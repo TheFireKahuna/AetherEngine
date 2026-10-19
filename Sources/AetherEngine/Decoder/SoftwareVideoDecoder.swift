@@ -1103,6 +1103,59 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, tags.transfer, .shouldPropagate)
         CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, tags.matrix, .shouldPropagate)
         attachHDRStaticMetadata(from: frame, to: pb)
+        attachChromaLocation(from: frame, to: pb)
+    }
+
+    /// Where the subsampled chroma samples sit, which the display layer's upsampler needs to put the
+    /// colour back on the right pixels; nothing told it before. Same value for both fields: what
+    /// leaves this decoder is progressive.
+    private func attachChromaLocation(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer) {
+        let chroma = OutputFormat(pixelFormatType: CVPixelBufferGetPixelFormatType(pb))?.chroma ?? .yuv420
+        guard let location = Self.chromaLocation(
+            frame.pointee.chroma_location, output: chroma,
+            isJPEG: Self.isJPEGFormat(AVPixelFormat(rawValue: frame.pointee.format))) else {
+            CVBufferRemoveAttachment(pb, kCVImageBufferChromaLocationTopFieldKey)
+            CVBufferRemoveAttachment(pb, kCVImageBufferChromaLocationBottomFieldKey)
+            return
+        }
+        CVBufferSetAttachment(pb, kCVImageBufferChromaLocationTopFieldKey, location, .shouldPropagate)
+        CVBufferSetAttachment(pb, kCVImageBufferChromaLocationBottomFieldKey, location, .shouldPropagate)
+    }
+
+    /// The CoreVideo chroma location for the frame's `chroma_location` on a buffer with `output`
+    /// subsampling. nil for 4:4:4, which has nothing to site.
+    ///
+    /// Unspecified is filled the way mpv fills it: left (co-sited horizontally, between the lines
+    /// vertically), the MPEG-2 / H.264 / HEVC / AV1 convention and so what an unlabelled stream on this
+    /// route almost always is, except a JPEG-family picture, which is centred. Left rather than no
+    /// attachment, because a buffer without one leaves the choice to whatever the display layer
+    /// assumes, and nothing documents that. On a 4:2:2 buffer only the horizontal half of the siting
+    /// exists, so the vertical variants fold onto Left / Center (a 4:2:0 picture swscale widened into
+    /// `sv22` keeps its horizontal siting).
+    nonisolated static func chromaLocation(_ location: AVChromaLocation, output: OutputFormat.Chroma,
+                                           isJPEG: Bool) -> CFString? {
+        let resolved = location == AVCHROMA_LOC_UNSPECIFIED
+            ? (isJPEG ? AVCHROMA_LOC_CENTER : AVCHROMA_LOC_LEFT) : location
+        switch output {
+        case .yuv444:
+            return nil
+        case .yuv422:
+            switch resolved {
+            case AVCHROMA_LOC_CENTER, AVCHROMA_LOC_TOP, AVCHROMA_LOC_BOTTOM:
+                return kCVImageBufferChromaLocation_Center
+            default:
+                return kCVImageBufferChromaLocation_Left
+            }
+        case .yuv420:
+            switch resolved {
+            case AVCHROMA_LOC_CENTER: return kCVImageBufferChromaLocation_Center
+            case AVCHROMA_LOC_TOPLEFT: return kCVImageBufferChromaLocation_TopLeft
+            case AVCHROMA_LOC_TOP: return kCVImageBufferChromaLocation_Top
+            case AVCHROMA_LOC_BOTTOMLEFT: return kCVImageBufferChromaLocation_BottomLeft
+            case AVCHROMA_LOC_BOTTOM: return kCVImageBufferChromaLocation_Bottom
+            default: return kCVImageBufferChromaLocation_Left
+            }
+        }
     }
 
     /// The mastering display and content light level travel with the colour tags: the frame's own
