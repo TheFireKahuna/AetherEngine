@@ -15,7 +15,8 @@ struct DeinterlaceConfig: Sendable, Equatable {
 ///
 /// Two engines:
 /// - HARDWARE (`config.mode == .auto`, default): `format=nv12,hwupload,yadif_videotoolbox`, the
-///   yadif kernel as a Metal compute shader over VideoToolbox frames. The sink emits
+///   yadif kernel as a Metal compute shader over VideoToolbox frames (`bwdif_videotoolbox` instead
+///   when the linked build has it, see `hardwareFilterName`). The sink emits
 ///   `AV_PIX_FMT_VIDEOTOOLBOX` frames wrapping IOSurface-backed CVPixelBuffers (`frame.data[3]`)
 ///   that go straight to the renderer, skipping the sws_scale copy. Runs at field rate by default
 ///   (`config.fieldRate`). Requires yadif_videotoolbox in the linked FFmpeg build (FFmpegBuild
@@ -64,8 +65,16 @@ final class DeinterlaceFilter {
 
     var isActive: Bool { graph != nil }
 
+    /// The Metal deinterlacer to use: `bwdif_videotoolbox` when the linked FFmpeg has it (better
+    /// edge reconstruction, the kernel the CPU fallback already prefers), else `yadif_videotoolbox`.
+    /// FFmpeg 8.1 ships only the yadif one; the preference costs nothing until a build adds bwdif.
+    /// Both take the same `mode` / `parity` / `deint` options. nil when neither is linked.
+    static func hardwareFilterName(available: (String) -> Bool = { avfilter_get_by_name($0) != nil }) -> String? {
+        ["bwdif_videotoolbox", "yadif_videotoolbox"].first(where: available)
+    }
+
     static func prewarmHardwarePipeline() -> Bool {
-        guard avfilter_get_by_name("yadif_videotoolbox") != nil,
+        guard hardwareFilterName() != nil,
               let frame = av_frame_alloc() else {
             return false
         }
@@ -138,11 +147,11 @@ final class DeinterlaceFilter {
         // Engine-specific preconditions.
         switch wanted {
         case .hardware:
-            guard avfilter_get_by_name("yadif_videotoolbox") != nil else {
+            guard Self.hardwareFilterName() != nil else {
                 if !loggedUnavailable {
                     loggedUnavailable = true
                     EngineLog.emit(
-                        "[Deinterlace] no yadif_videotoolbox in the linked FFmpeg build (needs FFmpegBuild >= 2.1)",
+                        "[Deinterlace] no bwdif_videotoolbox / yadif_videotoolbox in the linked FFmpeg build (needs FFmpegBuild >= 2.1)",
                         category: .swPlayback
                     )
                 }
@@ -217,11 +226,12 @@ final class DeinterlaceFilter {
             let swFmt = is10Bit(frame.pointee.format) ? "p010le" : "nv12"
             let mode = config.fieldRate == .field ? "send_field" : "send_frame"
             let deintOpts = "mode=\(mode):parity=auto:deint=interlaced"
-            chain = "format=\(swFmt),hwupload,yadif_videotoolbox=\(deintOpts)"
+            let deintName = Self.hardwareFilterName() ?? "yadif_videotoolbox"
+            chain = "format=\(swFmt),hwupload,\(deintName)=\(deintOpts)"
 
             guard let formatFilter = avfilter_get_by_name("format"),
                   let uploadFilter = avfilter_get_by_name("hwupload"),
-                  let deintFilter = avfilter_get_by_name("yadif_videotoolbox"),
+                  let deintFilter = avfilter_get_by_name(deintName),
                   let dev = hwDeviceRef else {
                 return false
             }
@@ -235,13 +245,13 @@ final class DeinterlaceFilter {
             }
             upC.pointee.hw_device_ctx = av_buffer_ref(dev)
             deintC.pointee.hw_device_ctx = av_buffer_ref(dev)
-            // yadif_videotoolbox init creates the Metal pipeline; failure here (no Metal
+            // The Metal deinterlacer's init creates its pipeline; failure here (no Metal
             // device, e.g. some CI VMs) is the fallback trigger.
             let upInit = avfilter_init_str(upC, nil)
             let deintInit = avfilter_init_str(deintC, deintOpts)
             guard upInit >= 0, deintInit >= 0 else {
                 EngineLog.emit(
-                    "[Deinterlace] hw filter init failed hwupload=\(upInit) yadif_vt=\(deintInit)",
+                    "[Deinterlace] hw filter init failed hwupload=\(upInit) \(deintName)=\(deintInit)",
                     category: .swPlayback
                 )
                 return false
