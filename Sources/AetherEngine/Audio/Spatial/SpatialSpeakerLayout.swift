@@ -37,6 +37,11 @@ public enum SpatialSpeakerLayout: String, Sendable, CaseIterable, Codable {
 
     public var channelCount: Int { speakers.count }
 
+    /// TS 103 448 table A.1's num_mid and num_top, which pick a layout's trim configuration: the
+    /// ear-level speakers other than the front three, and the height speakers.
+    var trimMidCount: Int { speakers.filter { !$0.isLFE && !$0.isHeight && ![.left, .right, .center].contains($0) }.count }
+    var trimTopCount: Int { speakers.filter(\.isHeight).count }
+
     /// Whether every channel of DTS:X's standard presentation, the 7.1 bed and the four heights, has
     /// a speaker of its own here, so each plays where it was authored and nothing is re-panned or
     /// folded: 7.1.4 and 9.1.6.

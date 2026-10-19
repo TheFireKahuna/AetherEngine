@@ -87,19 +87,75 @@ struct SpatialObjectRenderingTests {
         #expect(abs(power(gains) - 1) < 1e-5)
     }
 
-    @Test("snap routes to the nearest speaker; size spreads with unit power")
-    func snapAndSize() {
-        let layout = SpatialSpeakerLayout.l916
+    @Test("divergence splits an object either side of it along x; size spreads with unit power")
+    func divergenceAndSize() {
+        let layout = SpatialSpeakerLayout.l714
         let panner = AllocentricPanner(layout: layout)
         var gains: [Float] = []
-        panner.objectGains(position: SIMD3(0.05, 0.3, 0.1), size: 0, snap: true, into: &gains)
-        #expect(gains[layout.speakers.firstIndex(of: .wideLeft)!] == 1)
-        #expect(abs(power(gains) - 1) < 1e-6)
+        // TS 103 448 pseudocode 15: at the centre with divergence 1, halves at x = 0 and x = 1.
+        panner.objectGains(position: SIMD3(0.5, 0, 0), size: 0, divergence: 1, into: &gains)
+        let half = Float(0.5).squareRoot()
+        #expect(abs(gains[layout.speakers.firstIndex(of: .left)!] - half) < 1e-5)
+        #expect(abs(gains[layout.speakers.firstIndex(of: .right)!] - half) < 1e-5)
+        #expect(gains[layout.speakers.firstIndex(of: .center)!] < 1e-6)
+        // Near a wall the spread shrinks to keep both halves inside: at x = 0.1 it is 0.2.
+        panner.objectGains(position: SIMD3(0.1, 0, 0), size: 0.5, divergence: 1, into: &gains)
+        var reference: [Float] = []
+        panner.pointGains(SIMD3(0, 0, 0), into: &reference)
+        var other: [Float] = []
+        panner.pointGains(SIMD3(0.2, 0, 0), into: &other)
+        let sum = zip(reference, other).map(+)
+        let norm = power(sum).squareRoot()
+        for c in gains.indices { #expect(abs(gains[c] - sum[c] / norm) < 1e-5) }
 
-        panner.objectGains(position: SIMD3(0.5, 0.5, 0.5), size: 0.6, snap: false, into: &gains)
+        panner.objectGains(position: SIMD3(0.5, 0.5, 0.5), size: 0.6, into: &gains)
         #expect(abs(power(gains) - 1) < 1e-4)
         #expect(gains.filter { $0 > 0.01 }.count >= 10, "a large object reaches most of the room")
         #expect(gains[layout.lfeIndex] == 0)
+    }
+
+    @Test("size follows TS 103 448's size panner (pseudocodes 7-14), as the reference probe computes it")
+    func sizePanner() {
+        // probes/ts103448_size.py on 7.1.4, channel order L R C Ls Rs Lrs Rrs Vhl Vhr Ltr Rtr.
+        let cases: [(SIMD3<Float>, Float, [Float])] = [
+            (SIMD3(0.5, 0, 0), 0.25, [0.273602, 0.273602, 0.861703, 0.207717, 0.207717, 0, 0, 0.103585, 0.103585, 0, 0]),
+            (SIMD3(0.25, 0.4, 0.6), 0.5, [0.304005, 0.169154, 0.265656, 0.346168, 0.203891, 0.218110, 0.180817,
+                                          0.492804, 0.299801, 0.411259, 0.254663]),
+            (SIMD3(0, 1, 0), 1, [0.225163, 0.196513, 0.245808, 0.348137, 0.316066, 0.327558, 0.300895,
+                                 0.326882, 0.295649, 0.360861, 0.326882]),
+            (SIMD3(0.5, 0.5, 1), 0.1, [0, 0, 0, 0, 0, 0, 0, 0.5, 0.5, 0.5, 0.5]),
+        ]
+        let layout = SpatialSpeakerLayout.l714
+        let panner = AllocentricPanner(layout: layout)
+        var gains: [Float] = []
+        for (position, size, expected) in cases {
+            panner.objectGains(position: position, size: size, into: &gains)
+            let withoutLFE = gains.enumerated().filter { $0.offset != layout.lfeIndex }.map(\.element)
+            for (got, want) in zip(withoutLFE, expected) { #expect(abs(got - want) < 1e-4, "\(position) size \(size)") }
+        }
+    }
+
+    @Test("default trims leave 7.1.4 alone and pull the back and top down on smaller layouts")
+    func defaultTrim() {
+        let trim = ObjectAudioTrim.defaults
+        #expect(trim.gain(at: SIMD3(0, 1, 1), on: .l714) == 1)
+        // 5.1.2: num_mid 2, num_top 2, max_trim = -4.5 + 1.5 + 0.75 = -2.25 dB (pseudocode 16).
+        let back = 20 * log10(trim.gain(at: SIMD3(0.5, 1, 0), on: .l512))
+        #expect(abs(back + 2.25) < 1e-4)
+        #expect(trim.gain(at: SIMD3(0.5, 0, 0), on: .l512) == 1, "on the screen wall, at ear level")
+        // Halfway to full effect in y (0.3 of 0.6): half the maximum.
+        #expect(abs(20 * log10(trim.gain(at: SIMD3(0.5, 0.3, 0), on: .l512)) + 1.125) < 1e-4)
+    }
+
+    @Test("custom trims follow pseudocode 17 for the layout's trim configuration")
+    func customTrim() {
+        var configs = [ObjectAudioTrim.Mode](repeating: .default, count: 9)
+        configs[4] = .custom(centre: 0, surround: -3, height: -6)   // 5.1.2: trim_cfg 4
+        configs[8] = .disabled                                       // 7.1.4
+        let trim = ObjectAudioTrim(configs: configs)
+        #expect(trim.gain(at: SIMD3(0, 1, 1), on: .l714) == 1)
+        #expect(abs(20 * log10(trim.gain(at: SIMD3(0.5, 1, 1), on: .l512)) + 9) < 1e-4)
+        #expect(abs(20 * log10(trim.gain(at: SIMD3(0.5, 0.25, 0.5), on: .l512)) + 4.5) < 1e-4)
     }
 
     // MARK: - Renderer
@@ -159,7 +215,8 @@ struct SpatialObjectRenderingTests {
         #expect(out[l][49] == 1)
         #expect(abs(out[l][99] - 0.5) < 0.02 && abs(out[r][99] - 0.5) < 0.02)
         out = render(renderer, inputs: [ones], frames: 100, updates: [])
-        #expect(abs(out[l][49]) < 1e-5 && abs(out[r][49] - 1) < 1e-5)
+        // ramp_duration + 1 frames: the last step lands 100 frames after the update's.
+        #expect(abs(out[l][50]) < 1e-5 && abs(out[r][50] - 1) < 1e-5)
         #expect(abs(out[r][99] - 1) < 1e-5)
     }
 
@@ -204,7 +261,7 @@ struct SpatialObjectRenderingTests {
         let right = ObjectAudioElementState(position: SIMD3(1, 0, 0))
         let out = render(renderer, inputs: [ones, [Float](repeating: 0, count: 200)], frames: 200, updates: [
             .init(frameOffset: 0, rampFrames: 0, states: [left, left]),
-            .init(frameOffset: 0, rampFrames: 200, states: [right, nil]),
+            .init(frameOffset: 0, rampFrames: 199, states: [right, nil]),
             // Element 0 restated as unchanged halfway: its ramp must not restart.
             .init(frameOffset: 100, rampFrames: 0, states: [nil, right]),
         ])
@@ -229,7 +286,7 @@ struct SpatialObjectRenderingTests {
 
     // MARK: - Review round 1 (#731)
 
-    @Test("a ramp lands frame by frame on (k + 1) / total of the way, and finishes on the target")
+    @Test("a ramp of d lands frame by frame on (k + 1) / (d + 1) of the way, and finishes on the target")
     func rampIsExactPerFrame() {
         let layout = SpatialSpeakerLayout.l714
         let renderer = ObjectAudioRenderer(layout: layout, roles: [.object])
@@ -246,12 +303,13 @@ struct SpatialObjectRenderingTests {
             let out = render(renderer, inputs: [[Float](repeating: 1, count: 40)], frames: 40, updates: updates)
             left += out[l]; right += out[r]
         }
-        for k in 0..<100 {
-            let t = Float(k + 1) / 100
+        // TS 103 448 pseudocode 19: ramp_duration + 1 steps, the first on the update's frame.
+        for k in 0...100 {
+            let t = Float(k + 1) / 101
             #expect(abs(left[k] - (1 - t)) < 1e-5, "frame \(k)")
             #expect(abs(right[k] - t) < 1e-5, "frame \(k)")
         }
-        #expect(left[100...].allSatisfy { abs($0) < 1e-6 } && right[100...].allSatisfy { abs($0 - 1) < 1e-6 })
+        #expect(left[101...].allSatisfy { abs($0) < 1e-6 } && right[101...].allSatisfy { abs($0 - 1) < 1e-6 })
     }
 
     @Test("a resync mid-ramp freezes the object where the ramp had got to")
@@ -262,7 +320,7 @@ struct SpatialObjectRenderingTests {
         let l = layout.speakers.firstIndex(of: .left)!, r = layout.speakers.firstIndex(of: .right)!
         _ = render(renderer, inputs: [ones], frames: 50, updates: [
             .init(frameOffset: 0, rampFrames: 0, states: [ObjectAudioElementState(position: SIMD3(0, 0, 0))]),
-            .init(frameOffset: 0, rampFrames: 100, states: [ObjectAudioElementState(position: SIMD3(1, 0, 0))])])
+            .init(frameOffset: 0, rampFrames: 99, states: [ObjectAudioElementState(position: SIMD3(1, 0, 0))])])
         renderer.markDiscontinuity()
         let out = render(renderer, inputs: [ones], frames: 50, updates: [])
         #expect(abs(out[l][0] - 0.5) < 1e-5 && abs(out[l][49] - 0.5) < 1e-5)
@@ -339,7 +397,7 @@ struct SpatialObjectRenderingTests {
             let panner = AllocentricPanner(layout: layout, excluded: mask)
             for size: Float in [0, 0.1, 0.5, 1] {
                 for p in [SIMD3<Float>(0.1, 0.9, 0.7), SIMD3(0.5, 0.5, 0), SIMD3(1, 0, 1)] {
-                    panner.objectGains(position: p, size: size, snap: false, into: &gains)
+                    panner.objectGains(position: p, size: size, into: &gains)
                     #expect(abs(power(gains) - 1) < 1e-4, "\(layout.rawValue) size \(size) at \(p)")
                     #expect(gains[layout.lfeIndex] == 0)
                 }

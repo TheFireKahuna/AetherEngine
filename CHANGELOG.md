@@ -20,7 +20,15 @@ the public-API contract.
   Mac against the engine's own render of the same exact decode: same level and speaker split. The playlist
   announces the stream as the 7.1.4 tier (`apac.31.03`, `CHANNELS="12"`) whatever its own profile: announced
   as `apac.05.00`, a tvOS 27.2 Apple TV delivered it as multichannel PCM instead of Dolby MAT. Zone masks
-  cannot be delivered and are dropped, which the session log notes.
+  and divergence, which the system renderer ignores, are rendered by the engine (TS 103 448) onto eleven
+  fixed objects on the 7.1.4 speakers, crossfading over the update's ramp; an object switched off fades
+  where it is instead of gliding to the room's centre.
+- **Object metadata applied as TS 103 420 and TS 103 448 specify, personal builds** (`TrueHDReferenceRender`,
+  `APACObjectOutput`): snap to the 22.2 targets by weighted distance, distance to the room boundary, warp
+  mode, divergence, default and custom trims (the latter through the private LibTrueHD's
+  `truehd_atmos_decoder_get_trims`), the size panner, and ramps of ramp_duration + 1 frames. Checked against
+  Dolby's own 7.1 render fitted from the streams: point-object direction within a median 0.4 points and the
+  level equal to object gain plus default trim.
 
 ### Fixed
 

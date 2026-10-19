@@ -70,7 +70,7 @@ struct TrueHDObjectMetadataMappingTests {
         #expect(state.gain == 0.5)
         #expect(state.size == 0.3)
         #expect(state.excluded.isEmpty)
-        #expect(!state.snap)
+        #expect(state.divergence == 0)
     }
 
     @Test("an inactive object is silent")
@@ -79,12 +79,13 @@ struct TrueHDObjectMetadataMappingTests {
         #expect(state.gain == 0)
     }
 
-    @Test("an object without elevation stays off every height speaker")
+    @Test("an object without elevation comes down to ear level and stays off every height speaker")
     func noElevation() {
         let state = TrueHDObjectAudioDecoder.state(for: element(flags: TRUEHD_ATMOS_ELEMENT_ACTIVE))
         let heights = Set(SpatialSpeaker.allCases.filter(\.isHeight))
         #expect(heights.isSubset(of: state.excluded))
         #expect(!state.excluded.contains(.left))
+        #expect(state.position.z == 0)
     }
 
     @Test("a position below the ear-level plane is clamped to it")
@@ -131,10 +132,58 @@ struct TrueHDObjectMetadataMappingTests {
         #expect(state.size == 1)
     }
 
-    @Test("snap is carried through")
+    @Test("snap moves the object onto the nearest 22.2 target by TS 103 448's weighted distance")
     func snap() {
         let flags = TRUEHD_ATMOS_ELEMENT_ACTIVE | TRUEHD_ATMOS_ELEMENT_ELEVATION | TRUEHD_ATMOS_ELEMENT_SNAP
-        #expect(TrueHDObjectAudioDecoder.state(for: element(flags: flags)).snap)
+        let nearL = TrueHDObjectAudioDecoder.state(for: element(flags: flags, position: (0.2, 0.1, 0), size: (0.3, 0.3, 0.3)))
+        #expect(nearL.position == SIMD3(0, 0, 0))
+        #expect(nearL.size == 0)
+        #expect(TrueHDObjectAudioDecoder.state(for: element(flags: flags, position: (0.15, 0.2, 0.8))).position
+                == SIMD3(0.25, 0.25, 1))
+        // Surround only and no elevation: the front three, the wides and every height are gone.
+        let constrained = element(flags: TRUEHD_ATMOS_ELEMENT_ACTIVE | TRUEHD_ATMOS_ELEMENT_SNAP, position: (0.2, 0.1, 0.8),
+                                  zone: TRUEHD_ATMOS_ZONE_SURROUND_ONLY)
+        #expect(TrueHDObjectAudioDecoder.state(for: constrained).position == SIMD3(0, 0.5, 0))
+    }
+
+    @Test("a distance puts the object on the room boundary along its ray from the centre")
+    func distance() {
+        #expect(TrueHDObjectAudioDecoder.beyondTheRoom(SIMD3(0.75, 0.5, 0)) == SIMD3(1, 0.5, 0))
+        #expect(TrueHDObjectAudioDecoder.beyondTheRoom(SIMD3(0.5, 0.75, 0.5)) == SIMD3(0.5, 1, 1))
+        #expect(TrueHDObjectAudioDecoder.beyondTheRoom(SIMD3(0.5, 0.5, 0)) == SIMD3(0.5, 0.5, 0))
+        var e = element(flags: TRUEHD_ATMOS_ELEMENT_ACTIVE | TRUEHD_ATMOS_ELEMENT_ELEVATION | TRUEHD_ATMOS_ELEMENT_DISTANCE,
+                        position: (0.25, 0.5, 0))
+        e.distance = 2
+        #expect(TrueHDObjectAudioDecoder.state(for: e).position == SIMD3(0, 0.5, 0))
+    }
+
+    @Test("warp mode 1 doubles an object's depth, and leaves the beds alone")
+    func warp() {
+        let stream = TrueHDObjectAudioDecoder.StreamMetadata(warp: true)
+        #expect(TrueHDObjectAudioDecoder.state(for: element(position: (0.5, 0.3, 0)), stream: stream).position.y == 0.6)
+        #expect(TrueHDObjectAudioDecoder.state(for: element(position: (0.5, 0.8, 0)), stream: stream).position.y == 1)
+        let bed = element(kind: TRUEHD_ATMOS_ELEMENT_BED, position: (0, 0.5, 0))
+        #expect(TrueHDObjectAudioDecoder.state(for: bed, stream: stream).position.y == 0.5)
+    }
+
+    @Test("objects carry the stream's trims unless they bypass them; beds never trim")
+    func trims() {
+        var configs = [ObjectAudioTrim.Mode](repeating: .default, count: 9)
+        configs[8] = .custom(centre: 0, surround: -3, height: 0)
+        let stream = TrueHDObjectAudioDecoder.StreamMetadata(trim: ObjectAudioTrim(configs: configs))
+        #expect(TrueHDObjectAudioDecoder.state(for: element(), stream: stream).trim == stream.trim)
+        let bypass = TRUEHD_ATMOS_ELEMENT_ACTIVE | TRUEHD_ATMOS_ELEMENT_ELEVATION | TRUEHD_ATMOS_ELEMENT_TRIM_BYPASS
+        #expect(TrueHDObjectAudioDecoder.state(for: element(flags: bypass), stream: stream).trim == nil)
+        #expect(TrueHDObjectAudioDecoder.state(for: element(kind: TRUEHD_ATMOS_ELEMENT_BED), stream: stream).trim == nil)
+    }
+
+    @Test("divergence passes through, and a snapped object has none")
+    func divergence() {
+        var e = element(flags: TRUEHD_ATMOS_ELEMENT_ACTIVE | TRUEHD_ATMOS_ELEMENT_ELEVATION | TRUEHD_ATMOS_ELEMENT_DIVERGENCE)
+        e.divergence = 0.6
+        #expect(TrueHDObjectAudioDecoder.state(for: e).divergence == 0.6)
+        e.flags |= TRUEHD_ATMOS_ELEMENT_SNAP
+        #expect(TrueHDObjectAudioDecoder.state(for: e).divergence == 0)
     }
 
     @Test("zone masks keep an object off the speakers they name")
@@ -170,7 +219,7 @@ struct TrueHDObjectMetadataMappingTests {
         let excluded = TrueHDObjectAudioDecoder.excludedSpeakers(zone: TRUEHD_ATMOS_ZONE_NO_BACK)
         let panner = AllocentricPanner(layout: layout, excluded: excluded)
         var gains: [Float] = []
-        panner.objectGains(position: SIMD3(0.1, 1, 0), size: 0, snap: false, into: &gains)
+        panner.objectGains(position: SIMD3(0.1, 1, 0), size: 0, into: &gains)
         for (channel, speaker) in layout.speakers.enumerated() where excluded.contains(speaker) {
             #expect(gains[channel] == 0, "\(speaker)")
         }
