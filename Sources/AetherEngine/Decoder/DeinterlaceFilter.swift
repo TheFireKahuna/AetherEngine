@@ -354,6 +354,13 @@ final class DeinterlaceFilter {
         return av_buffersrc_add_frame_flags(src, frame, 0)
     }
 
+    /// Signal end of stream: yadif/bwdif then filter the frame they held as look-ahead, and `pull`
+    /// returns AVERROR_EOF once it is out. The buffersrc refuses frames from here on; `teardown`.
+    func pushEndOfStream() -> Int32 {
+        guard let src = srcCtx else { return -1 }
+        return av_buffersrc_add_frame_flags(src, nil, 0)
+    }
+
     /// Pull the next filtered frame into `out`. Returns >= 0 on success, AVERROR(EAGAIN) when the
     /// filter needs more input. Output PTS is on `outputTimeBase` (see class doc), and for the
     /// hardware engine the frame is `AV_PIX_FMT_VIDEOTOOLBOX` (CVPixelBuffer in `data[3]`).
