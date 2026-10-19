@@ -31,8 +31,8 @@ struct DoviShaderSyncTests {
 
     @Test("two composers share one pipeline state instance (compiled once lazily)", .enabled(if: DoviShaderSyncTests.metalAvailable, "needs a Metal device"))
     func twoComposersSharePipelineStateInstance() throws {
-        let c1 = try #require(DoviFelComposer())
-        let c2 = try #require(DoviFelComposer())
+        let c1 = try #require(DoviFelComposer.p010ForTesting())
+        let c2 = try #require(DoviFelComposer.p010ForTesting())
 
         // Before accessing pipelines or composing, both composers exist without separate compiles.
         // Accessing pipelines returns identical instances (shared across composers).
@@ -87,7 +87,7 @@ struct DoviShaderSyncTests {
         #expect(await AetherEngine.prewarmDualLayerDolbyVision())
         let device = try #require(MTLCreateSystemDefaultDevice())
         let shared = try DoviFelComposer.SharedPipelines.getOrCreate(device: device)
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         #expect(composer.lumaPipelineForTesting === shared.lumaPipeline, "the composer reuses the warmed pipeline, no second compile")
         #expect(await AetherEngine.prewarmDualLayerDolbyVision(), "a second warm is a cache hit")
     }

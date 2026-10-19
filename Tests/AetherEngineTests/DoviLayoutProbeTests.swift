@@ -120,7 +120,7 @@ struct DoviLayoutProbeTests {
 
     @Test("The shader reads every parameter sub-block at the offset the Swift serializer wrote it to")
     func layoutProbeRoundTrip() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         let params = Self.sentinelParams()
         let slots = try #require(composer.probeLayout(params: params),
                                  "dovi_layout_probe is unavailable, so the parameter ABI is unverified")

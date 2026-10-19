@@ -124,7 +124,7 @@ struct DoviGpuCurveSweepTests {
     #if DolbyVisionStillReshaping
     @Test("GPU luma sweep: a 3-piece polynomial with per-piece order and denominator matches the reference curve")
     func lumaMultiPiecePolynomialSweep() throws {
-        guard let composer = DoviFelComposer() else {
+        guard let composer = DoviFelComposer.p010ForTesting() else {
             Issue.record("Failed to initialize DoviFelComposer")
             return
         }
@@ -230,7 +230,7 @@ struct DoviGpuCurveSweepTests {
 
     @Test("GPU chroma sweep: MMR coefficients are read per reshaping piece, not only from piece 0")
     func chromaPerPieceMmrSweep() throws {
-        guard let composer = DoviFelComposer() else {
+        guard let composer = DoviFelComposer.p010ForTesting() else {
             Issue.record("Failed to initialize DoviFelComposer")
             return
         }
@@ -358,7 +358,7 @@ struct DoviGpuCurveSweepTests {
 
     @Test("GPU identity curve is bit-exact: every base-layer code survives the round trip")
     func identityCurveIsBitExact() throws {
-        guard let composer = DoviFelComposer() else {
+        guard let composer = DoviFelComposer.p010ForTesting() else {
             Issue.record("Failed to initialize DoviFelComposer")
             return
         }

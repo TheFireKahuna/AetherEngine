@@ -262,11 +262,11 @@ extension AetherEngine {
 }
 
 extension AetherEngine {
-    /// The buffer the FEL composer hands the display path. An experiment switch for whether more than
-    /// 10 bits survive tvOS's Dolby Vision output (dolby-vision-fel.md, `DoviDither.fullPrecision`).
+    /// The buffer the FEL composer hands the display path. Default ``sv22``, measured to carry more than
+    /// 10 bits through tvOS's Dolby Vision output (dolby-vision-fel.md, `DoviDither.fullPrecision`).
     @_spi(Diagnostics)
     public enum FelOutputMode: String, CaseIterable, Sendable {
-        /// P010, ordered-dithered to 10 bits. The validated default.
+        /// P010, ordered-dithered to 10 bits, bit-exact with Dolby's 4:2:0 reference. The fallback.
         case p010 = "p010"
         /// P010 rounded to the nearest 10-bit code, no dither: keeps nothing below 10 bits.
         case p010Rounded = "p010-round"
@@ -276,7 +276,7 @@ extension AetherEngine {
         case p010FullPrecision = "p010-full"
         /// 16-bit 4:2:2 `sv22` carrying the same full-precision words, where they are defined values, with
         /// chroma composed at every 4:2:2 site (vertical Catmull-Rom on the base chroma; not bit-exact with
-        /// Dolby's 4:2:0 reference).
+        /// Dolby's 4:2:0 reference). The default.
         case sv22 = "sv22"
     }
 

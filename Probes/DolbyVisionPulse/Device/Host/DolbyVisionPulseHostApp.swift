@@ -26,13 +26,13 @@ import UIKit
 // - `engine`: AetherEngine with `preferDualLayerDolbyVision: true` (a Profile 7 FEL clip takes the
 //   dual-layer route).
 // - `enginenofel`: as `engine` with `preferDualLayerDolbyVision: false` (native 8.1 route, EL dropped).
-//   `engine` takes `out=p010|p010-round|p010-bluenoise|p010-full|sv22` (default p010): the FEL composer's output
+//   `engine` takes `out=p010|p010-round|p010-bluenoise|p010-full|sv22` (default sv22, the engine's): the FEL composer's output
 //   buffer, for the 12-bit display-path experiment (`AetherEngine.felOutputMode`); `rpu=<url>` (absolute, or
 //   relative to the clip's): one Dolby Vision RPU NAL, fetched before the arm starts, that every composed frame
 //   carries in place of its own for this arm only (`AetherEngine.felComposedRpuOverride`; a fetch or parse
 //   failure skips the arm); `secs=N`: play N seconds, looping the clip, instead of once through (80 s cap).
 // - `soak`: `engine` for `minutes=` with a `seeks=at@to,...` schedule, sampled once a second, ending in
-//   one `soak summary` line; takes `out=` like `engine` (default p010).
+//   one `soak summary` line; takes `out=` like `engine` (default sv22, the engine's).
 //
 // The VT modes request Dolby Vision display criteria from the track's own format description, as an
 // app on this path would.
@@ -197,7 +197,7 @@ struct PulseHarnessView: View {
             case "vt", "vtcopy", "vtstrip":
                 await host.playVT(arm.url, mode: arm.mode, log: say)
             case "engine":
-                let out = arm.params["out"] ?? "p010"
+                let out = arm.params["out"] ?? AetherEngine.FelOutputMode.sv22.rawValue
                 guard let mode = AetherEngine.FelOutputMode(rawValue: out) else {
                     say("unknown out=\(out), arm skipped")
                     break
@@ -218,13 +218,13 @@ struct PulseHarnessView: View {
                 AetherEngine.felOutputMode = mode
                 say("fel output \(mode.rawValue)")
                 await playEngine(arm.url, fel: true, seconds: arm.params["secs"].flatMap(Double.init), log: say)
-                AetherEngine.felOutputMode = .p010
+                AetherEngine.felOutputMode = .sv22   // back to the engine default
                 AetherEngine.felComposedRpuOverride = nil
             case "enginenofel":
                 await playEngine(arm.url, fel: false, log: say)
             case "soak":
                 // `out=` as on `engine` arms, so a soak measures the output buffer it will ship with.
-                let out = arm.params["out"] ?? "p010"
+                let out = arm.params["out"] ?? AetherEngine.FelOutputMode.sv22.rawValue
                 guard let mode = AetherEngine.FelOutputMode(rawValue: out) else {
                     say("unknown out=\(out), arm skipped")
                     break
@@ -232,7 +232,7 @@ struct PulseHarnessView: View {
                 AetherEngine.felOutputMode = mode
                 say("fel output \(mode.rawValue)")
                 await playSoak(arm, log: say)
-                AetherEngine.felOutputMode = .p010
+                AetherEngine.felOutputMode = .sv22   // back to the engine default
             default:
                 say("unknown mode \(arm.mode), skipped")
             }
