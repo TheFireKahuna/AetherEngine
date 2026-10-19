@@ -29,6 +29,10 @@ public enum DoviRpuConverter {
         /// composed pixel buffer (`dualLayerUnspec62`). Nil when there was no RPU, the conversion
         /// failed, or neither dual-layer output was asked for (the remux route rewrites the packet only).
         let convertedRpu: [UInt8]?
+        /// The same RPU in Profile 8.1 with its luma/chroma mapping kept: what a frame presented as its
+        /// raw base layer carries, so the display side does the reshaping the composer did not. Set
+        /// whenever `convertedRpu` is.
+        let baseLayerRpu: [UInt8]?
         #if DualLayerDolbyVision
         let rpuParams: DoviMetalParams?
         #endif
@@ -42,11 +46,12 @@ public enum DoviRpuConverter {
         let disableResidual: Bool
 
         #if DualLayerDolbyVision
-        init(elPacket: UnsafeMutablePointer<AVPacket>?, rpuData: [UInt8]?, convertedRpu: [UInt8]? = nil, rpuParams: DoviMetalParams? = nil, isFEL: Bool, isMEL: Bool = false, success: Bool, usesPreviousMapping: Bool = false, disableResidual: Bool = false) {
+        init(elPacket: UnsafeMutablePointer<AVPacket>?, rpuData: [UInt8]?, convertedRpu: [UInt8]? = nil, baseLayerRpu: [UInt8]? = nil, rpuParams: DoviMetalParams? = nil, isFEL: Bool, isMEL: Bool = false, success: Bool, usesPreviousMapping: Bool = false, disableResidual: Bool = false) {
             self.rpuParams = rpuParams
             self.elPacket = elPacket
             self.rpuData = rpuData
             self.convertedRpu = convertedRpu
+            self.baseLayerRpu = baseLayerRpu
             self.isFEL = isFEL
             self.isMEL = isMEL
             self.success = success
@@ -54,10 +59,11 @@ public enum DoviRpuConverter {
             self.disableResidual = disableResidual
         }
         #else
-        init(elPacket: UnsafeMutablePointer<AVPacket>?, rpuData: [UInt8]?, convertedRpu: [UInt8]? = nil, isFEL: Bool, isMEL: Bool = false, success: Bool, usesPreviousMapping: Bool = false, disableResidual: Bool = false) {
+        init(elPacket: UnsafeMutablePointer<AVPacket>?, rpuData: [UInt8]?, convertedRpu: [UInt8]? = nil, baseLayerRpu: [UInt8]? = nil, isFEL: Bool, isMEL: Bool = false, success: Bool, usesPreviousMapping: Bool = false, disableResidual: Bool = false) {
             self.elPacket = elPacket
             self.rpuData = rpuData
             self.convertedRpu = convertedRpu
+            self.baseLayerRpu = baseLayerRpu
             self.isFEL = isFEL
             self.isMEL = isMEL
             self.success = success
@@ -206,6 +212,7 @@ public enum DoviRpuConverter {
         let keepRpuBytes = extractEL || extractParams
         var rawRpuBytes: [UInt8]?
         var convertedRpuBytes: [UInt8]?
+        var baseLayerRpuBytes: [UInt8]?
         #if DualLayerDolbyVision
         var rpuParams: DoviMetalParams?
         #endif
@@ -259,6 +266,7 @@ public enum DoviRpuConverter {
                 // FEL RPU that is the composed one, for any other the one that kept its mapping.
                 let out: UnsafePointer<DoviData>
                 var composedOut: UnsafePointer<DoviData>?
+                var baseLayerOut: UnsafePointer<DoviData>?
                 if keepRpuBytes {
                     guard let forms = Self.dualLayerUnspec62(rpu, isFEL: thisFEL) else {
                         degraded = true
@@ -268,6 +276,7 @@ public enum DoviRpuConverter {
                     rewritten.append(forms.baseLayer)
                     out = thisFEL ? forms.composed : forms.baseLayer
                     composedOut = forms.composed
+                    baseLayerOut = forms.baseLayer
                 } else {
                     guard let mode2 = Self.convertedUnspec62(rpu) else {
                         degraded = true
@@ -288,6 +297,9 @@ public enum DoviRpuConverter {
                 rawRpuBytes = thisRaw
                 convertedRpuBytes = composedOut.flatMap { c in
                     c.pointee.data.map { [UInt8](UnsafeBufferPointer(start: $0, count: c.pointee.len)) }
+                }
+                baseLayerRpuBytes = baseLayerOut.flatMap { b in
+                    b.pointee.data.map { [UInt8](UnsafeBufferPointer(start: $0, count: b.pointee.len)) }
                 }
                 #if DualLayerDolbyVision
                 rpuParams = thisParams
@@ -360,6 +372,7 @@ public enum DoviRpuConverter {
             elPacket: producedElPacket,
             rpuData: rawRpuBytes,
             convertedRpu: convertedRpuBytes,
+            baseLayerRpu: baseLayerRpuBytes,
             rpuParams: rpuParams,
             isFEL: isFEL && !isMEL,
             isMEL: isMEL,
@@ -372,6 +385,7 @@ public enum DoviRpuConverter {
             elPacket: producedElPacket,
             rpuData: rawRpuBytes,
             convertedRpu: convertedRpuBytes,
+            baseLayerRpu: baseLayerRpuBytes,
             isFEL: isFEL && !isMEL,
             isMEL: isMEL,
             success: !degraded && !allocationFailed,

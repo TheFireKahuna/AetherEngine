@@ -238,12 +238,17 @@ struct DualLayerEdgeCaseTests {
         let delivered = r.deliveries.all
         #expect(Self.isStrictlyIncreasing(delivered), "no frame lost, none out of order")
         let pairs = r.composer.pairs
-        #expect(pairs.count == count - missing.count)
+        #expect(pairs.count == count, "a frame without its EL is still composed, from its base layer alone")
         for pair in pairs {
             let i = try #require(bases.firstIndex { $0 === pair.base })
-            #expect(pair.enhancement === enhancements[i], "frame \(i) paired with its own picture's EL")
+            if missing.contains(i) {
+                // MEL-equivalent: reshaped, no residual; the base layer stands in for the unread EL texture.
+                #expect(pair.enhancement === bases[i] && pair.flags.contains(.disableResidual), "frame \(i) composes base-only")
+            } else {
+                #expect(pair.enhancement === enhancements[i], "frame \(i) paired with its own picture's EL")
+                #expect(!pair.flags.contains(.disableResidual), "frame \(i) keeps its residual")
+            }
         }
-        for i in missing { #expect(!pairs.contains { $0.base === bases[i] }, "frame \(i) goes out as its base layer") }
         #expect(r.decoder.stateSnapshotForTesting.blQueueCount == 0)
     }
 
@@ -268,10 +273,14 @@ struct DualLayerEdgeCaseTests {
         try await waitFor { r.deliveries.count == count }
         #expect(Self.isStrictlyIncreasing(r.deliveries.all))
         let pairs = r.composer.pairs
-        #expect(pairs.count == count - outage.count)
+        #expect(pairs.count == count)
         for pair in pairs {
             let i = try #require(bases.firstIndex { $0 === pair.base })
-            #expect(pair.enhancement === enhancements[i])
+            if outage.contains(i) {
+                #expect(pair.enhancement === bases[i] && pair.flags.contains(.disableResidual), "frame \(i) composes base-only")
+            } else {
+                #expect(pair.enhancement === enhancements[i] && !pair.flags.contains(.disableResidual))
+            }
         }
         let s = r.decoder.stateSnapshotForTesting
         #expect(s.blQueueCount == 0 && s.elQueueCount == 0)
@@ -308,7 +317,7 @@ struct DualLayerEdgeCaseTests {
         defer { r.decoder.close() }
         let k = DualLayerVideoDecoder.maxLayerSkewFrames
         var bases: [CVPixelBuffer] = []
-        // Frames 0...k arrive with no EL: frame 0 is released as its base layer on frame k's arrival.
+        // Frames 0...k arrive with no EL: frame 0 is released on frame k's arrival, composed from its base layer alone.
         for i in 0...k {
             r.decoder.seedRPUForTesting(pts: Self.pts(Int64(i)), params: Self.params(), displayMetadataNAL: nil)
             let bl = try Self.baseLayer()
@@ -316,7 +325,8 @@ struct DualLayerEdgeCaseTests {
             r.decoder.handleBaseLayerFrame(baseBuffer: bl, pts: Self.pts(Int64(i)), hdr10Data: nil)
         }
         try await waitFor { r.deliveries.count == 1 }
-        #expect(r.deliveries.all.first?.buffer === bases[0])
+        #expect(r.deliveries.all.first?.buffer === bases[0])   // what this composer hands back
+        #expect(r.composer.pairs.first.map { $0.base === bases[0] && $0.enhancement === bases[0] && $0.flags.contains(.disableResidual) } == true)
 
         let lateEL = try Self.enhancementLayer()
         r.decoder.handleEnhancementLayerFrame(elBuffer: lateEL, pts: Self.pts(0))
@@ -329,7 +339,7 @@ struct DualLayerEdgeCaseTests {
             r.decoder.handleEnhancementLayerFrame(elBuffer: el, pts: Self.pts(Int64(i)))
         }
         try await waitFor { r.deliveries.count == k + 1 }
-        let pairs = r.composer.pairs
+        let pairs = Array(r.composer.pairs.dropFirst())   // the first is frame 0's base-only composition
         #expect(pairs.count == k)
         #expect(pairs.allSatisfy { $0.enhancement !== lateEL })
         #expect(zip(pairs, zip(bases.dropFirst(), enhancements)).allSatisfy { $0.base === $1.0 && $0.enhancement === $1.1 })
