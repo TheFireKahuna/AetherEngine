@@ -127,15 +127,46 @@ final class DoviFelComposer: @unchecked Sendable {
         let lumaPipeline: MTLComputePipelineState
         let chromaPipeline: MTLComputePipelineState
         let layoutProbePipeline: MTLComputePipelineState?
+        /// The library the pipelines came from, kept for the blue-noise specialisation.
+        private let library: MTLLibrary?
+        private let blueNoiseLock = NSLock()
+        private var blueNoiseResult: Result<(luma: MTLComputePipelineState, chroma: MTLComputePipelineState), Error>?
 
         init(
             luma: MTLComputePipelineState,
             chroma: MTLComputePipelineState,
-            probe: MTLComputePipelineState?
+            probe: MTLComputePipelineState?,
+            library: MTLLibrary? = nil
         ) {
             self.lumaPipeline = luma
             self.chromaPipeline = chroma
             self.layoutProbePipeline = probe
+            self.library = library
+        }
+
+        /// The kernels specialised with the blue-noise dither (`dovi_fc_blue_noise` true), for
+        /// ``DoviDither/blueNoise``. Built on first use, so a session that never asks for the experiment never
+        /// pays the compile; the result, a failure included, is kept.
+        func blueNoisePipelines() throws -> (luma: MTLComputePipelineState, chroma: MTLComputePipelineState) {
+            blueNoiseLock.lock()
+            defer { blueNoiseLock.unlock() }
+            if let blueNoiseResult { return try blueNoiseResult.get() }
+            let result = Result { () throws -> (luma: MTLComputePipelineState, chroma: MTLComputePipelineState) in
+                guard let library else { throw ComposerError.missingKernelFunction }
+                let device = library.device
+                return (try device.makeComputePipelineState(function: try Self.kernel(library, "dovi_compose_luma", blueNoise: true)),
+                        try device.makeComputePipelineState(function: try Self.kernel(library, "dovi_compose_chroma", blueNoise: true)))
+            }
+            blueNoiseResult = result
+            return try result.get()
+        }
+
+        /// A composition kernel with its function constant set.
+        static func kernel(_ library: MTLLibrary, _ name: String, blueNoise: Bool) throws -> MTLFunction {
+            let values = MTLFunctionConstantValues()
+            var flag = blueNoise
+            values.setConstantValue(&flag, type: .bool, index: 0)
+            return try library.makeFunction(name: name, constantValues: values)
         }
 
         /// Per-device results, failures included: a shader that does not compile will not compile on the next
@@ -176,12 +207,12 @@ final class DoviFelComposer: @unchecked Sendable {
 
         static func compile(device: MTLDevice, source: String) throws -> SharedPipelines {
             let library = try device.makeLibrary(source: source, options: nil)
-            guard let lumaFn = library.makeFunction(name: "dovi_compose_luma"),
-                  let chromaFn = library.makeFunction(name: "dovi_compose_chroma") else {
+            guard library.functionNames.contains("dovi_compose_luma"),
+                  library.functionNames.contains("dovi_compose_chroma") else {
                 throw ComposerError.missingKernelFunction
             }
-            let luma = try device.makeComputePipelineState(function: lumaFn)
-            let chroma = try device.makeComputePipelineState(function: chromaFn)
+            let luma = try device.makeComputePipelineState(function: try kernel(library, "dovi_compose_luma", blueNoise: false))
+            let chroma = try device.makeComputePipelineState(function: try kernel(library, "dovi_compose_chroma", blueNoise: false))
             let probe: MTLComputePipelineState?
             if let probeFn = library.makeFunction(name: "dovi_layout_probe") {
                 probe = try? device.makeComputePipelineState(function: probeFn)
@@ -189,7 +220,7 @@ final class DoviFelComposer: @unchecked Sendable {
                 probe = nil
             }
 
-            return SharedPipelines(luma: luma, chroma: chroma, probe: probe)
+            return SharedPipelines(luma: luma, chroma: chroma, probe: probe, library: library)
         }
 
         #if DEBUG
@@ -883,10 +914,22 @@ final class DoviFelComposer: @unchecked Sendable {
         switch outputMode {
         case .p010: break
         case .p010Rounded: serialized.ditherMode = .none
+        case .p010BlueNoise: serialized.ditherMode = .blueNoise
         case .p010FullPrecision, .sv22: serialized.ditherMode = .fullPrecision
         }
         if outputMode == .sv22 { serialized.flags.insert(.chroma422) }
         serialized.serialize(into: rawBuffer)
+        // The blue-noise dither lives in its own specialisation of the kernels (`dovi_fc_blue_noise`).
+        let lumaPipeline: MTLComputePipelineState, chromaPipeline: MTLComputePipelineState
+        if serialized.ditherMode == .blueNoise {
+            guard let blue = try? pipelines.blueNoisePipelines() else {
+                returnParamSlot(paramSlot)
+                return nil
+            }
+            (lumaPipeline, chromaPipeline) = blue
+        } else {
+            (lumaPipeline, chromaPipeline) = (pipelines.lumaPipeline, pipelines.chromaPipeline)
+        }
 
         let lutBuffer = lumaLutBuffers[paramSlot]
         populateLumaLut(into: lutBuffer.contents().assumingMemoryBound(to: Float.self), params: metalParams)
@@ -909,7 +952,7 @@ final class DoviFelComposer: @unchecked Sendable {
             return nil
         }
 
-        encoder.setComputePipelineState(pipelines.lumaPipeline)
+        encoder.setComputePipelineState(lumaPipeline)
         encoder.setTexture(blYTex, index: 0)
         encoder.setTexture(blUvTex, index: 1)
         encoder.setTexture(elYTex, index: 2)
@@ -918,9 +961,9 @@ final class DoviFelComposer: @unchecked Sendable {
         encoder.setBuffer(lutBuffer, offset: 0, index: 1)
         encoder.setBuffer(nlqBuffer, offset: 0, index: 2)
         dispatch(encoder, width: blW, height: blH,
-                 threadgroup: threadgroupSize(for: pipelines.lumaPipeline))
+                 threadgroup: threadgroupSize(for: lumaPipeline))
 
-        encoder.setComputePipelineState(pipelines.chromaPipeline)
+        encoder.setComputePipelineState(chromaPipeline)
         encoder.setTexture(blYTex, index: 0)
         encoder.setTexture(blUvTex, index: 1)
         encoder.setTexture(elUvTex, index: 2)
@@ -928,7 +971,7 @@ final class DoviFelComposer: @unchecked Sendable {
         encoder.setBuffer(paramBuffer, offset: 0, index: 0)
         encoder.setBuffer(nlqBuffer, offset: 0, index: 2)
         dispatch(encoder, width: blW / 2, height: blH / 2,
-                 threadgroup: threadgroupSize(for: pipelines.chromaPipeline))
+                 threadgroup: threadgroupSize(for: chromaPipeline))
 
         encoder.endEncoding()
 

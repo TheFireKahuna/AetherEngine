@@ -181,11 +181,13 @@ struct DoviGpuBenchmark {
         let p010 = try #require(makeBuffer(width, height, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange))
         let sv22 = try #require(makeBuffer(width, height, kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange))
         for (mode, dither, out, c422) in [("p010", DoviDither.bayer8x8, p010, false),
+                                          ("p010-bn", DoviDither.blueNoise, p010, false),
                                           ("sv22", DoviDither.fullPrecision, sv22, true)] {
             try setMode(rig, dither: dither, chroma422: c422)
-            let l = try time(rig, pipeline: pipes.lumaPipeline, luma: true, out: out, extraBuffers: extra,
+            let kernels = dither == .blueNoise ? try pipes.blueNoisePipelines() : (pipes.lumaPipeline, pipes.chromaPipeline)
+            let l = try time(rig, pipeline: kernels.0, luma: true, out: out, extraBuffers: extra,
                              tgShape: tgShape, pixelsPerThread: pixelsPerThread)
-            let c = try time(rig, pipeline: pipes.chromaPipeline, luma: false, out: out, extraBuffers: extra,
+            let c = try time(rig, pipeline: kernels.1, luma: false, out: out, extraBuffers: extra,
                              tgShape: tgShape, pixelsPerThread: pixelsPerThread)
             // The last timed dispatch of each kernel left its output; it must match the baseline's bit for bit.
             let words = planes(out)
