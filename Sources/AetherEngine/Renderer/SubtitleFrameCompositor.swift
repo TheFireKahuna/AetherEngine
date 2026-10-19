@@ -162,6 +162,9 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else { return nil }
+        // Bitmap cues are upscaled 2x (PGS on 4K) to 4.5x (DVD on 4K). Explicit rather than
+        // `.default`, which happens to filter identically on macOS 27 but promises nothing.
+        ctx.interpolationQuality = .high
 
         let layout = textLayout(frameWidth: frameWidth, frameHeight: frameHeight)
         var textBaselineFromBottom = layout.bottomMargin
