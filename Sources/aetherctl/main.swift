@@ -539,6 +539,25 @@ if first == "dvsurvey" {
 }
 
 #if DualLayerDolbyVision
+// One FEL frame composed with and without its residual, as raw planes: elframe --at SECONDS --out DIR <url>.
+if first == "elframe" {
+    var rest = Array(args.dropFirst(2))
+    let at = takeDoubleFlag("--at", from: &rest) ?? 0
+    guard let outIdx = rest.firstIndex(of: "--out"), outIdx + 1 < rest.count else {
+        print("Usage: aetherctl elframe --at SECONDS --out DIR <url>")
+        exit(64)
+    }
+    let out = URL(fileURLWithPath: rest[outIdx + 1])
+    rest.removeSubrange(outIdx...(outIdx + 1))
+    guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
+        print("Usage: aetherctl elframe --at SECONDS --out DIR <url>")
+        exit(64)
+    }
+    rest.removeAll { $0 == urlArg }
+    rejectStrayFlags(rest, subcommand: "elframe")
+    exit(runElFrame(url: parseSourceURL(urlArg), seconds: at, outDir: out))
+}
+
 // What each title's enhancement layer does to its picture, measured at sampled keyframes: `label<TAB>url` lines on stdin.
 if first == "elsurvey" {
     var rest = Array(args.dropFirst(2))
