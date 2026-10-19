@@ -1258,11 +1258,13 @@ final class SoftwarePlaybackHost {
         // The clock waits until frames from its position on are queued, then starts a little ahead
         // (`AudioOutput.videoPrerollSatisfied`, #774, #800). A live stream off the FEL path starts at
         // once, and so does a session playing audio only in the background, which feeds the renderer
-        // nothing.
+        // nothing, or one whose source is exhausted: no handover is coming to open the gate, and a
+        // resume after the end waited out the whole timeout.
         let prerollRenderer = renderer
         let prerollLive = isLive
+        let prerollDiag = demuxDiag
         self.audioOutput?.videoPrerollSatisfied = { [weak self] clock in
-            guard self?.backgroundAudioOnly != true else { return nil }
+            guard self?.backgroundAudioOnly != true, !prerollDiag.snapshot.sourceExhausted else { return nil }
             return prerollRenderer.prerollSatisfied(clock: clock, live: prerollLive)
         }
         // Nothing polls the gate: each handover asks it again.
@@ -2204,6 +2206,8 @@ final class SoftwarePlaybackHost {
                 // Only current EOF may mark the diagnostic source exhausted or stop playback.
                 // A queued pre-seek EOF task must not end a freshly positioned generation.
                 self.demuxDiag.markSourceExhausted()
+                // A start waiting on frames that will never come is answered now, not at the timeout.
+                self.audioOutput?.videoPrerollAdvanced()
                 self.parkClockAtEndOfMedia()
                 self.didReachEnd = true
                 self.isPlaying = false
