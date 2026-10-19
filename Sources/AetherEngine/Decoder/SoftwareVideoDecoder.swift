@@ -725,7 +725,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Every field is written, a gap included (AE#654): VideoToolbox never hands the display layer an
     /// untagged buffer, and neither may this decoder.
     private func attachColorSpace(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer) {
-        let tags = ColorAttachments.presented(ColorDescription(frame: frame))
+        let tags = ColorAttachments.presented(
+            ColorDescription(frame: frame), frameSize: (frame.pointee.width, frame.pointee.height))
         CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, tags.primaries, .shouldPropagate)
         CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, tags.transfer, .shouldPropagate)
         CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, tags.matrix, .shouldPropagate)
