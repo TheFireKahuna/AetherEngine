@@ -469,7 +469,13 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             declaredFormat = (ColorDescription(codecpar: codecpar), codecpar.pointee.codec_id, codecpar.pointee.profile)
             lock.unlock()
         }
+        // The container's HDR10 static metadata, filled onto every delivered frame that lacks it. On the
+        // hvcC path the base layer's VideoToolbox buffer already carries it and composed frames copy that;
+        // a session opened from in-band parameter sets has no container behind its HardwareVideoDecoder,
+        // so without this its frames reached the layer with no mastering display or MaxCLL.
+        let hdrStatic = stream.pointee.codecpar.map { HDRStaticMetadata(codecpar: $0) } ?? .none
         self.onFrame = { [weak self] buffer, pts, extra in
+            hdrStatic.attachWhereAbsent(to: buffer)
             self?.reportDecodedFormat(buffer)
             onFrame(buffer, pts, extra)
         }
