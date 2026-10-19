@@ -1,0 +1,11 @@
+[package]
+name = "card_rpu"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Amplifier RPUs for the p7fel_card bit-survival test card (see ../../README.md)"
+
+[dependencies]
+# The libdovi crate dovi_tool 2.3.4 is built on; =3.4.0 so the bytes stay reproducible.
+dolby_vision = "=3.4.0"
+anyhow = "1"

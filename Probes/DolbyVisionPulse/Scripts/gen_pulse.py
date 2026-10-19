@@ -24,6 +24,14 @@ Usage: gen_pulse.py layout                  -> layout.json (patch boxes, code ce
        gen_pulse.py sub10-frames            -> raw 1920x1080 yuv420p10le EL frames for p7fel_sub10
        gen_pulse.py sub10-design            -> the sub-10-bit residual design as JSON
 
+       gen_pulse.py card-frames / card-el-frames      -> BL (4K, flat N) / EL frames for p7fel_card
+       gen_pulse.py card-design / card-amp-args      -> the card design as JSON / the card_rpu arguments
+       gen_pulse.py bullseye-frames / bullseye-el-frames -> BL / EL frames for p7fel_bullseye
+       gen_pulse.py still-rpu-json card|bullseye     -> dovi_tool generate config for those two clips
+
+card-* is the amplifier test card p7fel_card, bullseye-* its fallback p7fel_bullseye: see the comments
+above card_design and bullseye_planes.
+
 sub10-frames is for the bit-survival clip p7fel_sub10: the RPU is constant (`null`); on SUB10_PATCHES
 the residual is -2 VDR codes (-1/2 of a 10-bit code) in phase A and +1 (+1/4) in phase B. Rounded to
 10 bits both phases give the base layer's own code, so the 3/4-code swing exists only below 10 bits:
@@ -278,6 +286,167 @@ def write_sub10_frames(out):
         out.write(fb if phase_of(i) == "B" else fa)
 
 
+# ---------------------------------------------------------------- test card (p7fel_card)
+# A static card whose composed VDR luma is exactly N, N+1/4, N+1/2 and N+1 10-bit codes (VDR 4N .. 4N+4), on a flat
+# base layer at N: every offset is enhancement-layer residual. Seen through the engine's usual identity RPU it is
+# flat grey (a quarter code is far below visibility); through the amplifier RPU (Tools/card_rpu, slope CARD_SLOPE
+# over [CARD_LO, CARD_HI)) each quarter code becomes 16 codes, so the glyphs show iff those bits reached whoever
+# applies the curve:
+#   border  N + 1    (VDR +4)  the control, visible whenever the amplifier is applied at all
+#   "1/2"   N + 1/2  (VDR +2)  visible if the path rounds (or keeps >= 11 bits); gone if it truncates
+#   "12"    N + 1/4  (VDR +1)  visible only if >= 12 bits reach the amplifier (truncation and rounding both give N)
+# No "16" glyph: the clip's VDR is 12-bit (vdr_bit_depth_minus8 4 in fel_orig.bin), so N + 1/16 is not a
+# composable value; a deeper VDR would change the RPU and the converter path under test.
+CARD_FRAMES = 360            # 15 s at 24000/1001
+CARD_N = 448                 # 10-bit BL code, ~41 nit (PQ 0.438); the amplified card spans 511..575 = ~103..196 nit
+CARD_SLOPE = 64              # amplifier slope: 1/4 code -> 16 codes, 1/2 -> 32, 1 -> 64
+CARD_LO, CARD_HI = CARD_N - 1, CARD_N + 2   # the steep piece covers [447, 450): one code of margin each side
+CARD_BORDER = 60             # EL px (120 at 4K)
+CARD_CELL = 48               # EL px per font cell: every stroke is 48 EL px (96 at 4K)
+# fel_orig.bin's luma NLQ, as DoviFelComposer.inverseNlq reads it.
+NLQ = dict(offset=512, scale=2048, shift=23 - 12, threshold=0, vdr_in_max=512)
+
+FONT = {  # 5x7
+    "1": ["..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."],
+    "2": [".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"],
+    "/": ["....#", "....#", "...#.", "..#..", ".#...", "#....", "#...."],
+}
+
+
+def inverse_nlq(el, p=NLQ):
+    """DoviFelComposer.inverseNlq for one 10-bit EL code, in VDR (12-bit) code units."""
+    r = el - p["offset"]
+    if r == 0:
+        return 0
+    mag = ((2 * abs(r) - 1) * p["scale"] + 2 * p["threshold"]) >> (p["shift"] + 1)
+    mag = min(mag, p["vdr_in_max"])
+    return mag if r > 0 else -mag
+
+
+def el_code_for(vdr):
+    """The EL code nearest 512 whose inverse NLQ is exactly `vdr` (|EL - 512| = |vdr| + 1 for this NLQ)."""
+    for d in range(0, 512):
+        for el in (512 + d, 512 - d):
+            if inverse_nlq(el) == vdr:
+                return el
+    raise ValueError(vdr)
+
+
+def text_mask(text, x0, y0, cell, shape):
+    m = np.zeros(shape, dtype=bool)
+    x = x0
+    for ch in text:
+        for r, row in enumerate(FONT[ch]):
+            for c, on in enumerate(row):
+                if on == "#":
+                    m[y0 + r * cell:y0 + (r + 1) * cell, x + c * cell:x + (c + 1) * cell] = True
+        x += 6 * cell
+    return m
+
+
+def text_width(text, cell):
+    return (6 * len(text) - 1) * cell
+
+
+def card_design():
+    """Elements in EL coordinates (1920x1080), their VDR offset and EL code, probe pixels in 4K coordinates
+    (each the centre of a stroke, at least 20 EL px from any edge, where the bilinear EL upsampling is exact)."""
+    c = CARD_CELL
+    half_x = 540 - text_width("1/2", c) // 2
+    twelve_x = 1440 - text_width("12", c) // 2
+    y0 = 540 - 7 * c // 2
+    elements = [
+        {"name": "background", "vdr": 0, "probe": [1920, 300]},
+        {"name": "border", "vdr": 4, "probe": [CARD_BORDER, 1080]},
+        {"name": "half", "text": "1/2", "x0": half_x, "y0": y0, "vdr": 2,
+         "probe": [2 * (half_x + 2 * c + c // 2), 2 * (y0 + 3 * c + c // 2)]},
+        {"name": "twelve", "text": "12", "x0": twelve_x, "y0": y0, "vdr": 1,
+         "probe": [2 * (twelve_x + 2 * c + c // 2), 2 * (y0 + 3 * c + c // 2)]},
+    ]
+    for e in elements:
+        e["el_code"] = el_code_for(e["vdr"])
+        e["expect_vdr"] = 4 * CARD_N + e["vdr"]
+        e["expect_code"] = CARD_N + e["vdr"] / 4
+    return {"n": CARD_N, "frames": CARD_FRAMES, "el_size": [EL_W, EL_H], "border_el_px": CARD_BORDER,
+            "cell_el_px": c, "nlq": NLQ, "elements": elements,
+            "amp": {"lo": CARD_LO, "hi": CARD_HI, "slope": CARD_SLOPE}}
+
+
+def card_el_plane():
+    d = card_design()
+    E = np.full((EL_H, EL_W), EL_FLAT, dtype=np.uint16)
+    b = CARD_BORDER
+    border = next(e for e in d["elements"] if e["name"] == "border")
+    E[:b, :] = E[-b:, :] = E[:, :b] = E[:, -b:] = border["el_code"]
+    for e in d["elements"]:
+        if "text" in e:
+            E[text_mask(e["text"], e["x0"], e["y0"], CARD_CELL, E.shape)] = e["el_code"]
+    return E
+
+
+def write_flat_el(out, Y, n):
+    chroma = np.full((EL_H // 2) * (EL_W // 2), EL_FLAT, dtype=np.uint16).tobytes()
+    f = Y.astype(np.uint16).tobytes() + chroma + chroma
+    for _ in range(n):
+        out.write(f)
+
+
+def write_bl(out, Y, n):
+    chroma = np.full((H // 2) * (W // 2), 512, dtype=np.uint16).tobytes()
+    f = Y.astype(np.uint16).tobytes() + chroma + chroma
+    for _ in range(n):
+        out.write(f)
+
+
+def pq12_code10(c):
+    """12-bit PQ (L1 units) of a limited-range 10-bit luma code."""
+    return int(round((c - 64) / 876 * 4095))
+
+
+def amp_curve(x):
+    """The amplifier curve card_rpu writes, in 10-bit codes (see Tools/card_rpu/src/main.rs)."""
+    x = np.asarray(x, dtype=np.float64)
+    f_hi = CARD_LO + CARD_SLOPE * (CARD_HI - CARD_LO)
+    s2 = (1023 - f_hi) / (1023 - CARD_HI)
+    return np.where(x < CARD_LO, x, np.where(x < CARD_HI, CARD_LO + CARD_SLOPE * (x - CARD_LO),
+                                            f_hi + (x - CARD_HI) * s2))
+
+
+def card_amp_l1():
+    """L1 for the amplified card (12-bit PQ): min = background, max = border, avg area-weighted."""
+    E = card_el_plane()
+    vdr = np.vectorize(inverse_nlq)(E)
+    out = amp_curve(CARD_N + vdr / 4)
+    pq = (out - 64) / 876 * 4095
+    return int(round(pq.min())), int(round(pq.max())), int(round(pq.mean()))
+
+
+# ---------------------------------------------------------------- bullseye (p7fel_bullseye)
+# Dark radial gradient, centre BULL_CENTER to corners BULL_EDGE 10-bit codes (~0.6 to ~0.3 nit): one 10-bit step
+# every ~90 px, ~2.5% luminance per step, at the edge of what a dark-adapted eye sees on an OLED. Left half: the
+# target rounded to whole 10-bit codes (BL only, EL flat); right half: the same target at full 12-bit VDR
+# precision, BL plus a -2..+1 VDR residual, so a quarter-code step every ~23 px. Both computed on 2x2 blocks, so
+# each block is one EL texel and the bilinear EL upsampling is exact except along the residual's wrap lines
+# (+1 -> -2), where one 4K pixel each side is off by one VDR code.
+BULL_CENTER, BULL_EDGE = 176, 152
+BULL_DIVIDER = 8             # 4K px wide divider at BULL_EDGE - 8
+
+
+def bullseye_planes():
+    by, bx = np.mgrid[0:EL_H, 0:EL_W]
+    r = np.hypot(2 * bx + 1 - W / 2, 2 * by + 1 - H / 2) / np.hypot(W / 2, H / 2)
+    t = 4 * (BULL_CENTER - (BULL_CENTER - BULL_EDGE) * r)       # VDR target, float
+    left = bx < EL_W // 2
+    vdr = np.where(left, 4 * np.floor(t / 4 + 0.5), np.floor(t + 0.5)).astype(np.int64)
+    bl = (vdr + 2) // 4
+    res = vdr - 4 * bl
+    el = np.where(res == 0, EL_FLAT, np.vectorize(el_code_for)(res)).astype(np.uint16)
+    el[left] = EL_FLAT
+    Y = np.repeat(np.repeat(bl, 2, axis=0), 2, axis=1).astype(np.uint16)
+    Y[:, W // 2 - BULL_DIVIDER // 2:W // 2 + BULL_DIVIDER // 2] = BULL_EDGE - 8
+    return Y, el, vdr
+
+
 # ---------------------------------------------------------------- RPU configs
 NEUTRAL_TRIM = dict(trim_slope=2048, trim_offset=2048, trim_power=2048,
                     trim_chroma_weight=2048, trim_saturation_gain=2048, ms_weight=2048)
@@ -332,6 +501,21 @@ def rpu_config(variant):
     return cfg
 
 
+
+def still_rpu_config(name):
+    """dovi_tool generate config for the static card / bullseye clips: one shot, L1 of the composed picture as the
+    engine shows it (identity mapping), neutral L2, a 1000-nit grade in L6."""
+    if name == "card":
+        lo, hi, avg = pq12_code10(CARD_N), pq12_code10(CARD_N + 1), pq12_code10(CARD_N)
+    else:
+        lo, hi, avg = pq12_code10(BULL_EDGE - 8), pq12_code10(BULL_CENTER), pq12_code10((BULL_CENTER + BULL_EDGE) / 2)
+    blocks = [{"Level1": {"min_pq": lo, "max_pq": max(hi, 2081), "avg_pq": avg}}]
+    blocks += [{"Level2": dict(target_max_pq=pq12(t), **NEUTRAL_TRIM)} for t in TRIM_TARGETS]
+    return {"cm_version": "V29", "profile": "8.1", "length": CARD_FRAMES,
+            "level6": {"max_display_mastering_luminance": 1000, "min_display_mastering_luminance": 1,
+                       "max_content_light_level": 1000, "max_frame_average_light_level": 400},
+            "shots": [{"start": 0, "duration": CARD_FRAMES, "metadata_blocks": blocks}]}
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "layout":
@@ -348,6 +532,22 @@ if __name__ == "__main__":
         json.dump(sub10_design(), sys.stdout, indent=1)
     elif cmd == "el-design":
         json.dump(el_design(), sys.stdout, indent=1)
+    elif cmd == "card-design":
+        d = card_design()
+        d["amp"]["l1"] = card_amp_l1()
+        json.dump(d, sys.stdout, indent=1)
+    elif cmd == "card-frames":
+        write_bl(sys.stdout.buffer, np.full((H, W), CARD_N), CARD_FRAMES)
+    elif cmd == "card-el-frames":
+        write_flat_el(sys.stdout.buffer, card_el_plane(), CARD_FRAMES)
+    elif cmd == "card-amp-args":
+        print(CARD_N, CARD_SLOPE, CARD_LO, CARD_HI, *card_amp_l1())
+    elif cmd == "bullseye-frames":
+        write_bl(sys.stdout.buffer, bullseye_planes()[0], CARD_FRAMES)
+    elif cmd == "bullseye-el-frames":
+        write_flat_el(sys.stdout.buffer, bullseye_planes()[1], CARD_FRAMES)
+    elif cmd == "still-rpu-json" and len(sys.argv) == 3 and sys.argv[2] in ("card", "bullseye"):
+        json.dump(still_rpu_config(sys.argv[2]), sys.stdout, indent=1)
     elif cmd == "rpu-json" and len(sys.argv) == 3 and sys.argv[2] in ("l1", "l2", "null", "l8"):
         json.dump(rpu_config(sys.argv[2]), sys.stdout, indent=1)
     else:
