@@ -26,13 +26,19 @@ import UIKit
 // - `engine`: AetherEngine with `preferDualLayerDolbyVision: true` (a Profile 7 FEL clip takes the
 //   dual-layer route).
 // - `enginenofel`: as `engine` with `preferDualLayerDolbyVision: false` (native 8.1 route, EL dropped).
-//   `engine` takes `out=p010|p010-round|p010-full|sv22` (default p010): the FEL composer's output buffer, for the
-//   12-bit display-path experiment (`AetherEngine.felOutputMode`).
+//   `engine` takes `out=p010|p010-round|p010-bluenoise|p010-full|sv22` (default p010): the FEL composer's output
+//   buffer, for the 12-bit display-path experiment (`AetherEngine.felOutputMode`); `rpu=<url>` (absolute, or
+//   relative to the clip's): one Dolby Vision RPU NAL, fetched before the arm starts, that every composed frame
+//   carries in place of its own for this arm only (`AetherEngine.felComposedRpuOverride`; a fetch or parse
+//   failure skips the arm); `secs=N`: play N seconds, looping the clip, instead of once through (80 s cap).
 // - `soak`: `engine` for `minutes=` with a `seeks=at@to,...` schedule, sampled once a second, ending in
 //   one `soak summary` line.
 //
 // The VT modes request Dolby Vision display criteria from the track's own format description, as an
 // app on this path would.
+//
+// A label in the top-left corner names the arm and its options and shows the display mode tvOS is
+// sending (DisplayModeReadout.swift); every change of that mode is logged.
 
 @main
 struct DolbyVisionPulseHostApp: App {
@@ -109,6 +115,8 @@ struct PulseHarnessView: View {
     @State private var engine: AetherEngine?
     @State private var slate: String = ""
     @State private var host = PulseHostView()
+    @State private var armInfo = ""
+    @StateObject private var displayMode = DisplayModeMonitor()
 
     var body: some View {
         ZStack {
@@ -131,6 +139,7 @@ struct PulseHarnessView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.black)
             }
+            DisplayModeOverlay(arm: armInfo, monitor: displayMode).ignoresSafeArea()
         }
         .task { await run() }
     }
@@ -161,6 +170,7 @@ struct PulseHarnessView: View {
             PulseLog.shared.note(line)
         }
         say("sequence: " + arms.map { "\($0.label)(\($0.mode))" }.joined(separator: " "))
+        displayMode.start(window: { [host] in host.window }, log: say)
         // Without the trait the engine accepts preferDualLayerDolbyVision and plays the native route, so
         // every `engine` and `soak` arm would film the wrong thing. Refuse the whole sequence instead.
         if arms.contains(where: { $0.mode == "engine" || $0.mode == "soak" }),
@@ -173,6 +183,9 @@ struct PulseHarnessView: View {
         }
         for (n, arm) in arms.enumerated() {
             slate = "\(n + 1)/\(arms.count)  \(arm.label)"
+            armInfo = ([arm.label, arm.mode] + arm.params.sorted { $0.key < $1.key }.map { key, value in
+                key == "rpu" ? "rpu=\((value as NSString).lastPathComponent)" : "\(key)=\(value)"
+            }).joined(separator: " · ")
             host.window?.avDisplayManager.preferredDisplayCriteria = nil
             say("slate \(arm.label)")
             try? await Task.sleep(nanoseconds: 5_000_000_000)
@@ -189,10 +202,24 @@ struct PulseHarnessView: View {
                     say("unknown out=\(out), arm skipped")
                     break
                 }
+                if let spec = arm.params["rpu"] {
+                    guard let rpu = await fetchRpu(spec, relativeTo: arm.url, log: say) else {
+                        say("rpu=\(spec) not usable, arm skipped")
+                        break
+                    }
+                    AetherEngine.felComposedRpuOverride = rpu
+                    guard let attached = AetherEngine.felComposedRpuOverride else {
+                        say("rpu=\(spec): \(rpu.count) bytes do not parse as a Dolby Vision RPU NAL, arm skipped")
+                        break
+                    }
+                    say("rpu override \((spec as NSString).lastPathComponent): \(attached.count) bytes, "
+                        + attached.prefix(12).map { String(format: "%02x", $0) }.joined())
+                }
                 AetherEngine.felOutputMode = mode
                 say("fel output \(mode.rawValue)")
-                await playEngine(arm.url, fel: true, log: say)
+                await playEngine(arm.url, fel: true, seconds: arm.params["secs"].flatMap(Double.init), log: say)
                 AetherEngine.felOutputMode = .p010
+                AetherEngine.felComposedRpuOverride = nil
             case "enginenofel":
                 await playEngine(arm.url, fel: false, log: say)
             case "soak":
@@ -209,8 +236,26 @@ struct PulseHarnessView: View {
         exit(0)
     }
 
+    /// The bytes at `spec` (a URL, absolute or relative to the arm's clip), or nil with the reason logged.
+    private func fetchRpu(_ spec: String, relativeTo clip: URL, log: @Sendable (String) -> Void) async -> Data? {
+        guard let url = URL(string: spec, relativeTo: clip)?.absoluteURL else { log("rpu=\(spec): not a URL"); return nil }
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                log("rpu fetch \(url.absoluteString): HTTP \(http.statusCode)")
+                return nil
+            }
+            guard !data.isEmpty else { log("rpu fetch \(url.absoluteString): empty"); return nil }
+            return data
+        } catch {
+            log("rpu fetch \(url.absoluteString) failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Plays `url` once through (at most 80 s), or for `seconds`, starting the clip over each time it ends.
     @MainActor
-    private func playEngine(_ url: URL, fel: Bool, log: @Sendable (String) -> Void) async {
+    private func playEngine(_ url: URL, fel: Bool, seconds: Double? = nil, log: @Sendable (String) -> Void) async {
         guard let e = try? AetherEngine() else { log("engine init failed"); return }
         engine = e
         do {
@@ -224,8 +269,14 @@ struct PulseHarnessView: View {
             engine = nil
             return
         }
-        let deadline = Date().addingTimeInterval(80)
-        while Date() < deadline, e.state != .ended {
+        let deadline = Date().addingTimeInterval(min(seconds ?? 80, 80))
+        while Date() < deadline {
+            if e.state == .ended {
+                guard seconds != nil else { break }
+                await e.seek(to: 0)
+                e.play()
+                log("engine looped")
+            }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         log("engine state=\(e.state) t=\(e.currentTime)")
