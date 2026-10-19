@@ -4,6 +4,7 @@ import CoreVideo
 import CoreGraphics
 import AetherLibavformat
 import AetherLibavcodec
+import AetherLibavutil
 
 /// Decoded frame callback. `hdr10PlusT35` carries HDR10+ dynamic metadata serialised to ITU-T T.35 bytes
 /// (kCMSampleAttachmentKey_HDR10PlusPerFrameData format); nil for non-HDR10+ streams.
@@ -174,5 +175,136 @@ enum ColorAttachments {
     /// PQ (ST 2084) or HLG transfer means the stream is HDR.
     static func isHDRTransfer(_ trc: AVColorTransferCharacteristic) -> Bool {
         trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67
+    }
+}
+
+/// HDR10 static metadata, SMPTE ST 2086 mastering display and CTA-861.3 content light level, in the
+/// form CoreVideo carries it: `kCVImageBufferMasteringDisplayColorVolumeKey` and
+/// `kCVImageBufferContentLightLevelInfoKey` hold the big-endian HEVC SEI payloads, not a dictionary.
+/// The colour attachments alone were all a software-decoded buffer ever got, so an HDR10 file
+/// decoded in software reached the display layer with no mastering peak and no MaxCLL, and the tone
+/// mapping the layer does for a panel dimmer than the grade had nothing to map from.
+///
+/// Held as `NSData` so a decoder can keep one instance per stream and attach the same object to every
+/// frame: the per-frame cost is a comparison, and the renderer's format-description cache key sees
+/// equal bytes. `@unchecked Sendable`: both payloads are immutable `NSData`, never `NSMutableData`.
+struct HDRStaticMetadata: Equatable, @unchecked Sendable {
+    var masteringDisplay: NSData?
+    var contentLightLevel: NSData?
+
+    static let none = HDRStaticMetadata()
+
+    init(masteringDisplay: NSData? = nil, contentLightLevel: NSData? = nil) {
+        self.masteringDisplay = masteringDisplay
+        self.contentLightLevel = contentLightLevel
+    }
+
+    /// What the decoded frame carries. libavcodec puts the bitstream's SEI / AV1 metadata OBU here,
+    /// and the container's declaration too when the bitstream has none (`ff_decode_frame_props`).
+    init(frame: UnsafePointer<AVFrame>) {
+        if let sd = av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA),
+           let raw = sd.pointee.data, sd.pointee.size >= MemoryLayout<AVMasteringDisplayMetadata>.size {
+            let value = UnsafeRawPointer(raw).loadUnaligned(as: AVMasteringDisplayMetadata.self)
+            masteringDisplay = Self.masteringDisplayPayload(value).map { $0 as NSData }
+        }
+        if let sd = av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL),
+           let raw = sd.pointee.data, sd.pointee.size >= MemoryLayout<AVContentLightMetadata>.size {
+            let value = UnsafeRawPointer(raw).loadUnaligned(as: AVContentLightMetadata.self)
+            contentLightLevel = Self.contentLightLevelPayload(value).map { $0 as NSData }
+        }
+    }
+
+    /// What the container declared (Matroska's MasteringMetadata, MP4's `mdcv` / `clli`), for a
+    /// frame that arrives without it.
+    init(codecpar: UnsafePointer<AVCodecParameters>) {
+        let sideData = codecpar.pointee.coded_side_data
+        let count = codecpar.pointee.nb_coded_side_data
+        if let sd = av_packet_side_data_get(sideData, count, AV_PKT_DATA_MASTERING_DISPLAY_METADATA),
+           let raw = sd.pointee.data, sd.pointee.size >= MemoryLayout<AVMasteringDisplayMetadata>.size {
+            let value = UnsafeRawPointer(raw).loadUnaligned(as: AVMasteringDisplayMetadata.self)
+            masteringDisplay = Self.masteringDisplayPayload(value).map { $0 as NSData }
+        }
+        if let sd = av_packet_side_data_get(sideData, count, AV_PKT_DATA_CONTENT_LIGHT_LEVEL),
+           let raw = sd.pointee.data, sd.pointee.size >= MemoryLayout<AVContentLightMetadata>.size {
+            let value = UnsafeRawPointer(raw).loadUnaligned(as: AVContentLightMetadata.self)
+            contentLightLevel = Self.contentLightLevelPayload(value).map { $0 as NSData }
+        }
+    }
+
+    /// Per field, own value first: the bitstream's SEI is the grade, the container's a fallback.
+    func filled(from fallback: HDRStaticMetadata) -> HDRStaticMetadata {
+        HDRStaticMetadata(masteringDisplay: masteringDisplay ?? fallback.masteringDisplay,
+                          contentLightLevel: contentLightLevel ?? fallback.contentLightLevel)
+    }
+
+    /// The 24-byte `mastering_display_colour_volume` SEI payload (H.265 D.2.28): the three display
+    /// primaries in G, B, R order, then the white point, as x/y pairs in 0.00002 units, then the
+    /// maximum and minimum luminance in 0.0001 cd/m². FFmpeg's primaries are R, G, B. nil unless both
+    /// halves are present, because the attachment has no way to say "unknown" for either.
+    static func masteringDisplayPayload(_ m: AVMasteringDisplayMetadata) -> Data? {
+        guard m.has_primaries != 0, m.has_luminance != 0 else { return nil }
+        func chromaticity(_ r: AVRational) -> UInt16? {
+            guard r.den != 0 else { return nil }
+            let v = (av_q2d(r) * 50000).rounded()
+            guard v.isFinite, v >= 0, v <= 50000 else { return nil }
+            return UInt16(v)
+        }
+        func luminance(_ r: AVRational) -> UInt32? {
+            guard r.den != 0 else { return nil }
+            let v = (av_q2d(r) * 10000).rounded()
+            guard v.isFinite, v >= 0, v <= Double(UInt32.max) else { return nil }
+            return UInt32(v)
+        }
+        let p = m.display_primaries
+        guard let gx = chromaticity(p.1.0), let gy = chromaticity(p.1.1),
+              let bx = chromaticity(p.2.0), let by = chromaticity(p.2.1),
+              let rx = chromaticity(p.0.0), let ry = chromaticity(p.0.1),
+              let wx = chromaticity(m.white_point.0), let wy = chromaticity(m.white_point.1),
+              let maxL = luminance(m.max_luminance), let minL = luminance(m.min_luminance) else { return nil }
+        var bytes = Data(capacity: 24)
+        for v in [gx, gy, bx, by, rx, ry, wx, wy] { withUnsafeBytes(of: v.bigEndian) { bytes.append(contentsOf: $0) } }
+        for v in [maxL, minL] { withUnsafeBytes(of: v.bigEndian) { bytes.append(contentsOf: $0) } }
+        return bytes
+    }
+
+    /// The 4-byte `content_light_level_info` SEI payload (H.265 D.2.35): MaxCLL, then MaxFALL, in
+    /// cd/m². Zero is the standard's "unknown" and is carried as such; a pair of zeros says nothing
+    /// and is dropped.
+    static func contentLightLevelPayload(_ c: AVContentLightMetadata) -> Data? {
+        guard c.MaxCLL != 0 || c.MaxFALL != 0 else { return nil }
+        var bytes = Data(capacity: 4)
+        for v in [UInt16(clamping: c.MaxCLL), UInt16(clamping: c.MaxFALL)] {
+            withUnsafeBytes(of: v.bigEndian) { bytes.append(contentsOf: $0) }
+        }
+        return bytes
+    }
+
+    /// Write both attachments, removing a missing one: pool buffers are recycled across frames and a
+    /// stale value from an earlier stream must not survive on them.
+    func attach(to buffer: CVBuffer) {
+        if let masteringDisplay {
+            CVBufferSetAttachment(buffer, kCVImageBufferMasteringDisplayColorVolumeKey, masteringDisplay, .shouldPropagate)
+        } else {
+            CVBufferRemoveAttachment(buffer, kCVImageBufferMasteringDisplayColorVolumeKey)
+        }
+        if let contentLightLevel {
+            CVBufferSetAttachment(buffer, kCVImageBufferContentLightLevelInfoKey, contentLightLevel, .shouldPropagate)
+        } else {
+            CVBufferRemoveAttachment(buffer, kCVImageBufferContentLightLevelInfoKey)
+        }
+    }
+
+    /// Fill only what the buffer does not already carry. For VideoToolbox output, where the
+    /// decoder's own per-frame SEI (`PropagatePerFrameHDRDisplayMetadata`) is the better source and
+    /// the container's declaration is the fallback.
+    func attachWhereAbsent(to buffer: CVBuffer) {
+        if let masteringDisplay,
+           CVBufferCopyAttachment(buffer, kCVImageBufferMasteringDisplayColorVolumeKey, nil) == nil {
+            CVBufferSetAttachment(buffer, kCVImageBufferMasteringDisplayColorVolumeKey, masteringDisplay, .shouldPropagate)
+        }
+        if let contentLightLevel,
+           CVBufferCopyAttachment(buffer, kCVImageBufferContentLightLevelInfoKey, nil) == nil {
+            CVBufferSetAttachment(buffer, kCVImageBufferContentLightLevelInfoKey, contentLightLevel, .shouldPropagate)
+        }
     }
 }

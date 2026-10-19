@@ -298,6 +298,11 @@ final class SampleBufferRenderer: @unchecked Sendable {
         var matrix: String?
         var parH: Int?
         var parV: Int?
+        /// HDR10 static metadata. The description copies both attachments as extensions, and a sample
+        /// whose buffer disagrees with its description is refused outright, so a stream whose metadata
+        /// arrives after its first frame lost every frame from then on to a stale cached description.
+        var masteringDisplay: Data?
+        var contentLightLevel: Data?
     }
 
     private var loggedLayerFailed = false
@@ -855,7 +860,9 @@ final class SampleBufferRenderer: @unchecked Sendable {
             transfer: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, nil) as? String,
             matrix: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, nil) as? String,
             parH: (par?[kCVImageBufferPixelAspectRatioHorizontalSpacingKey] as? NSNumber)?.intValue,
-            parV: (par?[kCVImageBufferPixelAspectRatioVerticalSpacingKey] as? NSNumber)?.intValue
+            parV: (par?[kCVImageBufferPixelAspectRatioVerticalSpacingKey] as? NSNumber)?.intValue,
+            masteringDisplay: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferMasteringDisplayColorVolumeKey, nil) as? Data,
+            contentLightLevel: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferContentLightLevelInfoKey, nil) as? Data
         )
 
         // Guarded by reorderLock: flush() nils the cache from other threads.
