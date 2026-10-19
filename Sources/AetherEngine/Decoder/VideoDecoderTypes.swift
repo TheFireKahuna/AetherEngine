@@ -241,16 +241,21 @@ enum ColorAttachments {
 ///
 /// Held as `NSData` so a decoder can keep one instance per stream and attach the same object to every
 /// frame: the per-frame cost is a comparison, and the renderer's format-description cache key sees
-/// equal bytes. `@unchecked Sendable`: both payloads are immutable `NSData`, never `NSMutableData`.
+/// equal bytes. `@unchecked Sendable`: every payload is immutable `NSData`, never `NSMutableData`.
+///
+/// Also carries the H.274 ambient viewing environment (`kCVImageBufferAmbientViewingEnvironmentKey`),
+/// the room the grade was made for, which travels the same way and has the same lifetime.
 struct HDRStaticMetadata: Equatable, @unchecked Sendable {
     var masteringDisplay: NSData?
     var contentLightLevel: NSData?
+    var ambientViewingEnvironment: NSData?
 
     static let none = HDRStaticMetadata()
 
-    init(masteringDisplay: NSData? = nil, contentLightLevel: NSData? = nil) {
+    init(masteringDisplay: NSData? = nil, contentLightLevel: NSData? = nil, ambientViewingEnvironment: NSData? = nil) {
         self.masteringDisplay = masteringDisplay
         self.contentLightLevel = contentLightLevel
+        self.ambientViewingEnvironment = ambientViewingEnvironment
     }
 
     /// What the decoded frame carries. libavcodec puts the bitstream's SEI / AV1 metadata OBU here,
@@ -265,6 +270,11 @@ struct HDRStaticMetadata: Equatable, @unchecked Sendable {
            let raw = sd.pointee.data, sd.pointee.size >= MemoryLayout<AVContentLightMetadata>.size {
             let value = UnsafeRawPointer(raw).loadUnaligned(as: AVContentLightMetadata.self)
             contentLightLevel = Self.contentLightLevelPayload(value).map { $0 as NSData }
+        }
+        if let sd = av_frame_get_side_data(frame, AV_FRAME_DATA_AMBIENT_VIEWING_ENVIRONMENT),
+           let raw = sd.pointee.data, sd.pointee.size >= MemoryLayout<AVAmbientViewingEnvironment>.size {
+            let value = UnsafeRawPointer(raw).loadUnaligned(as: AVAmbientViewingEnvironment.self)
+            ambientViewingEnvironment = Self.ambientViewingEnvironmentPayload(value).map { $0 as NSData }
         }
     }
 
@@ -283,12 +293,18 @@ struct HDRStaticMetadata: Equatable, @unchecked Sendable {
             let value = UnsafeRawPointer(raw).loadUnaligned(as: AVContentLightMetadata.self)
             contentLightLevel = Self.contentLightLevelPayload(value).map { $0 as NSData }
         }
+        if let sd = av_packet_side_data_get(sideData, count, AV_PKT_DATA_AMBIENT_VIEWING_ENVIRONMENT),
+           let raw = sd.pointee.data, sd.pointee.size >= MemoryLayout<AVAmbientViewingEnvironment>.size {
+            let value = UnsafeRawPointer(raw).loadUnaligned(as: AVAmbientViewingEnvironment.self)
+            ambientViewingEnvironment = Self.ambientViewingEnvironmentPayload(value).map { $0 as NSData }
+        }
     }
 
     /// Per field, own value first: the bitstream's SEI is the grade, the container's a fallback.
     func filled(from fallback: HDRStaticMetadata) -> HDRStaticMetadata {
         HDRStaticMetadata(masteringDisplay: masteringDisplay ?? fallback.masteringDisplay,
-                          contentLightLevel: contentLightLevel ?? fallback.contentLightLevel)
+                          contentLightLevel: contentLightLevel ?? fallback.contentLightLevel,
+                          ambientViewingEnvironment: ambientViewingEnvironment ?? fallback.ambientViewingEnvironment)
     }
 
     /// The 24-byte `mastering_display_colour_volume` SEI payload (H.265 D.2.28): the three display
@@ -333,7 +349,20 @@ struct HDRStaticMetadata: Equatable, @unchecked Sendable {
         return bytes
     }
 
-    /// Write both attachments, removing a missing one: pool buffers are recycled across frames and a
+    /// The 8-byte `ambient_viewing_environment` SEI payload (H.274 8.28): the ambient illuminance in
+    /// 0.0001 lux (u32), then the ambient light's x / y chromaticity in 0.00002 units (u16 each).
+    static func ambientViewingEnvironmentPayload(_ a: AVAmbientViewingEnvironment) -> Data? {
+        guard a.ambient_illuminance.den != 0, a.ambient_light_x.den != 0, a.ambient_light_y.den != 0 else { return nil }
+        let lux = (av_q2d(a.ambient_illuminance) * 10000).rounded()
+        let x = (av_q2d(a.ambient_light_x) * 50000).rounded(), y = (av_q2d(a.ambient_light_y) * 50000).rounded()
+        guard lux >= 1, lux <= Double(UInt32.max), x >= 0, x <= 50000, y >= 0, y <= 50000 else { return nil }
+        var bytes = Data(capacity: 8)
+        withUnsafeBytes(of: UInt32(lux).bigEndian) { bytes.append(contentsOf: $0) }
+        for v in [UInt16(x), UInt16(y)] { withUnsafeBytes(of: v.bigEndian) { bytes.append(contentsOf: $0) } }
+        return bytes
+    }
+
+    /// Write every attachment, removing a missing one: pool buffers are recycled across frames and a
     /// stale value from an earlier stream must not survive on them.
     func attach(to buffer: CVBuffer) {
         if let masteringDisplay {
@@ -345,6 +374,11 @@ struct HDRStaticMetadata: Equatable, @unchecked Sendable {
             CVBufferSetAttachment(buffer, kCVImageBufferContentLightLevelInfoKey, contentLightLevel, .shouldPropagate)
         } else {
             CVBufferRemoveAttachment(buffer, kCVImageBufferContentLightLevelInfoKey)
+        }
+        if let ambientViewingEnvironment {
+            CVBufferSetAttachment(buffer, kCVImageBufferAmbientViewingEnvironmentKey, ambientViewingEnvironment, .shouldPropagate)
+        } else {
+            CVBufferRemoveAttachment(buffer, kCVImageBufferAmbientViewingEnvironmentKey)
         }
     }
 
@@ -359,6 +393,10 @@ struct HDRStaticMetadata: Equatable, @unchecked Sendable {
         if let contentLightLevel,
            CVBufferCopyAttachment(buffer, kCVImageBufferContentLightLevelInfoKey, nil) == nil {
             CVBufferSetAttachment(buffer, kCVImageBufferContentLightLevelInfoKey, contentLightLevel, .shouldPropagate)
+        }
+        if let ambientViewingEnvironment,
+           CVBufferCopyAttachment(buffer, kCVImageBufferAmbientViewingEnvironmentKey, nil) == nil {
+            CVBufferSetAttachment(buffer, kCVImageBufferAmbientViewingEnvironmentKey, ambientViewingEnvironment, .shouldPropagate)
         }
     }
 }

@@ -59,6 +59,35 @@ struct HDRStaticMetadataTests {
         #expect(HDRStaticMetadata.contentLightLevelPayload(AVContentLightMetadata(MaxCLL: 0, MaxFALL: 0)) == nil)
     }
 
+    /// 314 lux under D65, the H.274 example for a dim reference room.
+    @Test("ambient viewing environment is u32 illuminance in 0.0001 lux, then x / y in 0.00002, big-endian")
+    func ambientViewingEnvironmentEncoding() throws {
+        let ambient = AVAmbientViewingEnvironment(
+            ambient_illuminance: AVRational(num: 314, den: 1),
+            ambient_light_x: AVRational(num: 15635, den: 50000),
+            ambient_light_y: AVRational(num: 16450, den: 50000))
+        let payload = try #require(HDRStaticMetadata.ambientViewingEnvironmentPayload(ambient))
+        #expect([UInt8](payload) == [0x00, 0x2F, 0xE9, 0xA0, 0x3D, 0x13, 0x40, 0x42])
+    }
+
+    @Test("ambient viewing environment reaches the buffer and the format description, and is cleared when absent")
+    @MainActor
+    func ambientViewingEnvironmentAttachment() throws {
+        var pb: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 64, 64, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                            [kCVPixelBufferIOSurfacePropertiesKey: NSDictionary()] as NSDictionary, &pb)
+        let buffer = try #require(pb)
+        let bytes: [UInt8] = [0x00, 0x2F, 0xE9, 0xA0, 0x3D, 0x13, 0x40, 0x42]
+        HDRStaticMetadata(ambientViewingEnvironment: Data(bytes) as NSData).attach(to: buffer)
+        #expect(attachment(buffer, kCVImageBufferAmbientViewingEnvironmentKey) == bytes)
+        let sample = try #require(SampleBufferRenderer().createSampleBuffer(from: buffer, pts: .zero))
+        let desc = try #require(CMSampleBufferGetFormatDescription(sample))
+        let ext = CMFormatDescriptionGetExtension(desc, extensionKey: kCMFormatDescriptionExtension_AmbientViewingEnvironment)
+        #expect((ext as? Data).map { [UInt8]($0) } == bytes)
+        HDRStaticMetadata.none.attach(to: buffer)
+        #expect(attachment(buffer, kCVImageBufferAmbientViewingEnvironmentKey) == nil)
+    }
+
     @Test("the container's declaration is read off codecpar, the hardware decoder's only source")
     func containerDeclarationFromCodecpar() throws {
         let data = try #require(Data(base64Encoded: Self.vp9ContainerHDR10Base64, options: .ignoreUnknownCharacters))
