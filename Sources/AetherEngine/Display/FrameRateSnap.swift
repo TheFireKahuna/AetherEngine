@@ -17,20 +17,29 @@ enum FrameRateSnap {
     /// VFR / weird capture rates or a probe failure.
     static let standard: [Double] = [23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60]
 
+    /// How close to 24.000 a probe must be to count as a stated 24/1
+    /// rather than film NTSC. 24000/1001 is 0.024 away; a rational 24/1
+    /// is exact, and a Matroska DefaultDuration of 41666667 ns is 2e-7 off.
+    static let exactTwentyFourTolerance: Double = 0.001
+
     /// Snap `raw` to the nearest member of `standard` within ±0.5 fps,
     /// or `nil` if it falls outside that tolerance from every standard
     /// rate. Special case: 23.976 wins the [23.5, 24.05] window over
     /// 24.0 because film-cadence sources commonly probe to 23.976 and
-    /// 23.976 ↔ 24 matters for 3:2 pulldown / judder visibility.
+    /// 23.976 ↔ 24 matters for 3:2 pulldown / judder visibility. Only a
+    /// rate within `exactTwentyFourTolerance` of 24 (a stream stating
+    /// 24/1) gets 24.0. 29.97/30 and 59.94/60 need no such rule: nearest
+    /// match already keeps 30000/1001 and 30/1 (60000/1001, 60/1) apart.
     static func snap(_ raw: Double) -> Double? {
         guard raw > 0, raw.isFinite else { return nil }
 
-        // Film-cadence shortcut. 24.000-fps probes land here too;
-        // sending 23.976 to the panel for them is the conservative
-        // choice (panels that support 24 also support 23.976; the
-        // reverse isn't guaranteed).
+        // Film-cadence shortcut. Anything short of an exact 24 is sent
+        // as 23.976, the conservative choice for a noisy probe (panels
+        // that support 24 also support 23.976; the reverse isn't
+        // guaranteed). A stated 24/1 played at 23.976 Hz would repeat
+        // a frame every ~41.7 s.
         if raw >= 23.5 && raw <= 24.05 {
-            return 23.976
+            return abs(raw - 24) < exactTwentyFourTolerance ? 24 : 23.976
         }
 
         var best: (rate: Double, delta: Double)?
