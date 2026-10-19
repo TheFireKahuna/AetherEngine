@@ -52,6 +52,16 @@ struct InBandHDRStaticMetadata: Equatable {
         range == .sdr && prefersHLG ? .hlg : range
     }
 
+    /// HDR10 static metadata only means something on a PQ / HLG source, and is only worth reading
+    /// for a type the container did not state. Without the transfer gate every SDR MPEG-TS source paid
+    /// a head scan (a rewind on VOD, a peek of the live feed) for messages it cannot carry.
+    static func wantsStaticMetadata(
+        transfer: AVColorTransferCharacteristic, hasMastering: Bool, hasLightLevel: Bool
+    ) -> Bool {
+        (transfer == AVCOL_TRC_SMPTE2084 || transfer == AVCOL_TRC_ARIB_STD_B67)
+            && (!hasMastering || !hasLightLevel)
+    }
+
     /// Only a BT.2020 source whose transfer is not already PQ / HLG can be backward-compatible HLG.
     static func wantsAlternativeTransfer(
         primaries: AVColorPrimaries, transfer: AVColorTransferCharacteristic
@@ -165,7 +175,9 @@ extension HLSVideoEngine {
             par.coded_side_data, par.nb_coded_side_data, AV_PKT_DATA_CONTENT_LIGHT_LEVEL) != nil
         let wantsTransfer = InBandHDRStaticMetadata.wantsAlternativeTransfer(
             primaries: par.color_primaries, transfer: par.color_trc)
-        guard !hasMastering || !hasLightLevel || wantsTransfer else { return metadata }
+        let wantsStatic = InBandHDRStaticMetadata.wantsStaticMetadata(
+            transfer: par.color_trc, hasMastering: hasMastering, hasLightLevel: hasLightLevel)
+        guard wantsStatic || wantsTransfer else { return metadata }
         let framing = measuredFraming ?? NALUnitChain.lengthPrefixSize(
             codecID: par.codec_id, extradata: par.extradata, extradataSize: Int(par.extradata_size)
         ).map { .lengthPrefixed(size: $0) } ?? .annexB
@@ -180,8 +192,8 @@ extension HLSVideoEngine {
             if let data = pkt.pointee.data {
                 metadata.collect(from: data, size: Int(pkt.pointee.size), codecID: par.codec_id, framing: framing)
             }
-            return (metadata.masteringDisplay != nil || hasMastering)
-                && (metadata.contentLightLevel != nil || hasLightLevel)
+            return (metadata.masteringDisplay != nil || hasMastering || !wantsStatic)
+                && (metadata.contentLightLevel != nil || hasLightLevel || !wantsStatic)
                 && (metadata.alternativeTransfer != nil || !wantsTransfer)
                 || videoPackets >= packetBudget
         }
