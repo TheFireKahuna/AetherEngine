@@ -125,6 +125,31 @@ struct InBandHDRStaticMetadataTests {
         }
     }
 
+    // MARK: - Ambient viewing environment
+
+    /// ambient_viewing_environment (payload type 148): 5 lux, D65. No brew encoder writes this
+    /// message, so the NAL is built by hand to H.265 D.2.39; movenc n8.1 writes `amve` from the
+    /// matching side data (`mov_write_amve_tag`), and libavformat's MP4 demuxer already lifts a
+    /// source's own `amve` box into it, which the stream copy carries over untouched.
+    static let hevcAMVE: [UInt8] = [0x4e, 0x01, 0x94, 0x08, 0x00, 0x00, 0xc3, 0x50, 0x3d, 0x13, 0x40, 0x42, 0x80]
+
+    @Test("the ambient viewing environment SEI rides the same scan")
+    func ambientViewing() throws {
+        let m = Self.collect(Self.annexB([Self.hevcAMVE, Self.hevcSlice]), codecID: AV_CODEC_ID_HEVC, framing: .annexB)
+        #expect(m.ambientViewing == [0x00, 0x00, 0xc3, 0x50, 0x3d, 0x13, 0x40, 0x42])
+        var p: UnsafeMutablePointer<AVCodecParameters>? = avcodec_parameters_alloc()
+        defer { avcodec_parameters_free(&p) }
+        let par = try #require(p)
+        #expect(m.attach(to: par) == ["amve"])
+        let sd = try #require(av_packet_side_data_get(
+            par.pointee.coded_side_data, par.pointee.nb_coded_side_data, AV_PKT_DATA_AMBIENT_VIEWING_ENVIRONMENT))
+        sd.pointee.data.withMemoryRebound(to: AVAmbientViewingEnvironment.self, capacity: 1) {
+            #expect($0.pointee.ambient_illuminance.num == 50000 && $0.pointee.ambient_illuminance.den == 10000)
+            #expect($0.pointee.ambient_light_x.num == 15635 && $0.pointee.ambient_light_x.den == 50000)
+            #expect($0.pointee.ambient_light_y.num == 16450)
+        }
+    }
+
     // MARK: - movenc
 
     /// The init movenc writes from a codecpar carrying the lifted side data holds both boxes, and
@@ -133,6 +158,7 @@ struct InBandHDRStaticMetadataTests {
     func muxerWritesBoxes() throws {
         #expect(try Self.initBoxes(lifting: true).contains("mdcv"))
         #expect(try Self.initBoxes(lifting: true).contains("clli"))
+        #expect(try Self.initBoxes(lifting: true).contains("amve"))
         #expect(try !Self.initBoxes(lifting: false).contains("mdcv"))
     }
 
@@ -159,7 +185,7 @@ struct InBandHDRStaticMetadataTests {
         let par = try #require(p)
         #expect(avcodec_parameters_copy(par, stream.pointee.codecpar) >= 0)
         if lifting {
-            let m = collect(annexB([hevcCLL, hevcMDCV]), codecID: AV_CODEC_ID_HEVC, framing: .annexB)
+            let m = collect(annexB([hevcCLL, hevcMDCV, hevcAMVE]), codecID: AV_CODEC_ID_HEVC, framing: .annexB)
             m.attach(to: par)
         }
 
@@ -178,7 +204,7 @@ struct InBandHDRStaticMetadataTests {
         _ = muxer.finalize()
         #expect(!initBytes.isEmpty)
         var found = Set<String>()
-        for type in ["mdcv", "clli", "colr"] where initBytes.range(of: Data(type.utf8)) != nil {
+        for type in ["mdcv", "clli", "amve", "colr"] where initBytes.range(of: Data(type.utf8)) != nil {
             found.insert(type)
         }
         return found
