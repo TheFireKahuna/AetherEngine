@@ -515,6 +515,9 @@ final class DisplayCriteriaController {
     /// the #449 reporter's 50 Hz panel reads 50.002 Hz.
     nonisolated static let panelRateTolerance: Double = 0.0005
 
+    /// The refresh rate asked for when the source states none: the film rate FrameRateSnap uses.
+    nonisolated static let unknownFrameRateFallback: Double = 23.976
+
     nonisolated static func panelRateRelation(requestedRate: Float?, panelNominalRate: Double?) -> PanelRateRelation {
         guard let requested = requestedRate.map(Double.init), requested > 0, requested.isFinite,
               let panel = panelNominalRate, panel > 0, panel.isFinite else { return .unmeasured }
@@ -773,7 +776,9 @@ final class DisplayCriteriaController {
         // Codec FourCC drives the HDMI mode: 'hvc1' -> HDR10/HLG, 'dvh1' -> Dolby Vision. Using HEVC for a DV source kept DrHurt's Philips panel in HDR10 instead of DV (P8 MKV). ref: Jellyfin #16179, KSPlayer #633.
         let dvh1: FourCharCode = 0x64766831
         let codecType: CMVideoCodecType = codecTag ?? (format == .dolbyVision ? dvh1 : kCMVideoCodecType_HEVC)
-        let effectiveRate = Float(frameRate ?? 24.0)
+        // Unknown rate: film cadence, as FrameRateSnap sends for every probe in [23.5, 24.05] (24.000 included).
+        // Nearly all such material is 23.976, and a panel that has 24 Hz also has 23.976, not always the reverse.
+        let effectiveRate = Float(frameRate ?? Self.unknownFrameRateFallback)
         let hasExtensions = isHDR && !omitColorExtensions
 
         // #133: skip the panel write when these criteria are already active. Re-writing identical criteria
@@ -813,7 +818,7 @@ final class DisplayCriteriaController {
             lastCriteriaWasHDR = isHDR
             EngineLog.emit(
                 "[DisplayCriteria] skipped SET reason=unchanged (format=\(format) codec=\(fourccString(codecType)) "
-                + "rate=\(frameRate.map { String(format: "%.3f", $0) } ?? "default(24)"))",
+                + "rate=\(frameRate.map { String(format: "%.3f", $0) } ?? "default(23.976)"))",
                 category: .engine
             )
             return .unchanged
@@ -852,7 +857,7 @@ final class DisplayCriteriaController {
 
         EngineLog.emit(
             "[DisplayCriteria] SET: format=\(format) codec=\(fourccString(codecType)) "
-            + "rate=\(frameRate.map { String(format: "%.3f", $0) } ?? "default(24)") "
+            + "rate=\(frameRate.map { String(format: "%.3f", $0) } ?? "default(23.976)") "
             + "extensions=\(extensions != nil ? "HDR" : "none")",
             category: .engine
         )

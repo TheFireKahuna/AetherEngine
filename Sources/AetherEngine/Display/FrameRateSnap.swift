@@ -7,9 +7,9 @@ import Foundation
 /// 23.97-23.98 depending on container rounding), so a tolerance
 /// is necessary.
 ///
-/// Returns `nil` for zero or out-of-range rates, in which case the
-/// caller should program the display criteria without a refresh-rate
-/// hint and let the panel keep its current rate.
+/// Returns `nil` for zero or out-of-range rates; the display criteria
+/// then ask for `DisplayCriteriaController.unknownFrameRateFallback`
+/// (23.976, the film rate this snaps to).
 enum FrameRateSnap {
     /// Standard rates Apple TV's HDMI handshake will switch to.
     /// Source: AVDisplayManager documentation + empirical testing on
