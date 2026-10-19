@@ -17,7 +17,10 @@ the public-API contract.
   (the LFE on a bed) for tvOS to render, instead of the engine's speaker bed. Private AudioCodec properties
   and APAC's PCM-carried metadata (`APACObjectEncoder`), so it is never shipped; only worth listening to
   with a LibTrueHD built with `matrix-interpolation`, which decodes the elements exactly. Measured on the
-  Mac against the engine's own render of the same exact decode: same level and speaker split.
+  Mac against the engine's own render of the same exact decode: same level and speaker split. The playlist
+  announces the stream as the 7.1.4 tier (`apac.31.03`, `CHANNELS="12"`) whatever its own profile: announced
+  as `apac.05.00`, a tvOS 27.2 Apple TV delivered it as multichannel PCM instead of Dolby MAT. Zone masks
+  cannot be delivered and are dropped, which the session log notes.
 
 ### Fixed
 

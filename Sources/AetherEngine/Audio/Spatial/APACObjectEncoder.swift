@@ -28,7 +28,7 @@ import Foundation
 /// magic cookie and with it the sample entry are needed before the first block is decoded. Gains are
 /// applied to the audio, not sent: the renderer rounds a sent gain to 0.5 dB. Snap and elevation
 /// are applied to positions (`objectPosition`); zone masks and divergence have nothing that reaches
-/// the renderer with type 3 and are dropped (`droppedZoneUpdates`).
+/// the renderer with type 3 and are dropped, which the session log notes (`noteDroppedZone`).
 @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
 final class APACObjectEncoder: APACChunkEncoding {
 
@@ -79,8 +79,10 @@ final class APACObjectEncoder: APACChunkEncoding {
     private var route: [Int?] = []
     /// Slots an element feeds; the others get no metadata at all.
     private var used = [Bool](repeating: false, count: APACObjectEncoder.objectSlots)
-    /// Updates whose zone mask had to be dropped (no way to send it), for the session log.
+    /// Updates whose zone mask had to be dropped (no way to send it), for the session log, and how many
+    /// of them `flush` has reported.
     private(set) var droppedZoneUpdates = 0
+    private var zoneUpdatesReported = 0
     private var outputBuffer: [UInt8]
     private var ended = false
 
@@ -197,6 +199,13 @@ final class APACObjectEncoder: APACChunkEncoding {
     func flush() throws -> [APACEncoder.Packet] {
         guard !ended else { return [] }
         ended = true
+        // Also reached when the pipeline restarts the encoder mid-stream, so it reports what was
+        // dropped since the last report, not a running total.
+        if droppedZoneUpdates > zoneUpdatesReported {
+            EngineLog.emit("[APACObjectEncoder] \(droppedZoneUpdates - zoneUpdatesReported) metadata updates played "
+                           + "without their zone mask", category: .session)
+            zoneUpdatesReported = droppedZoneUpdates
+        }
         var packets: [APACEncoder.Packet] = []
         // The partial packet, then silence until the encoder's look-ahead has come out.
         var padding = (staged > 0 ? 1024 - staged : 0) + leadingFrames
@@ -278,7 +287,7 @@ final class APACObjectEncoder: APACChunkEncoding {
             switch roles[element] {
             case .object:
                 values = .init(position: Self.objectPosition(state), size: state.size, gain: state.gain)
-                if !state.excluded.isSubset(of: Self.heights), !state.excluded.isEmpty { droppedZoneUpdates += 1 }
+                if !state.excluded.isSubset(of: Self.heights), !state.excluded.isEmpty { noteDroppedZone(element) }
             case .bed(let speaker): values = .init(position: speaker.position, size: 0, gain: state.gain)
             case .fixed(let position): values = .init(position: position, size: 0, gain: state.gain)
             case .lfe: values = .init(position: SIMD3(0.5, 0, 0), size: 0, gain: state.gain)
@@ -288,6 +297,16 @@ final class APACObjectEncoder: APACChunkEncoding {
             } else {
                 slots[target].apply(values, at: clock, rampFrames: update.rampFrames)
             }
+        }
+    }
+
+    /// A zone mask has nothing that reaches the renderer with type 3 (README §3.20), so the object
+    /// plays as if it had none. Logged once, on the encoder's first one, and counted for `flush`.
+    private func noteDroppedZone(_ element: Int) {
+        droppedZoneUpdates += 1
+        if droppedZoneUpdates == 1 {
+            EngineLog.emit("[APACObjectEncoder] element \(element) carries a zone mask, which object APAC cannot "
+                           + "deliver; it plays without it (further ones are counted, not logged)", category: .session)
         }
     }
 

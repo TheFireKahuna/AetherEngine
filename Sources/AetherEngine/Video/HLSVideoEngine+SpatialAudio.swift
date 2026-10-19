@@ -393,7 +393,7 @@ extension HLSVideoEngine {
             audioHLSCodecs = bridge.hlsCodecs
             // Short on purpose: hosts append it to a track title in one-line stats rows.
             audioPipelineDescription = source == .trueHDAtmos
-                ? "\(sourceCodecLabel) Atmos → APAC \(layout.rawValue)"
+                ? "\(sourceCodecLabel) Atmos → APAC \(APACObjectOutputSwitch.isOn ? "objects" : layout.rawValue)"
                 : "DTS:X → APAC \(layout.rawValue)"
             audioDelivery = .bridged
             audioIsAPAC = true

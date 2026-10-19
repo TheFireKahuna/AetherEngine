@@ -126,6 +126,22 @@ struct APACObjectOutputTests {
         return try Self.decode(packets, cookie: encoder.magicCookie)
     }
 
+    @Test("a zone mask is counted as dropped; an elevation switch alone is not")
+    func zoneMasksAreCounted() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let heights = Set(SpatialSpeaker.allCases.filter(\.isHeight))
+        let encoder = try APACObjectEncoder(bitRate: 17 * 320_000)
+        let buffer = APACEncodePipeline.PlaneBuffer(channels: APACObjectEncoder.elementCapacity, capacity: 1024)
+        for plane in buffer.planes { plane.update(repeating: 0, count: 1024) }
+        buffer.objectRoles = [.object, .object]
+        buffer.objectUpdates = [.init(frameOffset: 0, rampFrames: 0, states: [
+            ObjectAudioElementState(excluded: heights),                                  // elevation off
+            ObjectAudioElementState(excluded: heights.union([.sideLeft, .sideRight])),   // + no sides
+        ])]
+        _ = try encoder.encode(buffer, frames: 1024)
+        #expect(encoder.droppedZoneUpdates == 1)
+    }
+
     // MARK: - Motion
 
     @Test("a jump inside a packet lands on its frame")
