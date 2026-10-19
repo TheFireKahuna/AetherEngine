@@ -666,10 +666,15 @@ both axes (`DoviEnhancementUpsamplerTests`).
   the composer, not tvOS, does the 4:2:0 -> 4:2:2 conversion, and repeating a 4:2:0 sample on both rows
   throws away what the reshaping says about each row: under order-3 MMR chroma a luma edge between rows 2k
   and 2k+1 predicts different chroma for the two. Each output row takes its luma from [1 2 1] on that row
-  alone, its base chroma from a vertical 4-tap Catmull-Rom (B = 0, C = 0.5) over the 4:2:0 rows at phase
-  3/4 or 1/4 (chroma vertically between luma rows 2k and 2k+1, the siting the two-row luma average at the
-  4:2:0 site assumes; taps -3, 29, 111, -9 over 128 and mirrored), kept fractional for the curves, and its
-  enhancement chroma bilinearly at the same row coordinate. This is libplacebo's order (chroma upsampled,
+  alone, its base chroma from a vertical 4-tap Catmull-Rom (B = 0, C = 0.5) over the 4:2:0 rows, kept
+  fractional for the curves, and its enhancement chroma bilinearly at the same row coordinate. The vertical
+  phase follows the base layer's `chroma_location` as FFmpeg read it from the HEVC VUI, stamped onto every
+  frame's parameters by `DualLayerVideoDecoder`: LEFT / CENTER (types 0 / 1, chroma between rows 2k and
+  2k+1) put row 2k at phase 3/4 and row 2k+1 at 1/4 (taps -3, 29, 111, -9 over 128 and mirrored); TOPLEFT /
+  TOP (types 2 / 3, common on UHD Blu-ray) copy chroma row k into row 2k and put row 2k+1 half way
+  ((-1, 9, 9, -1) / 16); BOTTOMLEFT / BOTTOM (types 4 / 5) the mirror. UNSPECIFIED is LEFT, as HEVC infers
+  without `chroma_loc_info`, and FFmpeg already reports LEFT for such a stream (the probe clips carry no
+  `chroma_loc_info`). The composer logs the siting once per session (`sv22 chroma siting: type N`). This is libplacebo's order (chroma upsampled,
   then reshaped), a deliberate quality choice that is not bit-exact with Dolby's 4:2:0 reference; on flat
   chroma it equals the 4:2:0 result exactly. It costs the chroma pass twice the threads: 0.35 -> 0.72 ms at
   UHD on an M4 Pro (`DoviGpuBenchmark`), the P010 modes unchanged. `DoviChroma422Tests` holds it against

@@ -144,6 +144,10 @@ struct DoviMetalParams {
     dovi_u32 bl_max;
     dovi_u32 vdr_max;
     dovi_u32 vdr_scale;
+
+    /* The base layer's chroma siting as FFmpeg's AVChromaLocation (chroma_sample_loc_type + 1; 0 =
+       unspecified). Read only by dovi_compose_chroma_422, for the vertical phase of each 4:2:2 row. */
+    dovi_u32 bl_chroma_loc;
 };
 /* DOVI_SHARED_STRUCTS_END */
 """
@@ -531,15 +535,15 @@ static inline float2 dovi_upsample_el_uv(texture2d<ushort, access::read> tex, ui
 }
 
 // Bilinear EL chroma codes (Cb, Cr) for row `site.y` of a 4:2:2 chroma plane (one chroma row per luma row),
-// column `site.x`. The row sits at 4:2:0 chroma-row coordinate site.y / 2 - 1/4 (dovi_compose_chroma_422), and
-// the EL is read at that coordinate through the same grid relation as dovi_upsample_el_uv (n_el = n * el / bl),
-// so at a 4:2:0 site this is that function. For a 2:1 EL the vertical weights are eighths, still exact in float
-// with the horizontal halves, and the caller rounds half up as before.
-static inline float2 dovi_upsample_el_uv_422(texture2d<ushort, access::read> tex, uint2 site,
+// column `site.x`. The row sits at 4:2:0 chroma-row coordinate `row_coord` (site.y / 2 plus the siting offset,
+// dovi_compose_chroma_422), and the EL is read at that coordinate through the same grid relation as
+// dovi_upsample_el_uv (n_el = n * el / bl), so at a 4:2:0 site this is that function. For a 2:1 EL the vertical
+// weights are eighths, still exact in float with the horizontal halves, and the caller rounds half up as before.
+static inline float2 dovi_upsample_el_uv_422(texture2d<ushort, access::read> tex, uint2 site, float row_coord,
                                              uint2 bl_size, uint2 el_size) {
     float fx;
     int x0 = dovi_el_axis(site.x, float(el_size.x) / float(bl_size.x), 0.0f, fx);
-    float v = (float(site.y) * 0.5f - 0.25f) * (float(el_size.y) / float(bl_size.y));
+    float v = row_coord * (float(el_size.y) / float(bl_size.y));
     float y0f = floor(v);
     float fy = v - y0f;
     int y0 = int(y0f);
@@ -741,13 +745,33 @@ kernel void dovi_compose_chroma(
     dovi_write_chroma(out_uv_tex, ushort4(ushort(out_cb << 6), ushort(out_cr << 6), 0, 0), gid, params.flags);
 }
 
-// Catmull-Rom (cubic B = 0, C = 0.5) taps for the base-layer chroma at a 4:2:2 row, in 128ths: chroma rows
-// k - 2 ... k + 1 for output row 2k (phase 3/4 from row k - 1 to k), rows k - 1 ... k + 2 for row 2k + 1 (phase
-// 1/4 from k to k + 1). Every tap is n / 128, so a 10-bit code times a tap and the four-tap sum are exact in float.
-constant float dovi_chroma_422_taps[2][4] = {
-    { -3.0f / 128.0f,  29.0f / 128.0f, 111.0f / 128.0f,  -9.0f / 128.0f },
+// Catmull-Rom (cubic B = 0, C = 0.5) taps for the base-layer chroma at a 4:2:2 row, over chroma rows i - 1 ... i + 2
+// for a row at chroma-row coordinate i + t, by phase t in quarters. t = 0 is the chroma row itself, copied; 1/2 is
+// (-1, 9, 9, -1) / 16. Every tap is n / 128, so a 10-bit code times a tap and the four-tap sum are exact in float.
+constant float dovi_chroma_422_taps[4][4] = {
+    {  0.0f,            1.0f,            0.0f,            0.0f           },
     { -9.0f / 128.0f, 111.0f / 128.0f,  29.0f / 128.0f,  -3.0f / 128.0f },
+    { -8.0f / 128.0f,  72.0f / 128.0f,  72.0f / 128.0f,  -8.0f / 128.0f },
+    { -3.0f / 128.0f,  29.0f / 128.0f, 111.0f / 128.0f,  -9.0f / 128.0f },
 };
+
+// The vertical offset, in quarter chroma rows, of 4:2:2 row 2k from chroma row k, by the base layer's siting
+// (AVChromaLocation in params.bl_chroma_loc):
+// - LEFT / CENTER (chroma_sample_loc_type 0 / 1): chroma between luma rows 2k and 2k + 1, so row 2k is 1/4 above
+//   chroma row k and row 2k + 1 1/4 below: -1.
+// - TOPLEFT / TOP (types 2 / 3, what UHD Blu-ray and BT.2020 HEVC commonly signal): chroma on row 2k, so row 2k
+//   is chroma row k and row 2k + 1 half way to k + 1: 0.
+// - BOTTOMLEFT / BOTTOM (types 4 / 5): chroma on row 2k + 1, so row 2k is half way between k - 1 and k: -2.
+// - UNSPECIFIED: HEVC infers type 0 when the VUI carries no chroma_loc_info, so LEFT. FFmpeg's HEVC decoder
+//   already writes LEFT into the codec parameters in that case, so UNSPECIFIED reaches here only from a stream
+//   FFmpeg did not probe.
+static inline int dovi_chroma_422_offset_q(uint loc) {
+    switch (loc) {
+        case 3u: case 4u: return 0;
+        case 5u: case 6u: return -2;
+        default: return -1;
+    }
+}
 
 // Chroma for a 4:2:2 output plane (sv22), one thread per output sample: every row is composed at its own site
 // instead of the 4:2:0 result being repeated on both rows. With sv22 the composer, not tvOS, does the 4:2:0 ->
@@ -756,13 +780,15 @@ constant float dovi_chroma_422_taps[2][4] = {
 // row first and reshaped there (libplacebo's order: chroma upsampled, then reshaped), a deliberate quality choice
 // that is not bit-exact with Dolby's 4:2:0 reference.
 //
-// Siting is the 4:2:0 kernel's reading: chroma horizontally co-sited with the even luma column and vertically
-// between luma rows 2k and 2k + 1 (hence the two-row luma average there). Output row 2k sits 1/4 chroma row
-// above chroma row k, row 2k + 1 1/4 below.
+// Chroma is horizontally co-sited with the even luma column (types 0 / 2 / 4; neither chroma kernel models the
+// half-column shift of 1 / 3 / 5); vertically it is sited from the stream (dovi_chroma_422_offset_q).
 // - luma: [1 2 1] around the even column on this row only, in integers, edges clamped;
-// - BL chroma: 4-tap Catmull-Rom over the chroma rows (dovi_chroma_422_taps), edge rows clamped, clamped to
-//   [0, bl_max] and kept fractional for the curve (dovi_eval_curve_f);
-// - EL chroma: bilinear at the same row coordinate (dovi_upsample_el_uv_422), rounded half up, inverse NLQ;
+// - BL chroma: 4-tap Catmull-Rom over the chroma rows at the row's phase (dovi_chroma_422_taps), edge rows
+//   clamped, clamped to [0, bl_max] and kept fractional for the curve (dovi_eval_curve_f);
+// - EL chroma: bilinear at the same row coordinate (dovi_upsample_el_uv_422), rounded half up, inverse NLQ.
+//   The EL phase convention itself (base chroma row n at EL chroma row n * el / bl) is kept; the siting only
+//   moves where between the base chroma rows the output row sits, and the residual is read where the base
+//   chroma it corrects is, so at a 4:2:0 site every siting reads what dovi_compose_chroma reads;
 // then denormalisation, residual, clamps and quantisation exactly as in dovi_compose_chroma.
 // A separate kernel rather than a branch in dovi_compose_chroma, so the 4:2:0 kernel the P010 modes run is
 // untouched. It is built without the blue-noise specialisation, which sv22 (full precision) never uses.
@@ -790,13 +816,15 @@ kernel void dovi_compose_chroma_422(
               + 2 * int(bl_y_tex.read(uint2(lx, gid.y)).r >> 6)
               + int(bl_y_tex.read(uint2(lxr, gid.y)).r >> 6) + 2) >> 2;
 
-    uint odd = gid.y & 1u;
-    int first = int(gid.y >> 1) - 2 + int(odd);
+    // The row's chroma-row coordinate in quarters, q = 2 * row + offset (>= -2): whole part q / 4, phase q % 4.
+    int q = 2 * int(gid.y) + dovi_chroma_422_offset_q(params.bl_chroma_loc) + 8;
+    int first = q / 4 - 2 - 1;
+    int phase = q & 3;
     int last_row = int(uv_height) - 1;
     float2 bl_uv = float2(0.0f);
     for (int i = 0; i < 4; ++i) {
         uint row = uint(clamp(first + i, 0, last_row));
-        bl_uv = fma(float2(bl_uv_tex.read(uint2(gid.x, row)).rg >> 6), dovi_chroma_422_taps[odd][i], bl_uv);
+        bl_uv = fma(float2(bl_uv_tex.read(uint2(gid.x, row)).rg >> 6), dovi_chroma_422_taps[phase][i], bl_uv);
     }
     bl_uv = clamp(bl_uv, 0.0f, float(params.bl_max));
 
@@ -818,7 +846,7 @@ kernel void dovi_compose_chroma_422(
         bool cb_active = (params.nlq_cb.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cb.nlq_scale != 0);
         bool cr_active = (params.nlq_cr.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cr.nlq_scale != 0);
         if (cb_active || cr_active) {
-            float2 el = dovi_upsample_el_uv_422(el_uv_tex, gid, uint2(uv_width, uv_height),
+            float2 el = dovi_upsample_el_uv_422(el_uv_tex, gid, float(q - 8) * 0.25f, uint2(uv_width, uv_height),
                                                 uint2(params.el_width / 2u, params.el_height / 2u));
             if (cb_active) {
                 vdr_cb += dovi_inv_nlq(nlq_lut, 1u, dovi_el_code(el.x));
@@ -857,9 +885,9 @@ kernel void dovi_compose_chroma_422(
 // against each other on the GPU rather than by hand. Metal has no static_assert
 // and the offline metal compiler is not always installed, so slot 0 carries
 // sizeof(DoviMetalParams), slots 1-35 the scalars and the last element of each
-// sub-block, and slots 36 onwards, per component, the first element of every array
-// and every NLQ scalar: any offset drift or swapped neighbours moves a sentinel
-// and the test fails.
+// sub-block, slots 36-95, per component, the first element of every array and every
+// NLQ scalar, and slot 96 bl_chroma_loc: any offset drift or swapped neighbours
+// moves a sentinel and the test fails.
 kernel void dovi_layout_probe(
     constant struct DoviMetalParams& params [[buffer(0)]],
     device uint*                     out    [[buffer(1)]],
@@ -974,6 +1002,8 @@ kernel void dovi_layout_probe(
     out[93] = uint(params.nlq_cr.vdr_in_max);
     out[94] = params.nlq_cr.nlq_pivots[0];
     out[95] = params.nlq_cr.nlq_pivots[1];
+
+    out[96] = params.bl_chroma_loc;
 }
 """
 
