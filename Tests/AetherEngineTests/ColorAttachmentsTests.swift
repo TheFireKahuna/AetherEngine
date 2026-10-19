@@ -64,6 +64,35 @@ struct ColorAttachmentsTests {
         #expect(pq.transfer == kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, "a declared curve is kept")
     }
 
+    @Test("a pure power curve is UseGamma with its exponent, and a still can be made from it")
+    func gammaCurves() throws {
+        let g22 = ColorAttachments.presented(described(AVCOL_PRI_BT470BG, AVCOL_TRC_GAMMA22, AVCOL_SPC_BT470BG))
+        #expect(g22.transfer == kCVImageBufferTransferFunction_UseGamma)
+        #expect(g22.gammaLevel == 2.2)
+        #expect(ColorAttachments.presented(described(AVCOL_PRI_BT470BG, AVCOL_TRC_GAMMA28)).gammaLevel == 2.8)
+        #expect(ColorAttachments.presented(described(AVCOL_PRI_BT709, AVCOL_TRC_BT709)).gammaLevel == nil)
+        #expect(ColorAttachments.colorSpace(for: g22) != nil)
+    }
+
+    @Test("code points CoreVideo has a constant for are mapped: EBU 3213 (22) is P22, SMPTE 428 has its curve")
+    func newlyMappedCodePoints() {
+        #expect(ColorAttachments.primaries(AVCOL_PRI_EBU3213) == kCVImageBufferColorPrimaries_P22)
+        #expect(ColorAttachments.transfer(AVCOL_TRC_SMPTE428) == kCVImageBufferTransferFunction_SMPTE_ST_428_1)
+    }
+
+    @Test("what CoreVideo cannot carry is named, and only that")
+    func unmappedIsNamed() {
+        #expect(ColorAttachments.unmapped(described(AVCOL_PRI_BT470M)) == "primaries BT.470M")
+        #expect(ColorAttachments.unmapped(described(AVCOL_PRI_FILM))?.contains("FILM") == true)
+        #expect(ColorAttachments.unmapped(described(AVCOL_PRI_SMPTE428))?.contains("XYZ") == true)
+        #expect(ColorAttachments.unmapped(described(AVCOL_PRI_BT2020, AVCOL_TRC_BT2020_10, AVCOL_SPC_BT2020_CL))?
+            .contains("constant-luminance") == true)
+        #expect(ColorAttachments.presented(described(AVCOL_PRI_BT2020, AVCOL_TRC_BT2020_10, AVCOL_SPC_BT2020_CL)).matrix
+                == kCVImageBufferYCbCrMatrix_ITU_R_2020)
+        #expect(ColorAttachments.unmapped(described(AVCOL_PRI_BT709, AVCOL_TRC_BT709, AVCOL_SPC_BT709)) == nil)
+        #expect(ColorAttachments.unmapped(.unspecified) == nil)
+    }
+
     @Test("AE#654: a lone BT.601 matrix gets SMPTE-C primaries, as VideoToolbox fills it")
     func bt601MatrixImpliesSMPTEC() {
         let tags = ColorAttachments.presented(described(AVCOL_PRI_UNSPECIFIED, AVCOL_TRC_UNSPECIFIED, AVCOL_SPC_SMPTE170M))

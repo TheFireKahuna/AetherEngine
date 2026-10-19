@@ -307,6 +307,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// `attachedHDRStatic` is guarded by `lock`, like everything `emit` touches.
     private var containerHDRStatic = HDRStaticMetadata.none
     private var attachedHDRStatic = HDRStaticMetadata.none
+    /// A declared colour value CoreVideo has no constant for is named once per decoder. Guarded by `lock`.
+    private var loggedUnmappedColor = false
 
     /// Deinterlaced frames dropped for carrying no PTS (see the drop site in decode()). Guarded by `lock`.
     private var droppedUntimestampedFields = 0
@@ -1097,11 +1099,21 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Every field is written, a gap included (AE#654): VideoToolbox never hands the display layer an
     /// untagged buffer, and neither may this decoder.
     private func attachColorSpace(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer) {
-        let tags = ColorAttachments.presented(
-            ColorDescription(frame: frame), frameSize: (frame.pointee.width, frame.pointee.height))
+        let description = ColorDescription(frame: frame)
+        let tags = ColorAttachments.presented(description, frameSize: (frame.pointee.width, frame.pointee.height))
         CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, tags.primaries, .shouldPropagate)
         CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, tags.transfer, .shouldPropagate)
         CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, tags.matrix, .shouldPropagate)
+        if let gamma = tags.gammaLevel {
+            CVBufferSetAttachment(pb, kCVImageBufferGammaLevelKey, gamma as NSNumber, .shouldPropagate)
+        } else {
+            CVBufferRemoveAttachment(pb, kCVImageBufferGammaLevelKey)
+        }
+        if !loggedUnmappedColor, let gaps = ColorAttachments.unmapped(description) {
+            loggedUnmappedColor = true
+            EngineLog.emit("[SWDecoder] no CoreVideo tag for \(gaps); presented as primaries=\(tags.primaries) "
+                           + "matrix=\(tags.matrix) (logged once)", category: .swPlayback)
+        }
         attachHDRStaticMetadata(from: frame, to: pb)
         attachChromaLocation(from: frame, to: pb)
     }
