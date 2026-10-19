@@ -38,6 +38,10 @@ final class DoviFelComposer: @unchecked Sendable {
     private var poolWidth: Int = 0
     private var poolHeight: Int = 0
     private var poolPixelFormat: OSType = 0
+    private var poolAttributesGeneration = -1
+    /// This composer's renderer recommendation in place of the process-wide one. For tests, which run in
+    /// parallel and must not change it under each other.
+    var rendererRecommendedAttributesOverride: [String: Any]?
     /// This composer's output mode in place of the process-wide ``outputMode``. For tests, which run in
     /// parallel and must not change the mode under each other.
     var outputModeOverride: DoviOutputMode?
@@ -275,7 +279,9 @@ final class DoviFelComposer: @unchecked Sendable {
         // earlier look and this point cannot leave a fresh pool behind that nothing will release.
         guard !tornDown else { return nil }
 
-        if let pool = pixelBufferPool, poolWidth == width, poolHeight == height, poolPixelFormat == pixelFormat {
+        let (recommended, generation) = rendererRecommendedAttributesOverride.map { ($0, -2) } ?? Self.rendererRecommendation
+        if let pool = pixelBufferPool, poolWidth == width, poolHeight == height, poolPixelFormat == pixelFormat,
+           poolAttributesGeneration == generation {
             return pool
         }
 
@@ -285,13 +291,13 @@ final class DoviFelComposer: @unchecked Sendable {
             kCVPixelBufferPoolAllocationThresholdKey: DoviFelComposer.outputPoolAllocationThreshold
         ]
 
-        let pixelBufferAttributes: [CFString: Any] = [
+        let pixelBufferAttributes = Self.mergingRecommendation(recommended, into: [
             kCVPixelBufferPixelFormatTypeKey: pixelFormat,
             kCVPixelBufferWidthKey: width,
             kCVPixelBufferHeightKey: height,
             kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any],
             kCVPixelBufferMetalCompatibilityKey: true
-        ]
+        ])
 
         var newPool: CVPixelBufferPool?
         let status = CVPixelBufferPoolCreate(
@@ -309,6 +315,7 @@ final class DoviFelComposer: @unchecked Sendable {
         self.poolWidth = width
         self.poolHeight = height
         self.poolPixelFormat = pixelFormat
+        self.poolAttributesGeneration = generation
         poolBuffers.removeAll()
         poolBufferHighWaterMark = 0
         return pool
@@ -657,6 +664,48 @@ final class DoviFelComposer: @unchecked Sendable {
     static var outputMode: DoviOutputMode {
         get { outputModeSwitch.withLock { $0 } }
         set { outputModeSwitch.withLock { $0 = newValue } }
+    }
+
+    private static let recommendationLock = NSLock()
+    nonisolated(unsafe) private static var _rendererRecommendedAttributes: [String: Any] = [:]  // guarded by recommendationLock
+    nonisolated(unsafe) private static var recommendationGeneration = 0  // guarded by recommendationLock
+
+    /// The display renderer's `recommendedPixelBufferAttributes` (tvOS 26), which the output pool is built
+    /// with underneath its own attributes: the frames this composer makes are the ones the renderer is
+    /// handed, and the renderer says how it wants them made (on macOS 27: IOSurface-backed, Core Animation
+    /// compatible, the real-time cache mode). Set by the software host when it attaches the renderer,
+    /// before the first composition; a change rebuilds the pool on the next frame. Process-wide, empty
+    /// before tvOS 26.
+    static var rendererRecommendedAttributes: [String: Any] {
+        get { rendererRecommendation.attributes }
+        set {
+            recommendationLock.lock()
+            _rendererRecommendedAttributes = newValue
+            recommendationGeneration += 1
+            recommendationLock.unlock()
+        }
+    }
+
+    private static var rendererRecommendation: (attributes: [String: Any], generation: Int) {
+        recommendationLock.lock()
+        defer { recommendationLock.unlock() }
+        return (_rendererRecommendedAttributes, recommendationGeneration)
+    }
+
+    /// `own` over `recommended`: every key the composer sets is its own (format, size, Metal), and only keys
+    /// it leaves open come from the renderer, so a recommendation cannot change what the kernels write.
+    /// The IOSurface property dictionaries are combined rather than replaced, the composer's entries winning.
+    static func mergingRecommendation(_ recommended: [String: Any], into own: [CFString: Any]) -> [CFString: Any] {
+        var merged: [CFString: Any] = [:]
+        for (key, value) in recommended { merged[key as CFString] = value }
+        for (key, value) in own { merged[key] = value }
+        let surfaceKey = kCVPixelBufferIOSurfacePropertiesKey as String
+        if let theirs = recommended[surfaceKey] as? [String: Any] {
+            var surface = theirs
+            for (key, value) in (own[kCVPixelBufferIOSurfacePropertiesKey] as? [String: Any]) ?? [:] { surface[key] = value }
+            merged[kCVPixelBufferIOSurfacePropertiesKey] = surface
+        }
+        return merged
     }
 
     static let outputPoolAllocationThreshold = SampleBufferRenderer.felVideoLookaheadFrames + 2 + maxFramesInFlight + 1
@@ -1024,6 +1073,7 @@ final class DoviFelComposer: @unchecked Sendable {
         poolWidth = 0
         poolHeight = 0
         poolPixelFormat = 0
+        poolAttributesGeneration = -1
     }
 
     // MARK: - ABI Layout Probe

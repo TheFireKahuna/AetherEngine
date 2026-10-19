@@ -7,7 +7,7 @@ import Testing
 @testable import AetherEngine
 
 /// The software path's start: the clock waits at rate 0 until frames are in the layer, then starts a
-/// fixed lead from now (`AudioOutput.videoPrerollSatisfied`, `prerollStartLead`,
+/// lead from now (`AudioOutput.videoPrerollSatisfied`, `prerollStartLead(outputLatency:)`,
 /// `SampleBufferRenderer.prerollSatisfied(clock:live:)`). On an Apple TV 4K a clock started the moment
 /// the first packet arrived dropped 3 to 7 frames at every start and seek; with both, none on FEL
 /// (#774). Every other VOD route since #800.
@@ -164,10 +164,11 @@ struct VideoPrerollTests {
         let opened = CMClockGetTime(CMClockGetHostTimeClock()).seconds
         gate.set(true)
         try await waitFor { output.synchronizer.rate == 1 }
-        // The start was scheduled `prerollStartLead` after the gate opened, so however late this
+        // The start was scheduled `lastPrerollStartLead` after the gate opened, so however late this
         // runs, the clock has not run longer than the time since then minus the lead.
         let now = CMClockGetTime(CMClockGetHostTimeClock()).seconds
-        let ran = max(0, now - opened - AudioOutput.prerollStartLead)
+        let lead = try #require(output.lastPrerollStartLead)
+        let ran = max(0, now - opened - lead)
         #expect(output.synchronizer.currentTime().seconds <= 5 + ran + 0.02)
     }
 
@@ -217,5 +218,22 @@ struct VideoPrerollTests {
         output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
         #expect(output.synchronizer.rate == 0)
         try await waitFor { output.synchronizer.rate == 1 }
+    }
+
+    @Test("The start lead follows the route's latency, capped at the validated 250 ms")
+    func startLeadFollowsTheRoute() {
+        let margin = 0.112
+        // The measured HDMI route gets exactly the lead that was validated on it.
+        #expect(abs(AudioOutput.prerollStartLead(outputLatency: 0.138, margin: margin) - 0.25) < 1e-9)
+        // A faster route starts sooner.
+        #expect(abs(AudioOutput.prerollStartLead(outputLatency: 0.020, margin: margin) - 0.132) < 1e-9)
+        // A buffered AirPlay route's seconds of latency are not waited for.
+        #expect(AudioOutput.prerollStartLead(outputLatency: 2.0, margin: margin) == AudioOutput.prerollStartLeadCeiling)
+        // No session (macOS) or a nonsense reading: the ceiling, as before this was adaptive.
+        #expect(AudioOutput.prerollStartLead(outputLatency: nil, margin: margin) == AudioOutput.prerollStartLeadCeiling)
+        #expect(AudioOutput.prerollStartLead(outputLatency: .nan, margin: margin) == AudioOutput.prerollStartLeadCeiling)
+        #expect(AudioOutput.prerollStartLead(outputLatency: -1, margin: margin) == AudioOutput.prerollStartLeadCeiling)
+        // A negative margin counts as none.
+        #expect(abs(AudioOutput.prerollStartLead(outputLatency: 0.05, margin: -1) - 0.05) < 1e-9)
     }
 }
