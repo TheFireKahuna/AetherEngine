@@ -321,5 +321,14 @@ extension AetherEngine {
         get { DoviFelComposer.residualEnabled }
         set { DoviFelComposer.residualEnabled = newValue }
     }
+
+    /// FEL / MEL split view: the fraction of the width, from the left, composed with the residual (full
+    /// FEL); the rest is composed without it (what a MEL stream decodes to), with a divider between them.
+    /// nil turns the split off. Takes effect from the next composed frame, for every session in the process.
+    @_spi(Diagnostics)
+    public nonisolated static var felResidualSplit: Double? {
+        get { DoviFelComposer.residualSplit }
+        set { DoviFelComposer.residualSplit = newValue }
+    }
 }
 #endif

@@ -80,7 +80,7 @@ final class DoviFelComposer: @unchecked Sendable {
     }
 
     /// Number of `uint` slots `dovi_layout_probe` writes.
-    static let layoutProbeSlots = 36 + 3 * 20 + 1
+    static let layoutProbeSlots = 36 + 3 * 20 + 2
 
     /// Largest `coefficient_log2_denom` the fixed-point path accepts. The RPU
     /// syntax caps it at 23 (0x17), so a
@@ -750,6 +750,17 @@ final class DoviFelComposer: @unchecked Sendable {
         set { residualSwitch.withLock { $0 = newValue } }
     }
 
+    private static let residualSplitSwitch = OSAllocatedUnfairLock<Double?>(initialState: nil)
+
+    /// FEL / MEL split view: the fraction of the picture's width, from the left, composed with the residual;
+    /// the rest is composed without it, as a MEL stream would be, with a divider between them. nil (the
+    /// default) composes the whole frame one way, as ``residualEnabled`` says. Takes effect from the next
+    /// composed frame and applies to every composer in the process.
+    static var residualSplit: Double? {
+        get { residualSplitSwitch.withLock { $0 } }
+        set { residualSplitSwitch.withLock { $0 = newValue.map { min(max($0, 0), 1) } } }
+    }
+
     private static let outputModeSwitch = OSAllocatedUnfairLock(initialState: DoviOutputMode.sv22)
 
     /// The output buffer format and how the 12-bit VDR code is quantised into it (``DoviOutputMode``).
@@ -972,6 +983,10 @@ final class DoviFelComposer: @unchecked Sendable {
         let rawBuffer = UnsafeMutableRawBufferPointer(start: paramBuffer.contents(), count: DoviMetalParams.serializedSize)
         var serialized = metalParams
         if !Self.residualEnabled { serialized.flags.insert(.disableResidual) }
+        if let split = Self.residualSplit {
+            // Even, so the chroma kernels (one sample per two luma columns) split on the same boundary.
+            serialized.residualSplitX = max(2, UInt32(Double(blW) * split) & ~1)
+        }
         switch outputMode {
         case .p010: break
         case .p010Rounded: serialized.ditherMode = .none
