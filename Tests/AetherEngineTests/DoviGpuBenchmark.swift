@@ -118,8 +118,9 @@ struct DoviGpuBenchmark {
     }
 
     /// Median GPU milliseconds per dispatch of one kernel, over `iterations` command buffers of
-    /// `dispatchesPerBuffer` dispatches each.
-    static func time(_ rig: Rig, pipeline: MTLComputePipelineState, luma: Bool, out: CVPixelBuffer,
+    /// `dispatchesPerBuffer` dispatches each. `chroma422` dispatches the chroma kernel over the 4:2:2 grid
+    /// (one thread per sv22 output sample, `dovi_compose_chroma_422`) instead of the 4:2:0 one.
+    static func time(_ rig: Rig, pipeline: MTLComputePipelineState, luma: Bool, chroma422: Bool = false, out: CVPixelBuffer,
                      extraBuffers: [(MTLBuffer, Int)] = [], tgShape: (Int, Int)? = nil, pixelsPerThread: Int = 1) throws -> Double {
         let blY = try texture(rig, rig.base, plane: 0, .r16Uint), blUV = try texture(rig, rig.base, plane: 1, .rg16Uint)
         let elY = try texture(rig, rig.enhancement, plane: 0, .r16Uint), elUV = try texture(rig, rig.enhancement, plane: 1, .rg16Uint)
@@ -140,7 +141,7 @@ struct DoviGpuBenchmark {
             enc.setBuffer(rig.mmr, offset: 0, index: 3)
             for (b, idx) in extraBuffers { enc.setBuffer(b, offset: 0, index: idx) }
             let grid = luma ? MTLSize(width: width / pixelsPerThread, height: height, depth: 1)
-                            : MTLSize(width: width / 2 / pixelsPerThread, height: height / 2, depth: 1)
+                            : MTLSize(width: width / 2 / pixelsPerThread, height: chroma422 ? height : height / 2, depth: 1)
             for _ in 0..<dispatchesPerBuffer { enc.dispatchThreads(grid, threadsPerThreadgroup: tg) }
             enc.endEncoding()
             cb.commit()
@@ -189,10 +190,11 @@ struct DoviGpuBenchmark {
                                           ("p010-bn", DoviDither.blueNoise, p010, false),
                                           ("sv22", DoviDither.fullPrecision, sv22, true)] {
             try setMode(rig, dither: dither, chroma422: c422)
-            let kernels = dither == .blueNoise ? try pipes.blueNoisePipelines() : (pipes.lumaPipeline, pipes.chromaPipeline)
+            let kernels = dither == .blueNoise ? try pipes.blueNoisePipelines()
+                : (pipes.lumaPipeline, c422 ? pipes.chroma422Pipeline : pipes.chromaPipeline)
             let l = try time(rig, pipeline: kernels.0, luma: true, out: out, extraBuffers: extra,
                              tgShape: tgShape, pixelsPerThread: pixelsPerThread)
-            let c = try time(rig, pipeline: kernels.1, luma: false, out: out, extraBuffers: extra,
+            let c = try time(rig, pipeline: kernels.1, luma: false, chroma422: c422, out: out, extraBuffers: extra,
                              tgShape: tgShape, pixelsPerThread: pixelsPerThread)
             // The last timed dispatch of each kernel left its output; it must match the baseline's bit for bit.
             let words = planes(out)
@@ -213,12 +215,13 @@ struct DoviGpuBenchmark {
 
     // MARK: - Variants
 
-    /// `source` with each (old, new) applied; fails if an `old` does not occur exactly once, so a variant
-    /// cannot silently measure the baseline.
+    /// `source` with each (old, new) applied at every occurrence; fails if an `old` does not occur, so a variant
+    /// cannot silently measure the baseline. Every occurrence, because the 4:2:0 and 4:2:2 chroma kernels share
+    /// some lines (the quantisation, the residual gate) and a variant applies to both.
     static func patched(_ source: String, _ edits: [(String, String)]) throws -> String {
         var s = source
         for (a, b) in edits {
-            #expect(s.components(separatedBy: a).count == 2, "variant edit not found exactly once: \(a.prefix(60))")
+            #expect(s.components(separatedBy: a).count >= 2, "variant edit not found: \(a.prefix(60))")
             s = s.replacingOccurrences(of: a, with: b)
         }
         return s
@@ -256,7 +259,7 @@ struct DoviGpuBenchmark {
     /// the kernel body becomes a loop with `gid` rebound per site, its early `return`s turned into `continue`.
     static func multiPixel(_ source: String, n: Int) throws -> String {
         var s = source
-        for name in ["dovi_compose_luma", "dovi_compose_chroma"] {
+        for name in ["dovi_compose_luma", "dovi_compose_chroma", "dovi_compose_chroma_422"] {
             let start = try #require(s.range(of: "kernel void \(name)("))
             let open = try #require(s.range(of: "{", range: start.upperBound..<s.endIndex))
             // The body ends at the first line that is exactly "}" after the opening brace.
@@ -299,6 +302,17 @@ struct DoviGpuBenchmark {
         return;
     }
     int bl_cb = int(bl_uv.r >> 6);
+"""),
+        // 4:2:2 chroma: the three luma taps, the four BL chroma rows, one EL texel -> write.
+        ("""
+    bl_uv = clamp(bl_uv, 0.0f, float(params.bl_max));
+""", """
+    bl_uv = clamp(bl_uv, 0.0f, float(params.bl_max));
+    {
+        ushort e = el_uv_tex.read(uint2(gid.x >> 1, gid.y >> 2)).r;
+        out_uv_tex.write(ushort4(ushort(ushort(bl_uv.x) + ushort(bl_y) + e), ushort(bl_uv.y), 0, 0), gid);
+        return;
+    }
 """),
     ]
 
@@ -363,6 +377,10 @@ struct DoviGpuBenchmark {
          "float pred_cb = dovi_eval_curve(params.poly_cb, params.mmr_cb,"),
         ("float pred_cr = dovi_eval_curve(params.poly_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE,",
          "float pred_cr = dovi_eval_curve(params.poly_cr, params.mmr_cr,"),
+        ("float pred_cb = dovi_eval_curve_f(params.poly_cb, mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE,",
+         "float pred_cb = dovi_eval_curve_f(params.poly_cb, params.mmr_cb,"),
+        ("float pred_cr = dovi_eval_curve_f(params.poly_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE,",
+         "float pred_cr = dovi_eval_curve_f(params.poly_cr, params.mmr_cr,"),
     ]
 
     @Test("UHD composition GPU time per kernel", .enabled(if: enabled, "set DOVI_BENCH=1"))
