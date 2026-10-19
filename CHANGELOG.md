@@ -10,7 +10,20 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **CM v4.0 RPUs with a level 253 block keep their Dolby Vision on the Profile 7 routes.** Disney+ v4.0
+  RPUs carry L253 (0x55 filler, up to 66 bytes), which `dolby_vision` 3.4.0 refused as an unknown level, so
+  every RPU of a hybrid built on such a donor was dropped and the title played as its base layer.
+  `DoviRpuGuard` now walks past L253, so a malformed block behind one is still refused before libdovi.
+
+### Changed
+
+- **LibDovi is built locally from dovi_tool 2.3.4** (`Vendor/LibDovi`, run its `build.sh` once after
+  cloning; the xcframework is gitignored). Same crate version, 3.4.0, plus the unreleased level 253
+  support; the header change is additive (`DoviDmData.level253`, two constants). tvOS and macOS slices
+  only: iOS and visionOS builds need upstream's published LibDovi, whose pin is kept in a comment in
+  `Package.swift`.
 
 ## [7.40.1] - 2026-10-18
 

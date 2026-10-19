@@ -232,6 +232,7 @@ enum DoviRpuGuard {
                     case 8: if ![10, 12, 13, 19, 25].contains(length) { return true }
                     case 9: if ![1, 17].contains(length) { return true }
                     case 10: if ![5, 21].contains(length) { return true }
+                    case 253: if length > 66 { return false }   // libdovi errors past LEVEL253_MAX_LENGTH
                     case 3, 11, 254: break
                     default: return false   // libdovi errors on the rest
                     }
