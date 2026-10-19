@@ -708,7 +708,9 @@ final class EmbeddedSubtitleDecoder {
             bitmapInfo: bitmapInfo,
             provider: provider,
             decode: nil,
-            shouldInterpolate: false,
+            // Drawn scaled (PGS 1080p and DVD 480p onto frames up to 4K); the palette is
+            // premultiplied above, so a filtered edge blends towards clear, not black.
+            shouldInterpolate: true,
             intent: .defaultIntent
         ) else { return nil }
 
