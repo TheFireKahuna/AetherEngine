@@ -294,6 +294,28 @@ struct DoviComposedFrameRpuTests {
         #expect(!s.isIdentityMapping)
     }
 
+    // MARK: - Raw base layer: the mapping stays
+
+    @Test("The RPU for a frame shown as its raw base layer is Profile 8.1 with the source's mapping and display metadata",
+          arguments: ["fel_orig", "fel_orig, residual off"])
+    func baseLayerRpuKeepsTheMapping(label: String) throws {
+        let nal = try #require(label == "fel_orig" ? Self.felNAL : Self.felNoResidualNAL)
+        let pkt = Self.avcc([Self.hevcNAL(type: 1, payload: [0xAA, 0xBB]), nal, Self.hevcNAL(type: 63, payload: [0xCC, 0xDD])])
+        defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
+        let r = DoviRpuConverter.separateDualLayers(pkt, extractEL: true, useCustomBlockSource: true, extractParams: true)
+        var el = r.elPacket
+        trackedPacketFree(&el)
+        let source = try #require(Self.snapshot(ofNAL: nal))
+        let baseLayer = try #require(r.baseLayerRpu)
+        #expect(baseLayer.prefix(2).elementsEqual([0x7C, 0x01]))
+        let out = try #require(Self.snapshot(ofNAL: baseLayer))
+        #expect(out.profile == 8, "\(label): not Profile 8")
+        #expect(out.carriesNoEnhancementLayer, "\(label): still carries an EL/NLQ part")
+        #expect(!out.isIdentityMapping, "\(label): the mapping was dropped, the display would show the base layer unreshaped")
+        #expect(out.curves == source.curves, "\(label): the curves changed")
+        #expect(out.blocks == source.blocks, "\(label): display metadata changed")
+    }
+
     // MARK: - Real file (CM v4.0)
 
     static let cmv40Clip = DoviFelRealFileTests.fixtures[2]
