@@ -14,6 +14,22 @@ func applyFelOutputFlag(_ spec: String?) {
     print("[aetherctl] FEL output: \(mode.rawValue)")
 }
 
+/// Sets `AetherEngine.felComposedRpuOverride` from `--fel-rpu-override <file>` (one unspec62 RPU NAL, as
+/// `dovi_write_unspec62_nalu` writes it), or exits 64 on a file it cannot read or libdovi cannot parse.
+func applyFelRpuOverrideFlag(_ path: String?) {
+    guard let path else { return }
+    guard let bytes = FileManager.default.contents(atPath: path) else {
+        print("ERROR: --fel-rpu-override cannot read '\(path)'")
+        exit(64)
+    }
+    AetherEngine.felComposedRpuOverride = bytes
+    guard let nal = AetherEngine.felComposedRpuOverride else {
+        print("ERROR: --fel-rpu-override: '\(path)' (\(bytes.count) bytes) does not parse as a Dolby Vision unspec62 RPU NAL")
+        exit(64)
+    }
+    print("[aetherctl] FEL composed-frame RPU override: \(path), \(nal.count) bytes")
+}
+
 /// Standalone test runner for Dolby Vision Profile 7 FEL dual-layer decoding and Metal reconstruction.
 func runFelTest(url: URL, maxFrames: Int = 100, probePoint: (x: Int, y: Int)? = nil) -> Int32 {
     print("==================================================")
