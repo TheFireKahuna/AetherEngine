@@ -45,6 +45,11 @@ final class DoviFelComposer: @unchecked Sendable {
     /// This composer's output mode in place of the process-wide ``outputMode``. For tests, which run in
     /// parallel and must not change the mode under each other.
     var outputModeOverride: DoviOutputMode?
+    #if DEBUG
+    /// sv22 chroma from the 4:2:0 kernel, each sample repeated on both rows, as before
+    /// `dovi_compose_chroma_422`: the tests' reference for what the 4:2:2-site kernel changed.
+    var sv22RowDuplicationForTesting = false
+    #endif
     private var poolBuffers: [WeakPoolBuffer] = []
     private var poolBufferHighWaterMark = 0
     /// Set by ``releaseOutputPool()``. A composition arriving after teardown (a VideoToolbox callback still in
@@ -147,6 +152,8 @@ final class DoviFelComposer: @unchecked Sendable {
     final class SharedPipelines: @unchecked Sendable {
         let lumaPipeline: MTLComputePipelineState
         let chromaPipeline: MTLComputePipelineState
+        /// `dovi_compose_chroma_422`: chroma composed at every 4:2:2 site, for ``DoviOutputMode/sv22``.
+        let chroma422Pipeline: MTLComputePipelineState
         let layoutProbePipeline: MTLComputePipelineState?
         /// The library the pipelines came from, kept for the blue-noise specialisation.
         private let library: MTLLibrary?
@@ -156,11 +163,13 @@ final class DoviFelComposer: @unchecked Sendable {
         init(
             luma: MTLComputePipelineState,
             chroma: MTLComputePipelineState,
+            chroma422: MTLComputePipelineState,
             probe: MTLComputePipelineState?,
             library: MTLLibrary? = nil
         ) {
             self.lumaPipeline = luma
             self.chromaPipeline = chroma
+            self.chroma422Pipeline = chroma422
             self.layoutProbePipeline = probe
             self.library = library
         }
@@ -229,11 +238,13 @@ final class DoviFelComposer: @unchecked Sendable {
         static func compile(device: MTLDevice, source: String) throws -> SharedPipelines {
             let library = try device.makeLibrary(source: source, options: nil)
             guard library.functionNames.contains("dovi_compose_luma"),
-                  library.functionNames.contains("dovi_compose_chroma") else {
+                  library.functionNames.contains("dovi_compose_chroma"),
+                  library.functionNames.contains("dovi_compose_chroma_422") else {
                 throw ComposerError.missingKernelFunction
             }
             let luma = try device.makeComputePipelineState(function: try kernel(library, "dovi_compose_luma", blueNoise: false))
             let chroma = try device.makeComputePipelineState(function: try kernel(library, "dovi_compose_chroma", blueNoise: false))
+            let chroma422 = try device.makeComputePipelineState(function: try kernel(library, "dovi_compose_chroma_422", blueNoise: false))
             let probe: MTLComputePipelineState?
             if let probeFn = library.makeFunction(name: "dovi_layout_probe") {
                 probe = try? device.makeComputePipelineState(function: probeFn)
@@ -241,7 +252,7 @@ final class DoviFelComposer: @unchecked Sendable {
                 probe = nil
             }
 
-            return SharedPipelines(luma: luma, chroma: chroma, probe: probe, library: library)
+            return SharedPipelines(luma: luma, chroma: chroma, chroma422: chroma422, probe: probe, library: library)
         }
 
         #if DEBUG
@@ -948,7 +959,8 @@ final class DoviFelComposer: @unchecked Sendable {
         if outputMode == .sv22 { serialized.flags.insert(.chroma422) }
         serialized.serialize(into: rawBuffer)
         // The blue-noise dither lives in its own specialisation of the kernels (`dovi_fc_blue_noise`).
-        let lumaPipeline: MTLComputePipelineState, chromaPipeline: MTLComputePipelineState
+        let lumaPipeline: MTLComputePipelineState
+        var chromaPipeline: MTLComputePipelineState
         if serialized.ditherMode == .blueNoise {
             guard let blue = try? pipelines.blueNoisePipelines() else {
                 returnParamSlot(paramSlot)
@@ -958,6 +970,12 @@ final class DoviFelComposer: @unchecked Sendable {
         } else {
             (lumaPipeline, chromaPipeline) = (pipelines.lumaPipeline, pipelines.chromaPipeline)
         }
+        // sv22 composes chroma at every 4:2:2 site, one thread per output sample (`dovi_compose_chroma_422`).
+        var chroma422Sites = outputMode == .sv22
+        #if DEBUG
+        if sv22RowDuplicationForTesting { chroma422Sites = false }
+        #endif
+        if chroma422Sites { chromaPipeline = pipelines.chroma422Pipeline }
 
         let lutBuffer = lumaLutBuffers[paramSlot]
         populateLumaLut(into: lutBuffer.contents().assumingMemoryBound(to: Float.self), params: metalParams)
@@ -1002,7 +1020,7 @@ final class DoviFelComposer: @unchecked Sendable {
         encoder.setBuffer(paramBuffer, offset: 0, index: 0)
         encoder.setBuffer(nlqBuffer, offset: 0, index: 2)
         encoder.setBuffer(mmrBuffer, offset: 0, index: 3)
-        dispatch(encoder, width: blW / 2, height: blH / 2,
+        dispatch(encoder, width: blW / 2, height: chroma422Sites ? blH : blH / 2,
                  threadgroup: threadgroupSize(for: chromaPipeline))
 
         encoder.endEncoding()
