@@ -63,6 +63,8 @@ final class DoviFelComposer: @unchecked Sendable {
     private let lumaLutBuffers: [MTLBuffer]
     /// Preallocated inverse-NLQ tables, one per slot: 1024 EL codes for each of Y, Cb, Cr (`populateNlqLut`).
     private let nlqLutBuffers: [MTLBuffer]
+    /// Preallocated MMR coefficient tables, one per slot, in float (`populateMmrTable`).
+    private let mmrTableBuffers: [MTLBuffer]
     private var freeParamSlotIndices: [Int]
 
     /// Output pixel buffer pool status for 1 Hz summary diagnostics (dolby-vision-fel.md §5.11).
@@ -306,19 +308,23 @@ final class DoviFelComposer: @unchecked Sendable {
         var pBuffers: [MTLBuffer] = []
         var lutBuffers: [MTLBuffer] = []
         var nlqBuffers: [MTLBuffer] = []
+        var mmrBuffers: [MTLBuffer] = []
         for _ in 0..<Self.maxFramesInFlight {
             guard let buf = dev.makeBuffer(length: DoviMetalParams.serializedSize, options: .storageModeShared),
                   let lut = dev.makeBuffer(length: 1024 * MemoryLayout<Float>.stride, options: .storageModeShared),
-                  let nlq = dev.makeBuffer(length: 3 * 1024 * MemoryLayout<Int32>.stride, options: .storageModeShared) else {
+                  let nlq = dev.makeBuffer(length: 3 * 1024 * MemoryLayout<Int32>.stride, options: .storageModeShared),
+                  let mmr = dev.makeBuffer(length: Self.mmrTableCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
                 return nil
             }
             pBuffers.append(buf)
             lutBuffers.append(lut)
             nlqBuffers.append(nlq)
+            mmrBuffers.append(mmr)
         }
         self.paramBuffers = pBuffers
         self.lumaLutBuffers = lutBuffers
         self.nlqLutBuffers = nlqBuffers
+        self.mmrTableBuffers = mmrBuffers
         self.freeParamSlotIndices = Array(0..<Self.maxFramesInFlight)
     }
 
@@ -957,6 +963,8 @@ final class DoviFelComposer: @unchecked Sendable {
         populateLumaLut(into: lutBuffer.contents().assumingMemoryBound(to: Float.self), params: metalParams)
         let nlqBuffer = nlqLutBuffers[paramSlot]
         Self.populateNlqLut(into: nlqBuffer.contents().assumingMemoryBound(to: Int32.self), params: serialized)
+        let mmrBuffer = mmrTableBuffers[paramSlot]
+        Self.populateMmrTable(into: mmrBuffer.contents().assumingMemoryBound(to: Float.self), params: serialized)
 
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             returnParamSlot(paramSlot)
@@ -982,6 +990,7 @@ final class DoviFelComposer: @unchecked Sendable {
         encoder.setBuffer(paramBuffer, offset: 0, index: 0)
         encoder.setBuffer(lutBuffer, offset: 0, index: 1)
         encoder.setBuffer(nlqBuffer, offset: 0, index: 2)
+        encoder.setBuffer(mmrBuffer, offset: 0, index: 3)
         dispatch(encoder, width: blW, height: blH,
                  threadgroup: threadgroupSize(for: lumaPipeline))
 
@@ -992,6 +1001,7 @@ final class DoviFelComposer: @unchecked Sendable {
         encoder.setTexture(outUvTex, index: 3)
         encoder.setBuffer(paramBuffer, offset: 0, index: 0)
         encoder.setBuffer(nlqBuffer, offset: 0, index: 2)
+        encoder.setBuffer(mmrBuffer, offset: 0, index: 3)
         dispatch(encoder, width: blW / 2, height: blH / 2,
                  threadgroup: threadgroupSize(for: chromaPipeline))
 
@@ -1060,6 +1070,26 @@ final class DoviFelComposer: @unchecked Sendable {
         fillNlq(ptr, params.nlqY)
         fillNlq(ptr + 1024, params.nlqCb)
         fillNlq(ptr + 2048, params.nlqCr)
+    }
+
+    /// Floats in the per-frame MMR table: Y, Cb, Cr, each `maxPieces` pieces of the constant and 21 terms.
+    static let mmrTableCount = 3 * DoviMmrParams.maxPieces * (1 + DoviMmrParams.coefficientsPerPiece)
+
+    /// Fills the MMR table the kernels read (`DOVI_MMR_TABLE_*` in the shader): each coefficient as
+    /// float(coef) * 2^-coef_shift, the value the kernel used to form per term per sample. The scale is a
+    /// power of two, so it is exact and the kernels' sums are bit-identical; 1056 conversions on the CPU
+    /// per frame replace an int-to-float conversion and a multiply per MMR term per GPU sample (UHD p010
+    /// about 0.045 ms per frame on an M4 Pro, DoviGpuBenchmark).
+    static func populateMmrTable(into ptr: UnsafeMutablePointer<Float>, params: DoviMetalParams) {
+        let piece = 1 + DoviMmrParams.coefficientsPerPiece
+        for (component, mmr) in [params.mmrY, params.mmrCb, params.mmrCr].enumerated() {
+            let inv = ldexpf(1, -Int32(truncatingIfNeeded: mmr.coefShift))
+            for p in 0..<DoviMmrParams.maxPieces {
+                let base = ptr + (component * DoviMmrParams.maxPieces + p) * piece
+                base[0] = Float(mmr.constant[p]) * inv
+                for t in 0..<DoviMmrParams.coefficientsPerPiece { base[1 + t] = Float(mmr.coef[p][t]) * inv }
+            }
+        }
     }
 
     private static func fillNlq(_ ptr: UnsafeMutablePointer<Int32>, _ nlq: DoviNlqParams) {

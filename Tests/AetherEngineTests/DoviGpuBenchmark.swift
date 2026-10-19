@@ -34,6 +34,8 @@ struct DoviGpuBenchmark {
         let lut: MTLBuffer
         /// The inverse-NLQ table the kernels index (`DoviFelComposer.populateNlqLut`), bound at buffer 2.
         let nlq: MTLBuffer
+        /// The MMR coefficient table (`DoviFelComposer.populateMmrTable`), bound at buffer 3.
+        let mmr: MTLBuffer
     }
 
     static func clipAParams() throws -> DoviMetalParams {
@@ -102,7 +104,9 @@ struct DoviGpuBenchmark {
         try #require(DoviFelComposer()).populateLumaLut(into: lut.contents().assumingMemoryBound(to: Float.self), params: params)
         let nlq = try #require(device.makeBuffer(length: 3 * 1024 * 4, options: .storageModeShared))
         DoviFelComposer.populateNlqLut(into: nlq.contents().assumingMemoryBound(to: Int32.self), params: params)
-        return Rig(device: device, queue: queue, cache: try #require(cache), base: base, enhancement: el, params: pbuf, lut: lut, nlq: nlq)
+        let mmr = try #require(device.makeBuffer(length: DoviFelComposer.mmrTableCount * 4, options: .storageModeShared))
+        DoviFelComposer.populateMmrTable(into: mmr.contents().assumingMemoryBound(to: Float.self), params: params)
+        return Rig(device: device, queue: queue, cache: try #require(cache), base: base, enhancement: el, params: pbuf, lut: lut, nlq: nlq, mmr: mmr)
     }
 
     static func texture(_ rig: Rig, _ b: CVPixelBuffer, plane: Int, _ format: MTLPixelFormat) throws -> (MTLTexture, CVMetalTexture) {
@@ -133,6 +137,7 @@ struct DoviGpuBenchmark {
             enc.setBuffer(rig.params, offset: 0, index: 0)
             enc.setBuffer(rig.lut, offset: 0, index: 1)
             enc.setBuffer(rig.nlq, offset: 0, index: 2)
+            enc.setBuffer(rig.mmr, offset: 0, index: 3)
             for (b, idx) in extraBuffers { enc.setBuffer(b, offset: 0, index: idx) }
             let grid = luma ? MTLSize(width: width / pixelsPerThread, height: height, depth: 1)
                             : MTLSize(width: width / 2 / pixelsPerThread, height: height / 2, depth: 1)
@@ -325,85 +330,44 @@ struct DoviGpuBenchmark {
 """),
     ]
 
-    /// MMR coefficients converted and scaled once per frame on the CPU (float(coef) * 2^-shift, exact on
-    /// both sides), read as floats from a device buffer: [component Cb, Cr][piece 0..7][constant, 21 terms].
-    static let mmrFloat: [(String, String)] = [
+    /// The previous MMR evaluation, int coefficients converted and scaled per term per sample in the kernel,
+    /// kept as the proof that the per-frame float table (`DoviFelComposer.populateMmrTable`) is bit-exact.
+    static let intMmr: [(String, String)] = [
         ("""
-// Chroma: both chroma planes in one pass, since an MMR curve for Cb and for Cr
-""", """
-static inline float dovi_eval_mmr_f(constant struct DoviPolynomialParams &curve, device const float* k,
-                                    int piece, float y_norm, float u_norm, float v_norm) {
-    device const float* c = k + piece * 22;
+    device const float* k,
+    int piece,
+    float y_norm, float u_norm, float v_norm)
+{
+    // y_norm, u_norm and v_norm are already clamped to their components' pivot ranges.
+    device const float* c = k + piece * DOVI_MMR_TABLE_PIECE_STRIDE;
     float s = c[0];
-    float base[7] = { y_norm, u_norm, v_norm, y_norm * u_norm, y_norm * v_norm, u_norm * v_norm,
-                      y_norm * u_norm * v_norm };
-    float t[7];
-    for (int j = 0; j < 7; ++j) { t[j] = base[j]; }
-    uint order = min(curve.order[piece], 3u);
-    for (uint o = 0u; o < order; ++o) {
-        for (int j = 0; j < 7; ++j) { s = fma(c[1u + o * 7u + uint(j)], t[j], s); }
-        if (o + 1u < order) { for (int j = 0; j < 7; ++j) { t[j] *= base[j]; } }
-    }
-    return s;
-}
-
-static inline float dovi_eval_curve_f(
-    constant struct DoviPolynomialParams &curve, device const float* k,
-    constant struct DoviPolynomialParams &poly_y, constant struct DoviPolynomialParams &poly_cb,
-    constant struct DoviPolynomialParams &poly_cr, int bl_val, float y_norm, float u_norm, float v_norm, uint bl_max)
-{
-    if (curve.num_pivots < 2u) { return float(bl_val) / float(bl_max); }
-    int piece = dovi_select_piece(curve, bl_val);
-    if (curve.method[piece] == DOVI_MAPPING_MMR) {
-        float scale = float(bl_max);
-        return dovi_eval_mmr_f(curve, k, piece, dovi_clamp_mmr_input(poly_y, y_norm, scale),
-                               dovi_clamp_mmr_input(poly_cb, u_norm, scale), dovi_clamp_mmr_input(poly_cr, v_norm, scale));
-    }
-    return dovi_eval_poly(curve, piece, bl_val, bl_max);
-}
-
-// Chroma: both chroma planes in one pass, since an MMR curve for Cb and for Cr
-"""),
-        ("""
-    uint2                                  gid           [[thread_position_in_grid]])
-{
-    uint uv_width
 """, """
-    device const float*                    mmr_f         [[buffer(3)]],
-    uint2                                  gid           [[thread_position_in_grid]])
+    constant struct DoviMmrParams &mmr,
+    int piece,
+    float y_norm, float u_norm, float v_norm)
 {
-    uint uv_width
+    float inv = ldexp(1.0f, -int(mmr.coef_shift));
+    float s = float(mmr.mmr_constant[piece]) * inv;
 """),
+        ("            s = fma(c[1u + o * 7u + uint(k)], t[k], s);",
+         "            s = fma(float(mmr.coef[piece][o * 7u + uint(k)]) * inv, t[k], s);"),
         ("""
-    float pred_cb = dovi_eval_curve(params.poly_cb, params.mmr_cb,
+    device const float* mmr,
+    constant struct DoviPolynomialParams &poly_y,
 """, """
-    float pred_cb = dovi_eval_curve_f(params.poly_cb, mmr_f,
+    constant struct DoviMmrParams &mmr,
+    constant struct DoviPolynomialParams &poly_y,
 """),
-        ("""
-    float pred_cr = dovi_eval_curve(params.poly_cr, params.mmr_cr,
-""", """
-    float pred_cr = dovi_eval_curve_f(params.poly_cr, mmr_f + 8 * 22,
-"""),
+        ("pred = dovi_eval_curve(params.poly_y, mmr_table,", "pred = dovi_eval_curve(params.poly_y, params.mmr_y,"),
+        ("float pred_cb = dovi_eval_curve(params.poly_cb, mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE,",
+         "float pred_cb = dovi_eval_curve(params.poly_cb, params.mmr_cb,"),
+        ("float pred_cr = dovi_eval_curve(params.poly_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE,",
+         "float pred_cr = dovi_eval_curve(params.poly_cr, params.mmr_cr,"),
     ]
-
-    static func mmrTable(_ rig: Rig) throws -> MTLBuffer {
-        let p = try clipAParams()
-        let buf = try #require(rig.device.makeBuffer(length: 2 * 8 * 22 * 4, options: .storageModeShared))
-        let out = buf.contents().assumingMemoryBound(to: Float.self)
-        for (c, mmr) in [p.mmrCb, p.mmrCr].enumerated() {
-            let inv = ldexpf(1, -Int32(mmr.coefShift))
-            for piece in 0..<8 {
-                out[(c * 8 + piece) * 22] = Float(mmr.constant[piece]) * inv
-                for t in 0..<21 { out[(c * 8 + piece) * 22 + 1 + t] = Float(mmr.coef[piece][t]) * inv }
-            }
-        }
-        return buf
-    }
 
     @Test("UHD composition GPU time per kernel", .enabled(if: enabled, "set DOVI_BENCH=1"))
     func uhdKernelTimes() throws {
         let rig = try Self.rig()
-        let mmrT = try Self.mmrTable(rig)
         print("[bench] device \(rig.device.name), \(Self.width)x\(Self.height), median of \(Self.iterations)")
         let base = DoviShaderSource.source
         let all = Self.deviceLut + Self.lazyDither + Self.shiftFullPrecision
@@ -413,7 +377,7 @@ static inline float dovi_eval_curve_f(
             ("lazy-dither  ", try Self.patched(base, Self.lazyDither), []),
             ("shift-fullp  ", try Self.patched(base, Self.shiftFullPrecision), []),
             ("all          ", try Self.patched(base, all), []),
-            ("mmr-float    ", try Self.patched(base, Self.mmrFloat), [(mmrT, 3)]),
+            ("int-mmr      ", try Self.patched(base, Self.intMmr), []),
             ("FLOOR (I/O)  ", try Self.patched(base, Self.floorOnly), []),
             ("c: 1-tap luma", try Self.patched(base, Self.chromaOneTap), []),
             ("c: no MMR    ", try Self.patched(base, Self.chromaNoMmr), []),
