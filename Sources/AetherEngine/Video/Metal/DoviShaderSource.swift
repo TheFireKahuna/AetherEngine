@@ -335,39 +335,12 @@ static inline int dovi_denormalize(float pred_norm, uint bl_max, uint vdr_scale,
    Inverse NLQ
    ========================================================================= */
 
-// Inverse linear-deadzone quantiser, in VDR code units.
-//
-// mag_fp is Q(coefficient_log2_denom) of the normalised residual, so the shift
-// by nlq_shift = coefficient_log2_denom - vdr_bit_depth lands it in VDR code
-// units. That reading is corroborated by the RPUs themselves: both test streams
-// carry linear_deadzone_slope = 2048 and vdr_in_max = 0.125 at denom 23, and
-// 512 * 2048 >> 11 is exactly 512, i.e. the slope is tuned so the enhancement
-// layer's full +/-512 swing lands precisely on vdr_in_max. Shifting by denom
-// instead (the convention the vc4 composer uses) collapses every residual to
-// zero, and no other shift makes the two fields agree.
-//
-// The threshold is ADDED to the magnitude, in the same Q(coefficient_log2_denom) domain as
-// (|r| - 1/2) * slope, and there is no early zero: that is the spec's pseudo-code, and DoViBaker
-// implements it (`dq += T * sign`). Every real stream carries linear_deadzone_threshold == 0 (RPU
-// survey, 9,816 RPUs), where all readings agree. Subtracting it, or zeroing anything inside the
-// deadzone, would be a different reading and does not match a second implementation.
-static inline int dovi_eval_inv_nlq(constant struct DoviNlqParams &nlq, int el_val) {
-    if (nlq.nlq_method != DOVI_NLQ_METHOD_LINEAR || nlq.nlq_scale == 0) {
-        return 0;
-    }
-    int r = el_val - nlq.nlq_offset;
-    if (r == 0) {
-        return 0;
-    }
-    // Reconstruction at the middle of the quantisation step, (|r| - 1/2) * scale, in doubled fixed
-    // point so the half step stays exact.
-    long mag_fp = (2L * long(abs(r)) - 1L) * long(nlq.nlq_scale);
-    long threshold2 = 2L * long(nlq.nlq_threshold);
-    long mag = (mag_fp + threshold2) >> (nlq.nlq_shift + 1u);
-    if (nlq.vdr_in_max > 0 && mag > long(nlq.vdr_in_max)) {
-        mag = long(nlq.vdr_in_max);
-    }
-    return (r < 0) ? -int(mag) : int(mag);
+// The inverse linear-deadzone quantiser depends on the 10-bit EL code alone, so the composer evaluates it
+// once per frame for all 1024 codes of each component (`DoviFelComposer.inverseNlq`, where the reading and
+// its reasons are written down) and the kernels index that table: nlq_lut[component * 1024 + code], in VDR
+// code units, Y then Cb then Cr. The 64-bit products it replaces were most of the residual's cost.
+static inline int dovi_inv_nlq(device const int* nlq_lut, uint component, int el_code) {
+    return nlq_lut[component * 1024u + uint(clamp(el_code, 0, 1023))];
 }
 
 /* ============================================================================
@@ -487,6 +460,7 @@ kernel void dovi_compose_luma(
     texture2d<ushort, access::write>       out_y_tex     [[texture(3)]],
     constant struct DoviMetalParams&       params        [[buffer(0)]],
     constant float*                        luma_lut      [[buffer(1)]],
+    device const int*                      nlq_lut       [[buffer(2)]],
     uint2                                  gid           [[thread_position_in_grid]])
 {
     if (gid.x >= params.bl_width || gid.y >= params.bl_height) {
@@ -515,7 +489,7 @@ kernel void dovi_compose_luma(
         // Centre-aligned: luma samples sit at pixel centres on both grids.
         float el = dovi_upsample_el(el_y_tex, gid, uint2(params.bl_width, params.bl_height),
                                     uint2(params.el_width, params.el_height));
-        vdr_y += dovi_eval_inv_nlq(params.nlq_y, dovi_el_code(el));
+        vdr_y += dovi_inv_nlq(nlq_lut, 0u, dovi_el_code(el));
     }
 
     vdr_y = clamp(vdr_y, 0, int(params.vdr_max));
@@ -553,6 +527,7 @@ kernel void dovi_compose_chroma(
     texture2d<ushort, access::read>        el_uv_tex     [[texture(2)]],
     texture2d<ushort, access::write>       out_uv_tex    [[texture(3)]],
     constant struct DoviMetalParams&       params        [[buffer(0)]],
+    device const int*                      nlq_lut       [[buffer(2)]],
     uint2                                  gid           [[thread_position_in_grid]])
 {
     uint uv_width = params.bl_width / 2u;
@@ -613,10 +588,10 @@ kernel void dovi_compose_chroma(
             float2 el = dovi_upsample_el_uv(el_uv_tex, gid, uint2(uv_width, uv_height),
                                             uint2(params.el_width / 2u, params.el_height / 2u));
             if (cb_active) {
-                vdr_cb += dovi_eval_inv_nlq(params.nlq_cb, dovi_el_code(el.x));
+                vdr_cb += dovi_inv_nlq(nlq_lut, 1u, dovi_el_code(el.x));
             }
             if (cr_active) {
-                vdr_cr += dovi_eval_inv_nlq(params.nlq_cr, dovi_el_code(el.y));
+                vdr_cr += dovi_inv_nlq(nlq_lut, 2u, dovi_el_code(el.y));
             }
         }
     }
