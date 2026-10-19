@@ -21,6 +21,16 @@ import AetherLibavutil
 /// extend the scan: it is rare, and a source's own `amve` box already reaches the init, since the MP4
 /// demuxer lifts it into stream side data (`mov_read_amve`) and the stream copy carries that over.
 ///
+/// The alternative transfer characteristics message (147) is read too, for backward-compatible HLG:
+/// the VUI states BT.2020-10 so an SDR decoder shows something, and the SEI names ARIB STD-B67 (18) as
+/// the transfer to prefer. libavcodec applies it, but only to a decoded frame, and a source whose
+/// config record holds the SPS is never decoded by `avformat_find_stream_info`: the decoder exports the
+/// VUI at init from the record. Measured on one x265 `atc-sei=18:transfer=bt2020-10` stream: from
+/// MPEG-TS the probe decodes, codecpar reads 18 and the master states `VIDEO-RANGE=HLG` with `colr`
+/// 9 / 18 / 9; the same bytes in an MP4 (MP4Box import, `colr` 9 / 14 / 9, or no `colr` at all) read 14
+/// and were served as SDR. The SEI's word is taken on the MP4 path as on the TS path, so one stream is
+/// one delivery whatever it arrives in.
+///
 /// A container statement wins: only a type the codecpar lacks is added.
 struct InBandHDRStaticMetadata: Equatable {
     /// mastering_display_colour_volume payload (24 bytes: G, B, R, white point, max / min luminance).
@@ -29,8 +39,25 @@ struct InBandHDRStaticMetadata: Equatable {
     var contentLightLevel: [UInt8]?
     /// ambient_viewing_environment payload (8 bytes: ambient_illuminance, ambient_light_x / _y).
     var ambientViewing: [UInt8]?
+    /// alternative_transfer_characteristics: preferred_transfer_characteristics.
+    var alternativeTransfer: UInt8?
 
     var isEmpty: Bool { masteringDisplay == nil && contentLightLevel == nil && ambientViewing == nil }
+
+    /// The SEI asks for ARIB STD-B67.
+    var prefersHLG: Bool { alternativeTransfer == UInt8(AVCOL_TRC_ARIB_STD_B67.rawValue) }
+
+    /// The manifest range once the SEI is heard: SDR becomes HLG, nothing else moves.
+    func videoRange(upgrading range: HLSVideoRange) -> HLSVideoRange {
+        range == .sdr && prefersHLG ? .hlg : range
+    }
+
+    /// Only a BT.2020 source whose transfer is not already PQ / HLG can be backward-compatible HLG.
+    static func wantsAlternativeTransfer(
+        primaries: AVColorPrimaries, transfer: AVColorTransferCharacteristic
+    ) -> Bool {
+        primaries == AVCOL_PRI_BT2020 && transfer != AVCOL_TRC_SMPTE2084 && transfer != AVCOL_TRC_ARIB_STD_B67
+    }
 
     /// Read the messages out of one H.264 / HEVC access unit, keeping the first of each.
     mutating func collect(
@@ -50,6 +77,7 @@ struct InBandHDRStaticMetadata: Equatable {
         if masteringDisplay == nil { masteringDisplay = first(137, size: 24) }
         if contentLightLevel == nil { contentLightLevel = first(144, size: 4) }
         if ambientViewing == nil { ambientViewing = first(148, size: 8) }
+        if alternativeTransfer == nil { alternativeTransfer = first(147, size: 1)?.first }
     }
 
     /// Add what the codecpar has no side data of its own for; returns the boxes that will now be
@@ -135,7 +163,9 @@ extension HLSVideoEngine {
             par.coded_side_data, par.nb_coded_side_data, AV_PKT_DATA_MASTERING_DISPLAY_METADATA) != nil
         let hasLightLevel = av_packet_side_data_get(
             par.coded_side_data, par.nb_coded_side_data, AV_PKT_DATA_CONTENT_LIGHT_LEVEL) != nil
-        guard !hasMastering || !hasLightLevel else { return metadata }
+        let wantsTransfer = InBandHDRStaticMetadata.wantsAlternativeTransfer(
+            primaries: par.color_primaries, transfer: par.color_trc)
+        guard !hasMastering || !hasLightLevel || wantsTransfer else { return metadata }
         let framing = measuredFraming ?? NALUnitChain.lengthPrefixSize(
             codecID: par.codec_id, extradata: par.extradata, extradataSize: Int(par.extradata_size)
         ).map { .lengthPrefixed(size: $0) } ?? .annexB
@@ -152,6 +182,7 @@ extension HLSVideoEngine {
             }
             return (metadata.masteringDisplay != nil || hasMastering)
                 && (metadata.contentLightLevel != nil || hasLightLevel)
+                && (metadata.alternativeTransfer != nil || !wantsTransfer)
                 || videoPackets >= packetBudget
         }
         if isLive {
