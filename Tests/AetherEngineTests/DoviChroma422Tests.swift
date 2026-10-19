@@ -25,6 +25,12 @@ struct DoviChroma422Tests {
         }
     }
 
+    /// One `AVChromaLocation` per vertical siting: LEFT (between rows 2k and 2k + 1), TOPLEFT (on row 2k),
+    /// BOTTOMLEFT (on row 2k + 1).
+    static let sitings: [UInt32] = [1, 3, 5]
+    /// Every value the kernel distinguishes, UNSPECIFIED and the horizontally shifted twins included.
+    static let allLocations: [UInt32] = [0, 1, 2, 3, 4, 5, 6]
+
     /// Cheap deterministic noise in [-16, 16].
     static func n(_ x: Int, _ y: Int) -> Int { Int((UInt32(truncatingIfNeeded: x &* 73_856_093 ^ y &* 19_349_663) >> 7) % 33) - 16 }
 
@@ -57,9 +63,10 @@ struct DoviChroma422Tests {
     }
 
     @Test("sv22 4:2:2-site chroma: the GPU matches the CPU model on real RPU coefficient sets",
-          arguments: DoviChroma422Tests.realParams().map(\.0))
-    func gpuMatchesModel(name: String) throws {
-        let p = try #require(Self.realParams().first { $0.0 == name }).1
+          arguments: DoviChroma422Tests.realParams().map(\.0), DoviChroma422Tests.sitings)
+    func gpuMatchesModel(name: String, location: UInt32) throws {
+        var p = try #require(Self.realParams().first { $0.0 == name }).1
+        p.blChromaLocation = location
         let (w, h) = (256, 64)
         // A luma ramp with grain, chroma swept around neutral down the rows and across, an EL of +-40 codes.
         let (bl, el) = try Self.buffers(width: w, height: h,
@@ -80,8 +87,8 @@ struct DoviChroma422Tests {
                 cr.add((Self.word(mcr, p) - Int(g.word(x, row, 1))) / unit)
             }
         }
-        print("[422] \(name): Cb \(cb.description)")
-        print("[422] \(name): Cr \(cr.description)")
+        print("[422] \(name) loc \(location): Cb \(cb.description)")
+        print("[422] \(name) loc \(location): Cr \(cr.description)")
         for (label, st) in [("Cb", cb), ("Cr", cr)] {
             #expect(st.over1Pct < 0.5, "\(label): \(st.description)")
             #expect(st.exactPct > 90, "\(label): \(st.description)")
@@ -137,11 +144,12 @@ struct DoviChroma422Tests {
     }
 
     @Test("top and bottom rows clamp to the edge chroma rows: exact against the model, no out-of-bounds reads",
-          arguments: [16, 4])
-    func edgeRowsClamp(height: Int) throws {
+          arguments: [16, 4], DoviChroma422Tests.allLocations)
+    func edgeRowsClamp(height: Int, location: UInt32) throws {
         // Identity curves are exact on the interpolated fraction (n / 128 codes times 4), so every sample must
         // match exactly; an out-of-range row read as 0 would pull the edge rows far down.
-        let p = DoviGpuEdgeCaseTests.params()
+        var p = DoviGpuEdgeCaseTests.params()
+        p.blChromaLocation = location
         let (bl, el) = try Self.buffers(width: 64, height: height,
             bl: { x, y, _ in 400 + 7 * x + 11 * y }, blUV: { x, y, c in c == 0 ? 900 - 37 * y + x : 120 + 41 * y + x },
             el: { _, _, _ in 512 }, elUV: { x, y, c in 512 + (c == 0 ? 3 * y - x % 5 : 2 * x % 7 - y) })
@@ -157,7 +165,50 @@ struct DoviChroma422Tests {
                 }
             }
         }
-        #expect(mismatches == 0, "\(mismatches) samples differ from the model at height \(height)")
+        #expect(mismatches == 0, "\(mismatches) samples differ from the model at height \(height), location \(location)")
+    }
+
+    @Test("top / bottom siting: the row on the chroma site is the 4:2:0 composition bit for bit, the other half way",
+          arguments: [UInt32(3), 4, 5, 6])
+    func onSiteRowsAreTheFourTwoZeroComposition(location: UInt32) throws {
+        var (name, p) = try #require(Self.realParams().first { $0.0 == "clip C" })
+        p.blChromaLocation = location
+        // Luma varies across columns only, so the 4:2:0 kernel's two-row average is this row's [1 2 1]; chroma and
+        // the EL vary in both directions, with grain.
+        let (w, h) = (64, 32)
+        let (bl, el) = try Self.buffers(width: w, height: h,
+            bl: { x, _, _ in 200 + 9 * x }, blUV: { x, y, c in 512 + (c == 0 ? 11 * y - 90 : 60 - 7 * y) + Self.n(x, y) },
+            el: { x, y, _ in 512 + Self.n(x, y) * 40 / 16 }, elUV: { x, y, _ in 512 + Self.n(y, x) * 20 / 16 })
+        let new = M.plane(try Self.sv22(bl, el, p), 1, components: 2)
+        let old = M.plane(try Self.sv22(bl, el, p, duplicated: true), 1, components: 2)
+        let onSite = location <= 4 ? 0 : 1
+        var differ = 0
+        for row in stride(from: onSite, to: h, by: 2) {
+            for x in 0..<(w / 2) where new.word(x, row, 0) != old.word(x, row, 0) || new.word(x, row, 1) != old.word(x, row, 1) {
+                differ += 1
+            }
+        }
+        #expect(differ == 0, "\(name) location \(location): \(differ) on-site samples differ from the 4:2:0 composition")
+
+        // The other rows sit half way between two chroma rows: (-1, 9, 9, -1) / 16. Identity curves and no
+        // residual make the VDR code exactly 4 x the interpolated chroma, rounded to even.
+        var q = DoviGpuEdgeCaseTests.params(flags: [.disableResidual])
+        q.blChromaLocation = location
+        let ident = M.plane(try Self.sv22(bl, el, q), 1, components: 2)
+        let blUV = M.plane(bl, 1, components: 2)
+        func c(_ x: Int, _ r: Int, _ comp: Int) -> Double { Double(blUV.code(x, min(max(r, 0), h / 2 - 1), comp)) }
+        var wrong = 0
+        for row in stride(from: 1 - onSite, to: h, by: 2) {
+            let k = onSite == 0 ? row / 2 : row / 2 - 1   // halfway between chroma rows k and k + 1
+            for x in 0..<(w / 2) {
+                for comp in 0..<2 {
+                    let v = (-c(x, k - 1, comp) + 9 * c(x, k, comp) + 9 * c(x, k + 1, comp) - c(x, k + 2, comp)) / 16
+                    let vdr = Int((min(max(v, 0), 1023) * 4).rounded(.toNearestOrEven))
+                    if Self.word(vdr, q) != Int(ident.word(x, row, comp)) { wrong += 1 }
+                }
+            }
+        }
+        #expect(wrong == 0, "location \(location): \(wrong) half-way samples off the (-1, 9, 9, -1) / 16 value")
     }
 
     /// How far the 4:2:2-site rows move from the old duplicated rows on real content. A diagnostic, not a
@@ -183,6 +234,7 @@ struct DoviChroma422Tests {
         }
         try #require(n > 0, "no frames reached the composer")
         let half = Double(n / 2) * 64
+        print("[422diag] \(name): the decoder stamped blChromaLocation \(Set(rec.captures.map(\.params.blChromaLocation)).sorted()) (AVChromaLocation)")
         print(String(format: "[422diag] %@: %d frames, |new - duplicated| mean %.4f max %.3f (10-bit codes), %.2f%% of samples changed; mean Cb %.3f -> %.3f, Cr %.3f -> %.3f",
                      name, rec.captures.count, sum / Double(n) / 64, Double(maxAbs) / 64, 100 * Double(changed) / Double(n),
                      meanOld[0] / half, meanNew[0] / half, meanOld[1] / half, meanNew[1] / half))

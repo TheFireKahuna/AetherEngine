@@ -58,6 +58,7 @@ struct DoviLayoutProbeTests {
         p.blMax = 1023
         p.vdrMax = 4095
         p.vdrScale = 4
+        p.blChromaLocation = 3
 
         return p
     }
@@ -185,6 +186,7 @@ struct DoviLayoutProbeTests {
                 expect(Self.slot(c, k), Self.sentinel(c, k), "\(names[c]).\(field)")
             }
         }
+        expect(DoviFelComposer.layoutProbeSlots - 1, 3, "bl_chroma_loc")
     }
 
     @Test("Bit depths derive the normalisation constants, and reject pairs the kernels cannot express")

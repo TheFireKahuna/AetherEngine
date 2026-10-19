@@ -209,6 +209,10 @@ struct DoviMetalParams: Sendable {
     var vdrMax: UInt32 = 4095
     /// `1 << (vdr_bit_depth - bl_bit_depth)`; residual and denormalisation scale.
     var vdrScale: UInt32 = 4
+    /// The base layer's chroma siting, FFmpeg's `AVChromaLocation` raw value (`chroma_sample_loc_type` + 1,
+    /// 0 = unspecified), from the stream's codec parameters (`DualLayerVideoDecoder`). Only the sv22 chroma
+    /// kernel reads it, for the vertical phase of each 4:2:2 row; unspecified is taken as LEFT, as HEVC infers.
+    var blChromaLocation: UInt32 = 0
 
     init() {}
 
@@ -216,7 +220,7 @@ struct DoviMetalParams: Sendable {
     static let serializedSize =
         4 * 8
         + 3 * (DoviPolynomialParams.stride + DoviMmrParams.stride + DoviNlqParams.stride)
-        + 4 * 6
+        + 4 * 7
 
     /// Derives ``blMax``, ``vdrMax`` and ``vdrScale`` from the RPU's declared bit
     /// depths. Returns false, leaving the values untouched, for a combination the
@@ -334,6 +338,7 @@ struct DoviMetalParams: Sendable {
         w.u32(blMax)
         w.u32(vdrMax)
         w.u32(vdrScale)
+        w.u32(blChromaLocation)
 
         precondition(w.offset == Self.serializedSize,
                      "DoviMetalParams serialization is not serializedSize bytes")

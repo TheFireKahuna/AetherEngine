@@ -25,7 +25,7 @@ struct DoviShaderSyncTests {
         params.polyY.numPivots = 9
         params.mmrCb.coefShift = 23
         #expect(params.serialize().count == DoviMetalParams.serializedSize)
-        #expect(DoviMetalParams.serializedSize == 2972,
+        #expect(DoviMetalParams.serializedSize == 2976,
                 "The parameter ABI changed; update tests and probe asserts")
     }
 
