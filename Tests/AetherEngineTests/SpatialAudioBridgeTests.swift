@@ -570,6 +570,18 @@ struct SpatialAudioBridgeTests {
         #expect(try Data(contentsOf: muxed.segment).count > 1000, "the segment carries audio")
     }
 
+    @Test("object output: CODECS and CHANNELS both name the 7.1.4 tier, whatever bed layout was asked for",
+          arguments: [SpatialSpeakerLayout.l714, .l916, .l512])
+    func objectOutputAnnouncesItsTier(layout: SpatialSpeakerLayout) throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: layout,
+            decoder: SyntheticDecoder(skipAfterReset: 0), objectOutput: true)
+        defer { bridge.close() }
+        #expect(bridge.hlsCodecs == "apac.31.03")
+        #expect(bridge.servedChannelCount == 12)
+    }
+
     /// The timestamp contract again, with the click carried by an object (`APACObjectEncoder`): its
     /// priming and packet stamping have to put it where the source did, like the bed encoder's.
     @Test("object output: a click decodes back at its source position through AVFoundation")

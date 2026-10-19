@@ -42,7 +42,13 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     let soundSampleEntryOverride: Data?
     /// HLS `CODECS` value for the track.
     let hlsCodecs: String
-    var servedChannelCount: Int? { layout.channelCount }
+    var servedChannelCount: Int? {
+#if APACObjectOutput
+        // CHANNELS agrees with CODECS: both name the tier the object stream is announced as.
+        if objectOutput { return Self.objectAnnouncedLayout.channelCount }
+#endif
+        return layout.channelCount
+    }
     let peakOutputBitRate: Int64
 
     private let srcTimeBase: AVRational
@@ -81,6 +87,9 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// (the system renderer mixes after the encode). The presentation the chunk being filled holds.
     private let objectOutput: Bool
     private var objectRoles: [ObjectAudioRole] = []
+    /// The channel bed an object stream is announced as in the playlist (see `init`): the one tvOS
+    /// renders it to for an HDMI Atmos route.
+    static let objectAnnouncedLayout = SpatialSpeakerLayout.l714
 #endif
 
     /// Timeline, in 48 kHz frames on the output time base.
@@ -164,7 +173,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             // MAT: APAC levels are channel-count tiers, level 0 the stereo one, and the player decides on
             // MAT for HLS from the playlist (MediaToolbox's HLS Atmos selection, HasAtmosAlternates /
             // AtmosIsSupported) before it reads the stream. The decoder takes the scene from the dapa box.
-            hlsCodecs = APACSampleEntry.codecsString(channelCount: SpatialSpeakerLayout.l714.channelCount)
+            hlsCodecs = APACSampleEntry.codecsString(channelCount: Self.objectAnnouncedLayout.channelCount)
         } else {
             rate = bitRate ?? layout.channelCount * Self.bitRatePerChannel
             encoder = try APACEncoder(layout: layout, sampleRate: Double(Self.sampleRate), bitRate: rate)
