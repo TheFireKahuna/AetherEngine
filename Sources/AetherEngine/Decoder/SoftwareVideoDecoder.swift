@@ -806,18 +806,21 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         logOutputFormat(outputFormat, source: av_get_pix_fmt_name(srcFmt).map { String(cString: $0) } ?? "?",
                         colorRange: frame.pointee.color_range)
 
-        let setup = SwscaleSetup(
-            width: Int32(width), height: Int32(height), source: srcFmt, destination: dstFmt,
-            sourceFullRange: frame.pointee.color_range == AVCOL_RANGE_JPEG || Self.isJPEGFormat(srcFmt),
-            destinationFullRange: outputFormat.fullRange,
-            colorspace: Self.swscaleColorspace(ColorAttachments.presented(
-                ColorDescription(frame: frame), frameSize: (frame.pointee.width, frame.pointee.height)).matrix))
-        if setup != swsKey {
-            sws_freeContext(swsContext)
-            swsContext = setup.makeContext()
-            swsKey = swsContext == nil ? nil : setup
+        let directShift = Self.directCopyShift(source: srcFmt, destination: dstFmt)
+        if directShift == nil {
+            let setup = SwscaleSetup(
+                width: Int32(width), height: Int32(height), source: srcFmt, destination: dstFmt,
+                sourceFullRange: frame.pointee.color_range == AVCOL_RANGE_JPEG || Self.isJPEGFormat(srcFmt),
+                destinationFullRange: outputFormat.fullRange,
+                colorspace: Self.swscaleColorspace(ColorAttachments.presented(
+                    ColorDescription(frame: frame), frameSize: (frame.pointee.width, frame.pointee.height)).matrix))
+            if setup != swsKey {
+                sws_freeContext(swsContext)
+                swsContext = setup.makeContext()
+                swsKey = swsContext == nil ? nil : setup
+            }
+            guard swsContext != nil else { return nil }
         }
-        guard swsContext != nil else { return nil }
 
         var pixelBuffer: CVPixelBuffer?
         guard let pool = ensurePixelBufferPool(width: width, height: height, format: outputFormat) else { return nil }
@@ -829,6 +832,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         CVPixelBufferLockBaseAddress(pb, [])
         defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+
+        if let directShift {
+            Self.copyPlanarToBiPlanar(frame, into: pb, shift: directShift)
+            if outputFormat.dithers { Self.ditherTo10Bit(pb) }
+            return pb
+        }
 
         let yPlane = CVPixelBufferGetBaseAddressOfPlane(pb, 0)!
             .assumingMemoryBound(to: UInt8.self)
@@ -870,17 +879,117 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             }
         }
 
-        if outputFormat.dithers {
-            for plane in 0..<2 {
-                // Words per row: one per luma pixel, two per sample of the interleaved chroma plane.
-                Self.ditherTo10Bit(plane: CVPixelBufferGetBaseAddressOfPlane(pb, plane)!,
-                                   bytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pb, plane),
-                                   width: CVPixelBufferGetWidthOfPlane(pb, plane) * (plane == 0 ? 1 : 2),
-                                   height: CVPixelBufferGetHeightOfPlane(pb, plane))
-            }
-        }
+        if outputFormat.dithers { Self.ditherTo10Bit(pb) }
 
         return pb
+    }
+
+    /// Both planes of a locked bi-planar 16-bit buffer, through `ditherTo10Bit(plane:...)`.
+    static func ditherTo10Bit(_ pb: CVPixelBuffer) {
+        for plane in 0..<2 {
+            // Words per row: one per luma pixel, two per sample of the interleaved chroma plane.
+            ditherTo10Bit(plane: CVPixelBufferGetBaseAddressOfPlane(pb, plane)!,
+                          bytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pb, plane),
+                          width: CVPixelBufferGetWidthOfPlane(pb, plane) * (plane == 0 ? 1 : 2),
+                          height: CVPixelBufferGetHeightOfPlane(pb, plane))
+        }
+    }
+
+    /// #8: the left shift that turns the source's planar samples into the destination's bi-planar
+    /// words, when the conversion is nothing more than that: planar YCbCr into the bi-planar format
+    /// with the same subsampling and the same sample size (8-bit into 8-bit, 9...16-bit into 16-bit
+    /// words, MSB-aligned). nil otherwise, and for 4:2:0, where swscale has unscaled converters of its
+    /// own (NV12 0.17 ms, P010 0.70 ms per 4K frame). For 4:2:2 and 4:4:4 it has none and runs its full
+    /// vertical scaler at the identity size: 4.9 ms for NV16, 9.2 ms for P210, 15 ms for P410 per 4K
+    /// frame on an M4 Pro, against well under a millisecond for this copy. The range and the matrix
+    /// are unchanged by construction (`SwscaleSetup` would copy the levels across all the same).
+    static func directCopyShift(source: AVPixelFormat, destination: AVPixelFormat) -> Int? {
+        guard let src = av_pix_fmt_desc_get(source)?.pointee,
+              let dst = av_pix_fmt_desc_get(destination)?.pointee else { return nil }
+        let excluded = UInt64(AV_PIX_FMT_FLAG_RGB) | UInt64(AV_PIX_FMT_FLAG_ALPHA) | UInt64(AV_PIX_FMT_FLAG_FLOAT)
+            | UInt64(AV_PIX_FMT_FLAG_BE) | UInt64(AV_PIX_FMT_FLAG_PAL) | UInt64(AV_PIX_FMT_FLAG_BITSTREAM)
+        guard src.nb_components == 3, (src.flags & UInt64(AV_PIX_FMT_FLAG_PLANAR)) != 0, (src.flags & excluded) == 0,
+              src.log2_chroma_h == 0, src.log2_chroma_w <= 1,
+              src.log2_chroma_w == dst.log2_chroma_w, src.log2_chroma_h == dst.log2_chroma_h,
+              src.comp.0.plane == 0, src.comp.1.plane == 1, src.comp.2.plane == 2,
+              src.comp.0.shift == 0, src.comp.1.shift == 0, src.comp.2.shift == 0,
+              dst.comp.0.plane == 0, dst.comp.1.plane == 1, dst.comp.2.plane == 1,
+              (dst.flags & UInt64(AV_PIX_FMT_FLAG_BE)) == 0 else { return nil }
+        let srcBytes = Int(src.comp.0.step), dstBytes = Int(dst.comp.0.step)
+        guard srcBytes == dstBytes, srcBytes == 1 || srcBytes == 2,
+              src.comp.1.step == src.comp.0.step, src.comp.2.step == src.comp.0.step else { return nil }
+        let shift = Int(dst.comp.0.depth + dst.comp.0.shift) - Int(src.comp.0.depth)
+        guard shift >= 0, shift < 8 * srcBytes else { return nil }
+        return shift
+    }
+
+    /// The copy `directCopyShift` allows: luma shifted row by row, the two chroma planes shifted and
+    /// interleaved into the bi-planar chroma plane. Buffer locked by the caller.
+    static func copyPlanarToBiPlanar(_ frame: UnsafePointer<AVFrame>, into pb: CVPixelBuffer, shift: Int) {
+        let desc = av_pix_fmt_desc_get(AVPixelFormat(rawValue: frame.pointee.format))!.pointee
+        let wide = desc.comp.0.step == 2
+        let width = Int(frame.pointee.width), height = Int(frame.pointee.height)
+        let chromaWidth = (width + (1 << Int(desc.log2_chroma_w)) - 1) >> Int(desc.log2_chroma_w)
+        let srcY = UnsafeRawPointer(frame.pointee.data.0!), srcU = UnsafeRawPointer(frame.pointee.data.1!)
+        let srcV = UnsafeRawPointer(frame.pointee.data.2!)
+        let lumaStride = Int(frame.pointee.linesize.0), chromaStride = Int(frame.pointee.linesize.1)
+        let chromaStrideV = Int(frame.pointee.linesize.2)
+        let dstY = CVPixelBufferGetBaseAddressOfPlane(pb, 0)!, dstC = CVPixelBufferGetBaseAddressOfPlane(pb, 1)!
+        let dstYStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), dstCStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 1)
+        for y in 0..<height {
+            let sy = srcY + y * lumaStride, dy = dstY + y * dstYStride
+            let su = srcU + y * chromaStride, sv = srcV + y * chromaStrideV, dc = dstC + y * dstCStride
+            if wide {
+                let s = UInt16(shift)
+                var x = 0
+                while x + 8 <= width {
+                    dy.storeBytes(of: sy.loadUnaligned(fromByteOffset: 2 * x, as: SIMD8<UInt16>.self) &<< s,
+                                  toByteOffset: 2 * x, as: SIMD8<UInt16>.self)
+                    x += 8
+                }
+                while x < width {
+                    dy.storeBytes(of: sy.loadUnaligned(fromByteOffset: 2 * x, as: UInt16.self) << s,
+                                  toByteOffset: 2 * x, as: UInt16.self)
+                    x += 1
+                }
+                x = 0
+                while x + 8 <= chromaWidth {
+                    let u = su.loadUnaligned(fromByteOffset: 2 * x, as: SIMD8<UInt16>.self) &<< s
+                    let v = sv.loadUnaligned(fromByteOffset: 2 * x, as: SIMD8<UInt16>.self) &<< s
+                    dc.storeBytes(of: SIMD8(u[0], v[0], u[1], v[1], u[2], v[2], u[3], v[3]),
+                                  toByteOffset: 4 * x, as: SIMD8<UInt16>.self)
+                    dc.storeBytes(of: SIMD8(u[4], v[4], u[5], v[5], u[6], v[6], u[7], v[7]),
+                                  toByteOffset: 4 * x + 16, as: SIMD8<UInt16>.self)
+                    x += 8
+                }
+                while x < chromaWidth {
+                    dc.storeBytes(of: sv.loadUnaligned(fromByteOffset: 2 * x, as: UInt16.self) << s,
+                                  toByteOffset: 4 * x + 2, as: UInt16.self)
+                    dc.storeBytes(of: su.loadUnaligned(fromByteOffset: 2 * x, as: UInt16.self) << s,
+                                  toByteOffset: 4 * x, as: UInt16.self)
+                    x += 1
+                }
+            } else {
+                dy.copyMemory(from: sy, byteCount: width)
+                var x = 0
+                while x + 16 <= chromaWidth {
+                    let u = su.loadUnaligned(fromByteOffset: x, as: SIMD16<UInt8>.self)
+                    let v = sv.loadUnaligned(fromByteOffset: x, as: SIMD16<UInt8>.self)
+                    dc.storeBytes(of: SIMD16(u[0], v[0], u[1], v[1], u[2], v[2], u[3], v[3],
+                                             u[4], v[4], u[5], v[5], u[6], v[6], u[7], v[7]),
+                                  toByteOffset: 2 * x, as: SIMD16<UInt8>.self)
+                    dc.storeBytes(of: SIMD16(u[8], v[8], u[9], v[9], u[10], v[10], u[11], v[11],
+                                             u[12], v[12], u[13], v[13], u[14], v[14], u[15], v[15]),
+                                  toByteOffset: 2 * x + 16, as: SIMD16<UInt8>.self)
+                    x += 16
+                }
+                while x < chromaWidth {
+                    dc.storeBytes(of: su.load(fromByteOffset: x, as: UInt8.self), toByteOffset: 2 * x, as: UInt8.self)
+                    dc.storeBytes(of: sv.load(fromByteOffset: x, as: UInt8.self), toByteOffset: 2 * x + 1, as: UInt8.self)
+                    x += 1
+                }
+            }
+        }
     }
 
     /// Everything a conversion context is built from (`sws_getCachedContext` exposes neither range nor
