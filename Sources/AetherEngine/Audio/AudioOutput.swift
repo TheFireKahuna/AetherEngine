@@ -36,10 +36,33 @@ final class AudioOutput: @unchecked Sendable {
         return _epoch
     }
 
+    /// Whether renderers join the synchronizer through `sampleBufferReceiver(adding:)` (tvOS / macOS 27) rather
+    /// than the `addRenderer` / `removeRenderer` pair the 27 SDKs deprecate. Only the attach and detach move:
+    /// buffers still go to the renderers themselves, which a receiver-attached renderer accepts (checked on
+    /// macOS 27). Process-wide, read at each attach; a switch back to the old pair for A/B on a device,
+    /// since this attach path is where tvOS has failed before (-12080, #351). Earlier systems always use it.
+    static var usesSampleBufferReceivers: Bool {
+        get { receiverSwitch.withLock { $0 } }
+        set { receiverSwitch.withLock { $0 = newValue } }
+    }
+    private static let receiverSwitch = OSAllocatedUnfairLock(initialState: true)
+
+    /// The receivers the renderers were attached with. Typed `AnyObject` because the receiver types exist
+    /// only on 27. The video one is what `removeReceiver(_:at:)` takes; the audio renderer is never removed
+    /// (it lives as long as the synchronizer), and its receiver is held anyway: dropping one did not detach
+    /// its renderer on macOS 27, but that is not documented, so neither is let go while attached. Guarded
+    /// by `lock`.
+    private var audioReceiver: AnyObject?
+    private var videoReceiver: AnyObject?
+
     init() {
         renderer = AVSampleBufferAudioRenderer()
         synchronizer = AVSampleBufferRenderSynchronizer()
-        synchronizer.addRenderer(renderer)
+        if #available(macOS 27, iOS 27, tvOS 27, visionOS 27, *), Self.usesSampleBufferReceivers {
+            audioReceiver = synchronizer.sampleBufferReceiver(adding: renderer)
+        } else {
+            synchronizer.addRenderer(renderer)
+        }
 
         // Spatial audio for AirPods Pro/Max and HomePod: renderer spatializes multichannel when system-enabled.
         renderer.allowedAudioSpatializationFormats = .multichannel
@@ -142,7 +165,14 @@ final class AudioOutput: @unchecked Sendable {
     /// FigVideoQueueRemote err=-12080 after the first enqueue. Taken as the renderer rather than read off the
     /// layer here, because the layer is main-actor isolated in the 27 SDKs and this runs off it (#351).
     func attachVideoRenderer(_ videoRenderer: AVSampleBufferVideoRenderer) {
-        synchronizer.addRenderer(videoRenderer)
+        if #available(macOS 27, iOS 27, tvOS 27, visionOS 27, *), Self.usesSampleBufferReceivers {
+            let receiver = synchronizer.sampleBufferReceiver(adding: videoRenderer)
+            lock.lock()
+            videoReceiver = receiver
+            lock.unlock()
+        } else {
+            synchronizer.addRenderer(videoRenderer)
+        }
     }
 
     /// Remove the video renderer and block until removal completes. The synchronizer detaches asynchronously;
@@ -152,8 +182,18 @@ final class AudioOutput: @unchecked Sendable {
     /// the handoff deterministic.
     func detachVideoRenderer(_ videoRenderer: AVSampleBufferVideoRenderer) {
         let semaphore = DispatchSemaphore(value: 0)
-        synchronizer.removeRenderer(videoRenderer, at: synchronizer.currentTime()) { _ in
-            semaphore.signal()
+        lock.lock()
+        let attachedReceiver = videoReceiver
+        videoReceiver = nil
+        lock.unlock()
+        if #available(macOS 27, iOS 27, tvOS 27, visionOS 27, *),
+           let receiver = attachedReceiver as? AVSampleBufferVideoRenderer.Receiver {
+            // Attached through a receiver: removed through it, the async counterpart of removeRenderer.
+            Self.removeReceiver(receiver, from: synchronizer, at: synchronizer.currentTime()) { semaphore.signal() }
+        } else {
+            synchronizer.removeRenderer(videoRenderer, at: synchronizer.currentTime()) { _ in
+                semaphore.signal()
+            }
         }
         let result = semaphore.wait(timeout: .now() + .seconds(1))
         #if DEBUG
@@ -161,6 +201,25 @@ final class AudioOutput: @unchecked Sendable {
             EngineLog.emit("[AudioOutput] detachVideoRenderer: timed out waiting for synchronizer removal", category: .swPlayback)
         }
         #endif
+    }
+
+    /// Removes a receiver-attached video renderer and calls `done` once the synchronizer has, off the caller's
+    /// thread. The receiver is handed over (`sending`): nothing else holds it once `detachVideoRenderer` cleared
+    /// `videoReceiver`.
+    @available(macOS 27, iOS 27, tvOS 27, visionOS 27, *)
+    private static func removeReceiver(_ receiver: sending AVSampleBufferVideoRenderer.Receiver,
+                                       from synchronizer: AVSampleBufferRenderSynchronizer,
+                                       at time: CMTime, done: @escaping @Sendable () -> Void) {
+        // A closure's captures cannot be `sending` (the compiler cannot know it runs once); this one
+        // runs once and is the receiver's only holder, which is what the opt-out below asserts.
+        nonisolated(unsafe) let handedOver = receiver
+        // Detached, so the removal never needs the caller's executor: the caller (the host's stop(), on the
+        // main actor) blocks on `done` for up to a second, as it did on removeRenderer's callback.
+        Task.detached {
+            nonisolated(unsafe) let receiver = handedOver
+            _ = await synchronizer.removeReceiver(receiver, at: time)
+            done()
+        }
     }
 
     var volume: Float {

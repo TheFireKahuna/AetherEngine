@@ -11,4 +11,14 @@ extension AetherEngine {
         get { AudioOutput.prerollStartMargin }
         set { AudioOutput.prerollStartMargin = newValue }
     }
+
+    /// Whether renderers join the clock through `sampleBufferReceiver(adding:)` on tvOS / macOS 27 (default
+    /// true) or through the `addRenderer` / `removeRenderer` pair the 27 SDKs deprecate. Buffers reach the
+    /// renderers the same way either way. A switch for A/B on a device; read at each attach, so it applies
+    /// from the next session. No effect before 27.
+    @_spi(Diagnostics)
+    public nonisolated static var usesSampleBufferReceivers: Bool {
+        get { AudioOutput.usesSampleBufferReceivers }
+        set { AudioOutput.usesSampleBufferReceivers = newValue }
+    }
 }
