@@ -157,7 +157,14 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             let objects = try APACObjectEncoder(bitRate: rate, sampleRate: Double(Self.sampleRate))
             encoder = objects
             channels = APACObjectEncoder.elementCapacity
-            hlsCodecs = objects.hlsCodecs
+            // Advertised as the 7.1.4 channel tier the HDMI route renders it to, not the stream's own
+            // profile and level (`objects.hlsCodecs`, apac.05.00). On a tvOS 27.2 Apple TV the object
+            // stream announced as apac.05.00 reached the receiver as multichannel PCM, where the 7.1.4
+            // bed (apac.31.03) and the same objects played from a file (no playlist) reached it as Dolby
+            // MAT: APAC levels are channel-count tiers, level 0 the stereo one, and the player decides on
+            // MAT for HLS from the playlist (MediaToolbox's HLS Atmos selection, HasAtmosAlternates /
+            // AtmosIsSupported) before it reads the stream. The decoder takes the scene from the dapa box.
+            hlsCodecs = APACSampleEntry.codecsString(channelCount: SpatialSpeakerLayout.l714.channelCount)
         } else {
             rate = bitRate ?? layout.channelCount * Self.bitRatePerChannel
             encoder = try APACEncoder(layout: layout, sampleRate: Double(Self.sampleRate), bitRate: rate)
@@ -181,7 +188,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         guard let cp = Self.makeStandInCodecpar() else { throw BridgeError.codecparAllocFailed }
         encoderCodecpar = cp
         EngineLog.emit(
-            "[SpatialAudioBridge] init: \(objectOutput ? "objects (\(channels - 1) slots + LFE)" : "layout=\(layout.rawValue)") "
+            "[SpatialAudioBridge] init: \(objectOutput ? "objects (\(channels - 1) slots + LFE, stream \(APACSampleEntry.codecsString(magicCookie: encoder.magicCookie) ?? "?"))" : "layout=\(layout.rawValue)") "
             + "bitRate=\(rate / 1000) kbps codecs=\(hlsCodecs) priming=\(encoder.leadingFrames) frames",
             category: .session
         )
