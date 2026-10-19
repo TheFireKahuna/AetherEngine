@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import CoreMedia
 import QuartzCore
+import os
 
 /// Audio output via AVSampleBufferAudioRenderer + AVSampleBufferRenderSynchronizer. The synchronizer is the
 /// **master clock** for the whole player: video frames check synchronizer.currentTime() to decide presentation.
@@ -384,6 +385,8 @@ final class AudioOutput: @unchecked Sendable {
     func seekClock(to time: CMTime, rate: Float) {
         // Asked before taking `lock`: the gate reads the video renderer's state under its own lock.
         let preroll = rate > 0 ? videoPrerollSatisfied?(time.seconds) : nil
+        // Read before `lock` too: the route's latency is an audio-session query.
+        let lead = preroll == true ? Self.currentPrerollStartLead() : 0
         lock.lock()
         defer { lock.unlock() }
         EngineLog.emit("[AudioOutput] seekClock to=\(String(format: "%.3f", time.seconds)) rate=\(rate)", category: .swPlayback)
@@ -394,7 +397,7 @@ final class AudioOutput: @unchecked Sendable {
             return
         }
         if preroll {
-            startAfterPreroll(rate: rate, time: time)
+            startAfterPreroll(rate: rate, time: time, lead: lead)
             return
         }
         synchronizer.setRate(0, time: timeline.rendererTime(forSource: time))
@@ -427,13 +430,51 @@ final class AudioOutput: @unchecked Sendable {
     /// How long a preroll may hold the clock. A decoder that never delivers must not freeze playback.
     static let prerollTimeout: Double = 2
 
-    /// How far ahead of now a prerolled start is scheduled. On tvOS the synchronizer lives in another
-    /// process, and the display path learns of a rate change about as late as the audio route's output
-    /// latency (138 ms measured on HDMI): a clock started "now" has already run that far when the first
-    /// frames are judged, and the ones due inside that window drop (3 to 5 a start on the A12 even with
-    /// the queue full). Scheduling the start 250 ms out took starts and seeks to 0 drops in every run
-    /// (8 of 8, 150 s soaks with 5 seeks; 500 ms was no better).
-    static let prerollStartLead: Double = 0.25
+    /// How far ahead of now a prerolled start is scheduled, at most. On tvOS the synchronizer lives in
+    /// another process, and the display path learns of a rate change about as late as the audio route's
+    /// output latency (138 ms measured on HDMI): a clock started "now" has already run that far when the
+    /// first frames are judged, and the ones due inside that window drop (3 to 5 a start on the A12 even
+    /// with the queue full). Scheduling the start 250 ms out took starts and seeks to 0 drops in every
+    /// run (8 of 8, 150 s soaks with 5 seeks; 500 ms was no better).
+    ///
+    /// The ceiling, not the lead: ``prerollStartLead(outputLatency:)`` follows the route, so a start on
+    /// a route faster than that HDMI sink is not held for latency it does not have. Never longer than
+    /// this, because a buffered AirPlay route reports seconds of latency the display path does not wait
+    /// for, and because 250 ms is the measured, drop-free figure.
+    static let prerollStartLeadCeiling: Double = 0.25
+
+    /// What the lead adds to the route's output latency: 112 ms, so the measured HDMI route (138 ms)
+    /// gets exactly the 250 ms that was validated on it. Process-wide and settable, for tuning on a device
+    /// against the renderer's dropped-frame count (`AetherEngine.prerollStartMargin`).
+    static var prerollStartMargin: Double {
+        get { prerollStartMarginSwitch.withLock { $0 } }
+        set { prerollStartMarginSwitch.withLock { $0 = max(0, newValue) } }
+    }
+    private static let prerollStartMarginSwitch = OSAllocatedUnfairLock(initialState: 0.112)
+
+    /// The prerolled start's lead for a route reporting `outputLatency` seconds: that latency plus the
+    /// margin, capped at the ceiling. Without a latency (no `AVAudioSession`, as on macOS), the ceiling.
+    static func prerollStartLead(outputLatency: Double?, margin: Double = prerollStartMargin) -> Double {
+        guard let latency = outputLatency, latency.isFinite, latency >= 0 else { return prerollStartLeadCeiling }
+        return min(prerollStartLeadCeiling, latency + max(0, margin))
+    }
+
+    /// ``prerollStartLead(outputLatency:)`` for the current audio route.
+    static func currentPrerollStartLead() -> Double {
+        #if os(iOS) || os(tvOS)
+        prerollStartLead(outputLatency: AVAudioSession.sharedInstance().outputLatency)
+        #else
+        prerollStartLead(outputLatency: nil)
+        #endif
+    }
+
+    /// The lead the last prerolled start was scheduled with, in seconds; nil before the first.
+    var lastPrerollStartLead: Double? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _lastPrerollStartLead
+    }
+    private var _lastPrerollStartLead: Double?  // guarded by lock
 
     private var prerollGeneration = 0  // guarded by lock
     private var prerollRate: Float?  // guarded by lock; non-nil while a preroll waits: the rate it starts at
@@ -462,6 +503,7 @@ final class AudioOutput: @unchecked Sendable {
             }
             return
         }
+        let lead = Self.currentPrerollStartLead()
         lock.lock()
         defer { lock.unlock() }
         guard prerollGeneration == gen, let rate = prerollRate else { return }
@@ -469,13 +511,16 @@ final class AudioOutput: @unchecked Sendable {
         EngineLog.emit("[AudioOutput] preroll \(ready ? "ready" : "timed out") after "
                        + "\(String(format: "%.0f", waited * 1000)) ms; starting at t=\(String(format: "%.3f", time.seconds)) rate=\(rate)",
                        category: .swPlayback)
-        startAfterPreroll(rate: rate, time: time)
+        startAfterPreroll(rate: rate, time: time, lead: lead)
     }
 
-    /// Starts the clock `prerollStartLead` from now. Called with `lock` held.
-    private func startAfterPreroll(rate: Float, time: CMTime) {
+    /// Starts the clock `lead` seconds from now (``currentPrerollStartLead()``, read by the caller before
+    /// it took `lock`). Called with `lock` held.
+    private func startAfterPreroll(rate: Float, time: CMTime, lead: Double) {
+        _lastPrerollStartLead = lead
+        EngineLog.emit("[AudioOutput] start lead \(String(format: "%.0f", lead * 1000)) ms", category: .swPlayback, level: .verbose)
         let hostNow = CMClockGetTime(CMClockGetHostTimeClock())
-        let host = CMTimeAdd(hostNow, CMTime(seconds: Self.prerollStartLead, preferredTimescale: 1_000_000_000))
+        let host = CMTimeAdd(hostNow, CMTime(seconds: lead, preferredTimescale: 1_000_000_000))
         synchronizer.setRate(rate, time: timeline.rendererTime(forSource: time), atHostTime: host)
     }
 

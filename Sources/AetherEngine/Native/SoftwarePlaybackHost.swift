@@ -1507,6 +1507,13 @@ final class SoftwarePlaybackHost {
         }
         if !demuxLoopStarted, let aOut = audioOutput {
             aOut.attachVideoRenderer(renderer.videoRenderer)
+            if let recommended = renderer.recommendedPixelBufferAttributes() {
+                let line = recommended.keys.sorted().map { "\($0)=\(String(describing: recommended[$0]!).replacingOccurrences(of: "\n", with: ""))" }
+                EngineLog.emit("[SoftwarePlaybackHost] video renderer recommends [\(line.joined(separator: ", "))]", category: .swPlayback)
+                #if DualLayerDolbyVision
+                DoviFelComposer.rendererRecommendedAttributes = recommended
+                #endif
+            }
         }
         if !demuxLoopStarted {
             demuxLoopStarted = true

@@ -400,6 +400,16 @@ final class SampleBufferRenderer: @unchecked Sendable {
         videoRenderer = layer.sampleBufferRenderer
     }
 
+    /// The pixel buffer attributes the renderer asks frames to be made with (`recommendedPixelBufferAttributes`,
+    /// tvOS 26); nil on earlier systems. The system's own statement of what it prefers to be handed: the FEL
+    /// composer builds its output pool with it, and the host logs it once per session.
+    func recommendedPixelBufferAttributes() -> [String: Any]? {
+        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) {
+            return videoRenderer.__recommendedPixelBufferAttributes
+        }
+        return nil
+    }
+
     /// #303: what the display did with the frames, as the renderer itself counts them. Our own
     /// counters can only see what we refuse; `numberOfDroppedFrames` also covers frames dropped for
     /// missing their display deadline, which is the class that shows up as a stutter.

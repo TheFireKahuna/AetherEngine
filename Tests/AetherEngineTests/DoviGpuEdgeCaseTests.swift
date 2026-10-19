@@ -396,6 +396,36 @@ extension DoviGpuEdgeCaseTests {
         #expect(Self.rawWord(rounded, plane: 0) == 500 << 6)
     }
 
+    @Test("the renderer's recommendation fills only keys the composer leaves open")
+    func recommendationMergesUnderTheComposersOwnKeys() {
+        let recommended: [String: Any] = [
+            kCVPixelBufferIOSurfaceCoreAnimationCompatibilityKey as String: true,
+            "PreferRealTimeCacheModeIfEveryoneDoes": true,
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,   // must not win
+            kCVPixelBufferIOSurfacePropertiesKey as String: ["Theirs": 1, "Shared": 1],
+        ]
+        let merged = DoviFelComposer.mergingRecommendation(recommended, into: [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelBufferIOSurfacePropertiesKey: ["Shared": 2] as [String: Any],
+        ])
+        #expect(merged[kCVPixelBufferPixelFormatTypeKey] as? OSType == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+        #expect(merged[kCVPixelBufferIOSurfaceCoreAnimationCompatibilityKey] as? Bool == true)
+        #expect(merged["PreferRealTimeCacheModeIfEveryoneDoes" as CFString] as? Bool == true)
+        let surface = merged[kCVPixelBufferIOSurfacePropertiesKey] as? [String: Any]
+        #expect(surface?["Theirs"] as? Int == 1)
+        #expect(surface?["Shared"] as? Int == 2, "the composer's IOSurface entries win")
+    }
+
+    @Test("the output pool is built with the renderer's recommendation")
+    func outputPoolCarriesTheRecommendation() throws {
+        let composer = try #require(DoviFelComposer())
+        composer.rendererRecommendedAttributesOverride = [kCVPixelBufferIOSurfaceCoreAnimationCompatibilityKey as String: true]
+        let pool = try #require(composer.ensurePoolForTesting(width: 64, height: 16))
+        let attrs = try #require(CVPixelBufferPoolGetPixelBufferAttributes(pool) as? [String: Any])
+        #expect(attrs[kCVPixelBufferIOSurfaceCoreAnimationCompatibilityKey as String] as? Bool == true)
+        #expect(attrs[kCVPixelBufferPixelFormatTypeKey as String] as? OSType == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+    }
+
     @Test("sv22 output carries the full-precision words in a 4:2:2 buffer, chroma on both rows")
     func sv22KeepsLowBitsAndDoublesChromaRows() throws {
         let composer = try #require(DoviFelComposer())
