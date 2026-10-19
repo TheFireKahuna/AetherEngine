@@ -84,6 +84,26 @@ final class AudioBridge: @unchecked Sendable {
         encoder == AV_CODEC_ID_EAC3 ? Int64(channels) * 128_000 : 0
     }
 
+    /// #4: the PCM intermediate a FLAC bridge encodes from, chosen from the format the OPENED decoder
+    /// produces rather than from a list of codecs. The list missed 24-bit Blu-ray LPCM (`pcm_bluray`,
+    /// the PCM track of an M2TS) and with it PCM_DVD, PCM_F32, WMA Lossless and others, and every codec
+    /// it missed went to a 16-bit FLAC: the "lossless" mode cut the bottom 8 bits of 24-bit PCM.
+    ///
+    /// 16-bit only where the decoder itself produces 16 bits or fewer, which encodes them exactly.
+    /// Everything else is S32 at 24 bits, FLAC's ceiling: integer 24/32-bit, and the float a lossy
+    /// decoder (AAC, Opus, Vorbis, MP3, a DTS core) produces, whose requantisation to 16 bits would add
+    /// noise the source does not have; a 24-bit FLAC costs bitrate, never fidelity. An unresolved format
+    /// (TrueHD and DTS defer theirs to the first frame) is never guessed down. `bits_per_raw_sample` is
+    /// deliberately not consulted: it is copied from the container and a stale 16 there could only
+    /// truncate, while the sample format is what libavcodec will actually hand the resampler.
+    static func flacIntermediate(decodedFormat: AVSampleFormat)
+        -> (format: AVSampleFormat, bytesPerSample: Int32, bitsPerRawSample: Int32) {
+        switch av_get_packed_sample_fmt(decodedFormat) {
+        case AV_SAMPLE_FMT_U8, AV_SAMPLE_FMT_S16: return (AV_SAMPLE_FMT_S16, 2, 16)
+        default:                                  return (AV_SAMPLE_FMT_S32, 4, 24)
+        }
+    }
+
     /// The sample rates an encoder in THIS build accepts, as libavcodec itself reports them. Empty means
     /// unconstrained (the codec advertises no list), which is the answer for FLAC.
     ///
@@ -196,9 +216,9 @@ final class AudioBridge: @unchecked Sendable {
     private let liveBytesLock = NSLock()
     private var publishedLiveBytes = LiveBytes(fifoSamples: 0, fifoBytes: 0, swrDelaySamples: 0, swrDelayBytes: 0)
 
-    /// PCM intermediate format end-to-end (resampler -> FIFO -> encoder). S16 for lossy sources (EAC3/AC3);
-    /// S32 @ bits_per_raw_sample=24 for lossless sources (TrueHD, DTS-HD MA, FLAC, ALAC, raw 24/32-bit PCM) so
-    /// FLAC output stays bit-perfect (S16 would dither away the bottom 8 bits, audible in quiet passages).
+    /// PCM intermediate format end-to-end (resampler -> FIFO -> encoder). FLTP for EAC3; for FLAC, S16 where
+    /// the decoder produces 16 bits or fewer and S32 @ bits_per_raw_sample=24 otherwise, so FLAC output
+    /// stays bit-perfect (S16 would cut away the bottom 8 bits, audible in quiet passages; #4).
     private var pcmSampleFmt: AVSampleFormat = AV_SAMPLE_FMT_FLTP
     private var pcmBytesPerSample: Int32 = 4
     private var pcmBitsPerRawSample: Int32 = 32
@@ -248,7 +268,7 @@ final class AudioBridge: @unchecked Sendable {
     /// Opens source decoder + bridge encoder (eagerly, so encoderCodecpar is ready for muxer init). The encoder
     /// comes from `bridgeEncoder(for:sourceChannels:)`, so it is settled only after the decoder is open and the
     /// source's channel count is resolved: EAC3 128 kbps/ch, max 6 ch, FLTP for a surround source in
-    /// `.surroundCompat`, FLAC max 8 ch, S16 (lossy src) or S32@24 (lossless src) otherwise. `forcedEncoder`
+    /// `.surroundCompat`, FLAC max 8 ch, S16 or S32@24 by the decoded format otherwise. `forcedEncoder`
     /// overrides that resolution and exists for the route's #165 cascade, which retries the other encoder when
     /// the resolved one is absent from the build. Incomplete source codecpar (TrueHD sometimes reports
     /// sample_rate=0 pre-frame) falls back to 48 kHz stereo, which the resampler reconfigures on the first
@@ -271,22 +291,7 @@ final class AudioBridge: @unchecked Sendable {
         decoderPacketThreshold = Self.decoderSilencePacketThreshold(for: srcCodecID)
 
         // PCM intermediate format follows the ENCODER (resolved below, after the channel count): EAC3 needs
-        // FLTP; FLAC takes S16 (lossy src) or S32@24 (lossless src).
-        let isLosslessSource: Bool
-        switch srcCodecID {
-        case AV_CODEC_ID_TRUEHD,
-             AV_CODEC_ID_MLP,
-             AV_CODEC_ID_DTS,
-             AV_CODEC_ID_FLAC,
-             AV_CODEC_ID_ALAC,
-             AV_CODEC_ID_PCM_S24LE,
-             AV_CODEC_ID_PCM_S24BE,
-             AV_CODEC_ID_PCM_S32LE,
-             AV_CODEC_ID_PCM_S32BE:
-            isLosslessSource = true
-        default:
-            isLosslessSource = false
-        }
+        // FLTP; FLAC takes what the opened decoder produces, 16-bit or S32@24 (`flacIntermediate`, #4).
         guard let srcCodec = avcodec_find_decoder(srcCodecID) else {
             throw AudioBridgeError.decoderNotFound(codecID: srcCodecID.rawValue)
         }
@@ -357,14 +362,9 @@ final class AudioBridge: @unchecked Sendable {
             pcmSampleFmt = AV_SAMPLE_FMT_FLTP
             pcmBytesPerSample = 4
             pcmBitsPerRawSample = 32
-        } else if isLosslessSource {
-            pcmSampleFmt = AV_SAMPLE_FMT_S32
-            pcmBytesPerSample = 4
-            pcmBitsPerRawSample = 24
         } else {
-            pcmSampleFmt = AV_SAMPLE_FMT_S16
-            pcmBytesPerSample = 2
-            pcmBitsPerRawSample = 16
+            (pcmSampleFmt, pcmBytesPerSample, pcmBitsPerRawSample) =
+                Self.flacIntermediate(decodedFormat: dec.pointee.sample_fmt)
         }
         guard let encCodec = avcodec_find_encoder(encoderCodecID) else {
             cleanup()
