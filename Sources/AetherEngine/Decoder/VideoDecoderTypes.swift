@@ -129,7 +129,17 @@ enum ColorAttachments {
     /// on VideoToolbox's output (`ColorInfoGuessedBy`): nothing declared reads as BT.709 in all three,
     /// at 720x480 and 720x576 as much as at 1080p and for MPEG-2 as much as H.264, and a lone BT.601
     /// matrix gets SMPTE-C primaries and the BT.709 curve.
-    static func presented(_ d: ColorDescription) -> Tags {
+    ///
+    /// #6: `frameSize` departs from VideoToolbox on purpose, for a picture that declares neither a
+    /// matrix nor primaries. What lands on the software route untagged is overwhelmingly DVD MPEG-2 and
+    /// SD broadcast, which was mastered BT.601, and decoding it with the BT.709 matrix shifts every
+    /// saturated colour (reds go orange, greens go yellow). The guess is mpv's: SD (narrower than 1280
+    /// and no taller than 576) is the BT.601 matrix, with EBU 3213 primaries for the 625-line heights
+    /// (576, 288) and SMPTE-C for the rest (480 / 486 NTSC and other SD sizes); anything larger is
+    /// BT.709. The curve stays BT.709 either way, which is what BT.1886 SD is tagged as. nil keeps the
+    /// VideoToolbox answer, for a caller that has to match the hardware path (a still of a source
+    /// playback decodes in hardware).
+    static func presented(_ d: ColorDescription, frameSize: (width: Int32, height: Int32)? = nil) -> Tags {
         let declaredPrimaries = primaries(d.primaries)
         let declaredMatrix = matrix(d.matrix)
         let bt709 = kCVImageBufferColorPrimaries_ITU_R_709_2
@@ -138,6 +148,14 @@ enum ColorAttachments {
         let bt2020Primaries = kCVImageBufferColorPrimaries_ITU_R_2020
         let smpteC = kCVImageBufferColorPrimaries_SMPTE_C
         let ebu = kCVImageBufferColorPrimaries_EBU_3213
+
+        if declaredPrimaries == nil, declaredMatrix == nil, let size = frameSize,
+           size.width < 1280, size.height <= 576 {
+            return Tags(
+                primaries: size.height == 576 || size.height == 288 ? ebu : smpteC,
+                transfer: transfer(d.transfer) ?? kCVImageBufferTransferFunction_ITU_R_709_2,
+                matrix: bt601Matrix)
+        }
 
         let resolvedPrimaries: CFString = declaredPrimaries ?? {
             switch declaredMatrix {
