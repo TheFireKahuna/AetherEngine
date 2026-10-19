@@ -8,8 +8,8 @@ public extension AetherEngine {
     /// The composer compiles its shaders from source on the first FEL frame of a process: about 300 ms on
     /// an M4 Pro the first time (longer on an Apple TV), then about 0.4 ms from Metal's shader cache until an
     /// app update or a cache purge. A host that calls this at launch, or when a Profile 7 title is selected,
-    /// spends that while the viewer is still in its UI. Call it from a detached task; it runs at utility
-    /// priority and returns when the shaders are ready.
+    /// spends that while the viewer is still in its UI. It compiles at utility priority off Swift's
+    /// cooperative pool and returns when the shaders are ready; a host need not wait for it.
     ///
     /// Safe to call any number of times, and concurrently with playback: the compile happens once per
     /// process, and a composition that starts while it runs waits for it rather than compiling again.
@@ -20,7 +20,8 @@ public extension AetherEngine {
     @discardableResult
     nonisolated static func prewarmDualLayerDolbyVision() async -> Bool {
         #if DualLayerDolbyVision
-        await Task.detached(priority: .utility) { DoviFelComposer.prewarmPipelines() }.value
+        // BlockingWork, not the cooperative pool: the compile blocks its thread for hundreds of milliseconds.
+        await BlockingWork.detached(priority: .utility) { DoviFelComposer.prewarmPipelines() }.value
         #else
         false
         #endif

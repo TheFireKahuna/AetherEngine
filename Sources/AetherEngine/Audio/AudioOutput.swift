@@ -213,9 +213,9 @@ final class AudioOutput: @unchecked Sendable {
         // A closure's captures cannot be `sending` (the compiler cannot know it runs once); this one
         // runs once and is the receiver's only holder, which is what the opt-out below asserts.
         nonisolated(unsafe) let handedOver = receiver
-        // Detached, so the removal never needs the caller's executor: the caller (the host's stop(), on the
-        // main actor) blocks on `done` for up to a second, as it did on removeRenderer's callback.
-        Task.detached {
+        // Off the caller's executor and off the cooperative pool (BlockingWork): the caller (the host's stop(),
+        // on the main actor) blocks on `done` for up to a second, as it did on removeRenderer's callback.
+        BlockingWork.detached {
             nonisolated(unsafe) let receiver = handedOver
             _ = await synchronizer.removeReceiver(receiver, at: time)
             done()
