@@ -274,7 +274,9 @@ extension AetherEngine {
         case p010BlueNoise = "p010-bluenoise"
         /// P010 with the sub-10-bit VDR bits in its low (padding) bits.
         case p010FullPrecision = "p010-full"
-        /// 16-bit 4:2:2 `sv22` carrying the same full-precision words, where they are defined values.
+        /// 16-bit 4:2:2 `sv22` carrying the same full-precision words, where they are defined values, with
+        /// chroma composed at every 4:2:2 site (vertical Catmull-Rom on the base chroma; not bit-exact with
+        /// Dolby's 4:2:0 reference).
         case sv22 = "sv22"
     }
 
