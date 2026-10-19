@@ -4,6 +4,7 @@
 # The 4K encode takes a few minutes; every intermediate is kept and reused, delete it to rebuild it.
 #
 #   pulse_{l2,l1,null}.mp4   Profile 8.1, the RPU switches (l2: trims, l1: max_pq, null: never)
+#   pulse_l8.mp4 / p7fel_l8.mp4  CM v4.0: only the L8 trims switch (does CM v4.0 metadata reach the panel?)
 #   p7fel_{l2,l1,null}.mp4   Profile 7 FEL, same RPUs; the enhancement layer is flat (zero residual)
 #   p7fel_el.mp4             Profile 7 FEL, constant RPU; the enhancement-layer residual switches
 #   p7fel_count_{null,l2}.mp4  Profile 7 FEL counter clips (fel_count.py): BL and EL each carry their own frame
@@ -22,7 +23,7 @@ for tool in x265 dovi_tool MP4Box python3 curl; do
 done
 python3 -c 'import numpy' 2>/dev/null || { echo "missing python module: numpy (python3 -m pip install numpy)"; exit 1; }
 
-for v in l2 l1 null; do
+for v in l2 l1 null l8; do
   python3 "$GEN" rpu-json $v > rpu_$v.json
   dovi_tool generate -j rpu_$v.json -o rpu_$v.bin
 done
@@ -39,7 +40,7 @@ if [[ ! -s base.hevc ]]; then
   mv base.hevc.tmp base.hevc
 fi
 
-for v in l2 l1 null; do
+for v in l2 l1 null l8; do
   dovi_tool inject-rpu -i base.hevc --rpu-in rpu_$v.bin -o pulse_$v.hevc
   rm -f pulse_$v.mp4
   MP4Box -add pulse_$v.hevc:fps=24000/1001:dvp=f8.1 -brand mp42isom -ab dby1 -quiet -new pulse_$v.mp4
@@ -86,6 +87,17 @@ for v in l2 null l1; do
   MP4Box -add p7_$v.hevc:fps=24000/1001:dvp=f7.6 -brand mp42isom -ab dby1 -quiet -new p7fel_$v.mp4
   rm el_$v.hevc p7_$v.hevc
 done
+
+# ---- p7fel_l8: the CM v4.0 L8 pulse on the FEL route ----
+# The FEL template RPU is CM v2.9, so the v4.0 levels (L3/L8/L9/L11/L254) only transfer with
+# allow_cmv4_transfer, which converts the template to CM v4.0 first.
+print '{"source_rpu":"'$OUT'/rpu_l8.bin","rpu_levels":[1,2,3,5,6,8,9,11,254],"allow_cmv4_transfer":true}' > fel_levels_l8.json
+dovi_tool editor -i fel_1584.bin -j fel_levels_l8.json -o fel_rpu_l8.bin
+dovi_tool inject-rpu -i el.hevc --rpu-in fel_rpu_l8.bin -o el_l8.hevc
+dovi_tool mux --bl base.hevc --el el_l8.hevc -o p7_l8.hevc
+rm -f p7fel_l8.mp4
+MP4Box -add p7_l8.hevc:fps=24000/1001:dvp=f7.6 -brand mp42isom -ab dby1 -quiet -new p7fel_l8.mp4
+rm el_l8.hevc p7_l8.hevc
 
 # ---- p7fel_el: constant RPU (the `null` one), the EL residual switches (arms TE, NE) ----
 # EL: flat 512 in phase A; in phase B a positive luma residual on a set of patches (gen_pulse.py
