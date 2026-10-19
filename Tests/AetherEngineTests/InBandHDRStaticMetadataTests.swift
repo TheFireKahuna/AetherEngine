@@ -189,6 +189,13 @@ struct InBandHDRStaticMetadataTests {
         #expect(!M.wantsAlternativeTransfer(primaries: AVCOL_PRI_BT2020, transfer: AVCOL_TRC_SMPTE2084))
         #expect(!M.wantsAlternativeTransfer(primaries: AVCOL_PRI_BT2020, transfer: AVCOL_TRC_ARIB_STD_B67))
         #expect(!M.wantsAlternativeTransfer(primaries: AVCOL_PRI_BT709, transfer: AVCOL_TRC_BT709))
+        // Static metadata is only looked for on a PQ / HLG source missing some of it: an SDR source
+        // (most of what arrives as MPEG-TS) pays no head scan, a live one no peek.
+        #expect(M.wantsStaticMetadata(transfer: AVCOL_TRC_SMPTE2084, hasMastering: false, hasLightLevel: true))
+        #expect(M.wantsStaticMetadata(transfer: AVCOL_TRC_ARIB_STD_B67, hasMastering: false, hasLightLevel: false))
+        #expect(!M.wantsStaticMetadata(transfer: AVCOL_TRC_SMPTE2084, hasMastering: true, hasLightLevel: true))
+        #expect(!M.wantsStaticMetadata(transfer: AVCOL_TRC_BT709, hasMastering: false, hasLightLevel: false))
+        #expect(!M.wantsStaticMetadata(transfer: AVCOL_TRC_UNSPECIFIED, hasMastering: false, hasLightLevel: false))
     }
 
     // MARK: - movenc
