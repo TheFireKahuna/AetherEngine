@@ -659,6 +659,21 @@ both axes (`DoviEnhancementUpsamplerTests`).
   resolving at compose time would follow completion order instead.
 - **Output precision:** `DoviDither.fullPrecision` keeps the VDR bits below the 10-bit code in P010's unused low
   6 bits. Opt-in, not yet validated on a display path; the default stays rounded or dithered 10-bit.
+- **Output modes** (`felOutputMode`, `--fel-output`): `p010` (Bayer dither, the default), `p010-round`,
+  `p010-bluenoise`, `p010-full` (the full-precision word in P010's padding) and `sv22` (16-bit 4:2:2 with the
+  same words, where they are defined values). The P010 modes compose chroma at its 4:2:0 sites, as Dolby's
+  reference does. `sv22` composes it at every 4:2:2 site instead (`dovi_compose_chroma_422`), because there
+  the composer, not tvOS, does the 4:2:0 -> 4:2:2 conversion, and repeating a 4:2:0 sample on both rows
+  throws away what the reshaping says about each row: under order-3 MMR chroma a luma edge between rows 2k
+  and 2k+1 predicts different chroma for the two. Each output row takes its luma from [1 2 1] on that row
+  alone, its base chroma from a vertical 4-tap Catmull-Rom (B = 0, C = 0.5) over the 4:2:0 rows at phase
+  3/4 or 1/4 (chroma vertically between luma rows 2k and 2k+1, the siting the two-row luma average at the
+  4:2:0 site assumes; taps -3, 29, 111, -9 over 128 and mirrored), kept fractional for the curves, and its
+  enhancement chroma bilinearly at the same row coordinate. This is libplacebo's order (chroma upsampled,
+  then reshaped), a deliberate quality choice that is not bit-exact with Dolby's 4:2:0 reference; on flat
+  chroma it equals the 4:2:0 result exactly. It costs the chroma pass twice the threads: 0.35 -> 0.72 ms at
+  UHD on an M4 Pro (`DoviGpuBenchmark`), the P010 modes unchanged. `DoviChroma422Tests` holds it against
+  the CPU model.
 - **Composed-frame RPU override (experiment):** `AetherEngine.felComposedRpuOverride` (`@_spi(Diagnostics)`,
   trait only; `aetherctl feltest|play --fel-rpu-override <file>`, the probe app's `rpu=<url>` arm option)
   replaces the converted RPU on every frame the composer produced, base-layer-only compositions included,

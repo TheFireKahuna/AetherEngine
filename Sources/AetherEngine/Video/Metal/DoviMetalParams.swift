@@ -45,7 +45,10 @@ enum DoviOutputMode: String, CaseIterable, Sendable {
     case p010FullPrecision = "p010-full"
     /// 16-bit 4:2:2 (`sv22`) with ``DoviDither/fullPrecision``. Its video range (luma 4096...60160) is
     /// the 10-bit range shifted left 6, so the full-precision word is a defined `sv22` value: the format
-    /// itself says every bit is picture. Chroma is the 4:2:0 result repeated on both rows.
+    /// itself says every bit is picture. Chroma is composed at every 4:2:2 site (`dovi_compose_chroma_422`):
+    /// the 4:2:0 base chroma is brought to each row by a vertical Catmull-Rom and reshaped there with that
+    /// row's luma, libplacebo's order (upsample, then reshape). A deliberate quality choice, since here the
+    /// composer owns the 4:2:0 -> 4:2:2 conversion; not bit-exact with Dolby's 4:2:0 reference.
     case sv22 = "sv22"
 
     var pixelFormat: OSType {
@@ -63,8 +66,9 @@ struct DoviComposerFlags: OptionSet, Sendable {
     /// The luma curve carries at least one MMR piece, so the luma kernel has to
     /// read the base-layer chroma planes as well.
     static let lumaMmr = DoviComposerFlags(rawValue: 0x2)
-    /// The output chroma plane is 4:2:2 (``DoviOutputMode/sv22``), so the chroma kernel writes each
-    /// 4:2:0 sample to both rows it covers. Set by the composer from its output mode, not by the parser.
+    /// The output chroma plane is 4:2:2 (``DoviOutputMode/sv22``). The composer fills it with
+    /// `dovi_compose_chroma_422`, which ignores the flag; the 4:2:0 kernel, given it, writes each sample to
+    /// both rows it covers (the tests' row-duplicated reference). Set by the composer, not by the parser.
     static let chroma422 = DoviComposerFlags(rawValue: 0x4)
 }
 
