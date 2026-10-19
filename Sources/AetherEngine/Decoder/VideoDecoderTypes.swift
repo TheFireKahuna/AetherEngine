@@ -88,6 +88,9 @@ enum ColorAttachments {
         case AVCOL_PRI_SMPTE431: kCVImageBufferColorPrimaries_DCI_P3
         case AVCOL_PRI_SMPTE170M, AVCOL_PRI_SMPTE240M: kCVImageBufferColorPrimaries_SMPTE_C
         case AVCOL_PRI_BT470BG:  kCVImageBufferColorPrimaries_EBU_3213
+        // H.273 code point 22, which CoreVideo's own code-point table maps to P22.
+        case AVCOL_PRI_EBU3213:  kCVImageBufferColorPrimaries_P22
+        // BT.470M, FILM (illuminant C) and SMPTE 428 (XYZ) have no CoreVideo constant; see `unmapped`.
         default:                 nil
         }
     }
@@ -102,13 +105,27 @@ enum ColorAttachments {
         case AVCOL_TRC_IEC61966_2_1: kCVImageBufferTransferFunction_sRGB
         case AVCOL_TRC_LINEAR:       kCVImageBufferTransferFunction_Linear
         case AVCOL_TRC_SMPTE240M:    kCVImageBufferTransferFunction_SMPTE_240M_1995
+        case AVCOL_TRC_SMPTE428:     kCVImageBufferTransferFunction_SMPTE_ST_428_1
+        // A pure power curve: the exponent rides in `kCVImageBufferGammaLevelKey`, see `gammaLevel`.
+        case AVCOL_TRC_GAMMA22, AVCOL_TRC_GAMMA28: kCVImageBufferTransferFunction_UseGamma
         default:                     nil
+        }
+    }
+
+    /// The exponent `kCVImageBufferTransferFunction_UseGamma` stands for, nil for every other curve.
+    static func gammaLevel(_ v: AVColorTransferCharacteristic) -> Double? {
+        switch v {
+        case AVCOL_TRC_GAMMA22: 2.2
+        case AVCOL_TRC_GAMMA28: 2.8
+        default:                nil
         }
     }
 
     static func matrix(_ v: AVColorSpace) -> CFString? {
         switch v {
         case AVCOL_SPC_BT709:                       kCVImageBufferYCbCrMatrix_ITU_R_709_2
+        // CoreVideo has one BT.2020 matrix, the non-constant-luminance one; a constant-luminance
+        // picture is decoded with it, slightly off in saturated colours (see `unmapped`).
         case AVCOL_SPC_BT2020_NCL, AVCOL_SPC_BT2020_CL: kCVImageBufferYCbCrMatrix_ITU_R_2020
         case AVCOL_SPC_SMPTE170M, AVCOL_SPC_BT470BG: kCVImageBufferYCbCrMatrix_ITU_R_601_4
         case AVCOL_SPC_SMPTE240M:                   kCVImageBufferYCbCrMatrix_SMPTE_240M_1995
@@ -120,6 +137,22 @@ enum ColorAttachments {
         var primaries: CFString
         var transfer: CFString
         var matrix: CFString
+        /// The exponent when `transfer` is `kCVImageBufferTransferFunction_UseGamma`.
+        var gammaLevel: Double? = nil
+    }
+
+    /// The declared values CoreVideo cannot carry, for a once-per-stream line: nil when everything the
+    /// stream declares reached a CoreVideo constant (or was undeclared, which `presented` fills).
+    static func unmapped(_ d: ColorDescription) -> String? {
+        var gaps: [String] = []
+        switch d.primaries {
+        case AVCOL_PRI_BT470M: gaps.append("primaries BT.470M")
+        case AVCOL_PRI_FILM: gaps.append("primaries FILM (illuminant C)")
+        case AVCOL_PRI_SMPTE428: gaps.append("primaries SMPTE 428 (XYZ)")
+        default: break
+        }
+        if d.matrix == AVCOL_SPC_BT2020_CL { gaps.append("BT.2020 constant-luminance matrix (tagged non-constant)") }
+        return gaps.isEmpty ? nil : gaps.joined(separator: ", ")
     }
 
     /// AE#654: the tags a software-decoded buffer is presented with, gaps filled the way VideoToolbox
@@ -154,7 +187,8 @@ enum ColorAttachments {
             return Tags(
                 primaries: size.height == 576 || size.height == 288 ? ebu : smpteC,
                 transfer: transfer(d.transfer) ?? kCVImageBufferTransferFunction_ITU_R_709_2,
-                matrix: bt601Matrix)
+                matrix: bt601Matrix,
+                gammaLevel: gammaLevel(d.transfer))
         }
 
         let resolvedPrimaries: CFString = declaredPrimaries ?? {
@@ -174,7 +208,8 @@ enum ColorAttachments {
         return Tags(
             primaries: resolvedPrimaries,
             transfer: transfer(d.transfer) ?? kCVImageBufferTransferFunction_ITU_R_709_2,
-            matrix: resolvedMatrix)
+            matrix: resolvedMatrix,
+            gammaLevel: gammaLevel(d.transfer))
     }
 
     /// The colour space CoreVideo manages a buffer with these tags in, i.e. the one playback shows the
@@ -182,11 +217,12 @@ enum ColorAttachments {
     /// a BT.709 still drew 8 levels darker than VideoToolbox's own conversion of the frame, and an SDR
     /// BT.2020 one up to 57 levels off in red.
     static func colorSpace(for tags: Tags) -> CGColorSpace? {
-        let attachments: NSDictionary = [
+        let attachments = NSMutableDictionary(dictionary: [
             kCVImageBufferColorPrimariesKey: tags.primaries,
             kCVImageBufferTransferFunctionKey: tags.transfer,
             kCVImageBufferYCbCrMatrixKey: tags.matrix,
-        ]
+        ])
+        if let gamma = tags.gammaLevel { attachments[kCVImageBufferGammaLevelKey] = gamma }
         return CVImageBufferCreateColorSpaceFromAttachments(attachments)?.takeRetainedValue()
     }
 
