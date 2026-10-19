@@ -268,7 +268,10 @@ final class DoviFelComposer: @unchecked Sendable {
     static func prewarmPipelines() -> Bool {
         guard let device = MTLCreateSystemDefaultDevice() else { return false }
         let start = CFAbsoluteTimeGetCurrent()
-        guard (try? SharedPipelines.getOrCreate(device: device)) != nil else { return false }
+        guard let shared = try? SharedPipelines.getOrCreate(device: device) else { return false }
+        // The blue-noise variant is built on first use; with that mode selected, build it here too so the
+        // first composed frame does not specialise it on the decode thread.
+        if outputMode == .p010BlueNoise, (try? shared.blueNoisePipelines()) == nil { return false }
         EngineLog.emit(String(format: "[DoviFelComposer] pipelines ready after %.1f ms (prewarm)",
                               (CFAbsoluteTimeGetCurrent() - start) * 1000), category: .swPlayback, level: .verbose)
         return true
