@@ -80,7 +80,7 @@ final class DoviFelComposer: @unchecked Sendable {
     }
 
     /// Number of `uint` slots `dovi_layout_probe` writes.
-    static let layoutProbeSlots = 36 + 3 * 20
+    static let layoutProbeSlots = 36 + 3 * 20 + 1
 
     /// Largest `coefficient_log2_denom` the fixed-point path accepts. The RPU
     /// syntax caps it at 23 (0x17), so a
@@ -260,6 +260,25 @@ final class DoviFelComposer: @unchecked Sendable {
             shared.removeAll()
         }
         #endif
+    }
+
+    /// The sv22 chroma siting last logged, so the line appears once per session (each decoder has its own
+    /// composer) and again only if the stream's siting changes. Under `lock`.
+    private var loggedChromaSiting: UInt32?
+
+    /// Logs the vertical chroma siting `dovi_compose_chroma_422` resolves from `blChromaLocation`. "stream" is
+    /// whatever FFmpeg put in the codec parameters, which for HEVC is LEFT both when the VUI says type 0 and when
+    /// it carries no chroma_loc_info at all; "default" is an unprobed UNSPECIFIED, which the kernel also takes as
+    /// LEFT (type 0), as HEVC infers.
+    private func logChromaSitingOnce(_ location: UInt32) {
+        lock.lock()
+        let fresh = loggedChromaSiting != location
+        loggedChromaSiting = location
+        lock.unlock()
+        guard fresh else { return }
+        let type = location == 0 ? 0 : Int(location) - 1
+        EngineLog.emit("[DoviFelComposer] sv22 chroma siting: type \(type) (source: \(location == 0 ? "default" : "stream"))",
+                       category: .swPlayback)
     }
 
     /// Lazily resolves or compiles the process-shared Metal compute pipelines (dolby-vision-fel.md §5.6).
@@ -975,7 +994,10 @@ final class DoviFelComposer: @unchecked Sendable {
         #if DEBUG
         if sv22RowDuplicationForTesting { chroma422Sites = false }
         #endif
-        if chroma422Sites { chromaPipeline = pipelines.chroma422Pipeline }
+        if chroma422Sites {
+            chromaPipeline = pipelines.chroma422Pipeline
+            logChromaSitingOnce(metalParams.blChromaLocation)
+        }
 
         let lutBuffer = lumaLutBuffers[paramSlot]
         populateLumaLut(into: lutBuffer.contents().assumingMemoryBound(to: Float.self), params: metalParams)

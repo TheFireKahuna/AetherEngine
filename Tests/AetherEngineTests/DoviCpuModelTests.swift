@@ -237,16 +237,32 @@ struct DoviCpuModelTests {
             return s
         }
 
-        /// Catmull-Rom (B = 0, C = 0.5) at phases 3/4 (row 2k: chroma rows k - 2 ... k + 1) and 1/4 (row 2k + 1:
-        /// rows k - 1 ... k + 2), in 128ths.
-        static let chroma422Taps: [[Double]] = [[-3, 29, 111, -9], [-9, 111, 29, -3]]
+        /// The chroma-row coordinate of 4:2:2 row `row` for the base layer's siting (`AVChromaLocation`): chroma
+        /// between luma rows 2k and 2k + 1 for LEFT / CENTER and unspecified (row / 2 - 1/4), on row 2k for TOPLEFT /
+        /// TOP (row / 2), on row 2k + 1 for BOTTOMLEFT / BOTTOM (row / 2 - 1/2).
+        func chroma422Coordinate(row: Int) -> Double {
+            switch p.blChromaLocation {
+            case 3, 4: return Double(row) / 2
+            case 5, 6: return Double(row) / 2 - 0.5
+            default: return Double(row) / 2 - 0.25
+            }
+        }
 
-        /// Base-layer chroma at 4:2:2 row `row`: the four taps over the clamped chroma rows, clamped to [0, bl_max].
+        /// Catmull-Rom (B = 0, C = 0.5) weights for rows i - 1 ... i + 2 at phase t from row i.
+        static func catmullRom(_ t: Double) -> [Double] {
+            [(-t + 2 * t * t - t * t * t) / 2, (2 - 5 * t * t + 3 * t * t * t) / 2,
+             (t + 4 * t * t - 3 * t * t * t) / 2, (-t * t + t * t * t) / 2]
+        }
+
+        /// Base-layer chroma at 4:2:2 row `row`: Catmull-Rom at the row's coordinate over the clamped chroma rows,
+        /// clamped to [0, bl_max].
         func chroma422Base(_ blUV: Plane, x: Int, row: Int, comp: Int) -> Double {
-            let odd = row & 1, first = row / 2 - 2 + odd
+            let c = chroma422Coordinate(row: row)
+            let i0 = Int(floor(c))
+            let w = Self.catmullRom(c - Double(i0))
             var s = 0.0
             for i in 0..<4 {
-                s += Double(blUV.code(x, min(max(first + i, 0), blUV.height - 1), comp)) * Self.chroma422Taps[odd][i] / 128
+                s += Double(blUV.code(x, min(max(i0 - 1 + i, 0), blUV.height - 1), comp)) * w[i]
             }
             return min(max(s, 0), Double(p.blMax))
         }
@@ -257,11 +273,11 @@ struct DoviCpuModelTests {
             return (at(x * 2 - 1) + 2 * at(x * 2) + at(x * 2 + 1) + 2) >> 2
         }
 
-        /// Bilinear EL chroma code at 4:2:2 row `row`, column `x`: the row's 4:2:0 coordinate row / 2 - 1/4 mapped
+        /// Bilinear EL chroma code at 4:2:2 row `row`, column `x`: the row's 4:2:0 coordinate (`chroma422Coordinate`) mapped
         /// through the co-sited grid relation of ``elCode(_:comp:x:y:baseW:baseH:cosited:)``, rounded half up.
         func elCode422(_ el: Plane, comp: Int, x: Int, row: Int, baseW: Int, baseH: Int) -> Int {
             let u = Double(x) / Double(baseW) * Double(el.width)
-            let v = (Double(row) / 2 - 0.25) / Double(baseH) * Double(el.height)
+            let v = chroma422Coordinate(row: row) / Double(baseH) * Double(el.height)
             let x0 = Int(floor(u)), y0 = Int(floor(v))
             let fx = u - Double(x0), fy = v - Double(y0)
             func w(_ xx: Int, _ yy: Int) -> Double {

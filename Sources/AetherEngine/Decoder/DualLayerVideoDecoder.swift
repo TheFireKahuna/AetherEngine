@@ -395,6 +395,9 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Last parameters that came from a real RPU, and how many frames in a row have borrowed them. Both
     /// move in decode order, in `recordSideData`.
     private var lastGoodParams: DoviMetalParams?
+    /// The base layer's `codecpar->chroma_location` (FFmpeg's reading of the HEVC VUI), stamped onto every
+    /// frame's parameters for the sv22 chroma kernel's vertical siting. Under `lock`.
+    private var baseChromaLocation: UInt32 = 0
     private var lastGoodDMNAL: [UInt8]?
     private var lastGoodBaseLayerNAL: [UInt8]?
     private var borrowedParamsRun = 0
@@ -539,6 +542,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         if let codecpar = stream.pointee.codecpar {
             lock.lock()
             declaredFormat = (ColorDescription(codecpar: codecpar), codecpar.pointee.codec_id, codecpar.pointee.profile)
+            baseChromaLocation = UInt32(codecpar.pointee.chroma_location.rawValue)
             lock.unlock()
         }
         // The container's HDR10 static metadata, filled onto every delivered frame that lacks it. On the
@@ -1429,6 +1433,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             }
         }
         guard resolvedParams != nil || resolvedNAL != nil || resolvedBaseLayerNAL != nil else { return }
+        resolvedParams?.blChromaLocation = baseChromaLocation
         sideDataRing.insert(key: key, params: resolvedParams, dmNAL: resolvedNAL, baseLayerNAL: resolvedBaseLayerNAL)
     }
 
