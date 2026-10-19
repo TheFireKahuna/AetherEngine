@@ -552,9 +552,52 @@ struct SpatialAudioBridgeTests {
         #expect(abs(heard - 0.25) < 0.001, "the click decodes at \(heard) s, not at its source position 0.25 s")
     }
 
-    /// Decodes the track to PCM and returns when the left channel first rises above the click
-    /// threshold, or nil when it never does. Blocks until AVFoundation has decoded that far.
-    private static func clickOnset(asset: AVURLAsset, track: AVAssetTrack) throws -> Double? {
+    #if APACObjectOutput
+    @Test("object output: the init segment carries a low-profile apac entry and CODECS")
+    func objectOutputMuxedInit() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
+            decoder: SyntheticDecoder(skipAfterReset: 0), objectOutput: true)
+        defer { bridge.close() }
+        #expect(bridge.hlsCodecs == "apac.05.00")
+        guard let muxed = try muxWithProbeVideo(bridge, startMs: 0, count: 50) else { return }
+        defer { try? FileManager.default.removeItem(at: muxed.sessionDir) }
+        #expect(muxed.initBytes.range(of: bridge.soundSampleEntryOverride!) != nil)
+        #expect(try Data(contentsOf: muxed.segment).count > 1000, "the segment carries audio")
+    }
+
+    /// The timestamp contract again, with the click carried by an object (`APACObjectEncoder`): its
+    /// priming and packet stamping have to put it where the source did, like the bed encoder's.
+    @Test("object output: a click decodes back at its source position through AVFoundation")
+    func objectOutputClick() async throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
+            decoder: ClickDecoder(clickFrame: 12_000), objectOutput: true)
+        defer { bridge.close() }
+        guard let muxed = try muxWithProbeVideo(bridge, startMs: 0, count: 30) else { return }
+        let sessionDir = muxed.sessionDir
+        defer { try? FileManager.default.removeItem(at: sessionDir) }
+        let file = sessionDir.appendingPathComponent("joined.mp4")
+        try (muxed.initBytes + Data(contentsOf: muxed.segment)).write(to: file)
+        let asset = AVURLAsset(url: file)
+        nonisolated(unsafe) let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
+        let decoded = await withCheckedContinuation {
+            (continuation: CheckedContinuation<Result<Double?, Error>, Never>) in
+            Thread.detachNewThread {
+                continuation.resume(returning: Result { try Self.clickOnset(asset: asset, track: track, anyChannel: true) })
+            }
+        }
+        let heard = try #require(try decoded.get(), "the click reaches an output channel")
+        #expect(abs(heard - 0.25) < 0.001, "the click decodes at \(heard) s, not at its source position 0.25 s")
+    }
+    #endif
+
+    /// Decodes the track to PCM and returns when the left channel (any channel with `anyChannel`)
+    /// first rises above the click threshold, or nil when it never does. Blocks until AVFoundation has
+    /// decoded that far.
+    private static func clickOnset(asset: AVURLAsset, track: AVAssetTrack, anyChannel: Bool = false) throws -> Double? {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
             AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 32,
@@ -575,7 +618,8 @@ struct SpatialAudioBridgeTests {
                 bufferListSize: MemoryLayout<AudioBufferList>.size, blockBufferAllocator: nil,
                 blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: &block)
             guard let samples = list.mBuffers.mData?.assumingMemoryBound(to: Float.self) else { continue }
-            if let i = (0..<frames).first(where: { abs(samples[$0 * channels]) > 0.2 }) {
+            let width = anyChannel ? channels : 1
+            if let i = (0..<frames).first(where: { f in (0..<width).contains { abs(samples[f * channels + $0]) > 0.2 } }) {
                 return start + Double(i) / 48_000
             }
         }

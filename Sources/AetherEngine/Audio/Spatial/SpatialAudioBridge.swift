@@ -76,6 +76,12 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
 #endif
     }
     private static let encodeChunkFrames = 2048
+#if APACObjectOutput
+    /// Elements go out as APAC objects (`APACObjectEncoder`): no renderer mix, no split, no limiter
+    /// (the system renderer mixes after the encode). The presentation the chunk being filled holds.
+    private let objectOutput: Bool
+    private var objectRoles: [ObjectAudioRole] = []
+#endif
 
     /// Timeline, in 48 kHz frames on the output time base.
     /// `originFrame`: the source PTS of the first packet pushed since the last reset.
@@ -127,32 +133,56 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// third packet after every reset.
     static let silentFeedPacketThreshold = AudioBridge.trueHDSilentFeedPacketThreshold
 
+    /// `objectOutput` (personal builds with `APACObjectOutput`): send the decoder's elements as APAC
+    /// objects instead of rendering them into `layout`.
     init(
         srcTimeBase: AVRational,
         layout: SpatialSpeakerLayout,
         decoder: ObjectAudioDecoding,
-        bitRate: Int? = nil
+        bitRate: Int? = nil,
+        objectOutput: Bool = false
     ) throws {
         self.srcTimeBase = srcTimeBase
         self.layout = layout
         self.decoder = decoder
         levelMeter = BedLevelMeter(layout: layout, sampleRate: Self.sampleRate)
         limiter = PeakLimiter(sampleRate: Self.sampleRate)
-        let rate = bitRate ?? layout.channelCount * Self.bitRatePerChannel
+        let encoder: any APACChunkEncoding
+        let channels: Int
+        let rate: Int
+#if APACObjectOutput
+        self.objectOutput = objectOutput
+        if objectOutput {
+            rate = bitRate ?? (APACObjectEncoder.objectSlots + 1) * Self.bitRatePerChannel
+            let objects = try APACObjectEncoder(bitRate: rate, sampleRate: Double(Self.sampleRate))
+            encoder = objects
+            channels = APACObjectEncoder.elementCapacity
+            hlsCodecs = objects.hlsCodecs
+        } else {
+            rate = bitRate ?? layout.channelCount * Self.bitRatePerChannel
+            encoder = try APACEncoder(layout: layout, sampleRate: Double(Self.sampleRate), bitRate: rate)
+            channels = layout.channelCount
+            hlsCodecs = APACSampleEntry.codecsString(channelCount: layout.channelCount)
+        }
+#else
+        precondition(!objectOutput, "object output is only built with the APACObjectOutput trait")
+        rate = bitRate ?? layout.channelCount * Self.bitRatePerChannel
+        encoder = try APACEncoder(layout: layout, sampleRate: Double(Self.sampleRate), bitRate: rate)
+        channels = layout.channelCount
+        hlsCodecs = APACSampleEntry.codecsString(channelCount: layout.channelCount)
+#endif
         peakOutputBitRate = Int64(rate)
-        let encoder = try APACEncoder(layout: layout, sampleRate: Double(Self.sampleRate), bitRate: rate)
         let pipeline = APACEncodePipeline(
-            encoder: encoder, channels: layout.channelCount, bufferFrames: Self.encodeChunkFrames * 4)
+            encoder: encoder, channels: channels, bufferFrames: Self.encodeChunkFrames * 4)
         self.pipeline = pipeline
         output = pipeline.takeInitialBuffer()
         soundSampleEntryOverride = APACSampleEntry.sampleEntry(
             magicCookie: encoder.magicCookie, sampleRate: Self.sampleRate)
-        hlsCodecs = APACSampleEntry.codecsString(channelCount: layout.channelCount)
         guard let cp = Self.makeStandInCodecpar() else { throw BridgeError.codecparAllocFailed }
         encoderCodecpar = cp
         EngineLog.emit(
-            "[SpatialAudioBridge] init: layout=\(layout.rawValue) bitRate=\(rate / 1000) kbps "
-            + "codecs=\(hlsCodecs) priming=\(encoder.leadingFrames) frames",
+            "[SpatialAudioBridge] init: \(objectOutput ? "objects (\(channels - 1) slots + LFE)" : "layout=\(layout.rawValue)") "
+            + "bitRate=\(rate / 1000) kbps codecs=\(hlsCodecs) priming=\(encoder.leadingFrames) frames",
             category: .session
         )
     }
@@ -325,6 +355,10 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         limiter.reset()
         logLevels(levelMeter.restart())
         pendingFrames = 0
+#if APACObjectOutput
+        output.objectUpdates.removeAll(keepingCapacity: true)
+        output.objectDiscontinuities.removeAll(keepingCapacity: true)
+#endif
         originFrame = nil
         encoderStartFrame = nil
         encoderFramesIn = 0
@@ -412,6 +446,15 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         }
         nextExpectedInputOffset = block.inputFrameOffset + Int64(block.frameCount)
 
+#if APACObjectOutput
+        if objectOutput {
+            stageObjects(block, discontinuity: block.isDiscontinuity && !rebuilt)
+            stats.samplesEnqueued += Int64(block.frameCount)
+            stats.packetsFedSinceLastEnqueue = 0
+            if pendingFrames >= Self.encodeChunkFrames { encodePending() }
+            return
+        }
+#endif
         output.ensureCapacity(pendingFrames + block.frameCount, keeping: pendingFrames)
 #if TrueHDObjectAudio
         if let bed = block.bed {
@@ -457,6 +500,34 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         stats.packetsFedSinceLastEnqueue = 0
         if pendingFrames >= Self.encodeChunkFrames { encodePending() }
     }
+
+#if APACObjectOutput
+    /// The block's elements into `output` as they are, and its metadata beside them for the encoder.
+    /// A chunk holds one presentation, so a new one starts a new chunk.
+    private func stageObjects(_ block: ObjectAudioDecodedBlock, discontinuity: Bool) {
+        if block.roles != objectRoles {
+            if pendingFrames > 0 { encodePending() }
+            objectRoles = block.roles
+            output.objectRoles = block.roles
+        }
+        let n = block.frameCount
+        output.ensureCapacity(pendingFrames + n, keeping: pendingFrames)
+        for (i, plane) in output.planes.enumerated() {
+            if i < block.planes.count {
+                (plane + pendingFrames).update(from: block.planes[i], count: n)
+            } else {
+                (plane + pendingFrames).update(repeating: 0, count: n)
+            }
+        }
+        if discontinuity { output.objectDiscontinuities.append(pendingFrames) }
+        for update in block.updates {
+            var shifted = update
+            shifted.frameOffset += pendingFrames
+            output.objectUpdates.append(shifted)
+        }
+        pendingFrames += n
+    }
+#endif
 
     /// Continue the encoder's input at `target` (a source position in 48 kHz frames): a short gap
     /// ahead is filled with silence, anything longer or behind restarts the encoder there, so every
@@ -525,8 +596,19 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         let frames = pendingFrames
         pendingFrames = 0
         guard let start = encoderStartFrame else { return }
-        limiter.process(output.planes, frameCount: frames)
         let position = start + encoderFramesIn
+#if APACObjectOutput
+        if objectOutput {
+            output = pipeline.submit(output, frames: frames, position: position)
+            // The free buffer handed back still holds the chunk it last carried.
+            output.objectRoles = objectRoles
+            output.objectUpdates.removeAll(keepingCapacity: true)
+            output.objectDiscontinuities.removeAll(keepingCapacity: true)
+            encoderFramesIn += Int64(frames)
+            return
+        }
+#endif
+        limiter.process(output.planes, frameCount: frames)
         // Where this chunk plays, for the level line: the anchor is a source PTS in 48 kHz frames.
         logLevels(levelMeter.add(output.planes.map { UnsafePointer($0) }, frameCount: frames,
                                  startSeconds: Double(position) / Double(Self.sampleRate)))

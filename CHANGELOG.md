@@ -10,6 +10,15 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Added
+
+- **TrueHD Atmos as APAC objects, personal builds only** (`APACObjectOutput` trait, off by default, with
+  `AETHER_APAC_OBJECTS=1`). Every element of the object presentation goes to APAC as a positioned object
+  (the LFE on a bed) for tvOS to render, instead of the engine's speaker bed. Private AudioCodec properties
+  and APAC's PCM-carried metadata (`APACObjectEncoder`), so it is never shipped; only worth listening to
+  with a LibTrueHD built with `matrix-interpolation`, which decodes the elements exactly. Measured on the
+  Mac against the engine's own render of the same exact decode: same level and speaker split.
+
 ### Fixed
 
 - **CM v4.0 RPUs with a level 253 block keep their Dolby Vision on the Profile 7 routes.** Disney+ v4.0

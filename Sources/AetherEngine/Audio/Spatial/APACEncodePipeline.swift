@@ -1,5 +1,24 @@
 import Foundation
 
+/// What `APACEncodePipeline` drives: the bed encoder (`APACEncoder`), or the object encoder of a
+/// personal build (`APACObjectEncoder`).
+@available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
+protocol APACChunkEncoding: AnyObject {
+    var leadingFrames: Int { get }
+    var magicCookie: Data { get }
+    /// Every packet the encoder completes from `frames` frames of `buffer`.
+    func encode(_ buffer: APACEncodePipeline.PlaneBuffer, frames: Int) throws -> [APACEncoder.Packet]
+    func flush() throws -> [APACEncoder.Packet]
+    func reset()
+}
+
+@available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
+extension APACEncoder: APACChunkEncoding {
+    func encode(_ buffer: APACEncodePipeline.PlaneBuffer, frames: Int) throws -> [Packet] {
+        try encode(planes: buffer.planes.map { UnsafePointer($0) }, frameCount: frames)
+    }
+}
+
 /// Runs an `APACEncoder` on its own serial queue, so the bridge decodes and renders the next chunk
 /// while the previous one encodes.
 ///
@@ -34,6 +53,15 @@ final class APACEncodePipeline: @unchecked Sendable {
         private(set) var planes: [UnsafeMutablePointer<Float>]
         private(set) var capacity: Int
 
+#if APACObjectOutput
+        /// Object output only: what the planes are (one per element of the decoded presentation), the
+        /// metadata updates inside this chunk (frame offsets from its start) and where the source
+        /// skipped. Set by the bridge for each chunk; the bed path leaves them empty.
+        var objectRoles: [ObjectAudioRole] = []
+        var objectUpdates: [ObjectAudioMetadataUpdate] = []
+        var objectDiscontinuities: [Int] = []
+#endif
+
         init(channels: Int, capacity: Int) {
             self.capacity = capacity
             planes = (0..<channels).map { _ in UnsafeMutablePointer<Float>.allocate(capacity: capacity) }
@@ -58,7 +86,7 @@ final class APACEncodePipeline: @unchecked Sendable {
     let leadingFrames: Int
     let magicCookie: Data
 
-    private let encoder: APACEncoder
+    private let encoder: any APACChunkEncoding
     private let queue = DispatchQueue(label: "AetherEngine.SpatialAudioBridge.encode")
 
     /// Guards everything below it.
@@ -75,7 +103,7 @@ final class APACEncodePipeline: @unchecked Sendable {
     private var packetsInRun: Int64 = 0
 
     /// `bufferCount` buffers in all: one the caller renders into, the rest queued or encoding.
-    init(encoder: APACEncoder, channels: Int, bufferFrames: Int, bufferCount: Int = 3) {
+    init(encoder: any APACChunkEncoding, channels: Int, bufferFrames: Int, bufferCount: Int = 3) {
         precondition(bufferCount >= 2, "one buffer to render into and one to encode")
         self.encoder = encoder
         leadingFrames = encoder.leadingFrames
@@ -190,8 +218,7 @@ final class APACEncodePipeline: @unchecked Sendable {
             packetsInRun = 0
         }
         do {
-            let planes = buffer.planes.map { UnsafePointer($0) }
-            stamp(try encoder.encode(planes: planes, frameCount: frames))
+            stamp(try encoder.encode(buffer, frames: frames))
         } catch {
             // Packet k of a run is stamped by its index, so a call that swallowed packets would
             // leave every later one early. The chunk becomes a gap instead.
@@ -240,6 +267,6 @@ final class APACEncodePipeline: @unchecked Sendable {
 }
 
 @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
-private extension APACEncoder {
-    func flushIgnoringErrors() -> [Packet] { (try? flush()) ?? [] }
+private extension APACChunkEncoding {
+    func flushIgnoringErrors() -> [APACEncoder.Packet] { (try? flush()) ?? [] }
 }

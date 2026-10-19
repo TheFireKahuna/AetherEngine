@@ -17,6 +17,20 @@ enum TrueHDReferenceRender {
     }
 }
 
+/// Personal builds only, with the APACObjectOutput trait: with this environment variable set to 1,
+/// TrueHD Atmos elements are sent to APAC as positioned objects (`APACObjectEncoder`) rather than
+/// rendered into the layout. Without the trait it is always off and that path is not built.
+enum APACObjectOutputSwitch {
+    static let variable = "AETHER_APAC_OBJECTS"
+    static var isOn: Bool {
+        #if APACObjectOutput
+        ProcessInfo.processInfo.environment[variable] == "1"
+        #else
+        false
+        #endif
+    }
+}
+
 extension HLSVideoEngine {
 
     /// The object-audio format a source would be rendered as, before it is confirmed.
@@ -292,7 +306,11 @@ extension HLSVideoEngine {
             switch source {
             case .trueHDAtmos:
                 #if TrueHDObjectAudio
-                decoder = try TrueHDObjectAudioDecoder(splitsBed: !TrueHDReferenceRender.isOn)
+                if APACObjectOutputSwitch.isOn {
+                    decoder = try TrueHDObjectAudioDecoder(splitsBed: false, objectOutput: true)
+                } else {
+                    decoder = try TrueHDObjectAudioDecoder(splitsBed: !TrueHDReferenceRender.isOn)
+                }
                 #else
                 return nil
                 #endif
@@ -339,7 +357,8 @@ extension HLSVideoEngine {
                 #endif
             }
             bridge = try SpatialAudioBridge(
-                srcTimeBase: audioStream.pointee.time_base, layout: layout, decoder: decoder)
+                srcTimeBase: audioStream.pointee.time_base, layout: layout, decoder: decoder,
+                objectOutput: source == .trueHDAtmos && APACObjectOutputSwitch.isOn)
         } catch {
             EngineLog.emit(
                 "[HLSVideoEngine] ERROR: \(source.name) rendering unavailable (\(error)); keeping the channel bridge",
@@ -380,6 +399,8 @@ extension HLSVideoEngine {
             audioIsAPAC = true
             let rendering: String
             switch source {
+            case .trueHDAtmos where APACObjectOutputSwitch.isOn:
+                rendering = "elements sent as APAC objects (\(APACObjectOutputSwitch.variable), personal build)"
             case .trueHDAtmos where TrueHDReferenceRender.isOn:
                 rendering = "objects rendered into \(layout.rawValue) (reference render, \(TrueHDReferenceRender.variable))"
             case .trueHDAtmos:
