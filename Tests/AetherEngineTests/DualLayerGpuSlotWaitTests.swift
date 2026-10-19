@@ -184,6 +184,146 @@ struct DualLayerGpuSlotWaitTests {
         decoder.close()
     }
 
+    /// The frame handlers are VideoToolbox output callbacks, and VideoToolbox can make one on the thread
+    /// that submitted the frame while `HardwareVideoDecoder.lock` is held: a handler that waits for a GPU
+    /// slot there stalls that session's whole output, and with it decode of both layers. Before the compose
+    /// queue, the second pair's base-layer handler parked in `acquireSlot()` until the first composition
+    /// retired; now it hands the composition to the queue and returns while every slot is still held.
+    @Test("the VideoToolbox-side handler returns promptly while every composer slot is held")
+    func handlerReturnsWhileSlotsAreHeld() async throws {
+        let bl0 = try #require(Self.makeBuffer(width: 64, height: 64))
+        let el0 = try #require(Self.makeBuffer(width: 32, height: 32))
+        let bl1 = try #require(Self.makeBuffer(width: 64, height: 64))
+        let el1 = try #require(Self.makeBuffer(width: 32, height: 32))
+
+        let composer = GatedFakeComposer()
+        let deliveries = Deliveries()
+        let decoder = DualLayerVideoDecoder(composer: composer)
+        defer { decoder.close() }
+        decoder.onFrame = { buffer, pts, hdr10 in deliveries.record(buffer, pts, hdr10) }
+        decoder.primeForTesting(enhancementLayer: true)
+        decoder.seedRPUForTesting(pts: Self.pts(0), params: DoviMetalParams(), displayMetadataNAL: nil)
+        decoder.seedRPUForTesting(pts: Self.pts(1), params: DoviMetalParams(), displayMetadataNAL: nil)
+
+        // First pair takes the only slot and holds it.
+        decoder.handleEnhancementLayerFrame(elBuffer: el0, pts: Self.pts(0))
+        decoder.handleBaseLayerFrame(baseBuffer: bl0, pts: Self.pts(0), hdr10Data: nil)
+        try await waitFor { composer.acquireCallCount == 1 }
+
+        // Second pair on a dedicated thread, standing in for the VideoToolbox callback.
+        let bl1Box = SendablePixelBuffer(value: bl1)
+        let el1Box = SendablePixelBuffer(value: el1)
+        let workerDone = Flag()
+        let worker = Thread {
+            decoder.handleEnhancementLayerFrame(elBuffer: el1Box.value, pts: Self.pts(1))
+            decoder.handleBaseLayerFrame(baseBuffer: bl1Box.value, pts: Self.pts(1), hdr10Data: nil)
+            workerDone.set()
+        }
+        worker.start()
+        // The bound is the assertion: the handlers do no waiting of their own, so a loaded machine
+        // finishes them in far less; a handler parked on the slot never does until it is released.
+        let returnedWhileHeld = try await waitFor(upTo: .seconds(5)) { workerDone.isSet }
+        #expect(returnedWhileHeld, "the base-layer handler waited for a GPU slot on the callback thread")
+
+        // The composition it handed off is the one now waiting for the slot.
+        try await waitFor { composer.acquireCallCount == 2 }
+        composer.releaseFirst()
+        try await waitFor { workerDone.isSet }
+        try await waitFor { deliveries.count >= 2 }
+        decoder.quiesceForTesting()
+        let points = deliveries.points
+        #expect(points.count == 2)
+        if points.count == 2 {
+            #expect(CMTimeCompare(points[0], Self.pts(0)) == 0)
+            #expect(CMTimeCompare(points[1], Self.pts(1)) == 0)
+        }
+    }
+
+    /// A composition handed to the compose queue before a `flush()` belongs to the old feed: it must
+    /// neither be delivered nor take a GPU slot once it reaches the front of the queue.
+    @Test("a composition still queued when flush() runs never reaches the GPU or delivery")
+    func queuedCompositionIsRetiredByFlush() async throws {
+        let composer = GatedFakeComposer()
+        let deliveries = Deliveries()
+        let decoder = DualLayerVideoDecoder(composer: composer)
+        defer { decoder.close() }
+        decoder.onFrame = { buffer, pts, hdr10 in deliveries.record(buffer, pts, hdr10) }
+        decoder.primeForTesting(enhancementLayer: true)
+        for i in 0...2 {
+            decoder.seedRPUForTesting(pts: Self.pts(Int64(i)), params: DoviMetalParams(), displayMetadataNAL: nil)
+        }
+        let pairs = try (0...2).map { _ -> (SendablePixelBuffer, SendablePixelBuffer) in
+            let bl = try #require(Self.makeBuffer(width: 64, height: 64))
+            let el = try #require(Self.makeBuffer(width: 32, height: 32))
+            return (SendablePixelBuffer(value: bl), SendablePixelBuffer(value: el))
+        }
+        let workerDone = Flag()
+        let worker = Thread {
+            for (i, pair) in pairs.enumerated() {
+                decoder.handleEnhancementLayerFrame(elBuffer: pair.1.value, pts: Self.pts(Int64(i)))
+                decoder.handleBaseLayerFrame(baseBuffer: pair.0.value, pts: Self.pts(Int64(i)), hdr10Data: nil)
+            }
+            workerDone.set()
+        }
+        worker.start()
+        // Frame 0 holds the slot, frame 1 waits for it on the compose queue, frame 2 is queued behind.
+        // Bounded, so a handler that parks on the slot itself fails here instead of hanging the suite.
+        let queued = try await waitFor(upTo: .seconds(5)) { workerDone.isSet && composer.acquireCallCount == 2 }
+        #expect(queued, "the handlers waited for a GPU slot on the callback thread")
+        guard queued else {
+            composer.releaseFirst()
+            try await waitFor { workerDone.isSet }
+            return
+        }
+        decoder.flush()
+        composer.releaseFirst()
+        decoder.quiesceForTesting()
+        #expect(deliveries.count == 0, "frames composed or queued before flush() must not be delivered after it")
+        #expect(composer.acquireCallCount == 2, "a composition queued before flush() must not take a GPU slot")
+    }
+
+    /// The callback threads no longer absorb GPU backpressure, so the feed does: with
+    /// `maxComposesAwaitingSlot` compositions queued behind a held slot, `decode(packet:)`'s wait holds
+    /// the demux thread until the backlog drains (or `composeBacklogWait` passes).
+    @Test("the feed waits while the compose backlog is full, and resumes once it drains")
+    func feedWaitsOnComposeBacklog() async throws {
+        let composer = GatedFakeComposer()
+        let deliveries = Deliveries()
+        let decoder = DualLayerVideoDecoder(composer: composer)
+        defer { decoder.close() }
+        decoder.onFrame = { buffer, pts, hdr10 in deliveries.record(buffer, pts, hdr10) }
+        decoder.primeForTesting(enhancementLayer: true)
+        let backlog = DualLayerVideoDecoder.maxComposesAwaitingSlot
+        for i in 0...backlog {
+            decoder.seedRPUForTesting(pts: Self.pts(Int64(i)), params: DoviMetalParams(), displayMetadataNAL: nil)
+        }
+        // Frame 0 holds the only slot; the next `backlog` frames queue behind it.
+        for i in 0...backlog {
+            let bl = try #require(Self.makeBuffer(width: 64, height: 64))
+            let el = try #require(Self.makeBuffer(width: 32, height: 32))
+            decoder.handleEnhancementLayerFrame(elBuffer: el, pts: Self.pts(Int64(i)))
+            decoder.handleBaseLayerFrame(baseBuffer: bl, pts: Self.pts(Int64(i)), hdr10Data: nil)
+        }
+        try await waitFor { composer.acquireCallCount == 2 }
+
+        let feedDone = Flag()
+        let feeder = Thread {
+            decoder.waitForComposeBacklog()
+            feedDone.set()
+        }
+        feeder.start()
+        // The bound is the assertion, and it can only err towards passing: the wait cannot end before
+        // `composeBacklogWait` while the slot is held, however late the thread starts.
+        let endedWhileFull = try await waitFor(upTo: .milliseconds(200)) { feedDone.isSet }
+        #expect(!endedWhileFull, "the feed did not wait for a full compose backlog")
+
+        composer.releaseFirst()
+        try await waitFor { feedDone.isSet }
+        try await waitFor { deliveries.count == backlog + 1 }
+        decoder.quiesceForTesting()
+        #expect(deliveries.count == backlog + 1)
+    }
+
     @Test("a frame with no usable RPU borrows the previous frame's parameters, but only for a short run")
     func missingRpuBorrowsPreviousParameters() async throws {
         let composer = GatedFakeComposer()
@@ -215,6 +355,8 @@ struct DualLayerGpuSlotWaitTests {
         try await waitFor { composer.acquireCallCount == 2 }
         composer.releaseFirst()
         try await waitFor { workerDone.isSet }
+        // The handlers hand compositions to the compose queue and return: wait for the queue too.
+        decoder.quiesceForTesting()
         #expect(composer.acquireCallCount == 1 + limit)
         decoder.close()
     }

@@ -2606,6 +2606,8 @@ struct DualLayerVideoDecoderTests {
 
         // Enhancement layer arrives at t = 10.0: pairs and composes
         decoder.handleEnhancementLayerFrame(elBuffer: elBuf, pts: Self.pts(1))
+        // The composition runs on the compose queue: let it finish before the summary counts it.
+        decoder.quiesceForTesting()
 
         // Advance by 0.5s to 10.5: interval (1.0s) has not elapsed yet
         currentTime = 10.5
@@ -2676,6 +2678,7 @@ struct DualLayerVideoDecoderTests {
         decoder.seedRPUForTesting(pts: Self.pts(1), params: Self.params(), displayMetadataNAL: nil)
         decoder.handleBaseLayerFrame(baseBuffer: baseBuf, pts: Self.pts(1), hdr10Data: nil)
         decoder.handleEnhancementLayerFrame(elBuffer: elBuf, pts: Self.pts(1))
+        decoder.quiesceForTesting()
 
         currentTime = 31.1
         decoder.maybeEmitSummary()
