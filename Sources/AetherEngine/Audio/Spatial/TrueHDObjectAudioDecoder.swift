@@ -30,6 +30,9 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     private var rolesSerial: UInt32?
     private var planes: [UnsafePointer<Float>] = []
     let splitsBed: Bool
+    /// Object output (`APACObjectOutput`): the elements and their full metadata, ramps included, go
+    /// out as APAC objects. No bed companion.
+    let objectOutput: Bool
     var playsBedOnly: Bool { splitsBed }
     private var bedRoles: [ObjectAudioRole] = []
     private var bedRolesSerial: UInt32?
@@ -41,19 +44,28 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     private var lent: ObjectMetadataHold.Copy?
 
     /// `splitsBed` is false only for the measurement reference (`TrueHDReferenceRender` trait).
-    init(splitsBed: Bool = true) throws {
+    init(splitsBed: Bool = true, objectOutput: Bool = false) throws {
         #if !TrueHDReferenceRender
-        precondition(splitsBed, "the exact decode and mix are only built with the TrueHDReferenceRender trait")
+        precondition(splitsBed || objectOutput, "the exact decode and mix are only built with the TrueHDReferenceRender trait")
         #endif
+        #if !APACObjectOutput
+        precondition(!objectOutput, "object output is only built with the APACObjectOutput trait")
+        #endif
+        precondition(!(splitsBed && objectOutput), "object output plays the elements, not the bed")
         guard let handle = truehd_atmos_decoder_create(TRUEHD_ATMOS_PRESENTATION_HIGHEST) else {
             throw DecoderError(status: TRUEHD_ATMOS_ERR_INVALID_ARGUMENT, message: "create failed")
         }
         self.handle = handle
         self.splitsBed = splitsBed
+        self.objectOutput = objectOutput
         if splitsBed {
             _ = truehd_atmos_decoder_set_bed_companion(handle, true)
             _ = truehd_atmos_decoder_set_ignore_interpolation(handle, true)
         }
+        // Object output, like the reference render, leaves interpolation on (LibTrueHD's default):
+        // with a LibTrueHD built with `matrix-interpolation` the elements decode exactly. With the
+        // shipped binary they decode approximately, with crosstalk wherever the stream interpolates
+        // (research notes §3.8), and object output is not worth listening to.
     }
 
     deinit { truehd_atmos_decoder_destroy(handle) }
@@ -205,7 +217,7 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     }
 
     private func state(for element: TrueHDAtmosElement) -> ObjectAudioElementState {
-        #if TrueHDReferenceRender
+        #if TrueHDReferenceRender || APACObjectOutput
         splitsBed ? Self.pointSource(for: element) : Self.state(for: element)
         #else
         Self.pointSource(for: element)
@@ -221,8 +233,9 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         return ObjectAudioElementState(position: SIMD3(p.0, p.1, max(0, p.2)), gain: active ? element.gain : 0)
     }
 
-    #if TrueHDReferenceRender
+    #if TrueHDReferenceRender || APACObjectOutput
     // The reference render's mapping: size, snap, zones, screen anchoring and the elevation switch.
+    // Object output uses it as well.
     static func state(for element: TrueHDAtmosElement) -> ObjectAudioElementState {
         let active = element.flags & TRUEHD_ATMOS_ELEMENT_ACTIVE != 0
         var p = element.position
