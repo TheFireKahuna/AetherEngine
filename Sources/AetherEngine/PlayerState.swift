@@ -573,8 +573,8 @@ public struct LoadOptions: Sendable, Equatable {
 
     /// Bridge encoder for codecs that cannot stream-copy into fMP4 (TrueHD, DTS, DTS-HD MA, MP3, Opus, EAC3-from-MKV-without-dec3-extradata).
     ///
-    /// - `.surroundCompat` (default): EAC3 128 kbps/ch. Surround on every sink, including a soundbar behind legacy ARC. Lossy; downmixes 7.1 to 5.1.
-    /// - `.lossless`: FLAC up to 7.1. Needs a sink that takes multichannel LPCM (an AVR over HDMI, or an AVR or soundbar on eARC); legacy-ARC routes silently downmix to stereo. The engine cannot tell the two apart from the route (AE#794).
+    /// - `.lossless` (default): FLAC up to 7.1, bit for bit. Needs a sink that takes multichannel LPCM (an AVR over HDMI, or an AVR or soundbar on eARC); legacy-ARC routes silently downmix to stereo. The engine cannot tell the two apart from the route (AE#794), so a host whose sink sits behind legacy ARC sets `.surroundCompat`.
+    /// - `.surroundCompat`: EAC3 128 kbps/ch. Surround on every sink, including a soundbar behind legacy ARC. Lossy; downmixes 7.1 to 5.1.
     public var audioBridgeMode: AudioBridgeMode
 
     /// TrueHD Atmos and DTS:X delivery (#731). `.off` (default) keeps `audioBridgeMode`'s 7.1 channel
@@ -993,7 +993,7 @@ public struct LoadOptions: Sendable, Equatable {
         panelIsInHDRMode: Bool = false,
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
         panelPresentsDolbyVision: Bool = false,
-        audioBridgeMode: AudioBridgeMode = .surroundCompat,
+        audioBridgeMode: AudioBridgeMode = .lossless,
         objectAudioRendering: ObjectAudioRendering = .off,
         isLive: Bool = false,
         audioOnly: Bool = false,

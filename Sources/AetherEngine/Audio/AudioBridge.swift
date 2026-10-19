@@ -18,8 +18,9 @@ import AetherLibswresample
 /// and heights only under `LoadOptions.objectAudioRendering`, in a build with the `TrueHDObjectAudio` /
 /// `DTSXObjectAudio` traits (off by default), which routes them to `SpatialAudioBridge` instead.
 ///
-/// Encoder choice. Public so LoadOptions / the host pass it through; default `.surroundCompat`, the one mode
-/// that keeps surround on every sink.
+/// Encoder choice. Public so LoadOptions / the host pass it through. `LoadOptions` defaults to `.lossless`: the
+/// sinks that take multichannel LPCM (an AVR over HDMI, an AVR or soundbar on eARC, AE#794) then get the source
+/// bit for bit instead of 768 kbps EAC3, and `.surroundCompat` is the opt-in for a sink behind legacy ARC.
 ///   - `.surroundCompat`: EAC3 128 kbps/channel (256 stereo, 768 5.1), AVPlayer -> HDMI bitstream tunnel. Lossy,
 ///     caps at 5.1 (a 7.1 source is downmixed, its back surrounds folded into the sides), but surround works on
 ///     every AVR and soundbar, including one behind legacy ARC (stereo LPCM or a Dolby bitstream only).
