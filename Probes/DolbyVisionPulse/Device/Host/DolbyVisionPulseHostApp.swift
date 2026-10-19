@@ -32,7 +32,7 @@ import UIKit
 //   carries in place of its own for this arm only (`AetherEngine.felComposedRpuOverride`; a fetch or parse
 //   failure skips the arm); `secs=N`: play N seconds, looping the clip, instead of once through (80 s cap).
 // - `soak`: `engine` for `minutes=` with a `seeks=at@to,...` schedule, sampled once a second, ending in
-//   one `soak summary` line.
+//   one `soak summary` line; takes `out=` like `engine` (default p010).
 //
 // The VT modes request Dolby Vision display criteria from the track's own format description, as an
 // app on this path would.
@@ -223,7 +223,16 @@ struct PulseHarnessView: View {
             case "enginenofel":
                 await playEngine(arm.url, fel: false, log: say)
             case "soak":
+                // `out=` as on `engine` arms, so a soak measures the output buffer it will ship with.
+                let out = arm.params["out"] ?? "p010"
+                guard let mode = AetherEngine.FelOutputMode(rawValue: out) else {
+                    say("unknown out=\(out), arm skipped")
+                    break
+                }
+                AetherEngine.felOutputMode = mode
+                say("fel output \(mode.rawValue)")
                 await playSoak(arm, log: say)
+                AetherEngine.felOutputMode = .p010
             default:
                 say("unknown mode \(arm.mode), skipped")
             }
