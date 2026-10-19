@@ -4,6 +4,7 @@ import CoreMedia
 import Testing
 import AetherLibavcodec
 import AetherLibavutil
+import AetherLibswscale
 @testable import AetherEngine
 
 /// Audit DEC-107: `SoftwareVideoDecoder` hard-wired its output to 8-bit or 10-bit VIDEO range from the
@@ -53,11 +54,37 @@ struct SoftwareDecoderOutputFormatTests {
         #expect(format.tenBit)
     }
 
-    @Test("a yuvj source stays video range, because swscale converts it itself")
-    func yuvjIsConvertedBySwscale() {
+    /// #8: this pinned the old behaviour, a yuvj picture squeezed to video range by swscale. swscale is
+    /// now told full range on both sides, so the levels are copied and the buffer is tagged full range.
+    @Test("a yuvj source stays full range, even when color_range does not say so")
+    func yuvjStaysFullRange() {
+        for range in [AVCOL_RANGE_JPEG, AVCOL_RANGE_UNSPECIFIED] {
+            let format = SoftwareVideoDecoder.outputFormat(
+                pixelFormat: AV_PIX_FMT_YUVJ420P.rawValue, colorRange: range, streamIs10Bit: false)
+            #expect(format == .init(tenBit: false, fullRange: true))
+        }
+    }
+
+    @Test("RGB has no range to keep: it is converted to video range even when tagged full")
+    func rgbConvertsToVideoRange() {
         let format = SoftwareVideoDecoder.outputFormat(
-            pixelFormat: AV_PIX_FMT_YUVJ420P.rawValue, colorRange: AVCOL_RANGE_JPEG, streamIs10Bit: false)
-        #expect(format == .init(tenBit: false, fullRange: false))
+            pixelFormat: AV_PIX_FMT_GBRP.rawValue, colorRange: AVCOL_RANGE_JPEG, streamIs10Bit: false)
+        #expect(!format.fullRange)
+    }
+
+    @Test("swscale gets bicubic and full chroma only where chroma is resampled; luma is never scaled")
+    func swscaleFlags() {
+        func setup(_ src: AVPixelFormat, _ dst: AVPixelFormat) -> SoftwareVideoDecoder.SwscaleSetup {
+            .init(width: 64, height: 64, source: src, destination: dst, sourceFullRange: false,
+                  destinationFullRange: false, colorspace: SWS_CS_ITU709)
+        }
+        let same = setup(AV_PIX_FMT_YUV420P, AV_PIX_FMT_NV12)
+        #expect(!same.resamplesChroma)
+        #expect(same.flags == Int32(SWS_BILINEAR.rawValue | SWS_ACCURATE_RND.rawValue))
+        #expect(!setup(AV_PIX_FMT_YUV422P10LE, AV_PIX_FMT_P210LE).resamplesChroma)
+        #expect(setup(AV_PIX_FMT_YUV420P12LE, AV_PIX_FMT_P216LE).resamplesChroma)
+        #expect(setup(AV_PIX_FMT_GBRP, AV_PIX_FMT_NV24).resamplesChroma)
+        #expect(setup(AV_PIX_FMT_YUV411P, AV_PIX_FMT_NV16).flags & Int32(SWS_BICUBIC.rawValue) != 0)
     }
 
     // MARK: - Native subsampling and depth (#8)
@@ -216,6 +243,81 @@ struct SoftwareDecoderOutputFormatTests {
         #expect(codes.allSatisfy { $0 & 0x3F == 0 }, "nothing left in P010's padding bits")
         #expect(codes.count <= 2, "a flat 12-bit level is at most two adjacent 10-bit codes")
     }
+
+    /// The linked FFmpeg has no JPEG decoder, so the yuvj picture is built here and run through the
+    /// decoder's own conversion context.
+    @Test("a yuvj picture is copied into the full-range buffer level for level, not squeezed to 16...235")
+    func yuvjCopiedAtFullRange() throws {
+        let setup = SoftwareVideoDecoder.SwscaleSetup(
+            width: 64, height: 64, source: AV_PIX_FMT_YUVJ420P, destination: AV_PIX_FMT_NV12,
+            sourceFullRange: true, destinationFullRange: true, colorspace: SWS_CS_ITU601)
+        let ctx = try #require(setup.makeContext())
+        defer { sws_freeContext(ctx) }
+        var src: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+        var dst: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+        defer { av_frame_free(&src); av_frame_free(&dst) }
+        let s = try #require(src), d = try #require(dst)
+        s.pointee.width = 64; s.pointee.height = 64; s.pointee.format = AV_PIX_FMT_YUVJ420P.rawValue
+        d.pointee.width = 64; d.pointee.height = 64; d.pointee.format = AV_PIX_FMT_NV12.rawValue
+        #expect(av_frame_get_buffer(s, 0) >= 0 && av_frame_get_buffer(d, 0) >= 0)
+        memset(s.pointee.data.0, 255, Int(s.pointee.linesize.0) * 64)
+        memset(s.pointee.data.1, 128, Int(s.pointee.linesize.1) * 32)
+        memset(s.pointee.data.2, 128, Int(s.pointee.linesize.2) * 32)
+        withUnsafePointer(to: &s.pointee.data) { sp in
+            withUnsafePointer(to: &s.pointee.linesize) { sl in
+                withUnsafePointer(to: &d.pointee.data) { dp in
+                    withUnsafePointer(to: &d.pointee.linesize) { dl in
+                        _ = sws_scale(ctx,
+                                      UnsafeRawPointer(sp).assumingMemoryBound(to: UnsafePointer<UInt8>?.self),
+                                      UnsafeRawPointer(sl).assumingMemoryBound(to: Int32.self), 0, 64,
+                                      UnsafeRawPointer(dp).assumingMemoryBound(to: UnsafeMutablePointer<UInt8>?.self),
+                                      UnsafeRawPointer(dl).assumingMemoryBound(to: Int32.self))
+                    }
+                }
+            }
+        }
+        #expect(d.pointee.data.0![32 * Int(d.pointee.linesize.0) + 32] == 255)
+    }
+
+    /// Red through BT.709 is luma 63 in video range; through swscale's default BT.601 it is 82, which
+    /// is what a buffer tagged BT.709 used to carry.
+    @Test("an RGB picture is converted with the matrix its buffer is tagged with")
+    func rgbConvertedWithTheTaggedMatrix() throws {
+        let buffer = try firstPixelBuffer(base64: Self.qtrleRedBase64, formatHint: "mov")
+        #expect(CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange)
+        #expect(CVBufferCopyAttachment(buffer, kCVImageBufferYCbCrMatrixKey, nil) as? String
+                == kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String)
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        let luma = try #require(CVPixelBufferGetBaseAddressOfPlane(buffer, 0)).assumingMemoryBound(to: UInt8.self)
+        let y = Int(luma[8 * CVPixelBufferGetBytesPerRowOfPlane(buffer, 0) + 640])
+        #expect(abs(y - 63) <= 1, "luma \(y): BT.709 red is 63, BT.601 red 82")
+    }
+
+    /// 1280x16 red QuickTime RLE (rgb24, untagged; 1280 wide is HD, so BT.709), 2 frames. Regenerate:
+    ///   ffmpeg -f lavfi -i "color=c=red:s=1280x16:r=10:d=0.2" -vf format=rgb24 -c:v qtrle -map_metadata -1 \
+    ///     -fflags +bitexact -flags:v +bitexact qtrle_red.mov
+    static let qtrleRedBase64 = """
+        AAAAFGZ0eXBxdCAgAAACAHF0ICAAAAAId2lkZQAAArZtZGF0AAACpwAAAYD+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AACA/gAA
+        gP4AAID+AAD/AYD+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AAD/AYD+AACA/gAAgP4AAID+AACA/gAAgP4A
+        AID+AACA/gAAgP4AAID+AAD/AYD+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AAD/AYD+AACA/gAAgP4AAID+
+        AACA/gAAgP4AAID+AACA/gAAgP4AAID+AAD/AYD+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AAD/AYD+AACA
+        /gAAgP4AAID+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AAD/AYD+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AACA/gAAgP4AAID+
+        AAD/AYD+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AAD/AYD+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AACA
+        /gAAgP4AAID+AAD/AYD+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AAD/AYD+AACA/gAAgP4AAID+AACA/gAA
+        gP4AAID+AACA/gAAgP4AAID+AAD/AYD+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AAD/AYD+AACA/gAAgP4A
+        AID+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AAD/AYD+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AAD/AYD+
+        AACA/gAAgP4AAID+AACA/gAAgP4AAID+AACA/gAAgP4AAID+AAD/AAAAAAcAAAAAAAK9bW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAA
+        AAAD6AAAAMgAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAA
+        AAAAAAAAAAAAAAAAAgAAAkl0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAAMgAAAAAAAAAAAAAAAAAAAAAAAEAAAAA
+        AAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAABQAAAAAQAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAADIAAAAAAABAAAA
+        AAHBbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAAAoAAAACAB//wAAAAAALWhkbHIAAAAAbWhscnZpZGUAAAAAAAAAAAAAAAAMVmlk
+        ZW9IYW5kbGVyAAABbG1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACxoZGxyAAAAAGRobHJ1cmwgAAAAAAAAAAAAAAAAC0RhdGFI
+        YW5kbGVyAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAAAAABAAABAHN0YmwAAACAc3RzZAAAAAAAAAABAAAAcHJsZSAA
+        AAAAAAAAAQAAAABGRk1QAAACAAAAAgAFAAAQAEgAAABIAAAAAAAAAAEKTGF2YyBxdHJsZQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY
+        //8AAAAKZmllbAEAAAAAEHBhc3AAAAABAAAAAQAAABhzdHRzAAAAAAAAAAEAAAACAAAEAAAAABRzdHNzAAAAAAAAAAEAAAABAAAA
+        HHN0c2MAAAAAAAAAAQAAAAEAAAACAAAAAQAAABxzdHN6AAAAAAAAAAAAAAACAAACpwAAAAcAAAAUc3RjbwAAAAAAAAABAAAAJA==
+        """
 
     /// 64x64 gray, 3 frames, 10-bit 4:2:2. Regenerate:
     ///   ffmpeg -f lavfi -i "color=c=0x808080:s=64x64:r=10:d=0.3" -vf format=yuv422p10le -c:v libx265 -preset ultrafast \
