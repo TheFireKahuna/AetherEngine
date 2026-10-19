@@ -109,7 +109,21 @@ Nothing is touched during the run.
 
 Sequences (`SEQ=` for `run_tv.sh`): `main` is P V1 V2 T N S P1 T1 P, about 11 minutes; the closing P
 repeats the first and checks drift over the session. `el` is TE NE T, about 4 minutes. `vt` is P V1
-V2 S. `count` is T NE TL PM on the counter clips, about 5 minutes. `soak` is one long arm.
+V2 S. `count` is T NE TL PM on the counter clips, about 5 minutes. `soak` is one long arm. `card` is the
+amplifier-RPU test of whether more than 10 bits reach the panel, about 6 minutes: `p7fel_card` with
+`card_amp10.bin` attached to every composed frame through TR (`p010-round`), TD (`p010`), TB
+(`p010-bluenoise`), TF (`p010-full`) and TS (`sv22`), then TF12 / TS12 with the steeper `card_amp12.bin`,
+TI with `card_identity.bin` (the control: flat grey), and BR / BF / BS on `p7fel_bullseye` without an
+override. `run_tv.sh` prints what to look for before launching.
+
+`engine` arm options, in the fourth field (`key=value;key=value`): `out=` the composer's output buffer;
+`rpu=<url>` (absolute, or relative to the clip) one RPU NAL, as `dovi_write_unspec62_nalu` writes it, that
+every composed frame carries in place of its own for this arm only (`AetherEngine.felComposedRpuOverride`;
+the arm is skipped if the fetch fails or libdovi cannot parse it); `secs=N` play N seconds (at most 80),
+starting the clip over each time it ends. Every arm shows a label in the top-left corner: the arm and its
+options, the display mode tvOS is sending (PineBoardServices' `PBSDisplayManager.currentDisplayMode`, a
+private API; "mode: unavailable" if it is missing) such as `Dolby Vision P3 · 3840x2160 23.98Hz`, EDR
+headroom and `AVDisplayManager` state. Each change of mode is logged as `display mode: …`.
 
 The counter clips are read by eye on the recording, not by `analyze.py`. Each layer carries its own frame
 number: the base layer draws "BL 0123" in its pixels, the enhancement layer draws "EL 0123" in its residual
