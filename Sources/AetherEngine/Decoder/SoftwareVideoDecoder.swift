@@ -150,6 +150,13 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// the decode thread afterwards, the same discipline `use10Bit` and the other open-time fields keep.
     private var containerColor = ColorDescription.unspecified
 
+    /// HDR10 static metadata the container declared, the fallback for a frame that carries none, and
+    /// the value last attached, kept so every frame of a stream gets the same `NSData` object (and the
+    /// renderer's format-description key equal bytes). Same open-time discipline as `containerColor`;
+    /// `attachedHDRStatic` is guarded by `lock`, like everything `emit` touches.
+    private var containerHDRStatic = HDRStaticMetadata.none
+    private var attachedHDRStatic = HDRStaticMetadata.none
+
     /// Deinterlaced frames dropped for carrying no PTS (see the drop site in decode()). Guarded by `lock`.
     private var droppedUntimestampedFields = 0
 
@@ -238,6 +245,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         av_dict_free(&opts)
 
         containerColor = ColorDescription(codecpar: codecpar)
+        containerHDRStatic = HDRStaticMetadata(codecpar: codecpar)
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         use10Bit = bitsPerSample > 8 || isHDRTransfer
@@ -721,6 +729,16 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, tags.primaries, .shouldPropagate)
         CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, tags.transfer, .shouldPropagate)
         CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, tags.matrix, .shouldPropagate)
+        attachHDRStaticMetadata(from: frame, to: pb)
+    }
+
+    /// The mastering display and content light level travel with the colour tags: the frame's own
+    /// (bitstream SEI / AV1 metadata OBU) first, the container's declaration for what it lacks. A
+    /// comparison per frame; the attached objects only change when the stream's metadata does.
+    private func attachHDRStaticMetadata(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer) {
+        let current = HDRStaticMetadata(frame: frame).filled(from: containerHDRStatic)
+        if current != attachedHDRStatic { attachedHDRStatic = current }
+        attachedHDRStatic.attach(to: pb)
     }
 
     // MARK: - Pixel Aspect Ratio (anamorphic SD)
