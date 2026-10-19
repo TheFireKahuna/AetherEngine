@@ -65,6 +65,14 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var colorTransfer: CFString?
     private var colorMatrix: CFString?
 
+    /// HDR10 static metadata the container declared (Matroska MasteringMetadata, MP4 `mdcv` / `clli`),
+    /// filled onto a buffer VideoToolbox delivered without its own. VT attaches the bitstream's SEI
+    /// (`PropagatePerFrameHDRDisplayMetadata`) and never the container's, so a remux that carries the
+    /// grade only in the container reached the layer, and the FEL composer's output that copies this
+    /// buffer's attachments, without it. Set in `open(stream:)` only: a session opened from parameter
+    /// sets has no container to read.
+    private var containerHDRStatic = HDRStaticMetadata.none
+
     /// #354: the stream's pixel aspect ratio, re-applied to every CVPixelBuffer for the same reason
     /// the colorimetry is: nothing else puts it there. The renderer builds its format description
     /// from the delivered buffer, so a ratio that is not an attachment on that buffer never reaches
@@ -291,6 +299,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let use10Bit = bitsPerSample > 8 || isHDRTransfer
 
         streamColor = ColorDescription(codecpar: codecpar)
+        containerHDRStatic = HDRStaticMetadata(codecpar: codecpar)
         streamCodecID = codecpar.pointee.codec_id
         streamProfile = codecpar.pointee.profile
         self.colorPrimaries = ColorAttachments.primaries(codecpar.pointee.color_primaries)
@@ -734,6 +743,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         if let matrix = colorMatrix {
             CVBufferSetAttachment(imageBuffer, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
         }
+        containerHDRStatic.attachWhereAbsent(to: imageBuffer)
 
         // #354: without this the renderer's format description carries no pixel aspect ratio and
         // anamorphic content is displayed at its coded dimensions.
