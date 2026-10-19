@@ -148,6 +148,10 @@ struct DoviMetalParams {
     /* The base layer's chroma siting as FFmpeg's AVChromaLocation (chroma_sample_loc_type + 1; 0 =
        unspecified). Read only by dovi_compose_chroma_422, for the vertical phase of each 4:2:2 row. */
     dovi_u32 bl_chroma_loc;
+
+    /* FEL / MEL split view: the luma column from which the residual is no longer added, so the left of the
+       picture is the full FEL result and the right what a MEL stream decodes to. 0 = no split. */
+    dovi_u32 residual_split_x;
 };
 /* DOVI_SHARED_STRUCTS_END */
 """
@@ -577,6 +581,11 @@ static inline int dovi_el_code(float v) {
 // nearest-neighbour from the 4:2:0 plane: the reshaping model is defined on 4:4:4
 // input, and reconstructing chroma to full resolution here would cost a separate
 // pass for a case that does not occur in practice.
+// Whether the residual is added at luma column `x`: everywhere without a split, left of it with one.
+static inline bool dovi_residual_at(constant struct DoviMetalParams &params, uint x) {
+    return params.residual_split_x == 0u || x < params.residual_split_x;
+}
+
 kernel void dovi_compose_luma(
     texture2d<ushort, access::read>        bl_y_tex      [[texture(0)]],
     texture2d<ushort, access::read>        bl_uv_tex     [[texture(1)]],
@@ -609,6 +618,7 @@ kernel void dovi_compose_luma(
     int vdr_y = dovi_denormalize(pred, params.bl_max + 1u, params.vdr_scale, params.vdr_max);
 
     if ((params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u &&
+        dovi_residual_at(params, gid.x) &&
         params.nlq_y.nlq_method == DOVI_NLQ_METHOD_LINEAR &&
         params.nlq_y.nlq_scale != 0) {
         // Centre-aligned: luma samples sit at pixel centres on both grids.
@@ -618,6 +628,9 @@ kernel void dovi_compose_luma(
     }
 
     vdr_y = clamp(vdr_y, 0, int(params.vdr_max));
+    if (params.residual_split_x != 0u && uint(abs(int(gid.x) - int(params.residual_split_x))) < 2u) {
+        vdr_y = int(params.vdr_max) / 2;   // the split's divider, mid-grey in PQ
+    }
 
     int out_y = dovi_quantize(vdr_y, params.vdr_scale, params.dither_mode,
                               dovi_dither(gid, params.frame_index, uint2(0u, 0u)), 64, 940);
@@ -702,7 +715,7 @@ kernel void dovi_compose_chroma(
     int vdr_cb = dovi_denormalize(pred_cb, params.bl_max + 1u, params.vdr_scale, params.vdr_max);
     int vdr_cr = dovi_denormalize(pred_cr, params.bl_max + 1u, params.vdr_scale, params.vdr_max);
 
-    if ((params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u) {
+    if ((params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u && dovi_residual_at(params, gid.x * 2u)) {
         bool cb_active = (params.nlq_cb.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cb.nlq_scale != 0);
         bool cr_active = (params.nlq_cr.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cr.nlq_scale != 0);
         if (cb_active || cr_active) {
@@ -845,7 +858,7 @@ kernel void dovi_compose_chroma_422(
     int vdr_cb = dovi_denormalize(pred_cb, params.bl_max + 1u, params.vdr_scale, params.vdr_max);
     int vdr_cr = dovi_denormalize(pred_cr, params.bl_max + 1u, params.vdr_scale, params.vdr_max);
 
-    if ((params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u) {
+    if ((params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u && dovi_residual_at(params, gid.x * 2u)) {
         bool cb_active = (params.nlq_cb.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cb.nlq_scale != 0);
         bool cr_active = (params.nlq_cr.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cr.nlq_scale != 0);
         if (cb_active || cr_active) {
@@ -1007,6 +1020,7 @@ kernel void dovi_layout_probe(
     out[95] = params.nlq_cr.nlq_pivots[1];
 
     out[96] = params.bl_chroma_loc;
+    out[97] = params.residual_split_x;
 }
 """
 

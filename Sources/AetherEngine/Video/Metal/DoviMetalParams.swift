@@ -213,6 +213,9 @@ struct DoviMetalParams: Sendable {
     /// 0 = unspecified), from the stream's codec parameters (`DualLayerVideoDecoder`). Only the sv22 chroma
     /// kernel reads it, for the vertical phase of each 4:2:2 row; unspecified is taken as LEFT, as HEVC infers.
     var blChromaLocation: UInt32 = 0
+    /// Luma column from which the residual is left out (FEL left, MEL right); 0 = no split. Set by the
+    /// composer from ``DoviFelComposer/residualSplit``.
+    var residualSplitX: UInt32 = 0
 
     init() {}
 
@@ -220,7 +223,7 @@ struct DoviMetalParams: Sendable {
     static let serializedSize =
         4 * 8
         + 3 * (DoviPolynomialParams.stride + DoviMmrParams.stride + DoviNlqParams.stride)
-        + 4 * 7
+        + 4 * 8
 
     /// Derives ``blMax``, ``vdrMax`` and ``vdrScale`` from the RPU's declared bit
     /// depths. Returns false, leaving the values untouched, for a combination the
@@ -339,6 +342,7 @@ struct DoviMetalParams: Sendable {
         w.u32(vdrMax)
         w.u32(vdrScale)
         w.u32(blChromaLocation)
+        w.u32(residualSplitX)
 
         precondition(w.offset == Self.serializedSize,
                      "DoviMetalParams serialization is not serializedSize bytes")
