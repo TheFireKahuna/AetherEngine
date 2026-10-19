@@ -32,6 +32,8 @@ Apple TV and a phone on a tripod.
 | `Scripts/analyze.py` | reads a phone recording back and prints a verdict per arm |
 | `Scripts/report.py` | turns the cut arms into the change-per-patch table, the phase-A levels and the all-arms figure |
 | `Scripts/check_el.py` | checks on the Mac that the EL clip carries the designed residual in B and none in A |
+| `Scripts/card.py` | the bit-survival test card on the Mac: composer model, feltest verification, preview images |
+| `Tools/card_rpu/` | Rust (libdovi `dolby_vision` 3.4.0): the card's amplifier RPUs |
 | `Scripts/dump_attachments.swift` | prints what VideoToolbox attaches to a decoded Dolby Vision frame, with a hash of the RPU |
 | `Scripts/sim_recording.py` | a fake phone recording, to prove the analysis before trusting a real one |
 | `Device/` | the tvOS host app (xcodegen project, committed generated project) |
@@ -42,7 +44,8 @@ Apple TV and a phone on a tripod.
 `x265`, `dovi_tool`, `MP4Box` (gpac), `ffmpeg`/`ffprobe`, `curl`, Python 3 with `numpy`, and `Pillow`
 for the optional plots (`analyze.py --png`, `report.py --png`; `cut.py` writes its per-arm `.png` only
 when Pillow is installed). On macOS: `brew install x265 dovi_tool gpac ffmpeg`,
-`python3 -m pip install numpy pillow`. `xcodegen` only if the Xcode project is regenerated.
+`python3 -m pip install numpy pillow`. A Rust toolchain (`cargo`, rustup) for `Tools/card_rpu`, which `build.sh`
+builds; it fetches the `dolby_vision` crate from crates.io once. `xcodegen` only if the Xcode project is regenerated.
 
 Tested with ffmpeg 9.0.2, dovi_tool 2.3.4, x265 4.3, MP4Box (GPAC) 26.07, Python 3.14 with numpy 2.3
 and Pillow 12.1, and Xcode 27.0 (tvOS 27 SDK), on an LG C1 filmed with a phone.
@@ -65,6 +68,8 @@ The 4K encode takes a few minutes and is skipped when `out/base.hevc` exists.
 | `p7fel_el.mp4` | 7 FEL | the RPU never changes; a positive luma residual on six patches in phase B |
 | `p7fel_count_{null,l2}.mp4` | 7 FEL | counter clips: "BL nnnn" in the base layer, "EL nnnn" in the residual only; `l2` pulses the RPU as `pulse_l2` |
 | `count_mel.mp4` | 8.1 | the counter clip's base layer alone (no EL numbers), the MEL/AVPlayer control |
+| `p7fel_card.mp4` | 7 FEL | nothing (static): the bit-survival test card, see below; with `card_{identity,amp10}.bin` |
+| `p7fel_bullseye.mp4` | 7 FEL | nothing (static): dark radial gradient, left half 10-bit codes, right half 12-bit |
 
 The Profile 7 clips need a FEL RPU to start from. `build.sh` fetches dovi_tool's own 384 byte test
 RPU once and checks its hash:
@@ -293,6 +298,70 @@ python3 Scripts/analyze.py sim.mp4 --arms pulse,steady        # PULSE (28 patche
 
 `cut.py` can be exercised the same way with a hand-written log of `[Pulse] wall=<epoch> t=<s> slate
 <label>`, `arm <label> start mode=<mode> url=<clip>` and `arm <label> end` lines and `--sync`.
+
+## Bit-survival test card
+
+Does precision below 10 bits survive tvOS's output path (the composer's `p010-full` / `sv22` modes)? A pattern one
+12-bit step tall is invisible by PQ's design, so the card uses Dolby Vision's own luma reshaping as an amplifier.
+
+`p7fel_card.mp4` (Profile 7 FEL, 15 s, static, both layers lossless) has a flat base layer at 10-bit code
+N = 448 (~41 nit) and draws everything in the enhancement-layer residual, so the composed 12-bit VDR luma is:
+
+| element | composed luma | VDR | EL code |
+| --- | --- | --- | --- |
+| background | N | 4N = 1792 | 512 |
+| border, 120 px at 4K (the control) | N + 1 | 4N + 4 | 517 |
+| "1/2" glyph | N + 1/2 | 4N + 2 | 515 |
+| "12" glyph | N + 1/4 | 4N + 1 | 514 |
+
+With fel_orig.bin's NLQ (offset 512, slope 2048 at denom 23, threshold 0, VDR 12 bit) `DoviFelComposer.inverseNlq`
+gives a residual of sign(r) * (|r| - 1) VDR codes for r = EL - 512, hence EL = 512 + residual + 1. Glyph strokes are
+48 EL px (96 at 4K), so the bilinear EL upsampling only touches their outer pixel. There is no "1/16" glyph: the
+clip's VDR is 12-bit, so N + 1/16 is not a composable value.
+
+Through the engine's usual identity RPU the card is flat grey. The amplifier RPUs replace it for the experiment.
+`Tools/card_rpu` takes the clip's own RPU, converts it exactly as `DoviRpuConverter.dualLayerUnspec62` does
+(libdovi mode 2, then remove_mapping), and writes:
+
+* `card_identity.bin`: that RPU unchanged, identity mapping (the control; feltest shows the engine attaching a payload of the same size and prefix);
+* `card_amp10.bin`: the same RPU with a three-piece luma curve (10-bit input codes x, output codes):
+  x < 447: f = x; 447 <= x < 450: f = 447 + 64 (x - 447); x >= 450: f = 639 + (x - 450) * 384/573, so f(1023) = 1023.
+  Pivots (delta-coded) [0, 447, 3, 573]; coefficients c0/c1 per piece (normalised) 0/1, -27.5009765625/64,
+  0.32952/0.67016. N -> 511 (~103 nit), N + 1/4 -> 527, N + 1/2 -> 543, N + 1 -> 575 (~196 nit). The window
+  leaves one code of margin each side of N .. N+1; the curve is continuous, monotonic and inside [0, 1023]
+  everywhere, so nothing clips, and the whole card stays far below the tone-mapping knee of a 1000-nit grade.
+  L1 is replaced by the amplified picture's (max 2389, avg 2147; min clamps to 12 as dovi_tool's does). Chroma
+  stays identity, NLQ absent (8.1).
+* no `card_amp12.bin`: libdovi refuses `bl_bit_depth_minus8 != 2` both when writing and when parsing
+  (`RpuDataHeader::validate`), so a 12-bit-declared 8.1 RPU cannot be made or read back with it; a libdovi-based
+  consumer would drop one anyway.
+
+Each file is one HEVC UNSPEC62 NAL unit exactly as libdovi's `write_hevc_unspec62_nalu` / C
+`dovi_write_unspec62_nalu` returns it: the 2-byte NAL header 0x7C 0x01, then the RPU (0x19 ... CRC32, 0x80) with
+emulation prevention bytes, no start code, no length prefix. `card_rpu` parses each back with libdovi and checks
+the round trip is byte-identical; `build.sh` also writes `dovi_tool info` of each (`out/card_*.json`).
+
+What to expect with `card_amp10.bin` attached (previews: `Scripts/card.py preview` writes
+`out/card_preview_{identity,truncated,rounded,bayer,bluenoise,full12}.png` and `out/CARD.md`):
+
+| reaching the amplifier | border | "1/2" | "12" |
+| --- | --- | --- | --- |
+| nothing applied (or RPU dropped) | - | - | - |
+| 10 bits, truncated | solid | - | - |
+| 10 bits, rounded (`p010-round`) | solid | solid, as bright as the border | - |
+| 10 bits, dithered (`p010`, `p010-bluenoise`) | solid | stipple, mean +32 | stipple, mean +16 |
+| 12 bits (`p010-full` / `sv22` intact) | solid | solid, +32 | solid, +16 |
+
+Dither carries the mean through 10 bits, so stippled glyphs are a positive control, not proof of 12 bits; only
+smooth, solid glyphs in `p010-full` / `sv22` are. `Scripts/card.py verify` runs `aetherctl feltest --probe-at` on
+every element in all five output modes and checks every word against the model (in `p010-full`/`sv22` the "12"
+stroke is 28688 = 448 + 16/64 and "1/2" 28704 = 448 + 32/64).
+
+`p7fel_bullseye.mp4` is the fallback that needs no RPU change: a dark radial gradient from code 176 (~0.6 nit,
+centre) to 152 (~0.3 nit, corners), left half rounded to 10-bit codes (one ~2.5% step every ~90 px, just visible
+on an OLED in a dark room), right half at full 12-bit VDR precision via a -2..+1 residual (steps of a quarter
+code). If the bits survive, the right half is smooth and the left one banded; if not, both band alike.
+`Scripts/card.py bullseye` checks it (residual wrap lines put 3% of right-half pixels 1-2 VDR codes off).
 
 ## Caveats
 
