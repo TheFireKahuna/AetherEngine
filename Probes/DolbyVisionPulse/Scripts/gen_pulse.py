@@ -21,6 +21,15 @@ Usage: gen_pulse.py layout                  -> layout.json (patch boxes, code ce
        gen_pulse.py el-frames               -> raw 1920x1080 yuv420p10le EL frames on stdout (feed x265)
        gen_pulse.py el-design               -> the EL residual design (patches, EL codes) as JSON
 
+       gen_pulse.py sub10-frames            -> raw 1920x1080 yuv420p10le EL frames for p7fel_sub10
+       gen_pulse.py sub10-design            -> the sub-10-bit residual design as JSON
+
+sub10-frames is for the bit-survival clip p7fel_sub10: the RPU is constant (`null`); on SUB10_PATCHES
+the residual is -2 VDR codes (-1/2 of a 10-bit code) in phase A and +1 (+1/4) in phase B. Rounded to
+10 bits both phases give the base layer's own code, so the 3/4-code swing exists only below 10 bits:
+a display path that keeps 12 bits pulses, one that rounds to 10 stays flat, and ordered dither
+(which carries the mean) pulses as the positive control.
+
 el-frames is for the p7fel_el clip: the RPU is constant (as in `null`), the enhancement layer is flat
 512 (zero residual) in phase A and carries a positive luma residual on EL_PATCHES in phase B.
 """
@@ -240,6 +249,35 @@ def write_el_frames(out):
         out.write(fb if phase_of(i) == "B" else fa)
 
 
+# ---------------------------------------------------------------- sub-10-bit residual (p7fel_sub10)
+# residual = |EL - 512| - 1 VDR codes (el_design's model of fel_orig.bin), applied with the EL's sign.
+SUB10_EL_A = EL_FLAT - 3   # -2 VDR codes: 1/2 of a 10-bit code down, which rounds back up to the BL code
+SUB10_EL_B = EL_FLAT + 2   # +1 VDR code: 1/4 of a 10-bit code up, which rounds back down to it
+# Mid greys and two colours; the other patches stay flat as in-frame controls. Not g0.1 (black clamp)
+# or the top greys (L1/trim roll-off can compress the swing there).
+SUB10_PATCHES = ["g1", "g10", "g50", "g100", "g200", "g400", "gray150", "skin"]
+
+
+def sub10_design():
+    return {"el_a": SUB10_EL_A, "el_b": SUB10_EL_B, "vdr_a": -2, "vdr_b": 1,
+            "patches": [{"name": p["name"], "box": p["box"], "bl_y10": rgb_nits_to_ycc10(p["rgb"])[0]}
+                        for p in layout()["patches"] if p["name"] in SUB10_PATCHES]}
+
+
+def write_sub10_frames(out):
+    A = np.full((EL_H, EL_W), EL_FLAT, dtype=np.uint16)
+    B = A.copy()
+    for d in sub10_design()["patches"]:
+        x0, y0, x1, y1 = (v // 2 for v in d["box"])
+        A[y0:y1, x0:x1] = SUB10_EL_A
+        B[y0:y1, x0:x1] = SUB10_EL_B
+    chroma = np.full((EL_H // 2) * (EL_W // 2), EL_FLAT, dtype=np.uint16).tobytes()
+    fa = A.tobytes() + chroma + chroma
+    fb = B.tobytes() + chroma + chroma
+    for i in range(N_FRAMES):
+        out.write(fb if phase_of(i) == "B" else fa)
+
+
 # ---------------------------------------------------------------- RPU configs
 NEUTRAL_TRIM = dict(trim_slope=2048, trim_offset=2048, trim_power=2048,
                     trim_chroma_weight=2048, trim_saturation_gain=2048, ms_weight=2048)
@@ -304,6 +342,10 @@ if __name__ == "__main__":
         write_frames(sys.stdout.buffer)
     elif cmd == "el-frames":
         write_el_frames(sys.stdout.buffer)
+    elif cmd == "sub10-frames":
+        write_sub10_frames(sys.stdout.buffer)
+    elif cmd == "sub10-design":
+        json.dump(sub10_design(), sys.stdout, indent=1)
     elif cmd == "el-design":
         json.dump(el_design(), sys.stdout, indent=1)
     elif cmd == "rpu-json" and len(sys.argv) == 3 and sys.argv[2] in ("l1", "l2", "null", "l8"):

@@ -1,4 +1,4 @@
-import AetherEngine
+@_spi(Diagnostics) import AetherEngine
 import AVFoundation
 import AVKit
 import CoreMedia
@@ -26,6 +26,8 @@ import UIKit
 // - `engine`: AetherEngine with `preferDualLayerDolbyVision: true` (a Profile 7 FEL clip takes the
 //   dual-layer route).
 // - `enginenofel`: as `engine` with `preferDualLayerDolbyVision: false` (native 8.1 route, EL dropped).
+//   `engine` takes `out=p010|p010-round|p010-full|sv22` (default p010): the FEL composer's output buffer, for the
+//   12-bit display-path experiment (`AetherEngine.felOutputMode`).
 // - `soak`: `engine` for `minutes=` with a `seeks=at@to,...` schedule, sampled once a second, ending in
 //   one `soak summary` line.
 //
@@ -180,7 +182,15 @@ struct PulseHarnessView: View {
             case "vt", "vtcopy", "vtstrip":
                 await host.playVT(arm.url, mode: arm.mode, log: say)
             case "engine":
+                let out = arm.params["out"] ?? "p010"
+                guard let mode = AetherEngine.FelOutputMode(rawValue: out) else {
+                    say("unknown out=\(out), arm skipped")
+                    break
+                }
+                AetherEngine.felOutputMode = mode
+                say("fel output \(mode.rawValue)")
                 await playEngine(arm.url, fel: true, log: say)
+                AetherEngine.felOutputMode = .p010
             case "enginenofel":
                 await playEngine(arm.url, fel: false, log: say)
             case "soak":
