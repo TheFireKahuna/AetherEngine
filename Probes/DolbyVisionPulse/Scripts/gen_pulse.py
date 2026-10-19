@@ -7,6 +7,9 @@ the analysis reads back from the phone video. Only the RPU changes:
   l2    L1 constant (true stats); L2 trims at 100/600/1000/4000-nit targets switch neutral <-> extreme
   l1    L1 max_pq switches 100 nits <-> 10000 nits; no trims
   null  L1 constant, L2 trims always neutral (same shot boundaries as l2)
+  l8    CM v4.0: L1 constant, L2 trims always neutral; L8 trims at the 100/600/1000/higher presets
+        switch neutral <-> extreme. Only a CM v4.0 display manager can see the switch, so a pulse
+        means the L8 blocks reached the panel; a v2.9-only path (or one that drops L8) stays flat.
 
 Timeline at 24000/1001 fps: 144 frames of phase A (pre-roll, lets the HDMI mode switch settle),
 then 20 phases of 72 frames alternating B, A, B, ... (10 cycles of ~6 s). The phase of any frame is
@@ -244,6 +247,13 @@ NEUTRAL_TRIM = dict(trim_slope=2048, trim_offset=2048, trim_power=2048,
 EXTREME_TRIM = dict(trim_slope=512, trim_offset=1792, trim_power=3584,
                     trim_chroma_weight=2048, trim_saturation_gain=0, ms_weight=2048)
 TRIM_TARGETS = [100, 600, 1000, 4000]
+# L8 addresses targets by preset index, not by nits, and a frame carries at most 5 L8 blocks. These are
+# the presets real masters carry (1: 100-nit BT.709, 27: 600-nit P3, 48: 1000-nit P3, 49: the next one
+# up), mirroring TRIM_TARGETS, so whichever pair the panel's CM v4.0 interpolates between, both switch.
+L8_TARGET_INDICES = [1, 27, 48, 49]
+# L8's neutral is 2048 in every field, including chroma weight and saturation (unlike L2's).
+L8_NEUTRAL_TRIM = dict(NEUTRAL_TRIM, target_mid_contrast=2048, clip_trim=2048)
+L8_EXTREME_TRIM = dict(EXTREME_TRIM, target_mid_contrast=2048, clip_trim=2048)
 
 
 def shots():
@@ -259,7 +269,7 @@ def rpu_config(variant):
     L = layout()
     mn, mx, avg = l1_stats(L)
     cfg = {
-        "cm_version": "V29",
+        "cm_version": "V40" if variant == "l8" else "V29",
         "profile": "8.1",
         "length": N_FRAMES,
         "level6": {"max_display_mastering_luminance": 10000, "min_display_mastering_luminance": 1,
@@ -276,6 +286,10 @@ def rpu_config(variant):
             trim = EXTREME_TRIM if (variant == "l2" and ph == "B") else NEUTRAL_TRIM
             for t in TRIM_TARGETS:
                 blocks.append({"Level2": dict(target_max_pq=pq12(t), **trim)})
+            if variant == "l8":
+                trim8 = L8_EXTREME_TRIM if ph == "B" else L8_NEUTRAL_TRIM
+                for idx in L8_TARGET_INDICES:
+                    blocks.append({"Level8": dict(length=10, target_display_index=idx, **trim8)})
         cfg["shots"].append({"start": start, "duration": dur, "metadata_blocks": blocks})
     return cfg
 
@@ -292,7 +306,7 @@ if __name__ == "__main__":
         write_el_frames(sys.stdout.buffer)
     elif cmd == "el-design":
         json.dump(el_design(), sys.stdout, indent=1)
-    elif cmd == "rpu-json" and len(sys.argv) == 3 and sys.argv[2] in ("l1", "l2", "null"):
+    elif cmd == "rpu-json" and len(sys.argv) == 3 and sys.argv[2] in ("l1", "l2", "null", "l8"):
         json.dump(rpu_config(sys.argv[2]), sys.stdout, indent=1)
     else:
         sys.exit(__doc__)
