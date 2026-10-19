@@ -557,6 +557,17 @@ if first == "dvsurvey" {
     exit(runDvSurvey(url: parseSourceURL(urlArg), maxFrames: frames, listFrames: list))
 }
 
+#if DualLayerDolbyVision
+// What each title's enhancement layer does to its picture, measured at sampled keyframes: `label<TAB>url` lines on stdin.
+if first == "elsurvey" {
+    var rest = Array(args.dropFirst(2))
+    let parallel = takeIntFlag("--parallel", from: &rest) ?? 8
+    let points = takeIntFlag("--points", from: &rest) ?? 48
+    rejectStrayFlags(rest, subcommand: "elsurvey")
+    exit(runElSurvey(parallel: parallel, points: points))
+}
+#endif
+
 // FEL / MEL for many sources at once: `label<TAB>url` lines on stdin.
 if first == "eltype" {
     var rest = Array(args.dropFirst(2))
