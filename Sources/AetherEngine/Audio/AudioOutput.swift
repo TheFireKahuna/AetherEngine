@@ -432,8 +432,7 @@ final class AudioOutput: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         _epoch &+= 1
-        prerollGeneration &+= 1
-        prerollRate = nil
+        disarmPreroll()
         synchronizer.setRate(0.0, time: .zero)
         renderer.flush()
     }
@@ -449,8 +448,7 @@ final class AudioOutput: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         EngineLog.emit("[AudioOutput] seekClock to=\(String(format: "%.3f", time.seconds)) rate=\(rate)", category: .swPlayback)
-        prerollGeneration &+= 1
-        prerollRate = nil
+        disarmPreroll()
         guard let preroll else {
             synchronizer.setRate(rate, time: timeline.rendererTime(forSource: time))
             return
@@ -462,8 +460,17 @@ final class AudioOutput: @unchecked Sendable {
         synchronizer.setRate(0, time: timeline.rendererTime(forSource: time))
         let gen = prerollGeneration
         prerollRate = rate
-        let started = CACurrentMediaTime()
-        prerollQueue.async { [weak self] in self?.pollPreroll(gen: gen, time: time, started: started) }
+        prerollTime = time
+        prerollStarted = CACurrentMediaTime()
+        prerollWake.withLock { $0 = PrerollWake(generation: gen) }
+        // The fallback: one tick at the timeout, cancelled by whatever ends the wait first.
+        let timer = DispatchSource.makeTimerSource(queue: prerollQueue)
+        timer.schedule(deadline: .now() + Self.prerollTimeout)
+        timer.setEventHandler { [weak self] in self?.evaluatePreroll(gen: gen, timedOut: true) }
+        prerollTimer = timer
+        timer.resume()
+        // Frames handed over between the question above and now told nobody: ask once more.
+        videoPrerollAdvanced()
     }
 
     // MARK: - Video preroll
@@ -479,7 +486,8 @@ final class AudioOutput: @unchecked Sendable {
     /// frames at every start and every seek on an Apple TV 4K (A12). With the preroll, `seekClock`
     /// anchors at rate 0, and the clock starts at the requested rate and the same source time once
     /// the renderer is ready, or after `prerollTimeout`. A pause, a rate change or another seek in the
-    /// meantime cancels the start; `stop()` too.
+    /// meantime cancels the start; `stop()` too. The gate is asked again only when the renderer hands
+    /// a frame over (``videoPrerollAdvanced()``), not on a timer.
     var videoPrerollSatisfied: (@Sendable (Double) -> Bool?)? {
         get { lock.lock(); defer { lock.unlock() }; return _videoPrerollSatisfied }
         set { lock.lock(); _videoPrerollSatisfied = newValue; lock.unlock() }
@@ -537,7 +545,20 @@ final class AudioOutput: @unchecked Sendable {
 
     private var prerollGeneration = 0  // guarded by lock
     private var prerollRate: Float?  // guarded by lock; non-nil while a preroll waits: the rate it starts at
+    private var prerollTime = CMTime.invalid  // guarded by lock; the source time a waiting preroll starts at
+    private var prerollStarted: CFTimeInterval = 0  // guarded by lock
+    private var prerollTimer: DispatchSourceTimer?  // guarded by lock; the waiting preroll's timeout
     private let prerollQueue = DispatchQueue(label: "aether.audio.preroll", qos: .userInteractive)
+
+    /// What a handover needs to know to wake a waiting preroll, behind its own lock so the decode
+    /// thread never waits on `lock` (held across synchronizer calls, which are IPC on tvOS). Taken
+    /// inside `lock` when a preroll is armed or disarmed, and alone everywhere else; never the
+    /// other way round. `queued` coalesces a burst of handovers into one evaluation.
+    private struct PrerollWake {
+        var generation: Int?
+        var queued = false
+    }
+    private let prerollWake = OSAllocatedUnfairLock(initialState: PrerollWake())
 
     /// Whether a preroll holds the clock at rate 0 to start it later. A host must not read that
     /// standing clock as stalled (AE#549) and restart it.
@@ -547,26 +568,59 @@ final class AudioOutput: @unchecked Sendable {
         return prerollRate != nil
     }
 
-    private func pollPreroll(gen: Int, time: CMTime, started: CFTimeInterval) {
-        // A pause, seek or stop since: this chain is over. Without the check every cancelled preroll
-        // polled on at 500 Hz, taking both locks, until its gate opened or it timed out.
+    /// Prerolled starts so far, the immediate ones included; and whether the last waiting one was
+    /// started by its timeout rather than by the gate. Diagnostics for tests: exactly one start per
+    /// preroll, and the one the handover triggered.
+    var prerollStartCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _prerollStartCount
+    }
+    private var _prerollStartCount = 0  // guarded by lock
+    var lastPrerollTimedOut: Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _lastPrerollTimedOut
+    }
+    private var _lastPrerollTimedOut: Bool?  // guarded by lock
+
+    /// The gate's inputs moved: the renderer handed a frame over (`SampleBufferRenderer.setPrerollAdvancedObserver`).
+    /// Callable from any thread and never blocks: it queues one evaluation on `prerollQueue` if a
+    /// preroll waits and none is queued yet. This replaced a poll every 2 ms, which kept the gate's
+    /// lock and this one busy about 300 times a second through every wait (measured on macOS) and
+    /// saw an opened gate a median 3.0 ms late (7.1 ms at worst, timer leeway); this sees it in 0.02 ms.
+    func videoPrerollAdvanced() {
+        let gen: Int? = prerollWake.withLock { wake in
+            guard let gen = wake.generation, !wake.queued else { return nil }
+            wake.queued = true
+            return gen
+        }
+        guard let gen else { return }
+        prerollQueue.async { [weak self] in self?.evaluatePreroll(gen: gen, timedOut: false) }
+    }
+
+    /// Asks the gate for the preroll armed as `gen`, and starts the clock if it is open or the
+    /// timeout has come. On `prerollQueue` only, so a handover and the timeout are judged one at a
+    /// time; the generation, read again under `lock` after the gate answered, makes the first of them
+    /// the only start and lets a pause, seek or stop in the meantime win.
+    private func evaluatePreroll(gen: Int, timedOut: Bool) {
+        // A handover from here on queues another evaluation: this one may read the gate before it.
+        prerollWake.withLock { if $0.generation == gen { $0.queued = false } }
         lock.lock()
         let current = prerollGeneration == gen && prerollRate != nil
+        let time = prerollTime
+        let started = prerollStarted
         lock.unlock()
         guard current else { return }
         let ready = videoPrerollSatisfied?(time.seconds) != false
+        guard ready || timedOut else { return }
         let waited = CACurrentMediaTime() - started
-        if !ready, waited < Self.prerollTimeout {
-            prerollQueue.asyncAfter(deadline: .now() + .milliseconds(2)) { [weak self] in
-                self?.pollPreroll(gen: gen, time: time, started: started)
-            }
-            return
-        }
         let lead = Self.currentPrerollStartLead()
         lock.lock()
         defer { lock.unlock() }
         guard prerollGeneration == gen, let rate = prerollRate else { return }
-        prerollRate = nil
+        disarmPreroll()
+        _lastPrerollTimedOut = !ready
         EngineLog.emit("[AudioOutput] preroll \(ready ? "ready" : "timed out") after "
                        + "\(String(format: "%.0f", waited * 1000)) ms; starting at t=\(String(format: "%.3f", time.seconds)) rate=\(rate)",
                        category: .swPlayback)
@@ -577,6 +631,7 @@ final class AudioOutput: @unchecked Sendable {
     /// it took `lock`). Called with `lock` held.
     private func startAfterPreroll(rate: Float, time: CMTime, lead: Double) {
         _lastPrerollStartLead = lead
+        _prerollStartCount += 1
         EngineLog.emit("[AudioOutput] start lead \(String(format: "%.0f", lead * 1000)) ms", category: .swPlayback, level: .verbose)
         let hostNow = CMClockGetTime(CMClockGetHostTimeClock())
         let host = CMTimeAdd(hostNow, CMTime(seconds: lead, preferredTimescale: 1_000_000_000))
@@ -585,9 +640,18 @@ final class AudioOutput: @unchecked Sendable {
 
     private func cancelPreroll() {
         lock.lock()
+        disarmPreroll()
+        lock.unlock()
+    }
+
+    /// Ends any waiting preroll: its generation moves on, so a handover or timeout already queued for
+    /// it finds nothing to start. Called with `lock` held.
+    private func disarmPreroll() {
         prerollGeneration &+= 1
         prerollRate = nil
-        lock.unlock()
+        prerollTimer?.cancel()
+        prerollTimer = nil
+        prerollWake.withLock { $0 = PrerollWake() }
     }
 
     private func updatePrerollRate(_ rate: Float) -> Bool {

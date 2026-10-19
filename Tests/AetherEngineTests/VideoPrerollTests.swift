@@ -163,11 +163,18 @@ struct VideoPrerollTests {
 
     // MARK: - Clock
 
-    /// A gate the test opens by hand.
+    /// A gate the test opens by hand. Nothing polls it: like the renderer's handover, opening it
+    /// has to tell the output (`AudioOutput.videoPrerollAdvanced()`). `evaluations` counts how often
+    /// the output asked.
     private final class Gate: Sendable {
         private let open = OSAllocatedUnfairLock(initialState: false)
-        func set(_ value: Bool) { open.withLock { $0 = value } }
-        var isOpen: Bool { open.withLock { $0 } }
+        private let asked = OSAllocatedUnfairLock(initialState: 0)
+        func set(_ value: Bool, telling output: AudioOutput? = nil) {
+            open.withLock { $0 = value }
+            output?.videoPrerollAdvanced()
+        }
+        var isOpen: Bool { asked.withLock { $0 += 1 }; return open.withLock { $0 } }
+        var evaluations: Int { asked.withLock { $0 } }
     }
 
     @Test("Without a gate seekClock starts the clock at once", .timeLimit(.minutes(1)))
@@ -187,7 +194,7 @@ struct VideoPrerollTests {
         #expect(output.synchronizer.rate == 0)
         #expect(abs(output.synchronizer.currentTime().seconds - 5) < 0.001)
         let opened = CMClockGetTime(CMClockGetHostTimeClock()).seconds
-        gate.set(true)
+        gate.set(true, telling: output)
         try await waitFor { output.synchronizer.rate == 1 }
         // The start was scheduled `lastPrerollStartLead` after the gate opened, so however late this
         // runs, the clock has not run longer than the time since then minus the lead.
@@ -205,7 +212,7 @@ struct VideoPrerollTests {
         output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
         output.setRate(1.5)
         #expect(output.synchronizer.rate == 0, "the rate does not start the clock early")
-        gate.set(true)
+        gate.set(true, telling: output)
         try await waitFor { output.synchronizer.rate == 1.5 }
     }
 
@@ -216,7 +223,7 @@ struct VideoPrerollTests {
         output.videoPrerollSatisfied = { _ in gate.isOpen }
         output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
         output.pause()
-        gate.set(true)
+        gate.set(true, telling: output)
         let started = try await waitFor(upTo: .milliseconds(300)) { output.synchronizer.rate != 0 }
         #expect(!started)
     }
@@ -231,7 +238,7 @@ struct VideoPrerollTests {
         output.setRate(1)
         #expect(output.synchronizer.rate == 0, "nothing is queued yet")
         #expect(output.prerollPending, "the host must not read this clock as stalled")
-        gate.set(true)
+        gate.set(true, telling: output)
         try await waitFor { output.synchronizer.rate == 1 }
         #expect(!output.prerollPending)
     }
@@ -243,6 +250,117 @@ struct VideoPrerollTests {
         output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
         #expect(output.synchronizer.rate == 0)
         try await waitFor { output.synchronizer.rate == 1 }
+    }
+
+    @Test("A waiting preroll asks the gate on each handover, not on a timer", .timeLimit(.minutes(1)))
+    func waitingPrerollDoesNotPoll() async throws {
+        let output = AudioOutput()
+        let gate = Gate()
+        output.videoPrerollSatisfied = { _ in gate.isOpen }
+        output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
+        // The seek's own question, and the one asked once the preroll was armed.
+        try await waitFor { gate.evaluations >= 2 }
+        // A gate that opens with nobody saying so stays unseen: the 2 ms poll this replaced asked it
+        // about 300 times a second (measured on macOS), and would have started the clock here.
+        gate.set(true)
+        let started = try await waitFor(upTo: .milliseconds(300)) { output.synchronizer.rate != 0 }
+        #expect(!started)
+        // Nothing asked it since.
+        #expect(gate.evaluations <= 2, "\(gate.evaluations) evaluations")
+        #expect(output.prerollPending)
+        gate.set(true, telling: output)
+        try await waitFor { output.synchronizer.rate == 1 }
+        #expect(output.lastPrerollTimedOut == false, "the handover started it, not the timeout")
+        #expect(output.prerollStartCount == 1)
+    }
+
+    @Test("The handover that fills the renderer's preroll starts the clock", .timeLimit(.minutes(1)))
+    @MainActor
+    func rendererHandoverStartsTheClock() async throws {
+        let output = AudioOutput()
+        let renderer = SampleBufferRenderer()
+        renderer.setReorderDepth(SampleBufferRenderer.presentationOrderReorderDepth)
+        // Wired as the software host wires them.
+        output.videoPrerollSatisfied = { renderer.prerollSatisfied(clock: $0, live: false) }
+        renderer.setPrerollAdvancedObserver { [weak output] in output?.videoPrerollAdvanced() }
+        let pixels = Self.makePixelBuffer()
+        output.seekClock(to: .zero, rate: 1)
+        for i in 0...3 { renderer.enqueue(pixelBuffer: pixels, pts: Self.time(i)) }
+        let early = try await waitFor(upTo: .milliseconds(200)) { output.synchronizer.rate != 0 }
+        #expect(!early, "frames up to 0.083 s are not the 0.125 s preroll")
+        renderer.enqueue(pixelBuffer: pixels, pts: Self.time(4))
+        try await waitFor { output.synchronizer.rate == 1 }
+        #expect(output.lastPrerollTimedOut == false)
+        #expect(output.prerollStartCount == 1)
+    }
+
+    @Test("A gate that never opens is asked once more at the timeout, not on the way to it",
+          .timeLimit(.minutes(1)))
+    func timeoutIsOneShot() async throws {
+        let output = AudioOutput()
+        let gate = Gate()
+        output.videoPrerollSatisfied = { _ in gate.isOpen }
+        let armed = ContinuousClock.now
+        output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
+        try await waitFor { output.synchronizer.rate == 1 }
+        #expect(ContinuousClock.now - armed >= .seconds(AudioOutput.prerollTimeout) - .milliseconds(50))
+        #expect(output.lastPrerollTimedOut == true)
+        #expect(gate.evaluations <= 3, "seek, arm and timeout: \(gate.evaluations)")
+        #expect(output.prerollStartCount == 1)
+    }
+
+    @Test("A seek that lands while a handover is being judged keeps the clock where it put it",
+          .timeLimit(.minutes(1)))
+    func seekDuringAnEvaluationWins() async throws {
+        let output = AudioOutput()
+        let gate = Gate()
+        let reseek = OSAllocatedUnfairLock(initialState: false)
+        output.videoPrerollSatisfied = { _ in
+            // The paused seek arrives between the gate's answer and the start it would trigger.
+            if reseek.withLock({ $0 }), gate.isOpen {
+                reseek.withLock { $0 = false }
+                output.seekClock(to: CMTime(seconds: 9, preferredTimescale: 90000), rate: 0)
+                return true
+            }
+            return gate.isOpen
+        }
+        output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
+        reseek.withLock { $0 = true }
+        gate.set(true, telling: output)
+        try await waitFor { !reseek.withLock { $0 } }
+        // Stale handovers for the old seek change nothing either.
+        for _ in 0..<5 { output.videoPrerollAdvanced() }
+        let started = try await waitFor(upTo: .milliseconds(300)) { output.synchronizer.rate != 0 }
+        #expect(!started)
+        #expect(abs(output.synchronizer.currentTime().seconds - 9) < 0.001)
+        #expect(!output.prerollPending)
+        #expect(output.prerollStartCount == 0)
+    }
+
+    @Test("Handovers racing each other and the timeout start the clock once", .timeLimit(.minutes(1)))
+    func handoversAndTimeoutStartOnce() async throws {
+        let output = AudioOutput()
+        let gate = Gate()
+        output.videoPrerollSatisfied = { _ in gate.isOpen }
+        output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
+        // Open the gate right at the timeout and fire handovers from several threads around it.
+        let fire = DispatchGroup()
+        for lane in 0..<4 {
+            DispatchQueue.global(qos: .userInitiated).async(group: fire) {
+                let start = CACurrentMediaTime()
+                while CACurrentMediaTime() - start < AudioOutput.prerollTimeout + 0.1 {
+                    if lane == 0, CACurrentMediaTime() - start > AudioOutput.prerollTimeout - 0.01 {
+                        gate.set(true)
+                    }
+                    output.videoPrerollAdvanced()
+                    usleep(200)
+                }
+            }
+        }
+        try await waitFor { output.synchronizer.rate == 1 }
+        try await waitFor { fire.wait(timeout: .now()) == .success }
+        #expect(output.prerollStartCount == 1)
+        #expect(!output.prerollPending)
     }
 
     @Test("The start lead follows the route's latency, capped at the validated 250 ms")
