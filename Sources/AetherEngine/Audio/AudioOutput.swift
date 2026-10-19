@@ -465,7 +465,7 @@ final class AudioOutput: @unchecked Sendable {
         prerollWake.withLock { $0 = PrerollWake(generation: gen) }
         // The fallback: one tick at the timeout, cancelled by whatever ends the wait first.
         let timer = DispatchSource.makeTimerSource(queue: prerollQueue)
-        timer.schedule(deadline: .now() + Self.prerollTimeout)
+        timer.schedule(deadline: .now() + (prerollTimeoutOverride ?? Self.prerollTimeout))
         timer.setEventHandler { [weak self] in self?.evaluatePreroll(gen: gen, timedOut: true) }
         prerollTimer = timer
         timer.resume()
@@ -496,6 +496,9 @@ final class AudioOutput: @unchecked Sendable {
 
     /// How long a preroll may hold the clock. A decoder that never delivers must not freeze playback.
     static let prerollTimeout: Double = 2
+    /// Tests that prove a start came from a handover set this long, so the fallback timer cannot fire
+    /// while a loaded test runner is still between its steps. Set before `seekClock`.
+    var prerollTimeoutOverride: Double?
 
     /// How far ahead of now a prerolled start is scheduled, at most. On tvOS the synchronizer lives in
     /// another process, and the display path learns of a rate change about as late as the audio route's

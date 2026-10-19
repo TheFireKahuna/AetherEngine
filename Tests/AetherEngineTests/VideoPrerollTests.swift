@@ -255,6 +255,9 @@ struct VideoPrerollTests {
     @Test("A waiting preroll asks the gate on each handover, not on a timer", .timeLimit(.minutes(1)))
     func waitingPrerollDoesNotPoll() async throws {
         let output = AudioOutput()
+        // Out of reach of the waits below even under the one-thread pool lane, where they have
+        // outlasted the real 2 s timeout and its tick started the clock as designed.
+        output.prerollTimeoutOverride = 60
         let gate = Gate()
         output.videoPrerollSatisfied = { _ in gate.isOpen }
         output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
@@ -278,6 +281,7 @@ struct VideoPrerollTests {
     @MainActor
     func rendererHandoverStartsTheClock() async throws {
         let output = AudioOutput()
+        output.prerollTimeoutOverride = 60   // as in `waitingPrerollDoesNotPoll`
         let renderer = SampleBufferRenderer()
         renderer.setReorderDepth(SampleBufferRenderer.presentationOrderReorderDepth)
         // Wired as the software host wires them.
