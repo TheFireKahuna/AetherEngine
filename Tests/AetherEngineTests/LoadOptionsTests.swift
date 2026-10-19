@@ -17,7 +17,9 @@ struct LoadOptionsTests {
         #expect(opts.matchContentEnabled == true)
         // Default panelIsInHDRMode MUST be false (conservative branch).
         #expect(opts.panelIsInHDRMode == false)
-        #expect(opts.audioBridgeMode == .surroundCompat)
+        // Lossless by default: the sinks that take multichannel LPCM (an AVR over HDMI, an AVR or
+        // soundbar on eARC) get the source bit for bit; legacy ARC opts into .surroundCompat.
+        #expect(opts.audioBridgeMode == .lossless)
         #expect(opts.isLive == false)
         #expect(opts.audioOnly == false)
         // Dual-layer FEL composition is opt-in.
