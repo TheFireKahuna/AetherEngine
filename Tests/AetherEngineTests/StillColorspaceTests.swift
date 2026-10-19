@@ -20,6 +20,13 @@ struct StillColorspaceTests {
         #expect(FrameDecodeContext.swsColorspace(for: described(AVCOL_PRI_BT470BG, AVCOL_SPC_UNSPECIFIED)) == SWS_CS_ITU601)
     }
 
+    @Test("An untagged SD still takes playback's BT.601 guess (#6); HD stays BT.709")
+    func untaggedSDFollowsPlayback() {
+        #expect(FrameDecodeContext.swsColorspace(for: .unspecified, frameSize: (720, 480)) == SWS_CS_ITU601)
+        #expect(FrameDecodeContext.swsColorspace(for: .unspecified, frameSize: (720, 576)) == SWS_CS_ITU601)
+        #expect(FrameDecodeContext.swsColorspace(for: .unspecified, frameSize: (1920, 1080)) == SWS_CS_ITU709)
+    }
+
     @Test("SD and BT.2020 matrices keep their own tables")
     func declaredMatrices() {
         #expect(FrameDecodeContext.swsColorspace(for: described(AVCOL_PRI_UNSPECIFIED, AVCOL_SPC_SMPTE170M)) == SWS_CS_ITU601)
