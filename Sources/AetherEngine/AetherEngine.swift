@@ -4783,7 +4783,17 @@ public final class AetherEngine: ObservableObject {
         ) ?? (probeOpened ? nil : audioSourceStreamIndex)
         let resolvedInitialAudio = selectedAudio ?? probedDefaultAudioIndex
         activeAudioTrackIndex = resolvedInitialAudio >= 0 ? Int(resolvedInitialAudio) : nil
-        let snappedRate = FrameRateSnap.snap(detectedRate ?? 0)
+        // #7: the field rate when the software deinterlacer will output one; `detectedRate` stays the
+        // content rate for everything else that reads it.
+        let displayRate = Self.displayFrameRate(
+            contentRate: detectedRate, codecID: detectedCodecID, fieldOrder: detectedFieldOrder,
+            deinterlaceMode: options.deinterlaceMode, deinterlaceFieldRate: options.deinterlaceFieldRate)
+        if let displayRate, let detectedRate, displayRate != detectedRate {
+            EngineLog.emit("[AetherEngine] interlaced (fieldOrder=\(detectedFieldOrder.rawValue)) at "
+                           + String(format: "%.3f", detectedRate) + " fps deinterlaces at field rate; "
+                           + "display rate " + String(format: "%.3f", displayRate), category: .engine)
+        }
+        let snappedRate = FrameRateSnap.snap(displayRate ?? 0)
         EngineLog.emit("[AetherEngine] load url=\(url.absoluteString) source-format=\(detectedFormat) effective-format=\(effectiveFormat) rate=\(snappedRate.map { String(format: "%.3f", $0) } ?? "n/a")", category: .engine)
 
         // 1.5 Audio-only fast path: no display-criteria handshake, no video dispatch.
