@@ -5,6 +5,7 @@
 #
 #   pulse_{l2,l1,null}.mp4   Profile 8.1, the RPU switches (l2: trims, l1: max_pq, null: never)
 #   pulse_l8.mp4 / p7fel_l8.mp4  CM v4.0: only the L8 trims switch (does CM v4.0 metadata reach the panel?)
+#   p7fel_sub10.mp4          Profile 7 FEL, constant RPU; the residual swings 3/4 of a 10-bit code, below 10 bits only
 #   p7fel_{l2,l1,null}.mp4   Profile 7 FEL, same RPUs; the enhancement layer is flat (zero residual)
 #   p7fel_el.mp4             Profile 7 FEL, constant RPU; the enhancement-layer residual switches
 #   p7fel_count_{null,l2}.mp4  Profile 7 FEL counter clips (fel_count.py): BL and EL each carry their own frame
@@ -113,6 +114,21 @@ dovi_tool mux --bl base.hevc --el el_el.hevc -o p7_el.hevc
 rm -f p7fel_el.mp4
 MP4Box -add p7_el.hevc:fps=24000/1001:dvp=f7.6 -brand mp42isom -ab dby1 -quiet -new p7fel_el.mp4
 rm el_el.hevc p7_el.hevc
+
+# ---- p7fel_sub10: the bit-survival clip (SEQ=bits) ----
+# EL residual -2 / +1 VDR codes on SUB10_PATCHES (gen_pulse.py sub10-design). Encoded lossless: a lossy
+# encode would round offsets of 1-3 codes on a flat 512 field away.
+if [[ ! -s el_sub10.hevc ]]; then
+  python3 "$GEN" sub10-frames | x265 --input - --input-res 1920x1080 --fps 24000/1001 --input-depth 10 \
+    --input-csp i420 --output-depth 10 --profile main10 --lossless --preset fast --keyint 48 --min-keyint 48 \
+    --no-scenecut --no-open-gop --repeat-headers --aud --frames 1584 -o el_sub10.hevc.tmp
+  mv el_sub10.hevc.tmp el_sub10.hevc
+fi
+dovi_tool inject-rpu -i el_sub10.hevc --rpu-in fel_rpu_null.bin -o el_sub10_rpu.hevc
+dovi_tool mux --bl base.hevc --el el_sub10_rpu.hevc -o p7_sub10.hevc
+rm -f p7fel_sub10.mp4
+MP4Box -add p7_sub10.hevc:fps=24000/1001:dvp=f7.6 -brand mp42isom -ab dby1 -quiet -new p7fel_sub10.mp4
+rm el_sub10_rpu.hevc p7_sub10.hevc
 
 # ---- Counter clips (arms T, NE, TL, PM of SEQ=count) ----
 # Same RPUs as p7fel_null / p7fel_l2. Both layers get the same fixed GOP (no adaptive B-frame placement,

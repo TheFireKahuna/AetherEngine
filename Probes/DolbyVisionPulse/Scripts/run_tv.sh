@@ -6,6 +6,10 @@
 #   DEVICE=... ./run_tv.sh --no-build           play only (app already installed)
 #   DEVICE=... SEQ=el ./run_tv.sh               TE engine (FEL) / NE enginenofel (EL dropped) on p7fel_el.mp4, then T
 #   DEVICE=... SEQ=vt ./run_tv.sh               the three VideoToolbox arms only, on pulse_l2.mp4
+#   DEVICE=... SEQ=cm4 ./run_tv.sh              CM v4.0: P8 AVPlayer / T8 engine (FEL) on the L8-only pulse, P/T the L2 controls
+#   DEVICE=... SEQ=fmt ./run_tv.sh              the L2 pulse on the FEL route per output buffer: T p010, TF p010-full, TS sv22
+#   DEVICE=... SEQ=bits ./run_tv.sh             12-bit survival on p7fel_sub10: TD p010 dithered (+ control), TR p010-round
+#                                               (- control), TF p010-full, TS sv22; TF/TS pulse = bits below 10 reach the panel
 #   DEVICE=... SEQ=count ./run_tv.sh            counter clips: T / NE / TL (FEL route, residual, RPU pulse) and PM (8.1 control)
 #   DEVICE=... SEQ=soak SOAK_URL=<http url | file under $PULSE_OUT> [SOAK_MIN=5] [SOAK_SEEKS=60@1800,150@600,240@3000] ./run_tv.sh
 #                                               one FEL soak arm; its summary line is grepped at the end
@@ -59,7 +63,20 @@ case "$SEQ" in
     esac
     ARMS="SOAK|soak|$U|minutes=${SOAK_MIN:-5};seeks=${SOAK_SEEKS:-60@1800,150@600,240@3000}"
     LABELS=SOAK ;;
-  *) echo "unknown SEQ=$SEQ (main|el|vt|count|soak)"; exit 1 ;;
+  cm4)
+    # Does CM v4.0 (L8) reach the panel? P/T pulse on L2 (v2.9) as the positive controls; P8/T8 only
+    # pulse if the L8 blocks survive to the TV's display manager.
+    ARMS="P|avplayer|$B/pulse_l2.mp4,P8|avplayer|$B/pulse_l8.mp4,T|engine|$B/p7fel_l2.mp4,T8|engine|$B/p7fel_l8.mp4"
+    LABELS=P,P8,T,T8 ;;
+  fmt)
+    # Does the per-frame RPU still drive the panel when the composer hands tvOS P010 with the low bits
+    # used, or a 16-bit 4:2:2 sv22 buffer? A flat TS (or an HDR10 badge) means sv22 loses Dolby Vision.
+    ARMS="T|engine|$B/p7fel_l2.mp4|out=p010,TF|engine|$B/p7fel_l2.mp4|out=p010-full,TS|engine|$B/p7fel_l2.mp4|out=sv22"
+    LABELS=T,TF,TS ;;
+  bits)
+    ARMS="TD|engine|$B/p7fel_sub10.mp4|out=p010,TR|engine|$B/p7fel_sub10.mp4|out=p010-round,TF|engine|$B/p7fel_sub10.mp4|out=p010-full,TS|engine|$B/p7fel_sub10.mp4|out=sv22,TD|engine|$B/p7fel_sub10.mp4|out=p010"
+    LABELS=TD,TR,TF,TS,TD ;;
+  *) echo "unknown SEQ=$SEQ (main|el|vt|count|cm4|fmt|bits|soak)"; exit 1 ;;
 esac
 
 if [[ "${1:-}" != "--no-build" ]]; then
