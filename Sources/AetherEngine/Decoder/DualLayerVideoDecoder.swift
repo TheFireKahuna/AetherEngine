@@ -17,10 +17,12 @@ import AetherLibavutil
 /// `OrderedDelivery.emit` runs on the delivery queue and does not reach
 /// into the decoder's frame state (`dmRpuCache`, the queues) itself. `HardwareVideoDecoder` passes
 /// `hdr10Data: nil` today (latent), so that field is unused in practice, with
-/// room for params if they migrate here too.
+/// room for params if they migrate here too. `baseLayerNAL` is the same RPU with its mapping kept,
+/// which the frame carries instead if it goes out as its raw base layer.
 private struct FrameSideData: Sendable {
     let hdr10Data: Data?
     let dmNAL: [UInt8]?
+    let baseLayerNAL: [UInt8]?
 }
 
 /// What `DualLayerVideoDecoder` needs from its composer.
@@ -332,8 +334,8 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var elFrameQueue: [Int64: CVPixelBuffer] = [:]
 
     /// Maximum layer skew in frames (dolby-vision-fel.md §5.5): a waiting base-layer
-    /// frame is bypassed under its own arrival ticket once this many newer
-    /// base-layer frames have arrived. Starts at 3; the 1 Hz summary's maximum skew
+    /// frame is released under its own arrival ticket once this many newer
+    /// base-layer frames have arrived (`baseLayerOnlyOutcome`). Starts at 3; the 1 Hz summary's maximum skew
     /// counter (§5.11) is what measures whether it can tighten.
     static let maxLayerSkewFrames = 3
 
@@ -361,6 +363,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// move in decode order, in `recordSideData`.
     private var lastGoodParams: DoviMetalParams?
     private var lastGoodDMNAL: [UInt8]?
+    private var lastGoodBaseLayerNAL: [UInt8]?
     private var borrowedParamsRun = 0
     /// A frame whose RPU is missing or failed its CRC may borrow the previous frame's parameters
     /// for up to this many frames in a row. Reshaping and NLQ parameters are constant across a scene,
@@ -383,6 +386,8 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// `composeResultLock`; read by `drainForEndOfStream` and `quiesceForTesting`.
     private var composeRequestsStarted = 0
     private var composeRequestsHandedOff = 0
+    /// Base-layer frames that went out without their enhancement layer, whether composed base-only
+    /// (`baseLayerOnlyOutcome`, then also counted in `composed`) or bypassed raw.
     private var summaryBypassNoEL: Int = 0
     private var summaryBypassNoRPU: Int = 0
     private var summaryDropStaleEL: Int = 0
@@ -571,6 +576,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             // In decode order, here, so every frame carries concrete parameters by the time it pairs:
             // compose time runs in completion order, which is not stream order.
             recordSideData(key: ptsKey, params: layers.rpuParams, dmNAL: layers.convertedRpu,
+                           baseLayerNAL: layers.baseLayerRpu,
                            usesPrevious: layers.usesPreviousMapping, disableResidual: layers.disableResidual)
         }
 
@@ -835,9 +841,10 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// already enters the system as a parameter — so it can travel with the
     /// frame instead of living in a cache `OrderedDelivery.emit` would
     /// otherwise have to reach back into without the decoder's lock
-    /// (dolby-vision-fel.md §5.7).
-    private func resolveDisplayMetadata(key: Int64) -> [UInt8]? {
-        sideDataRing.removeDisplayMetadata(key: key)
+    /// (dolby-vision-fel.md §5.7). Both forms come back, because whether the frame is composed is
+    /// not decided yet: `composed` has no mapping, `baseLayer` keeps it.
+    private func resolveDisplayMetadata(key: Int64) -> (composed: [UInt8]?, baseLayer: [UInt8]?) {
+        sideDataRing.removeDisplayMetadataForms(key: key)
     }
 
     // MARK: - Frame Pairing & Metal Composition
@@ -865,7 +872,10 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let frameIndex: UInt32
         let pts: CMTime
         let hdr10Data: Data?
+        /// The composed frame's RPU (no mapping).
         let dmNAL: [UInt8]?
+        /// The RPU with its mapping kept, for the base layer delivered in its place if composition fails.
+        let baseLayerNAL: [UInt8]?
         /// Which arrival path produced this, for the compose-failure log.
         let arrived: String
     }
@@ -876,6 +886,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let buffer: CVPixelBuffer
         let pts: CMTime
         let hdr10Data: Data?
+        /// The raw base layer's RPU: the mapping kept, so the display side reshapes it.
         let dmNAL: [UInt8]?
         let reason: String
     }
@@ -894,6 +905,46 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         )
     }
 
+    /// Acts on one decided outcome. No lock held.
+    private func perform(_ outcome: PairingOutcome) {
+        switch outcome {
+        case .queued:
+            break
+        case .bypass(let req):
+            fulfilBypass(req)
+        case .compose(let req):
+            runCompose(req)
+        }
+    }
+
+    /// What a base-layer frame of a FEL stream becomes when its enhancement layer is not coming (it never
+    /// arrived within the skew window, the stream ended first, or the enhancement decoder never opened).
+    /// The caller holds `lock`.
+    ///
+    /// With its RPU's parameters and a composer, the frame is composed with `.disableResidual`: the
+    /// reshaping applied, no residual, which is what a MEL stream decodes to and far closer to the
+    /// neighbouring composed frames than the raw base layer (`fallbackFrameDelta` measured the raw base
+    /// layer up to ~79 10-bit codes off in mean). The base layer stands in for the enhancement texture,
+    /// which the kernels never read with the residual off, so nothing is allocated. Such a frame carries
+    /// the composed RPU (no mapping), like every other composed frame.
+    ///
+    /// Without parameters (no RPU, or a run longer than `maxBorrowedParamsRun`) or without a composer the
+    /// frame goes out as its raw base layer, and then it carries the RPU with its mapping kept, so the
+    /// display side reshapes it instead. The same holds for a composition that fails (`runCompose`).
+    private func baseLayerOnlyOutcome(ticket: UInt64, epoch: UInt64, buffer: CVPixelBuffer, pts: CMTime,
+                                      key: Int64, side: FrameSideData, reason: String) -> PairingOutcome {
+        if composer != nil, let params = takeParams(key: key) {
+            var baseOnly = params
+            baseOnly.flags.insert(.disableResidual)
+            frameIndex &+= 1
+            return .compose(ComposeRequest(ticket: ticket, epoch: epoch, base: buffer, enhancement: buffer, params: baseOnly,
+                                           frameIndex: frameIndex, pts: pts, hdr10Data: side.hdr10Data, dmNAL: side.dmNAL,
+                                           baseLayerNAL: side.baseLayerNAL, arrived: "no enhancement layer (\(reason))"))
+        }
+        return .bypass(BypassRequest(ticket: ticket, epoch: epoch, buffer: buffer, pts: pts, hdr10Data: side.hdr10Data,
+                                     dmNAL: side.baseLayerNAL, reason: reason))
+    }
+
     /// Acquires the GPU slot with no lock held, then encodes and commits. The
     /// completed frame (or the base layer when composition fails) reaches
     /// `orderedDelivery`, which reorders by ticket. The completion closure
@@ -905,11 +956,13 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         guard let composer else {
             orderedDelivery.fulfil(
                 ticket: req.ticket, epoch: req.epoch,
-                DeliveredFrame(buffer: SendableBuffer(value: req.base), pts: req.pts, hdr10Data: req.hdr10Data, dmNAL: req.dmNAL)
+                DeliveredFrame(buffer: SendableBuffer(value: req.base), pts: req.pts, hdr10Data: req.hdr10Data, dmNAL: req.baseLayerNAL)
             )
             return
         }
-        if let concrete = composer as? DoviFelComposer {
+        // A base-layer-only composition passes the base layer as its enhancement layer too
+        // (`baseLayerOnlyOutcome`): there is no residual to measure.
+        if let concrete = composer as? DoviFelComposer, req.enhancement !== req.base {
             FelResidualMeasure.sampleIfDue(composer: concrete, base: req.base, enhancement: req.enhancement,
                                            params: req.params, frameIndex: req.frameIndex, pts: req.pts)
         }
@@ -924,6 +977,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let pts = req.pts
         let hdr10Data = req.hdr10Data
         let dmNAL = req.dmNAL
+        let baseLayerNAL = req.baseLayerNAL
         let arrived = req.arrived
         let delivery = orderedDelivery
         composer.composeAsyncWithAcquiredSlot(
@@ -936,8 +990,10 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             if composed == nil {
                 EngineLog.emit("[DualLayerVideoDecoder] compose failed (\(arrived)): pts=\(String(format: "%.3f", pts.seconds))", category: .swPlayback, level: .verbose)
             }
+            // The fallback is the raw base layer, so it carries the RPU that still holds the mapping.
             let buffer = SendableBuffer(value: composed ?? fallback.value)
-            delivery.fulfil(ticket: ticket, epoch: epoch, DeliveredFrame(buffer: buffer, pts: pts, hdr10Data: hdr10Data, dmNAL: dmNAL))
+            delivery.fulfil(ticket: ticket, epoch: epoch, DeliveredFrame(buffer: buffer, pts: pts, hdr10Data: hdr10Data,
+                                                                         dmNAL: composed != nil ? dmNAL : baseLayerNAL))
             self?.composeResultLock.lock(); self?.composeRequestsHandedOff += 1; self?.composeResultLock.unlock()
         }
     }
@@ -961,7 +1017,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // The arrival may also push older waiting frames past K newer frames,
         // which go out here under their own tickets (`due`).
         let outcome: PairingOutcome
-        let due: [BypassRequest]
+        let due: [PairingOutcome]
         (outcome, due) = {
             lock.lock()
             defer { lock.unlock() }
@@ -975,18 +1031,24 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             guard isFEL, !isMEL, enhancementDecoder != nil, composer != nil else {
                 // Not a FEL stream or secondary decoder not engaged (e.g. MEL or P8.1 fallback): emit Base Layer directly
                 EngineLog.emit("[DualLayerVideoDecoder] bypass, single layer: isFEL=\(isFEL), isMEL=\(isMEL), enhDecoder=\(enhancementDecoder != nil)", category: .swPlayback, level: .verbose)
+                let singleLayerKey = Self.canonicalKey(pts: pts)
+                let forms = resolveDisplayMetadata(key: singleLayerKey)
+                let side = FrameSideData(hdr10Data: hdr10Data, dmNAL: forms.composed, baseLayerNAL: forms.baseLayer)
                 if isFEL && !isMEL && enhancementDecoder == nil {
                     summaryBypassNoEL += 1
+                    // A FEL stream whose enhancement decoder never opened still has its RPUs.
+                    return (baseLayerOnlyOutcome(ticket: nextDeliveryTicket(), epoch: _feedEpoch, buffer: baseBuffer, pts: pts,
+                                                 key: singleLayerKey, side: side, reason: "single-layer"), [])
                 }
-                let singleLayerKey = Self.canonicalKey(pts: pts)
-                let dmNAL = resolveDisplayMetadata(key: singleLayerKey)
-                return (.bypass(BypassRequest(ticket: nextDeliveryTicket(), epoch: _feedEpoch, buffer: baseBuffer, pts: pts, hdr10Data: hdr10Data, dmNAL: dmNAL, reason: "single-layer")), [])
+                return (.bypass(BypassRequest(ticket: nextDeliveryTicket(), epoch: _feedEpoch, buffer: baseBuffer, pts: pts, hdr10Data: hdr10Data, dmNAL: side.baseLayerNAL, reason: "single-layer")), [])
             }
 
             let key = Self.canonicalKey(pts: pts)
             let ticket = nextDeliveryTicket()
             let epoch = _feedEpoch
-            let dmNAL = resolveDisplayMetadata(key: key)
+            let forms = resolveDisplayMetadata(key: key)
+            let dmNAL = forms.composed
+            let baseLayerNAL = forms.baseLayer
             blArrivalSeq &+= 1
             let seq = blArrivalSeq
 
@@ -995,7 +1057,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             // the ticket it already holds, rather than waiting for a partner that cannot match it.
             guard key != Int64.min else {
                 EngineLog.emit("[DualLayerVideoDecoder] bypass, no timestamp: base-layer frame has nothing to pair on", category: .swPlayback, level: .verbose)
-                return (.bypass(BypassRequest(ticket: ticket, epoch: epoch, buffer: baseBuffer, pts: pts, hdr10Data: hdr10Data, dmNAL: dmNAL, reason: "no-pts")), collectDueBypasses())
+                return (.bypass(BypassRequest(ticket: ticket, epoch: epoch, buffer: baseBuffer, pts: pts, hdr10Data: hdr10Data, dmNAL: baseLayerNAL, reason: "no-pts")), collectDueBypasses())
             }
             let mKey: Int64?
             if elFrameQueue[key] != nil {
@@ -1012,24 +1074,24 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                     EngineLog.emit("[DualLayerVideoDecoder] bypass, missing RPU: key=\(key)", category: .swPlayback, level: .verbose)
                     summaryBypassNoRPU += 1
                     noteSettledBaseLayer(key: key)
-                    primary = .bypass(BypassRequest(ticket: ticket, epoch: epoch, buffer: baseBuffer, pts: pts, hdr10Data: hdr10Data, dmNAL: dmNAL, reason: "missing-rpu"))
+                    primary = .bypass(BypassRequest(ticket: ticket, epoch: epoch, buffer: baseBuffer, pts: pts, hdr10Data: hdr10Data, dmNAL: baseLayerNAL, reason: "missing-rpu"))
                     return (primary, collectDueBypasses())
                 }
                 frameIndex &+= 1
                 noteSettledBaseLayer(key: key)
-                primary = .compose(ComposeRequest(ticket: ticket, epoch: epoch, base: baseBuffer, enhancement: elBuffer, params: params, frameIndex: frameIndex, pts: pts, hdr10Data: hdr10Data, dmNAL: dmNAL, arrived: "base layer arrived last"))
+                primary = .compose(ComposeRequest(ticket: ticket, epoch: epoch, base: baseBuffer, enhancement: elBuffer, params: params, frameIndex: frameIndex, pts: pts, hdr10Data: hdr10Data, dmNAL: dmNAL, baseLayerNAL: baseLayerNAL, arrived: "base layer arrived last"))
             } else {
                 // EL frame has not arrived yet: queue Base Layer frame under its ticket
                 EngineLog.emit("[DualLayerVideoDecoder] queued base layer: pts=\(String(format: "%.3f", pts.seconds)) key=\(key), elCount=\(elFrameQueue.count)", category: .swPlayback, level: .verbose)
-                var displaced: BypassRequest?
+                var displaced: PairingOutcome?
                 if let old = blFrameQueue[key] {
                     // Same canonical key twice: the old entry's ticket would stall
                     // delivery forever if dropped, so bypass it under its ticket,
                     // carrying its stored side data.
-                    displaced = BypassRequest(ticket: old.ticket, epoch: epoch, buffer: old.buffer, pts: old.pts, hdr10Data: old.side.hdr10Data, dmNAL: old.side.dmNAL, reason: "duplicate-key")
+                    displaced = .bypass(BypassRequest(ticket: old.ticket, epoch: epoch, buffer: old.buffer, pts: old.pts, hdr10Data: old.side.hdr10Data, dmNAL: old.side.baseLayerNAL, reason: "duplicate-key"))
                     noteSettledBaseLayer(key: key)
                 }
-                blFrameQueue[key] = (buffer: baseBuffer, pts: pts, ticket: ticket, seq: seq, side: FrameSideData(hdr10Data: hdr10Data, dmNAL: dmNAL))
+                blFrameQueue[key] = (buffer: baseBuffer, pts: pts, ticket: ticket, seq: seq, side: FrameSideData(hdr10Data: hdr10Data, dmNAL: dmNAL, baseLayerNAL: baseLayerNAL))
                 let currentSkew = max(blFrameQueue.count, elFrameQueue.count)
                 if currentSkew > summaryMaxObservedSkew {
                     summaryMaxObservedSkew = currentSkew
@@ -1043,8 +1105,8 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }()
 
         // Older tickets first; `orderedDelivery` reorders by ticket anyway.
-        for req in due {
-            fulfilBypass(req)
+        for older in due {
+            perform(older)
         }
         switch outcome {
         case .queued:
@@ -1091,16 +1153,17 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 // under the ticket its arrival took.
                 let epoch = _feedEpoch
                 let dmNAL = waiting.side.dmNAL
+                let baseLayerNAL = waiting.side.baseLayerNAL
                 guard let params = takeParams(key: mKey) else {
                     // Missing RPU metadata: do NOT synthesize identity NLQ. Emit base layer directly.
                     EngineLog.emit("[DualLayerVideoDecoder] bypass, missing RPU: key=\(mKey)", category: .swPlayback, level: .verbose)
                     summaryBypassNoRPU += 1
                     noteSettledBaseLayer(key: mKey)
-                    return .bypass(BypassRequest(ticket: waiting.ticket, epoch: epoch, buffer: waiting.buffer, pts: waiting.pts, hdr10Data: waiting.side.hdr10Data, dmNAL: waiting.side.dmNAL, reason: "missing-rpu"))
+                    return .bypass(BypassRequest(ticket: waiting.ticket, epoch: epoch, buffer: waiting.buffer, pts: waiting.pts, hdr10Data: waiting.side.hdr10Data, dmNAL: baseLayerNAL, reason: "missing-rpu"))
                 }
                 frameIndex &+= 1
                 noteSettledBaseLayer(key: mKey)
-                return .compose(ComposeRequest(ticket: waiting.ticket, epoch: epoch, base: waiting.buffer, enhancement: elBuffer, params: params, frameIndex: frameIndex, pts: waiting.pts, hdr10Data: waiting.side.hdr10Data, dmNAL: dmNAL, arrived: "enhancement layer arrived last"))
+                return .compose(ComposeRequest(ticket: waiting.ticket, epoch: epoch, base: waiting.buffer, enhancement: elBuffer, params: params, frameIndex: frameIndex, pts: waiting.pts, hdr10Data: waiting.side.hdr10Data, dmNAL: dmNAL, baseLayerNAL: baseLayerNAL, arrived: "enhancement layer arrived last"))
             } else {
                 // Base Layer frame has not arrived yet: queue EL frame under its own larger cap
                 EngineLog.emit("[DualLayerVideoDecoder] queued enhancement layer: pts=\(String(format: "%.3f", pts.seconds)) key=\(key), blCount=\(blFrameQueue.count)", category: .swPlayback, level: .verbose)
@@ -1142,12 +1205,14 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// - A missing or corrupt RPU may borrow the previous mapping for up to `maxBorrowedParamsRun` frames in
     ///   a row; reshaping and NLQ parameters are constant across a scene. Past that the frame carries none
     ///   and goes out as its base layer.
-    private func recordSideData(key: Int64, params: DoviMetalParams?, dmNAL: [UInt8]?, usesPrevious: Bool, disableResidual: Bool = false) {
+    private func recordSideData(key: Int64, params: DoviMetalParams?, dmNAL: [UInt8]?, baseLayerNAL: [UInt8]? = nil, usesPrevious: Bool, disableResidual: Bool = false) {
         var resolvedParams = params
         var resolvedNAL = dmNAL
+        var resolvedBaseLayerNAL = baseLayerNAL
         if let params {
             lastGoodParams = params
             lastGoodDMNAL = dmNAL
+            lastGoodBaseLayerNAL = baseLayerNAL
             borrowedParamsRun = 0
         } else if let last = lastGoodParams {
             if usesPrevious {
@@ -1158,16 +1223,18 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 if disableResidual { borrowed.flags.insert(.disableResidual) } else { borrowed.flags.remove(.disableResidual) }
                 resolvedParams = borrowed
                 resolvedNAL = dmNAL ?? lastGoodDMNAL
+                resolvedBaseLayerNAL = baseLayerNAL ?? lastGoodBaseLayerNAL
             } else if borrowedParamsRun < Self.maxBorrowedParamsRun {
                 borrowedParamsRun += 1
                 summaryBorrowedParams += 1
                 resolvedParams = last
                 resolvedNAL = dmNAL ?? lastGoodDMNAL
+                resolvedBaseLayerNAL = baseLayerNAL ?? lastGoodBaseLayerNAL
                 EngineLog.emit("[DualLayerVideoDecoder] RPU missing for key=\(key); reusing the previous frame's parameters (\(borrowedParamsRun)/\(Self.maxBorrowedParamsRun))", category: .swPlayback, level: .verbose)
             }
         }
-        guard resolvedParams != nil || resolvedNAL != nil else { return }
-        sideDataRing.insert(key: key, params: resolvedParams, dmNAL: resolvedNAL)
+        guard resolvedParams != nil || resolvedNAL != nil || resolvedBaseLayerNAL != nil else { return }
+        sideDataRing.insert(key: key, params: resolvedParams, dmNAL: resolvedNAL, baseLayerNAL: resolvedBaseLayerNAL)
     }
 
     /// The parameters `recordSideData` resolved for `key`, nil when the frame has none. The caller holds `lock`.
@@ -1190,11 +1257,12 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
     }
 
-    /// Bypasses every queued base-layer frame that has seen K newer base-layer
-    /// arrivals, oldest first, each under the ticket its arrival took.
+    /// Releases every queued base-layer frame that has seen K newer base-layer
+    /// arrivals, oldest first, each under the ticket its arrival took, through
+    /// ``baseLayerOnlyOutcome(ticket:epoch:buffer:pts:key:side:reason:)``.
     /// The caller holds `lock`.
-    private func collectDueBypasses() -> [BypassRequest] {
-        var due: [BypassRequest] = []
+    private func collectDueBypasses() -> [PairingOutcome] {
+        var due: [PairingOutcome] = []
         for k in blFrameQueue.keys.sorted() {
             guard let entry = blFrameQueue[k],
                   blArrivalSeq &- entry.seq >= UInt64(Self.maxLayerSkewFrames) else { continue }
@@ -1202,7 +1270,8 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             summaryBypassNoEL += 1
             EngineLog.emit("[DualLayerVideoDecoder] bypass, no enhancement layer arrived: pts=\(String(format: "%.3f", entry.pts.seconds)) key=\(k)", category: .swPlayback, level: .verbose)
             noteSettledBaseLayer(key: k)
-            due.append(BypassRequest(ticket: entry.ticket, epoch: _feedEpoch, buffer: entry.buffer, pts: entry.pts, hdr10Data: entry.side.hdr10Data, dmNAL: entry.side.dmNAL, reason: "no-el"))
+            due.append(baseLayerOnlyOutcome(ticket: entry.ticket, epoch: _feedEpoch, buffer: entry.buffer, pts: entry.pts,
+                                            key: k, side: entry.side, reason: "no-el"))
         }
         // Every arrival takes a new `seq`, so what survives the loop arrived within the last
         // `maxLayerSkewFrames` base frames: the queue is bounded by the skew rule alone.
@@ -1329,6 +1398,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // exist, and not after the drain.
         lastGoodParams = nil
         lastGoodDMNAL = nil
+        lastGoodBaseLayerNAL = nil
         borrowedParamsRun = 0
         sideDataRing.removeAll()
         let epoch = _feedEpoch
@@ -1420,7 +1490,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// calls this once the last packet has been fed, before its end-of-stream `flush()`.
     ///
     /// The drained frames pair as usual; a base-layer frame whose enhancement layer never came goes out
-    /// alone, under its own ticket. Returns once everything has reached `onFrame`, or after
+    /// alone, under its own ticket (`baseLayerOnlyOutcome`). Returns once everything has reached `onFrame`, or after
     /// `endOfStreamComposeWait` if a composition is still on the GPU.
     func drainForEndOfStream() {
         lifecycleLock.lock()
@@ -1436,20 +1506,21 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         primary.flushKeepingEpoch()
         el?.flushKeepingEpoch()
 
-        let unpaired: [BypassRequest] = {
+        let unpaired: [PairingOutcome] = {
             lock.lock()
             defer { lock.unlock() }
-            var due: [BypassRequest] = []
+            var due: [PairingOutcome] = []
             for k in blFrameQueue.keys.sorted() {
                 guard let entry = blFrameQueue.removeValue(forKey: k) else { continue }
                 summaryBypassNoEL += 1
                 noteSettledBaseLayer(key: k)
-                due.append(BypassRequest(ticket: entry.ticket, epoch: _feedEpoch, buffer: entry.buffer, pts: entry.pts, hdr10Data: entry.side.hdr10Data, dmNAL: entry.side.dmNAL, reason: "end-of-stream"))
+                due.append(baseLayerOnlyOutcome(ticket: entry.ticket, epoch: _feedEpoch, buffer: entry.buffer, pts: entry.pts,
+                                                key: k, side: entry.side, reason: "end-of-stream"))
             }
             return due
         }()
-        for req in unpaired {
-            fulfilBypass(req)
+        for outcome in unpaired {
+            perform(outcome)
         }
 
         let deadline = ProcessInfo.processInfo.systemUptime + Self.endOfStreamComposeWait
@@ -1530,6 +1601,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         settledBlKeys.removeAll()
         lastGoodParams = nil
         lastGoodDMNAL = nil
+        lastGoodBaseLayerNAL = nil
         borrowedParamsRun = 0
         sideDataRing.removeAll()
         composeResultLock.lock(); summaryComposedFrames = 0; summaryComposeFailures = 0; composeResultLock.unlock()
@@ -1840,11 +1912,11 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// reshaping parameters and the Profile 8.1 RPU NAL attached as display metadata.
     /// One call is one packet, in decode order: a nil `params` is a packet with a missing RPU (or, with
     /// `usesPrevious`, one that says to keep the previous mapping), resolved exactly as in production.
-    func seedRPUForTesting(pts: CMTime, params: DoviMetalParams?, displayMetadataNAL: [UInt8]?, usesPrevious: Bool = false, disableResidual: Bool = false) {
+    func seedRPUForTesting(pts: CMTime, params: DoviMetalParams?, displayMetadataNAL: [UInt8]?, baseLayerNAL: [UInt8]? = nil, usesPrevious: Bool = false, disableResidual: Bool = false) {
         lock.lock()
         defer { lock.unlock() }
         let key = Self.canonicalKey(pts: pts)
-        recordSideData(key: key, params: params, dmNAL: displayMetadataNAL, usesPrevious: usesPrevious, disableResidual: disableResidual)
+        recordSideData(key: key, params: params, dmNAL: displayMetadataNAL, baseLayerNAL: baseLayerNAL, usesPrevious: usesPrevious, disableResidual: disableResidual)
     }
 }
 #endif
