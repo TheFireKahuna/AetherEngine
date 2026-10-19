@@ -179,7 +179,10 @@ final class AudioDecoder: @unchecked Sendable {
             0,
             nil
         )
-        guard ret >= 0, swrContext != nil else { return false }
+        guard ret >= 0, let swr = swrContext else { return false }
+        // Same rate in and out and float out, so of the bridge's options only the downmix normalisation
+        // does anything here: a source above 8 channels folded into 7.1 cannot clip.
+        AudioBridge.applyResamplerQuality(swr, outputFormat: AV_SAMPLE_FMT_FLT)
         guard swr_init(swrContext) >= 0 else {
             swr_free(&swrContext)
             return false
