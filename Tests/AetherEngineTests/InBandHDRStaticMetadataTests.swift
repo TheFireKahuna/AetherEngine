@@ -150,6 +150,47 @@ struct InBandHDRStaticMetadataTests {
         }
     }
 
+    // MARK: - HLG signalled by the alternative transfer characteristics SEI
+
+    /// alternative_transfer_characteristics (payload type 147), preferred_transfer_characteristics 18:
+    /// backward-compatible HLG, the VUI stating BT.2020-10 for an SDR decoder. Real NAL units, from
+    /// x265 `atc-sei=18:transfer=bt2020-10` and x264 `alternative-transfer=arib-std-b67`.
+    static let hevcATC: [UInt8] = [0x4e, 0x01, 0x93, 0x01, 0x12, 0x80]
+    static let h264ATC: [UInt8] = [0x06, 0x93, 0x01, 0x12, 0x80]
+
+    @Test("the alternative transfer SEI names HLG, HEVC and H.264")
+    func alternativeTransfer() {
+        let hevc = Self.collect(Self.annexB([Self.hevcATC, Self.hevcSlice]), codecID: AV_CODEC_ID_HEVC, framing: .annexB)
+        #expect(hevc.alternativeTransfer == 18)
+        #expect(hevc.prefersHLG)
+        let h264 = Self.collect(Self.annexB([Self.h264ATC, [0x65, 0x88, 0x84]]), codecID: AV_CODEC_ID_H264, framing: .annexB)
+        #expect(h264.prefersHLG)
+        #expect(!Self.collect(Self.annexB([Self.hevcCLL]), codecID: AV_CODEC_ID_HEVC, framing: .annexB).prefersHLG)
+    }
+
+    /// The upgrade is SDR to HLG only, and only on the SEI's word: a PQ source keeps PQ whatever an
+    /// SEI says, and an SDR source without the message stays SDR.
+    @Test("VIDEO-RANGE follows the SEI from SDR to HLG, and nowhere else")
+    func rangeUpgrade() {
+        var hlg = InBandHDRStaticMetadata()
+        hlg.alternativeTransfer = 18
+        #expect(hlg.videoRange(upgrading: .sdr) == .hlg)
+        #expect(hlg.videoRange(upgrading: .pq) == .pq)
+        #expect(InBandHDRStaticMetadata().videoRange(upgrading: .sdr) == .sdr)
+    }
+
+    /// The scan only runs where it can change something: a BT.2020 source whose transfer is not
+    /// already PQ / HLG (the backward-compatible VUI), or a source without container static metadata.
+    @Test("which sources the head scan reads")
+    func scanGate() {
+        typealias M = InBandHDRStaticMetadata
+        #expect(M.wantsAlternativeTransfer(primaries: AVCOL_PRI_BT2020, transfer: AVCOL_TRC_BT2020_10))
+        #expect(M.wantsAlternativeTransfer(primaries: AVCOL_PRI_BT2020, transfer: AVCOL_TRC_BT709))
+        #expect(!M.wantsAlternativeTransfer(primaries: AVCOL_PRI_BT2020, transfer: AVCOL_TRC_SMPTE2084))
+        #expect(!M.wantsAlternativeTransfer(primaries: AVCOL_PRI_BT2020, transfer: AVCOL_TRC_ARIB_STD_B67))
+        #expect(!M.wantsAlternativeTransfer(primaries: AVCOL_PRI_BT709, transfer: AVCOL_TRC_BT709))
+    }
+
     // MARK: - movenc
 
     /// The init movenc writes from a codecpar carrying the lifted side data holds both boxes, and
