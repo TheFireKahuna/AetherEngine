@@ -706,13 +706,16 @@ kernel void dovi_compose_chroma(
         bool cb_active = (params.nlq_cb.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cb.nlq_scale != 0);
         bool cr_active = (params.nlq_cr.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cr.nlq_scale != 0);
         if (cb_active || cr_active) {
-            // Chroma is co-sited with the top-left luma sample (chroma location type 2, as HDR10 and
-            // Dolby Vision streams carry it), so the enhancement chroma grid and the base chroma grid
-            // share their first sample rather than their outer edge: base chroma sample n sits at EL
-            // chroma texel n * el / bl, and a quarter-resolution EL gives the even samples exactly and
-            // the odd ones half way between two texels. This is DoViBaker's phase (`upsampleChromaEven`
-            // copies, `upsampleChromaOdd` interpolates at 0.5); a centre-aligned fetch puts every
-            // sample a quarter of an EL chroma texel up and to the left. Same-resolution EL is unchanged.
+            // The enhancement chroma grid and the base chroma grid share their first sample rather than
+            // their outer edge: base chroma sample n sits at EL chroma texel n * el / bl, and a
+            // quarter-resolution EL gives the even samples exactly and the odd ones half way between two
+            // texels. This is DoViBaker's phase (`upsampleChromaEven` copies, `upsampleChromaOdd`
+            // interpolates at 0.5); a centre-aligned fetch puts every sample a quarter of an EL chroma
+            // texel up and to the left. Same-resolution EL is unchanged. It is a relation between the two
+            // chroma grids taken from DoViBaker, not a reading of the stream's chroma_sample_loc_type,
+            // which this kernel never consults: it is what decimating top-left co-sited (type 2) chroma
+            // from sample 0 gives, hence the "type 2" this comment used to claim, while the luma at the
+            // chroma site above assumes chroma vertically between rows 2k and 2k + 1 (type 0).
             float2 el = dovi_upsample_el_uv(el_uv_tex, gid, uint2(uv_width, uv_height),
                                             uint2(params.el_width / 2u, params.el_height / 2u));
             if (cb_active) {
