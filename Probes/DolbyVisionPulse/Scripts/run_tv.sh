@@ -10,8 +10,8 @@
 #   DEVICE=... SEQ=fmt ./run_tv.sh              the L2 pulse on the FEL route per output buffer: T p010, TF p010-full, TS sv22
 #   DEVICE=... SEQ=bits ./run_tv.sh             12-bit survival on p7fel_sub10: TD p010 dithered (+ control), TR p010-round
 #                                               (- control), TF p010-full, TS sv22; TF/TS pulse = bits below 10 reach the panel
-#   DEVICE=... SEQ=card ./run_tv.sh             amplifier RPU on p7fel_card (25 s per arm): TR p010-round, TD p010, TB p010-bluenoise,
-#                                               TF p010-full, TS sv22 (card_amp10.bin); TF12/TS12 (card_amp12.bin); TI identity
+#   DEVICE=... SEQ=card ./run_tv.sh             amplifier RPU on p7fel_card (14 s per arm): TR p010-round, TD p010, TB p010-bluenoise,
+#                                               TF p010-full, TS sv22 (card_amp10.bin); TI identity
 #                                               control; BR/BF/BS the p7fel_bullseye banding fallback, no override
 #   DEVICE=... SEQ=count ./run_tv.sh            counter clips: T / NE / TL (FEL route, residual, RPU pulse) and PM (8.1 control)
 #   DEVICE=... SEQ=soak SOAK_URL=<http url | file under $PULSE_OUT> [SOAK_MIN=5] [SOAK_SEEKS=60@1800,150@600,240@3000] ./run_tv.sh
@@ -82,15 +82,16 @@ case "$SEQ" in
   card)
     # Amplifier RPU: a luma curve steep in a narrow window, attached to every composed frame in place of the
     # identity one, so sub-10-bit steps in the composed picture become visible if they survive tvOS's output.
-    C="$B/p7fel_card.mp4"; A10="rpu=$B/card_amp10.bin;secs=25"; A12="rpu=$B/card_amp12.bin;secs=25"
+    # 14 s: inside the 15 s clips, so no arm relies on the end-of-clip loop. There is no 12-bit-declared
+    # amplifier: libdovi refuses any bl_bit_depth but 10 (Tools/card_rpu).
+    C="$B/p7fel_card.mp4"; A10="rpu=$B/card_amp10.bin;secs=14"
     ARMS="TR|engine|$C|out=p010-round;$A10,TD|engine|$C|out=p010;$A10,TB|engine|$C|out=p010-bluenoise;$A10"
     ARMS+=",TF|engine|$C|out=p010-full;$A10,TS|engine|$C|out=sv22;$A10"
-    ARMS+=",TF12|engine|$C|out=p010-full;$A12,TS12|engine|$C|out=sv22;$A12"
-    ARMS+=",TI|engine|$C|out=p010-full;rpu=$B/card_identity.bin;secs=25"
-    ARMS+=",BR|engine|$B/p7fel_bullseye.mp4|out=p010-round;secs=25,BF|engine|$B/p7fel_bullseye.mp4|out=p010-full;secs=25"
-    ARMS+=",BS|engine|$B/p7fel_bullseye.mp4|out=sv22;secs=25"
-    LABELS=TR,TD,TB,TF,TS,TF12,TS12,TI,BR,BF,BS
-    for f in p7fel_card.mp4 card_amp10.bin card_amp12.bin card_identity.bin p7fel_bullseye.mp4; do
+    ARMS+=",TI|engine|$C|out=p010-full;rpu=$B/card_identity.bin;secs=14"
+    ARMS+=",BR|engine|$B/p7fel_bullseye.mp4|out=p010-round;secs=14,BF|engine|$B/p7fel_bullseye.mp4|out=p010-full;secs=14"
+    ARMS+=",BS|engine|$B/p7fel_bullseye.mp4|out=sv22;secs=14"
+    LABELS=TR,TD,TB,TF,TS,TI,BR,BF,BS
+    for f in p7fel_card.mp4 card_amp10.bin card_identity.bin p7fel_bullseye.mp4; do
       [[ -e "$OUT/$f" ]] || { echo "missing $OUT/$f (Scripts/build.sh makes it)"; exit 1; }
     done ;;
   *) echo "unknown SEQ=$SEQ (main|el|vt|count|cm4|fmt|bits|card|soak)"; exit 1 ;;
@@ -117,12 +118,16 @@ if [[ "$SEQ" == card ]]; then
 what to look for (top-left label: arm, out=, rpu=, and the mode tvOS is sending; expect Dolby Vision):
   border visible     the amplifier RPU is active (TI, the identity control: expect flat grey)
   "½" visible        rounded or better
-  "12" clean         12 or more bits survive tvOS's output (watch TF/TS, TF12/TS12)
+  "12" clean         12 or more bits survive tvOS's output (watch TF/TS)
   speckled           dither (TD ordered, TB blue noise)
   BR/BF/BS           the bullseye banding fallback, no override: compare the rings across the three
 LEGEND
 fi
-[[ "$SEQ" == soak ]] || echo "start the phone recording now; launching in 10 s"
+case "$SEQ" in
+  soak) ;;
+  card) echo "watch the TV (no recording needed); launching in 10 s" ;;
+  *) echo "start the phone recording now; launching in 10 s" ;;
+esac
 sleep 10
 # `process launch` hands --environment-variables to the app process (unlike a test bundle).
 xcrun devicectl device process launch --device "$DEVICE" --terminate-existing --console \
