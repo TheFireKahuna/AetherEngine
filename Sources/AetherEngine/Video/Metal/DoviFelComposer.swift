@@ -844,13 +844,13 @@ final class DoviFelComposer: @unchecked Sendable {
 
         var keepAliveTextures: [CVMetalTexture] = []
 
-        // Plane 0 is luma, plane 1 is interleaved chroma. The integer planes are
-        // bound as Uint so the kernels see raw code values; the enhancement layer
-        // is bound as Unorm because it is upsampled by the hardware bilinear sampler.
+        // Plane 0 is luma, plane 1 is interleaved chroma. Every plane is bound as Uint so the kernels see
+        // raw code values; the enhancement layer is upsampled from explicit texel reads (`dovi_upsample_el`),
+        // not by the hardware sampler.
         guard let blYTex = makeTexture(from: baseBuffer, plane: 0, format: .r16Uint, width: blW, height: blH, keepAlive: &keepAliveTextures),
               let blUvTex = makeTexture(from: baseBuffer, plane: 1, format: .rg16Uint, width: blW / 2, height: blH / 2, keepAlive: &keepAliveTextures),
-              let elYTex = makeTexture(from: enhancementBuffer, plane: 0, format: .r16Unorm, width: elW, height: elH, keepAlive: &keepAliveTextures),
-              let elUvTex = makeTexture(from: enhancementBuffer, plane: 1, format: .rg16Unorm, width: elW / 2, height: elH / 2, keepAlive: &keepAliveTextures),
+              let elYTex = makeTexture(from: enhancementBuffer, plane: 0, format: .r16Uint, width: elW, height: elH, keepAlive: &keepAliveTextures),
+              let elUvTex = makeTexture(from: enhancementBuffer, plane: 1, format: .rg16Uint, width: elW / 2, height: elH / 2, keepAlive: &keepAliveTextures),
               let outYTex = makeTexture(from: dst, plane: 0, format: .r16Uint, width: blW, height: blH, keepAlive: &keepAliveTextures),
               let outUvTex = makeTexture(from: dst, plane: 1, format: .rg16Uint, width: blW / 2,
                                          height: outputMode == .sv22 ? blH : blH / 2, keepAlive: &keepAliveTextures) else {
