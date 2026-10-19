@@ -54,3 +54,6 @@ scratchpad/
 
 # Local git worktrees created for feature work
 .claude/worktrees/
+
+# The local LibDovi build (Vendor/LibDovi/build.sh): ~70 MB of static libraries, rebuilt from source.
+Vendor/LibDovi/Dovi.xcframework/
