@@ -15,6 +15,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
     // FFmpeg 8.x exposes SwsContext as a real struct (7.x was OpaquePointer); pointer type must match or call sites miscompile.
     private var swsContext: UnsafeMutablePointer<SwsContext>?
+    /// What `swsContext` was built for; a different key rebuilds it. Guarded by `lock`, like the context.
+    private var swsKey: SwscaleSetup?
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
     var onFrame: DecodedFrameHandler?
 
@@ -218,11 +220,11 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var twelveBit420 = TwelveBit420Output.p010Dithered
 
     /// `streamIs10Bit` is the open-time verdict (declared depth or an HDR transfer) and only ever widens
-    /// the answer. The range is a LABEL: the legacy `sws_scale` reads a source's range from the pixel
-    /// format alone (the yuvj family), so a full-range frame in a plain 4:2:0 format is copied across
-    /// untouched and only has to be tagged as what it is. Asking swscale to convert would take 4K off its
-    /// unscaled NV12 / P010 path, and a yuvj source IS converted to video range by swscale itself, so it
-    /// stays video range here.
+    /// the answer. The range is a LABEL: swscale is told the same range on both sides (`SwscaleSetup`),
+    /// so a full-range frame is copied across untouched and only has to be tagged as what it is. Asking
+    /// swscale to convert would take 4K off its unscaled NV12 / P010 path. A yuvj source is full range
+    /// by its pixel format whatever `color_range` says, and stays full range here; it used to be
+    /// converted to video range by swscale itself.
     ///
     /// #8: subsampling from the descriptor. Full horizontal chroma is 4:4:4 (RGB and 4:4:0 included),
     /// horizontal and vertical subsampling 4:2:0 (4:1:0 included), horizontal only 4:2:2 (4:1:1
@@ -233,14 +235,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let format = AVPixelFormat(rawValue: pixelFormat)
         let desc = av_pix_fmt_desc_get(format)?.pointee
         let depth = desc?.comp.0.depth ?? 8
-        let convertedBySwscale: Bool
-        switch format {
-        case AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P:
-            convertedBySwscale = true
-        default:
-            convertedBySwscale = false
-        }
-        let fullRange = colorRange == AVCOL_RANGE_JPEG && !convertedBySwscale
+        let isRGB = ((desc?.flags ?? 0) & UInt64(AV_PIX_FMT_FLAG_RGB)) != 0
+        // RGB has no range of its own to keep: it is converted, to video range like every other source.
+        let fullRange = !isRGB && (colorRange == AVCOL_RANGE_JPEG || isJPEGFormat(format))
 
         let chroma: OutputFormat.Chroma
         if let desc, desc.nb_components >= 3 {
@@ -707,6 +704,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             sws_freeContext(swsContext)
             swsContext = nil
         }
+        swsKey = nil
         pixelBufferPool = nil
         poolWidth = 0
         poolHeight = 0
@@ -808,14 +806,17 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         logOutputFormat(outputFormat, source: av_get_pix_fmt_name(srcFmt).map { String(cString: $0) } ?? "?",
                         colorRange: frame.pointee.color_range)
 
-        swsContext = sws_getCachedContext(
-            swsContext,
-            Int32(width), Int32(height), srcFmt,
-            Int32(width), Int32(height), dstFmt,
-            // FFmpeg 8 turned the SWS_* constants into a typed `SwsFlags`
-            // enum; the C signature still wants a plain int, so unwrap.
-            Int32(SWS_BILINEAR.rawValue), nil, nil, nil
-        )
+        let setup = SwscaleSetup(
+            width: Int32(width), height: Int32(height), source: srcFmt, destination: dstFmt,
+            sourceFullRange: frame.pointee.color_range == AVCOL_RANGE_JPEG || Self.isJPEGFormat(srcFmt),
+            destinationFullRange: outputFormat.fullRange,
+            colorspace: Self.swscaleColorspace(ColorAttachments.presented(
+                ColorDescription(frame: frame), frameSize: (frame.pointee.width, frame.pointee.height)).matrix))
+        if setup != swsKey {
+            sws_freeContext(swsContext)
+            swsContext = setup.makeContext()
+            swsKey = swsContext == nil ? nil : setup
+        }
         guard swsContext != nil else { return nil }
 
         var pixelBuffer: CVPixelBuffer?
@@ -880,6 +881,94 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
 
         return pb
+    }
+
+    /// Everything a conversion context is built from (`sws_getCachedContext` exposes neither range nor
+    /// matrix, so the decoder keeps its own key).
+    ///
+    /// - Ranges: equal on both sides wherever the picture stays YCbCr, so swscale copies the levels
+    ///   across and keeps its unscaled converters (NV12 / P010 at 4K). A yuvj source is full range on
+    ///   both sides too: it used to be squeezed to video range, which also pushed it off the unscaled
+    ///   path. Only RGB has a real range conversion, to whatever the buffer is tagged.
+    /// - Matrix: one table for both sides, the one the buffer is tagged with. YCbCr to YCbCr is then a
+    ///   copy (different tables would make swscale cascade through RGB), and RGB is converted with the
+    ///   coefficients the display layer will decode it with: it used to get swscale's default BT.601
+    ///   on a buffer tagged BT.709.
+    /// - Flags: `SWS_ACCURATE_RND` for exact rounding where the vertical scaler runs, and, only when
+    ///   chroma is resampled (4:2:0 into `sv22`, 4:1:1, 4:4:0, RGB), bicubic with full-resolution chroma
+    ///   in and out instead of bilinear. Luma is never scaled: the destination is the source size, so
+    ///   the filter choice only reaches chroma. swscale's own `sws_dither` is left alone: it applies to
+    ///   RGB and 8-bit outputs, neither of which this decoder writes from a deeper source (the one
+    ///   depth reduction left, 12+ to 10 bits, is `ditherTo10Bit`).
+    struct SwscaleSetup: Equatable {
+        var width: Int32
+        var height: Int32
+        var source: AVPixelFormat
+        var destination: AVPixelFormat
+        var sourceFullRange: Bool
+        var destinationFullRange: Bool
+        var colorspace: Int32
+
+        var resamplesChroma: Bool {
+            guard let src = av_pix_fmt_desc_get(source)?.pointee,
+                  let dst = av_pix_fmt_desc_get(destination)?.pointee else { return true }
+            return (src.flags & UInt64(AV_PIX_FMT_FLAG_RGB)) != 0 || src.nb_components < 3
+                || src.log2_chroma_w != dst.log2_chroma_w || src.log2_chroma_h != dst.log2_chroma_h
+        }
+
+        var flags: Int32 {
+            // FFmpeg 8 turned the SWS_* constants into a typed `SwsFlags` enum; the option wants an int.
+            resamplesChroma
+                ? Int32(SWS_BICUBIC.rawValue | SWS_ACCURATE_RND.rawValue | SWS_FULL_CHR_H_INT.rawValue
+                        | SWS_FULL_CHR_H_INP.rawValue)
+                : Int32(SWS_BILINEAR.rawValue | SWS_ACCURATE_RND.rawValue)
+        }
+
+        func makeContext() -> UnsafeMutablePointer<SwsContext>? {
+            guard let ctx = sws_alloc_context() else { return nil }
+            var owned: UnsafeMutablePointer<SwsContext>? = ctx
+            let raw = UnsafeMutableRawPointer(ctx)
+            av_opt_set_int(raw, "srcw", Int64(width), 0)
+            av_opt_set_int(raw, "srch", Int64(height), 0)
+            av_opt_set_int(raw, "dstw", Int64(width), 0)
+            av_opt_set_int(raw, "dsth", Int64(height), 0)
+            av_opt_set_int(raw, "src_format", Int64(source.rawValue), 0)
+            av_opt_set_int(raw, "dst_format", Int64(destination.rawValue), 0)
+            av_opt_set_int(raw, "src_range", sourceFullRange ? 1 : 0, 0)
+            av_opt_set_int(raw, "dst_range", destinationFullRange ? 1 : 0, 0)
+            av_opt_set_int(raw, "sws_flags", Int64(flags), 0)
+            guard sws_init_context(ctx, nil, nil) >= 0 else {
+                sws_freeContext(owned)
+                return nil
+            }
+            let table = sws_getCoefficients(colorspace)
+            guard sws_setColorspaceDetails(ctx, table, sourceFullRange ? 1 : 0, table, destinationFullRange ? 1 : 0,
+                                           0, 1 << 16, 1 << 16) >= 0 else {
+                sws_freeContext(owned)
+                owned = nil
+                return nil
+            }
+            return owned
+        }
+    }
+
+    nonisolated static func isJPEGFormat(_ format: AVPixelFormat) -> Bool {
+        switch format {
+        case AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P, AV_PIX_FMT_YUVJ411P:
+            true
+        default:
+            false
+        }
+    }
+
+    /// The swscale coefficient table for the matrix the buffer is tagged with.
+    nonisolated static func swscaleColorspace(_ matrix: CFString) -> Int32 {
+        switch matrix {
+        case kCVImageBufferYCbCrMatrix_ITU_R_601_4: SWS_CS_ITU601
+        case kCVImageBufferYCbCrMatrix_ITU_R_2020: SWS_CS_BT2020
+        case kCVImageBufferYCbCrMatrix_SMPTE_240M_1995: SWS_CS_SMPTE240M
+        default: SWS_CS_ITU709
+        }
     }
 
     /// One release-visible line whenever the buffer format changes, naming what it was chosen from.
