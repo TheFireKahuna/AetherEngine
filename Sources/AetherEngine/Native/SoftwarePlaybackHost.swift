@@ -2479,7 +2479,6 @@ final class SoftwarePlaybackHost {
                 initialClockTime: initialClock,
                 currentRate: currentRate,
                 diag: diag,
-                ring: ring,
                 videoTimeBaseSeconds: vTbSec,
                 audioTimeBaseSeconds: aTbSec,
                 isLive: liveSession,
@@ -3099,7 +3098,6 @@ final class SoftwarePlaybackHost {
         initialClockTime: CMTime,
         currentRate: @Sendable () -> Float,
         diag: SWPlaybackDiagState? = nil,
-        ring: PacketRingBuffer?,
         videoTimeBaseSeconds: Double,
         audioTimeBaseSeconds: Double,
         isLive: Bool,
@@ -3490,9 +3488,8 @@ final class SoftwarePlaybackHost {
                 return !isLive
             }
 
-            // AE#560: record before any branch. The DVR ring append further down sits inside
-            // `if let ring`, so a tap placed there would silently do nothing for a live session
-            // loaded without dvrWindowSeconds.
+            // AE#560: record before any branch. This loop serves a live session loaded without
+            // dvrWindowSeconds, so a tap tied to the DVR ring would silently do nothing for it.
             recordingTap(packet)
 
             let streamIdx = packet.pointee.stream_index
@@ -3567,7 +3564,7 @@ final class SoftwarePlaybackHost {
                 }
             }
 
-            // Fill ring before decode so the ring holds every packet. Audio appended for sync; only video keyframes tagged for eviction alignment.
+            // Live edge for a live session without a DVR ring (one with a ring takes the reader/feeder split).
             if isLive {
                 let isVideo = streamIdx == videoStreamIndex
                 let isAudio = streamIdx == audioStreamIndex
@@ -3575,20 +3572,7 @@ final class SoftwarePlaybackHost {
                     let tbSec = isVideo ? videoTimeBaseSeconds : audioTimeBaseSeconds
                     let rawPts = packet.pointee.pts
                     if rawPts != Int64.min, tbSec > 0 {
-                        let ptsSec = Double(rawPts) * tbSec
-                        noteEdge(ptsSec)
-                        if let ring {
-                            let isKey = isVideo && (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
-                            if let data = packet.pointee.data, packet.pointee.size > 0 {
-                                // Append is a small file write; off-main and
-                                // internally locked, so it never touches the
-                                // decoders' state. Best-effort: a write failure
-                                // just shrinks the rewind window, it must not
-                                // stall live playback.
-                                try? ring.append(pts: ptsSec, isKeyframe: isKey, isVideo: isVideo,
-                                                 bytes: UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)))
-                            }
-                        }
+                        noteEdge(Double(rawPts) * tbSec)
                     }
                 }
             }
