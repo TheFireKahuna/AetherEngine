@@ -270,6 +270,8 @@ extension AetherEngine {
         case p010 = "p010"
         /// P010 rounded to the nearest 10-bit code, no dither: keeps nothing below 10 bits.
         case p010Rounded = "p010-round"
+        /// P010 with a static blue-noise dither in place of the ordered one.
+        case p010BlueNoise = "p010-bluenoise"
         /// P010 with the sub-10-bit VDR bits in its low (padding) bits.
         case p010FullPrecision = "p010-full"
         /// 16-bit 4:2:2 `sv22` carrying the same full-precision words, where they are defined values.

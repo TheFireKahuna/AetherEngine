@@ -506,7 +506,7 @@ if first == "feltest" {
     }
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: feltest requires a <file> argument")
-        print("Usage: aetherctl feltest [--frames N] [--fel-output p010|p010-round|p010-full|sv22] [--probe-at X,Y] <file>")
+        print("Usage: aetherctl feltest [--frames N] [--fel-output p010|p010-round|p010-bluenoise|p010-full|sv22] [--probe-at X,Y] <file>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
@@ -792,7 +792,7 @@ if first == "play" {
         AetherEngine.usesSampleBufferReceivers = false
         print("[aetherctl] renderer attach: legacy addRenderer/removeRenderer")
     }
-    // `--fel-output <mode>`: the FEL composer's output buffer (p010, p010-round, p010-full, sv22), for the 12-bit experiment.
+    // `--fel-output <mode>`: the FEL composer's output buffer (p010, p010-round, p010-bluenoise, p010-full, sv22), for the 12-bit experiment.
     if let mode = takeStringFlag("--fel-output", from: &rest) {
         #if !DualLayerDolbyVision
         print("ERROR: --fel-output needs the DualLayerDolbyVision trait (swift build --traits DualLayerDolbyVision)")
