@@ -6,6 +6,11 @@ import Foundation
 /// metadata: an update moves each value from where it is (mid-ramp included) to its new value over
 /// the update's ramp, linearly, and a ramp of 0 (or the first update after a reset) jumps.
 ///
+/// Atmos ramps speaker gains (TS 103 448 5.5), the renderer ramps positions. The two agree for a
+/// ramp to or from silence only if the object does not move meanwhile, so it fades where it was
+/// and comes in where it is going: an object switched off would otherwise glide to the default
+/// position (the room's centre) as it fades out, and back from there when it returns.
+///
 /// The object encoder needs it twice per 1024-frame packet: per sample, to apply the gain to the
 /// audio, and once at the packet's end, to describe its motion as `APACObjectMetadata.Block`s. The
 /// renderer moves an object linearly over each block's interpolation length (measured, README
@@ -62,9 +67,20 @@ struct APACObjectTrajectory {
         hasMetadata = true
         let now = piece.value(at: t)
         replaced.append(piece)
-        piece = jump
-            ? Piece(start: t, length: 0, from: values, to: values)
-            : Piece(start: t, length: Int64(rampFrames), from: now, to: values)
+        if jump {
+            piece = Piece(start: t, length: 0, from: values, to: values)
+            return
+        }
+        var to = values
+        var from = now
+        if to.gain == 0 {
+            to.position = now.position
+            to.size = now.size
+        } else if from.gain == 0 {
+            from.position = to.position
+            from.size = to.size
+        }
+        piece = Piece(start: t, length: Int64(rampFrames), from: from, to: to)
     }
 
     /// Hold every value where it has got to: the encoder restarted at `t`, and the renderer starts
