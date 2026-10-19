@@ -212,6 +212,82 @@ struct DoviCpuModelTests {
             let m = Int(p.vdrMax)
             return (min(max(vcb, 0), m), min(max(vcr, 0), m))
         }
+
+        // MARK: 4:2:2 sites (sv22)
+
+        /// Normalised prediction from a fractional base-layer value: piece selection and the polynomial on the
+        /// value itself, as `dovi_eval_curve_f` does for the interpolated 4:2:2 chroma.
+        func predict(_ c: DoviPolynomialParams, _ mmr: DoviMmrParams, blFraction b: Double,
+                     y: Double, u: Double, v: Double) -> Double {
+            if c.numPivots < 2 { return b / blMax }
+            let last = Int(c.numPivots) - 2
+            var k = 0
+            for i in 0...max(last, 0) where b >= Double(c.pivots[i]) { k = i }
+            k = min(max(k, 0), max(last, 0))
+            if c.method[k] == DoviMapping.mmr.rawValue {
+                // MMR reads the value only to select the piece; at its own pivot the integer path selects k too.
+                return predict(c, mmr, blValue: Int(c.pivots[k]), y: y, u: u, v: v)
+            }
+            let lo = Double(c.pivots[0]), hi = Double(c.pivots[Int(c.numPivots) - 1])
+            let x = min(max(b, lo), hi) / blMax
+            let inv = pow(2.0, -Double(c.coefShift[k]))
+            var s = Double(c.coef[k][0]) * inv
+            if c.order[k] >= 1 { s += Double(c.coef[k][1]) * inv * x }
+            if c.order[k] >= 2 { s += Double(c.coef[k][2]) * inv * x * x }
+            return s
+        }
+
+        /// Catmull-Rom (B = 0, C = 0.5) at phases 3/4 (row 2k: chroma rows k - 2 ... k + 1) and 1/4 (row 2k + 1:
+        /// rows k - 1 ... k + 2), in 128ths.
+        static let chroma422Taps: [[Double]] = [[-3, 29, 111, -9], [-9, 111, 29, -3]]
+
+        /// Base-layer chroma at 4:2:2 row `row`: the four taps over the clamped chroma rows, clamped to [0, bl_max].
+        func chroma422Base(_ blUV: Plane, x: Int, row: Int, comp: Int) -> Double {
+            let odd = row & 1, first = row / 2 - 2 + odd
+            var s = 0.0
+            for i in 0..<4 {
+                s += Double(blUV.code(x, min(max(first + i, 0), blUV.height - 1), comp)) * Self.chroma422Taps[odd][i] / 128
+            }
+            return min(max(s, 0), Double(p.blMax))
+        }
+
+        /// Luma at a 4:2:2 chroma site: [1 2 1] around the even column on that row alone, edges clamped.
+        static func chroma422Luma(_ bl: Plane, x: Int, row: Int) -> Int {
+            func at(_ c: Int) -> Int { bl.code(min(max(c, 0), bl.width - 1), row) }
+            return (at(x * 2 - 1) + 2 * at(x * 2) + at(x * 2 + 1) + 2) >> 2
+        }
+
+        /// Bilinear EL chroma code at 4:2:2 row `row`, column `x`: the row's 4:2:0 coordinate row / 2 - 1/4 mapped
+        /// through the co-sited grid relation of ``elCode(_:comp:x:y:baseW:baseH:cosited:)``, rounded half up.
+        func elCode422(_ el: Plane, comp: Int, x: Int, row: Int, baseW: Int, baseH: Int) -> Int {
+            let u = Double(x) / Double(baseW) * Double(el.width)
+            let v = (Double(row) / 2 - 0.25) / Double(baseH) * Double(el.height)
+            let x0 = Int(floor(u)), y0 = Int(floor(v))
+            let fx = u - Double(x0), fy = v - Double(y0)
+            func w(_ xx: Int, _ yy: Int) -> Double {
+                Double(el.code(min(max(xx, 0), el.width - 1), min(max(yy, 0), el.height - 1), comp))
+            }
+            let top = w(x0, y0) * (1 - fx) + w(x0 + 1, y0) * fx
+            let bot = w(x0, y0 + 1) * (1 - fx) + w(x0 + 1, y0 + 1) * fx
+            return Int((top * (1 - fy) + bot * fy + 0.5).rounded(.down))
+        }
+
+        /// Clamped 12-bit VDR (Cb, Cr) at 4:2:2 site (x, row), as `dovi_compose_chroma_422` composes it.
+        func chroma422(bl: Plane, blUV: Plane, elUV: Plane, x: Int, row: Int) -> (Int, Int) {
+            let by = Self.chroma422Luma(bl, x: x, row: row)
+            let cb = chroma422Base(blUV, x: x, row: row, comp: 0), cr = chroma422Base(blUV, x: x, row: row, comp: 1)
+            let yn = Double(by) / blMax, un = cb / blMax, vn = cr / blMax
+            var vcb = min(max(denormalize(predict(p.polyCb, p.mmrCb, blFraction: cb, y: yn, u: un, v: vn)), 0), Int(p.vdrMax))
+            var vcr = min(max(denormalize(predict(p.polyCr, p.mmrCr, blFraction: cr, y: yn, u: un, v: vn)), 0), Int(p.vdrMax))
+            if nlqActive(p.nlqCb) {
+                vcb += inverseNlq(p.nlqCb, elCode422(elUV, comp: 0, x: x, row: row, baseW: blUV.width, baseH: blUV.height))
+            }
+            if nlqActive(p.nlqCr) {
+                vcr += inverseNlq(p.nlqCr, elCode422(elUV, comp: 1, x: x, row: row, baseW: blUV.width, baseH: blUV.height))
+            }
+            let m = Int(p.vdrMax)
+            return (min(max(vcb, 0), m), min(max(vcr, 0), m))
+        }
     }
 
     // MARK: - Comparison
