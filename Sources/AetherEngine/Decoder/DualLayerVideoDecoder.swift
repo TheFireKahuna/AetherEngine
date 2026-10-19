@@ -5,6 +5,8 @@ import CoreMedia
 import CoreVideo
 import VideoToolbox
 import QuartzCore
+import os
+import Dovi
 import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
@@ -221,6 +223,36 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// closed after releasing it in `flush()`/`close()`.
     private var enhancementDecoder: (any SingleLayerVideoDecoder)?
     private let composer: (any FelComposing)?
+
+    private static let composedRpuOverrideSwitch = OSAllocatedUnfairLock<[UInt8]?>(initialState: nil)
+
+    /// The RPU NAL every composed frame carries in place of its converted one (`AetherEngine.felComposedRpuOverride`),
+    /// or nil for the converted one. A display-path experiment, process-wide like `DoviFelComposer.outputMode`:
+    /// read once per composed frame, so it takes effect from the next one. A frame delivered as its raw base
+    /// layer keeps the RPU with its mapping, override or not: its pixels were never reshaped.
+    static var composedRpuOverride: [UInt8]? {
+        get { composedRpuOverrideSwitch.withLock { $0 } }
+        set { composedRpuOverrideSwitch.withLock { $0 = newValue } }
+    }
+
+    /// This decoder's override in place of the process-wide one, for tests, which run in parallel. Set before
+    /// the first frame.
+    var composedRpuOverrideForTesting: [UInt8]?
+
+    /// `bytes` as an unspec62 NAL that `DoviDisplayMetadata.attach` takes (2-byte `0x7C 0x01` header, emulation
+    /// prevention in place: what `dovi_write_unspec62_nalu` returns), or nil when libdovi cannot parse it behind
+    /// `DoviRpuGuard`. A header-less payload (starting `0x19`, the attachment's own form) gets the header put back.
+    static func validatedRpuOverride(_ bytes: Data) -> [UInt8]? {
+        var nal = [UInt8](bytes)
+        if nal.first == 0x19 { nal.insert(contentsOf: [0x7C, 0x01], at: 0) }
+        guard nal.count > 2, nal[0] == 0x7C, nal[1] == 0x01 else { return nil }
+        let parsed = nal.withUnsafeBufferPointer { buf -> Bool in
+            guard let base = buf.baseAddress, let rpu = DoviRpuGuard.parse(base, buf.count) else { return false }
+            dovi_rpu_free(rpu)
+            return true
+        }
+        return parsed ? nal : nil
+    }
 
     /// Every outgoing frame — composed or bypassed — reaches the host through
     /// here (dolby-vision-fel.md §5.7). Owned by the decoder, not the composer.
@@ -1139,7 +1171,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let epoch = req.epoch
         let pts = req.pts
         let hdr10Data = req.hdr10Data
-        let dmNAL = req.dmNAL
+        let dmNAL = composedRpuOverrideForTesting ?? Self.composedRpuOverride ?? req.dmNAL
         let baseLayerNAL = req.baseLayerNAL
         let arrived = req.arrived
         let delivery = orderedDelivery

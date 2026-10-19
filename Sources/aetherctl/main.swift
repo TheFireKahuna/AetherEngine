@@ -70,7 +70,7 @@ func printUsage() {
       aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
-      aetherctl play [--fel] [--surface | --window] [--cycle-el SECONDS] [--fel-output MODE] [--legacy-renderer-attach] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
+      aetherctl play [--fel] [--surface | --window] [--cycle-el SECONDS] [--fel-output MODE] [--fel-rpu-override FILE] [--legacy-renderer-attach] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
                  [--assert-dv] [--dv-base-layer]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
@@ -112,7 +112,7 @@ func printUsage() {
                           (#92: SW-decode each segment in isolation; framesDecoded==0 => not independent)
       aetherctl disc-inspect <disc.iso>
       aetherctl dovitest [--out PATH.hevc] <file>
-      aetherctl feltest [--frames N] [--fel-output MODE] <file>   (DualLayerDolbyVision trait)
+      aetherctl feltest [--frames N] [--fel-output MODE] [--fel-rpu-override FILE] <file>   (DualLayerDolbyVision trait)
       aetherctl dvsurvey [--frames N] [--list K] <file>
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
@@ -500,6 +500,7 @@ if first == "feltest" {
     var rest = Array(args.dropFirst(2))
     let frames = takeIntFlag("--frames", from: &rest) ?? 100
     let felOutput = takeStringFlag("--fel-output", from: &rest)
+    let felRpuOverride = takeStringFlag("--fel-rpu-override", from: &rest)
     let probeAt = takeStringFlag("--probe-at", from: &rest).map { spec -> (x: Int, y: Int) in
         let v = spec.split(separator: ",").compactMap { Int($0) }
         guard v.count == 2 else { print("ERROR: --probe-at takes X,Y, got '\(spec)'"); exit(64) }
@@ -507,13 +508,14 @@ if first == "feltest" {
     }
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: feltest requires a <file> argument")
-        print("Usage: aetherctl feltest [--frames N] [--fel-output p010|p010-round|p010-bluenoise|p010-full|sv22] [--probe-at X,Y] <file>")
+        print("Usage: aetherctl feltest [--frames N] [--fel-output p010|p010-round|p010-bluenoise|p010-full|sv22] [--fel-rpu-override FILE] [--probe-at X,Y] <file>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "feltest")
     #if DualLayerDolbyVision
     applyFelOutputFlag(felOutput)
+    applyFelRpuOverrideFlag(felRpuOverride)
     exit(runFelTest(url: parseSourceURL(urlArg), maxFrames: frames, probePoint: probeAt))
     #else
     print("ERROR: feltest needs the DualLayerDolbyVision trait (swift build --traits DualLayerDolbyVision)")
@@ -785,6 +787,16 @@ if first == "play" {
         #else
         if !playFel { print("[aetherctl] note: --fel-output only changes a session on the dual-layer route; add --fel") }
         applyFelOutputFlag(mode)
+        #endif
+    }
+    // `--fel-rpu-override <file>`: the RPU every composed FEL frame carries in place of its converted one, for the 12-bit experiment.
+    if let path = takeStringFlag("--fel-rpu-override", from: &rest) {
+        #if !DualLayerDolbyVision
+        print("ERROR: --fel-rpu-override needs the DualLayerDolbyVision trait (swift build --traits DualLayerDolbyVision)")
+        exit(64)
+        #else
+        if !playFel { print("[aetherctl] note: --fel-rpu-override only changes a session on the dual-layer route; add --fel") }
+        applyFelRpuOverrideFlag(path)
         #endif
     }
     // `--dv-pin <spec>`: arm the Dolby Vision pin test (DEBUG builds), same grammar `dvsurvey` prints.

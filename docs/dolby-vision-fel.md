@@ -659,6 +659,17 @@ both axes (`DoviEnhancementUpsamplerTests`).
   resolving at compose time would follow completion order instead.
 - **Output precision:** `DoviDither.fullPrecision` keeps the VDR bits below the 10-bit code in P010's unused low
   6 bits. Opt-in, not yet validated on a display path; the default stays rounded or dithered 10-bit.
+- **Composed-frame RPU override (experiment):** `AetherEngine.felComposedRpuOverride` (`@_spi(Diagnostics)`,
+  trait only; `aetherctl feltest|play --fel-rpu-override <file>`, the probe app's `rpu=<url>` arm option)
+  replaces the converted RPU on every frame the composer produced, base-layer-only compositions included,
+  with one fixed RPU NAL: an "amplifier" whose luma curve is steep in a narrow window, so sub-10-bit steps
+  in the composed picture become visible on the TV if more than 10 bits survive tvOS's output. The bytes
+  are what `dovi_write_unspec62_nalu` writes (`0x7C 0x01` header, emulation prevention, no start code);
+  `DoviRpuGuard` + libdovi must parse them or the setter refuses and logs. Read per composed frame at its
+  hand-off to the GPU, process-wide like `felOutputMode`. A frame delivered as its raw base layer (failed
+  composition, no parameters, no composer) keeps its mapping-kept RPU, since its pixels were never reshaped
+  and the amplifier would mean something else on them. `DoviComposedRpuOverrideTests` pins the attachment
+  form.
 - **Not implemented, by design:** NLQ methods other than linear (the spec defines only linear; an unknown method
   yields no residual), MEL (no residual by definition), NLQ pivots (the linear inverse has one segment).
 - **Not implemented, blocked:** polynomial pieces with `poly_order_minus1 == 0` and `linear_interp_flag`. libdovi is
