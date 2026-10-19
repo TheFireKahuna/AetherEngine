@@ -115,11 +115,10 @@ Nothing is touched during the run.
 Sequences (`SEQ=` for `run_tv.sh`): `main` is P V1 V2 T N S P1 T1 P, about 11 minutes; the closing P
 repeats the first and checks drift over the session. `el` is TE NE T, about 4 minutes. `vt` is P V1
 V2 S. `count` is T NE TL PM on the counter clips, about 5 minutes. `soak` is one long arm. `card` is the
-amplifier-RPU test of whether more than 10 bits reach the panel, about 6 minutes: `p7fel_card` with
-`card_amp10.bin` attached to every composed frame through TR (`p010-round`), TD (`p010`), TB
-(`p010-bluenoise`), TF (`p010-full`) and TS (`sv22`), then TF12 / TS12 with the steeper `card_amp12.bin`,
-TI with `card_identity.bin` (the control: flat grey), and BR / BF / BS on `p7fel_bullseye` without an
-override. `run_tv.sh` prints what to look for before launching.
+amplifier-RPU test of whether more than 10 bits reach the panel, about 2.5 minutes (14 s arms, inside the
+15 s clips): `p7fel_card` with `card_amp10.bin` attached to every composed frame through TR (`p010-round`),
+TD (`p010`), TB (`p010-bluenoise`), TF (`p010-full`) and TS (`sv22`), TI with `card_identity.bin` (the
+control: flat grey), and BR / BF / BS on `p7fel_bullseye` without an override. `run_tv.sh` prints what to look for before launching.
 
 `engine` arm options, in the fourth field (`key=value;key=value`): `out=` the composer's output buffer;
 `rpu=<url>` (absolute, or relative to the clip) one RPU NAL, as `dovi_write_unspec62_nalu` writes it, that
