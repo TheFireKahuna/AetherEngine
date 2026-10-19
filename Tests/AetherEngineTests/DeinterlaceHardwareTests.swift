@@ -17,11 +17,11 @@ struct DeinterlaceHardwareTests {
     private static let hardwareAvailable = DeinterlaceFilter.prewarmHardwarePipeline()
     private static let needsHardware: Comment = "needs yadif_videotoolbox and a Metal device"
 
-    private func makeFrame(pts: Int64) -> UnsafeMutablePointer<AVFrame> {
+    private func makeFrame(pts: Int64, format: AVPixelFormat = AV_PIX_FMT_YUV420P) -> UnsafeMutablePointer<AVFrame> {
         let f = av_frame_alloc()!
         f.pointee.width = 64
         f.pointee.height = 64
-        f.pointee.format = AV_PIX_FMT_YUV420P.rawValue
+        f.pointee.format = format.rawValue
         f.pointee.pts = pts
         f.pointee.flags |= (1 << 3)  // AV_FRAME_FLAG_INTERLACED
         _ = av_frame_get_buffer(f, 0)
@@ -33,6 +33,7 @@ struct DeinterlaceHardwareTests {
     private func run(
         fieldRate: DeinterlaceFieldRate,
         count: Int64,
+        format: AVPixelFormat = AV_PIX_FMT_YUV420P,
         onFrame: ((UnsafeMutablePointer<AVFrame>) -> Void)? = nil
     ) -> (seconds: [Double], hardware: Bool) {
         let streamTB = AVRational(num: 1, den: 30)
@@ -46,7 +47,7 @@ struct DeinterlaceHardwareTests {
         var seconds: [Double] = []
         var hardware = false
         for pts in Int64(0)..<count {
-            let f = makeFrame(pts: pts)
+            let f = makeFrame(pts: pts, format: format)
             guard filter.ensureGraph(frame: f, timeBase: streamTB) else {
                 var ff: UnsafeMutablePointer<AVFrame>? = f
                 av_frame_free(&ff)
@@ -99,6 +100,38 @@ struct DeinterlaceHardwareTests {
         #expect(hardware)
         #expect(sawVTFrame, "hw graph engaged but produced no frames")
         #expect(!seconds.isEmpty)
+    }
+
+    /// #7: interlaced 4:2:2 is uploaded as 4:2:2, so the deinterlacer sees each field's own chroma
+    /// lines instead of a 4:2:0 downsample that already mixed the two fields.
+    @Test("interlaced 4:2:2 stays 4:2:2 through the hardware chain", arguments: [
+        (AV_PIX_FMT_YUV422P, kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange),
+        (AV_PIX_FMT_YUV422P10LE, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange),
+    ])
+    func fourTwoTwoStaysFourTwoTwo(_ format: AVPixelFormat, _ expected: OSType) throws {
+        try #require(DeinterlaceHardwareTests.hardwareAvailable, DeinterlaceHardwareTests.needsHardware)
+        var types = Set<OSType>()
+        let (seconds, hardware) = run(fieldRate: .field, count: 8, format: format) { out in
+            if let raw = out.pointee.data.3 {
+                types.insert(CVPixelBufferGetPixelFormatType(
+                    Unmanaged<CVPixelBuffer>.fromOpaque(UnsafeRawPointer(raw)).takeUnretainedValue()))
+            }
+        }
+        #expect(hardware)
+        #expect(!seconds.isEmpty)
+        #expect(types == [expected], "surfaces: \(types.map { String($0, radix: 16) })")
+    }
+
+    @Test("the upload layout keeps the decoder's subsampling")
+    func uploadFormat() {
+        #expect(DeinterlaceFilter.uploadFormat(for: AV_PIX_FMT_YUV420P.rawValue) == "nv12")
+        #expect(DeinterlaceFilter.uploadFormat(for: AV_PIX_FMT_YUV420P10LE.rawValue) == "p010le")
+        #expect(DeinterlaceFilter.uploadFormat(for: AV_PIX_FMT_YUV420P12LE.rawValue) == "p010le")
+        #expect(DeinterlaceFilter.uploadFormat(for: AV_PIX_FMT_YUV422P.rawValue) == "nv16")
+        #expect(DeinterlaceFilter.uploadFormat(for: AV_PIX_FMT_YUV422P10LE.rawValue) == "p210le")
+        #expect(DeinterlaceFilter.uploadFormat(for: AV_PIX_FMT_YUV422P12LE.rawValue) == "p216le")
+        #expect(DeinterlaceFilter.uploadFormat(for: AV_PIX_FMT_YUV444P.rawValue) == "nv24")
+        #expect(DeinterlaceFilter.uploadFormat(for: AV_PIX_FMT_YUV411P.rawValue) == "nv16")
     }
 
     @Test("send_field doubles output cadence; send_frame keeps it",

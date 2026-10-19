@@ -223,7 +223,7 @@ final class DeinterlaceFilter {
             // displayable. hwupload: sw frame -> VideoToolbox hwframes ctx (IOSurface + Metal
             // compatible). deint=interlaced: progressive frames pass through (uploaded but
             // untouched).
-            let swFmt = is10Bit(frame.pointee.format) ? "p010le" : "nv12"
+            let swFmt = Self.uploadFormat(for: frame.pointee.format)
             let mode = config.fieldRate == .field ? "send_field" : "send_frame"
             let deintOpts = "mode=\(mode):parity=auto:deint=interlaced"
             let deintName = Self.hardwareFilterName() ?? "yadif_videotoolbox"
@@ -328,10 +328,24 @@ final class DeinterlaceFilter {
         return true
     }
 
-    /// True when the pixel format stores >8 bits per component (HDR10-class sources).
-    private func is10Bit(_ format: Int32) -> Bool {
-        guard let desc = av_pix_fmt_desc_get(AVPixelFormat(rawValue: format)) else { return false }
-        return desc.pointee.comp.0.depth > 8
+    /// #7: the bi-planar layout the hardware chain uploads, with the decoder's own subsampling. It
+    /// used to be NV12 / P010 for everything, so an interlaced 4:2:2 source (XDCAM / broadcast
+    /// contribution MPEG-2 4:2:2, H.264 High 4:2:2) was vertically downsampled to 4:2:0 BEFORE the
+    /// deinterlacer saw it, and that downsample filters chroma across the two fields of each frame:
+    /// colour from one instant smeared into the other, which no deinterlacer can undo. The Metal
+    /// kernels work plane by plane on any 8- or 16-bit bi-planar layout and the VideoToolbox hwframes
+    /// context takes NV16 / P210 / P216 / NV24 / P410 / P416, so the chroma keeps its own lines. 4:2:0
+    /// past 10 bits stays P010: VideoToolbox has no 16-bit 4:2:0 surface.
+    static func uploadFormat(for format: Int32) -> String {
+        guard let desc = av_pix_fmt_desc_get(AVPixelFormat(rawValue: format))?.pointee else { return "nv12" }
+        let depth = desc.comp.0.depth
+        if desc.nb_components >= 3, desc.log2_chroma_w == 0 {
+            return depth <= 8 ? "nv24" : (depth <= 10 ? "p410le" : "p416le")
+        }
+        if desc.nb_components >= 3, desc.log2_chroma_h == 0 {
+            return depth <= 8 ? "nv16" : (depth <= 10 ? "p210le" : "p216le")
+        }
+        return depth <= 8 ? "nv12" : "p010le"
     }
 
     /// Feed a decoded frame (takes ownership; frame is reset after the call).
