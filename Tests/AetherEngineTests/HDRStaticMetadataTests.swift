@@ -59,6 +59,33 @@ struct HDRStaticMetadataTests {
         #expect(HDRStaticMetadata.contentLightLevelPayload(AVContentLightMetadata(MaxCLL: 0, MaxFALL: 0)) == nil)
     }
 
+    @Test("the container's declaration is read off codecpar, the hardware decoder's only source")
+    func containerDeclarationFromCodecpar() throws {
+        let data = try #require(Data(base64Encoded: Self.vp9ContainerHDR10Base64, options: .ignoreUnknownCharacters))
+        let demuxer = Demuxer()
+        try demuxer.open(reader: DataIOReader(data: data), formatHint: "matroska")
+        defer { demuxer.close() }
+        let codecpar = try #require(demuxer.stream(at: demuxer.videoStreamIndex)?.pointee.codecpar)
+        let declared = HDRStaticMetadata(codecpar: codecpar)
+        #expect(declared.masteringDisplay.map { [UInt8]($0 as Data) } == Self.expectedMDCV)
+        #expect(declared.contentLightLevel.map { [UInt8]($0 as Data) } == Self.expectedCLL)
+    }
+
+    /// VideoToolbox output: what VT attached from the bitstream's SEI stays, the container fills the rest.
+    @Test("attachWhereAbsent keeps an attachment the buffer already has and fills a missing one")
+    func whereAbsentKeepsTheDecodersOwn() throws {
+        var pb: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 16, 16, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, nil, &pb)
+        let buffer = try #require(pb)
+        let own: [UInt8] = [0x00, 0x64, 0x00, 0x32]
+        CVBufferSetAttachment(buffer, kCVImageBufferContentLightLevelInfoKey, Data(own) as CFData, .shouldPropagate)
+        let container = HDRStaticMetadata(masteringDisplay: Data(Self.expectedMDCV) as NSData,
+                                          contentLightLevel: Data(Self.expectedCLL) as NSData)
+        container.attachWhereAbsent(to: buffer)
+        #expect(attachment(buffer, kCVImageBufferContentLightLevelInfoKey) == own)
+        #expect(attachment(buffer, kCVImageBufferMasteringDisplayColorVolumeKey) == Self.expectedMDCV)
+    }
+
     // MARK: - Real decodes
 
     private func firstPixelBuffer(base64: String, formatHint: String?) throws -> CVPixelBuffer {
