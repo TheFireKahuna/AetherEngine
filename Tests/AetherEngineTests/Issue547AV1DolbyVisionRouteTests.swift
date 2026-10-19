@@ -157,7 +157,7 @@ struct Issue547AV1DolbyVisionRouteTests {
         let r = try Self.route(AV1DVCodecpar(blCompatibilityID: 1))
         #expect(r.codecTagOverride == "av01")
         #expect(r.videoRange == .pq)
-        #expect(r.primaryCodecs == "av01.0.08M.10.0.111.09.16.09.0")
+        #expect(r.primaryCodecs == "av01.0.00M.10.0.110.09.16.09.0")
         #expect(r.supplementalCodecs == "dav1.10.06/db1p")
         #expect(r.doviConfig == .keep)
         #expect(r.dvVariant == .av1Profile101)
