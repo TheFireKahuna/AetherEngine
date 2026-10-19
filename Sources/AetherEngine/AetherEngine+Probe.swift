@@ -1164,4 +1164,34 @@ extension AetherEngine {
         }
         return nil
     }
+
+    /// #7: the rate the display has to run at, which is not the content rate when the software route
+    /// deinterlaces at field rate. The hardware deinterlacer (`DeinterlaceMode.auto` with
+    /// `DeinterlaceFieldRate.field`, the defaults) emits one picture per field, so 1080i25 goes out at
+    /// 50 fps while `detectFrameRate` says 25 and the panel was asked for 25 Hz: every other field
+    /// dropped by the display, or judder. Doubled before snapping, so the snap sees the field rate.
+    ///
+    /// Only a declared interlaced field order on a codec the software route takes counts: interlaced
+    /// HEVC plays native and is not deinterlaced, and the CPU fallback (`.software`, or no Metal
+    /// deinterlacer linked) runs at frame rate. A rate above 30 is already a field rate (a muxer that
+    /// counted fields) and is left alone; no interlaced format carries more than 30 frames a second.
+    /// Measured on generated clips through the linked FFmpeg: MPEG-2 1080i25 (TS), H.264 1080i25 (TS,
+    /// MKV) and 480i29.97 (MPEG-PS, MP4) all report their FRAME rate in both `avg_frame_rate` and
+    /// `r_frame_rate`. When #232's frame sample later refutes the declaration and routes native, the
+    /// panel is at twice a progressive rate, which shows every picture for exactly two refreshes.
+    nonisolated static func displayFrameRate(
+        contentRate: Double?,
+        codecID: AVCodecID,
+        fieldOrder: AVFieldOrder,
+        deinterlaceMode: DeinterlaceMode,
+        deinterlaceFieldRate: DeinterlaceFieldRate,
+        hardwareDeinterlacerLinked: Bool = DeinterlaceFilter.hardwareFilterName() != nil
+    ) -> Double? {
+        guard let contentRate, contentRate > 0, contentRate <= 30.5,
+              deinterlaceMode == .auto, deinterlaceFieldRate == .field, hardwareDeinterlacerLinked,
+              VideoRoutingPolicy.interlacedFieldOrders.contains(fieldOrder),
+              VideoRoutingPolicy.requiresSoftwarePath(codecID: codecID, fieldOrder: fieldOrder, av1Available: true)
+        else { return contentRate }
+        return contentRate * 2
+    }
 }
