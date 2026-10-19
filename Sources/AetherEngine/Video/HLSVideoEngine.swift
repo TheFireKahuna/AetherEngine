@@ -1595,6 +1595,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
             hevcExtradataOverride = nil
         }
 
+        // 5b. HDR10 static metadata stated only in-band (MPEG-TS, a Matroska remuxed from one): read
+        //     the SEI so movenc writes `mdcv` / `clli`. See `InBandHDRStaticMetadata`.
+        let inBandHDRMetadata = scanInBandHDRStaticMetadata(
+            demuxer: dem,
+            videoStreamIndex: videoIndex,
+            codecpar: codecpar,
+            framing: measuredVideoNALFraming,
+            isLive: isLiveSession
+        )
+
         // 6. Reset demuxer cursor to 0 (cue prewarm moved it mid-file). Skipped for live
         //    (no prewarm, forward-only feed), and for a forward-only VOD source: the prewarm did not
         //    run there, so the cursor never left the head, and a seek on a pb that cannot rewind
@@ -1679,6 +1689,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
             throw HLSVideoEngineError.openFailed(reason: "codecpar copy failed")
         }
         ownedCodecParams.append(ownedVideoParams)
+        let liftedHDRBoxes = inBandHDRMetadata.attach(to: ownedVideoParams.ptr)
+        if !liftedHDRBoxes.isEmpty {
+            EngineLog.emit(
+                "[HLSVideoEngine] HDR10 static metadata stated only in-band: lifted the SEI into the "
+                + "stream side data, init carries \(liftedHDRBoxes.joined(separator: " + "))",
+                category: .session
+            )
+        }
         // movenc writes `pasp` from the output codecpar alone, and a container-declared ratio never
         // reaches codecpar: Matroska's DisplayWidth quotient and MP4's own `pasp` land on AVStream
         // (matroskadec.c / mov.c), which is where a DVD remuxed to MKV carries its anamorphic ratio.
