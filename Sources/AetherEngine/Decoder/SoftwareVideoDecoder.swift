@@ -179,13 +179,14 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         /// The buffer's own format read back, for a buffer this decoder did not convert (the
         /// hardware deinterlacer's surfaces): nil for a format no `OutputFormat` describes.
         init?(pixelFormatType type: OSType) {
-            let all: [OutputFormat] = [Chroma.yuv420, .yuv422, .yuv444].flatMap { chroma in
-                [Depth.eight, .ten, .sixteen].flatMap { depth in
-                    [false, true].map { OutputFormat(chroma: chroma, depth: depth, fullRange: $0) }
-                }
-            }
-            guard let match = all.first(where: { $0.pixelFormatType == type }) else { return nil }
+            guard let match = Self.all.first(where: { $0.pixelFormatType == type }) else { return nil }
             self = match
+        }
+
+        private static let all: [OutputFormat] = [Chroma.yuv420, .yuv422, .yuv444].flatMap { chroma in
+            [Depth.eight, .ten, .sixteen].flatMap { depth in
+                [false, true].map { OutputFormat(chroma: chroma, depth: depth, fullRange: $0) }
+            }
         }
 
         /// `x422 (10-bit 4:2:2), video range`, for the one-per-change output line.
