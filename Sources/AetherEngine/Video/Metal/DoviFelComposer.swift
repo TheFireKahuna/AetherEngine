@@ -90,6 +90,25 @@ final class DoviFelComposer: @unchecked Sendable {
     nonisolated(unsafe) private static var loggedNonZeroDeadzone = false
     private static let deadzoneLogLock = NSLock()
 
+    /// One-shot latches, by name, for the other RPU fields the kernels assume a value for: a stream that
+    /// breaks one says so once, with the value it carried, exactly like the deadzone line above.
+    nonisolated(unsafe) private static var loggedAssumptions = Set<String>()
+
+    private static func logAssumptionOnce(_ key: String, _ line: @autoclosure () -> String) {
+        deadzoneLogLock.lock()
+        let first = loggedAssumptions.insert(key).inserted
+        deadzoneLogLock.unlock()
+        if first { EngineLog.emit(line(), category: .swPlayback) }
+    }
+
+    #if DEBUG
+    static func resetAssumptionLogForTesting() {
+        deadzoneLogLock.lock()
+        loggedAssumptions.removeAll()
+        deadzoneLogLock.unlock()
+    }
+    #endif
+
     /// Lines already logged by ``logOnce(_:)``. Bounded: a stream that varies the numbers in a message stops
     /// being logged after `maxOnceLines` distinct lines instead of growing the set.
     nonisolated(unsafe) private static var onceLines = Set<String>()
@@ -1062,6 +1081,11 @@ final class DoviFelComposer: @unchecked Sendable {
     /// survey, 9,816 RPUs), where all readings agree. Subtracting it, or zeroing anything inside the
     /// deadzone, would be a different reading and does not match a second implementation.
     ///
+    /// The final shift has no rounding offset, so the magnitude truncates to a whole VDR code. Neither
+    /// reference rounds there: DoViBaker shifts with no offset as well (it keeps four more fractional bits
+    /// and rounds once, at the output) and libplacebo works in float. Carrying that fraction into the output
+    /// quantiser would be the change worth measuring, not an offset here.
+    ///
     /// Wrapping arithmetic, as the kernels' 32/64-bit integers had: parameters no real stream carries (a
     /// negative or huge scale, an offset far outside the code range) must give some deterministic value, not trap.
     static func inverseNlq(_ nlq: DoviNlqParams, elCode: Int) -> Int32 {
@@ -1324,6 +1348,11 @@ final class DoviFelComposer: @unchecked Sendable {
             return nil
         }
 
+        if header.pointee.bl_video_full_range_flag {
+            logAssumptionOnce("bl_video_full_range_flag", "[DoviFelComposer] bl_video_full_range_flag = 1; the composer "
+                + "writes video-range P010 (luma 64...940, chroma 64...960), as every surveyed Profile 7 stream "
+                + "is. A full-range reconstruction is clipped to that range.")
+        }
         if header.pointee.disable_residual_flag {
             params.flags.insert(.disableResidual)
         }
@@ -1356,6 +1385,16 @@ final class DoviFelComposer: @unchecked Sendable {
             let p0 = UInt32(pivotData[0])
             let p1 = p0 + UInt32(pivotData[1])
             nlqPivots = [p0, p1]
+        }
+        if nlqMethod == .linear, nlqPivots != [0, params.blMax] {
+            logAssumptionOnce("nlq_pred_pivot_value", "[DoviFelComposer] nlq_pred_pivot_value = \(nlqPivots[0])...\(nlqPivots[1]) "
+                + "(not 0...\(params.blMax)); the linear inverse NLQ applies one segment to every base-layer "
+                + "code and does not consult the pivots, as no surveyed stream needed it to.")
+        }
+        if mapping.pointee.num_x_partitions_minus1 != 0 || mapping.pointee.num_y_partitions_minus1 != 0 {
+            logAssumptionOnce("num_partitions", "[DoviFelComposer] num_x_partitions_minus1 = \(mapping.pointee.num_x_partitions_minus1), "
+                + "num_y_partitions_minus1 = \(mapping.pointee.num_y_partitions_minus1); the kernels apply one "
+                + "mapping to the whole picture, as libdovi parses one. A partitioned mapping would be applied as if unpartitioned.")
         }
 
         let curves = [mapping.pointee.curves.0, mapping.pointee.curves.1, mapping.pointee.curves.2]
