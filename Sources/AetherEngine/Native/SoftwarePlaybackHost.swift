@@ -1375,6 +1375,8 @@ final class SoftwarePlaybackHost {
             guard self?.backgroundAudioOnly != true else { return nil }
             return prerollRenderer.prerollSatisfied(clock: clock, live: prerollLive)
         }
+        // Nothing polls the gate: each handover asks it again.
+        renderer.setPrerollAdvancedObserver { [weak audioOutput] in audioOutput?.videoPrerollAdvanced() }
         // AE#395: the route this session plays into, the counterpart of the native host's line. Without
         // it a silent software session on a long-latency route and an audible one on HDMI log the same.
         if let route = AudioRouteDescription.current() {
@@ -1680,6 +1682,8 @@ final class SoftwarePlaybackHost {
     func enterBackgroundAudioOnly() {
         guard !backgroundAudioOnly else { return }
         backgroundAudioOnly = true
+        // The preroll gate now answers nil (start at once), and no handover will come to ask it.
+        audioOutput?.videoPrerollAdvanced()
         EngineLog.emit("[SWHost] background audio-only: dropping video, audio keeps playing",
                        category: .swPlayback)
     }
