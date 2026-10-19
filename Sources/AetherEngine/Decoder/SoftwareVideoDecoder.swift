@@ -1,4 +1,5 @@
 import Foundation
+import os
 import CoreMedia
 import CoreVideo
 import VideoToolbox
@@ -105,21 +106,116 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// full-range AV1 / VP9 / HEVC picture was labelled video range and shown crushed, and
     /// `bits_per_raw_sample` is 0 for libdav1d and the AV1 / VP9 parsers, so a 10-bit SDR stream was
     /// dithered down to 8 bit.
+    ///
+    /// #8: the frame's chroma subsampling and depth are kept wherever CoreVideo has a bi-planar format
+    /// for them. Everything used to go out as 4:2:0 NV12 / P010, so a 4:2:2 or 4:4:4 source (ProRes,
+    /// XDCAM / broadcast 4:2:2, HEVC and H.264 4:2:2 / 4:4:4 that VideoToolbox will not decode) had its
+    /// chroma halved by swscale only for the display layer to upsample it again, and a 12-bit picture
+    /// was cut to 10 bits with no dither. The 16-bit formats (`sv22` / `sv44`) are video range only:
+    /// their range is the 10-bit range shifted left six, so a full-range 12-bit picture goes to the
+    /// 10-bit full-range format, dithered.
     struct OutputFormat: Equatable {
-        var tenBit: Bool
+        enum Chroma: Equatable { case yuv420, yuv422, yuv444 }
+        enum Depth: Equatable { case eight, ten, sixteen }
+
+        var chroma: Chroma
+        var depth: Depth
         var fullRange: Bool
+        /// The frame has more bits than `depth` keeps. swscale's P010 / P210 / P410 writers round with
+        /// no dither (and its unscaled 4:2:0 path just shifts, leaving the extra bits in what CoreVideo
+        /// defines as padding), so swscale writes the 16-bit sibling, which has the same memory layout,
+        /// and `ditherTo10Bit` orders it down to the 10 bits the format keeps.
+        var dithers: Bool
+
+        init(chroma: Chroma = .yuv420, depth: Depth, fullRange: Bool, dithers: Bool = false) {
+            self.chroma = chroma
+            self.depth = depth
+            self.fullRange = fullRange
+            self.dithers = dithers
+        }
+
+        init(tenBit: Bool, fullRange: Bool) {
+            self.init(depth: tenBit ? .ten : .eight, fullRange: fullRange)
+        }
+
+        var tenBit: Bool { depth != .eight }
 
         var pixelFormatType: OSType {
-            switch (tenBit, fullRange) {
-            case (false, false): return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-            case (false, true): return kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            case (true, false): return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-            case (true, true): return kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+            switch (chroma, depth, fullRange) {
+            case (.yuv420, .eight, false): kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            case (.yuv420, .eight, true): kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            // No 16-bit 4:2:0 bi-planar format exists; `outputFormat` never asks for one.
+            case (.yuv420, _, false): kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            case (.yuv420, _, true): kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+            case (.yuv422, .eight, false): kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange
+            case (.yuv422, .eight, true): kCVPixelFormatType_422YpCbCr8BiPlanarFullRange
+            case (.yuv422, .ten, false): kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange
+            case (.yuv422, .ten, true): kCVPixelFormatType_422YpCbCr10BiPlanarFullRange
+            case (.yuv422, .sixteen, _): kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange
+            case (.yuv444, .eight, false): kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange
+            case (.yuv444, .eight, true): kCVPixelFormatType_444YpCbCr8BiPlanarFullRange
+            case (.yuv444, .ten, false): kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange
+            case (.yuv444, .ten, true): kCVPixelFormatType_444YpCbCr10BiPlanarFullRange
+            case (.yuv444, .sixteen, _): kCVPixelFormatType_444YpCbCr16BiPlanarVideoRange
             }
         }
 
-        var swscaleFormat: AVPixelFormat { tenBit ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12 }
+        var swscaleFormat: AVPixelFormat {
+            switch (chroma, depth == .sixteen || dithers ? Depth.sixteen : depth) {
+            case (.yuv420, .eight): AV_PIX_FMT_NV12
+            case (.yuv420, .ten): AV_PIX_FMT_P010LE
+            case (.yuv420, .sixteen): AV_PIX_FMT_P016LE
+            case (.yuv422, .eight): AV_PIX_FMT_NV16
+            case (.yuv422, .ten): AV_PIX_FMT_P210LE
+            case (.yuv422, .sixteen): AV_PIX_FMT_P216LE
+            case (.yuv444, .eight): AV_PIX_FMT_NV24
+            case (.yuv444, .ten): AV_PIX_FMT_P410LE
+            case (.yuv444, .sixteen): AV_PIX_FMT_P416LE
+            }
+        }
+
+        /// The buffer's own format read back, for a buffer this decoder did not convert (the
+        /// hardware deinterlacer's surfaces): nil for a format no `OutputFormat` describes.
+        init?(pixelFormatType type: OSType) {
+            let all: [OutputFormat] = [Chroma.yuv420, .yuv422, .yuv444].flatMap { chroma in
+                [Depth.eight, .ten, .sixteen].flatMap { depth in
+                    [false, true].map { OutputFormat(chroma: chroma, depth: depth, fullRange: $0) }
+                }
+            }
+            guard let match = all.first(where: { $0.pixelFormatType == type }) else { return nil }
+            self = match
+        }
+
+        /// `x422 (10-bit 4:2:2), video range`, for the one-per-change output line.
+        var logDescription: String {
+            let code = pixelFormatType
+            let fourCC = String(bytes: [24, 16, 8, 0].map { UInt8((code >> $0) & 0xFF) }, encoding: .ascii) ?? "?"
+            let bits = switch depth { case .eight: "8-bit"; case .ten: "10-bit"; case .sixteen: "16-bit" }
+            let subsampling = switch chroma { case .yuv420: "4:2:0"; case .yuv422: "4:2:2"; case .yuv444: "4:4:4" }
+            return "\(fourCC) (\(bits) \(subsampling)\(dithers ? ", dithered from 12+ bits" : "")), "
+                + "\(fullRange ? "full" : "video") range"
+        }
     }
+
+    /// #8: what a 12-bit 4:2:0 picture goes out as. No 16-bit 4:2:0 bi-planar format exists, so it is
+    /// either cut to 10 bits (ordered dither, the default: 4:2:0 stays 4:2:0, at P010's size and on the
+    /// display path every other 10-bit stream takes) or kept at full depth in 4:2:2 `sv22`, which
+    /// costs twice the chroma and swscale's vertical chroma upsample, for the measurement of whether
+    /// more than 10 bits survive the display path at all. Read at `open`.
+    enum TwelveBit420Output: String, CaseIterable, Sendable {
+        case p010Dithered = "p010-dither"
+        case sv22 = "sv22"
+    }
+
+    private static let twelveBit420Switch = OSAllocatedUnfairLock(initialState: TwelveBit420Output.p010Dithered)
+
+    static var twelveBit420Output: TwelveBit420Output {
+        get { twelveBit420Switch.withLock { $0 } }
+        set { twelveBit420Switch.withLock { $0 = newValue } }
+    }
+
+    /// This session's `twelveBit420Output`, read once at `open`.
+    private var twelveBit420 = TwelveBit420Output.p010Dithered
 
     /// `streamIs10Bit` is the open-time verdict (declared depth or an HDR transfer) and only ever widens
     /// the answer. The range is a LABEL: the legacy `sws_scale` reads a source's range from the pixel
@@ -127,10 +223,16 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// untouched and only has to be tagged as what it is. Asking swscale to convert would take 4K off its
     /// unscaled NV12 / P010 path, and a yuvj source IS converted to video range by swscale itself, so it
     /// stays video range here.
+    ///
+    /// #8: subsampling from the descriptor. Full horizontal chroma is 4:4:4 (RGB and 4:4:0 included),
+    /// horizontal and vertical subsampling 4:2:0 (4:1:0 included), horizontal only 4:2:2 (4:1:1
+    /// included); grey goes out as 4:2:0 with neutral chroma.
     nonisolated static func outputFormat(pixelFormat: Int32, colorRange: AVColorRange,
-                                         streamIs10Bit: Bool) -> OutputFormat {
+                                         streamIs10Bit: Bool,
+                                         twelveBit420: TwelveBit420Output = .p010Dithered) -> OutputFormat {
         let format = AVPixelFormat(rawValue: pixelFormat)
-        let depth = av_pix_fmt_desc_get(format)?.pointee.comp.0.depth ?? 8
+        let desc = av_pix_fmt_desc_get(format)?.pointee
+        let depth = desc?.comp.0.depth ?? 8
         let convertedBySwscale: Bool
         switch format {
         case AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P:
@@ -138,9 +240,61 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         default:
             convertedBySwscale = false
         }
-        return OutputFormat(tenBit: streamIs10Bit || depth > 8,
-                            fullRange: colorRange == AVCOL_RANGE_JPEG && !convertedBySwscale)
+        let fullRange = colorRange == AVCOL_RANGE_JPEG && !convertedBySwscale
+
+        let chroma: OutputFormat.Chroma
+        if let desc, desc.nb_components >= 3 {
+            chroma = desc.log2_chroma_w == 0 ? .yuv444 : (desc.log2_chroma_h > 0 ? .yuv420 : .yuv422)
+        } else {
+            chroma = .yuv420
+        }
+        guard depth > 10 else {
+            return OutputFormat(chroma: chroma, depth: streamIs10Bit || depth > 8 ? .ten : .eight,
+                                fullRange: fullRange)
+        }
+        switch (chroma, fullRange) {
+        case (.yuv420, false) where twelveBit420 == .sv22:
+            return OutputFormat(chroma: .yuv422, depth: .sixteen, fullRange: false)
+        case (.yuv420, _), (_, true):
+            return OutputFormat(chroma: chroma, depth: .ten, fullRange: fullRange, dithers: true)
+        case (_, false):
+            return OutputFormat(chroma: chroma, depth: .sixteen, fullRange: false)
+        }
     }
+
+    /// #8: order 16-bit MSB-aligned words down to the 10 bits P010 / P210 / P410 keep, in place: an
+    /// 8x8 Bayer threshold (0...63, one sixty-fourth of a 10-bit step) added before the low six bits are
+    /// cleared, saturating at the top code. Unbiased to half a 16-bit unit, and a smooth 12-bit
+    /// gradient comes out as a pattern of adjacent 10-bit codes instead of 4-code-wide bands.
+    static func ditherTo10Bit(plane base: UnsafeMutableRawPointer, bytesPerRow: Int, width words: Int, height: Int) {
+        for y in 0..<height {
+            let row = base.advanced(by: y * bytesPerRow).assumingMemoryBound(to: UInt16.self)
+            let threshold = bayer8x8Rows[y & 7]
+            var x = 0
+            while x + 8 <= words {
+                let raw = UnsafeMutableRawPointer(row + x)
+                let w = raw.loadUnaligned(as: SIMD8<UInt16>.self)
+                let sum = w &+ threshold
+                var out = sum & 0xFFC0
+                out.replace(with: 0xFFC0, where: sum .< w)
+                raw.storeBytes(of: out, as: SIMD8<UInt16>.self)
+                x += 8
+            }
+            while x < words {
+                let w = UInt32(row[x]) + UInt32(threshold[x & 7])
+                row[x] = UInt16(min(w, 0xFFFF)) & 0xFFC0
+                x += 1
+            }
+        }
+    }
+
+    /// The 8x8 Bayer matrix (0...63), one SIMD row per line.
+    private static let bayer8x8Rows: [SIMD8<UInt16>] = [
+        [0, 32, 8, 40, 2, 34, 10, 42], [48, 16, 56, 24, 50, 18, 58, 26],
+        [12, 44, 4, 36, 14, 46, 6, 38], [60, 28, 52, 20, 62, 30, 54, 22],
+        [3, 35, 11, 43, 1, 33, 9, 41], [51, 19, 59, 27, 49, 17, 57, 25],
+        [15, 47, 7, 39, 13, 45, 5, 37], [63, 31, 55, 23, 61, 29, 53, 21],
+    ]
 
     /// AE#499: what the container declared about colour, captured at `open` before a single frame
     /// exists. A decoded frame carries the VUI alone, and a remux whose VUI is empty would otherwise
@@ -246,6 +400,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         containerColor = ColorDescription(codecpar: codecpar)
         containerHDRStatic = HDRStaticMetadata(codecpar: codecpar)
+        twelveBit420 = Self.twelveBit420Output
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         use10Bit = bitsPerSample > 8 || isHDRTransfer
@@ -603,12 +758,17 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             guard status == noErr, let s = session else { return nil }
             transferSession = s
         }
-        // The transfer converts range and depth itself, so it asks for the stream's own default.
+        // #8: the surface's own format, so the transfer is a copy. It used to ask for 4:2:0 video range
+        // at the stream's default depth whatever the deinterlacer uploaded, which squeezed a full-range
+        // surface into video range and would have downsampled a 4:2:2 one.
+        let format = OutputFormat(pixelFormatType: CVPixelBufferGetPixelFormatType(src))
+            ?? OutputFormat(tenBit: use10Bit, fullRange: false)
+        logOutputFormat(format, source: "VideoToolbox deinterlacer surface", colorRange: nil)
         guard let session = transferSession,
               let pool = ensurePixelBufferPool(
                   width: CVPixelBufferGetWidth(src),
                   height: CVPixelBufferGetHeight(src),
-                  format: OutputFormat(tenBit: use10Bit, fullRange: false)
+                  format: format
               ) else { return nil }
         var dst: CVPixelBuffer?
         guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &dst) == kCVReturnSuccess,
@@ -642,18 +802,11 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let srcFmt = AVPixelFormat(rawValue: frame.pointee.format)
 
         let outputFormat = Self.outputFormat(
-            pixelFormat: frame.pointee.format, colorRange: frame.pointee.color_range, streamIs10Bit: use10Bit)
+            pixelFormat: frame.pointee.format, colorRange: frame.pointee.color_range, streamIs10Bit: use10Bit,
+            twelveBit420: twelveBit420)
         let dstFmt = outputFormat.swscaleFormat
-        if outputFormat != loggedOutputFormat {
-            loggedOutputFormat = outputFormat
-            EngineLog.emit(
-                "[SWDecoder] output \(outputFormat.tenBit ? "10-bit P010" : "8-bit NV12"), "
-                + "\(outputFormat.fullRange ? "full" : "video") range "
-                + "(frame \(av_get_pix_fmt_name(srcFmt).map { String(cString: $0) } ?? "?"), "
-                + "color_range=\(frame.pointee.color_range.rawValue))",
-                category: .swPlayback
-            )
-        }
+        logOutputFormat(outputFormat, source: av_get_pix_fmt_name(srcFmt).map { String(cString: $0) } ?? "?",
+                        colorRange: frame.pointee.color_range)
 
         swsContext = sws_getCachedContext(
             swsContext,
@@ -716,7 +869,28 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             }
         }
 
+        if outputFormat.dithers {
+            for plane in 0..<2 {
+                // Words per row: one per luma pixel, two per sample of the interleaved chroma plane.
+                Self.ditherTo10Bit(plane: CVPixelBufferGetBaseAddressOfPlane(pb, plane)!,
+                                   bytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pb, plane),
+                                   width: CVPixelBufferGetWidthOfPlane(pb, plane) * (plane == 0 ? 1 : 2),
+                                   height: CVPixelBufferGetHeightOfPlane(pb, plane))
+            }
+        }
+
         return pb
+    }
+
+    /// One release-visible line whenever the buffer format changes, naming what it was chosen from.
+    private func logOutputFormat(_ format: OutputFormat, source: String, colorRange: AVColorRange?) {
+        guard format != loggedOutputFormat else { return }
+        loggedOutputFormat = format
+        EngineLog.emit(
+            "[SWDecoder] output \(format.logDescription) (frame \(source)"
+            + (colorRange.map { ", color_range=\($0.rawValue))" } ?? ")"),
+            category: .swPlayback
+        )
     }
 
     // MARK: - Color Space Metadata
@@ -878,5 +1052,24 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             + ", using square pixels "
             + "(frame=\(frame.num):\(frame.den) ctx=\(ctx.num):\(ctx.den) "
             + "stream=\(stream.num):\(stream.den))"
+    }
+}
+
+extension AetherEngine {
+    /// #8: what the software decoder hands the display layer for a 12-bit 4:2:0 picture, for which no
+    /// 16-bit 4:2:0 bi-planar format exists. See `SoftwareVideoDecoder.TwelveBit420Output`.
+    @_spi(Diagnostics)
+    public enum SoftwareTwelveBit420Output: String, CaseIterable, Sendable {
+        /// 10-bit `x420`, ordered-dithered from the 12-bit picture. The default.
+        case p010Dithered = "p010-dither"
+        /// 16-bit 4:2:2 `sv22`: all 12 bits of luma kept, chroma upsampled vertically by swscale.
+        case sv22 = "sv22"
+    }
+
+    /// Takes effect from the next software decoder opened and applies to every session in the process.
+    @_spi(Diagnostics)
+    public nonisolated static var softwareTwelveBit420Output: SoftwareTwelveBit420Output {
+        get { SoftwareTwelveBit420Output(rawValue: SoftwareVideoDecoder.twelveBit420Output.rawValue) ?? .p010Dithered }
+        set { SoftwareVideoDecoder.twelveBit420Output = .init(rawValue: newValue.rawValue) ?? .p010Dithered }
     }
 }
