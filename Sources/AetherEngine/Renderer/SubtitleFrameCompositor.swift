@@ -136,6 +136,22 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
         return output
     }
 
+    /// Where overlay white (an SDR 1.0, the text fill and a white PGS glyph alike) lands in a PQ
+    /// frame: BT.2408 reference/graphics white, also mpv's default HDR subtitle white. Full-scale
+    /// SDR white on a PQ frame would be 10,000 nits; this keeps subtitles at paper-white level.
+    ///
+    /// No scaling is applied to get here. The overlay is drawn in DeviceRGB and CoreImage's
+    /// SDR-to-HDR convention maps linear 1.0 to exactly this level on render into the `itur_2100`
+    /// spaces: measured on macOS 27, a full white overlay over a BT.2020 PQ 10-bit video-range
+    /// frame reads back as luma code 573 (203.7 nits; 203 nits encodes to 572.7), and over HLG as
+    /// code 721 (0.75 signal). `HDRSubtitleWhiteLevelTests` reads those codes back, so a
+    /// CoreImage change that moves them fails there instead of shipping blinding or dim subtitles.
+    nonisolated static let hdrSubtitleWhitePQNits: Double = 203
+
+    /// The HLG counterpart of `hdrSubtitleWhitePQNits`: BT.2408's 75% HLG signal for reference
+    /// white. Lands there through the same CoreImage convention, pinned by the same test.
+    nonisolated static let hdrSubtitleWhiteHLGSignal: Double = 0.75
+
     /// The source's own colour space, so the render encodes the picture the way it was decoded
     /// (PQ and HLG included). BT.709 only when the source carries no usable tags.
     nonisolated static func renderColorSpace(for buffer: CVPixelBuffer) -> CGColorSpace {
