@@ -148,6 +148,16 @@ public struct DecodedVideoFormat: Sendable, Equatable {
         case "420f": return "NV12 full range (420f)"
         case "x420": return "P010 (x420)"
         case "xf20": return "P010 full range (xf20)"
+        case "422v": return "NV16 (422v)"
+        case "422f": return "NV16 full range (422f)"
+        case "444v": return "NV24 (444v)"
+        case "444f": return "NV24 full range (444f)"
+        case "x422": return "P210 (x422)"
+        case "xf22": return "P210 full range (xf22)"
+        case "x444": return "P410 (x444)"
+        case "xf44": return "P410 full range (xf44)"
+        case "sv22": return "P216 (sv22)"
+        case "sv44": return "P416 (sv44)"
         default: return pixelBufferFormat
         }
     }
@@ -158,6 +168,16 @@ public struct DecodedVideoFormat: Sendable, Equatable {
              kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: return AV_PIX_FMT_NV12
         case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
              kCVPixelFormatType_420YpCbCr10BiPlanarFullRange: return AV_PIX_FMT_P010LE
+        case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange,
+             kCVPixelFormatType_422YpCbCr8BiPlanarFullRange: return AV_PIX_FMT_NV16
+        case kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange,
+             kCVPixelFormatType_444YpCbCr8BiPlanarFullRange: return AV_PIX_FMT_NV24
+        case kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
+             kCVPixelFormatType_422YpCbCr10BiPlanarFullRange: return AV_PIX_FMT_P210LE
+        case kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,
+             kCVPixelFormatType_444YpCbCr10BiPlanarFullRange: return AV_PIX_FMT_P410LE
+        case kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange: return AV_PIX_FMT_P216LE
+        case kCVPixelFormatType_444YpCbCr16BiPlanarVideoRange: return AV_PIX_FMT_P416LE
         default: return AV_PIX_FMT_NONE
         }
     }

@@ -72,6 +72,9 @@ struct StreamFormatReportTests {
         #expect(DecodedVideoFormat(frame: .init(pixelFormat: nil, bitDepth: nil, colorPrimaries: nil,
                                                 transfer: nil, matrix: nil, range: nil, profile: nil),
                                    pixelBufferFormat: p010).pixelBufferLabel == "P010 (x420)")
+        #expect(DecodedVideoFormat(frame: .init(pixelFormat: nil, bitDepth: nil, colorPrimaries: nil,
+                                                transfer: nil, matrix: nil, range: nil, profile: nil),
+                                   pixelBufferFormat: "sv22").pixelBufferLabel == "P216 (sv22)")
         #expect(DecodedVideoFormat.fourCC(0x0000_0001) == "0x1")
     }
 
@@ -83,6 +86,10 @@ struct StreamFormatReportTests {
             forPixelBufferType: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) == AV_PIX_FMT_P010LE)
         #expect(DecodedVideoFormat.libavPixelFormat(
             forPixelBufferType: kCVPixelFormatType_32BGRA) == AV_PIX_FMT_NONE)
+        #expect(DecodedVideoFormat.libavPixelFormat(
+            forPixelBufferType: kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange) == AV_PIX_FMT_P216LE)
+        #expect(DecodedVideoFormat.libavPixelFormat(
+            forPixelBufferType: kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange) == AV_PIX_FMT_P410LE)
     }
 
     @Test("DTS:X and TrueHD Atmos surface through the profile name")
