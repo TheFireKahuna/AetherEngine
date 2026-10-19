@@ -118,6 +118,31 @@ struct VideoPrerollTests {
         #expect(renderer.framesBelowFloor == 0)
     }
 
+    @Test("Every frame handed over tells the preroll, on both handover paths and at the drain",
+          arguments: [false, true])
+    @MainActor
+    func handoverTellsThePreroll(arrivalOrder: Bool) {
+        let renderer = SampleBufferRenderer()
+        if arrivalOrder {
+            renderer.setFELLookahead(enabled: true, frameRate: 24)
+            renderer.setArrivalOrderHandover(frameRate: 24)
+        } else {
+            renderer.setReorderDepth(SampleBufferRenderer.presentationOrderReorderDepth)
+        }
+        let calls = OSAllocatedUnfairLock(initialState: 0)
+        renderer.setPrerollAdvancedObserver { calls.withLock { $0 += 1 } }
+        let pixels = Self.makePixelBuffer()
+        for i in 0..<5 { renderer.enqueue(pixelBuffer: pixels, pts: Self.time(i)) }
+        // The reorder path holds one frame back; the arrival path hands each over as it comes.
+        #expect(calls.withLock { $0 } == (arrivalOrder ? 5 : 4))
+        renderer.drainReorderBuffer()
+        #expect(calls.withLock { $0 } == 5)
+        renderer.setPrerollAdvancedObserver(nil)
+        renderer.enqueue(pixelBuffer: pixels, pts: Self.time(5))
+        renderer.drainReorderBuffer()
+        #expect(calls.withLock { $0 } == 5, "a cleared observer is not called")
+    }
+
     @Test("At 60 fps the preroll fits inside the look-ahead window")
     @MainActor
     func prerollFitsTheLookaheadAt60() {

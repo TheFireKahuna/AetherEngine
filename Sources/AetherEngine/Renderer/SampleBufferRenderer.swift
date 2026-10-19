@@ -257,6 +257,19 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.unlock()
     }
 
+    /// Fires after every frame handed toward the layer, on the thread that handed it over (decode or
+    /// drain), with no lock held: what `prerollSatisfied(clock:live:)` reads, the last released
+    /// timestamp and the arrival-order frontier, moves only on a handover, so this is the moment the
+    /// preroll gate can open (`AudioOutput.videoPrerollAdvanced()`). It fires even for a frame whose
+    /// sample buffer could not be built, since the gate's inputs moved anyway. Guarded by `reorderLock`
+    /// for the swap only, as `_frameEnqueuedObserver` is.
+    private var _prerollAdvancedObserver: (@Sendable () -> Void)?
+    func setPrerollAdvancedObserver(_ observer: (@Sendable () -> Void)?) {
+        reorderLock.lock()
+        _prerollAdvancedObserver = observer
+        reorderLock.unlock()
+    }
+
     /// AE#395: the session's renderer axis, shared with the `AudioOutput` whose synchronizer this
     /// renderer runs on. Only the stamp on the sample buffer moves onto it; the reorder buffer, the
     /// frontier and the frame-time reports stay on the source axis. Guarded by `reorderLock`.
@@ -744,6 +757,13 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// it lists the timestamps that this frame made contiguous, in the order they will be shown.
     private func flushFrame(pixelBuffer: CVPixelBuffer, pts: CMTime, hdr10PlusData: Data?,
                             nextPTS: CMTime? = nil, displayOrderSpacing: [Double]? = nil) {
+        // Every exit returns with `reorderLock` released, so the observer runs with no lock held.
+        defer {
+            reorderLock.lock()
+            let prerollObserver = _prerollAdvancedObserver
+            reorderLock.unlock()
+            prerollObserver?()
+        }
         let outputBuffer = subtitleCompositor.composite(pixelBuffer, ptsSeconds: pts.seconds)
         reorderLock.lock()
         let timeline = _timeline
