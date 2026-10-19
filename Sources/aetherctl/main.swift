@@ -70,7 +70,7 @@ func printUsage() {
       aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
-      aetherctl play [--fel] [--surface | --window] [--cycle-el SECONDS] [--fel-output MODE] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
+      aetherctl play [--fel] [--surface | --window] [--cycle-el SECONDS] [--fel-output MODE] [--legacy-renderer-attach] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
                  [--assert-dv] [--dv-base-layer]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
@@ -771,6 +771,11 @@ if first == "play" {
         }
         t.start()
         #endif
+    }
+    // `--legacy-renderer-attach`: attach renderers with addRenderer/removeRenderer instead of the 27 receivers, for A/B.
+    if takeFlag("--legacy-renderer-attach", from: &rest) {
+        AetherEngine.usesSampleBufferReceivers = false
+        print("[aetherctl] renderer attach: legacy addRenderer/removeRenderer")
     }
     // `--fel-output <mode>`: the FEL composer's output buffer (p010, p010-round, p010-full, sv22), for the 12-bit experiment.
     if let mode = takeStringFlag("--fel-output", from: &rest) {
