@@ -648,8 +648,9 @@ used), so no kernel inverts it exactly. Against the DoViBaker oracle on a fine-d
 plate, band-limited noise) a 4-fetch Catmull-Rom lowered the per-pixel error sd by about 0.7% on luma and
 left chroma unchanged, for four times the enhancement-layer reads. `dovi_sample_el_1d` / `_2d` keep the
 texture size in their signature so a wider filter can replace bilinear without touching the callers.
-The phases are DoViBaker's: luma texel-centre aligned, chroma co-sited with the top-left luma sample in
-both axes (`DoviEnhancementUpsamplerTests`).
+The phases are DoViBaker's: luma texel-centre aligned, and the EL and BL chroma grids sharing their first
+sample in both axes (`DoviEnhancementUpsamplerTests`). That chroma phase is a relation between the two grids,
+not a reading of the stream's `chroma_sample_loc_type`, which the 4:2:0 kernel never consults.
 
 - **Missing or CRC-failed RPU:** the frame borrows the previous real RPU's parameters for up to
   `maxBorrowedParamsRun` (3) frames in a row, then bypasses to the base layer. Reshaping and NLQ are constant
