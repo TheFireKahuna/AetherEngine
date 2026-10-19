@@ -553,14 +553,17 @@ struct SpatialAudioBridgeTests {
     }
 
     #if APACObjectOutput
-    @Test("object output: the init segment carries a low-profile apac entry and CODECS")
+    @Test("object output: the init segment carries a low-profile apac entry, announced as 7.1.4")
     func objectOutputMuxedInit() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
             decoder: SyntheticDecoder(skipAfterReset: 0), objectOutput: true)
         defer { bridge.close() }
-        #expect(bridge.hlsCodecs == "apac.05.00")
+        // Announced as the 7.1.4 tier tvOS delivers it as (see `SpatialAudioBridge.init`); the stream
+        // itself is low profile, level 0.
+        #expect(bridge.hlsCodecs == "apac.31.03")
+        #expect(APACSampleEntry.codecsString(magicCookie: try #require(bridge.soundSampleEntryOverride).suffix(from: 36)) == "apac.05.00")
         guard let muxed = try muxWithProbeVideo(bridge, startMs: 0, count: 50) else { return }
         defer { try? FileManager.default.removeItem(at: muxed.sessionDir) }
         #expect(muxed.initBytes.range(of: bridge.soundSampleEntryOverride!) != nil)
