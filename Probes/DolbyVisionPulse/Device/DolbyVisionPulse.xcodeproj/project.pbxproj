@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		1254C205053EE036691617B5 /* DisplayModeReadout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1183C2E52D49E774C3701716 /* DisplayModeReadout.swift */; };
 		1CC1EA98D9C5F77AAC72F7CC /* PulseVideoToolbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9672B7938DDC09AAB435BC6 /* PulseVideoToolbox.swift */; };
 		77CB08AE958747D4126970C6 /* DolbyVisionPulseHostApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BCA97A8853B09B4E7B4B99A /* DolbyVisionPulseHostApp.swift */; };
 		C3F88D052478C6D03F65C74C /* PulseEngine in Frameworks */ = {isa = PBXBuildFile; productRef = 5DDCF6DD2D95C3E73D4B2B5C /* PulseEngine */; };
@@ -14,6 +15,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		1183C2E52D49E774C3701716 /* DisplayModeReadout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayModeReadout.swift; sourceTree = "<group>"; };
 		6EC0C4402B0A4CFAB2376CAB /* PulseEngine */ = {isa = PBXFileReference; lastKnownFileType = folder; path = PulseEngine; sourceTree = SOURCE_ROOT; };
 		7BCA97A8853B09B4E7B4B99A /* DolbyVisionPulseHostApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DolbyVisionPulseHostApp.swift; sourceTree = "<group>"; };
 		81B68F565101F4AD4C23902A /* DolbyVisionPulseHost.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = DolbyVisionPulseHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -61,6 +63,7 @@
 		A0F3EC54F7CC8065A3A7DFAC /* Host */ = {
 			isa = PBXGroup;
 			children = (
+				1183C2E52D49E774C3701716 /* DisplayModeReadout.swift */,
 				7BCA97A8853B09B4E7B4B99A /* DolbyVisionPulseHostApp.swift */,
 				DCACA2DF252349E564F73EAC /* PulseLog.swift */,
 				B9672B7938DDC09AAB435BC6 /* PulseVideoToolbox.swift */,
@@ -131,6 +134,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				1254C205053EE036691617B5 /* DisplayModeReadout.swift in Sources */,
 				77CB08AE958747D4126970C6 /* DolbyVisionPulseHostApp.swift in Sources */,
 				FB3139445F0E0031753BB397 /* PulseLog.swift in Sources */,
 				1CC1EA98D9C5F77AAC72F7CC /* PulseVideoToolbox.swift in Sources */,
