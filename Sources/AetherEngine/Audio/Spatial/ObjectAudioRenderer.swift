@@ -27,17 +27,57 @@ struct ObjectAudioElementState: Sendable, Equatable {
     var gain: Float = 1
     /// 0 = point source, 1 = whole room.
     var size: Float = 0
-    /// Render to the single nearest speaker.
-    var snap: Bool = false
+    /// Atmos divergence (TS 103 448 5.2.4): 0 = one source; more splits it into two, spread along x.
+    var divergence: Float = 0
     /// Speakers the object must not use (Atmos zone masks).
     var excluded: Set<SpatialSpeaker> = []
+    /// How the object is trimmed on smaller layouts (TS 103 448 5.3); nil = not at all.
+    var trim: ObjectAudioTrim?
+}
+
+/// TS 103 448 5.3: the level of an object positioned in the room, lowered on layouts with fewer
+/// speakers than the mix had, by default (pseudocode 16) or by the trims the stream sends
+/// (pseudocode 17).
+struct ObjectAudioTrim: Sendable, Equatable {
+    enum Mode: Sendable, Equatable {
+        case `default`, disabled
+        case custom(centre: Float, surround: Float, height: Float)
+    }
+
+    /// Indexed by trim_cfg (TS 103 448 table 7).
+    var configs: [Mode]
+
+    static let defaults = ObjectAudioTrim(configs: Array(repeating: .default, count: 9))
+
+    /// trim_gain, linear, for an object at `p` rendered to `layout`.
+    func gain(at p: SIMD3<Float>, on layout: SpatialSpeakerLayout) -> Float {
+        let (mid, top) = (layout.trimMidCount, layout.trimTopCount)
+        let row = mid >= 4 ? 2 : (mid >= 2 ? 1 : 0)
+        let column = top > 2 ? 2 : (top > 0 ? 1 : 0)
+        func clamp(_ v: Float) -> Float { min(max(v, 0), 1) }
+        let db: Float
+        switch configs[3 * column + row] {
+        case .disabled:
+            return 1
+        case .default:
+            let maxTrim = min(0, -4.5 + 3 * min(1, Float(mid) / 4) + 1.5 * min(1, Float(top) / 4))
+            let gY = clamp(p.y / 0.6)
+            let gZ = clamp((abs(p.z) - 0.2) / 0.8)
+            db = maxTrim * clamp(gY + gZ)
+        case .custom(_, let surround, let height):
+            // The centre trim applies to a 2.0 layout only (output_speaker_config 0); none here is.
+            db = height * abs(p.z) + (p.y >= 0.5 ? surround : surround * 2 * p.y)
+        }
+        return powf(10, db / 20)
+    }
 }
 
 /// A metadata change taking effect partway through a block.
 struct ObjectAudioMetadataUpdate: Sendable {
     /// Frame within the block at which the ramp towards the new state starts.
     var frameOffset: Int
-    /// Frames over which gains move from their current values to the new ones. 0 jumps.
+    /// The update's ramp_duration: gains move from their current values to the new ones over this
+    /// many frames plus the update's own (TS 103 448 5.5). 0 jumps.
     var rampFrames: Int
     /// One entry per element, indexed like `ObjectAudioRenderer.roles`. Nil leaves that element
     /// alone, ramp included: encoders restate unchanged elements, and restarting their ramps on
@@ -240,8 +280,9 @@ final class ObjectAudioRenderer {
             switch roles[index] {
             case .object:
                 panner(excluding: state.excluded).objectGains(
-                    position: state.position, size: state.size, snap: state.snap, into: &gains)
-                if state.gain != 1 { for c in gains.indices { gains[c] *= state.gain } }
+                    position: state.position, size: state.size, divergence: state.divergence, into: &gains)
+                let gain = state.gain * (state.trim?.gain(at: state.position, on: layout) ?? 1)
+                if gain != 1 { for c in gains.indices { gains[c] *= gain } }
             case .bed, .lfe, .fixed:
                 staticGains(for: roles[index], state: state, into: &gains)
             }
@@ -254,8 +295,10 @@ final class ObjectAudioRenderer {
             }
             target[index] = gains
             if !jump {
-                rampRemaining[index] = update.rampFrames
-                rampTotal[index] = update.rampFrames
+                // TS 103 448 pseudocode 19: ramp_duration + 1 steps of (target - current) / (ramp_duration + 1),
+                // the first on the update's own frame.
+                rampRemaining[index] = update.rampFrames + 1
+                rampTotal[index] = update.rampFrames + 1
             } else {
                 current[index] = gains
                 rampRemaining[index] = 0

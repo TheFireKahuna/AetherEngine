@@ -38,6 +38,7 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     private var bedRolesSerial: UInt32?
     private var bedPlanes: [UnsafePointer<Float>] = []
     private(set) var selfResetCount = 0
+    private var warpLogged = false
     /// Blocks between a reset and the first metadata, so objects play from the first frame (see
     /// `ObjectMetadataHold`), and the released block last handed out, whose planes it owns.
     private let hold = ObjectMetadataHold()
@@ -137,15 +138,16 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         if block.flags & TRUEHD_ATMOS_BLOCK_METADATA_UPDATED != 0, let metadata = block.metadata {
             let md = metadata.pointee
             let count = min(Int(md.element_count), channels)
+            let stream = streamMetadata(md)
             for u in 0..<Int(md.update_count) {
                 let update = md.updates[u]
-                if u == 0 { firstStates = (0..<count).map { state(for: update.elements[$0]) } }
+                if u == 0 { firstStates = (0..<count).map { state(for: update.elements[$0], stream) } }
                 var states: [ObjectAudioElementState?] = []
                 states.reserveCapacity(count)
                 for e in 0..<count {
                     let element = update.elements[e]
                     states.append(element.flags & TRUEHD_ATMOS_ELEMENT_CHANGED != 0
-                                  ? state(for: element) : nil)
+                                  ? state(for: element, stream) : nil)
                 }
                 updates.append(ObjectAudioMetadataUpdate(
                     frameOffset: Int(update.frame_offset),
@@ -216,12 +218,41 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         }
     }
 
-    private func state(for element: TrueHDAtmosElement) -> ObjectAudioElementState {
+    private func state(for element: TrueHDAtmosElement, _ stream: StreamMetadata) -> ObjectAudioElementState {
         #if TrueHDReferenceRender || APACObjectOutput
-        splitsBed ? Self.pointSource(for: element) : Self.state(for: element)
+        splitsBed ? Self.pointSource(for: element) : Self.state(for: element, stream: stream)
         #else
         Self.pointSource(for: element)
         #endif
+    }
+
+    /// What the stream signals for every element at once, as of a block's updates.
+    struct StreamMetadata: Equatable {
+        /// warp_mode 1 (TS 103 420 table 32).
+        var warp = false
+        var trim = ObjectAudioTrim.defaults
+    }
+
+    private func streamMetadata(_ md: TrueHDAtmosMetadata) -> StreamMetadata {
+        var stream = StreamMetadata(warp: md.warp_mode == TRUEHD_ATMOS_WARP_WARPING)
+        if stream.warp, !warpLogged {
+            warpLogged = true
+            EngineLog.emit("[TrueHDObjectAudioDecoder] the stream signals warp_mode 1: object depth is doubled "
+                           + "(TS 103 420 table 32)", category: .session)
+        }
+        #if TrueHDReferenceRender || APACObjectOutput
+        var trims = [TrueHDAtmosTrim](repeating: TrueHDAtmosTrim(), count: Int(TRUEHD_ATMOS_TRIM_CONFIGS))
+        if truehd_atmos_decoder_get_trims(handle, &trims) == TRUEHD_ATMOS_OK {
+            stream.trim = ObjectAudioTrim(configs: trims.map { t in
+                switch t.mode {
+                case TRUEHD_ATMOS_TRIM_DISABLED: .disabled
+                case TRUEHD_ATMOS_TRIM_CUSTOM: .custom(centre: t.centre_db, surround: t.surround_db, height: t.height_db)
+                default: .default
+                }
+            })
+        }
+        #endif
+        return stream
     }
 
     /// An element as a point at its position: no size, snap, zone exclusion, screen anchoring or
@@ -234,34 +265,115 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     }
 
     #if TrueHDReferenceRender || APACObjectOutput
-    // The reference render's mapping: size, snap, zones, screen anchoring and the elevation switch.
-    // Object output uses it as well.
-    static func state(for element: TrueHDAtmosElement) -> ObjectAudioElementState {
+    /// An element as TS 103 420 decodes it and TS 103 448 prepares it for panning, which the
+    /// reference render and object output share. In order: the room position (distance, screen
+    /// anchoring), warp, the elevation switch, snap; zones and trims travel on to the panner.
+    static func state(for element: TrueHDAtmosElement, stream: StreamMetadata = .init()) -> ObjectAudioElementState {
         let active = element.flags & TRUEHD_ATMOS_ELEMENT_ACTIVE != 0
-        var p = element.position
+        var p = SIMD3(element.position.0, element.position.1, element.position.2)
         var size = max(element.size.0, element.size.1, element.size.2)
+        var divergence = element.flags & TRUEHD_ATMOS_ELEMENT_DIVERGENCE != 0 ? element.divergence : 0
+        var excluded = excludedSpeakers(zone: element.zone)
+        let isObject = element.kind == TRUEHD_ATMOS_ELEMENT_OBJECT
         if element.kind == TRUEHD_ATMOS_ELEMENT_ISF {
             // The library does not decode ISF (intermediate spatial format) positions, and no home
             // content carrying them was found. Spread it over the room rather than pin it to
             // whatever position value is left in the struct.
-            p = (0.5, 0.5, 0.5)
+            p = SIMD3(0.5, 0.5, 0.5)
             size = 1
         } else if element.flags & TRUEHD_ATMOS_ELEMENT_SCREEN_REF != 0 {
-            let room = roomPosition(screenAnchored: SIMD3(p.0, p.1, p.2), screenFactor: element.screen_factor,
-                                    depthFactor: element.depth_factor, screen: .frontWall)
-            p = (room.x, room.y, room.z)
+            p = roomPosition(screenAnchored: p, screenFactor: element.screen_factor,
+                             depthFactor: element.depth_factor, screen: .frontWall)
+        } else if element.flags & TRUEHD_ATMOS_ELEMENT_DISTANCE != 0 {
+            p = beyondTheRoom(p)
         }
-        var excluded = excludedSpeakers(zone: element.zone)
-        if element.kind == TRUEHD_ATMOS_ELEMENT_OBJECT, element.flags & TRUEHD_ATMOS_ELEMENT_ELEVATION == 0 {
+        if isObject, stream.warp { p.y = min(1, 2 * p.y) }
+        if isObject, element.flags & TRUEHD_ATMOS_ELEMENT_ELEVATION == 0 {
+            // TS 103 448 5.1.3.2: no height speakers, and the object down on the listener's plane.
             excluded.formUnion(heights)
+            p.z = 0
         }
+        if isObject, element.flags & TRUEHD_ATMOS_ELEMENT_SNAP != 0 {
+            p = snapped(p, zone: element.zone, elevation: element.flags & TRUEHD_ATMOS_ELEMENT_ELEVATION != 0)
+            size = 0
+            divergence = 0
+        }
+        let bypassTrim = !isObject || element.flags & TRUEHD_ATMOS_ELEMENT_TRIM_BYPASS != 0
         return ObjectAudioElementState(
-            position: SIMD3(p.0, p.1, max(0, p.2)),
+            position: SIMD3(p.x, p.y, max(0, p.z)),
             gain: active ? element.gain : 0,
             size: size,
-            snap: element.flags & TRUEHD_ATMOS_ELEMENT_SNAP != 0,
-            excluded: excluded)
+            divergence: divergence,
+            excluded: excluded,
+            trim: bypassTrim ? nil : stream.trim)
     }
+
+    /// TS 103 420 5.2.1.2: an object with a distance lies outside the room, distance_factor times
+    /// as far from the room's centre O = (0.5, 0.5, 0) as the boundary point I on the ray from O
+    /// through its position. Every factor is above 1 (table 15) and a speaker layout ends at the
+    /// boundary, so it renders at I, in the direction it was placed.
+    static func beyondTheRoom(_ c: SIMD3<Float>) -> SIMD3<Float> {
+        let o = SIMD3<Float>(0.5, 0.5, 0)
+        let d = c - o
+        // The room is x, y in 0...1 and z in -1...1: half-extents 0.5, 0.5, 1 about O.
+        let half = SIMD3<Float>(0.5, 0.5, 1)
+        var t = Float.infinity
+        for axis in 0..<3 where d[axis] != 0 { t = min(t, half[axis] / abs(d[axis])) }
+        return t.isFinite ? o + t * d : c
+    }
+
+    /// TS 103 448 5.1.4: the panner target of the 22.2 layout nearest the position by the
+    /// weighted distance of pseudocode 2, among those the zone mask and the elevation switch
+    /// leave (5.1.3 applied to 22.2), the ties going as the clause orders the list.
+    static func snapped(_ p: SIMD3<Float>, zone: UInt8, elevation: Bool) -> SIMD3<Float> {
+        let weights = SIMD3<Float>(1.0 / 16, 4, 32)
+        var best = p, bestDistance = Float.infinity
+        for target in snapTargets where elevation || target.position.z == 0 {
+            if target.excludedBy.contains(zone) { continue }
+            let d = target.position - p
+            let distance = (weights * d * d).sum()
+            if distance < bestDistance {
+                bestDistance = distance
+                best = target.position
+            }
+        }
+        return best
+    }
+
+    /// TS 103 448 table A.9 (22.2) with the zone masks of table 4 that remove each target, ordered
+    /// as 5.1.4.2 orders the snap list: the three centre-line targets first, then by z and y
+    /// descending and x ascending. LFEs are no targets.
+    private static let snapTargets: [(position: SIMD3<Float>, excludedBy: Set<UInt8>)] = {
+        let (noBack, noSides, centreBack, screen, surround) = (TRUEHD_ATMOS_ZONE_NO_BACK, TRUEHD_ATMOS_ZONE_NO_SIDES,
+            TRUEHD_ATMOS_ZONE_CENTER_BACK, TRUEHD_ATMOS_ZONE_SCREEN_ONLY, TRUEHD_ATMOS_ZONE_SURROUND_ONLY)
+        let table: [(SIMD3<Float>, Set<UInt8>)] = [
+            (SIMD3(0, 0, 0), [centreBack, surround]),                  // L
+            (SIMD3(1, 0, 0), [centreBack, surround]),                  // R
+            (SIMD3(0.5, 0, 0), [surround]),                            // C
+            (SIMD3(0, 0.5, 0), [noSides, centreBack, screen]),         // Lss
+            (SIMD3(1, 0.5, 0), [noSides, centreBack, screen]),         // Rss
+            (SIMD3(0, 1, 0), [noBack, screen]),                        // Lb
+            (SIMD3(1, 1, 0), [noBack, screen]),                        // Rb
+            (SIMD3(0.25, 0.25, 1), []), (SIMD3(0.75, 0.25, 1), []),    // Tfl, Tfr
+            (SIMD3(0.25, 0.75, 1), []), (SIMD3(0.75, 0.75, 1), []),    // Tbl, Tbr
+            (SIMD3(0.25, 0.5, 1), []), (SIMD3(0.75, 0.5, 1), []),      // Tsl, Tsr
+            (SIMD3(0.5, 0.25, 1), []), (SIMD3(0.5, 0.75, 1), []),      // Tfc, Tbc
+            (SIMD3(0.5, 0.5, 1), []),                                  // Tc
+            (SIMD3(0, 0, -1), []), (SIMD3(1, 0, -1), []),              // Bfl, Bfr
+            (SIMD3(0.5, 0, -1), []),                                   // Bfc
+            (SIMD3(0.5, 1, 0), [noBack, screen]),                      // Cb
+            (SIMD3(0, 0.2929, 0), [noSides, centreBack, screen, surround]),  // Lw
+            (SIMD3(1, 0.2929, 0), [noSides, centreBack, screen, surround]),  // Rw
+        ]
+        let first: [SIMD3<Float>] = [SIMD3(0.5, 0, 0), SIMD3(0.5, 0, 1), SIMD3(0.5, 0, -1)]
+        return table.sorted { a, b in
+            let (ia, ib) = (first.firstIndex(of: a.0) ?? 3, first.firstIndex(of: b.0) ?? 3)
+            if ia != ib { return ia < ib }
+            if a.0.z != b.0.z { return a.0.z > b.0.z }
+            if a.0.y != b.0.y { return a.0.y > b.0.y }
+            return a.0.x < b.0.x
+        }.map { (position: $0.0, excludedBy: $0.1) }
+    }()
 
     /// The playback screen in room coordinates (TS 103 420 4.2.1: x 0…1 left to right, z −1…1 floor to
     /// ceiling): its bottom-left corner and its size. The stream does not carry it. Without one the

@@ -24,11 +24,15 @@ import Foundation
 ///   present (a left bed channel comes out half left, half centre), while an object on a speaker's
 ///   position renders entirely to that speaker, so bed channels travel as fixed objects.
 ///
-/// The scene is fixed when the encoder is built (`objectSlots` objects, used or silent), because the
-/// magic cookie and with it the sample entry are needed before the first block is decoded. Gains are
-/// applied to the audio, not sent: the renderer rounds a sent gain to 0.5 dB. Snap and elevation
-/// are applied to positions (`objectPosition`); zone masks and divergence have nothing that reaches
-/// the renderer with type 3 and are dropped, which the session log notes (`noteDroppedZone`).
+/// The scene is fixed when the encoder is built (`objectSlots` objects, used or silent, then the
+/// speaker bus), because the magic cookie and with it the sample entry are needed before the first
+/// block is decoded. Gains, trims included, are applied to the audio, not sent: the renderer rounds a
+/// sent gain to 0.5 dB. Snap and the elevation switch are positions by the time an update gets here.
+/// Zone masks and divergence have nothing that reaches the renderer with type 3 (README §3.20), so
+/// an object carrying either is rendered here instead, by `ObjectAudioRenderer` as TS 103 448 has it,
+/// onto the speaker bus: eleven fixed objects on the 7.1.4 speakers, each of which plays from its
+/// speaker alone. An object moving between its slot and the bus crossfades over the update's ramp,
+/// which is exactly the gain ramp Atmos specifies for it.
 @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
 final class APACObjectEncoder: APACChunkEncoding {
 
@@ -48,6 +52,11 @@ final class APACObjectEncoder: APACChunkEncoding {
 
     /// TrueHD's object presentation holds at most 16 elements, one of them usually the LFE.
     static let objectSlots = 16
+    /// The speaker bus: the layout tvOS renders object APAC to for an HDMI Atmos route, one fixed
+    /// object per speaker after the slots.
+    static let busLayout = SpatialSpeakerLayout.l714
+    static let busSpeakers = busLayout.speakers.filter { !$0.isLFE }
+    static let sceneObjects = objectSlots + busSpeakers.count
     /// The bed: the only one of its channels with signal is the LFE.
     static let bedLayout = SpatialSpeakerLayout.l714
     /// Planes the caller hands over per chunk: one per element of the decoded presentation.
@@ -77,12 +86,15 @@ final class APACObjectEncoder: APACChunkEncoding {
     /// What each element of the current presentation feeds: a slot, the LFE (-1) or nothing (nil).
     private var roles: [ObjectAudioRole] = []
     private var route: [Int?] = []
-    /// Slots an element feeds; the others get no metadata at all.
-    private var used = [Bool](repeating: false, count: APACObjectEncoder.objectSlots)
-    /// Updates whose zone mask had to be dropped (no way to send it), for the session log, and how many
-    /// of them `flush` has reported.
-    private(set) var droppedZoneUpdates = 0
-    private var zoneUpdatesReported = 0
+    /// Slots an element feeds, and the bus's; the others get no metadata at all.
+    private var used = APACObjectEncoder.busSlotsOnly
+    /// The objects this encoder renders itself, into one plane per `busLayout` channel.
+    private var bus: ObjectAudioRenderer
+    private let busPlanes: [UnsafeMutablePointer<Float>]
+    private var busInputs: [UnsafePointer<Float>] = []
+    /// Updates that sent an object to the bus, for the session log.
+    private(set) var busUpdates = 0
+    private var busUpdatesReported = 0
     private var outputBuffer: [UInt8]
     private var ended = false
 
@@ -96,10 +108,19 @@ final class APACObjectEncoder: APACChunkEncoding {
             throw EncoderError.codecUnavailable
         }
         self.codec = codec
-        inputChannels = Self.bedLayout.channelCount + Self.objectSlots + 1
+        inputChannels = Self.bedLayout.channelCount + Self.sceneObjects + 1
         staging = [Float](repeating: 0, count: 1024 * inputChannels)
-        slots = (0..<Self.objectSlots).map { _ in APACObjectTrajectory(Self.silent) }
+        slots = (0..<Self.sceneObjects).map { _ in APACObjectTrajectory(Self.silent) }
+        for (k, speaker) in Self.busSpeakers.enumerated() {
+            slots[Self.objectSlots + k] = APACObjectTrajectory(.init(position: speaker.position, size: 0, gain: 1))
+        }
         lfe = APACObjectTrajectory(Self.silent)
+        bus = ObjectAudioRenderer(layout: Self.busLayout, roles: [])
+        busPlanes = (0..<Self.busLayout.channelCount).map { _ in
+            let plane = UnsafeMutablePointer<Float>.allocate(capacity: 1024)
+            plane.initialize(repeating: 0, count: 1024)
+            return plane
+        }
         outputBuffer = [UInt8](repeating: 0, count: 1 << 18)
 
         func set<T: BitwiseCopyable>(_ name: String, _ id: AudioCodecPropertyID, _ value: T) throws {
@@ -124,7 +145,7 @@ final class APACObjectEncoder: APACChunkEncoding {
             try set("output format", kAudioCodecPropertyCurrentOutputFormat, output)
             // The input layout only labels the channels; the scene itself is the settings dictionary
             // below. (The encoder refuses an output layout for this input, 'nope'.)
-            var layout = Self.inputChannelLayout(bed: Self.bedLayout, objects: Self.objectSlots)
+            var layout = Self.inputChannelLayout(bed: Self.bedLayout, objects: Self.sceneObjects)
             let layoutStatus = layout.withUnsafeMutableBytes {
                 AudioCodecSetProperty(codec, kAudioCodecPropertyCurrentInputChannelLayout, UInt32($0.count), $0.baseAddress!)
             }
@@ -157,13 +178,18 @@ final class APACObjectEncoder: APACChunkEncoding {
             hlsCodecs = APACSampleEntry.codecsString(magicCookie: magicCookie) ?? "apac.05.00"
         } catch {
             AudioComponentInstanceDispose(codec)
+            busPlanes.forEach { $0.deallocate() }
             throw error
         }
     }
 
-    deinit { AudioComponentInstanceDispose(codec) }
+    deinit {
+        AudioComponentInstanceDispose(codec)
+        busPlanes.forEach { $0.deallocate() }
+    }
 
     private static let silent = APACObjectTrajectory.Values(position: SIMD3(0.5, 0.5, 0), size: 0, gain: 0)
+    private static let busSlotsOnly = (0..<sceneObjects).map { $0 >= objectSlots }
 
     // MARK: - APACChunkEncoding
 
@@ -201,10 +227,10 @@ final class APACObjectEncoder: APACChunkEncoding {
         ended = true
         // Also reached when the pipeline restarts the encoder mid-stream, so it reports what was
         // dropped since the last report, not a running total.
-        if droppedZoneUpdates > zoneUpdatesReported {
-            EngineLog.emit("[APACObjectEncoder] \(droppedZoneUpdates - zoneUpdatesReported) metadata updates played "
-                           + "without their zone mask", category: .session)
-            zoneUpdatesReported = droppedZoneUpdates
+        if busUpdates > busUpdatesReported {
+            EngineLog.emit("[APACObjectEncoder] \(busUpdates - busUpdatesReported) object updates rendered onto the "
+                           + "speaker bus (zone mask or divergence)", category: .session)
+            busUpdatesReported = busUpdates
         }
         var packets: [APACEncoder.Packet] = []
         // The partial packet, then silence until the encoder's look-ahead has come out.
@@ -236,7 +262,8 @@ final class APACObjectEncoder: APACChunkEncoding {
     private func configure(_ newRoles: [ObjectAudioRole]) {
         roles = newRoles
         route = []
-        used = [Bool](repeating: false, count: Self.objectSlots)
+        used = Self.busSlotsOnly
+        bus = ObjectAudioRenderer(layout: Self.busLayout, roles: newRoles.map { _ in .object })
         var nextSlot = 0
         for role in newRoles {
             switch role {
@@ -256,7 +283,7 @@ final class APACObjectEncoder: APACChunkEncoding {
             EngineLog.emit("[APACObjectEncoder] \(newRoles.count) elements, only \(Self.objectSlots) object slots; "
                            + "the rest are dropped", category: .session)
         }
-        for i in slots.indices {
+        for i in 0..<Self.objectSlots {
             slots[i] = APACObjectTrajectory(Self.silent)
             slots[i].restart(at: clock)
         }
@@ -281,13 +308,25 @@ final class APACObjectEncoder: APACChunkEncoding {
     }
 
     private func apply(_ update: ObjectAudioMetadataUpdate) {
+        var busStates = [ObjectAudioElementState?](repeating: nil, count: roles.count)
         for (element, state) in update.states.enumerated() {
             guard let state, element < route.count, let target = route[element] else { continue }
             let values: APACObjectTrajectory.Values
             switch roles[element] {
             case .object:
-                values = .init(position: Self.objectPosition(state), size: state.size, gain: state.gain)
-                if !state.excluded.isSubset(of: Self.heights), !state.excluded.isEmpty { noteDroppedZone(element) }
+                // Every object update reaches the bus too, silent unless the object is on it, so the
+                // bus always has a state to ramp from when one moves over.
+                let onBus = Self.needsBus(state)
+                var busState = state
+                if onBus {
+                    busUpdates += 1
+                } else {
+                    busState.gain = 0
+                }
+                busStates[element] = busState
+                let trim = state.trim?.gain(at: state.position, on: Self.busLayout) ?? 1
+                values = .init(position: Self.objectPosition(state), size: state.size,
+                               gain: onBus ? 0 : state.gain * trim)
             case .bed(let speaker): values = .init(position: speaker.position, size: 0, gain: state.gain)
             case .fixed(let position): values = .init(position: position, size: 0, gain: state.gain)
             case .lfe: values = .init(position: SIMD3(0.5, 0, 0), size: 0, gain: state.gain)
@@ -298,42 +337,35 @@ final class APACObjectEncoder: APACChunkEncoding {
                 slots[target].apply(values, at: clock, rampFrames: update.rampFrames)
             }
         }
-    }
-
-    /// A zone mask has nothing that reaches the renderer with type 3 (README §3.20), so the object
-    /// plays as if it had none. Logged once, on the encoder's first one, and counted for `flush`.
-    private func noteDroppedZone(_ element: Int) {
-        droppedZoneUpdates += 1
-        if droppedZoneUpdates == 1 {
-            EngineLog.emit("[APACObjectEncoder] element \(element) carries a zone mask, which object APAC cannot "
-                           + "deliver; it plays without it (further ones are counted, not logged)", category: .session)
+        if busStates.contains(where: { $0 != nil }) {
+            bus.advance(frameCount: 0, updates: [.init(frameOffset: 0, rampFrames: update.rampFrames, states: busStates)])
         }
     }
 
     private func markDiscontinuity() {
         for i in slots.indices { slots[i].markDiscontinuity() }
         lfe.markDiscontinuity()
+        bus.markDiscontinuity()
     }
 
-    private static let heights = Set(SpatialSpeaker.allCases.filter(\.isHeight))
-    /// The 7.1.4 speakers a snapping object goes to: tvOS renders object APAC to 7.1.4 for an HDMI
-    /// Atmos route, and an object on one of these positions renders entirely to that speaker
-    /// (measured for all eleven, README §3.20).
-    private static let snapTargets = SpatialSpeakerLayout.l714.speakers.filter { !$0.isLFE }.map(\.position)
+    private static let busFloor = Set(busSpeakers.filter { !$0.isHeight })
 
-    /// An object's position with what Atmos asks of it that the renderer will not do itself: snap
-    /// moves it onto the nearest speaker, and an object without elevation (its zone mask excludes
-    /// every height) comes down to ear level.
+    /// Whether an object needs what the renderer will not do with type 3: a zone mask that takes
+    /// away a 7.1.4 ear-level speaker, or divergence. Taking the heights away is already a position
+    /// (the elevation switch put it at ear level).
+    static func needsBus(_ state: ObjectAudioElementState) -> Bool {
+        state.divergence > 0 || !state.excluded.isDisjoint(with: busFloor)
+    }
+
+    /// The position the renderer gets: inside its room, and at ear level for an object kept off the
+    /// heights (TS 103 448 5.1.3.2), which is how type 3 hears an elevation switch.
     static func objectPosition(_ state: ObjectAudioElementState) -> SIMD3<Float> {
         var p = simd_clamp(state.position, SIMD3(repeating: 0), SIMD3(repeating: 1))
         if heights.isSubset(of: state.excluded) { p.z = 0 }
-        if state.snap {
-            let candidates = p.z == 0 && heights.isSubset(of: state.excluded)
-                ? snapTargets.filter { $0.z == 0 } : snapTargets
-            p = candidates.min { simd_distance_squared($0, p) < simd_distance_squared($1, p) } ?? p
-        }
         return p
     }
+
+    private static let heights = Set(SpatialSpeaker.allCases.filter(\.isHeight))
 
     /// Undoes the renderer's distance attenuation. It treats a point's distance from the centre of
     /// its −1…1 cube as a distance and attenuates 1/r beyond 1 (measured, README §3.20): a floor
@@ -374,6 +406,17 @@ final class APACObjectEncoder: APACChunkEncoding {
                     g = v.gain * Self.distanceCompensation(v.position)
                 }
                 staging[(staged + i) * inputChannels + channel] = plane[i] * g
+            }
+        }
+        if roles.count <= planes.count {
+            busInputs.removeAll(keepingCapacity: true)
+            for element in roles.indices { busInputs.append(UnsafePointer(planes[element] + start)) }
+            bus.render(inputs: busInputs, frameCount: count, updates: [], outputs: busPlanes)
+            for (k, speaker) in Self.busSpeakers.enumerated() {
+                let plane = busPlanes[Self.busLayout.speakers.firstIndex(of: speaker)!]
+                let channel = bedChannels + Self.objectSlots + k
+                let g = Self.distanceCompensation(speaker.position)
+                for i in 0..<count { staging[(staged + i) * inputChannels + channel] = plane[i] * g }
             }
         }
         staged += count
@@ -478,7 +521,7 @@ final class APACObjectEncoder: APACChunkEncoding {
             "key": "Channel Bed",
             "Channel Bed": [["key": "ChannelLayoutTag", "current value": bedIndex], channelMap(0, bedCount - 1)],
         ]]
-        for i in 0..<objectSlots {
+        for i in 0..<sceneObjects {
             components.append([
                 "key": "Object",
                 "Object": [
@@ -488,7 +531,7 @@ final class APACObjectEncoder: APACChunkEncoding {
                 ],
             ])
         }
-        let blob = APACObjectMetadata.staticBlob(objects: objectSlots)
+        let blob = APACObjectMetadata.staticBlob(objects: sceneObjects)
         return [
             "version": 0,
             "sub version": 0,

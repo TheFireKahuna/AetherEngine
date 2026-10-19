@@ -39,12 +39,12 @@ let package = Package(
         ),
         .trait(
             name: "TrueHDReferenceRender",
-            description: "Measurement only: with TrueHDObjectAudio and a LibTrueHD built with matrix interpolation, AETHER_TRUEHD_REFERENCE_RENDER=1 decodes TrueHD Atmos exactly and mixes its objects, the reference the bed split is measured against. Never ship it.",
+            description: "Measurement only: with TrueHDObjectAudio and the private LibTrueHD (built with matrix interpolation, with truehd_atmos_decoder_get_trims), AETHER_TRUEHD_REFERENCE_RENDER=1 decodes TrueHD Atmos exactly and mixes its objects, the reference the bed split is measured against. Never ship it.",
             enabledTraits: ["TrueHDObjectAudio"]
         ),
         .trait(
             name: "APACObjectOutput",
-            description: "Personal builds only, never shipped: with TrueHDObjectAudio, AETHER_APAC_OBJECTS=1 sends TrueHD Atmos elements to APAC as positioned objects (private AudioCodec properties and APAC's PCM-carried metadata) instead of a rendered speaker bed. Only meaningful with a LibTrueHD built with matrix-interpolation (the elements then decode exactly); with the shipped binary they carry crosstalk.",
+            description: "Personal builds only, never shipped: with TrueHDObjectAudio, AETHER_APAC_OBJECTS=1 sends TrueHD Atmos elements to APAC as positioned objects (private AudioCodec properties and APAC's PCM-carried metadata) instead of a rendered speaker bed. Needs the private LibTrueHD (truehd_atmos_decoder_get_trims, and matrix-interpolation so the elements decode exactly; the shipped binary has neither).",
             enabledTraits: ["TrueHDObjectAudio"]
         ),
         .trait(

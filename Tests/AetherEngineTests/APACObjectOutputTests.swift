@@ -56,10 +56,13 @@ struct APACObjectOutputTests {
              state: ObjectAudioElementState(position: SIMD3(0, 0.5, 0)), expect: [.ls]),
         Case(name: "object in the rear right corner", element: 2,
              state: ObjectAudioElementState(position: SIMD3(1, 1, 0)), expect: [.rrs]),
-        Case(name: "snapping object near L goes to L", element: 2,
-             state: ObjectAudioElementState(position: SIMD3(0.2, 0.1, 0), snap: true), expect: [.l]),
-        Case(name: "snapping object up front left goes to the front left top", element: 2,
-             state: ObjectAudioElementState(position: SIMD3(0.15, 0.2, 0.8), snap: true), expect: [.vhl]),
+        Case(name: "object kept out of the back plays from the sides (speaker bus)", element: 2,
+             state: ObjectAudioElementState(position: SIMD3(0, 1, 0), excluded: [.rearLeft, .rearRight]), expect: [.ls]),
+        Case(name: "screen-only object at the side plays from the front (speaker bus)", element: 2,
+             state: ObjectAudioElementState(position: SIMD3(1, 0.5, 0),
+                                            excluded: [.sideLeft, .sideRight, .rearLeft, .rearRight]), expect: [.r]),
+        Case(name: "divergent object at the centre plays from L and R (speaker bus)", element: 2,
+             state: ObjectAudioElementState(position: SIMD3(0.5, 0, 0), divergence: 1), expect: [.l, .r]),
         Case(name: "bed top front right on Vhr", element: 3, state: nil, expect: [.vhr]),
         Case(name: "centre back between the rears", element: 4, state: nil, expect: [.lrs, .rrs]),
     ]
@@ -126,20 +129,41 @@ struct APACObjectOutputTests {
         return try Self.decode(packets, cookie: encoder.magicCookie)
     }
 
-    @Test("a zone mask is counted as dropped; an elevation switch alone is not")
-    func zoneMasksAreCounted() throws {
+    @Test("zone masks and divergence go to the speaker bus; an elevation switch alone does not")
+    func busRouting() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let heights = Set(SpatialSpeaker.allCases.filter(\.isHeight))
         let encoder = try APACObjectEncoder(bitRate: 17 * 320_000)
         let buffer = APACEncodePipeline.PlaneBuffer(channels: APACObjectEncoder.elementCapacity, capacity: 1024)
         for plane in buffer.planes { plane.update(repeating: 0, count: 1024) }
-        buffer.objectRoles = [.object, .object]
+        buffer.objectRoles = [.object, .object, .object]
         buffer.objectUpdates = [.init(frameOffset: 0, rampFrames: 0, states: [
             ObjectAudioElementState(excluded: heights),                                  // elevation off
             ObjectAudioElementState(excluded: heights.union([.sideLeft, .sideRight])),   // + no sides
+            ObjectAudioElementState(divergence: 0.5),
         ])]
         _ = try encoder.encode(buffer, frames: 1024)
-        #expect(encoder.droppedZoneUpdates == 1)
+        #expect(encoder.busUpdates == 2)
+    }
+
+    @Test("an object moving onto the bus crossfades: no doubling, no gap")
+    func busCrossfade() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        // On the left side as a plain object, then the same place with the back excluded: the bus
+        // renders it there too, so the level holds through the 4096-frame crossfade.
+        let free = ObjectAudioElementState(position: SIMD3(0, 0.5, 0))
+        let zoned = ObjectAudioElementState(position: SIMD3(0, 0.5, 0), excluded: [.rearLeft, .rearRight])
+        let out = try render(roles: [.object], signalOn: 0, frames: 48_000, updates: [
+            .init(frameOffset: 0, rampFrames: 0, states: [free]),
+            .init(frameOffset: 16_384, rampFrames: 4096, states: [zoned]),
+        ])
+        let level = { (s: Int) in (0..<12).reduce(Float(0)) { $0 + Self.power(out[$1], s, s + 1024) } }
+        let before = level(8192)
+        for s in stride(from: 12_288, to: 28_672, by: 1024) {
+            let db = 10 * log10(level(s) / before)
+            #expect(abs(db) < 0.5, "\(db) dB at frame \(s)")
+        }
+        #expect(Self.shares(out, from: 30_000, to: 48_000)[Out.ls.rawValue] > 0.97)
     }
 
     // MARK: - Motion
@@ -185,6 +209,17 @@ struct APACObjectOutputTests {
     }
 
     // MARK: - Trajectory
+
+    @Test("an object fading to silence stays where it was, and one fading in starts where it is going")
+    func trajectoryFadesInPlace() {
+        var t = APACObjectTrajectory(.init(position: SIMD3(0, 0, 0), size: 0, gain: 1))
+        t.apply(.init(position: SIMD3(0, 0, 0), size: 0.2, gain: 1), at: 0, rampFrames: 0)
+        // Switched off: Atmos's default position is the room's centre, which it must not glide to.
+        t.apply(.init(position: SIMD3(0.5, 0.5, 0), size: 0, gain: 0), at: 100, rampFrames: 200)
+        #expect(t.value(at: 200) == .init(position: SIMD3(0, 0, 0), size: 0.2, gain: 0.5))
+        t.apply(.init(position: SIMD3(1, 1, 0), size: 0, gain: 1), at: 1000, rampFrames: 200)
+        #expect(t.value(at: 1100) == .init(position: SIMD3(1, 1, 0), size: 0, gain: 0.5))
+    }
 
     @Test("a still object is one block over the packet")
     func trajectoryStill() {
