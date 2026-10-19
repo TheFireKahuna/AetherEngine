@@ -1528,7 +1528,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // 4. Classify DV variant; per-profile policy in `resolveCodecRoute`.
         let route = try resolveCodecRoute(codecpar: codecpar)
         let codecTagOverride = route.codecTagOverride
-        let videoRange = route.videoRange
+        var videoRange = route.videoRange
         let primaryCodecs = route.primaryCodecs
         let supplementalCodecs = route.supplementalCodecs
         let doviConfig = route.doviConfig
@@ -1604,6 +1604,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
             framing: measuredVideoNALFraming,
             isLive: isLiveSession
         )
+        let sdrUpgradedToHLG = inBandHDRMetadata.videoRange(upgrading: videoRange) != videoRange
+        if sdrUpgradedToHLG {
+            videoRange = .hlg
+            EngineLog.emit(
+                "[HLSVideoEngine] alternative transfer SEI names ARIB STD-B67 over a "
+                + "trc=\(codecpar.pointee.color_trc.rawValue) VUI: backward-compatible HLG, "
+                + "VIDEO-RANGE=HLG and colr transfer 18",
+                category: .session
+            )
+        }
 
         // 6. Reset demuxer cursor to 0 (cue prewarm moved it mid-file). Skipped for live
         //    (no prewarm, forward-only feed), and for a forward-only VOD source: the prewarm did not
@@ -1690,6 +1700,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
         ownedCodecParams.append(ownedVideoParams)
         let liftedHDRBoxes = inBandHDRMetadata.attach(to: ownedVideoParams.ptr)
+        // The `colr` the MPEG-TS delivery of the same stream carries (see `InBandHDRStaticMetadata`).
+        if sdrUpgradedToHLG { ownedVideoParams.ptr.pointee.color_trc = AVCOL_TRC_ARIB_STD_B67 }
         if !liftedHDRBoxes.isEmpty {
             EngineLog.emit(
                 "[HLSVideoEngine] HDR10 static metadata stated only in-band: lifted the SEI into the "
