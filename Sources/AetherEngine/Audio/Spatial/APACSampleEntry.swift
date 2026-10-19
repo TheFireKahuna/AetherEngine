@@ -45,6 +45,19 @@ enum APACSampleEntry {
         return String(format: "apac.31.%02d", level)
     }
 
+    /// HLS `CODECS` value read from the encoder's magic cookie (the `dapa` box): the profile is the
+    /// top 6 bits of the configuration's byte 2 and the level the 4 bits after them. The channel bed
+    /// encoder's cookies read 31 / 3 for 7.1.4 and 31 / 4 for 9.1.6, matching `codecsString(channelCount:)`;
+    /// object APAC reads profile 5 (low), level 0. Nil for a cookie too short to hold them.
+    static func codecsString(magicCookie: Data) -> String? {
+        let b = [UInt8](magicCookie)
+        // size(4) 'dapa'(4) version/flags(4), then the configuration.
+        guard b.count >= 16, String(bytes: b[4..<8], encoding: .ascii) == "dapa" else { return nil }
+        let profile = Int(b[14] >> 2)
+        let level = Int((b[14] & 0x03) << 2 | b[15] >> 6)
+        return String(format: "apac.%02d.%02d", profile, level)
+    }
+
     /// `initBytes` with the sound track's first sample entry replaced by `entry`, or nil when the
     /// init has no parseable sound track (the caller then forwards it unchanged, and the failure
     /// shows up as a load error naming the audio rather than as corrupt bytes).

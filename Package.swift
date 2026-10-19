@@ -43,6 +43,11 @@ let package = Package(
             enabledTraits: ["TrueHDObjectAudio"]
         ),
         .trait(
+            name: "APACObjectOutput",
+            description: "Personal builds only, never shipped: with TrueHDObjectAudio, AETHER_APAC_OBJECTS=1 sends TrueHD Atmos elements to APAC as positioned objects (private AudioCodec properties and APAC's PCM-carried metadata) instead of a rendered speaker bed. Only meaningful with a LibTrueHD built with matrix-interpolation (the elements then decode exactly); with the shipped binary they carry crosstalk.",
+            enabledTraits: ["TrueHDObjectAudio"]
+        ),
+        .trait(
             name: "DTSXObjectAudio",
             description: "Compile the DTS:X decoder (FFmpeg's dca with FFmpegBuild's height patch) and the object renderer, so objectAudioRendering can render DTS:X heights to APAC."
         ),

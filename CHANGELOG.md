@@ -12,6 +12,13 @@ the public-API contract.
 
 ### Added
 
+- **TrueHD Atmos as APAC objects, personal builds only** (`APACObjectOutput` trait, off by default, with
+  `AETHER_APAC_OBJECTS=1`). Every element of the object presentation goes to APAC as a positioned object
+  (the LFE on a bed) for tvOS to render, instead of the engine's speaker bed. Private AudioCodec properties
+  and APAC's PCM-carried metadata (`APACObjectEncoder`), so it is never shipped; only worth listening to
+  with a LibTrueHD built with `matrix-interpolation`, which decodes the elements exactly. Measured on the
+  Mac against the engine's own render of the same exact decode: same level and speaker split.
+
 - **`LoadOptions.sessionCacheByteBudget` and `EngineDiagnostics.sessionCacheStatus`: a host can
   size the temporary VOD cache and see what it holds (#830, thanks @orut34iop).** An explicit byte
   request goes through the same quarter-of-free-space clamp and `RetentionClaims` ledger as the
