@@ -72,7 +72,7 @@ struct DoviFelMathTests {
             (514, 2049),      // r = +2: (3 * 2048) >> 12 = 1
           ])
     func inverseNlqThroughComposer(el: Int, expectedVdr: Int) throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         var p = Self.rawParams(residual: true)
         p.nlqY = DoviGpuEdgeCaseTests.nlq(vdrInMax: 4095)   // not binding: isolate the quantiser
         let out = try DoviGpuEdgeCaseTests.composeConstant(composer, bl: (512, 512, 512), el: (el, 512, 512), params: p)
@@ -109,7 +109,7 @@ struct DoviFelMathTests {
     /// is distinct, so the output names the piece that was selected.
     @Test("piece selection on the GPU: boundaries belong to the upper piece and the top code selects the last piece")
     func pieceSelectionOnGpu() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         var poly = DoviPolynomialParams()
         poly.numPivots = 4
         poly.pivots[0] = 0; poly.pivots[1] = 128; poly.pivots[2] = 256; poly.pivots[3] = 1023
@@ -143,7 +143,7 @@ struct DoviFelMathTests {
     /// result is in 12-bit VDR codes after 2^vdr_bit_depth (4096).
     @Test("polynomial reshaping on the GPU matches the closed form over all 1024 base-layer codes")
     func polynomialOverAllCodes() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         let c0 = 0.02, c1 = 0.95, c2 = 0.10
         var p = Self.rawParams(residual: false)
         p.polyY = Self.polynomial(c0, c1, c2, order: 2)
@@ -171,7 +171,7 @@ struct DoviFelMathTests {
 
     @Test("N3: a prediction above the VDR range is capped at vdr_max before the residual is added")
     func predictionOvershootCappedBeforeResidual() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         // Prediction 1.02 -> 4178 12-bit codes (above vdr_max 4095); EL 312 -> r = -200 -> (399 * 2048) >> 12 = 199 -> -199.
         // DoViBaker caps the mapping result at 0xffff before the residual (`polynompialMapping` returns uint16_t):
         // (65535 - 3192 + 8) >> 4 = 3896, which is 4095 - 199. Adding first would give 4178 - 199 = 3979.
@@ -200,7 +200,7 @@ struct DoviFelMathTests {
 
         params.ditherMode = .debugRawVDR
         params.flags.insert(.disableResidual)
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
 
         // Chroma plane is 1024 wide for a 2048-wide base layer: column c carries Cb = c, with Y and Cr at mid-grey.
         let bl = try #require(H.makeBuffer(width: 2048, height: 4))
@@ -237,7 +237,7 @@ struct DoviFelMathTests {
 
     @Test("Metal GPU Composition: Real RPU reconstructs 10-bit P010 without flat-64 green chroma")
     func metalGpuCompositionSanity() throws {
-        guard let composer = DoviFelComposer() else {
+        guard let composer = DoviFelComposer.p010ForTesting() else {
             Issue.record("Failed to initialize DoviFelComposer")
             return
         }

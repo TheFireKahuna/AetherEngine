@@ -750,12 +750,15 @@ final class DoviFelComposer: @unchecked Sendable {
         set { residualSwitch.withLock { $0 = newValue } }
     }
 
-    private static let outputModeSwitch = OSAllocatedUnfairLock(initialState: DoviOutputMode.p010)
+    private static let outputModeSwitch = OSAllocatedUnfairLock(initialState: DoviOutputMode.sv22)
 
     /// The output buffer format and how the 12-bit VDR code is quantised into it (``DoviOutputMode``).
-    /// An experiment switch for the 12-bit display-path question: takes effect from the next composed
-    /// frame (the pool is rebuilt on a format change) and applies to every composer in the process.
-    /// Default ``DoviOutputMode/p010``, the validated path.
+    /// Takes effect from the next composed frame (the pool is rebuilt on a format change) and applies to
+    /// every composer in the process. Default ``DoviOutputMode/sv22``: measured on an Apple TV 4K (A15,
+    /// tvOS 27) into an LG G5, its sub-10-bit precision reaches the TV-led Dolby Vision output (the
+    /// amplifier-RPU test card, `SEQ=card`) and a 4K FEL soak plays with no more dropped frames than
+    /// ``DoviOutputMode/p010``, for ~30 MB more peak memory. ``DoviOutputMode/p010`` (ordered dither, bit-exact
+    /// with Dolby's 4:2:0 reference) stays selectable.
     static var outputMode: DoviOutputMode {
         get { outputModeSwitch.withLock { $0 } }
         set { outputModeSwitch.withLock { $0 = newValue } }

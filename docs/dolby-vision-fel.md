@@ -659,9 +659,13 @@ not a reading of the stream's `chroma_sample_loc_type`, which the 4:2:0 kernel n
   stream asks, with no limit. Both are resolved when the packet is demuxed (`recordSideData`), in decode order,
   so "previous" is the previous frame of the stream and each frame reaches pairing with concrete parameters;
   resolving at compose time would follow completion order instead.
-- **Output precision:** `DoviDither.fullPrecision` keeps the VDR bits below the 10-bit code in P010's unused low
-  6 bits. Opt-in, not yet validated on a display path; the default stays rounded or dithered 10-bit.
-- **Output modes** (`felOutputMode`, `--fel-output`): `p010` (Bayer dither, the default), `p010-round`,
+- **Output precision:** `DoviDither.fullPrecision` keeps the VDR bits below the 10-bit code: in P010's unused low
+  6 bits (`p010-full`, undefined padding), or as defined values in `sv22`. Measured on an Apple TV 4K (A15,
+  tvOS 27) into an LG G5 with the amplifier-RPU test card (`SEQ=card`): `sv22`'s sub-10-bit precision reaches
+  the TV-led Dolby Vision output (HDMI colour mode 332, 12-bit), the rounded control's does not, and a 4K FEL
+  soak drops no more frames than `p010`. So `sv22` is the default.
+- **Output modes** (`felOutputMode`, `--fel-output`): `sv22` (the default), `p010` (Bayer dither, bit-exact with
+  Dolby's 4:2:0 reference, the fallback), `p010-round`,
   `p010-bluenoise`, `p010-full` (the full-precision word in P010's padding) and `sv22` (16-bit 4:2:2 with the
   same words, where they are defined values). The P010 modes compose chroma at its 4:2:0 sites, as Dolby's
   reference does. `sv22` composes it at every 4:2:2 site instead (`dovi_compose_chroma_422`), because there

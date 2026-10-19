@@ -18,7 +18,7 @@ struct DoviEnhancementUpsamplerTests {
     /// output is 2048 + floor((2|r| - 1) * 2048 / 4096) with r = el - 512, i.e. |r| - 1 for the codes used here
     /// (|r| of 88 or more is far from the half-step rounding), and the first row is returned.
     private func composeLuma(elColumn: (Int) -> Int) throws -> [Int] {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         var p = DoviGpuEdgeCaseTests.params(nlqY: DoviGpuEdgeCaseTests.nlq(vdrInMax: 4095))
         p.ditherMode = .debugRawVDR
         let bl = try #require(H.makeBuffer(width: 64, height: 8))
@@ -53,7 +53,7 @@ struct DoviEnhancementUpsamplerTests {
         // rows, 16 codes per EL texel. Base chroma sample n sits at EL texel n / 2 (DoViBaker's
         // upsampleChromaEven / Odd), so even samples read one texel exactly; a centre-aligned fetch would
         // read n / 2 - 0.25 and land 4 codes low on every even sample past the edge.
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         var p = DoviGpuEdgeCaseTests.params()
         p.ditherMode = .debugRawVDR
         let bl = try #require(H.makeBuffer(width: 64, height: 16))
@@ -109,7 +109,7 @@ struct DoviEnhancementUpsamplerTests {
     func chromaHalfRoundsUp() throws {
         // Quarter-resolution EL chroma alternating 601 / 600 by column: odd base samples sit half way, at 600.5,
         // which rounds up to 601 (ties-to-even would give 600). Even samples read one texel exactly.
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         var p = DoviGpuEdgeCaseTests.params()
         p.ditherMode = .debugRawVDR
         let bl = try #require(H.makeBuffer(width: 64, height: 16))

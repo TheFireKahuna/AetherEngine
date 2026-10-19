@@ -105,7 +105,7 @@ struct DoviDitherTests {
         dither: DoviDither,
         frameIndex: UInt32
     ) -> CVPixelBuffer? {
-        guard let composer = DoviFelComposer(),
+        guard let composer = DoviFelComposer.p010ForTesting(),
               let bl = makeBuffer(width: width, height: height),
               let el = makeBuffer(width: width / 2, height: height / 2) else { return nil }
         fillPlane(bl, plane: 0, components: 1, value: 512)
@@ -330,7 +330,7 @@ struct DoviDitherTests {
     func blueNoiseOutputModeSelectsTheDither() throws {
         let (curve, _) = Self.curveHitting(vdr: 500 * 4 + 1, blMax: 1023, vdrScale: 4)
         func run(mode: DoviOutputMode, dither: DoviDither) throws -> [Int] {
-            let composer = try #require(DoviFelComposer())
+            let composer = try #require(DoviFelComposer.p010ForTesting())
             composer.outputModeOverride = mode
             let bl = try #require(Self.makeBuffer(width: Self.width, height: Self.height))
             let el = try #require(Self.makeBuffer(width: Self.width / 2, height: Self.height / 2))
@@ -365,7 +365,7 @@ struct DoviDitherTests {
     /// rounds up in a cell exactly when `j + k >= 64`; the first `j` at which a cell rises gives `k = 64 - j`.
     @Test("the dither matrix the kernel applies is the golden Bayer 8x8, cell for cell")
     func ditherMatrixIsGolden() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         var recovered = [Int](repeating: 0, count: 64)
         var rose = [Bool](repeating: false, count: 64)
         for j in 0..<64 {
