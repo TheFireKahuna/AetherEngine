@@ -32,6 +32,8 @@ struct DoviGpuBenchmark {
         let enhancement: CVPixelBuffer
         let params: MTLBuffer
         let lut: MTLBuffer
+        /// The inverse-NLQ table the kernels index (`DoviFelComposer.populateNlqLut`), bound at buffer 2.
+        let nlq: MTLBuffer
     }
 
     static func clipAParams() throws -> DoviMetalParams {
@@ -98,7 +100,9 @@ struct DoviGpuBenchmark {
         params.serialize(into: UnsafeMutableRawBufferPointer(start: pbuf.contents(), count: DoviMetalParams.serializedSize))
         let lut = try #require(device.makeBuffer(length: 1024 * 4, options: .storageModeShared))
         try #require(DoviFelComposer()).populateLumaLut(into: lut.contents().assumingMemoryBound(to: Float.self), params: params)
-        return Rig(device: device, queue: queue, cache: try #require(cache), base: base, enhancement: el, params: pbuf, lut: lut)
+        let nlq = try #require(device.makeBuffer(length: 3 * 1024 * 4, options: .storageModeShared))
+        DoviFelComposer.populateNlqLut(into: nlq.contents().assumingMemoryBound(to: Int32.self), params: params)
+        return Rig(device: device, queue: queue, cache: try #require(cache), base: base, enhancement: el, params: pbuf, lut: lut, nlq: nlq)
     }
 
     static func texture(_ rig: Rig, _ b: CVPixelBuffer, plane: Int, _ format: MTLPixelFormat) throws -> (MTLTexture, CVMetalTexture) {
@@ -128,6 +132,7 @@ struct DoviGpuBenchmark {
             enc.setTexture(luma ? elY.0 : elUV.0, index: 2); enc.setTexture(luma ? oY.0 : oUV.0, index: 3)
             enc.setBuffer(rig.params, offset: 0, index: 0)
             enc.setBuffer(rig.lut, offset: 0, index: 1)
+            enc.setBuffer(rig.nlq, offset: 0, index: 2)
             for (b, idx) in extraBuffers { enc.setBuffer(b, offset: 0, index: idx) }
             let grid = luma ? MTLSize(width: width / pixelsPerThread, height: height, depth: 1)
                             : MTLSize(width: width / 2 / pixelsPerThread, height: height / 2, depth: 1)
@@ -238,37 +243,6 @@ struct DoviGpuBenchmark {
     static let shiftFullPrecision: [(String, String)] = [
         ("    int v = (vdr_val * 64 + int(vdr_scale >> 1)) / int(vdr_scale);",
          "    int v = (vdr_val * 64 + int(vdr_scale >> 1)) >> ctz(vdr_scale);"),
-    ]
-
-    /// Inverse NLQ from a per-frame table of the 1024 EL codes per component (built on the CPU with the
-    /// same integer formula), instead of 64-bit integer arithmetic per sample.
-    static let nlqLut: [(String, String)] = [
-        ("""
-    constant float*                        luma_lut      [[buffer(1)]],
-    uint2                                  gid           [[thread_position_in_grid]])
-""", """
-    constant float*                        luma_lut      [[buffer(1)]],
-    device const int*                      nlq_lut       [[buffer(2)]],
-    uint2                                  gid           [[thread_position_in_grid]])
-"""),
-        ("        vdr_y += dovi_eval_inv_nlq(params.nlq_y, dovi_el_code(el));",
-         "        vdr_y += nlq_lut[clamp(dovi_el_code(el), 0, 1023)];"),
-        ("""
-    constant struct DoviMetalParams&       params        [[buffer(0)]],
-    uint2                                  gid           [[thread_position_in_grid]])
-{
-    uint uv_width
-""", """
-    constant struct DoviMetalParams&       params        [[buffer(0)]],
-    device const int*                      nlq_lut       [[buffer(2)]],
-    uint2                                  gid           [[thread_position_in_grid]])
-{
-    uint uv_width
-"""),
-        ("                vdr_cb += dovi_eval_inv_nlq(params.nlq_cb, dovi_el_code(el.x));",
-         "                vdr_cb += nlq_lut[1024 + clamp(dovi_el_code(el.x), 0, 1023)];"),
-        ("                vdr_cr += dovi_eval_inv_nlq(params.nlq_cr, dovi_el_code(el.y));",
-         "                vdr_cr += nlq_lut[2048 + clamp(dovi_el_code(el.y), 0, 1023)];"),
     ]
 
     /// Each thread composes `n` horizontally adjacent sites (luma pixels / chroma samples) instead of one:
@@ -424,44 +398,20 @@ static inline float dovi_eval_curve_f(
         return buf
     }
 
-    /// The shader's dovi_eval_inv_nlq over every EL code, Y then Cb then Cr.
-    static func nlqTable(_ rig: Rig) throws -> MTLBuffer {
-        let p = try clipAParams()
-        let buf = try #require(rig.device.makeBuffer(length: 3 * 1024 * 4, options: .storageModeShared))
-        let out = buf.contents().assumingMemoryBound(to: Int32.self)
-        for (c, nlq) in [p.nlqY, p.nlqCb, p.nlqCr].enumerated() {
-            for code in 0..<1024 {
-                var v: Int64 = 0
-                let r = Int64(code) - Int64(nlq.nlqOffset)
-                if nlq.nlqMethod == .linear, nlq.nlqScale != 0, r != 0 {
-                    var mag = ((2 * abs(r) - 1) * Int64(nlq.nlqScale) + 2 * Int64(nlq.nlqThreshold)) >> (Int64(nlq.nlqShift) + 1)
-                    if nlq.vdrInMax > 0, mag > Int64(nlq.vdrInMax) { mag = Int64(nlq.vdrInMax) }
-                    v = r < 0 ? -mag : mag
-                }
-                out[c * 1024 + code] = Int32(v)
-            }
-        }
-        return buf
-    }
-
     @Test("UHD composition GPU time per kernel", .enabled(if: enabled, "set DOVI_BENCH=1"))
     func uhdKernelTimes() throws {
         let rig = try Self.rig()
-        let table = try Self.nlqTable(rig)
         let mmrT = try Self.mmrTable(rig)
         print("[bench] device \(rig.device.name), \(Self.width)x\(Self.height), median of \(Self.iterations)")
         let base = DoviShaderSource.source
-        // nlqLut first: deviceLut rewrites a line nlqLut matches on.
-        let all = Self.nlqLut + Self.deviceLut + Self.lazyDither + Self.shiftFullPrecision
+        let all = Self.deviceLut + Self.lazyDither + Self.shiftFullPrecision
         let variants: [(String, String, [(MTLBuffer, Int)])] = [
             ("baseline     ", base, []),
             ("device-lut   ", try Self.patched(base, Self.deviceLut), []),
             ("lazy-dither  ", try Self.patched(base, Self.lazyDither), []),
             ("shift-fullp  ", try Self.patched(base, Self.shiftFullPrecision), []),
-            ("nlq-lut      ", try Self.patched(base, Self.nlqLut), [(table, 2)]),
-            ("all          ", try Self.patched(base, all), [(table, 2)]),
+            ("all          ", try Self.patched(base, all), []),
             ("mmr-float    ", try Self.patched(base, Self.mmrFloat), [(mmrT, 3)]),
-            ("mmr+nlq-lut  ", try Self.patched(base, Self.nlqLut + Self.mmrFloat), [(table, 2), (mmrT, 3)]),
             ("FLOOR (I/O)  ", try Self.patched(base, Self.floorOnly), []),
             ("c: 1-tap luma", try Self.patched(base, Self.chromaOneTap), []),
             ("c: no MMR    ", try Self.patched(base, Self.chromaNoMmr), []),
@@ -477,8 +427,6 @@ static inline float dovi_eval_curve_f(
             }
             for n in [2, 4] where ProcessInfo.processInfo.environment["DOVI_BENCH_ALL"] == "1" {
                 try Self.report("\(n) px/thread  ", source: try Self.multiPixel(base, n: n), rig: rig, pixelsPerThread: n)
-                try Self.report("\(n)px+nlq-lut  ", source: try Self.multiPixel(try Self.patched(base, Self.nlqLut), n: n),
-                                rig: rig, extra: [(table, 2)], pixelsPerThread: n)
             }
         }
     }
