@@ -8,6 +8,7 @@
 #   pulse_l8.mp4 / p7fel_l8.mp4  CM v4.0: only the L8 trims switch (does CM v4.0 metadata reach the panel?)
 #   p7fel_sub10.mp4          Profile 7 FEL, constant RPU; the residual swings 3/4 of a 10-bit code, below 10 bits only
 #   p7fel_{l2,l1,null}.mp4   Profile 7 FEL, same RPUs; the enhancement layer is flat (zero residual)
+#   p7mel_l1.mp4             p7fel_l1 with its RPU rewritten as MEL (el_type MEL), the enhancement-layer probe's control
 #   p7fel_el.mp4             Profile 7 FEL, constant RPU; the enhancement-layer residual switches
 #   p7fel_count_{null,l2}.mp4  Profile 7 FEL counter clips (fel_count.py): BL and EL each carry their own frame
 #                            number, the EL one as residual only; null: constant RPU, l2: the RPU pulses as in pulse_l2
@@ -92,6 +93,14 @@ for v in l2 null l1; do
   MP4Box -add p7_$v.hevc:fps=24000/1001:dvp=f7.6 -brand mp42isom -ab dby1 -quiet -new p7fel_$v.mp4
   rm el_$v.hevc p7_$v.hevc
 done
+
+# ---- p7mel_l1: the l1 clip with its RPU rewritten as MEL (dovi_tool mode 1), the MEL control for the
+# enhancement-layer probe (DolbyVisionEnhancementLayerProbeTests) ----
+MP4Box -raw 1 p7fel_l1.mp4 -out p7fel_l1_raw.hevc -quiet
+dovi_tool -m 1 convert p7fel_l1_raw.hevc -o p7mel_l1.hevc
+rm -f p7mel_l1.mp4
+MP4Box -add p7mel_l1.hevc:fps=24000/1001:dvp=f7.6 -brand mp42isom -ab dby1 -quiet -new p7mel_l1.mp4
+rm p7fel_l1_raw.hevc p7mel_l1.hevc
 
 # ---- p7fel_l8: the CM v4.0 L8 pulse on the FEL route ----
 # The FEL template RPU is CM v2.9, so the v4.0 levels (L3/L8/L9/L11/L254) only transfer with
