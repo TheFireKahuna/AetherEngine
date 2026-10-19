@@ -26,6 +26,10 @@ enum DoviDither: UInt32, Sendable {
     /// so a consumer that reads the full 16-bit word sees 12-bit (or finer) precision while one
     /// that reads the top 10 bits sees the truncated code. Not validated on a display path yet.
     case fullPrecision = 3
+    /// Like ``bayer8x8``, a threshold added before the floor, with the same exact 0.5 mean, but taken from a
+    /// static 64x64 blue-noise map (`DoviShaderSource.blueNoiseRows`) instead of the 8x8 Bayer matrix with its
+    /// per-frame inversion: no fixed-period pattern and no frame-to-frame alternation.
+    case blueNoise = 4
 }
 
 /// The buffer the composer hands downstream, and how the 12-bit VDR code is put into it.
@@ -34,6 +38,8 @@ enum DoviOutputMode: String, CaseIterable, Sendable {
     case p010 = "p010"
     /// P010 rounded to the nearest 10-bit code, no dither: the control that keeps nothing below 10 bits.
     case p010Rounded = "p010-round"
+    /// P010 quantised with ``DoviDither/blueNoise`` instead of the ordered dither.
+    case p010BlueNoise = "p010-bluenoise"
     /// P010 with ``DoviDither/fullPrecision``: the bits below the 10-bit code go in P010's low bits,
     /// which CoreVideo defines as padding, so whether a consumer keeps them is undefined.
     case p010FullPrecision = "p010-full"

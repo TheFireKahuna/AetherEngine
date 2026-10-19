@@ -246,6 +246,108 @@ struct DoviDitherTests {
         #expect(Set(cell).count == 1, "undithered output is not flat: \(Set(cell).sorted())")
     }
 
+    // MARK: - Blue noise
+
+    /// Every sample of one component of a plane, row-major.
+    static func readAll(_ buffer: CVPixelBuffer, plane: Int, components: Int, component: Int) -> [Int] {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(buffer, plane) else { return [] }
+        let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(buffer, plane)
+        let w = CVPixelBufferGetWidthOfPlane(buffer, plane), h = CVPixelBufferGetHeightOfPlane(buffer, plane)
+        var out: [Int] = []
+        for row in 0..<h {
+            let rowPtr = (base + row * bytesPerRow).assumingMemoryBound(to: UInt16.self)
+            for column in 0..<w { out.append(Int(rowPtr[column * components + component] >> 6)) }
+        }
+        return out
+    }
+
+    static var blueNoiseRanks: [Int] {
+        DoviShaderSource.blueNoiseRows.flatMap { row -> [Int] in
+            stride(from: 0, to: row.count, by: 3).map { i in
+                let a = row.index(row.startIndex, offsetBy: i)
+                return Int(row[a..<row.index(a, offsetBy: 3)], radix: 16)!
+            }
+        }
+    }
+
+    @Test("the blue-noise map holds every rank once, so its thresholds average exactly 0.5, and its local means are flat")
+    func blueNoiseTableShape() {
+        let ranks = Self.blueNoiseRanks
+        #expect(DoviShaderSource.blueNoiseRows.count == 64)
+        #expect(ranks.sorted() == Array(0..<4096), "not a permutation of 0...4095")
+        // Blue noise has almost no low-frequency content, so 8x8 block means sit close to the tile mean
+        // (2047.5): this map spreads them by 41.5, a shuffled table (white noise) by about 160.
+        var sq = 0.0
+        for by in 0..<8 { for bx in 0..<8 {
+            var sum = 0
+            for y in 0..<8 { for x in 0..<8 { sum += ranks[(by * 8 + y) * 64 + bx * 8 + x] } }
+            let d = Double(sum) / 64 - 2047.5
+            sq += d * d
+        } }
+        let sd = (sq / 64).squareRoot()
+        #expect(sd < 60, "8x8 block means spread by \(sd), not blue")
+    }
+
+    @Test("blue-noise dither is unbiased: the 64x64 tile mean is the exact pre-rounding value, at every quarter-code residue")
+    func blueNoiseMeanMatchesExactValue() throws {
+        for r in 0..<4 {
+            let target = 500 * 4 + r
+            let (curve, vdr) = Self.curveHitting(vdr: target, blMax: 1023, vdrScale: 4)
+            #expect(vdr == target)
+            let dst = try #require(Self.compose(lumaCurve: curve, cbCurve: Self.constantCurve(c0: 0),
+                                                crCurve: Self.constantCurve(c0: 0), dither: .blueNoise, frameIndex: 0))
+            let luma = Self.readAll(dst, plane: 0, components: 1, component: 0)
+            #expect(luma.count == 4096, "the plane covers exactly one tile")
+            let mean = Double(luma.reduce(0, +)) / Double(luma.count)
+            #expect(abs(mean - Double(vdr) / 4.0) < 1e-9, "residue \(r): tile mean \(mean) is not \(Double(vdr) / 4.0)")
+            #expect(Set(luma).count <= 2, "residue \(r): more than two output levels")
+        }
+    }
+
+    @Test("blue-noise dither is static across frames, differs from the Bayer pattern, and gives Cb and Cr their own patterns")
+    func blueNoisePatternIsStaticAndDecorrelated() throws {
+        let (curve, _) = Self.curveHitting(vdr: 500 * 4 + 2, blMax: 1023, vdrScale: 4)
+        func run(_ dither: DoviDither, frame: UInt32) throws -> CVPixelBuffer {
+            try #require(Self.compose(lumaCurve: curve, cbCurve: curve, crCurve: curve, dither: dither, frameIndex: frame))
+        }
+        let f0 = try run(.blueNoise, frame: 0), f1 = try run(.blueNoise, frame: 1)
+        let y0 = Self.readAll(f0, plane: 0, components: 1, component: 0)
+        #expect(y0 == Self.readAll(f1, plane: 0, components: 1, component: 0), "no per-frame change")
+        let bayer = Self.readAll(try run(.bayer8x8, frame: 0), plane: 0, components: 1, component: 0)
+        #expect(y0 != bayer)
+        // The thresholds below 0.5 are exactly ranks 0...2047, so at residue 2 the luma plane is the map's lower half.
+        let ranks = Self.blueNoiseRanks
+        #expect(y0 == ranks.map { $0 >= 2048 ? 501 : 500 }, "the luma plane is not the map at offset (0, 0)")
+        let cb = Self.readAll(f0, plane: 1, components: 2, component: 0)
+        let cr = Self.readAll(f0, plane: 1, components: 2, component: 1)
+        let differing = zip(cb, cr).filter { $0 != $1 }.count
+        #expect(differing > cb.count / 3, "Cb and Cr agree on \(cb.count - differing) of \(cb.count) samples")
+    }
+
+    @Test("the p010-bluenoise output mode composes with the blue-noise dither")
+    func blueNoiseOutputModeSelectsTheDither() throws {
+        let (curve, _) = Self.curveHitting(vdr: 500 * 4 + 1, blMax: 1023, vdrScale: 4)
+        func run(mode: DoviOutputMode, dither: DoviDither) throws -> [Int] {
+            let composer = try #require(DoviFelComposer())
+            composer.outputModeOverride = mode
+            let bl = try #require(Self.makeBuffer(width: Self.width, height: Self.height))
+            let el = try #require(Self.makeBuffer(width: Self.width / 2, height: Self.height / 2))
+            Self.fillPlane(bl, plane: 0, components: 1, value: 512); Self.fillPlane(bl, plane: 1, components: 2, value: 512)
+            Self.fillPlane(el, plane: 0, components: 1, value: 512); Self.fillPlane(el, plane: 1, components: 2, value: 512)
+            var params = DoviMetalParams()
+            params.ditherMode = dither
+            params.flags = [.disableResidual]
+            params.polyY = curve; params.polyCb = Self.constantCurve(c0: 0); params.polyCr = Self.constantCurve(c0: 0)
+            let out = try #require(composer.compose(baseBuffer: bl, enhancementBuffer: el, params: params))
+            return Self.readAll(out, plane: 0, components: 1, component: 0)
+        }
+        #expect(try run(mode: .p010BlueNoise, dither: .bayer8x8) == run(mode: .p010, dither: .blueNoise))
+        #expect(try run(mode: .p010, dither: .bayer8x8) != run(mode: .p010BlueNoise, dither: .bayer8x8), "the default stays Bayer")
+        #expect(DoviOutputMode(rawValue: "p010-bluenoise") == .p010BlueNoise)
+    }
+
     /// The 8x8 ordered-dither matrix as a literal table (`k` in `k/64`).
     static let bayerGolden: [Int] = [
         0, 32, 8, 40, 2, 34, 10, 42,
