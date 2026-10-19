@@ -2,6 +2,7 @@
 #if TrueHDObjectAudio
 import Testing
 import Foundation
+import simd
 import TrueHD
 @testable import AetherEngine
 
@@ -92,13 +93,35 @@ struct TrueHDObjectMetadataMappingTests {
         #expect(state.position.z == 0)
     }
 
-    @Test("a screen-anchored object keeps its room depth, the top of the screen halfway up the room")
+    @Test("a screen-anchored object keeps its room depth, and with no screen known plays where it is")
     func screenReference() {
         let flags = TRUEHD_ATMOS_ELEMENT_ACTIVE | TRUEHD_ATMOS_ELEMENT_ELEVATION | TRUEHD_ATMOS_ELEMENT_SCREEN_REF
         // Only x and z are screen-anchored; y is still depth, so an object flying from the screen to
-        // the back wall travels (review of eae933d0 found it pinned to the front wall).
-        let state = TrueHDObjectAudioDecoder.state(for: element(flags: flags, position: (0.8, 0.6, 1)))
-        #expect(state.position == SIMD3(0.8, 0.6, 0.5))
+        // the back wall travels (review of eae933d0 found it pinned to the front wall). The playback
+        // screen defaults to the whole front wall, where TS 103 420 5.2.1.3 is the identity.
+        var e = element(flags: flags, position: (0.8, 0.6, 1))
+        e.screen_factor = 0.5
+        e.depth_factor = 0.25
+        let position = TrueHDObjectAudioDecoder.state(for: e).position
+        #expect(simd_distance(position, SIMD3(0.8, 0.6, 1)) < 1e-6)
+    }
+
+    @Test("TS 103 420 5.2.1.3: on the screen at the front wall, toward the raw position deeper in")
+    func screenAnchoredFormula() {
+        // A TV a third of the wall wide, centred, from z = -0.4 to 0.2.
+        let tv = TrueHDObjectAudioDecoder.PlaybackScreen(origin: SIMD3(1.0 / 3, 0, -0.4), width: 1.0 / 3, height: 0.6)
+        let at = { (p: SIMD3<Float>, sf: Float, df: Float) in
+            TrueHDObjectAudioDecoder.roomPosition(screenAnchored: p, screenFactor: sf, depthFactor: df, screen: tv)
+        }
+        let near = { (a: SIMD3<Float>, b: SIMD3<Float>) in simd_distance(a, b) < 1e-5 }
+        // At the front wall the factors do not matter: the screen's centre and its top right corner.
+        #expect(near(at(SIMD3(0.5, 0, 0), 1, 0.25), SIMD3(0.5, 0, -0.1)))
+        #expect(near(at(SIMD3(1, 0, 1), 0.125, 2), SIMD3(2.0 / 3, 0, 0.2)))
+        // At the back wall (weight 1) screen_factor blends: 1 is the raw position, 0.5 halfway.
+        #expect(near(at(SIMD3(1, 1, 1), 1, 1), SIMD3(1, 1, 1)))
+        #expect(near(at(SIMD3(1, 1, 1), 0.5, 1), SIMD3(5.0 / 6, 1, 0.6)))
+        // Halfway into the room the weight is y^depth_factor: 0.5^2 = 0.25 of the way to the raw x.
+        #expect(near(at(SIMD3(1, 0.5, 0), 1, 2), SIMD3(2.0 / 3 + 0.25 / 3, 0.5, -0.075)))
     }
 
     @Test("an ISF object, whose position is not decoded, is spread over the room")

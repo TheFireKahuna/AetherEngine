@@ -234,11 +234,9 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             p = (0.5, 0.5, 0.5)
             size = 1
         } else if element.flags & TRUEHD_ATMOS_ELEMENT_SCREEN_REF != 0 {
-            // Screen-anchored: x across the screen and z −1…1 over its height, while y stays room
-            // depth (header, COORDINATES). A home room has no screen geometry to map that onto
-            // exactly, so the screen spans the front wall's width and its top sits halfway up the
-            // room rather than at the ceiling.
-            p = (p.0, p.1, max(0, p.2) * 0.5)
+            let room = roomPosition(screenAnchored: SIMD3(p.0, p.1, p.2), screenFactor: element.screen_factor,
+                                    depthFactor: element.depth_factor, screen: .frontWall)
+            p = (room.x, room.y, room.z)
         }
         var excluded = excludedSpeakers(zone: element.zone)
         if element.kind == TRUEHD_ATMOS_ELEMENT_OBJECT, element.flags & TRUEHD_ATMOS_ELEMENT_ELEVATION == 0 {
@@ -250,6 +248,29 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             size: size,
             snap: element.flags & TRUEHD_ATMOS_ELEMENT_SNAP != 0,
             excluded: excluded)
+    }
+
+    /// The playback screen in room coordinates (TS 103 420 4.2.1: x 0…1 left to right, z −1…1 floor to
+    /// ceiling): its bottom-left corner and its size. The stream does not carry it. Without one the
+    /// screen fills the front wall, which makes the screen-anchored mapping the identity.
+    struct PlaybackScreen: Equatable {
+        var origin: SIMD3<Float>
+        var width: Float
+        var height: Float
+        static let frontWall = PlaybackScreen(origin: SIMD3(0, 0, -1), width: 1, height: 2)
+    }
+
+    /// TS 103 420 5.2.1.3: a screen-anchored position (x across the screen, z −1…1 over its height,
+    /// y room depth) as a room position. At the front wall it sits on the screen; deeper in the room it
+    /// moves toward the raw coordinates by `screenFactor`, weighted by depth to the power `depthFactor`.
+    static func roomPosition(screenAnchored p: SIMD3<Float>, screenFactor: Float, depthFactor: Float,
+                             screen: PlaybackScreen) -> SIMD3<Float> {
+        let onScreen = SIMD3(screen.origin.x + screen.width * p.x, p.y,
+                             screen.origin.z + screen.height / 2 * (p.z + 1))          // C_R
+        let blend = screenFactor * p + (1 - screenFactor) * onScreen                    // M1 C_S + (I - M1) C_R
+        let weight = pow(max(p.y, 0), depthFactor)                                      // y^depth_factor
+        let mixed = weight * blend + (1 - weight) * onScreen                            // M2 (…) + (I - M2) C_R
+        return SIMD3(mixed.x, p.y, mixed.z)
     }
 
     /// Built once: they run per changed element on every metadata update.
