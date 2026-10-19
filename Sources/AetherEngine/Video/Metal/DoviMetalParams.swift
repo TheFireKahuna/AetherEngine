@@ -1,5 +1,6 @@
 // Only with the DualLayerDolbyVision trait (off by default).
 #if DualLayerDolbyVision
+import CoreVideo
 import Foundation
 
 /// How one reshaping piece is evaluated (`mapping_idc`).
@@ -27,6 +28,25 @@ enum DoviDither: UInt32, Sendable {
     case fullPrecision = 3
 }
 
+/// The buffer the composer hands downstream, and how the 12-bit VDR code is put into it.
+enum DoviOutputMode: String, CaseIterable, Sendable {
+    /// P010 (`x420`), quantised to 10 bits with the parameters' dither mode (default ordered dither).
+    case p010 = "p010"
+    /// P010 rounded to the nearest 10-bit code, no dither: the control that keeps nothing below 10 bits.
+    case p010Rounded = "p010-round"
+    /// P010 with ``DoviDither/fullPrecision``: the bits below the 10-bit code go in P010's low bits,
+    /// which CoreVideo defines as padding, so whether a consumer keeps them is undefined.
+    case p010FullPrecision = "p010-full"
+    /// 16-bit 4:2:2 (`sv22`) with ``DoviDither/fullPrecision``. Its video range (luma 4096...60160) is
+    /// the 10-bit range shifted left 6, so the full-precision word is a defined `sv22` value: the format
+    /// itself says every bit is picture. Chroma is the 4:2:0 result repeated on both rows.
+    case sv22 = "sv22"
+
+    var pixelFormat: OSType {
+        self == .sv22 ? kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+    }
+}
+
 /// `DoviMetalParams.flags` bits.
 struct DoviComposerFlags: OptionSet, Sendable {
     let rawValue: UInt32
@@ -37,6 +57,9 @@ struct DoviComposerFlags: OptionSet, Sendable {
     /// The luma curve carries at least one MMR piece, so the luma kernel has to
     /// read the base-layer chroma planes as well.
     static let lumaMmr = DoviComposerFlags(rawValue: 0x2)
+    /// The output chroma plane is 4:2:2 (``DoviOutputMode/sv22``), so the chroma kernel writes each
+    /// 4:2:0 sample to both rows it covers. Set by the composer from its output mode, not by the parser.
+    static let chroma422 = DoviComposerFlags(rawValue: 0x4)
 }
 
 /// Piecewise reshaping curve for one component; mirrors

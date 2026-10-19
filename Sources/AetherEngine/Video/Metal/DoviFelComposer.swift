@@ -37,6 +37,10 @@ final class DoviFelComposer: @unchecked Sendable {
     private var pixelBufferPool: CVPixelBufferPool?
     private var poolWidth: Int = 0
     private var poolHeight: Int = 0
+    private var poolPixelFormat: OSType = 0
+    /// This composer's output mode in place of the process-wide ``outputMode``. For tests, which run in
+    /// parallel and must not change the mode under each other.
+    var outputModeOverride: DoviOutputMode?
     private var poolBuffers: [WeakPoolBuffer] = []
     private var poolBufferHighWaterMark = 0
     /// Set by ``releaseOutputPool()``. A composition arriving after teardown (a VideoToolbox callback still in
@@ -250,7 +254,7 @@ final class DoviFelComposer: @unchecked Sendable {
 
     // MARK: - Pixel Buffer Pool Management
 
-    private func ensurePool(width: Int, height: Int) -> CVPixelBufferPool? {
+    private func ensurePool(width: Int, height: Int, pixelFormat: OSType = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) -> CVPixelBufferPool? {
         lock.lock()
         defer { lock.unlock() }
 
@@ -258,7 +262,7 @@ final class DoviFelComposer: @unchecked Sendable {
         // earlier look and this point cannot leave a fresh pool behind that nothing will release.
         guard !tornDown else { return nil }
 
-        if let pool = pixelBufferPool, poolWidth == width, poolHeight == height {
+        if let pool = pixelBufferPool, poolWidth == width, poolHeight == height, poolPixelFormat == pixelFormat {
             return pool
         }
 
@@ -269,7 +273,7 @@ final class DoviFelComposer: @unchecked Sendable {
         ]
 
         let pixelBufferAttributes: [CFString: Any] = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelBufferPixelFormatTypeKey: pixelFormat,
             kCVPixelBufferWidthKey: width,
             kCVPixelBufferHeightKey: height,
             kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any],
@@ -291,6 +295,7 @@ final class DoviFelComposer: @unchecked Sendable {
         self.pixelBufferPool = pool
         self.poolWidth = width
         self.poolHeight = height
+        self.poolPixelFormat = pixelFormat
         poolBuffers.removeAll()
         poolBufferHighWaterMark = 0
         return pool
@@ -630,6 +635,17 @@ final class DoviFelComposer: @unchecked Sendable {
         set { residualSwitch.withLock { $0 = newValue } }
     }
 
+    private static let outputModeSwitch = OSAllocatedUnfairLock(initialState: DoviOutputMode.p010)
+
+    /// The output buffer format and how the 12-bit VDR code is quantised into it (``DoviOutputMode``).
+    /// An experiment switch for the 12-bit display-path question: takes effect from the next composed
+    /// frame (the pool is rebuilt on a format change) and applies to every composer in the process.
+    /// Default ``DoviOutputMode/p010``, the validated path.
+    static var outputMode: DoviOutputMode {
+        get { outputModeSwitch.withLock { $0 } }
+        set { outputModeSwitch.withLock { $0 = newValue } }
+    }
+
     static let outputPoolAllocationThreshold = SampleBufferRenderer.felVideoLookaheadFrames + 2 + maxFramesInFlight + 1
     nonisolated(unsafe) private static let poolAuxAttributes: CFDictionary = [
         kCVPixelBufferPoolAllocationThresholdKey: outputPoolAllocationThreshold
@@ -729,7 +745,9 @@ final class DoviFelComposer: @unchecked Sendable {
         let elH = CVPixelBufferGetHeight(enhancementBuffer)
 
         guard blW > 0, blH > 0, elW > 0, elH > 0 else { return nil }
-        guard let pool = ensurePool(width: blW, height: blH) else { return nil }
+        // Read once per frame, so a switch mid-stream never pairs one mode's pool with another's kernels.
+        let outputMode = outputModeOverride ?? Self.outputMode
+        guard let pool = ensurePool(width: blW, height: blH, pixelFormat: outputMode.pixelFormat) else { return nil }
 
         // A base-layer frame is NOT close to the composed one on real titles: measured on the three
         // real FEL files its 10-bit luma differs by a mean of ~8 codes (p99 up to 230) on two and ~79
@@ -772,7 +790,8 @@ final class DoviFelComposer: @unchecked Sendable {
               let elYTex = makeTexture(from: enhancementBuffer, plane: 0, format: .r16Unorm, width: elW, height: elH, keepAlive: &keepAliveTextures),
               let elUvTex = makeTexture(from: enhancementBuffer, plane: 1, format: .rg16Unorm, width: elW / 2, height: elH / 2, keepAlive: &keepAliveTextures),
               let outYTex = makeTexture(from: dst, plane: 0, format: .r16Uint, width: blW, height: blH, keepAlive: &keepAliveTextures),
-              let outUvTex = makeTexture(from: dst, plane: 1, format: .rg16Uint, width: blW / 2, height: blH / 2, keepAlive: &keepAliveTextures) else {
+              let outUvTex = makeTexture(from: dst, plane: 1, format: .rg16Uint, width: blW / 2,
+                                         height: outputMode == .sv22 ? blH : blH / 2, keepAlive: &keepAliveTextures) else {
             return nil
         }
 
@@ -793,6 +812,12 @@ final class DoviFelComposer: @unchecked Sendable {
         let rawBuffer = UnsafeMutableRawBufferPointer(start: paramBuffer.contents(), count: DoviMetalParams.serializedSize)
         var serialized = metalParams
         if !Self.residualEnabled { serialized.flags.insert(.disableResidual) }
+        switch outputMode {
+        case .p010: break
+        case .p010Rounded: serialized.ditherMode = .none
+        case .p010FullPrecision, .sv22: serialized.ditherMode = .fullPrecision
+        }
+        if outputMode == .sv22 { serialized.flags.insert(.chroma422) }
         serialized.serialize(into: rawBuffer)
 
         let lutBuffer = lumaLutBuffers[paramSlot]
@@ -985,6 +1010,7 @@ final class DoviFelComposer: @unchecked Sendable {
         poolBufferHighWaterMark = 0
         poolWidth = 0
         poolHeight = 0
+        poolPixelFormat = 0
     }
 
     // MARK: - ABI Layout Probe

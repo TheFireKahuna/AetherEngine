@@ -2,8 +2,20 @@
 import Foundation
 @_spi(Diagnostics) import AetherEngine
 
+/// Sets `AetherEngine.felOutputMode` from `--fel-output`, or exits 64 on an unknown mode.
+func applyFelOutputFlag(_ spec: String?) {
+    guard let spec else { return }
+    guard let mode = AetherEngine.FelOutputMode(rawValue: spec) else {
+        let modes = AetherEngine.FelOutputMode.allCases.map(\.rawValue).joined(separator: ", ")
+        print("ERROR: --fel-output takes one of \(modes), got '\(spec)'")
+        exit(64)
+    }
+    AetherEngine.felOutputMode = mode
+    print("[aetherctl] FEL output: \(mode.rawValue)")
+}
+
 /// Standalone test runner for Dolby Vision Profile 7 FEL dual-layer decoding and Metal reconstruction.
-func runFelTest(url: URL, maxFrames: Int = 100) -> Int32 {
+func runFelTest(url: URL, maxFrames: Int = 100, probePoint: (x: Int, y: Int)? = nil) -> Int32 {
     print("==================================================")
     print("aetherctl feltest: Dolby Vision Profile 7 FEL Engine")
     print("Source: \(url.path)")
@@ -12,7 +24,7 @@ func runFelTest(url: URL, maxFrames: Int = 100) -> Int32 {
 
     let result: FelProbeResult
     do {
-        result = try AetherEngine.felDecodeProbe(url: url, maxPackets: maxFrames)
+        result = try AetherEngine.felDecodeProbe(url: url, maxPackets: maxFrames, probePoint: probePoint)
     } catch {
         print("ERROR: felDecodeProbe failed: \(error)")
         return 1
@@ -33,6 +45,17 @@ func runFelTest(url: URL, maxFrames: Int = 100) -> Int32 {
     print("Avg Chroma Cb:            \(String(format: "%.1f", result.avgCb)) (std dev: \(String(format: "%.2f", result.stdDevCb)))")
     print("Avg Chroma Cr:            \(String(format: "%.1f", result.avgCr)) (std dev: \(String(format: "%.2f", result.stdDevCr)))")
     print("Chroma Validity Check:    \(result.isChromaValid ? "PASS (active picture)" : "FAIL (collapsed to 64)")")
+    print("Luma below 10 bits:       \(String(format: "%.1f", result.lumaSubTenBitFraction * 100))% of samples carry bits below the 10-bit code")
+    if let pt = probePoint {
+        // Runs of identical words, so a phase switch shows as one line: "frames a-b: word (code + frac)".
+        print("--- Luma at (\(pt.x), \(pt.y)), raw 16-bit word = 10-bit code + fraction in 1/64 ---")
+        var start = 0
+        for i in 1...result.probeWords.count where i == result.probeWords.count || result.probeWords[i] != result.probeWords[start] {
+            let w = result.probeWords[start]
+            print("frames \(start)-\(i - 1): \(w) = \(w >> 6) + \(w & 0x3F)/64")
+            start = i
+        }
+    }
     print("--- Dolby Vision Display Metadata ---")
     print("Frames w/ RPU attachment: \(result.framesWithDVMetadata) / \(result.framesReconstructed)")
     print("Distinct RPU payloads:    \(result.distinctDVPayloads)")

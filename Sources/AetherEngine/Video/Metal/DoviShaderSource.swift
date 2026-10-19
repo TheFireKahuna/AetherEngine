@@ -43,6 +43,7 @@ typedef int  dovi_i32;
 /* ---- flags ---- */
 #define DOVI_FLAG_DISABLE_RESIDUAL    0x1u /* disable_residual_flag, or el_type == MEL */
 #define DOVI_FLAG_LUMA_MMR            0x2u /* luma curve has at least one MMR piece */
+#define DOVI_FLAG_CHROMA_422          0x4u /* output chroma plane is 4:2:2 (sv22): each sample covers two rows */
 
 /* Piecewise reshaping curve for one component.
  *
@@ -498,6 +499,18 @@ kernel void dovi_compose_luma(
     out_y_tex.write(ushort4(ushort(out_y << 6), 0, 0, 0), gid);
 }
 
+// One composed chroma sample, at its 4:2:0 site. A 4:2:2 output plane has twice the rows,
+// so the sample is written to both (vertical nearest-neighbour; the BL chroma is 4:2:0).
+static inline void dovi_write_chroma(texture2d<ushort, access::write> out_uv_tex, ushort4 uv,
+                                     uint2 gid, uint flags) {
+    if ((flags & DOVI_FLAG_CHROMA_422) != 0u) {
+        out_uv_tex.write(uv, uint2(gid.x, 2u * gid.y));
+        out_uv_tex.write(uv, uint2(gid.x, 2u * gid.y + 1u));
+    } else {
+        out_uv_tex.write(uv, gid);
+    }
+}
+
 // Chroma: both chroma planes in one pass, since an MMR curve for Cb and for Cr
 // reads the same three base-layer components.
 kernel void dovi_compose_chroma(
@@ -585,15 +598,16 @@ kernel void dovi_compose_chroma(
                                dovi_dither(gid, params.frame_index, uint2(1u, 1u)), 64, 960);
 
     if (params.dither_mode == DOVI_DEBUG_RAW_VDR) {
-        out_uv_tex.write(ushort4(ushort(vdr_cb << 4), ushort(vdr_cr << 4), 0, 0), gid);
+        dovi_write_chroma(out_uv_tex, ushort4(ushort(vdr_cb << 4), ushort(vdr_cr << 4), 0, 0), gid, params.flags);
         return;
     }
     if (params.dither_mode == DOVI_DITHER_FULL_PRECISION) {
-        out_uv_tex.write(ushort4(ushort(dovi_full_precision(vdr_cb, params.vdr_scale, 64, 960)),
-                                 ushort(dovi_full_precision(vdr_cr, params.vdr_scale, 64, 960)), 0, 0), gid);
+        dovi_write_chroma(out_uv_tex, ushort4(ushort(dovi_full_precision(vdr_cb, params.vdr_scale, 64, 960)),
+                                              ushort(dovi_full_precision(vdr_cr, params.vdr_scale, 64, 960)), 0, 0),
+                          gid, params.flags);
         return;
     }
-    out_uv_tex.write(ushort4(ushort(out_cb << 6), ushort(out_cr << 6), 0, 0), gid);
+    dovi_write_chroma(out_uv_tex, ushort4(ushort(out_cb << 6), ushort(out_cr << 6), 0, 0), gid, params.flags);
 }
 
 /* ============================================================================

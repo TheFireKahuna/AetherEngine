@@ -395,6 +395,32 @@ extension DoviGpuEdgeCaseTests {
         let rounded = try Self.composeConstant(composer, bl: (500, 512, 512), el: (514, 512, 512), params: r)
         #expect(Self.rawWord(rounded, plane: 0) == 500 << 6)
     }
+
+    @Test("sv22 output carries the full-precision words in a 4:2:2 buffer, chroma on both rows")
+    func sv22KeepsLowBitsAndDoublesChromaRows() throws {
+        let composer = try #require(DoviFelComposer())
+        composer.outputModeOverride = .sv22
+        // As fullPrecisionKeepsLowBits: VDR 2001 = 500.25 in 10-bit codes. Chroma BL 600 with a +2
+        // residual -> VDR 2401 = 600.25. The params ask for no dither; sv22 implies full precision.
+        var p = Self.params(); p.ditherMode = .none
+        let out = try Self.composeConstant(composer, bl: (500, 600, 512), el: (514, 514, 512), params: p)
+        #expect(CVPixelBufferGetPixelFormatType(out) == kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange)
+        #expect(CVPixelBufferGetHeightOfPlane(out, 1) == CVPixelBufferGetHeight(out), "4:2:2: one chroma row per luma row")
+        #expect(Self.rawWord(out, plane: 0) == 2001 * 16)
+        // Raw 16-bit words (readPlane drops the low 6 bits), over every row of the chroma plane.
+        CVPixelBufferLockBaseAddress(out, .readOnly); defer { CVPixelBufferUnlockBaseAddress(out, .readOnly) }
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(out, 1) / 2
+        let uv = CVPixelBufferGetBaseAddressOfPlane(out, 1)!.assumingMemoryBound(to: UInt16.self)
+        var cb = Set<Int>(), cr = Set<Int>()
+        for row in 0..<CVPixelBufferGetHeightOfPlane(out, 1) {
+            for col in 0..<CVPixelBufferGetWidthOfPlane(out, 1) {
+                cb.insert(Int(uv[row * stride + col * 2]))
+                cr.insert(Int(uv[row * stride + col * 2 + 1]))
+            }
+        }
+        #expect(cb == [2401 * 16], "every chroma row composed, odd rows included, sub-10-bit bits kept")
+        #expect(cr == [512 << 6])
+    }
 }
 
 // MARK: - DoViBaker input and prediction clamps
