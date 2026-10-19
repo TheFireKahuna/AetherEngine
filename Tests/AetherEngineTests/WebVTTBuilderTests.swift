@@ -98,4 +98,22 @@ struct WebVTTBuilderTests {
         let vtt = WebVTTBuilder.segment(cues: [(start: 0, end: 1, text: "{\\i1}Tom & Jerry")])
         #expect(vtt.contains("00:00:00.000 --> 00:00:01.000\n<i>Tom &amp; Jerry</i>\n\n"))
     }
+
+    @Test("SRT formatting tags WebVTT cannot express are stripped, not shown as text")
+    func stripsUnrepresentableSRTTags() {
+        #expect(cueText("<font color=\"#ffff00\">yellow</font> text") == "yellow text")
+        #expect(cueText("<font color='red' face=\"Arial\"><i>both</i></font>") == "<i>both</i>")
+        #expect(cueText("<i><font color=red>nested</font></i>") == "<i>nested</i>")
+        #expect(cueText("<FONT COLOR=\"#00FF00\">LOUD</FONT>") == "LOUD")
+        #expect(cueText("<s>struck</s> <S>also</S>") == "struck also")
+        #expect(cueText("<span style=\"color:red\">red</span><SPAN>x</SPAN>") == "redx")
+    }
+
+    @Test("angle-bracket text that is not a formatting tag stays literal")
+    func keepsNonTagAngleText() {
+        #expect(cueText("<laughs>") == "&lt;laughs&gt;")
+        #expect(cueText("a < b > c") == "a &lt; b &gt; c")
+        #expect(cueText("<fonts> <spanner> <sigh>") == "&lt;fonts&gt; &lt;spanner&gt; &lt;sigh&gt;")
+        #expect(cueText("<font color=red unterminated") == "&lt;font color=red unterminated")
+    }
 }

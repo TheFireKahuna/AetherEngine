@@ -61,7 +61,9 @@ enum WebVTTBuilder {
     /// crossed, stray and unterminated tags still come out properly nested and empty spans vanish.
     /// Every other override block is dropped, as is the text of ASS drawings (`\p1` .. `\p0`),
     /// which is vector commands, not words. An unclosed `{` stays literal, as in
-    /// `MovTextSampleBuilder.sanitize`.
+    /// `MovTextSampleBuilder.sanitize`. SRT/HTML tags WebVTT has no tag for (`<font ...>`, `<s>`,
+    /// `<span ...>`) are dropped rather than escaped: escaping would print them on screen, where a
+    /// WebVTT parser used to swallow them as unknown tags.
     static func cueText(_ raw: String) -> String {
         let text = SubtitleRectText.capped(raw)
         var styled: [(char: Character, styles: [InlineStyle])] = []
@@ -101,6 +103,10 @@ enum WebVTTBuilder {
             }
             if c == "<", let (style, opens, length) = srtTag(chars, at: i) {
                 set(style, opens)
+                i += length
+                continue
+            }
+            if c == "<", let length = unrepresentableTagLength(chars, at: i) {
                 i += length
                 continue
             }
@@ -170,6 +176,26 @@ enum WebVTTBuilder {
               let letter = chars[j].lowercased().first,
               let style = InlineStyle(rawValue: letter) else { return nil }
         return (style, !closing, j + 2 - index)
+    }
+
+    /// SRT/HTML formatting tags that carry nothing WebVTT can express.
+    private static let unrepresentableTags: Set<String> = ["font", "s", "span"]
+
+    /// Length of an opening or closing `unrepresentableTags` tag starting at `index` (any case,
+    /// any attributes, on one line), or nil. The name must end at `>` or whitespace, so `<fonts>`
+    /// and `<spanner>` stay literal text, as does a tag with no `>` before the line ends.
+    private static func unrepresentableTagLength(_ chars: [Character], at index: Int) -> Int? {
+        var j = index + 1
+        if j < chars.count, chars[j] == "/" { j += 1 }
+        var name = ""
+        while j < chars.count, chars[j].isLetter { name.append(chars[j]); j += 1 }
+        guard unrepresentableTags.contains(name.lowercased()), j < chars.count,
+              chars[j] == ">" || (chars[j].isWhitespace && !chars[j].isNewline) else { return nil }
+        while j < chars.count, chars[j] != ">" {
+            if chars[j] == "<" || chars[j].isNewline { return nil }
+            j += 1
+        }
+        return j < chars.count ? j + 1 - index : nil
     }
 
     private static func timestamp(_ seconds: Double) -> String {
