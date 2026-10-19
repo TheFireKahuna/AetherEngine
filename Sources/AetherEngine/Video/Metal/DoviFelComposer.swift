@@ -864,7 +864,7 @@ final class DoviFelComposer: @unchecked Sendable {
     }
 
     /// Precomputes the 1024-entry luma prediction table when luma is polynomial (dolby-vision-fel.md §5.6).
-    private func populateLumaLut(into ptr: UnsafeMutablePointer<Float>, params: DoviMetalParams) {
+    func populateLumaLut(into ptr: UnsafeMutablePointer<Float>, params: DoviMetalParams) {
         let poly = params.polyY
         let blMax = Float(params.blMax) + 1   // normalise by 2^bits, as the kernels do
         guard poly.numPivots >= 2 else {
