@@ -531,10 +531,10 @@ final class DoviFelComposer: @unchecked Sendable {
 
     /// Blocks until one of ``maxFramesInFlight`` compositions is free.
     ///
-    /// dolby-vision-fel.md §5.6: the decoder calls this with no lock held, on the
-    /// VideoToolbox output thread that produced the `compose` action, so the
-    /// backpressure lands on that thread instead of stalling `deliver`, the
-    /// other layer's callback, `flush()` and `close()` behind the decoder lock.
+    /// dolby-vision-fel.md §5.6: the decoder calls this with no lock held, on its
+    /// compose queue (`DualLayerVideoDecoder.composeQueue`), so the backpressure
+    /// never stalls `deliver`, a VideoToolbox output callback, `flush()` or
+    /// `close()` behind the decoder lock or the callback thread.
     func acquireSlot() {
         inFlight.wait()
         slotLock.lock()
