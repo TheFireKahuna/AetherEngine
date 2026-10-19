@@ -40,7 +40,8 @@ protocol VideoDecodingPipeline: AnyObject, Sendable {
     func flush()
     /// End of source or a live seam: delivers what the decoder still owes before the `flush()` the host
     /// makes next. `flush()` of a decoder that delivers what it drains is enough, so the default does
-    /// nothing; a decoder whose `flush()` discards (the dual-layer one) overrides it. Seeks never call it.
+    /// nothing; a decoder whose `flush()` discards (the dual-layer and libavcodec ones) overrides it.
+    /// Seeks never call it.
     func drainForEndOfStream()
     func close()
 }

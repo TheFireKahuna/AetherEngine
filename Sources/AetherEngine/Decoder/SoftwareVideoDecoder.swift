@@ -537,31 +537,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 if deinterlacer.ensureGraph(frame: f, timeBase: timeBase),
                    deinterlacer.push(f) >= 0 {
                     if filtered == nil { filtered = av_frame_alloc() }
-                    if let out = filtered {
-                        while deinterlacer.pull(into: out) >= 0 {  // filter holds 1-2 frames lookahead; push can yield EAGAIN
-                            // Untimestamped output is unschedulable: yadif's SECOND field is
-                            // cur.pts + next.pts, which is NOPTS whenever either source frame
-                            // lacked a PTS (live TS delivers those); an invalid-PTS sample
-                            // can't be paced by the render synchronizer and can wedge the
-                            // display queue. Drop it; at field rate the neighbor field covers.
-                            if out.pointee.pts == Int64.min {
-                                droppedUntimestampedFields += 1
-                                if droppedUntimestampedFields == 1 || droppedUntimestampedFields % 250 == 0 {
-                                    EngineLog.emit(
-                                        "[SWDecoder] dropped \(droppedUntimestampedFields) untimestamped deinterlaced frame(s)",
-                                        category: .swPlayback
-                                    )
-                                }
-                                av_frame_unref(out)
-                                continue
-                            }
-                            // Filtered PTS rides the sink's time_base, NOT the stream's: yadif/bwdif
-                            // halve the link time_base, and send_field puts the two fields of a frame
-                            // on odd/even ticks of that halved base (see DeinterlaceFilter class doc).
-                            emit(out, timeBase: deinterlacer.outputTimeBase)
-                            av_frame_unref(out)
-                        }
-                    }
+                    if let out = filtered { emitDeinterlacedFrames(into: out) }
                     lock.unlock()
                     continue
                 }
@@ -575,6 +551,72 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         av_frame_free(&frame)
         if filtered != nil { av_frame_free(&filtered) }
+    }
+
+    /// Pull and emit everything the deinterlacer has ready. Caller holds `lock`, as for `emit`.
+    private func emitDeinterlacedFrames(into out: UnsafeMutablePointer<AVFrame>) {
+        while deinterlacer.pull(into: out) >= 0 {  // filter holds 1-2 frames lookahead; push can yield EAGAIN
+            // Untimestamped output is unschedulable: yadif's SECOND field is
+            // cur.pts + next.pts, which is NOPTS whenever either source frame
+            // lacked a PTS (live TS delivers those); an invalid-PTS sample
+            // can't be paced by the render synchronizer and can wedge the
+            // display queue. Drop it; at field rate the neighbor field covers.
+            if out.pointee.pts == Int64.min {
+                droppedUntimestampedFields += 1
+                if droppedUntimestampedFields == 1 || droppedUntimestampedFields % 250 == 0 {
+                    EngineLog.emit(
+                        "[SWDecoder] dropped \(droppedUntimestampedFields) untimestamped deinterlaced frame(s)",
+                        category: .swPlayback
+                    )
+                }
+                av_frame_unref(out)
+                continue
+            }
+            // Filtered PTS rides the sink's time_base, NOT the stream's: yadif/bwdif
+            // halve the link time_base, and send_field puts the two fields of a frame
+            // on odd/even ticks of that halved base (see DeinterlaceFilter class doc).
+            emit(out, timeBase: deinterlacer.outputTimeBase)
+            av_frame_unref(out)
+        }
+    }
+
+    /// End of source or a live seam: deliver what libavcodec and the deinterlacer still hold, then
+    /// leave both ready to decode again. The protocol default did nothing here, so the host's
+    /// `flush()` discarded it: frame threading keeps up to `thread_count` frames in flight on top of
+    /// the reorder delay, and yadif/bwdif one frame of look-ahead (two fields at field rate), which
+    /// were the last pictures of every software-decoded file and of every segment before a seam.
+    ///
+    /// The NULL packet puts libavcodec in draining mode, and a buffersrc fed EOF refuses frames for
+    /// good, so both are reset here (`avcodec_flush_buffers`, graph teardown) rather than relying on
+    /// the caller's `flush()`: the still extractor's `flush(resetFilterGraph: false)` would otherwise
+    /// keep a graph that can never take another frame. The epoch is not moved, this is not a seek.
+    func drainForEndOfStream() {
+        lock.lock()
+        guard let ctx = codecContext else { lock.unlock(); return }
+        let epoch = _feedEpoch
+        var sendRet = avcodec_send_packet(ctx, nil)
+        lock.unlock()
+        if Self.disposition(forSendResult: sendRet) == .drainAndRetry {
+            drainDecodedFrames()
+            lock.lock()
+            sendRet = codecContext == nil ? FFmpegErr.einval : avcodec_send_packet(ctx, nil)
+            lock.unlock()
+        }
+        // Exits on AVERROR_EOF once the decoder has handed over its last frame.
+        if sendRet >= 0 { drainDecodedFrames() }
+
+        lock.lock()
+        defer { lock.unlock() }
+        guard codecContext != nil else { return }
+        // A flush that landed during the drain retired this stream; its frames are not owed.
+        if epoch == _feedEpoch, deinterlacer.isActive, deinterlacer.pushEndOfStream() >= 0,
+           let out = av_frame_alloc() {
+            emitDeinterlacedFrames(into: out)
+            var owned: UnsafeMutablePointer<AVFrame>? = out
+            av_frame_free(&owned)
+        }
+        deinterlacer.teardown()
+        avcodec_flush_buffers(ctx)
     }
 
     /// Convert + deliver one decoded (or deinterlaced) frame: skip threshold, pixel buffer
