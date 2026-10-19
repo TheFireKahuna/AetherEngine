@@ -16,14 +16,21 @@ import AetherLibavutil
 /// `colr` 9 / 16 / 9 and neither box. `avformat_find_stream_info` does not help: the decoder attaches
 /// these messages to frames, not to the stream.
 ///
+/// The ambient viewing environment message (148) is read in the same pass and lands in `amve`, which
+/// movenc n8.1 writes from its side data the same way (`mov_write_amve_tag`). It does not gate or
+/// extend the scan: it is rare, and a source's own `amve` box already reaches the init, since the MP4
+/// demuxer lifts it into stream side data (`mov_read_amve`) and the stream copy carries that over.
+///
 /// A container statement wins: only a type the codecpar lacks is added.
 struct InBandHDRStaticMetadata: Equatable {
     /// mastering_display_colour_volume payload (24 bytes: G, B, R, white point, max / min luminance).
     var masteringDisplay: [UInt8]?
     /// content_light_level_info payload (4 bytes: max_content_light_level, max_pic_average_light_level).
     var contentLightLevel: [UInt8]?
+    /// ambient_viewing_environment payload (8 bytes: ambient_illuminance, ambient_light_x / _y).
+    var ambientViewing: [UInt8]?
 
-    var isEmpty: Bool { masteringDisplay == nil && contentLightLevel == nil }
+    var isEmpty: Bool { masteringDisplay == nil && contentLightLevel == nil && ambientViewing == nil }
 
     /// Read the messages out of one H.264 / HEVC access unit, keeping the first of each.
     mutating func collect(
@@ -42,6 +49,7 @@ struct InBandHDRStaticMetadata: Equatable {
         }
         if masteringDisplay == nil { masteringDisplay = first(137, size: 24) }
         if contentLightLevel == nil { contentLightLevel = first(144, size: 4) }
+        if ambientViewing == nil { ambientViewing = first(148, size: 8) }
     }
 
     /// Add what the codecpar has no side data of its own for; returns the boxes that will now be
@@ -89,6 +97,18 @@ struct InBandHDRStaticMetadata: Equatable {
                 c.pointee.MaxFALL = UInt32(u16(cll, 2))
             }
             added.append("clli")
+        }
+        // Illuminance in 0.0001 lux, chromaticity in 0.00002: libavcodec's denominators again.
+        if let amve = ambientViewing, !has(AV_PKT_DATA_AMBIENT_VIEWING_ENVIRONMENT),
+           let sd = av_packet_side_data_new(
+               &codecpar.pointee.coded_side_data, &codecpar.pointee.nb_coded_side_data,
+               AV_PKT_DATA_AMBIENT_VIEWING_ENVIRONMENT, MemoryLayout<AVAmbientViewingEnvironment>.size, 0) {
+            sd.pointee.data.withMemoryRebound(to: AVAmbientViewingEnvironment.self, capacity: 1) { a in
+                a.pointee.ambient_illuminance = AVRational(num: u32(amve, 0), den: 10000)
+                a.pointee.ambient_light_x = AVRational(num: u16(amve, 4), den: 50000)
+                a.pointee.ambient_light_y = AVRational(num: u16(amve, 6), den: 50000)
+            }
+            added.append("amve")
         }
         return added
     }
