@@ -306,6 +306,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         /// Chroma siting, an extension of the description for the same reason.
         var chromaLocationTop: String?
         var chromaLocationBottom: String?
+        var gammaLevel: Double?
     }
 
     private var loggedLayerFailed = false
@@ -867,7 +868,8 @@ final class SampleBufferRenderer: @unchecked Sendable {
             masteringDisplay: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferMasteringDisplayColorVolumeKey, nil) as? Data,
             contentLightLevel: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferContentLightLevelInfoKey, nil) as? Data,
             chromaLocationTop: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferChromaLocationTopFieldKey, nil) as? String,
-            chromaLocationBottom: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferChromaLocationBottomFieldKey, nil) as? String
+            chromaLocationBottom: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferChromaLocationBottomFieldKey, nil) as? String,
+            gammaLevel: (CVBufferCopyAttachment(pixelBuffer, kCVImageBufferGammaLevelKey, nil) as? NSNumber)?.doubleValue
         )
 
         // Guarded by reorderLock: flush() nils the cache from other threads.
