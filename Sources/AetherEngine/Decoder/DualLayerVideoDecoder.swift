@@ -4,6 +4,7 @@ import Foundation
 import CoreMedia
 import CoreVideo
 import VideoToolbox
+import QuartzCore
 import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
@@ -423,13 +424,27 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// retired). Guarded by `composeBacklog`, which `decode(packet:)` waits on (`waitForComposeBacklog`).
     private let composeBacklog = NSCondition()
     private var composesAwaitingSlot = 0
+    /// When the backlog last reached `maxComposesAwaitingSlot`, or last moved while there (a composition
+    /// got its slot or was dropped as retired): the start of the current wait for GPU progress. nil
+    /// while the backlog is below the limit. Guarded by `composeBacklog`.
+    private var composeBacklogFullSince: CFTimeInterval?
+    /// Bumped by `flush()` and `close()` (`wakeComposeBacklog`), so a feed waiting on the backlog
+    /// returns at once to the seek or teardown instead of waiting for the GPU. Guarded by `composeBacklog`.
+    private var composeBacklogWakeGeneration: UInt64 = 0
+    /// Set once the backlog has stood full with no progress for `composeStallTimeout`: the stall was
+    /// reported and `decode(packet:)` refuses packets from then on. Guarded by `composeBacklog`.
+    private var composeStalled = false
     /// The backlog past which `decode(packet:)` holds the feed back. The parked callback threads used to
     /// be that backpressure; without it a stalled GPU would let VideoToolbox's buffers pile up on the
-    /// queue for as long as the host kept feeding. One queued frame per slot in flight.
+    /// queue for as long as the host kept feeding. One queued frame per slot in flight. The feed waits
+    /// for room with no timeout of its own, so the backlog (and the base and enhancement buffers each
+    /// queued composition holds) is bounded by this whatever the GPU does.
     static let maxComposesAwaitingSlot = DoviFelComposer.maxFramesInFlight
-    /// The longest one `decode(packet:)` call waits on the backlog, so a GPU that never retires slows
-    /// the feed instead of hanging the demux thread (and `flush()`/`close()` behind its caller).
-    static let composeBacklogWait: TimeInterval = 0.5
+    /// How long the backlog may stand full with no composition getting a GPU slot before the stall is
+    /// reported (`VideoDecoderError.composerStalled`). Metal's own watchdog fails a command buffer that
+    /// runs away long before this, and a failed one still returns its slot, so only work that never
+    /// completes at all reaches it.
+    static let composeStallTimeout: TimeInterval = 2
     private var _feedEpoch: UInt64 = 0
     /// True while `flush()` is draining the hardware decoders (dolby-vision-fel.md
     /// §5.8). `HardwareVideoDecoder.flush()` waits for the frames VideoToolbox
@@ -559,8 +574,9 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         lock.unlock()
 
         // No lock held: the backpressure a stalled GPU used to put on the VideoToolbox callback
-        // threads lands on the feed instead.
-        waitForComposeBacklog()
+        // threads lands on the feed instead. A reported stall refuses the packet: nothing it decodes
+        // could be composed, and queuing it would only hold its buffers.
+        guard waitForComposeBacklog() else { return }
 
         if !primed {
             ensurePrimaryDecoder(from: packet)
@@ -1019,7 +1035,12 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                                            params: req.params, frameIndex: req.frameIndex, pts: req.pts)
         }
         composeResultLock.lock(); composeRequestsStarted += 1; composeResultLock.unlock()
-        composeBacklog.lock(); composesAwaitingSlot += 1; composeBacklog.unlock()
+        composeBacklog.lock()
+        composesAwaitingSlot += 1
+        if composesAwaitingSlot >= Self.maxComposesAwaitingSlot, composeBacklogFullSince == nil {
+            composeBacklogFullSince = CACurrentMediaTime()
+        }
+        composeBacklog.unlock()
         // Strong `self`: the decoder outlives a composition it queued, as it did a callback parked in it.
         composeQueue.async { [self] in
             composeOnQueue(req, composer: composer)
@@ -1034,21 +1055,54 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         return req.epoch != _feedEpoch
     }
 
-    /// Waits, for at most `composeBacklogWait`, while `maxComposesAwaitingSlot` or more compositions are
-    /// queued for a GPU slot. Called by `decode(packet:)` with no lock held: the feeding thread absorbs
-    /// the backpressure, never a VideoToolbox callback. Internal for `DualLayerGpuSlotWaitTests`.
-    func waitForComposeBacklog() {
-        let deadline = Date(timeIntervalSinceNow: Self.composeBacklogWait)
+    /// Waits while `maxComposesAwaitingSlot` or more compositions are queued for a GPU slot, until one
+    /// gets its slot (or is dropped as retired), or a `flush()`/`close()` wakes it. Called by
+    /// `decode(packet:)` with no lock held: the feeding thread absorbs the backpressure, never a
+    /// VideoToolbox callback. Returns false once the GPU has made no progress for
+    /// `composeStallTimeout` with the backlog full: the stall is reported once through
+    /// `onFatalDecodeError` and every later call refuses at once. The deadline is only looked at while
+    /// already waiting, so nothing wakes the thread on a timer in normal running. Internal for
+    /// `DualLayerGpuSlotWaitTests`.
+    @discardableResult
+    func waitForComposeBacklog() -> Bool {
         composeBacklog.lock()
-        while composesAwaitingSlot >= Self.maxComposesAwaitingSlot {
-            if !composeBacklog.wait(until: deadline) { break }
+        let wake = composeBacklogWakeGeneration
+        var newlyStalled: Double?
+        while !composeStalled, composesAwaitingSlot >= Self.maxComposesAwaitingSlot,
+              composeBacklogWakeGeneration == wake {
+            let since = composeBacklogFullSince ?? CACurrentMediaTime()
+            let remaining = since + Self.composeStallTimeout - CACurrentMediaTime()
+            if remaining <= 0 || !composeBacklog.wait(until: Date(timeIntervalSinceNow: remaining)),
+               composeBacklogFullSince.map({ CACurrentMediaTime() - $0 >= Self.composeStallTimeout }) ?? false {
+                composeStalled = true
+                newlyStalled = CACurrentMediaTime() - since
+            }
         }
+        let proceed = !composeStalled
         composeBacklog.unlock()
+        if let seconds = newlyStalled {
+            let error = VideoDecoderError.composerStalled(seconds: seconds)
+            EngineLog.emit("[DualLayerVideoDecoder] \(error.localizedDescription); refusing further packets",
+                           category: .swPlayback)
+            onFatalDecodeError?(error)
+        }
+        return proceed
     }
 
     private func leaveComposeBacklog() {
         composeBacklog.lock()
         composesAwaitingSlot -= 1
+        // Progress: below the limit the stall clock stops, at it the clock restarts from now.
+        composeBacklogFullSince = composesAwaitingSlot >= Self.maxComposesAwaitingSlot ? CACurrentMediaTime() : nil
+        composeBacklog.broadcast()
+        composeBacklog.unlock()
+    }
+
+    /// Releases a feed waiting on the backlog, for `flush()` and `close()`: a seek or teardown must not
+    /// wait for the GPU. Takes only `composeBacklog`, a leaf.
+    private func wakeComposeBacklog() {
+        composeBacklog.lock()
+        composeBacklogWakeGeneration &+= 1
         composeBacklog.broadcast()
         composeBacklog.unlock()
     }
@@ -1498,6 +1552,8 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         lock.lock()
         guard !isClosed else { lock.unlock(); return }
         _feedEpoch &+= 1
+        // A feed parked on a full compose backlog returns to the seek now (`composeBacklog` is a leaf).
+        wakeComposeBacklog()
         draining = true
         // Here, not with the queues below: the demux thread may feed post-seek packets while this
         // thread waits on the drain, and those must start from the next IRAP.
@@ -1701,6 +1757,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // larger epoch.
         lock.lock()
         _feedEpoch &+= 1
+        wakeComposeBacklog()   // as in `flush()`: teardown never waits for the GPU
         draining = false
         deliveryNextTicket = 0
         pictureAlignment = Self.makeAlignment()
