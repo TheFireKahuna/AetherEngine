@@ -303,6 +303,9 @@ final class SampleBufferRenderer: @unchecked Sendable {
         /// arrives after its first frame lost every frame from then on to a stale cached description.
         var masteringDisplay: Data?
         var contentLightLevel: Data?
+        /// Chroma siting, an extension of the description for the same reason.
+        var chromaLocationTop: String?
+        var chromaLocationBottom: String?
     }
 
     private var loggedLayerFailed = false
@@ -862,7 +865,9 @@ final class SampleBufferRenderer: @unchecked Sendable {
             parH: (par?[kCVImageBufferPixelAspectRatioHorizontalSpacingKey] as? NSNumber)?.intValue,
             parV: (par?[kCVImageBufferPixelAspectRatioVerticalSpacingKey] as? NSNumber)?.intValue,
             masteringDisplay: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferMasteringDisplayColorVolumeKey, nil) as? Data,
-            contentLightLevel: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferContentLightLevelInfoKey, nil) as? Data
+            contentLightLevel: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferContentLightLevelInfoKey, nil) as? Data,
+            chromaLocationTop: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferChromaLocationTopFieldKey, nil) as? String,
+            chromaLocationBottom: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferChromaLocationBottomFieldKey, nil) as? String
         )
 
         // Guarded by reorderLock: flush() nils the cache from other threads.
