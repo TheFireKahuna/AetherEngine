@@ -1,4 +1,5 @@
 import Testing
+import AetherLibavutil
 @testable import AetherEngine
 
 @Suite("FrameRateSnap")
@@ -41,6 +42,25 @@ struct FrameRateSnapTests {
         #expect(FrameRateSnap.snap(23.98) == 23.976)
         #expect(FrameRateSnap.snap(23.995) == 23.976)
         #expect(FrameRateSnap.snap(24.002) == 23.976)
+    }
+
+    @Test("The stream's rationals: 24/1 reaches 24 Hz unless r_frame_rate says 24000/1001")
+    func streamRationalsResolveTwentyFour() {
+        func snapped(_ avg: (Int32, Int32), _ r: (Int32, Int32)) -> Double? {
+            AetherEngine.frameRate(avg: AVRational(num: avg.0, den: avg.1), r: AVRational(num: r.0, den: r.1))
+                .flatMap(FrameRateSnap.snap)
+        }
+        #expect(snapped((24, 1), (24, 1)) == 24)
+        #expect(snapped((24, 1), (0, 0)) == 24)
+        #expect(snapped((0, 0), (24, 1)) == 24)
+        #expect(snapped((24000, 1001), (24000, 1001)) == 23.976)
+        #expect(snapped((24000, 1001), (24, 1)) == 23.976)
+        // The two estimates disagree on 24 against film NTSC (a 1 ms timebase cannot tell them apart): ambiguous.
+        #expect(snapped((24, 1), (24000, 1001)) == 23.976)
+        // A field-rate r_frame_rate is not a disagreement about 24.
+        #expect(snapped((24, 1), (48, 1)) == 24)
+        #expect(snapped((30, 1), (30000, 1001)) == 30)
+        #expect(snapped((0, 0), (0, 0)) == nil)
     }
 
     @Test("30/60 and their 1001 rates snap to themselves; 25/1 to 25")
