@@ -105,6 +105,28 @@ final class AudioBridge: @unchecked Sendable {
         }
     }
 
+    /// Options every bridge resampler gets between `swr_alloc_set_opts2` and `swr_init`; both were
+    /// allocated with none.
+    ///
+    /// - `rematrix_maxval` 1.0: libswresample normalises a downmix only for an integer output, so the
+    ///   E-AC-3 arm (FLTP) folded a 7.1 source's sides into its backs at sqrt(1/2) on top of the backs'
+    ///   own unity, and an in-phase full-scale passage reached the encoder at 1.71 (+4.6 dB), which it
+    ///   clips. Normalised, the whole fold sits 4.6 dB lower instead; the FLAC arm already behaved so.
+    /// - `filter_size` 64 (default 32): a sharper, lower-ripple anti-alias filter where a rate does
+    ///   change (96 kHz into E-AC-3's 48, #548). No cost where in and out rates match.
+    /// - `dither_method` triangular_hp, only into S16: TPDF noise-shaped dither instead of plain
+    ///   truncation wherever a 16-bit output still requantises (a resample or a downmix into a
+    ///   16-bit FLAC). A 16-bit source into a 16-bit FLAC with nothing to convert is not dithered by
+    ///   libswresample, and the 24-bit path is never dithered, so both stay bit-exact.
+    static func applyResamplerQuality(_ swr: OpaquePointer, outputFormat: AVSampleFormat) {
+        let options = UnsafeMutableRawPointer(swr)
+        _ = av_opt_set_double(options, "rematrix_maxval", 1.0, 0)
+        _ = av_opt_set_int(options, "filter_size", 64, 0)
+        if av_get_packed_sample_fmt(outputFormat) == AV_SAMPLE_FMT_S16 {
+            _ = av_opt_set_int(options, "dither_method", Int64(SWR_DITHER_TRIANGULAR_HIGHPASS.rawValue), 0)
+        }
+    }
+
     /// The sample rates an encoder in THIS build accepts, as libavcodec itself reports them. Empty means
     /// unconstrained (the codec advertises no list), which is the answer for FLAC.
     ///
@@ -474,6 +496,7 @@ final class AudioBridge: @unchecked Sendable {
             cleanup()
             throw AudioBridgeError.resamplerAllocFailed(code: swrRet)
         }
+        Self.applyResamplerQuality(swrCtx!, outputFormat: pcmSampleFmt)
         let initRet = swr_init(swrCtx)
         guard initRet >= 0 else {
             cleanup()
@@ -1048,6 +1071,7 @@ final class AudioBridge: @unchecked Sendable {
             0,
             nil
         )
+        if setRet >= 0, let scratch { Self.applyResamplerQuality(scratch, outputFormat: pcmSampleFmt) }
         let initRet = setRet >= 0 && scratch != nil ? swr_init(scratch) : setRet
         guard initRet >= 0 else {
             swr_free(&scratch)
