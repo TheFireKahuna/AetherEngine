@@ -29,7 +29,7 @@ struct DoviCpuModelTests {
         func code(_ x: Int, _ y: Int, _ c: Int = 0) -> Int {
             Int(raw[(y * width + x) * components + c] >> 6)
         }
-        /// Raw 16-bit word, for the enhancement-layer filter (the GPU filters the UNORM word).
+        /// Raw 16-bit word.
         func word(_ x: Int, _ y: Int, _ c: Int = 0) -> Double {
             Double(raw[(y * width + x) * components + c])
         }
@@ -112,7 +112,7 @@ struct DoviCpuModelTests {
         }
 
         /// Bilinear sample of an enhancement-layer plane at base-layer sample (x, y) of a plane `baseW` x
-        /// `baseH`, as a 10-bit code (the word is UNORM x 65535 / 64). Luma samples sit at pixel centres;
+        /// `baseH`: the 10-bit codes interpolated, then rounded half up. Luma samples sit at pixel centres;
         /// chroma (`cosited`) is co-sited with the top-left luma sample, so the two grids share sample 0.
         func elCode(_ el: Plane, comp: Int, x: Int, y: Int, baseW: Int, baseH: Int, cosited: Bool = false) -> Int {
             let centre = cosited ? 0.0 : 0.5
@@ -121,12 +121,11 @@ struct DoviCpuModelTests {
             let x0 = Int(floor(u)), y0 = Int(floor(v))
             let fx = u - Double(x0), fy = v - Double(y0)
             func w(_ xx: Int, _ yy: Int) -> Double {
-                el.word(min(max(xx, 0), el.width - 1), min(max(yy, 0), el.height - 1), comp)
+                Double(el.code(min(max(xx, 0), el.width - 1), min(max(yy, 0), el.height - 1), comp))
             }
             let top = w(x0, y0) * (1 - fx) + w(x0 + 1, y0) * fx
             let bot = w(x0, y0 + 1) * (1 - fx) + w(x0 + 1, y0 + 1) * fx
-            let word = top * (1 - fy) + bot * fy
-            return Int((word / 64.0).rounded(.toNearestOrEven))
+            return Int((top * (1 - fy) + bot * fy + 0.5).rounded(.down))
         }
 
         /// One component's pieces before any clamp: the normalised prediction, the VDR code it
@@ -281,9 +280,9 @@ struct DoviCpuModelTests {
         print("[m8] \(name): Y \(yStat.description)")
         print("[m8] \(name): Cb \(cbStat.description)")
         print("[m8] \(name): Cr \(crStat.description)")
-        // The enhancement-layer filter is the one place the two are not the same arithmetic (the
-        // hardware bilinear weights are fixed point), so a residual code can land one off; anything
-        // beyond that is a disagreement about the maths.
+        // The enhancement-layer filter is now the same exact arithmetic on both sides; what remains is the
+        // float curve evaluation, which can land one VDR code off; anything beyond that is a disagreement
+        // about the maths.
         for (label, st) in [("Y", yStat), ("Cb", cbStat), ("Cr", crStat)] {
             #expect(st.over1Pct < 0.5, "\(label): \(st.description)")
             #expect(st.exactPct > 90, "\(label): \(st.description)")

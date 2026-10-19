@@ -114,7 +114,7 @@ struct DoviGpuBenchmark {
     static func time(_ rig: Rig, pipeline: MTLComputePipelineState, luma: Bool, out: CVPixelBuffer,
                      extraBuffers: [(MTLBuffer, Int)] = [], tgShape: (Int, Int)? = nil, pixelsPerThread: Int = 1) throws -> Double {
         let blY = try texture(rig, rig.base, plane: 0, .r16Uint), blUV = try texture(rig, rig.base, plane: 1, .rg16Uint)
-        let elY = try texture(rig, rig.enhancement, plane: 0, .r16Unorm), elUV = try texture(rig, rig.enhancement, plane: 1, .rg16Unorm)
+        let elY = try texture(rig, rig.enhancement, plane: 0, .r16Uint), elUV = try texture(rig, rig.enhancement, plane: 1, .rg16Uint)
         let oY = try texture(rig, out, plane: 0, .r16Uint), oUV = try texture(rig, out, plane: 1, .rg16Uint)
         let w = pipeline.threadExecutionWidth
         let tg = tgShape.map { MTLSize(width: $0.0, height: $0.1, depth: 1) }
@@ -251,8 +251,8 @@ struct DoviGpuBenchmark {
     device const int*                      nlq_lut       [[buffer(2)]],
     uint2                                  gid           [[thread_position_in_grid]])
 """),
-        ("        vdr_y += dovi_eval_inv_nlq(params.nlq_y, int(rint(el)));",
-         "        vdr_y += nlq_lut[clamp(int(rint(el)), 0, 1023)];"),
+        ("        vdr_y += dovi_eval_inv_nlq(params.nlq_y, dovi_el_code(el));",
+         "        vdr_y += nlq_lut[clamp(dovi_el_code(el), 0, 1023)];"),
         ("""
     constant struct DoviMetalParams&       params        [[buffer(0)]],
     uint2                                  gid           [[thread_position_in_grid]])
@@ -265,10 +265,10 @@ struct DoviGpuBenchmark {
 {
     uint uv_width
 """),
-        ("                vdr_cb += dovi_eval_inv_nlq(params.nlq_cb, int(rint(el.r)));",
-         "                vdr_cb += nlq_lut[1024 + clamp(int(rint(el.r)), 0, 1023)];"),
-        ("                vdr_cr += dovi_eval_inv_nlq(params.nlq_cr, int(rint(el.g)));",
-         "                vdr_cr += nlq_lut[2048 + clamp(int(rint(el.g)), 0, 1023)];"),
+        ("                vdr_cb += dovi_eval_inv_nlq(params.nlq_cb, dovi_el_code(el.x));",
+         "                vdr_cb += nlq_lut[1024 + clamp(dovi_el_code(el.x), 0, 1023)];"),
+        ("                vdr_cr += dovi_eval_inv_nlq(params.nlq_cr, dovi_el_code(el.y));",
+         "                vdr_cr += nlq_lut[2048 + clamp(dovi_el_code(el.y), 0, 1023)];"),
     ]
 
     /// Each thread composes `n` horizontally adjacent sites (luma pixels / chroma samples) instead of one:
@@ -292,7 +292,7 @@ struct DoviGpuBenchmark {
     }
 
     /// The memory floor: each kernel reduced to its own input fetches and output write, no arithmetic.
-    /// Luma: BL luma + one EL sample -> write. Chroma: the six BL luma taps, BL chroma, one EL sample -> write.
+    /// Luma: BL luma + one EL texel -> write. Chroma: the six BL luma taps, BL chroma, one EL texel -> write.
     static let floorOnly: [(String, String)] = [
         ("""
     int bl_y = int(bl_y_tex.read(gid).r >> 6);
@@ -301,9 +301,8 @@ struct DoviGpuBenchmark {
 """, """
     int bl_y = int(bl_y_tex.read(gid).r >> 6);
     {
-        constexpr sampler fs(coord::normalized, filter::linear, address::clamp_to_edge);
-        float e = el_y_tex.sample(fs, (float2(gid) + 0.5f) / float2(params.bl_width, params.bl_height)).r;
-        out_y_tex.write(ushort4(ushort((bl_y + int(e * 4.0f)) << 6), 0, 0, 0), gid);
+        int e = int(el_y_tex.read(uint2(gid.x >> 1, gid.y >> 1)).r >> 6);
+        out_y_tex.write(ushort4(ushort((bl_y + e) << 6), 0, 0, 0), gid);
         return;
     }
     float pred;
@@ -314,9 +313,8 @@ struct DoviGpuBenchmark {
 """, """
     ushort4 bl_uv = bl_uv_tex.read(gid);
     {
-        constexpr sampler fs(coord::normalized, filter::linear, address::clamp_to_edge);
-        float2 e = el_uv_tex.sample(fs, float2(gid) / float2(uv_width, uv_height)).rg;
-        dovi_write_chroma(out_uv_tex, ushort4(ushort(bl_uv.r + ushort(bl_y) + ushort(e.r * 4.0f)), bl_uv.g, 0, 0), gid, params.flags);
+        ushort e = el_uv_tex.read(uint2(gid.x >> 1, gid.y >> 1)).r;
+        dovi_write_chroma(out_uv_tex, ushort4(ushort(bl_uv.r + ushort(bl_y) + e), bl_uv.g, 0, 0), gid, params.flags);
         return;
     }
     int bl_cb = int(bl_uv.r >> 6);

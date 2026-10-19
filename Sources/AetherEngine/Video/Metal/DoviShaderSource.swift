@@ -401,36 +401,71 @@ static inline int dovi_quantize(
    Enhancement layer upsampling
    ========================================================================= */
 
-// EL upsampling: one hardware bilinear fetch.
+// EL upsampling: bilinear, from four explicit texel reads with exact weights.
 //
 // el_spatial_resampling_filter_flag advertises that the encoder used its own
 // separable filter, whose taps the RPU does not carry, so no bit-exact inverse
 // is available from the stream. Against the DoViBaker oracle on a fine-detail set (gratings, zone plate,
 // band-limited noise) a 4-fetch Catmull-Rom bought about 0.7% of per-pixel error sd over bilinear, with chroma
-// unchanged, for four times the EL reads. `tex_size` is unused by bilinear; it is
-// kept so a wider filter can replace this one without touching the callers.
-static inline float dovi_sample_el_1d(
-    texture2d<float, access::sample> tex,
-    sampler s,
-    float2 uv,
-    float2 tex_size)
-{
-    return tex.sample(s, uv).r;
+// unchanged, for four times the EL reads.
+//
+// Not the hardware sampler: its bilinear weights are fixed point, so the interpolated code could land one
+// off the exact value (the CPU model saw it), and rounding that with rint() sent every exact half to the
+// even neighbour. A 2:1 EL interpolates at quarter weights, where halves are common (two texels 2 apart
+// mod 4), so ties-to-even was a parity-dependent bias. Here the weights for a 2:1 or 1:1 EL are exact quarters,
+// halves or zero, every product and sum of 10-bit codes at those weights is exact in float, and the caller
+// rounds half up.
+
+// One axis: the lower EL texel index and the fraction towards the next texel for base-layer sample n.
+// `centre` 0.5 puts both grids' samples at their pixel centres (luma: n_el = (n + 1/2) * el / bl - 1/2);
+// 0 co-sites the first samples (chroma: n_el = n * el / bl). For the 2:1 and 1:1 grids streams use,
+// el / bl is 0.5 or 1, so every term is exact in float.
+static inline int dovi_el_axis(uint n, float ratio, float centre, thread float &frac) {
+    float u = (float(n) + centre) * ratio - centre;
+    float i = floor(u);
+    frac = u - i;
+    return int(i);
 }
 
-static inline float2 dovi_sample_el_2d(
-    texture2d<float, access::sample> tex,
-    sampler s,
-    float2 uv,
-    float2 tex_size)
-{
-    return tex.sample(s, uv).rg;
+// Bilinear EL luma code at base-layer pixel `site` of a `bl_size` plane, edges clamped. One gather fetches the
+// 2x2 footprint: the point between the four texel centres selects it and sits half a texel from any footprint
+// boundary. A gather measured cheaper here than four reads (UHD luma 0.41 ms against 0.45 ms on an M4 Pro).
+static inline float dovi_upsample_el(texture2d<ushort, access::sample> tex, uint2 site,
+                                     uint2 bl_size, uint2 el_size) {
+    constexpr sampler s(coord::pixel, filter::nearest, address::clamp_to_edge);
+    float fx, fy;
+    int x0 = dovi_el_axis(site.x, float(el_size.x) / float(bl_size.x), 0.5f, fx);
+    int y0 = dovi_el_axis(site.y, float(el_size.y) / float(bl_size.y), 0.5f, fy);
+    // Gather order: (x0, y1), (x1, y1), (x1, y0), (x0, y0).
+    float4 c = float4(tex.gather(s, float2(float(x0 + 1), float(y0 + 1))) >> 6);
+    float top = c.w * (1.0f - fx) + c.z * fx;
+    float bot = c.x * (1.0f - fx) + c.y * fx;
+    return top * (1.0f - fy) + bot * fy;
 }
 
-// UNORM [0, 1] from a 10-in-16 MSB-aligned P010 plane back to a code value.
-// 65535 / 64 is exact: the hardware divides the stored ushort by 65535, and the
-// code value is that ushort >> 6.
-constant float dovi_unorm_to_code = 65535.0f / 64.0f;
+// Bilinear EL chroma codes (Cb, Cr) at base chroma sample `site`, co-sited, edges clamped. Four reads of the
+// interleaved plane return both components each, which measured cheaper than a gather per component.
+static inline float2 dovi_upsample_el_uv(texture2d<ushort, access::read> tex, uint2 site,
+                                         uint2 bl_size, uint2 el_size) {
+    float fx, fy;
+    int x0 = dovi_el_axis(site.x, float(el_size.x) / float(bl_size.x), 0.0f, fx);
+    int y0 = dovi_el_axis(site.y, float(el_size.y) / float(bl_size.y), 0.0f, fy);
+    int xm = int(el_size.x) - 1, ym = int(el_size.y) - 1;
+    uint xa = uint(clamp(x0, 0, xm)), xb = uint(clamp(x0 + 1, 0, xm));
+    uint ya = uint(clamp(y0, 0, ym)), yb = uint(clamp(y0 + 1, 0, ym));
+    float2 c00 = float2(tex.read(uint2(xa, ya)).rg >> 6);
+    float2 c10 = float2(tex.read(uint2(xb, ya)).rg >> 6);
+    float2 c01 = float2(tex.read(uint2(xa, yb)).rg >> 6);
+    float2 c11 = float2(tex.read(uint2(xb, yb)).rg >> 6);
+    float2 top = c00 * (1.0f - fx) + c10 * fx;
+    float2 bot = c01 * (1.0f - fx) + c11 * fx;
+    return top * (1.0f - fy) + bot * fy;
+}
+
+// Round half up: the interpolated EL code back to an integer code for the inverse NLQ.
+static inline int dovi_el_code(float v) {
+    return int(floor(v + 0.5f));
+}
 
 /* ============================================================================
    Composition kernels
@@ -448,7 +483,7 @@ constant float dovi_unorm_to_code = 65535.0f / 64.0f;
 kernel void dovi_compose_luma(
     texture2d<ushort, access::read>        bl_y_tex      [[texture(0)]],
     texture2d<ushort, access::read>        bl_uv_tex     [[texture(1)]],
-    texture2d<float, access::sample>       el_y_tex      [[texture(2)]],
+    texture2d<ushort, access::sample>      el_y_tex      [[texture(2)]],
     texture2d<ushort, access::write>       out_y_tex     [[texture(3)]],
     constant struct DoviMetalParams&       params        [[buffer(0)]],
     constant float*                        luma_lut      [[buffer(1)]],
@@ -477,11 +512,10 @@ kernel void dovi_compose_luma(
     if ((params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u &&
         params.nlq_y.nlq_method == DOVI_NLQ_METHOD_LINEAR &&
         params.nlq_y.nlq_scale != 0) {
-        constexpr sampler s(coord::normalized, filter::linear, address::clamp_to_edge);
-        float2 uv = (float2(gid) + 0.5f) / float2(params.bl_width, params.bl_height);
-        float el = dovi_sample_el_1d(el_y_tex, s, uv,
-                                     float2(params.el_width, params.el_height)) * dovi_unorm_to_code;
-        vdr_y += dovi_eval_inv_nlq(params.nlq_y, int(rint(el)));
+        // Centre-aligned: luma samples sit at pixel centres on both grids.
+        float el = dovi_upsample_el(el_y_tex, gid, uint2(params.bl_width, params.bl_height),
+                                    uint2(params.el_width, params.el_height));
+        vdr_y += dovi_eval_inv_nlq(params.nlq_y, dovi_el_code(el));
     }
 
     vdr_y = clamp(vdr_y, 0, int(params.vdr_max));
@@ -516,7 +550,7 @@ static inline void dovi_write_chroma(texture2d<ushort, access::write> out_uv_tex
 kernel void dovi_compose_chroma(
     texture2d<ushort, access::read>        bl_y_tex      [[texture(0)]],
     texture2d<ushort, access::read>        bl_uv_tex     [[texture(1)]],
-    texture2d<float, access::sample>       el_uv_tex     [[texture(2)]],
+    texture2d<ushort, access::read>        el_uv_tex     [[texture(2)]],
     texture2d<ushort, access::write>       out_uv_tex    [[texture(3)]],
     constant struct DoviMetalParams&       params        [[buffer(0)]],
     uint2                                  gid           [[thread_position_in_grid]])
@@ -569,7 +603,6 @@ kernel void dovi_compose_chroma(
         bool cb_active = (params.nlq_cb.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cb.nlq_scale != 0);
         bool cr_active = (params.nlq_cr.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cr.nlq_scale != 0);
         if (cb_active || cr_active) {
-            constexpr sampler s(coord::normalized, filter::linear, address::clamp_to_edge);
             // Chroma is co-sited with the top-left luma sample (chroma location type 2, as HDR10 and
             // Dolby Vision streams carry it), so the enhancement chroma grid and the base chroma grid
             // share their first sample rather than their outer edge: base chroma sample n sits at EL
@@ -577,14 +610,13 @@ kernel void dovi_compose_chroma(
             // the odd ones half way between two texels. This is DoViBaker's phase (`upsampleChromaEven`
             // copies, `upsampleChromaOdd` interpolates at 0.5); a centre-aligned fetch puts every
             // sample a quarter of an EL chroma texel up and to the left. Same-resolution EL is unchanged.
-            float2 el_uv_size = float2(params.el_width / 2u, params.el_height / 2u);
-            float2 uv = float2(gid) / float2(uv_width, uv_height) + 0.5f / el_uv_size;
-            float2 el = dovi_sample_el_2d(el_uv_tex, s, uv, el_uv_size) * dovi_unorm_to_code;
+            float2 el = dovi_upsample_el_uv(el_uv_tex, gid, uint2(uv_width, uv_height),
+                                            uint2(params.el_width / 2u, params.el_height / 2u));
             if (cb_active) {
-                vdr_cb += dovi_eval_inv_nlq(params.nlq_cb, int(rint(el.r)));
+                vdr_cb += dovi_eval_inv_nlq(params.nlq_cb, dovi_el_code(el.x));
             }
             if (cr_active) {
-                vdr_cr += dovi_eval_inv_nlq(params.nlq_cr, int(rint(el.g)));
+                vdr_cr += dovi_eval_inv_nlq(params.nlq_cr, dovi_el_code(el.y));
             }
         }
     }
