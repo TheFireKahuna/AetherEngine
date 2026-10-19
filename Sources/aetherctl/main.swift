@@ -538,6 +538,14 @@ if first == "dvsurvey" {
     exit(runDvSurvey(url: parseSourceURL(urlArg), maxFrames: frames, listFrames: list))
 }
 
+// FEL / MEL for many sources at once: `label<TAB>url` lines on stdin.
+if first == "eltype" {
+    var rest = Array(args.dropFirst(2))
+    let parallel = takeIntFlag("--parallel", from: &rest) ?? 8
+    rejectStrayFlags(rest, subcommand: "eltype")
+    exit(runElType(parallel: parallel))
+}
+
 // #93 post-recovery judder: raw video packet timing per demuxer open profile.
 if first == "pktdump" {
     var rest = Array(args.dropFirst(2))
