@@ -1119,11 +1119,20 @@ extension AetherEngine {
     }
 
     nonisolated static func detectFrameRate(stream: UnsafeMutablePointer<AVStream>) -> Double? {
-        let avg = stream.pointee.avg_frame_rate
+        frameRate(avg: stream.pointee.avg_frame_rate, r: stream.pointee.r_frame_rate)
+    }
+
+    /// `avg_frame_rate`, else `r_frame_rate`. An exact 24 that `r_frame_rate` contradicts with 24000/1001 is
+    /// ambiguous (both are estimates on a coarse timebase such as Matroska's 1 ms), so it reads as the film
+    /// rate FrameRateSnap prefers rather than as a stated 24.
+    nonisolated static func frameRate(avg: AVRational, r: AVRational) -> Double? {
         if avg.den > 0 && avg.num > 0 {
-            return Double(avg.num) / Double(avg.den)
+            let rate = Double(avg.num) / Double(avg.den)
+            if abs(rate - 24) < FrameRateSnap.exactTwentyFourTolerance, r.num == 24000, r.den == 1001 {
+                return Double(r.num) / Double(r.den)
+            }
+            return rate
         }
-        let r = stream.pointee.r_frame_rate
         if r.den > 0 && r.num > 0 {
             return Double(r.num) / Double(r.den)
         }
