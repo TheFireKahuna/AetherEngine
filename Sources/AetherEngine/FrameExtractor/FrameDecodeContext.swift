@@ -726,8 +726,9 @@ final class FrameDecodeContext: @unchecked Sendable {
 
     /// The sws coefficient table for the matrix `ColorAttachments.presented` resolves, so a gap is
     /// filled here exactly as it is on the buffer playback shows.
-    static func swsColorspace(for description: ColorDescription) -> Int32 {
-        switch ColorAttachments.presented(description).matrix {
+    static func swsColorspace(for description: ColorDescription,
+                              frameSize: (width: Int32, height: Int32)? = nil) -> Int32 {
+        switch ColorAttachments.presented(description, frameSize: frameSize).matrix {
         case kCVImageBufferYCbCrMatrix_ITU_R_601_4:     SWS_CS_ITU601
         case kCVImageBufferYCbCrMatrix_ITU_R_2020:      SWS_CS_BT2020
         case kCVImageBufferYCbCrMatrix_SMPTE_240M_1995: SWS_CS_SMPTE240M
@@ -773,7 +774,8 @@ final class FrameDecodeContext: @unchecked Sendable {
         // BT.709 colour bar up to 33 levels off in the still while playback showed it right.
         // The matrix comes from the rule the displayed buffer is tagged by, so both agree.
         let description = ColorDescription(frame: frame)
-        let coefficients = sws_getCoefficients(Self.swsColorspace(for: description))
+        let frameSize = (frame.pointee.width, frame.pointee.height)
+        let coefficients = sws_getCoefficients(Self.swsColorspace(for: description, frameSize: frameSize))
         sws_setColorspaceDetails(
             swsContext, coefficients, Self.isFullRange(frame) ? 1 : 0,
             coefficients, 1, 0, 1 << 16, 1 << 16)
@@ -814,7 +816,7 @@ final class FrameDecodeContext: @unchecked Sendable {
 
         let data = Data(rgba)
         guard let provider = CGDataProvider(data: data as CFData),
-              let colorSpace = ColorAttachments.colorSpace(for: ColorAttachments.presented(description))
+              let colorSpace = ColorAttachments.colorSpace(for: ColorAttachments.presented(description, frameSize: frameSize))
                 ?? CGColorSpace(name: CGColorSpace.sRGB) else {
             return nil
         }

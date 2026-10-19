@@ -305,6 +305,17 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         self.colorPrimaries = ColorAttachments.primaries(codecpar.pointee.color_primaries)
         self.colorTransfer = ColorAttachments.transfer(codecpar.pointee.color_trc)
         self.colorMatrix = ColorAttachments.matrix(codecpar.pointee.color_space)
+        // #6: an SD stream that declares neither matrix nor primaries gets the software route's BT.601
+        // guess here too. Left untagged, VideoToolbox reads it as BT.709, so one untagged file showed in
+        // two colours depending on which decoder the route picked.
+        if colorPrimaries == nil, colorMatrix == nil {
+            let guessed = ColorAttachments.presented(
+                streamColor, frameSize: (codecpar.pointee.width, codecpar.pointee.height))
+            if guessed.matrix == kCVImageBufferYCbCrMatrix_ITU_R_601_4 {
+                colorPrimaries = guessed.primaries
+                colorMatrix = guessed.matrix
+            }
+        }
         let pixelFormat: OSType = use10Bit
             ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
             : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange

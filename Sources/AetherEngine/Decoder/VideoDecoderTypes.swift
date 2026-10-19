@@ -169,9 +169,9 @@ enum ColorAttachments {
     /// saturated colour (reds go orange, greens go yellow). The guess is mpv's: SD (narrower than 1280
     /// and no taller than 576) is the BT.601 matrix, with EBU 3213 primaries for the 625-line heights
     /// (576, 288) and SMPTE-C for the rest (480 / 486 NTSC and other SD sizes); anything larger is
-    /// BT.709. The curve stays BT.709 either way, which is what BT.1886 SD is tagged as. nil keeps the
-    /// VideoToolbox answer, for a caller that has to match the hardware path (a still of a source
-    /// playback decodes in hardware).
+    /// BT.709. The curve stays BT.709 either way, which is what BT.1886 SD is tagged as. The hardware
+    /// decoder tags such a stream the same way, and stills pass their frame size, so every path agrees;
+    /// nil keeps the VideoToolbox answer.
     static func presented(_ d: ColorDescription, frameSize: (width: Int32, height: Int32)? = nil) -> Tags {
         let declaredPrimaries = primaries(d.primaries)
         let declaredMatrix = matrix(d.matrix)
