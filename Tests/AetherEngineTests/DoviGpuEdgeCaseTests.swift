@@ -426,7 +426,7 @@ extension DoviGpuEdgeCaseTests {
         #expect(attrs[kCVPixelBufferPixelFormatTypeKey as String] as? OSType == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
     }
 
-    @Test("sv22 output carries the full-precision words in a 4:2:2 buffer, chroma on both rows")
+    @Test("sv22 output carries the full-precision words in a 4:2:2 buffer, chroma on every row")
     func sv22KeepsLowBitsAndDoublesChromaRows() throws {
         let composer = try #require(DoviFelComposer())
         composer.outputModeOverride = .sv22
