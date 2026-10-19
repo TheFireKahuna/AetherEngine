@@ -89,6 +89,7 @@ public enum SpatialSpeaker: String, Sendable, CaseIterable {
     case surroundLeft, surroundRight
     case sideLeft, sideRight
     case rearLeft, rearRight
+    /// Where TS 103 448 table A.9 has them, 1 - 1/sqrt(2) of the way back (M±60 on the side walls).
     case wideLeft, wideRight
     case topFrontLeft, topFrontRight
     case topMiddleLeft, topMiddleRight
@@ -107,8 +108,8 @@ public enum SpatialSpeaker: String, Sendable, CaseIterable {
         case .sideRight:      return SIMD3(1, 0.5, 0)
         case .rearLeft:       return SIMD3(0, 1, 0)
         case .rearRight:      return SIMD3(1, 1, 0)
-        case .wideLeft:       return SIMD3(0, 0.25, 0)
-        case .wideRight:      return SIMD3(1, 0.25, 0)
+        case .wideLeft:       return SIMD3(0, 0.2929, 0)
+        case .wideRight:      return SIMD3(1, 0.2929, 0)
         case .topFrontLeft:   return SIMD3(0.25, 0.25, 1)
         case .topFrontRight:  return SIMD3(0.75, 0.25, 1)
         case .topMiddleLeft:  return SIMD3(0.25, 0.5, 1)
