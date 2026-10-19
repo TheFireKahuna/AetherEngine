@@ -65,6 +65,10 @@ enum VideoDecoderError: Error, LocalizedError {
     /// there in production: it builds the composer first and decodes the base layer alone when that
     /// fails.
     case composerUnavailable
+    /// The FEL composer's GPU work stopped completing: its slots stayed taken and the compose backlog
+    /// full for `DualLayerVideoDecoder.composeStallTimeout`. Reported once through
+    /// `onFatalDecodeError`; the decoder refuses packets after it.
+    case composerStalled(seconds: Double)
 
     var errorDescription: String? {
         switch self {
@@ -75,6 +79,7 @@ enum VideoDecoderError: Error, LocalizedError {
         case .sessionCreationFailed(let s): "Decoder session failed (\(s))"
         case .decoderClosed: "Decoder is closed (single use)"
         case .composerUnavailable: "Dolby Vision FEL composer unavailable (no Metal device or shader compilation failed)"
+        case .composerStalled(let seconds): "Dolby Vision FEL composer stalled (no GPU composition completed for \(String(format: "%.1f", seconds)) s)"
         }
     }
 }

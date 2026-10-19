@@ -284,7 +284,7 @@ struct DualLayerGpuSlotWaitTests {
 
     /// The callback threads no longer absorb GPU backpressure, so the feed does: with
     /// `maxComposesAwaitingSlot` compositions queued behind a held slot, `decode(packet:)`'s wait holds
-    /// the demux thread until the backlog drains (or `composeBacklogWait` passes).
+    /// the demux thread until the backlog drains.
     @Test("the feed waits while the compose backlog is full, and resumes once it drains")
     func feedWaitsOnComposeBacklog() async throws {
         let composer = GatedFakeComposer()
@@ -312,8 +312,8 @@ struct DualLayerGpuSlotWaitTests {
             feedDone.set()
         }
         feeder.start()
-        // The bound is the assertion, and it can only err towards passing: the wait cannot end before
-        // `composeBacklogWait` while the slot is held, however late the thread starts.
+        // The bound is the assertion, and it can only err towards passing: the wait cannot end while the
+        // slot is held (short of the 2 s stall report), however late the thread starts.
         let endedWhileFull = try await waitFor(upTo: .milliseconds(200)) { feedDone.isSet }
         #expect(!endedWhileFull, "the feed did not wait for a full compose backlog")
 
@@ -322,6 +322,98 @@ struct DualLayerGpuSlotWaitTests {
         try await waitFor { deliveries.count == backlog + 1 }
         decoder.quiesceForTesting()
         #expect(deliveries.count == backlog + 1)
+    }
+
+    /// Frame 0 holds the only slot and `maxComposesAwaitingSlot` more queue behind it: the backlog is full.
+    private func fillComposeBacklog(_ decoder: DualLayerVideoDecoder, _ composer: GatedFakeComposer) async throws {
+        decoder.primeForTesting(enhancementLayer: true)
+        let backlog = DualLayerVideoDecoder.maxComposesAwaitingSlot
+        for i in 0...backlog {
+            decoder.seedRPUForTesting(pts: Self.pts(Int64(i)), params: DoviMetalParams(), displayMetadataNAL: nil)
+        }
+        for i in 0...backlog {
+            let bl = try #require(Self.makeBuffer(width: 64, height: 64))
+            let el = try #require(Self.makeBuffer(width: 32, height: 32))
+            decoder.handleEnhancementLayerFrame(elBuffer: el, pts: Self.pts(Int64(i)))
+            decoder.handleBaseLayerFrame(baseBuffer: bl, pts: Self.pts(Int64(i)), hdr10Data: nil)
+        }
+        try await waitFor { composer.acquireCallCount == 2 }
+    }
+
+    /// A seek must not wait for the GPU: `flush()` wakes a feed parked on the full backlog at once,
+    /// where it used to sit out a fixed 0.5 s.
+    @Test("flush() releases a feed waiting on a full compose backlog at once")
+    func flushReleasesBacklogWaiter() async throws {
+        let composer = GatedFakeComposer()
+        let decoder = DualLayerVideoDecoder(composer: composer)
+        defer { composer.releaseFirst(); decoder.close() }
+        decoder.onFrame = { _, _, _ in }
+        try await fillComposeBacklog(decoder, composer)
+
+        let feedDone = Flag()
+        let feeder = Thread {
+            decoder.waitForComposeBacklog()
+            feedDone.set()
+        }
+        feeder.start()
+        let early = try await waitFor(upTo: .milliseconds(150)) { feedDone.isSet }
+        #expect(!early, "the feed did not wait for a full compose backlog")
+        let started = CFAbsoluteTimeGetCurrent()
+        let flusher = Thread { decoder.flush() }
+        flusher.start()
+        try await waitFor { feedDone.isSet }
+        // Well under the stall timeout; the old cap was 0.5 s.
+        #expect(CFAbsoluteTimeGetCurrent() - started < 0.4)
+    }
+
+    /// A GPU whose work never completes: the backlog stands full, and after `composeStallTimeout` the
+    /// stall is reported once and the feed refused from then on, so nothing more is decoded and queued.
+    /// Before, the feed went on after 0.5 s per packet and the queued buffers grew without bound.
+    @Test("a GPU that never completes is reported once as a stall, and the feed is refused after it",
+          .timeLimit(.minutes(1)))
+    func stalledComposerIsReportedAndRefused() async throws {
+        let composer = GatedFakeComposer()
+        let decoder = DualLayerVideoDecoder(composer: composer)
+        defer { composer.releaseFirst(); decoder.close() }
+        decoder.onFrame = { _, _, _ in }
+        let reportCount = Flag()
+        let errors = ErrorBox()
+        decoder.onFatalDecodeError = { error in errors.record(error); reportCount.set() }
+        try await fillComposeBacklog(decoder, composer)
+
+        let started = CFAbsoluteTimeGetCurrent()
+        let result = ResultBox()
+        let feeder = Thread { result.set(decoder.waitForComposeBacklog()) }
+        feeder.start()
+        try await waitFor { result.value != nil }
+        let waited = CFAbsoluteTimeGetCurrent() - started
+        #expect(result.value == false)
+        #expect(waited >= DualLayerVideoDecoder.composeStallTimeout - 0.1, "reported after \(waited) s")
+        #expect(reportCount.isSet)
+        if case .composerStalled? = errors.first as? VideoDecoderError {} else {
+            Issue.record("expected composerStalled, got \(String(describing: errors.first))")
+        }
+        // Every later packet is refused at once, and the stall is not reported again.
+        let again = CFAbsoluteTimeGetCurrent()
+        #expect(decoder.waitForComposeBacklog() == false)
+        #expect(CFAbsoluteTimeGetCurrent() - again < 0.05)
+        #expect(errors.count == 1)
+        #expect(composer.acquireCallCount == 2, "nothing more reached the GPU")
+    }
+
+    private final class ErrorBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var errors: [Error] = []
+        func record(_ e: Error) { lock.lock(); errors.append(e); lock.unlock() }
+        var first: Error? { lock.lock(); defer { lock.unlock() }; return errors.first }
+        var count: Int { lock.lock(); defer { lock.unlock() }; return errors.count }
+    }
+
+    private final class ResultBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: Bool?
+        func set(_ v: Bool) { lock.lock(); stored = v; lock.unlock() }
+        var value: Bool? { lock.lock(); defer { lock.unlock() }; return stored }
     }
 
     @Test("a frame with no usable RPU borrows the previous frame's parameters, but only for a short run")
