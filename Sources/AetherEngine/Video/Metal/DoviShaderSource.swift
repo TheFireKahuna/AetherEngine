@@ -41,6 +41,10 @@ typedef int  dovi_i32;
 #define DOVI_MAPPING_POLYNOMIAL       0
 #define DOVI_MAPPING_MMR              1
 
+/* ---- per-frame MMR table (buffer 3): [Y, Cb, Cr][piece 0..7][constant, 21 coefficients] ---- */
+#define DOVI_MMR_TABLE_PIECE_STRIDE      22
+#define DOVI_MMR_TABLE_COMPONENT_STRIDE  (8 * DOVI_MMR_TABLE_PIECE_STRIDE)
+
 /* ---- flags ---- */
 #define DOVI_FLAG_DISABLE_RESIDUAL    0x1u /* disable_residual_flag, or el_type == MEL */
 #define DOVI_FLAG_LUMA_MMR            0x2u /* luma curve has at least one MMR piece */
@@ -281,15 +285,19 @@ static inline float dovi_clamp_mmr_input(constant struct DoviPolynomialParams &c
 
 // MMR piece: a regression over the seven cross terms of all three normalised
 // base-layer components, with order o contributing those terms raised to o + 1.
+// `k` is this component's slice of the per-frame MMR table (`populateMmrTable`): per piece the
+// constant then the 21 coefficients, each float(coef) * 2^-coef_shift computed once on the CPU. That
+// is the value this function used to form per term in the loop (a power-of-two scale is exact), so
+// the sum is unchanged bit for bit, without an int-to-float conversion and a multiply per term.
 static inline float dovi_eval_mmr(
     constant struct DoviPolynomialParams &curve,
-    constant struct DoviMmrParams &mmr,
+    device const float* k,
     int piece,
     float y_norm, float u_norm, float v_norm)
 {
     // y_norm, u_norm and v_norm are already clamped to their components' pivot ranges.
-    float inv = ldexp(1.0f, -int(mmr.coef_shift));
-    float s = float(mmr.mmr_constant[piece]) * inv;
+    device const float* c = k + piece * DOVI_MMR_TABLE_PIECE_STRIDE;
+    float s = c[0];
 
     float base[7] = {
         y_norm,
@@ -308,7 +316,7 @@ static inline float dovi_eval_mmr(
     uint order = min(curve.order[piece], 3u);
     for (uint o = 0u; o < order; ++o) {
         for (int k = 0; k < 7; ++k) {
-            s = fma(float(mmr.coef[piece][o * 7u + uint(k)]) * inv, t[k], s);
+            s = fma(c[1u + o * 7u + uint(k)], t[k], s);
         }
         if (o + 1u < order) {
             for (int k = 0; k < 7; ++k) {
@@ -324,7 +332,7 @@ static inline float dovi_eval_mmr(
 // means identity: the base layer passes through untouched.
 static inline float dovi_eval_curve(
     constant struct DoviPolynomialParams &curve,
-    constant struct DoviMmrParams &mmr,
+    device const float* mmr,
     constant struct DoviPolynomialParams &poly_y,
     constant struct DoviPolynomialParams &poly_cb,
     constant struct DoviPolynomialParams &poly_cr,
@@ -486,6 +494,7 @@ kernel void dovi_compose_luma(
     constant struct DoviMetalParams&       params        [[buffer(0)]],
     constant float*                        luma_lut      [[buffer(1)]],
     device const int*                      nlq_lut       [[buffer(2)]],
+    device const float*                    mmr_table     [[buffer(3)]],
     uint2                                  gid           [[thread_position_in_grid]])
 {
     if (gid.x >= params.bl_width || gid.y >= params.bl_height) {
@@ -502,7 +511,7 @@ kernel void dovi_compose_luma(
         ushort4 bl_uv = bl_uv_tex.read(uint2(gid.x >> 1, gid.y >> 1));
         float u_norm = float(int(bl_uv.r >> 6)) / float(params.bl_max + 1u);
         float v_norm = float(int(bl_uv.g >> 6)) / float(params.bl_max + 1u);
-        pred = dovi_eval_curve(params.poly_y, params.mmr_y,
+        pred = dovi_eval_curve(params.poly_y, mmr_table,
                                params.poly_y, params.poly_cb, params.poly_cr, bl_y,
                                y_norm, u_norm, v_norm, params.bl_max + 1u);
     }
@@ -553,6 +562,7 @@ kernel void dovi_compose_chroma(
     texture2d<ushort, access::write>       out_uv_tex    [[texture(3)]],
     constant struct DoviMetalParams&       params        [[buffer(0)]],
     device const int*                      nlq_lut       [[buffer(2)]],
+    device const float*                    mmr_table     [[buffer(3)]],
     uint2                                  gid           [[thread_position_in_grid]])
 {
     uint uv_width = params.bl_width / 2u;
@@ -589,10 +599,10 @@ kernel void dovi_compose_chroma(
     float u_norm = float(bl_cb) / float(params.bl_max + 1u);
     float v_norm = float(bl_cr) / float(params.bl_max + 1u);
 
-    float pred_cb = dovi_eval_curve(params.poly_cb, params.mmr_cb,
+    float pred_cb = dovi_eval_curve(params.poly_cb, mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE,
                                     params.poly_y, params.poly_cb, params.poly_cr, bl_cb,
                                     y_norm, u_norm, v_norm, params.bl_max + 1u);
-    float pred_cr = dovi_eval_curve(params.poly_cr, params.mmr_cr,
+    float pred_cr = dovi_eval_curve(params.poly_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE,
                                     params.poly_y, params.poly_cb, params.poly_cr, bl_cr,
                                     y_norm, u_norm, v_norm, params.bl_max + 1u);
 
