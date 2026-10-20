@@ -22,7 +22,9 @@ the public-API contract.
   as `apac.05.00`, a tvOS 27.2 Apple TV delivered it as multichannel PCM instead of Dolby MAT. Zone masks
   and divergence, which the system renderer ignores, are rendered by the engine (TS 103 448) onto eleven
   fixed objects on the 7.1.4 speakers, crossfading over the update's ramp; an object switched off fades
-  where it is instead of gliding to the room's centre.
+  where it is instead of gliding to the room's centre. An object that jumps across the room ramps as Atmos
+  does, fading out where it was (on the bus) and in where it goes, instead of sweeping through the
+  speakers between; 3–5% of position changes in films are such jumps.
 - **Object metadata applied as TS 103 420 and TS 103 448 specify, personal builds** (`TrueHDReferenceRender`,
   `APACObjectOutput`): snap to the 22.2 targets by weighted distance, distance to the room boundary, warp
   mode, divergence, default and custom trims (the latter through the private LibTrueHD's
