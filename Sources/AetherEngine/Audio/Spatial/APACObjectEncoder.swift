@@ -33,6 +33,12 @@ import Foundation
 /// onto the speaker bus: eleven fixed objects on the 7.1.4 speakers, each of which plays from its
 /// speaker alone. An object moving between its slot and the bus crossfades over the update's ramp,
 /// which is exactly the gain ramp Atmos specifies for it.
+///
+/// Atmos ramps speaker gains from the old pan to the new; the renderer ramps the position. For the
+/// small steps of a moving object the two agree, but an object that jumps across the room would sweep
+/// through speakers it is never meant to reach. For such an update the old pan fades out on the bus
+/// while the slot jumps to the new position and fades in: the spec's ramp exactly, since the renderer
+/// pans the slot as the bus does.
 @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
 final class APACObjectEncoder: APACChunkEncoding {
 
@@ -92,9 +98,13 @@ final class APACObjectEncoder: APACChunkEncoding {
     private var bus: ObjectAudioRenderer
     private let busPlanes: [UnsafeMutablePointer<Float>]
     private var busInputs: [UnsafePointer<Float>] = []
-    /// Updates that sent an object to the bus, for the session log.
+    /// Each element's last object state, the pan a ramp starts from; nil after a gap or restart.
+    private var lastStates: [ObjectAudioElementState?] = []
+    /// Updates that sent an object to the bus, and ramps it crossfaded there, for the session log.
     private(set) var busUpdates = 0
+    private(set) var busRamps = 0
     private var busUpdatesReported = 0
+    private var busRampsReported = 0
     private var outputBuffer: [UInt8]
     private var ended = false
 
@@ -227,10 +237,12 @@ final class APACObjectEncoder: APACChunkEncoding {
         ended = true
         // Also reached when the pipeline restarts the encoder mid-stream, so it reports what was
         // dropped since the last report, not a running total.
-        if busUpdates > busUpdatesReported {
+        if busUpdates > busUpdatesReported || busRamps > busRampsReported {
             EngineLog.emit("[APACObjectEncoder] \(busUpdates - busUpdatesReported) object updates rendered onto the "
-                           + "speaker bus (zone mask or divergence)", category: .session)
+                           + "speaker bus (zone mask or divergence), \(busRamps - busRampsReported) jumps crossfaded "
+                           + "there", category: .session)
             busUpdatesReported = busUpdates
+            busRampsReported = busRamps
         }
         var packets: [APACEncoder.Packet] = []
         // The partial packet, then silence until the encoder's look-ahead has come out.
@@ -252,6 +264,7 @@ final class APACObjectEncoder: APACChunkEncoding {
         ended = false
         for i in slots.indices { slots[i].restart(at: clock) }
         lfe.restart(at: clock)
+        lastStates = lastStates.map { _ in nil }
     }
 
     // MARK: - Scene
@@ -262,6 +275,7 @@ final class APACObjectEncoder: APACChunkEncoding {
     private func configure(_ newRoles: [ObjectAudioRole]) {
         roles = newRoles
         route = []
+        lastStates = newRoles.map { _ in nil }
         used = Self.busSlotsOnly
         bus = ObjectAudioRenderer(layout: Self.busLayout, roles: newRoles.map { _ in .object })
         var nextSlot = 0
@@ -309,6 +323,7 @@ final class APACObjectEncoder: APACChunkEncoding {
 
     private func apply(_ update: ObjectAudioMetadataUpdate) {
         var busStates = [ObjectAudioElementState?](repeating: nil, count: roles.count)
+        var busFrom = busStates
         for (element, state) in update.states.enumerated() {
             guard let state, element < route.count, let target = route[element] else { continue }
             let values: APACObjectTrajectory.Values
@@ -318,8 +333,19 @@ final class APACObjectEncoder: APACChunkEncoding {
                 // bus always has a state to ramp from when one moves over.
                 let onBus = Self.needsBus(state)
                 var busState = state
+                let previous = lastStates[element]
+                lastStates[element] = state
                 if onBus {
                     busUpdates += 1
+                } else if let previous, update.rampFrames > 0, !Self.needsBus(previous),
+                          Self.rampsDiffer(from: previous, to: state) {
+                    // The old pan takes over on the bus and fades there; the slot comes in where it goes.
+                    busRamps += 1
+                    busFrom[element] = previous
+                    busState = previous
+                    busState.gain = 0
+                    slots[target].apply(.init(position: slots[target].value(at: clock).position, size: 0, gain: 0),
+                                        at: clock, rampFrames: 0)
                 } else {
                     busState.gain = 0
                 }
@@ -337,12 +363,16 @@ final class APACObjectEncoder: APACChunkEncoding {
                 slots[target].apply(values, at: clock, rampFrames: update.rampFrames)
             }
         }
+        if busFrom.contains(where: { $0 != nil }) {
+            bus.advance(frameCount: 0, updates: [.init(frameOffset: 0, rampFrames: 0, states: busFrom)])
+        }
         if busStates.contains(where: { $0 != nil }) {
             bus.advance(frameCount: 0, updates: [.init(frameOffset: 0, rampFrames: update.rampFrames, states: busStates)])
         }
     }
 
     private func markDiscontinuity() {
+        lastStates = lastStates.map { _ in nil }
         for i in slots.indices { slots[i].markDiscontinuity() }
         lfe.markDiscontinuity()
         bus.markDiscontinuity()
@@ -356,6 +386,27 @@ final class APACObjectEncoder: APACChunkEncoding {
     static func needsBus(_ state: ObjectAudioElementState) -> Bool {
         state.divergence > 0 || !state.excluded.isDisjoint(with: busFloor)
     }
+
+    private static let busPanner = AllocentricPanner(layout: busLayout)
+
+    /// Whether ramping an object's position from `previous` to `state` would sound different from
+    /// Atmos's ramp of its speaker gains: halfway through, some speaker's gain differs by more than
+    /// `rampTolerance`. Only a ramp between two sounding positions can; one to or from silence holds
+    /// its position (`APACObjectTrajectory`).
+    static func rampsDiffer(from previous: ObjectAudioElementState, to state: ObjectAudioElementState) -> Bool {
+        guard previous.gain > 0, state.gain > 0 else { return false }
+        let a = objectPosition(previous), b = objectPosition(state)
+        guard a != b else { return false }
+        var from: [Float] = [], to: [Float] = [], mid: [Float] = []
+        busPanner.pointGains(a, into: &from)
+        busPanner.pointGains(b, into: &to)
+        busPanner.pointGains((a + b) / 2, into: &mid)
+        return mid.indices.contains { abs((from[$0] + to[$0]) / 2 - mid[$0]) > rampTolerance }
+    }
+
+    /// 2% of full scale: the small steps of a moving object stay well under it, a jump between
+    /// speakers is far over it.
+    static let rampTolerance: Float = 0.02
 
     /// The position the renderer gets: inside its room, and at ear level for an object kept off the
     /// heights (TS 103 448 5.1.3.2), which is how type 3 hears an elevation switch.
