@@ -188,24 +188,39 @@ struct APACObjectOutputTests {
         #expect([0, 2048].contains { abs(delay - $0) <= window }, "R takes over \(delay) frames after the jump")
     }
 
-    @Test("a ramp glides through the centre")
-    func rampGlides() throws {
+    @Test("a jump across the room ramps as Atmos does: out on the left, in on the right, never the centre")
+    func rampCrossfades() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let left = ObjectAudioElementState(position: SIMD3(0, 0, 0))
         let right = ObjectAudioElementState(position: SIMD3(1, 0, 0))
-        // L until frame 8192, then over 16384 frames to R: halfway (frame 16384) it is at the centre.
+        // L until frame 8192, then over 16384 frames to R. Atmos ramps the speaker gains, so halfway
+        // (frame 16384) L and R each have half the amplitude: −3 dB, and nothing in the centre.
         let out = try render(roles: [.object], signalOn: 0, frames: 48_000, updates: [
             .init(frameOffset: 0, rampFrames: 0, states: [left]),
             .init(frameOffset: 8192, rampFrames: 16_384, states: [right]),
         ])
-        // Either timeline (see `jumpTiming`): the centre peaks at 16384 or 2048 later.
-        let centre = [16_384, 16_384 + 2048].map { s -> Float in
-            let all = (0..<12).reduce(Float(0)) { $0 + Self.power(out[$1], s - 256, s + 256) }
-            return Self.power(out[Out.c.rawValue], s - 256, s + 256) / max(all, 1e-20)
+        let all = { (s: Int) in (0..<12).reduce(Float(0)) { $0 + Self.power(out[$1], s - 256, s + 256) } }
+        let before = all(6144)
+        // Either timeline (see `jumpTiming`): the middle is at 16384 or 2048 later.
+        let middle = [16_384, 16_384 + 2048].map { s in
+            (centre: Self.power(out[Out.c.rawValue], s - 256, s + 256) / max(all(s), 1e-20),
+             db: 10 * log10(all(s) / before))
         }
-        #expect(centre.max()! > 0.9, "centre share at the ramp's middle: \(centre)")
-        let early = Self.shares(out, from: 4096, to: 8192)
-        #expect(early[Out.l.rawValue] > 0.97)
+        #expect(middle.allSatisfy { $0.centre < 0.02 }, "centre share at the ramp's middle: \(middle)")
+        #expect(middle.contains { abs($0.db + 3) < 0.5 }, "level at the ramp's middle: \(middle)")
+        #expect(Self.shares(out, from: 30_000, to: 48_000)[Out.r.rawValue] > 0.97)
+    }
+
+    @Test("only a ramp whose positions and gains part ways goes over the bus")
+    func rampsDiffer() {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let at = { (x: Float, y: Float, gain: Float) in ObjectAudioElementState(position: SIMD3(x, y, 0), gain: gain) }
+        #expect(APACObjectEncoder.rampsDiffer(from: at(0, 0, 1), to: at(1, 0, 1)))        // L to R
+        #expect(APACObjectEncoder.rampsDiffer(from: at(0, 0, 1), to: at(1, 1, 1)))        // corner to corner
+        #expect(!APACObjectEncoder.rampsDiffer(from: at(0.30, 0.6, 1), to: at(0.32, 0.6, 1)))  // a step
+        #expect(!APACObjectEncoder.rampsDiffer(from: at(0, 0.5, 1), to: at(0, 0.5, 0.5)))  // gain only
+        #expect(!APACObjectEncoder.rampsDiffer(from: at(0, 0, 0), to: at(1, 0, 1)))        // from silence
+        #expect(!APACObjectEncoder.rampsDiffer(from: at(0, 0, 1), to: at(1, 0, 0)))        // to silence
     }
 
     // MARK: - Trajectory
