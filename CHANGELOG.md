@@ -66,6 +66,17 @@ the public-API contract.
   bus does (it started one step ahead), and a sized object with its elevation off is rendered on the bus
   on 7.1.4, where the system's size would spread it into the heights. A position exactly on a speaker
   row or column gives its neighbour exactly 0 instead of 7.5e-8 (Float's cos(pi / 2)).
+- **The shipping bed split follows the objects as TS 103 448 places them.** Its guide (where each element's
+  energy belongs) now comes from the elements as the renderer prepares them (warp, distance, screen, the
+  elevation switch, snap, zones, size, divergence) rather than plain points, ramps included, with the
+  renderer's snapshot taken on each analysis hop's last frame instead of at the end of the block, and the
+  snapshot's positions and gains following a ramp as its speaker gains do. Measured against the exact
+  objects through the renderer (mean level error per speaker and 1024-frame window): Unfold 1.135 to
+  0.940 dB, Helicopter 0.441 to 0.026 dB, Furiosa and Dolby's 7.1.4 test unchanged; overall level as before.
+- **Object size along each axis** (TS 103 448 pseudocodes 7-14 with object_width_X, _Y, _Z): OAMD width,
+  depth and height each shape the spread, instead of the largest standing for all three. Apple's renderer
+  takes one size for every axis, so on object APAC an object sized differently along its axes is rendered
+  by the engine on the speaker bus. Matches an independent implementation of the clause to 1e-4.
 - **`LoadOptions.objectDialogueGain`**: dialogue enhancement, in dB, for elements a TrueHD Atmos stream
   marks as dialogue (OAMD element 4), where the engine renders the objects itself. Applied as AC-4
   specifies for object audio (TS 103 190-2 5.8.2.5): up to the most the stream allows, which is 0 dB when

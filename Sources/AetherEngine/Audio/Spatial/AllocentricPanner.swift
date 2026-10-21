@@ -115,9 +115,10 @@ struct AllocentricPanner: Sendable {
     // MARK: - Object
 
     /// Gains for an object: point panning; TS 103 448's size panner (5.2.3) for an object with size
-    /// (0 for a point up to 1 for the whole room); or, with divergence, two points either side of it
-    /// along x (5.2.4, pseudocode 15: size is then ignored). Unit power in every case.
-    func objectGains(position: SIMD3<Float>, size: Float, divergence: Float = 0, into gains: inout [Float]) {
+    /// along any axis (object_width_X, _Y, _Z: 0 for a point up to 1 for the whole room); or, with
+    /// divergence, two points either side of it along x (5.2.4, pseudocode 15: size is then ignored).
+    /// Unit power in every case.
+    func objectGains(position: SIMD3<Float>, size: SIMD3<Float>, divergence: Float = 0, into gains: inout [Float]) {
         if gains.count != channelCount { gains = [Float](repeating: 0, count: channelCount) }
         for i in gains.indices { gains[i] = 0 }
         let p = clamp(position)
@@ -131,11 +132,17 @@ struct AllocentricPanner: Sendable {
             if norm > 0 { for i in gains.indices { gains[i] /= norm } }
             return
         }
-        guard size > 0 else {
+        // 5.2.1.2 item 7: the size panner when any width is above 0.
+        guard size.max() > 0 else {
             accumulatePoint(p, weight: 1, into: &gains)
             return
         }
-        sizeGains(p, width: min(size, 1), into: &gains)
+        sizeGains(p, width: simd_clamp(size, SIMD3(repeating: 0), SIMD3(repeating: 1)), into: &gains)
+    }
+
+    /// `objectGains` for the same width along every axis (object_width, 5.2.3.2).
+    func objectGains(position: SIMD3<Float>, size: Float, divergence: Float = 0, into gains: inout [Float]) {
+        objectGains(position: position, size: SIMD3(repeating: size), divergence: divergence, into: &gains)
     }
 
     // MARK: - Size (TS 103 448 5.2.3)
@@ -173,8 +180,8 @@ struct AllocentricPanner: Sendable {
         (0..<count).map { axisGains(Float($0) / Float(count - 1), axis: axis) }
     }
 
-    /// Pseudocodes 7-14: gains for an object of uniform `width` (object_width, 0...1) at `p`.
-    private func sizeGains(_ p: SIMD3<Float>, width: Float, into gains: inout [Float]) {
+    /// Pseudocodes 7-14: gains for an object of `width` (object_width_X, _Y, _Z, each 0...1) at `p`.
+    private func sizeGains(_ p: SIMD3<Float>, width: SIMD3<Float>, into gains: inout [Float]) {
         let (nx, ny, nz) = Self.sizeGrid
         let gX = sizeGridGains.x, gY = sizeGridGains.y, gZ = sizeGridGains.z
         let (x, y, z) = (Double(p.x), Double(p.y), Double(max(p.z, 0)))
@@ -198,14 +205,15 @@ struct AllocentricPanner: Sendable {
             return g.map { $0 / max(1e-5, total) }
         }
 
-        // One width for all three axes: Atmos sends object_width (5.2.3.2).
-        let size = sizeScale(Double(width))
-        let lbX = max(size, 2 / Double(nx - 1)), lbY = max(size, 2 / Double(ny - 1)), lbZ = max(size, 2 / Double(nz - 1))
+        // object_size_X/Y/Z, and with lower bounds (5.2.3.2).
+        let (sizeX, sizeY, sizeZ) = (sizeScale(Double(width.x)), sizeScale(Double(width.y)), sizeScale(Double(width.z)))
+        let lbX = max(sizeX, 2 / Double(nx - 1)), lbY = max(sizeY, 2 / Double(ny - 1)), lbZ = max(sizeZ, 2 / Double(nz - 1))
         let wX = (0..<nx).map { weight(Double($0) / Double(nx - 1), x, lbX) }
         let wY = (0..<ny).map { weight(Double($0) / Double(ny - 1), y, lbY) }
         let wZ = (0..<nz).map { weight(Double($0) / Double(nz - 1), z, lbZ) }
-        // Pseudocode 9, with x1 = x2 = x3 = size.
-        let sizeEff = (2.0 / 3 + 2.0 / 9 + 1.0 / 9) * size
+        // Pseudocode 9: the sizes sorted descending, weighted 2/3, 2/9, 1/9.
+        let sorted = [sizeX, sizeY, sizeZ].sorted(by: >)
+        let sizeEff = 2.0 / 3 * sorted[0] + 2.0 / 9 * sorted[1] + 1.0 / 9 * sorted[2]
         let power = sizeEff > 0.5 ? 6 + (sizeEff - 0.5) * (-4 / 2.3) : 6
 
         // Pseudocode 10: the weighted per-axis sums, and the inside gains.

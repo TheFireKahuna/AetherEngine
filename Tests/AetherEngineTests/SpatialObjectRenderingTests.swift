@@ -151,6 +151,29 @@ struct SpatialObjectRenderingTests {
         }
     }
 
+    @Test("a size along each axis follows TS 103 448's size panner, as the reference probe computes it")
+    func sizePannerPerAxis() {
+        // probes/ts103448_size.py size_pan(x, y, z, wx, wy, wz) on 7.1.4, order L R C Ls Rs Lrs Rrs Vhl Vhr Ltr Rtr.
+        let cases: [(SIMD3<Float>, SIMD3<Float>, [Float])] = [
+            (SIMD3(0.5, 0, 0), SIMD3(0.6, 0.1, 0),
+             [0.529456, 0.529456, 0.649200, 0.073168, 0.073168, 0, 0, 0.059937, 0.059937, 0, 0]),
+            (SIMD3(0.25, 0.4, 0.6), SIMD3(0.1, 0.5, 0.3),
+             [0.326264, 0, 0.321510, 0.325460, 0.277318, 0.291610, 0.248326, 0.489826, 0.234784, 0.336904, 0.228239]),
+            (SIMD3(0.5, 0.5, 0), SIMD3(0, 0, 0.8),
+             [0.004500, 0.004500, 0.063247, 0.632035, 0.632035, 0.044973, 0.044973, 0.219645, 0.219645, 0.219645, 0.219645]),
+            (SIMD3(0.7, 0.2, 0.3), SIMD3(0.3, 0.9, 0.05),
+             [0.098501, 0.413013, 0.486043, 0.172151, 0.227997, 0.272433, 0.455654, 0.167888, 0.306361, 0.157123, 0.270721]),
+        ]
+        let layout = SpatialSpeakerLayout.l714
+        let panner = AllocentricPanner(layout: layout)
+        var gains: [Float] = []
+        for (position, size, expected) in cases {
+            panner.objectGains(position: position, size: size, into: &gains)
+            let withoutLFE = gains.enumerated().filter { $0.offset != layout.lfeIndex }.map(\.element)
+            for (got, want) in zip(withoutLFE, expected) { #expect(abs(got - want) < 1e-4, "\(position) size \(size)") }
+        }
+    }
+
     @Test("default trims leave 7.1.4 alone and pull the back and top down on smaller layouts")
     func defaultTrim() {
         let trim = ObjectAudioTrim.defaults
@@ -301,6 +324,24 @@ struct SpatialObjectRenderingTests {
         ])
         #expect(abs(out[r][149] - 0.625) < 0.01)
         #expect(abs(out[r][299] - 1) < 1e-5)
+    }
+
+    @Test("a snapshot mid-ramp reports the object where its ramp has got to, position and gain as its gains")
+    func snapshotFollowsTheRamp() {
+        let layout = SpatialSpeakerLayout.l714
+        let renderer = ObjectAudioRenderer(layout: layout, roles: [.object])
+        var snapshot = ObjectAudioGainSnapshot()
+        renderer.advance(frameCount: 100, updates: [
+            .init(frameOffset: 0, rampFrames: 0, states: [ObjectAudioElementState(position: SIMD3(0, 0, 0), gain: 1)]),
+            .init(frameOffset: 0, rampFrames: 199, states: [ObjectAudioElementState(position: SIMD3(1, 0, 0), gain: 0.5)]),
+        ])
+        renderer.snapshot(into: &snapshot)
+        // 100 of the ramp's 200 steps.
+        #expect(abs(snapshot.positions[0]!.x - 0.5) < 1e-6)
+        #expect(abs(snapshot.gains[0] - 0.75) < 1e-6)
+        renderer.advance(frameCount: 100, updates: [])
+        renderer.snapshot(into: &snapshot)
+        #expect(snapshot.positions[0] == SIMD3(1, 0, 0) && snapshot.gains[0] == 0.5)
     }
 
     @Test("a custom trim's balance fades the far end of the room (TS 103 420 5.6.5.9-12)")

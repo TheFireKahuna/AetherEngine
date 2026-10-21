@@ -10,8 +10,9 @@ import TrueHD
 /// With `splitsBed` (the engine's TrueHD path, see `BedSplitter`) the decode is a different one:
 /// the matrix interpolation values are discarded, so the object signals are approximate, every block
 /// also carries the stream's channel-based presentation (Dolby's own 7.1 or 5.1 rendering of the mix)
-/// from the same access unit, and elements are described as plain point sources: the bridge then
-/// takes every output from that bed and only reads where the objects' energy lies.
+/// from the same access unit, and the bridge takes every output from that bed, reading only where the
+/// objects' energy lies: elements prepared as TS 103 448 has them (`state(for:stream:)`), ramps
+/// included, so that is where the renderer would put it.
 ///
 /// The library's coordinates are OAMD room coordinates (ETSI TS 103 420 4.2.1): x left→right and
 /// y front→back on 0...1, z −1 floor, 0 ear level, +1 ceiling. That is the renderer's own room
@@ -206,8 +207,7 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
                 let states: [ObjectAudioElementState?] = (0..<count).map { state(for: update.elements[$0], stream) }
                 updates.append(ObjectAudioMetadataUpdate(
                     frameOffset: Int(update.frame_offset),
-                    // Splitting the bed, each update is taken as it stands, without the ramp towards it.
-                    rampFrames: splitsBed ? 0 : Int(update.ramp_frames), states: states))
+                    rampFrames: Int(update.ramp_frames), states: states))
             }
         }
 
@@ -277,11 +277,7 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     }
 
     private func state(for element: TrueHDAtmosElement, _ stream: StreamMetadata) -> ObjectAudioElementState {
-        #if TrueHDReferenceRender || APACObjectOutput
-        splitsBed ? Self.pointSource(for: element) : Self.state(for: element, stream: stream)
-        #else
-        Self.pointSource(for: element)
-        #endif
+        Self.state(for: element, stream: stream)
     }
 
     /// What the stream signals for every element at once, as of a block's updates.
@@ -332,24 +328,15 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         return stream
     }
 
-    /// An element as a point at its position: no size, snap, zone exclusion, screen anchoring or
-    /// elevation switch. ISF elements, whose positions the library does not decode, sit in the room's
-    /// centre.
-    static func pointSource(for element: TrueHDAtmosElement) -> ObjectAudioElementState {
-        let active = element.flags & TRUEHD_ATMOS_ELEMENT_ACTIVE != 0
-        let p = element.kind == TRUEHD_ATMOS_ELEMENT_ISF ? (Float(0.5), Float(0.5), Float(0.5)) : element.position
-        return ObjectAudioElementState(position: SIMD3(p.0, p.1, max(0, p.2)), gain: active ? element.gain : 0)
-    }
-
-    #if TrueHDReferenceRender || APACObjectOutput
-    /// An element as TS 103 420 decodes it and TS 103 448 prepares it for panning, which the
-    /// reference render and object output share. In order: the room position (distance, screen
+    /// An element as TS 103 420 decodes it and TS 103 448 prepares it for panning, which every path
+    /// shares: the bed split's guide, the reference render and object output. In order: the room position (distance, screen
     /// anchoring), warp, the elevation switch, snap; zones, trims and the elevation switch's ear-level
     /// position, which depends on the layout, travel on to the panner.
     static func state(for element: TrueHDAtmosElement, stream: StreamMetadata = .init()) -> ObjectAudioElementState {
         let active = element.flags & TRUEHD_ATMOS_ELEMENT_ACTIVE != 0
         var p = SIMD3(element.position.0, element.position.1, element.position.2)
-        var size = max(element.size.0, element.size.1, element.size.2)
+        // OAMD width, depth, height: TS 103 448's object_width_X, _Y, _Z.
+        var size = SIMD3(element.size.0, element.size.1, element.size.2)
         var divergence = element.flags & TRUEHD_ATMOS_ELEMENT_DIVERGENCE != 0 ? element.divergence : 0
         var excluded = excludedSpeakers(zone: element.zone)
         let isObject = element.kind == TRUEHD_ATMOS_ELEMENT_OBJECT
@@ -358,7 +345,7 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             // content carrying them was found. Spread it over the room rather than pin it to
             // whatever position value is left in the struct.
             p = SIMD3(0.5, 0.5, 0.5)
-            size = 1
+            size = SIMD3(repeating: 1)
         } else if element.flags & TRUEHD_ATMOS_ELEMENT_SCREEN_REF != 0 {
             p = roomPosition(screenAnchored: p, screenFactor: element.screen_factor,
                              depthFactor: element.depth_factor, screen: .frontWall)
@@ -374,11 +361,15 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         let screenAnchored = element.flags & TRUEHD_ATMOS_ELEMENT_SCREEN_REF != 0
         if isObject, element.flags & TRUEHD_ATMOS_ELEMENT_SNAP != 0, !screenAnchored {
             p = snapped(p, zone: element.zone, elevation: element.flags & TRUEHD_ATMOS_ELEMENT_ELEVATION != 0)
-            size = 0
+            size = .zero
             divergence = 0
         }
         let bypassTrim = !isObject || element.flags & TRUEHD_ATMOS_ELEMENT_TRIM_BYPASS != 0
+        #if TrueHDReferenceRender || APACObjectOutput
         let dialogue = element.dialog == TRUEHD_ATMOS_DIALOG_DIALOGUE ? stream.dialogue : 1
+        #else
+        let dialogue: Float = 1    // the published LibTrueHD (API 2) names no dialogue value
+        #endif
         return ObjectAudioElementState(
             position: SIMD3(p.x, p.y, max(0, p.z)),
             gain: active ? element.gain * dialogue : 0,
@@ -501,6 +492,5 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         default: return []
         }
     }
-    #endif
 }
 #endif
