@@ -207,6 +207,21 @@ extension AetherEngine {
         #endif
     }
 
+    /// From before the display criteria write to the end of the load: the session about to start will play
+    /// APAC (`loadInternal` checked its track). The banner an LG G5 shows when the panel finishes its switch
+    /// to Dolby Vision read Dolby Vision alone on the FEL route, whose activator otherwise starts only once
+    /// the software host has loaded, after that switch; AVPlayer with both running from the start showed Dolby
+    /// Vision and Atmos.
+    /// The load's own `followAtmosOutput` (software host) or `currentAVPlayer` (native) takes over, and a load
+    /// that ends some other way releases it as the state leaves `.loading`.
+    func anticipateAtmosOutput() {
+        #if os(tvOS)
+        let activator = atmosOutputActivator ?? AtmosOutputActivator()
+        atmosOutputActivator = activator
+        activator.attach(playsAPAC: { [weak self] in self?.state == .loading }, isPaused: { false })
+        #endif
+    }
+
     /// #597: a media services reset invalidates the activator's own `AVQueuePlayer` along with the engine's,
     /// and the engine only rebuilds its own. Dropped here, the next `currentAVPlayer` builds a fresh one.
     func dropAtmosOutputActivator() {

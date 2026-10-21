@@ -4937,6 +4937,15 @@ public final class AetherEngine: ObservableObject {
         // AE#348: the pre-flight gate of a VOD load, running beside the load instead of in front of it.
         var preflightGate: Task<Void, Never>?
         defer { preflightGate?.cancel() }
+        // A TrueHD Atmos track rendered to APAC plays with the Atmos activator on either route; started
+        // before the panel switch, so the TV's format banner after it already sees Atmos.
+        if probeOpened, resolvedInitialAudio >= 0, let par = probe.stream(at: resolvedInitialAudio)?.pointee.codecpar,
+           HLSVideoEngine.objectAudioSource(codecID: par.pointee.codec_id, profile: par.pointee.profile) == .trueHDAtmos,
+           HLSVideoEngine.spatialRenderingLayout(
+               rendering: options.objectAudioRendering, codecID: par.pointee.codec_id,
+               profile: par.pointee.profile, sampleRate: par.pointee.sample_rate) != nil {
+            anticipateAtmosOutput()
+        }
         switch Self.loadDisplayCriteriaAction(engineWritesCriteria: options.engineWritesDisplayCriteria, audioOnlyPath: false) {
         case .applyFresh:
             let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
