@@ -191,9 +191,15 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         if block.flags & TRUEHD_ATMOS_BLOCK_METADATA_UPDATED != 0, let metadata = block.metadata {
             let md = metadata.pointee
             let count = min(Int(md.element_count), channels)
-            let stream = streamMetadata(md)
             for u in 0..<Int(md.update_count) {
                 let update = md.updates[u]
+                // Trims and warp as of this update, which another update in the block may change. The
+                // published LibTrueHD (API 2) has no per-update trims; its warp mode is the block's.
+                #if TrueHDReferenceRender || APACObjectOutput
+                let stream = streamMetadata(warpMode: update.warp_mode, trims: update.trims)
+                #else
+                let stream = streamMetadata(warpMode: md.warp_mode)
+                #endif
                 if u == 0 { firstStates = (0..<count).map { state(for: update.elements[$0], stream) } }
                 // Every element, unchanged ones included: an update restarts every ramp (TS 103 448
                 // pseudocode 19).
@@ -296,8 +302,14 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         powf(10, min(gain, maximum) / 20)
     }
 
-    private func streamMetadata(_ md: TrueHDAtmosMetadata) -> StreamMetadata {
-        var stream = StreamMetadata(warp: md.warp_mode == TRUEHD_ATMOS_WARP_WARPING,
+    #if TrueHDReferenceRender || APACObjectOutput
+    private typealias UpdateTrims = UnsafePointer<TrueHDAtmosTrim>
+    #else
+    private typealias UpdateTrims = UnsafeRawPointer
+    #endif
+
+    private func streamMetadata(warpMode: Int32, trims updateTrims: UpdateTrims? = nil) -> StreamMetadata {
+        var stream = StreamMetadata(warp: warpMode == TRUEHD_ATMOS_WARP_WARPING,
                                     dialogue: Self.dialogueEnhancement(gain: dialogueGain))
         if stream.warp, !warpLogged {
             warpLogged = true
@@ -305,8 +317,8 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
                            + "(TS 103 420 table 32)", category: .session)
         }
         #if TrueHDReferenceRender || APACObjectOutput
-        var trims = [TrueHDAtmosTrim](repeating: TrueHDAtmosTrim(), count: Int(TRUEHD_ATMOS_TRIM_CONFIGS))
-        if truehd_atmos_decoder_get_trims(handle, &trims) == TRUEHD_ATMOS_OK {
+        if let updateTrims {
+            let trims = UnsafeBufferPointer(start: updateTrims, count: Int(TRUEHD_ATMOS_TRIM_CONFIGS))
             stream.trim = ObjectAudioTrim(configs: trims.map { t in
                 switch t.mode {
                 case TRUEHD_ATMOS_TRIM_DISABLED: .disabled
