@@ -66,6 +66,11 @@ the public-API contract.
   bus does (it started one step ahead), and a sized object with its elevation off is rendered on the bus
   on 7.1.4, where the system's size would spread it into the heights. A position exactly on a speaker
   row or column gives its neighbour exactly 0 instead of 7.5e-8 (Float's cos(pi / 2)).
+- **`LoadOptions.objectDialogueGain`**: dialogue enhancement, in dB, for elements a TrueHD Atmos stream
+  marks as dialogue (OAMD element 4), where the engine renders the objects itself. Applied as AC-4
+  specifies for object audio (TS 103 190-2 5.8.2.5): up to the most the stream allows, which is 0 dB when
+  it states no maximum, and TrueHD states none, so only a cut takes effect. No film surveyed (183 TrueHD
+  Atmos titles) marks its dialogue, so for now it changes nothing on real content.
 - **TrueHD Atmos at 96 and 192 kHz is rendered with its objects** instead of falling back to the channel
   bridge's 7.1 without heights. The decoded elements (and the bed the bed split plays) are decimated to
   48 kHz right after decoding (`ObjectAudioDecimator`: linear-phase FIR, flat to 20 kHz, over 100 dB down
