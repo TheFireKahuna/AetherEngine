@@ -22,9 +22,10 @@ import AetherLibavcodec
 /// decoder": the whole duration). So every encoder run's priming packets are stamped `leadingFrames` before
 /// the run's anchor and trimmed, and its content packets sit exactly on their source position. That is the
 /// shape Apple's own APAC takes: written by AVAssetWriter and read back unchanged, the first buffer carries
-/// TrimDurationAtStart = 2048 frames and its output time is content time 0. The HLS route's fMP4 states no
-/// priming (no edit list, no trim), and AVPlayer was measured to infer the shift there; this path does not
-/// depend on anything inferring it.
+/// TrimDurationAtStart = 2048 frames and its output time is content time 0. The HLS route keeps the priming
+/// unstated on purpose: that is how Apple's own HLS writer writes APAC (AVAssetWriter with mpeg4AppleHLS: no
+/// edit list, the first fragment's decode time 0 on the priming packets), the form AVPlayer's HLS path is
+/// built for. A sample buffer renderer has no such convention to lean on, so here it is stated.
 @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
 final class APACSampleBufferDecoder: SoftwareAudioDecoding, @unchecked Sendable {
 
