@@ -135,6 +135,15 @@ the public-API contract.
 
 ### Fixed
 
+- **Every load declares its audio session.** The category, mode and route-sharing policy were declared once,
+  at init, and a host that redeclared the process-wide session in between kept it that way: Sodalite's music
+  player set `.playback`/`.default` before every track, which also dropped the `.longFormAudio` policy HDMI
+  route negotiation relies on (#24), and every video after it played on that session until relaunch. Each load
+  now declares `.moviePlayback` (`.default` for `audioOnly`), the policy and multichannel content on the session
+  transition queue, ahead of its own activation, changing nothing when they already hold. New
+  `reactivateAudioSession()` makes the session active again for a resume on the paths the engine owns it
+  (software, audio-only) and leaves the native path to AVKit, for hosts that called `setActive` themselves.
+
 - **APAC fragments state their pre-roll, as Apple's HLS writer writes them.** Every APAC packet reports one
   packet of pre-roll (`AudioStreamPacketDependencyDescription`), which Apple's own HLS fMP4 carries as a
   fragment-local `prol` sample group with roll distance 1; movenc, muxing the track as its ALAC stand-in,

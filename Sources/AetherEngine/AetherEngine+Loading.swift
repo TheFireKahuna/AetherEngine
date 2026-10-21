@@ -1935,6 +1935,19 @@ extension AetherEngine {
         logAudibleReadback(host: host)
     }
 
+    /// Make the session active again before a resume, on the paths where the engine owns it.
+    ///
+    /// For a host that resumes after the system deactivated the session (a pause, a return from the background).
+    /// The software and audio-only paths own their session and get the same activation a load gives them, queued
+    /// behind any release still in flight. The native path gets nothing: AVKit activates it there, and an activation
+    /// from the host latches an idle HDMI link at stereo (#24). Calling `setActive` directly bypasses both.
+    public func reactivateAudioSession() async {
+        #if os(iOS) || os(tvOS)
+        guard softwareHost != nil || audioHost != nil || audioAVPlayerActive else { return }
+        await activateRendererAudioSession()
+        #endif
+    }
+
     /// Activate AVAudioSession for renderer paths (SoftwarePlaybackHost, audio hosts) that have no AVPlayerViewController. Native path deliberately skips this: AVKit activates per playback so tvOS can auto-negotiate the HDMI route (issue #24).
     ///
     /// Called once per load, and again when an interruption ends on a renderer path (AE#549): these
