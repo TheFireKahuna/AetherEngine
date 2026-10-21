@@ -310,9 +310,11 @@ extension HLSVideoEngine {
             case .trueHDAtmos:
                 #if TrueHDObjectAudio
                 if APACObjectOutputSwitch.isOn {
-                    decoder = try TrueHDObjectAudioDecoder(splitsBed: false, objectOutput: true)
+                    decoder = try TrueHDObjectAudioDecoder(splitsBed: false, objectOutput: true,
+                                                           dialogueGain: objectDialogueGain)
                 } else {
-                    decoder = try TrueHDObjectAudioDecoder(splitsBed: !TrueHDReferenceRender.isOn)
+                    decoder = try TrueHDObjectAudioDecoder(splitsBed: !TrueHDReferenceRender.isOn,
+                                                           dialogueGain: objectDialogueGain)
                 }
                 #else
                 return nil

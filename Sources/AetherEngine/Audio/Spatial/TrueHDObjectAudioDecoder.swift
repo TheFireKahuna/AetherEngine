@@ -49,8 +49,12 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     private var bedDecimator: ObjectAudioDecimator?
     private var discontinuityPending = false
 
+    /// The listener's dialogue gain in dB (`LoadOptions.objectDialogueGain`), applied as
+    /// `dialogueEnhancement(gain:maximum:)` has it.
+    let dialogueGain: Float
+
     /// `splitsBed` is false only for the measurement reference (`TrueHDReferenceRender` trait).
-    init(splitsBed: Bool = true, objectOutput: Bool = false) throws {
+    init(splitsBed: Bool = true, objectOutput: Bool = false, dialogueGain: Float = 0) throws {
         #if !TrueHDReferenceRender
         precondition(splitsBed || objectOutput, "the exact decode and mix are only built with the TrueHDReferenceRender trait")
         #endif
@@ -62,6 +66,7 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             throw DecoderError(status: TRUEHD_ATMOS_ERR_INVALID_ARGUMENT, message: "create failed")
         }
         self.handle = handle
+        self.dialogueGain = dialogueGain
         self.splitsBed = splitsBed
         self.objectOutput = objectOutput
         if splitsBed {
@@ -278,10 +283,22 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         /// warp_mode 1 (TS 103 420 table 32).
         var warp = false
         var trim = ObjectAudioTrim.defaults
+        /// The linear gain for elements the stream marks as dialogue (`dialogueEnhancement`).
+        var dialogue: Float = 1
+    }
+
+    /// Dialogue enhancement as AC-4 specifies it for object audio (TS 103 190-2 V1.3.1 5.8.2.5): the
+    /// objects marked as dialogue take 10^(G/20), G the listener's gain in dB, at most `maximum`, the
+    /// most the stream allows. A stream that states no maximum allows none (G_max = 0 dB), so it can
+    /// be turned down but not up. TrueHD carries the marks in OAMD element 4 (dialog 1) and no maximum
+    /// anyone has decoded, and no film surveyed carries the element at all.
+    static func dialogueEnhancement(gain: Float, maximum: Float = 0) -> Float {
+        powf(10, min(gain, maximum) / 20)
     }
 
     private func streamMetadata(_ md: TrueHDAtmosMetadata) -> StreamMetadata {
-        var stream = StreamMetadata(warp: md.warp_mode == TRUEHD_ATMOS_WARP_WARPING)
+        var stream = StreamMetadata(warp: md.warp_mode == TRUEHD_ATMOS_WARP_WARPING,
+                                    dialogue: Self.dialogueEnhancement(gain: dialogueGain))
         if stream.warp, !warpLogged {
             warpLogged = true
             EngineLog.emit("[TrueHDObjectAudioDecoder] the stream signals warp_mode 1: object depth is doubled "
@@ -349,9 +366,10 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             divergence = 0
         }
         let bypassTrim = !isObject || element.flags & TRUEHD_ATMOS_ELEMENT_TRIM_BYPASS != 0
+        let dialogue = element.dialog == TRUEHD_ATMOS_DIALOG_DIALOGUE ? stream.dialogue : 1
         return ObjectAudioElementState(
             position: SIMD3(p.x, p.y, max(0, p.z)),
-            gain: active ? element.gain : 0,
+            gain: active ? element.gain * dialogue : 0,
             size: size,
             divergence: divergence,
             excluded: excluded,

@@ -591,6 +591,14 @@ public struct LoadOptions: Sendable, Equatable {
     /// (`AetherEngine.OptionalComponent`).
     public var objectAudioRendering: ObjectAudioRendering
 
+    /// Dialogue enhancement for TrueHD Atmos where the engine renders the objects itself (the exact
+    /// decode or object APAC, personal builds; the bed split plays Dolby's own channel mix and has no
+    /// objects to adjust), in dB: elements the stream marks as dialogue are raised or lowered by it,
+    /// as AC-4 specifies for object audio. A boost is limited to the most the stream allows, and
+    /// TrueHD streams state none, so only a cut (a negative value) takes effect, and only on a stream
+    /// that marks its dialogue, which no film surveyed does. Default 0.
+    public var objectDialogueGain: Float
+
     /// Treat the source as a live stream. `seek(to:)` becomes a no-op; `isLive` surface reflects this for host UIs. Set explicitly: auto-detection from `probe.durationSeconds == 0` is too noisy (VOD MKVs with broken duration headers). Default `false`.
     public var isLive: Bool
 
@@ -1007,6 +1015,7 @@ public struct LoadOptions: Sendable, Equatable {
         panelPresentsDolbyVision: Bool = false,
         audioBridgeMode: AudioBridgeMode = .lossless,
         objectAudioRendering: ObjectAudioRendering = .off,
+        objectDialogueGain: Float = 0,
         isLive: Bool = false,
         audioOnly: Bool = false,
         dvrWindowSeconds: Double? = nil,
@@ -1064,6 +1073,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.panelPresentsDolbyVision = panelPresentsDolbyVision
         self.audioBridgeMode = audioBridgeMode
         self.objectAudioRendering = objectAudioRendering
+        self.objectDialogueGain = objectDialogueGain
         self.isLive = isLive
         self.audioOnly = audioOnly
         self.dvrWindowSeconds = dvrWindowSeconds
