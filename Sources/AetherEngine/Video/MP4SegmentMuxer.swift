@@ -25,6 +25,11 @@ import AetherLibavutil
 /// av_write_frame(nil) (gated by `moovFlushed`) handles FFmpeg splitting ftyp+moov and
 /// moof+mdat across calls; subsequent cuts are single-call. FragmentSplitter routes ftyp+moov
 /// to onInitCaptured (init.mp4) and moof+mdat bytes to the staging POSIX file.
+/// The APAC track the splitter adds the pre-roll group to, set from the init (splitter-thread only).
+final class PreRollTrack: @unchecked Sendable {
+    var trackID: UInt32?
+}
+
 final class MP4SegmentMuxer {
 
     // MARK: - Types
@@ -355,9 +360,13 @@ final class MP4SegmentMuxer {
         self.byteCounter = counter
 
         let sampleEntryOverride = audio?.soundSampleEntryOverride
+        // The APAC track's fragments carry the pre-roll group its encoder states (`APACPreRollGroup`); the
+        // track is found in the init the moment it is written, before any fragment.
+        let preRoll = PreRollTrack()
         self.splitter = FragmentSplitter(
             onHeaderComplete: { initBytes in
                 let initBytes = Self.installingSoundSampleEntry(sampleEntryOverride, in: initBytes)
+                if sampleEntryOverride != nil { preRoll.trackID = APACPreRollGroup.apacTrackID(inInit: initBytes) }
                 // AE#187 defense-in-depth: strip a zero-sample video `sdtp` from the fragmented init before
                 // forwarding it. The pinned FFmpegBuild (n8.1.2) never writes it, so this is a no-op there;
                 // it neutralizes the box only for a consumer that links an older FFmpeg (a -force_load'ed
@@ -386,6 +395,10 @@ final class MP4SegmentMuxer {
                 }
                 counter.bytesWrittenCurrentSegment += count
                 counter.lifetimeFragmentBytes += count
+            },
+            moofRewriter: sampleEntryOverride == nil ? nil : { moof in
+                guard let trackID = preRoll.trackID else { return moof }
+                return APACPreRollGroup.addingPreRoll(toMoof: moof, trackID: trackID) ?? moof
             }
         )
 
