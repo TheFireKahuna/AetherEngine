@@ -112,6 +112,10 @@ final class AudioOutput: @unchecked Sendable {
 
     private var automaticFlushObserver: NSObjectProtocol?
     private var _automaticFlushCount = 0
+    /// The last compressed buffer the renderer took, as delivered, and whether the next one needs it again
+    /// as its pre-roll (after an AE#549 automatic flush). Guarded by `lock`.
+    private var lastCompressedDelivery: CMSampleBuffer?
+    private var primeAfterAutomaticFlush = false
 
     /// Where the AE#549 flush runs. The posting thread must never wait on `lock`: `enqueue` holds it
     /// across `renderer.enqueue` (DEC-106), and a renderer that posts from inside that call would make the
@@ -148,6 +152,9 @@ final class AudioOutput: @unchecked Sendable {
                 _automaticFlushCount += 1
                 let count = _automaticFlushCount
                 renderer.flush()
+                // A compressed stream picks up mid-run here, where its decoder starts cold: the packet
+                // before the next one goes in again first, decoded only to prime (see `enqueue`).
+                primeAfterAutomaticFlush = lastCompressedDelivery != nil
                 lock.unlock()
                 EngineLog.emit(
                     "[AudioOutput] AE#549 renderer flushed itself (#\(count)): "
@@ -311,8 +318,24 @@ final class AudioOutput: @unchecked Sendable {
                 + String(format: "%+.0f ms", offset.seconds * 1000)
                 + String(format: " (sample at %.3fs delivered at %.3fs)", source, source + offset.seconds)
         }
+        // A codec whose packets need the one before them for full output (APAC reports one packet of
+        // pre-roll for every packet) restarts cold after an automatic flush, mid-stream. The feed carries on
+        // from where it was, so the packet that belongs before this one is the last one delivered: it goes
+        // in again, trimmed for its whole duration, the documented way to decode samples only to prime the
+        // decoder (`kCMSampleBufferAttachmentKey_TrimDurationAtStart`). A seek needs none of this: the
+        // decoder restarts with it, and an APAC encoder run opens on its own trimmed priming packets.
+        let compressed = Self.isCompressed(delivered)
+        if compressed, primeAfterAutomaticFlush, let last = lastCompressedDelivery, let primer = Self.decodeOnlyCopy(last) {
+            renderer.enqueue(primer)
+            #if DEBUG
+            rendererEnqueueObserverForTesting?(primer)
+            #endif
+        }
+        primeAfterAutomaticFlush = false
+        lastCompressedDelivery = compressed ? delivered : nil
         renderer.enqueue(delivered)
         #if DEBUG
+        rendererEnqueueObserverForTesting?(delivered)
         afterRendererEnqueueForTesting?()
         #endif
         lock.unlock()
@@ -338,7 +361,28 @@ final class AudioOutput: @unchecked Sendable {
         return true
     }
 
+    nonisolated static func isCompressed(_ buffer: CMSampleBuffer) -> Bool {
+        guard let format = CMSampleBufferGetFormatDescription(buffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee else { return false }
+        return asbd.mFormatID != kAudioFormatLinearPCM
+    }
+
+    /// `buffer` again, with all of its decoded output trimmed: it primes the decoder and plays nothing.
+    nonisolated static func decodeOnlyCopy(_ buffer: CMSampleBuffer) -> CMSampleBuffer? {
+        var copy: CMSampleBuffer?
+        guard CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault, sampleBuffer: buffer, sampleBufferOut: &copy) == noErr,
+              let copy else { return nil }
+        CMRemoveAttachment(copy, key: kCMSampleBufferAttachmentKey_TrimDurationAtEnd)
+        CMSetAttachment(
+            copy, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
+            value: CMTimeCopyAsDictionary(CMSampleBufferGetDuration(copy), allocator: kCFAllocatorDefault),
+            attachmentMode: kCMAttachmentMode_ShouldPropagate)
+        return copy
+    }
+
     #if DEBUG
+    /// Test-only: every buffer handed to the renderer, in order, primers included.
+    var rendererEnqueueObserverForTesting: (@Sendable (CMSampleBuffer) -> Void)?
     /// Test-only: runs inside `enqueue`'s locked section, right after the renderer took the buffer, which
     /// is where a renderer that posts its notifications from inside `enqueue` would post them.
     var afterRendererEnqueueForTesting: (@Sendable () -> Void)?
@@ -426,12 +470,17 @@ final class AudioOutput: @unchecked Sendable {
         defer { lock.unlock() }
         _epoch &+= 1
         renderer.flush()
+        // The decoder starts over with a flush like this one, priming itself.
+        lastCompressedDelivery = nil
+        primeAfterAutomaticFlush = false
     }
 
     func stop() {
         lock.lock()
         defer { lock.unlock() }
         _epoch &+= 1
+        lastCompressedDelivery = nil
+        primeAfterAutomaticFlush = false
         disarmPreroll()
         synchronizer.setRate(0.0, time: .zero)
         renderer.flush()
