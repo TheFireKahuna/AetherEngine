@@ -325,15 +325,22 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     private var loggedLayerFailed = false
     private var loggedNotReady = false
-    /// Enqueues in a row that found the target failed, flush or no flush; a rendering status ends the run.
-    /// Decode thread only, like the flags above.
+    /// Enqueues in a row that found the target failed, flush or no flush; a rendering status ends the run, and so
+    /// does a `flush()` (a seek, or the host's recovery), which is what rearms the report. Guarded by `reorderLock`.
     private var consecutiveFailedEnqueues = 0
-    /// A failure the flush below does not clear: the target is still failed this many enqueues later.
+    /// A failure the per-enqueue flush does not clear: the target is still failed this many enqueues later.
     static let failedEnqueuesBeforeReport = 3
+    /// While the run goes on with no `flush()` to end it (a live source the host can only flush in place, a recovery
+    /// that never reaches this renderer), it is reported again this many enqueues later, so it cannot go quiet.
+    static let failedEnqueuesBetweenReports = 120
 
-    /// Called once per run of failed enqueues that reaches `failedEnqueuesBeforeReport`, on the decode thread,
-    /// with the target's error. Until then the per-enqueue flush is the recovery (a handoff race clears with it);
-    /// after it the host has to act, or the picture stays black while the audio plays on.
+    nonisolated static func reportsFailure(afterConsecutiveFailedEnqueues count: Int) -> Bool {
+        count >= failedEnqueuesBeforeReport && (count - failedEnqueuesBeforeReport) % failedEnqueuesBetweenReports == 0
+    }
+
+    /// Called on the decode thread, with the target's error, for a run of failed enqueues at the counts
+    /// `reportsFailure(afterConsecutiveFailedEnqueues:)` names. Until the first the per-enqueue flush is the recovery
+    /// (a handoff race clears with it); after it the host has to act, or the picture stays black while the audio plays on.
     private var _persistentFailureObserver: (@Sendable (String) -> Void)?
     func setPersistentFailureObserver(_ observer: (@Sendable (String) -> Void)?) {
         reorderLock.lock()
@@ -735,6 +742,8 @@ final class SampleBufferRenderer: @unchecked Sendable {
         gateReorderLead = 0   // a seek relearns the lead from the new position
         // #311: everything reported before this point describes frames that are now gone.
         _flushGeneration = SampleBufferRenderer.flushGenerations.next()
+        // A failure that outlives this flush is a new run, reported again.
+        consecutiveFailedEnqueues = 0
         // Invalidate the format description cache; the next load() may open a stream with different colorimetry at the same resolution.
         cachedFormatDesc = nil
         cachedFormatKey = nil
@@ -810,22 +819,25 @@ final class SampleBufferRenderer: @unchecked Sendable {
         let target = queueTarget
         switch queueStatus {
         case .failed:
+            reorderLock.lock()
             consecutiveFailedEnqueues += 1
+            let failedRun = consecutiveFailedEnqueues
+            let observer = _persistentFailureObserver
+            reorderLock.unlock()
             if !loggedLayerFailed {
                 loggedLayerFailed = true
                 EngineLog.emit("[Renderer] queue target failed at enqueue #\(enqueueCount + 1): \(queueError?.localizedDescription ?? "nil"), attempting recovery via flush()", category: .swPlayback)
             }
-            if consecutiveFailedEnqueues == Self.failedEnqueuesBeforeReport {
+            if Self.reportsFailure(afterConsecutiveFailedEnqueues: failedRun) {
                 let error = queueError.map { "\(($0 as NSError).domain)/\(($0 as NSError).code) \($0.localizedDescription)" } ?? "no error"
-                EngineLog.emit("[Renderer] queue target still failed after \(consecutiveFailedEnqueues) flushes: \(error)", category: .swPlayback)
-                reorderLock.lock()
-                let observer = _persistentFailureObserver
-                reorderLock.unlock()
+                EngineLog.emit("[Renderer] queue target still failed after \(failedRun) flushes: \(error)", category: .swPlayback)
                 observer?(error)
             }
             target.flush()
         case .rendering:
+            reorderLock.lock()
             consecutiveFailedEnqueues = 0
+            reorderLock.unlock()
         default:
             // Unknown: what a flush leaves until the next buffer lands, which is no sign the failure cleared.
             break

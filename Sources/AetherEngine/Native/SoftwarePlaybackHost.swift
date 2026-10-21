@@ -948,54 +948,36 @@ final class SoftwarePlaybackHost {
 
     // MARK: Renderer failure
 
-    enum FailedRenderer: String { case video, audio }
-    enum RendererFailureAction: Equatable { case reposition, fail }
+    /// A renderer that stays failed, reported to the engine, which owns the escalation (`RendererRecoveryLadder`)
+    /// because one of its steps replaces this host. The video renderer reports a target still failed after the flushes
+    /// it makes itself, the audio output its renderer failing (its header calls the state terminal); each reports again
+    /// only after a flush, so a recovery that does not hold is reported once more. Main actor.
+    var onRendererFailed: ((FailedRenderer, String) -> Void)?
 
-    /// How long after a recovery a second failure counts as the recovery not holding.
-    nonisolated static let rendererRecoveryWindow: TimeInterval = 60
-
-    /// The first failure repositions; a second inside the window fails the session.
-    nonisolated static func rendererFailureAction(now: Date, lastRecovery: Date?) -> RendererFailureAction {
-        guard let lastRecovery, now.timeIntervalSince(lastRecovery) < rendererRecoveryWindow else { return .reposition }
-        return .fail
-    }
-
-    /// Main actor only.
-    private var lastRendererRecovery: Date?
-
-    /// A renderer that stays failed: the video one after the flushes it makes itself, the audio one at once (its
-    /// header calls the state terminal). Before this the video renderer flushed on every frame, black for the rest
-    /// of the session, and a failed audio renderer was a debug-only log line under a clock that ran on in silence.
-    ///
-    /// The first recovery is the reposition AE#739 makes after a lost decoder session: the seek flushes both
-    /// renderers, the documented reset of a failed one, and the picture comes back on the frame the audio is at.
-    /// A live source with no rewind ring cannot go back, so there the flush is all: the audio one here, the video
-    /// one the renderer already made. A second failure inside `rendererRecoveryWindow` means the reset does not
-    /// hold, and it surfaces as the session's failure, which the host app can see and act on.
     private func handleRendererFailure(_ which: FailedRenderer, error: String) {
         guard !stopRequested else { return }
-        let now = Date()
-        switch Self.rendererFailureAction(now: now, lastRecovery: lastRendererRecovery) {
-        case .fail:
-            EngineLog.emit("[SWHost] \(which.rawValue) renderer failed again within "
-                           + "\(Int(Self.rendererRecoveryWindow)) s of its recovery (\(error)): failing the session",
+        EngineLog.emit("[SWHost] \(which.rawValue) renderer failed: \(error)", category: .swPlayback)
+        onRendererFailed?(which, error)
+    }
+
+    /// The ladder's first step: reposition to the playhead, the reposition AE#739 makes after a lost decoder session.
+    /// The seek flushes both renderers (the documented reset of a failed one, and what rearms their reports), and the
+    /// picture comes back on the frame the audio is at. A live source with no rewind ring cannot go back, so there the
+    /// renderers are flushed in place and the feed carries on from where it is.
+    func repositionToResetRenderers() {
+        guard !stopRequested else { return }
+        if isLive && dvrRing == nil {
+            EngineLog.emit("[SWHost] renderers flushed in place on a live source without a rewind ring",
                            category: .swPlayback)
-            failure = PlaybackErrorInfo(kind: isLive ? .liveSourceUnavailable : .softwarePipelineFailed,
-                                        message: "Playback error: the \(which.rawValue) renderer failed (\(error))")
-        case .reposition:
-            lastRendererRecovery = now
-            if isLive && dvrRing == nil {
-                EngineLog.emit("[SWHost] \(which.rawValue) renderer failed (\(error)) on a live source: flushed, "
-                               + "resuming with the feed", category: .swPlayback)
-                if which == .audio { audioOutput?.flush() }
-                return
-            }
-            let target = currentTime
-            EngineLog.emit("[SWHost] \(which.rawValue) renderer failed (\(error)): repositioning to the playhead at "
-                           + "\(String(format: "%.3f", target))s to reset it", category: .swPlayback)
-            Task { @MainActor [weak self] in
-                _ = await self?.seek(to: target)
-            }
+            renderer.flush(removingDisplayedImage: false)
+            audioOutput?.flush()
+            return
+        }
+        let target = currentTime
+        EngineLog.emit("[SWHost] repositioning to the playhead at \(String(format: "%.3f", target))s to reset the "
+                       + "renderers", category: .swPlayback)
+        Task { @MainActor [weak self] in
+            _ = await self?.seek(to: target)
         }
     }
 

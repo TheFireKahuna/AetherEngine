@@ -1109,6 +1109,11 @@ public final class AetherEngine: ObservableObject {
     /// anyone stopped watching, and the host owns that second question.
     private var mediaServicesResetPending = false
 
+    /// Where the software and audio-only paths stand in recovering a renderer that stays failed. On the engine because
+    /// one of its steps rebuilds the session, replacing the host that reported it. See `climbRendererRecovery`.
+    var rendererRecoveryLadder = RendererRecoveryLadder()
+    var rendererRebuildInFlight = false
+
     func noteMediaServicesReset(lost: Bool) {
         mediaServicesResetPending = true
         dropAtmosOutputActivator()

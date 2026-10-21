@@ -182,6 +182,13 @@ final class AudioPlaybackHost {
         self.audioStreamIndex = resolvedAudioIdx
         self.audioOutput = AudioOutput()
         self.audioOutput?.volume = volume
+        self.audioOutput?.onRendererFailed = { [weak self] error in
+            Task { @MainActor in
+                guard let self, !self.stopRequested else { return }
+                EngineLog.emit("[AudioHost] audio renderer failed: \(error)", category: .swPlayback)
+                self.onRendererFailed?(.audio, error)
+            }
+        }
 
         if let start = startPosition, start.isFinite, start > 0 {
             // #254: same off-main, deadline-bounded reposition the transport seek uses. Also load()'s
@@ -642,6 +649,23 @@ final class AudioPlaybackHost {
             + "\(String(format: "%.3f", aOut.currentTimeSeconds))s",
             category: .swPlayback
         )
+    }
+
+    // MARK: - Renderer failure
+
+    /// The renderer failing, reported to the engine, which owns the escalation (`RendererRecoveryLadder`) as it does
+    /// for the software host. Main actor.
+    var onRendererFailed: ((FailedRenderer, String) -> Void)?
+
+    /// The ladder's first step: reposition to the playhead, whose flush is the renderer's reset and rearms its report.
+    func repositionToResetRenderers() {
+        guard !stopRequested else { return }
+        let target = currentTime
+        EngineLog.emit("[AudioHost] repositioning to the playhead at \(String(format: "%.3f", target))s to reset the "
+                       + "renderer", category: .swPlayback)
+        Task { @MainActor [weak self] in
+            _ = await self?.seek(to: target)
+        }
     }
 
     // MARK: - Time updates

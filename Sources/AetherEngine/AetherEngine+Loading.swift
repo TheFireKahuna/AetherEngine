@@ -2077,6 +2077,10 @@ extension AetherEngine {
         host.onLiveEdge = { [weak self] edge in
             self?.publishLiveWindow(edgeSessionTime: edge)
         }
+        host.onRendererFailed = { [weak self, weak host] which, error in
+            guard let self, let host, self.softwareHost === host else { return }
+            self.climbRendererRecovery(which, error: error)
+        }
         self.softwareHost = host
         armHeldPictureRelease(onSoftwareHost: host)
         // #311: a load builds a new host and a new renderer, so an observer installed once by the
@@ -2233,6 +2237,10 @@ extension AetherEngine {
         await activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
         try checkLoadCurrent(generation)
         let host = AudioPlaybackHost()
+        host.onRendererFailed = { [weak self, weak host] which, error in
+            guard let self, let host, self.audioHost === host else { return }
+            self.climbRendererRecovery(which, error: error)
+        }
         self.audioHost = host
         applyDesiredVolume(to: host)
         applyDesiredRate(to: host)
