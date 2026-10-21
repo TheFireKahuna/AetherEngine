@@ -50,6 +50,8 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         return layout.channelCount
     }
     let peakOutputBitRate: Int64
+    /// The encoder's priming: the first frames of every encoder run's decoded audio, before its content.
+    var leadingFrames: Int { pipeline.leadingFrames }
 
     private let srcTimeBase: AVRational
     private let decoder: ObjectAudioDecoding
@@ -248,6 +250,23 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     func feed(packet: UnsafePointer<AVPacket>) throws -> [UnsafeMutablePointer<AVPacket>] {
         opLock.lock()
         defer { opLock.unlock() }
+        var results: [UnsafeMutablePointer<AVPacket>] = []
+        wrap(feedLocked(packet: packet), into: &results)
+        return results
+    }
+
+    /// `feed` without the muxer's packets: the encoder's own, each with its place in its encoder run, for a
+    /// consumer that states the priming itself (`APACSampleBufferDecoder`).
+    func feedStamped(packet: UnsafePointer<AVPacket>) -> [APACEncodePipeline.StampedPacket] {
+        opLock.lock()
+        defer { opLock.unlock() }
+        let stamped = feedLocked(packet: packet)
+        noteEmitted(stamped)
+        return stamped
+    }
+
+    /// Caller holds `opLock`.
+    private func feedLocked(packet: UnsafePointer<AVPacket>) -> [APACEncodePipeline.StampedPacket] {
         stats.packetsFed += 1
         stats.packetsFedSinceLastEnqueue += 1
         // Every exit: a decoder that rejects each packet has decoded nothing too.
@@ -260,7 +279,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             stats.packetsRejected += 1
             noteDecoderSelfReset()
             noteFeedFailure(error)
-            var results: [UnsafeMutablePointer<AVPacket>] = []
+            var results: [APACEncodePipeline.StampedPacket] = []
             // This feed has already counted as failed.
             collectEncoded(into: &results, noteFailure: false)
             return results
@@ -274,7 +293,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
 
         // Packets already stamped stay in the result when a later block of the same packet fails:
         // their timestamps are right, and dropping them would leave a hole the source never had.
-        var results: [UnsafeMutablePointer<AVPacket>] = []
+        var results: [APACEncodePipeline.StampedPacket] = []
         do {
             while let block = try decoder.nextBlock() {
                 stats.framesDecoded += 1
@@ -333,13 +352,15 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     func settle() -> [UnsafeMutablePointer<AVPacket>] {
         opLock.lock()
         defer { opLock.unlock() }
-        var results: [UnsafeMutablePointer<AVPacket>] = []
+        var stamped: [APACEncodePipeline.StampedPacket] = []
         // Audio the decoder holds for metadata sits before the cut; released here, the cut sees what
         // it saw before the hold existed, rather than up to 100 ms of it landing in the next segment.
-        renderHeldBlocks(into: &results)
+        renderHeldBlocks(into: &stamped)
         let settled = pipeline.settle()
-        wrap(settled.packets, into: &results)
+        stamped += settled.packets
         noteEncodeErrors(settled.errors)
+        var results: [UnsafeMutablePointer<AVPacket>] = []
+        wrap(stamped, into: &results)
         return results
     }
 
@@ -348,15 +369,17 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         defer { opLock.unlock() }
         guard !drainedAtEOF else { return [] }
         drainedAtEOF = true
-        var results: [UnsafeMutablePointer<AVPacket>] = []
+        var stamped: [APACEncodePipeline.StampedPacket] = []
         // Audio the decoder held back for metadata that never came plays as it is.
-        renderHeldBlocks(into: &results)
+        renderHeldBlocks(into: &stamped)
         drainSplitter()
         encodePending()
         logLevels(levelMeter.restart())
         let finished = pipeline.finish()
-        wrap(finished.packets, into: &results)
+        stamped += finished.packets
         noteEncodeErrors(finished.errors)
+        var results: [UnsafeMutablePointer<AVPacket>] = []
+        wrap(stamped, into: &results)
         if !results.isEmpty {
             EngineLog.emit("[SpatialAudioBridge] EOF flush emitted \(results.count) tail packet(s)", category: .session)
         }
@@ -414,7 +437,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     // MARK: - Pipeline
 
     /// Caller holds `opLock`.
-    private func renderHeldBlocks(into results: inout [UnsafeMutablePointer<AVPacket>]) {
+    private func renderHeldBlocks(into results: inout [APACEncodePipeline.StampedPacket]) {
         decoder.releaseHeldBlocks()
         do {
             while let block = try decoder.nextBlock() {
@@ -426,7 +449,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         }
     }
 
-    private func renderAndEncode(_ block: ObjectAudioDecodedBlock, into results: inout [UnsafeMutablePointer<AVPacket>]) throws {
+    private func renderAndEncode(_ block: ObjectAudioDecodedBlock, into results: inout [APACEncodePipeline.StampedPacket]) throws {
         guard block.sampleRate == Self.sampleRate else { throw BridgeError.unsupportedSampleRate(block.sampleRate) }
         guard block.frameCount > 0 else { return }
 
@@ -647,9 +670,9 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     }
 
     /// Caller holds `opLock`. Everything the encoder has finished since the last call.
-    private func collectEncoded(into results: inout [UnsafeMutablePointer<AVPacket>], noteFailure: Bool = true) {
+    private func collectEncoded(into results: inout [APACEncodePipeline.StampedPacket], noteFailure: Bool = true) {
         let encoded = pipeline.collect()
-        wrap(encoded.packets, into: &results)
+        results += encoded.packets
         noteEncodeErrors(encoded.errors, noteFailure: noteFailure)
     }
 
@@ -696,10 +719,14 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             avpkt.pointee.dts = packet.pts
             avpkt.pointee.duration = frames
             if packet.isSync { avpkt.pointee.flags |= AV_PKT_FLAG_KEY }
-            outputBytesLifetime += Int64(packet.data.count)
-            stats.packetsEmitted += 1
             results.append(avpkt)
         }
+        noteEmitted(packets)
+    }
+
+    private func noteEmitted(_ packets: [APACEncodePipeline.StampedPacket]) {
+        for packet in packets { outputBytesLifetime += Int64(packet.data.count) }
+        stats.packetsEmitted += packets.count
     }
 }
 #endif

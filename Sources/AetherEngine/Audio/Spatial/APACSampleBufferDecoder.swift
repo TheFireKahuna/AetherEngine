@@ -14,8 +14,17 @@ import AetherLibavcodec
 /// still move. So the engine runs the activator for a software session that plays this.
 ///
 /// The format description is the one AVPlayer builds from the HLS route's `apac` sample entry
-/// (`SpatialAudioBridge.soundSampleEntryOverride`), and the packets keep the bridge's timestamps, which
-/// already account for AVFoundation presenting an APAC packet's audio `leadingFrames` before its stamp.
+/// (`SpatialAudioBridge.soundSampleEntryOverride`).
+///
+/// Timing follows CoreMedia's documented contract rather than any player's inference: a buffer's audio plays
+/// from its presentation timestamp, and decoded audio to discard is marked with
+/// `kCMSampleBufferAttachmentKey_TrimDurationAtStart` ("the samples are only being decoded to prime the
+/// decoder": the whole duration). So every encoder run's priming packets are stamped `leadingFrames` before
+/// the run's anchor and trimmed, and its content packets sit exactly on their source position. That is the
+/// shape Apple's own APAC takes: written by AVAssetWriter and read back unchanged, the first buffer carries
+/// TrimDurationAtStart = 2048 frames and its output time is content time 0. The HLS route's fMP4 states no
+/// priming (no edit list, no trim), and AVPlayer was measured to infer the shift there; this path does not
+/// depend on anything inferring it.
 @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
 final class APACSampleBufferDecoder: SoftwareAudioDecoding, @unchecked Sendable {
 
@@ -65,47 +74,51 @@ final class APACSampleBufferDecoder: SoftwareAudioDecoding, @unchecked Sendable 
     var packetsBeforeClockFallback: Int { SpatialAudioBridge.silentFeedPacketThreshold }
 
     func decode(packet: UnsafeMutablePointer<AVPacket>) -> [CMSampleBuffer] {
-        let encoded: [UnsafeMutablePointer<AVPacket>]
-        do {
-            encoded = try bridge.feed(packet: packet)
-        } catch {
-            // The bridge logs and counts its own failures; a packet it refused is a gap in the audio.
-            return []
-        }
-        var buffers: [CMSampleBuffer] = []
-        buffers.reserveCapacity(encoded.count)
-        for pkt in encoded {
-            if let buffer = sampleBuffer(pkt) { buffers.append(buffer) }
-            var p: UnsafeMutablePointer<AVPacket>? = pkt
-            trackedPacketFree(&p)
-        }
-        return buffers
+        // The bridge logs and counts its own failures; a packet it refused is a gap in the audio.
+        bridge.feedStamped(packet: packet).compactMap(sampleBuffer)
+    }
+
+    /// Where packet `indexInRun` of an encoder run plays, and how much of its decoded audio is priming, given
+    /// the bridge's stamp (the run's anchor plus k·1024, priming included).
+    static func timing(bridgeStamp: Int64, indexInRun: Int64, leadingFrames: Int)
+        -> (presentation: Int64, trimAtStart: Int64) {
+        let frames = Int64(APACEncoder.framesPerPacket)
+        let trim = min(max(Int64(leadingFrames) - indexInRun * frames, 0), frames)
+        return (bridgeStamp - Int64(leadingFrames), trim)
     }
 
     func flush() { bridge.startSegment() }
 
     func close() { bridge.close() }
 
-    /// One APAC packet as one compressed sample buffer, on the bridge's 48 kHz timestamp.
-    private func sampleBuffer(_ pkt: UnsafeMutablePointer<AVPacket>) -> CMSampleBuffer? {
-        let size = Int(pkt.pointee.size)
-        guard size > 0, let data = pkt.pointee.data else { return nil }
+    /// One APAC packet as one compressed sample buffer, on its 48 kHz presentation time, its priming trimmed.
+    private func sampleBuffer(_ packet: APACEncodePipeline.StampedPacket) -> CMSampleBuffer? {
+        let size = packet.data.count
+        guard size > 0 else { return nil }
         var block: CMBlockBuffer?
         guard CMBlockBufferCreateWithMemoryBlock(
             allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: size, blockAllocator: kCFAllocatorDefault,
             customBlockSource: nil, offsetToData: 0, dataLength: size, flags: kCMBlockBufferAssureMemoryNowFlag,
             blockBufferOut: &block) == kCMBlockBufferNoErr, let block,
-              CMBlockBufferReplaceDataBytes(with: data, blockBuffer: block, offsetIntoDestination: 0, dataLength: size)
-                == kCMBlockBufferNoErr
+              packet.data.withUnsafeBytes({ raw in
+                  CMBlockBufferReplaceDataBytes(with: raw.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: size)
+              }) == kCMBlockBufferNoErr
         else { return nil }
+        let timing = Self.timing(bridgeStamp: packet.pts, indexInRun: packet.indexInRun, leadingFrames: bridge.leadingFrames)
         var description = AudioStreamPacketDescription(
             mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: UInt32(size))
         var buffer: CMSampleBuffer?
         let status = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
             allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: formatDescription,
-            sampleCount: 1, presentationTimeStamp: CMTime(value: pkt.pointee.pts, timescale: timescale),
+            sampleCount: 1, presentationTimeStamp: CMTime(value: timing.presentation, timescale: timescale),
             packetDescriptions: &description, sampleBufferOut: &buffer)
         guard status == noErr, let buffer else { return nil }
+        if timing.trimAtStart > 0 {
+            CMSetAttachment(
+                buffer, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
+                value: CMTimeCopyAsDictionary(CMTime(value: timing.trimAtStart, timescale: timescale), allocator: kCFAllocatorDefault),
+                attachmentMode: kCMAttachmentMode_ShouldPropagate)
+        }
         return buffer
     }
 }

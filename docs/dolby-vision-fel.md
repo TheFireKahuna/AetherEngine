@@ -132,7 +132,11 @@ The dual-layer route runs on `SoftwarePlaybackHost`, so its audio goes through t
 
 - **TrueHD Atmos with `objectAudioRendering = .apac(...)`** (the `TrueHDObjectAudio` trait) is rendered to
   APAC exactly as on the HLS route (`SpatialAudioBridge`) and handed to the renderer as compressed sample
-  buffers (`APACSampleBufferDecoder`), with the HLS route's `apac` sample entry as their format. On an Apple TV
+  buffers (`APACSampleBufferDecoder`), with the HLS route's `apac` sample entry as their format. Their timing
+  follows CoreMedia's documented contract, so lip sync rests on nothing inferred: every encoder run's priming
+  packets are stamped before the anchor with `kCMSampleBufferAttachmentKey_TrimDurationAtStart` covering them,
+  and content packets sit exactly on their source position, the shape Apple's own APAC has when AVAssetWriter
+  writes it and AVAssetReader reads it back. On an Apple TV
   4K (tvOS 27.2) into a Samsung HW-Q990B the renderer renders the APAC, heights and objects included, but sends
   the HDMI sink multichannel PCM; with `AtmosOutputActivator`'s silent Atmos player beside it the sink shows
   Dolby Atmos and the objects still move. The engine therefore runs the activator for such a session too,

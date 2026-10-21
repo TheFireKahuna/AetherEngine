@@ -49,16 +49,32 @@ struct APACSampleBufferDecoderTests {
         #expect(!decoder.producesPCM)
     }
 
-    @Test("one packet per buffer, on the bridge's timestamps, sized by its packet description")
-    func buffersCarryTheBridgeTimeline() throws {
+    private static func trimAtStart(_ buffer: CMSampleBuffer) -> Int64 {
+        guard let d = CMGetAttachment(buffer, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart, attachmentModeOut: nil) as? NSDictionary
+        else { return 0 }
+        return CMTimeMakeFromDictionary(d).convertScale(48_000, method: .roundTowardZero).value
+    }
+
+    @Test("priming is stated, not inferred: priming packets before the anchor and fully trimmed, content on its source position")
+    func primingIsTrimmedAndContentIsOnTime() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let decoder = try makeDecoder()
         defer { decoder.close() }
+        #expect(decoder.bridge.leadingFrames == 2048)
         let buffers = decode(decoder, startMs: 1000, count: 100)
         #expect(buffers.count > 40)
-        // As `SpatialAudioBridgeTests.anchorsOnSource`: 1000 ms plus five skipped access units.
-        #expect(buffers.first.map { CMSampleBufferGetPresentationTimeStamp($0) } == CMTime(value: 48_200, timescale: 48_000))
+        // As `SpatialAudioBridgeTests.anchorsOnSource`: the first content frame belongs at 1000 ms plus five
+        // skipped access units, 48 200. The two priming packets come before it and play nothing.
         let pts = buffers.map { CMSampleBufferGetPresentationTimeStamp($0).value }
+        let firstThree: [Int64] = Array(pts.prefix(3))
+        let expectedThree: [Int64] = [46_152, 47_176, 48_200]
+        #expect(firstThree == expectedThree)
+        let trims: [Int64] = buffers.prefix(3).map { Self.trimAtStart($0) }
+        let expectedTrims: [Int64] = [1024, 1024, 0]
+        #expect(trims == expectedTrims)
+        #expect(buffers.dropFirst(2).allSatisfy { Self.trimAtStart($0) == 0 })
+        // Output time (what the renderer plays from) of the first content buffer: its source position.
+        #expect(CMSampleBufferGetOutputPresentationTimeStamp(buffers[2]) == CMTime(value: 48_200, timescale: 48_000))
         #expect(zip(pts, pts.dropFirst()).allSatisfy { $1 - $0 == 1024 })
         for buffer in buffers {
             #expect(CMSampleBufferGetNumSamples(buffer) == 1)
@@ -139,6 +155,21 @@ struct APACSampleBufferDecoderTests {
         #expect(energy > 1)
     }
 
+    @Test("priming that is not a whole number of packets is trimmed to the frame")
+    func partialPrimingTrim() {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        var t: [(presentation: Int64, trimAtStart: Int64)] = []
+        for k in Int64(0)..<4 {
+            t.append(APACSampleBufferDecoder.timing(bridgeStamp: 10_000 + k * 1024, indexInRun: k, leadingFrames: 1500))
+        }
+        let presentations: [Int64] = t.map { $0.presentation }
+        let trims: [Int64] = t.map { $0.trimAtStart }
+        #expect(presentations == [8_500, 9_524, 10_548, 11_572])
+        #expect(trims == [1024, 476, 0, 0])
+        // Content frame 0 (decoded frame 1500) plays at the anchor: packet 1 starts at 9524, trims 476.
+        #expect(t[1].presentation + t[1].trimAtStart == 10_000)
+    }
+
     @Test("a flush starts the bridge over: the next buffer anchors on the next packet")
     func flushReanchors() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
@@ -147,8 +178,14 @@ struct APACSampleBufferDecoderTests {
         _ = decode(decoder, startMs: 0, count: 60)
         decoder.flush()
         let after = decode(decoder, startMs: 30_000, count: 60)
-        // 30 s = 1 440 000 frames, plus the five access units skipped after the reset.
-        #expect(after.first.map { CMSampleBufferGetPresentationTimeStamp($0).value } == 1_440_200)
+        // 30 s = 1 440 000 frames, plus the five access units skipped after the reset; the new run primes again.
+        let firstPTS: Int64? = after.first.map { CMSampleBufferGetPresentationTimeStamp($0).value }
+        #expect(firstPTS == 1_438_152)
+        let firstTrim: Int64? = after.first.map { Self.trimAtStart($0) }
+        #expect(firstTrim == 1024)
+        let content: CMSampleBuffer? = after.first { Self.trimAtStart($0) == 0 }
+        let contentOutput: Int64? = content.map { CMSampleBufferGetOutputPresentationTimeStamp($0).value }
+        #expect(contentOutput == 1_440_200)
     }
     #endif
 }
