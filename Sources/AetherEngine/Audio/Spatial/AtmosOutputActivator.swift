@@ -189,12 +189,18 @@ extension AetherEngine {
             activator.attach(to: player) { [weak self] _ in self?.nativeVideoSession?.audioIsAPAC == true }
         } else if let host = softwareHost, host.audioIsAPAC {
             // The software host plays APAC through its own renderer (the Dolby Vision FEL route): followed
-            // by the engine's state, which `state`'s didSet refreshes.
+            // by the engine's state, which `state`'s didSet refreshes. Loading and seeking count as playing,
+            // as an AVPlayer waiting to play does on the HLS route: the TV's format banner reads the audio
+            // when the panel finishes its Dolby Vision switch, which lands while the session still loads, and
+            // started only at `.playing` the stream came too late for it to say Atmos.
             let activator = atmosOutputActivator ?? AtmosOutputActivator()
             atmosOutputActivator = activator
             activator.attach(
                 playsAPAC: { [weak self, weak host] in host != nil && self?.softwareHost === host },
-                isPaused: { [weak self] in self?.state != .playing })
+                isPaused: { [weak self] in
+                    guard let state = self?.state else { return true }
+                    return ![.playing, .loading, .seeking].contains(state)
+                })
         } else {
             atmosOutputActivator?.detach()
         }
