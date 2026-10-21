@@ -507,6 +507,20 @@ Walks a title's RPUs with no decoders and no GPU, converts each to Profile 8.1 e
 swift run aetherctl dvsurvey --frames 6000 <p7-source>
 ```
 
+## eltype, elsurvey, elframe
+
+Profile 7 enhancement-layer tools for a library. `eltype` reads `label<TAB>url` lines on stdin and prints `label<TAB>FEL|MEL|none|error: ...` for each, in input order, probing `--parallel N` sources at a time (default 8); each probe walks only to the first RPU (`probeDolbyVisionEnhancementLayer`), so a library's Profile 7 copies classify in seconds.
+
+`elsurvey` (with the `DualLayerDolbyVision` trait) reads the same lines and measures what each title's enhancement layer does to its picture at `--points N` sampled keyframes (default 48), `--parallel N` titles at a time (default 8), through `doviResidualSurvey`. It prints a header, then one TSV row per title as it finishes (completion order): measured frames, residual-off frames, failures, mean |residual| and mean signed residual in 12-bit codes, the p99 |residual| (median over frames, then the max), the share of pixels moved by at least one 10-bit step, the mean nits change at the average level, the p99 nits change at the peak (median, max), the timestamp of the frame with the largest highlight change, and the seconds the title took.
+
+`elframe` (same trait) writes one FEL frame at `--at SECONDS`, composed with and without its residual, into `--out DIR`: `fel_y.bin`, `fel_uv.bin`, `mel_y.bin`, `mel_uv.bin` (full-precision P010 planes, little-endian 16-bit) and `frame.json`.
+
+```bash
+swift run aetherctl eltype --parallel 8 < titles.tsv
+swift run aetherctl elsurvey --parallel 4 --points 48 < titles.tsv
+swift run aetherctl elframe --at 600 --out /tmp/frame <p7-source>
+```
+
 ## pktdump
 
 Opens the demuxer under a selectable open profile, optionally seeks, and dumps raw video packet timing exactly as the demuxer delivers it (before any producer-side dts repair and before muxing): per-packet dts / pts / duration / keyframe flag samples, NOPTS and non-monotonic dts counts, and dts-delta / duration histograms. Also prints the resolved stream fields that `find_stream_info` fills (`avg_frame_rate`, `codecpar.video_delay`).
