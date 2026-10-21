@@ -126,6 +126,11 @@ the public-API contract.
 
 ### Fixed
 
+- **The Atmos output activator runs on HDMI again.** #834 compared the route's port type with "HDMI",
+  but `AVAudioSession.Port.HDMI` is "HDMIOutput" (as the session's own route line logs it), so no route
+  ever matched and the activator stayed off everywhere, the HDMI sinks it exists for included. A
+  soundbar that needs it (a Samsung HW-Q990C, see `AtmosOutputActivator`) played APAC without showing Atmos.
+
 - **CM v4.0 RPUs with a level 253 block keep their Dolby Vision on the Profile 7 routes.** Disney+ v4.0
   RPUs carry L253 (0x55 filler, up to 66 bytes), which `dolby_vision` 3.4.0 refused as an unknown level, so
   every RPU of a hybrid built on such a donor was dropped and the title played as its base layer.

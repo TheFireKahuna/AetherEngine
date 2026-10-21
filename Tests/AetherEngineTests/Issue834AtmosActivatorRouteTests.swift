@@ -9,14 +9,20 @@ struct Issue834AtmosActivatorRouteTests {
 
     @Test("an all-HDMI route takes the activator")
     func hdmiRouteTakesIt() {
-        #expect(AtmosOutputActivator.routeTakesActivator(outputPortTypes: ["HDMI"]))
+        #expect(AtmosOutputActivator.routeTakesActivator(outputPortTypes: ["HDMIOutput"]))
     }
 
     @Test("AirPlay, Bluetooth and mixed routes do not")
     func otherRoutesDoNot() {
         #expect(!AtmosOutputActivator.routeTakesActivator(outputPortTypes: ["AirPlay"]))
         #expect(!AtmosOutputActivator.routeTakesActivator(outputPortTypes: ["BluetoothA2DPOutput"]))
-        #expect(!AtmosOutputActivator.routeTakesActivator(outputPortTypes: ["HDMI", "AirPlay"]))
+        #expect(!AtmosOutputActivator.routeTakesActivator(outputPortTypes: ["HDMIOutput", "AirPlay"]))
+    }
+
+    @Test("the port type is the session's spelling, HDMIOutput, which the macOS suite cannot read off the session")
+    func portTypeSpelling() {
+        #expect(AtmosOutputActivator.hdmiPortType == "HDMIOutput")
+        #expect(!AtmosOutputActivator.routeTakesActivator(outputPortTypes: ["HDMI"]))
     }
 
     @Test("a route in transition, with no outputs, does not")
