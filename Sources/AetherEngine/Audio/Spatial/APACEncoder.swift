@@ -127,7 +127,7 @@ final class APACEncoder {
         guard !ended else { return [] }
         ended = true
         var packets: [Packet] = []
-        try drain(feeding: nil, endOfStream: true, into: &packets)
+        try APACCodecGate.lock.withLock { try drain(feeding: nil, endOfStream: true, into: &packets) }
         return packets
     }
 
@@ -178,4 +178,15 @@ final class APACEncoder {
             packets.append(Packet(data: data, isSync: sync))
         }
     }
+}
+
+/// A lock the APAC encoders in a process share. Measured on macOS 27: a bed encoder (`APACEncoder`)
+/// that was running when an object encoder's codec (`APACObjectEncoder`) was initialized, ending its
+/// stream before that codec has coded its first frames, leaves the whole object stream without its
+/// metadata, every object at the room's centre (6 streams in 6, one thread). Ending it any later does
+/// no harm, nor does disposing of it without ending its stream, nor a bed encoder started after the
+/// object codec. So the object encoder initializes its codec when it codes its first frames, and
+/// that and the end of a bed stream never overlap.
+enum APACCodecGate {
+    static let lock = NSLock()
 }
