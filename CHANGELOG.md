@@ -12,6 +12,13 @@ the public-API contract.
 
 ### Added
 
+- **Dolby Vision FEL titles keep their TrueHD Atmos.** The dual-layer route plays on the software host, which
+  decoded TrueHD to its 7.1 presentation. With `objectAudioRendering` on (and the `TrueHDObjectAudio` trait), a
+  TrueHD Atmos track there is now rendered to APAC as on the HLS route and played through the host's
+  `AVSampleBufferAudioRenderer`, with the Atmos output activator beside it: on an Apple TV 4K into a Samsung
+  HW-Q990B the soundbar shows Dolby Atmos and the heights and objects come through, where the renderer alone
+  sends multichannel PCM. `audioDelivery` reports `.bridged` and the decoder label names the APAC pipeline.
+
 - **TrueHD Atmos as APAC objects, personal builds only** (`APACObjectOutput` trait, off by default, with
   `AETHER_APAC_OBJECTS=1`). Every element of the object presentation goes to APAC as a positioned object
   (the LFE on a bed) for tvOS to render, instead of the engine's speaker bed. Private AudioCodec properties

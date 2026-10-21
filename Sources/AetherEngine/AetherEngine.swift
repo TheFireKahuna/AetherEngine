@@ -62,6 +62,8 @@ public final class AetherEngine: ObservableObject {
             recomputePlaybackPhase()
             resolveLoadingStashedSeek(from: oldValue)
             settleOwedBackgroundAction()
+            // A software-host programme has no player for the activator to observe.
+            atmosOutputActivator?.refresh()
             if let logTag { EngineLog.emit("[AetherEngine:\(logTag)] state=\(state)", category: .engine) }
         }
     }
@@ -1976,7 +1978,9 @@ public final class AetherEngine: ObservableObject {
 
     /// SW decode host (dav1d/libavcodec) for codecs AVPlayer can't handle (AV1 on tvOS, VP9, MPEG-2, VC-1).
     /// Non-nil between load and stop when the source routed SW.
-    var softwareHost: SoftwarePlaybackHost?
+    var softwareHost: SoftwarePlaybackHost? {
+        didSet { if softwareHost == nil, oldValue != nil { followAtmosOutput() } }
+    }
 
     /// Combine subscriptions mirroring softwareHost's @Published. Cancelled in stopInternal.
     var softwareCancellables: Set<AnyCancellable> = []
@@ -5536,7 +5540,7 @@ public final class AetherEngine: ObservableObject {
                 // AE#462: the host's own resolved index, not the engine's pick. The pick says which
                 // track was ASKED for; only the host knows whether a decoder opened for it, and this
                 // label claimed one for a session that had dropped its audio and gone video-only.
-                activeAudioDecoder = Self.softwareAudioDecoderLabel(
+                activeAudioDecoder = softwareHost?.audioPipelineDescription ?? Self.softwareAudioDecoderLabel(
                     audioTracks: probedAudioTracks,
                     activeIndex: softwareHost?.audioStreamIndex ?? -1
                 )
