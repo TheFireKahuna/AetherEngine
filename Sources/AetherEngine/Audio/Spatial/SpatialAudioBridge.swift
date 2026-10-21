@@ -162,8 +162,12 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
 #if APACObjectOutput
         self.objectOutput = objectOutput
         if objectOutput {
-            rate = bitRate ?? (APACObjectEncoder.objectSlots + 1) * Self.bitRatePerChannel
+            // Coded to quality per object (`APACObjectEncoder.objectBitRate`), the stream's rate follows
+            // the content; this is what the playlist declares as its peak (Unfold peaks at 10.3 Mbit/s).
+            rate = bitRate ?? (APACObjectEncoder.objectSlots + 1) * APACObjectEncoder.objectBitRate
             let objects = try APACObjectEncoder(bitRate: rate, sampleRate: Double(Self.sampleRate))
+            objects.followRoute()
+            EngineLog.emit("[SpatialAudioBridge] objects rendered for a \(objects.output.rawValue) output", category: .session)
             encoder = objects
             channels = APACObjectEncoder.elementCapacity
             // Advertised as the 7.1.4 channel tier the HDMI route renders it to, not the stream's own

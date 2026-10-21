@@ -24,6 +24,9 @@ struct APACObjectTrajectory {
         var size: Float
         var gain: Float
 
+        /// The same as far as the renderer is told: position and size (the gain is in the audio).
+        func placed(like other: Values) -> Bool { position == other.position && size == other.size }
+
         func lerp(to other: Values, _ t: Float) -> Values {
             Values(position: position + (other.position - position) * t,
                    size: size + (other.size - size) * t,
@@ -38,10 +41,16 @@ struct APACObjectTrajectory {
         var from: Values
         var to: Values
 
+        /// Position and size move as the renderer interpolates a block: `from` at `start`, `to` after
+        /// `length` frames. The gain, applied to the audio here, ramps as TS 103 448 ramps speaker
+        /// gains (pseudocode 19): length + 1 steps, the first on the update's own frame, so a fade on
+        /// a slot and one on the speaker bus (`ObjectAudioRenderer`) step together.
         func value(at t: Int64) -> Values {
             guard length > 0, t < start + length else { return to }
-            guard t > start else { return from }
-            return from.lerp(to: to, Float(t - start) / Float(length))
+            guard t >= start else { return from }
+            var v = from.lerp(to: to, Float(t - start) / Float(length))
+            v.gain = from.gain + (to.gain - from.gain) * Float(t - start + 1) / Float(length + 1)
+            return v
         }
     }
 
@@ -63,6 +72,9 @@ struct APACObjectTrajectory {
     /// Apply an update at absolute frame `t`. Updates come in time order, none before the start of
     /// the packet `blocks` will describe next.
     mutating func apply(_ values: Values, at t: Int64, rampFrames: Int) {
+        // A restatement of where the object already is, with no ramp in flight, changes nothing; as a
+        // piece it would cost a metadata block saying so. (One mid-ramp restarts the ramp, as in Atmos.)
+        if hasMetadata, values == piece.to, t >= piece.start + piece.length { return }
         let jump = rampFrames <= 0 || !hasMetadata
         hasMetadata = true
         let now = piece.value(at: t)
@@ -131,10 +143,10 @@ struct APACObjectTrajectory {
             let next = i + 1 < boundaries.count ? boundaries[i + 1] : end
             let after = value(t, justAfter: true)
             let target = value(next, justAfter: false)
-            let jumps = (t == packetStart && needsJump) || value(t, justAfter: false) != after
+            let jumps = (t == packetStart && needsJump) || !value(t, justAfter: false).placed(like: after)
             if jumps {
                 add(t, 0, after)
-                if target != after { add(t, next - t, target) }
+                if !target.placed(like: after) { add(t, next - t, target) }
             } else {
                 add(t, next - t, target)
             }

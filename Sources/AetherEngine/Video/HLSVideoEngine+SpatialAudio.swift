@@ -84,7 +84,7 @@ extension HLSVideoEngine {
         profile: Int32,
         sampleRate: Int32
     ) -> SpatialSpeakerLayout? {
-        guard let layout = rendering.layout,
+        guard let layout = rendering.layout, layout.isBed,
               objectAudioSource(codecID: codecID, profile: profile)?.isBuiltIn == true,
               sampleRate == 0 || sampleRate == Int32(ObjectAudioRendering.sampleRate)
         else { return nil }
