@@ -487,12 +487,22 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
                     + "split by the objects' energy (latency \(BedSplitter.latency) frames)",
                     category: .session)
             }
-            renderer!.advance(frameCount: block.frameCount, updates: block.updates)
-            renderer!.snapshot(into: &gainSnapshot)
-            splitter!.setGains(gainSnapshot)
-            pendingFrames += splitter!.process(
-                elements: block.planes, bed: bed.planes, frameCount: block.frameCount,
-                output: output.planes.map { $0 + pendingFrames })
+            // Up to each hop boundary in turn, so the splitter reads the gains as they are on the
+            // hop's last frame, mid-ramp included, not as they are at the end of the block.
+            var start = 0
+            while start < block.frameCount {
+                let count = min(block.frameCount - start, splitter!.framesUntilHop)
+                let last = start + count == block.frameCount
+                let updates = block.updates.filter { $0.frameOffset >= start && ($0.frameOffset < start + count || last) }
+                    .map { u -> ObjectAudioMetadataUpdate in var u = u; u.frameOffset -= start; return u }
+                renderer!.advance(frameCount: count, updates: updates)
+                renderer!.snapshot(into: &gainSnapshot)
+                splitter!.setGains(gainSnapshot)
+                pendingFrames += splitter!.process(
+                    elements: block.planes.map { $0 + start }, bed: bed.planes.map { $0 + start }, frameCount: count,
+                    output: output.planes.map { $0 + pendingFrames })
+                start += count
+            }
         } else if let splitter {
             // A block without its bed in a stream that has one: silence on the bed's timeline.
             renderer!.advance(frameCount: block.frameCount, updates: block.updates)

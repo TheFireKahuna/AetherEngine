@@ -496,7 +496,8 @@ final class APACObjectEncoder: APACChunkEncoding {
                 rampStart[element] = clock
                 rampLength[element] = ramp
                 let trim = state.trim?.gain(at: ObjectAudioRenderer.renderPosition(state, on: output), on: output) ?? 1
-                values = .init(position: Self.objectPosition(state, on: output), size: state.size,
+                // Even along every axis here: one that is not goes to the bus (`needsBus`).
+                values = .init(position: Self.objectPosition(state, on: output), size: state.size.max(),
                                gain: onBus ? 0 : state.gain * trim)
             case .bed, .fixed:
                 // A bed channel table 6 sends to one speaker plays from its slot there; one it splits
@@ -554,11 +555,13 @@ final class APACObjectEncoder: APACChunkEncoding {
     /// whose pan law is not TS 103 448's. Taking the heights away from a point is already a position
     /// (the elevation switch put it at ear level), but a size spreads in three dimensions and nothing
     /// tells the renderer to keep it off the heights, so a sized object without elevation is rendered
-    /// here on an output that has them.
+    /// here on an output that has them. And the renderer takes one size for every axis, the largest
+    /// (README §3.6), so an object sized differently along its axes is rendered here too.
     static func needsBus(_ state: ObjectAudioElementState, on output: SpatialSpeakerLayout) -> Bool {
         output == .l20 || state.divergence > 0
             || output.speakers.contains { !$0.isLFE && !$0.isHeight && state.excluded.contains($0) }
-            || (!state.elevation && state.size > 0 && output.isBed)
+            || (!state.elevation && state.size.max() > 0 && output.isBed)
+            || state.size.max() != state.size.min()
     }
 
     private static let outputPanners = Dictionary(uniqueKeysWithValues: [SpatialSpeakerLayout.l20, .l51, .l71, .l714].map {

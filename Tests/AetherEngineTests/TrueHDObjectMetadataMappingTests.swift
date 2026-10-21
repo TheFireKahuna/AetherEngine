@@ -50,25 +50,28 @@ struct TrueHDObjectMetadataMappingTests {
         #expect(TrueHDObjectAudioDecoder.role(forSpeaker: TRUEHD_ATMOS_SPEAKER_UNKNOWN) == .object)
     }
 
-    @Test("splitting the bed, an element is a point at its position with its gain, and nothing else")
-    func pointSource() {
-        let flags = TRUEHD_ATMOS_ELEMENT_ACTIVE | TRUEHD_ATMOS_ELEMENT_SNAP | TRUEHD_ATMOS_ELEMENT_SCREEN_REF
-        let state = TrueHDObjectAudioDecoder.pointSource(
-            for: element(flags: flags, position: (0.8, 0.6, 1), size: (0.4, 0.4, 0.4), zone: TRUEHD_ATMOS_ZONE_NO_BACK))
-        #expect(state == ObjectAudioElementState(position: SIMD3(0.8, 0.6, 1), gain: 0.5))
-        #expect(TrueHDObjectAudioDecoder.pointSource(for: element(flags: 0)).gain == 0)
-        #expect(TrueHDObjectAudioDecoder.pointSource(for: element(position: (0.5, 0.5, -0.6))).position.z == 0)
-        #expect(TrueHDObjectAudioDecoder.pointSource(for: element(kind: TRUEHD_ATMOS_ELEMENT_ISF)).position
-                == SIMD3(0.5, 0.5, 0.5))
+    @Test("the bed split's guide is the element as TS 103 448 prepares it, in every build")
+    func guidePreparation() {
+        // Elevation off: kept off the heights; snapped onto the nearest 22.2 target at ear level.
+        let flags = TRUEHD_ATMOS_ELEMENT_ACTIVE | TRUEHD_ATMOS_ELEMENT_SNAP
+        let state = TrueHDObjectAudioDecoder.state(
+            for: element(flags: flags, position: (0.2, 0.1, 0.8), size: (0.4, 0.4, 0.4), zone: TRUEHD_ATMOS_ZONE_NO_BACK))
+        #expect(!state.elevation && Set(SpatialSpeaker.allCases.filter(\.isHeight)).isSubset(of: state.excluded))
+        #expect(state.position == SIMD3(0, 0, 0))
+        #expect(state.size == .zero)
+        #expect(state.excluded.isSuperset(of: [.rearLeft, .rearRight]))
+        #expect(TrueHDObjectAudioDecoder.state(for: element(flags: 0)).gain == 0)
+        #expect(TrueHDObjectAudioDecoder.state(for: element(position: (0.5, 0.5, -0.6))).position.z == 0)
     }
 
     #if TrueHDReferenceRender
-    @Test("an active elevated object keeps its position, gain and largest size dimension")
+    @Test("an active elevated object keeps its position, gain and its size along each axis")
     func plainObject() {
         let state = TrueHDObjectAudioDecoder.state(for: element(size: (0.1, 0.3, 0.2)))
         #expect(state.position == SIMD3(0.25, 0.5, 0.75))
         #expect(state.gain == 0.5)
-        #expect(state.size == 0.3)
+        // OAMD width, depth, height are TS 103 448's object_width_X, _Y, _Z.
+        #expect(state.size == SIMD3(0.1, 0.3, 0.2))
         #expect(state.excluded.isEmpty)
         #expect(state.divergence == 0)
     }
@@ -133,7 +136,7 @@ struct TrueHDObjectMetadataMappingTests {
     func isfSpread() {
         let state = TrueHDObjectAudioDecoder.state(for: element(kind: TRUEHD_ATMOS_ELEMENT_ISF, position: (0, 0, 0)))
         #expect(state.position == SIMD3(0.5, 0.5, 0.5))
-        #expect(state.size == 1)
+        #expect(state.size == SIMD3(repeating: 1))
     }
 
     @Test("snap moves the object onto the nearest 22.2 target by TS 103 448's weighted distance")
@@ -141,7 +144,7 @@ struct TrueHDObjectMetadataMappingTests {
         let flags = TRUEHD_ATMOS_ELEMENT_ACTIVE | TRUEHD_ATMOS_ELEMENT_ELEVATION | TRUEHD_ATMOS_ELEMENT_SNAP
         let nearL = TrueHDObjectAudioDecoder.state(for: element(flags: flags, position: (0.2, 0.1, 0), size: (0.3, 0.3, 0.3)))
         #expect(nearL.position == SIMD3(0, 0, 0))
-        #expect(nearL.size == 0)
+        #expect(nearL.size == .zero)
         #expect(TrueHDObjectAudioDecoder.state(for: element(flags: flags, position: (0.15, 0.2, 0.8))).position
                 == SIMD3(0.25, 0.25, 1))
         // Surround only and no elevation: the front three, the wides and every height are gone.
@@ -178,7 +181,7 @@ struct TrueHDObjectMetadataMappingTests {
         let state = TrueHDObjectAudioDecoder.state(for: e)
         // Where it is (the screen fills the front wall), not on the nearest target, L.
         #expect(simd_distance(state.position, SIMD3(0.2, 0.1, 0)) < 1e-6)
-        #expect(state.size == 0.3)
+        #expect(state.size == SIMD3(repeating: 0.3))
     }
 
     @Test("a distance puts the object on the room boundary along its ray from the centre")
