@@ -28,5 +28,24 @@ final class AudioSessionRouteSharingPolicyTests: XCTestCase {
         XCTAssertEqual(AVAudioSession.sharedInstance().routeSharingPolicy, expected,
                        "init() must declare the platform policy on the shared session")
     }
+
+    /// A host redeclaring the session between loads (Sodalite's music player set `.playback`/`.default`, which
+    /// also dropped the policy) does not carry into the next load: each load declares what it plays.
+    @MainActor
+    func testEachLoadRedeclaresModeAndPolicy() async throws {
+        let engine = try AetherEngine()
+        await engine.awaitAudioSessionCategoryConfigured()
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playback, mode: .default)
+
+        await engine.declareAudioSessionCategory(audioOnly: false)
+        XCTAssertEqual(session.mode, .moviePlayback)
+        XCTAssertEqual(session.routeSharingPolicy, expected)
+        XCTAssertTrue(session.supportsMultichannelContent)
+
+        await engine.declareAudioSessionCategory(audioOnly: true)
+        XCTAssertEqual(session.mode, .default)
+        XCTAssertEqual(session.routeSharingPolicy, expected)
+    }
 }
 #endif

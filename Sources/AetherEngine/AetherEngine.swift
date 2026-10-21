@@ -3890,6 +3890,47 @@ public final class AetherEngine: ObservableObject {
         await audioSessionCategoryTask?.value
     }
 
+    /// Declare the category again for this load, after the init declaration, on the session transition queue.
+    ///
+    /// The init declaration alone does not hold: the session is process-wide and a host can redeclare it.
+    /// Sodalite's music player set `.playback`/`.default` before every track, which also dropped the
+    /// `.longFormAudio` policy #24 relies on, and every video after it ran on that session until relaunch.
+    /// Each load now states what it needs: `.default` for an audio-only load, `.moviePlayback` otherwise.
+    /// Queued with the activations so it lands before this load's own and after any release still in flight.
+    func declareAudioSessionCategory(audioOnly: Bool) async {
+        await awaitAudioSessionCategoryConfigured()
+        #if os(iOS) || os(tvOS)
+        let mode = Self.audioSessionMode(audioOnly: audioOnly)
+        await enqueueAudioSessionTransition {
+            AetherEngine.applyAudioSessionCategory(mode: mode)
+        }.value
+        #endif
+    }
+
+    #if os(iOS) || os(tvOS)
+    nonisolated static func audioSessionMode(audioOnly: Bool) -> AVAudioSession.Mode {
+        audioOnly ? .default : .moviePlayback
+    }
+
+    /// The blocking half of `declareAudioSessionCategory`: the XPC calls are made only when something differs.
+    nonisolated static func applyAudioSessionCategory(mode: AVAudioSession.Mode) {
+        let session = AVAudioSession.sharedInstance()
+        let policy = audioSessionRouteSharingPolicy
+        guard session.category != .playback || session.mode != mode || session.routeSharingPolicy != policy
+                || !session.supportsMultichannelContent else { return }
+        let before = "\(session.category.rawValue)/\(session.mode.rawValue) policy=\(session.routeSharingPolicy.rawValue) "
+            + "multichannel=\(session.supportsMultichannelContent)"
+        do {
+            try session.setCategory(.playback, mode: mode, policy: policy)
+            try session.setSupportsMultichannelContent(true)
+            EngineLog.emit("[AetherEngine] AVAudioSession re-declared for this load: \(before) -> "
+                           + "\(session.category.rawValue)/\(mode.rawValue) policy=\(policy.rawValue)", category: .engine)
+        } catch {
+            EngineLog.emit("[AetherEngine] AVAudioSession re-declaration error: \(error)", category: .engine)
+        }
+    }
+    #endif
+
     // MARK: - Public load
 
     /// Load a media file or stream URL. Replaces any current playback.
@@ -4360,10 +4401,10 @@ public final class AetherEngine: ObservableObject {
         sourceVideoHeight = 0
         sourceVideoPixelAspectRatio = 1
 
-        // #114: guarantee the AVAudioSession category is declared (off-main, from init) before any branch
-        // below can activate the session: AVKit on the native/remote-HLS paths, activateRendererAudioSession()
-        // on the SW and audio paths. The task is short and typically already complete, so this rarely suspends.
-        await awaitAudioSessionCategoryConfigured()
+        // #114: guarantee the AVAudioSession category is declared (off-main) before any branch below can
+        // activate the session: AVKit on the native/remote-HLS paths, activateRendererAudioSession() on the
+        // SW and audio paths. Declared again for every load, as the session may have been redeclared since.
+        await declareAudioSessionCategory(audioOnly: options.audioOnly)
         // Audit CORE-6: the first suspension point. Two loads issued back to back right after init
         // both wait on the same category task, and the older one must not resume as the current one.
         try checkLoadCurrent(gen)
