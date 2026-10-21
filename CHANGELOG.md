@@ -18,6 +18,8 @@ the public-API contract.
   `AVSampleBufferAudioRenderer`, with the Atmos output activator beside it: on an Apple TV 4K into a Samsung
   HW-Q990B the soundbar shows Dolby Atmos and the heights and objects come through, where the renderer alone
   sends multichannel PCM. `audioDelivery` reports `.bridged` and the decoder label names the APAC pipeline.
+  The encoder's priming is stated with `TrimDurationAtStart` rather than left to the renderer, so the audio's
+  timing follows CoreMedia's documented contract exactly.
 
 - **TrueHD Atmos as APAC objects, personal builds only** (`APACObjectOutput` trait, off by default, with
   `AETHER_APAC_OBJECTS=1`). Every element of the object presentation goes to APAC as a positioned object
