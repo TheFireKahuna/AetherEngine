@@ -103,10 +103,13 @@ struct AllocentricPanner: Sendable {
         while items[upper][keyPath: key] < value { upper += 1 }
         let a = items[upper - 1], b = items[upper]
         let lo = a[keyPath: key], hi = b[keyPath: key]
+        // On an element exactly, that element alone: cos(pi / 2) is 7.5e-8 in Float, not 0. The floor
+        // at 0 is for the size panner, which raises gains to a non-integer power.
+        if value == hi { body(b, 1); return }
         let t = hi > lo ? (value - lo) / (hi - lo) : 0
         let angle = t * .pi / 2
-        body(a, cos(angle))
-        body(b, sin(angle))
+        body(a, max(0, cos(angle)))
+        body(b, max(0, sin(angle)))
     }
 
     // MARK: - Object

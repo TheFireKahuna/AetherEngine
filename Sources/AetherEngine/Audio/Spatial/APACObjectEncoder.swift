@@ -30,7 +30,8 @@ import AVFoundation
 /// The scene is fixed when the encoder is built (`objectSlots` objects, used or silent, then the
 /// speaker bus), because the magic cookie and with it the sample entry are needed before the first
 /// block is decoded. Gains, trims included, are applied to the audio, not sent: the renderer rounds a
-/// sent gain to 0.5 dB. Snap and the elevation switch are positions by the time an update gets here.
+/// sent gain to 0.5 dB. Snap is a position by the time an update gets here, and the elevation switch
+/// becomes one here (an object kept off the heights is sent at ear level).
 /// Zone masks and divergence have nothing that reaches the renderer with type 3 (README §3.20), so
 /// an object carrying either is rendered here instead, by `ObjectAudioRenderer` as TS 103 448 has it,
 /// onto the speaker bus: eleven fixed objects on the 7.1.4 speakers, each of which plays from its
@@ -118,6 +119,8 @@ final class APACObjectEncoder: APACChunkEncoding {
     private var busInputs: [UnsafePointer<Float>] = []
     /// Each element's last state; nil after a gap or restart.
     private var lastStates: [ObjectAudioElementState?] = []
+    /// Whether the bed has the back pair, which sets how TS 103 448 table 6 folds its channels.
+    private var bedHasBacks = false
     /// Where each object's current slot ramp started (its state, unprojected) and over which frames,
     /// to know where it is when a jump hands it to the bus mid-ramp. nil when the slot is not moving.
     private var rampFrom: [ObjectAudioElementState?] = []
@@ -359,9 +362,10 @@ final class APACObjectEncoder: APACChunkEncoding {
         roles = newRoles
         route = []
         lastStates = newRoles.map { _ in nil }
+        bedHasBacks = ObjectAudioRenderer.bedHasBacks(newRoles)
         resetMotion()
         used = Self.busSlotsOnly
-        bus = Self.busRenderer(output, elements: newRoles.count)
+        bus = Self.busRenderer(output, roles: newRoles)
         var nextSlot = 0
         for role in newRoles {
             switch role {
@@ -390,10 +394,9 @@ final class APACObjectEncoder: APACChunkEncoding {
             guard let target = route[element] else { continue }
             let initial: APACObjectTrajectory.Values
             switch role {
-            case .bed(let speaker): initial = .init(position: Self.position(of: speaker, on: output), size: 0, gain: 1)
             case .fixed(let position): initial = .init(position: Self.position(position, on: output), size: 0, gain: 1)
             case .lfe: initial = .init(position: SIMD3(0.5, 0, 0), size: 0, gain: 1)
-            case .object: initial = Self.silent
+            case .bed, .object: initial = Self.silent
             }
             if target < 0 {
                 lfe = APACObjectTrajectory(initial)
@@ -403,8 +406,8 @@ final class APACObjectEncoder: APACChunkEncoding {
                 slots[target].restart(at: clock)
             }
         }
-        // Beds sound from the start; on stereo they sound from the bus.
-        if output == .l20 { apply(.init(frameOffset: 0, rampFrames: 0, states: newRoles.map(Self.bedDefault))) }
+        // Beds sound from the start, from their slots or the bus.
+        apply(.init(frameOffset: 0, rampFrames: 0, states: newRoles.map(Self.bedDefault)))
     }
 
     private static func bedDefault(_ role: ObjectAudioRole) -> ObjectAudioElementState? {
@@ -414,8 +417,17 @@ final class APACObjectEncoder: APACChunkEncoding {
         }
     }
 
-    private static func busRenderer(_ output: SpatialSpeakerLayout, elements: Int) -> ObjectAudioRenderer {
-        ObjectAudioRenderer(layout: output, roles: Array(repeating: .object, count: 2 * elements))
+    /// Two voices per element: a bed channel's first is the bed channel itself, routed by TS 103 448
+    /// table 6, and silent until it is sent a gain; the others are objects.
+    private static func busRenderer(_ output: SpatialSpeakerLayout, roles: [ObjectAudioRole]) -> ObjectAudioRenderer {
+        let voices: [ObjectAudioRole] = roles.map { if case .bed = $0 { $0 } else { .object } }
+            + roles.map { _ in .object }
+        let bus = ObjectAudioRenderer(layout: output, roles: voices)
+        let silent = voices.map { role -> ObjectAudioElementState? in
+            if case .bed = role { ObjectAudioElementState(gain: 0) } else { nil }
+        }
+        bus.advance(frameCount: 0, updates: [.init(frameOffset: 0, rampFrames: 0, states: silent)])
+        return bus
     }
 
     private func resetMotion() {
@@ -462,8 +474,8 @@ final class APACObjectEncoder: APACChunkEncoding {
                     // and its gain, the trim taken back out for the bus to apply.
                     busRamps += 1
                     var now = current(element, previous: previous)
-                    let trim = now.trim?.gain(at: now.position, on: output) ?? 1
-                    now.gain = trim > 0 ? slots[target].value(at: clock).gain / trim : 0
+                    let trim = now.trim?.gain(at: ObjectAudioRenderer.renderPosition(now, on: output), on: output) ?? 1
+                    now.gain = trim > 0 ? slots[target].gain(before: clock) / trim : 0
                     let voice = freeVoice(element)
                     busFrom[voice] = now
                     voiceSounding[voice] = now.gain > 0
@@ -483,22 +495,25 @@ final class APACObjectEncoder: APACChunkEncoding {
                 rampFrom[element] = moving
                 rampStart[element] = clock
                 rampLength[element] = ramp
-                let trim = state.trim?.gain(at: state.position, on: output) ?? 1
+                let trim = state.trim?.gain(at: ObjectAudioRenderer.renderPosition(state, on: output), on: output) ?? 1
                 values = .init(position: Self.objectPosition(state, on: output), size: state.size,
                                gain: onBus ? 0 : state.gain * trim)
             case .bed, .fixed:
-                // On stereo, whose pan law is not TS 103 448's, beds are rendered on the bus too.
-                let (position, placed): (SIMD3<Float>, SIMD3<Float>)
+                // A bed channel table 6 sends to one speaker plays from its slot there; one it splits
+                // between two plays from the bus. On stereo, whose pan law is not TS 103 448's,
+                // everything is rendered on the bus.
+                let (position, placed): (SIMD3<Float>, (position: SIMD3<Float>, gain: Float)?)
                 switch roles[element] {
-                case .bed(let speaker): (position, placed) = (speaker.position, Self.position(of: speaker, on: output))
-                case .fixed(let p): (position, placed) = (p, Self.position(p, on: output))
+                case .bed(let speaker): (position, placed) = (speaker.position, Self.placement(of: speaker, on: output, bedHasBacks: bedHasBacks))
+                case .fixed(let p): (position, placed) = (p, (Self.position(p, on: output), 1))
                 case .object, .lfe: continue
                 }
-                let onBus = output == .l20
+                let onBus = output == .l20 || placed == nil
                 if onBus || voiceSounding[element] {
                     send(element, ObjectAudioElementState(position: position, gain: onBus ? state.gain : 0))
                 }
-                values = .init(position: placed, size: 0, gain: onBus ? 0 : state.gain)
+                values = .init(position: placed?.position ?? position, size: 0,
+                               gain: onBus ? 0 : state.gain * (placed?.gain ?? 1))
             case .lfe: values = .init(position: SIMD3(0.5, 0, 0), size: 0, gain: state.gain)
             }
             if target < 0 {
@@ -536,11 +551,14 @@ final class APACObjectEncoder: APACChunkEncoding {
 
     /// Whether an object needs what the renderer will not do with type 3: a zone mask that takes
     /// away one of the output's ear-level speakers, or divergence; or any object at all on stereo,
-    /// whose pan law is not TS 103 448's. Taking the heights away is already a position (the
-    /// elevation switch put it at ear level).
+    /// whose pan law is not TS 103 448's. Taking the heights away from a point is already a position
+    /// (the elevation switch put it at ear level), but a size spreads in three dimensions and nothing
+    /// tells the renderer to keep it off the heights, so a sized object without elevation is rendered
+    /// here on an output that has them.
     static func needsBus(_ state: ObjectAudioElementState, on output: SpatialSpeakerLayout) -> Bool {
         output == .l20 || state.divergence > 0
             || output.speakers.contains { !$0.isLFE && !$0.isHeight && state.excluded.contains($0) }
+            || (!state.elevation && state.size > 0 && output.isBed)
     }
 
     private static let outputPanners = Dictionary(uniqueKeysWithValues: [SpatialSpeakerLayout.l20, .l51, .l71, .l714].map {
@@ -573,7 +591,7 @@ final class APACObjectEncoder: APACChunkEncoding {
     /// on an output without heights, where TS 103 448 pans by x and y alone.
     static func objectPosition(_ state: ObjectAudioElementState, on output: SpatialSpeakerLayout) -> SIMD3<Float> {
         var p = position(simd_clamp(state.position, SIMD3(repeating: 0), SIMD3(repeating: 1)), on: output)
-        if heights.isSubset(of: state.excluded) { p.z = 0 }
+        if !state.elevation { p.z = 0 }
         return p
     }
 
@@ -582,15 +600,18 @@ final class APACObjectEncoder: APACChunkEncoding {
         output.isBed ? p : SIMD3(p.x, p.y, 0)
     }
 
-    /// Where a bed channel plays on the output, as `ObjectAudioRenderer` places it: on its own
-    /// speaker, on the one a downmix folds it to, or panned from its position.
-    static func position(of speaker: SpatialSpeaker, on output: SpatialSpeakerLayout) -> SIMD3<Float> {
-        if output.speakers.contains(speaker) { return speaker.position }
-        if let target = ObjectAudioRenderer.downmixTarget(speaker, in: output) { return output.speakers[target].position }
-        return position(speaker.position, on: output)
+    /// Where a bed channel plays on the output and at what gain, as `ObjectAudioRenderer` routes it
+    /// (TS 103 448 table 6): on its own speaker or the one the table folds it to, or panned from its
+    /// position where the table has no row for it. Nil where the table splits it between speakers,
+    /// which one object cannot do exactly.
+    static func placement(of speaker: SpatialSpeaker, on output: SpatialSpeakerLayout,
+                          bedHasBacks: Bool) -> (position: SIMD3<Float>, gain: Float)? {
+        guard let routes = ObjectAudioRenderer.speakerAnchoredRoutes(speaker, in: output, bedHasBacks: bedHasBacks) else {
+            return (position(speaker.position, on: output), 1)
+        }
+        guard routes.count == 1 else { return nil }
+        return (output.speakers[routes[0].channel].position, routes[0].gain)
     }
-
-    private static let heights = Set(SpatialSpeaker.allCases.filter(\.isHeight))
 
     /// Undoes the renderer's distance attenuation. It treats a point's distance from the centre of
     /// its −1…1 cube as a distance and attenuates 1/r beyond 1 (measured, README §3.20): a floor
@@ -671,7 +692,7 @@ final class APACObjectEncoder: APACChunkEncoding {
                 ? APACObjectTrajectory.Values(position: busSpeakers[k].position, size: 0, gain: 1) : Self.silent
             slots[Self.objectSlots + k].apply(values, at: clock, rampFrames: 0)
         }
-        bus = Self.busRenderer(next, elements: roles.count)
+        bus = Self.busRenderer(next, roles: roles)
         let states = lastStates
         lastStates = states.map { _ in nil }
         resetMotion()

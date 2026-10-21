@@ -54,7 +54,26 @@ the public-API contract.
   mode, divergence, default and custom trims (the latter through the private LibTrueHD's
   `truehd_atmos_decoder_get_trims`), the size panner, and ramps of ramp_duration + 1 frames. Checked against
   Dolby's own 7.1 render fitted from the streams: point-object direction within a median 0.4 points and the
-  level equal to object gain plus default trim.
+  level equal to object gain plus default trim. Bed channels a layout lacks now fold as TS 103 448 table 6
+  has them, on the renderer and in object APAC: a 7.1 bed's sides and backs reach 5.1's surrounds at -3 dB
+  each instead of 0 dB (3 dB too loud together), and on stereo the centre plays at -3 dB and the backs,
+  tops and wides at -6 dB. An object with its elevation off comes down to ear level only on layouts with
+  height speakers (table 5), so on 2.0, 5.1 and 7.1 the default trim lowers it by its height again. A
+  screen-anchored object no longer snaps (5.1.2.2), every update restarts every object's ramp as
+  pseudocode 19 does (in films a restatement lands one frame before the ramp ends, so nothing is heard),
+  and a custom trim's front/back balance is applied, as a fader, which no specification defines.
+  In object APAC a ramp restarted mid-way steps on from the gain of the frame before it, as the speaker
+  bus does (it started one step ahead), and a sized object with its elevation off is rendered on the bus
+  on 7.1.4, where the system's size would spread it into the heights. A position exactly on a speaker
+  row or column gives its neighbour exactly 0 instead of 7.5e-8 (Float's cos(pi / 2)).
+- **TrueHD Atmos at 96 and 192 kHz is rendered with its objects** instead of falling back to the channel
+  bridge's 7.1 without heights. The decoded elements (and the bed the bed split plays) are decimated to
+  48 kHz right after decoding (`ObjectAudioDecimator`: linear-phase FIR, flat to 20 kHz, over 100 dB down
+  from 28 kHz), with its delay taken up front so every frame and every metadata update keeps its time;
+  APAC encodes 48 kHz only. The private LibTrueHD reads such a stream's metadata timing in the units its
+  payload interval implies (TS 103 420 5.3: 1536 per frame of metadata). Measuring it takes two
+  payloads, so at the start of such a stream its first metadata comes one payload interval (up to
+  32 ms) later, covered by the hold the engine already keeps; seeks within the stream reuse it.
 
 - **`LoadOptions.sessionCacheByteBudget` and `EngineDiagnostics.sessionCacheStatus`: a host can
   size the temporary VOD cache and see what it holds (#830, thanks @orut34iop).** An explicit byte
