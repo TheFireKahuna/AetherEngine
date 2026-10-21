@@ -711,11 +711,20 @@ struct APACObjectOutputTests {
         }
     }
 
+    @Test("a size that differs along its axes goes to the bus: the renderer takes the largest for all three")
+    func anisotropicSizeNeedsBus() {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        #expect(APACObjectEncoder.needsBus(ObjectAudioElementState(size: SIMD3(0.4, 0.1, 0)), on: .l714))
+        #expect(APACObjectEncoder.needsBus(ObjectAudioElementState(size: SIMD3(0, 0, 0.2)), on: .l51))
+        #expect(!APACObjectEncoder.needsBus(ObjectAudioElementState(size: SIMD3(repeating: 0.4)), on: .l714))
+        #expect(!APACObjectEncoder.needsBus(ObjectAudioElementState(), on: .l714))
+    }
+
     @Test("a sized object without elevation goes to the bus where there are heights to keep off")
     func sizedElevationOffNeedsBus() {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let heights = Set(SpatialSpeaker.allCases.filter(\.isHeight))
-        let sized = ObjectAudioElementState(size: 0.3, excluded: heights, elevation: false)
+        let sized = ObjectAudioElementState(size: SIMD3(repeating: 0.3), excluded: heights, elevation: false)
         #expect(APACObjectEncoder.needsBus(sized, on: .l714))
         #expect(!APACObjectEncoder.needsBus(sized, on: .l51))
         #expect(!APACObjectEncoder.needsBus(ObjectAudioElementState(excluded: heights, elevation: false), on: .l714))

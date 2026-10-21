@@ -237,6 +237,10 @@ final class BedSplitter {
         written = 0
     }
 
+    /// Input frames until the next hop completes, when `setGains` is next read: the caller takes its
+    /// snapshot at that frame by feeding up to it.
+    var framesUntilHop: Int { h - filled }
+
     /// The elements' gains and positions from here on (`ObjectAudioRenderer.snapshot`).
     func setGains(_ source: ObjectAudioGainSnapshot) {
         snapshot = source
