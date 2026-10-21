@@ -134,6 +134,13 @@ final class AudioOutput: @unchecked Sendable {
     }
     private var outputConfigurationObserver: NSObjectProtocol?
 
+    /// Called once when an enqueue finds the renderer failed, off the main actor, with its error. A failed audio
+    /// renderer is terminal "from which recovery is not always possible" (its header), and silent: the clock it
+    /// drives runs on. `flush()` rearms it, so a recovery that fails again reports again. Set before the feed starts.
+    var onRendererFailed: (@Sendable (String) -> Void)?
+    /// Guarded by `lock`.
+    private var reportedRendererFailure = false
+
     /// Where the AE#549 flush runs. The posting thread must never wait on `lock`: `enqueue` holds it
     /// across `renderer.enqueue` (DEC-106), and a renderer that posts from inside that call would make the
     /// feed thread wait on a lock it already holds, with every `flush()` / `stop()` / `seekClock()` behind it.
@@ -432,6 +439,7 @@ final class AudioOutput: @unchecked Sendable {
         #endif
         lock.unlock()
         if let offsetLine { EngineLog.emit(offsetLine, category: .swPlayback) }
+        if renderer.status == .failed { reportRendererFailure() }
 
         #if DEBUG
         // Once per session: first enqueue + any renderer rejection, to distinguish "nothing enqueued" from
@@ -451,6 +459,17 @@ final class AudioOutput: @unchecked Sendable {
         }
         #endif
         return true
+    }
+
+    private func reportRendererFailure() {
+        lock.lock()
+        let first = !reportedRendererFailure
+        reportedRendererFailure = true
+        lock.unlock()
+        guard first else { return }
+        let error = (renderer.error as NSError?).map { "\($0.domain)/\($0.code) \($0.localizedDescription)" } ?? "no error"
+        EngineLog.emit("[AudioOutput] renderer failed: \(error)", category: .swPlayback)
+        onRendererFailed?(error)
     }
 
     nonisolated static func isCompressed(_ buffer: CMSampleBuffer) -> Bool {
@@ -566,6 +585,7 @@ final class AudioOutput: @unchecked Sendable {
         lastCompressedDelivery = nil
         primeAfterAutomaticFlush = false
         queued.removeAll()
+        reportedRendererFailure = false
     }
 
     func stop() {

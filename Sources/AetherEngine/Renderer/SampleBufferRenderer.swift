@@ -325,6 +325,21 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     private var loggedLayerFailed = false
     private var loggedNotReady = false
+    /// Enqueues in a row that found the target failed, flush or no flush; a rendering status ends the run.
+    /// Decode thread only, like the flags above.
+    private var consecutiveFailedEnqueues = 0
+    /// A failure the flush below does not clear: the target is still failed this many enqueues later.
+    static let failedEnqueuesBeforeReport = 3
+
+    /// Called once per run of failed enqueues that reaches `failedEnqueuesBeforeReport`, on the decode thread,
+    /// with the target's error. Until then the per-enqueue flush is the recovery (a handoff race clears with it);
+    /// after it the host has to act, or the picture stays black while the audio plays on.
+    private var _persistentFailureObserver: (@Sendable (String) -> Void)?
+    func setPersistentFailureObserver(_ observer: (@Sendable (String) -> Void)?) {
+        reorderLock.lock()
+        _persistentFailureObserver = observer
+        reorderLock.unlock()
+    }
     /// Internal (not private) for #298 tests: the gate's job is that untimed frames never get here.
     /// Guarded by `reorderLock` since #407: the 1 Hz diagnostic reads it off the main actor while the
     /// decode thread writes it, and the two counts it is compared against are read under the same lock.
@@ -793,12 +808,27 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
         // Recover from failed queue target (Synchronizer/controlTimebase handoff races can push it here; flush recovers it).
         let target = queueTarget
-        if queueStatus == .failed {
+        switch queueStatus {
+        case .failed:
+            consecutiveFailedEnqueues += 1
             if !loggedLayerFailed {
                 loggedLayerFailed = true
                 EngineLog.emit("[Renderer] queue target failed at enqueue #\(enqueueCount + 1): \(queueError?.localizedDescription ?? "nil"), attempting recovery via flush()", category: .swPlayback)
             }
+            if consecutiveFailedEnqueues == Self.failedEnqueuesBeforeReport {
+                let error = queueError.map { "\(($0 as NSError).domain)/\(($0 as NSError).code) \($0.localizedDescription)" } ?? "no error"
+                EngineLog.emit("[Renderer] queue target still failed after \(consecutiveFailedEnqueues) flushes: \(error)", category: .swPlayback)
+                reorderLock.lock()
+                let observer = _persistentFailureObserver
+                reorderLock.unlock()
+                observer?(error)
+            }
             target.flush()
+        case .rendering:
+            consecutiveFailedEnqueues = 0
+        default:
+            // Unknown: what a flush leaves until the next buffer lands, which is no sign the failure cleared.
+            break
         }
         if !target.isReadyForMoreMediaData, !loggedNotReady {
             loggedNotReady = true
