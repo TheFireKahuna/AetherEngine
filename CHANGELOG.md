@@ -135,6 +135,13 @@ the public-API contract.
 
 ### Fixed
 
+- **The software route follows an output reconfiguration.** When the output is set up for another format under
+  the audio renderer (`AVSampleBufferAudioRendererOutputConfigurationDidChange`: the Atmos activator's keep-alive
+  player starting beside an APAC session, an HDMI input switch, a soundbar power cycle) the renderer kept playing
+  into it, which its header calls suboptimal rendering. It is now flushed and given its queue again from the
+  playhead, as the header prescribes, which configures the output for the enqueued format; a compressed stream
+  gets the buffer before as a decode-only primer.
+
 - **Every load declares its audio session.** The category, mode and route-sharing policy were declared once,
   at init, and a host that redeclared the process-wide session in between kept it that way: Sodalite's music
   player set `.playback`/`.default` before every track, which also dropped the `.longFormAudio` policy HDMI

@@ -71,11 +71,12 @@ final class AudioOutput: @unchecked Sendable {
         // whether they keep pitch (#434). Pinned here, while the timebase is still stopped.
         AudioRatePolicy.apply(to: renderer)
         observeAutomaticFlush()
+        observeOutputConfigurationChange()
     }
 
     deinit {
-        if let automaticFlushObserver {
-            NotificationCenter.default.removeObserver(automaticFlushObserver)
+        for observer in [automaticFlushObserver, outputConfigurationObserver].compactMap({ $0 }) {
+            NotificationCenter.default.removeObserver(observer)
         }
     }
 
@@ -117,6 +118,22 @@ final class AudioOutput: @unchecked Sendable {
     private var lastCompressedDelivery: CMSampleBuffer?
     private var primeAfterAutomaticFlush = false
 
+    /// What the renderer holds: every buffer delivered since the one the clock is in, as delivered (on the
+    /// renderer axis, offset applied), plus the one before it as a compressed stream's pre-roll. The same
+    /// objects the renderer holds, so keeping them costs references, not audio. Guarded by `lock`.
+    private var queued: [CMSampleBuffer] = []
+    /// A backstop for a clock that never advances while the feed does; the lead caps it long before this.
+    private static let queuedLimit = 4096
+
+    /// How often the output was reconfigured under the renderer, for the diagnostic line. Guarded by `lock`.
+    private var _outputReconfigurationCount = 0
+    var outputReconfigurationCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _outputReconfigurationCount
+    }
+    private var outputConfigurationObserver: NSObjectProtocol?
+
     /// Where the AE#549 flush runs. The posting thread must never wait on `lock`: `enqueue` holds it
     /// across `renderer.enqueue` (DEC-106), and a renderer that posts from inside that call would make the
     /// feed thread wait on a lock it already holds, with every `flush()` / `stop()` / `seekClock()` behind it.
@@ -152,6 +169,8 @@ final class AudioOutput: @unchecked Sendable {
                 _automaticFlushCount += 1
                 let count = _automaticFlushCount
                 renderer.flush()
+                // What it held is gone; an output reconfiguration after this has nothing of it to put back.
+                queued.removeAll()
                 // A compressed stream picks up mid-run here, where its decoder starts cold: the packet
                 // before the next one goes in again first, decoded only to prime (see `enqueue`).
                 primeAfterAutomaticFlush = lastCompressedDelivery != nil
@@ -165,6 +184,77 @@ final class AudioOutput: @unchecked Sendable {
                 )
             }
         }
+    }
+
+    /// The output was configured for another format under the renderer (`…OutputConfigurationDidChange`): another
+    /// client played something else (the Atmos activator's keep-alive player starting beside an APAC session), or
+    /// the HDMI sink came back from an input switch or a power cycle in a different mode. The renderer keeps
+    /// playing into that configuration, which the header calls suboptimal rendering: multichannel PCM where the
+    /// source is Atmos, or fewer channels. Its remedy is to flush and enqueue again from the playhead, which
+    /// configures the output for the enqueued format.
+    ///
+    /// Unlike AE#549's automatic flush, the audio is still here to enqueue again: `queued` holds what the renderer
+    /// held. It goes back in from the buffer the clock is in, the one before it first as a decode-only primer for a
+    /// compressed stream, so the gap is the renderer's restart, not the lead. Under `lock`, so the feed's next
+    /// buffer lands after them; off the posting thread, for the reason `automaticFlushQueue` gives.
+    private func observeOutputConfigurationChange() {
+        outputConfigurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVSampleBufferAudioRendererOutputConfigurationDidChange,
+            object: renderer,
+            queue: nil
+        ) { [weak self] _ in
+            self?.automaticFlushQueue.async { [weak self] in self?.reenqueueAfterOutputConfigurationChange() }
+        }
+    }
+
+    func reenqueueAfterOutputConfigurationChange() {
+        lock.lock()
+        _outputReconfigurationCount += 1
+        let count = _outputReconfigurationCount
+        let now = synchronizer.currentTime()
+        let refeed = Self.refeed(queued, at: now)
+        renderer.flush()
+        for buffer in refeed {
+            renderer.enqueue(buffer)
+            #if DEBUG
+            rendererEnqueueObserverForTesting?(buffer)
+            #endif
+        }
+        // The primer above stands in for the one an automatic flush would have asked for.
+        primeAfterAutomaticFlush = false
+        lock.unlock()
+        EngineLog.emit(
+            "[AudioOutput] output reconfigured under the renderer (#\(count)): flushed and enqueued "
+            + "\(refeed.count) buffer(s) again from the clock at "
+            + "\(String(format: "%.3f", timeline.sourceSeconds(forRenderer: now.seconds)))s rate=\(rate)",
+            category: .swPlayback)
+    }
+
+    /// What goes back in after an output reconfiguration at renderer time `now`: every buffer that ends after
+    /// `now`, in order, and before them, for a compressed stream, the buffer before the first of those as a
+    /// decode-only primer. Pure, so the choice is checkable without a renderer.
+    nonisolated static func refeed(_ queued: [CMSampleBuffer], at now: CMTime) -> [CMSampleBuffer] {
+        guard let first = queued.firstIndex(where: { endTime(of: $0) > now }) else { return [] }
+        var out = Array(queued[first...])
+        if first > 0, isCompressed(queued[first]), isCompressed(queued[first - 1]),
+           let primer = decodeOnlyCopy(queued[first - 1]) {
+            out.insert(primer, at: 0)
+        }
+        return out
+    }
+
+    /// `queued` with what the clock at `now` has finished with dropped: everything before the buffer the clock
+    /// is in, except the one just before it, which is that buffer's pre-roll.
+    nonisolated static func pruned(_ queued: [CMSampleBuffer], at now: CMTime, limit: Int) -> [CMSampleBuffer] {
+        let current = queued.firstIndex(where: { endTime(of: $0) > now }) ?? queued.count
+        let drop = max(current - 1, queued.count - limit, 0)
+        return drop == 0 ? queued : Array(queued.dropFirst(drop))
+    }
+
+    nonisolated static func endTime(of buffer: CMSampleBuffer) -> CMTime {
+        let start = CMSampleBufferGetPresentationTimeStamp(buffer)
+        let duration = CMSampleBufferGetDuration(buffer)
+        return duration.isValid ? CMTimeAdd(start, duration) : start
     }
 
     /// Add the video renderer to the synchronizer for automatic A/V sync + frame pacing. The display layer's
@@ -334,6 +424,8 @@ final class AudioOutput: @unchecked Sendable {
         primeAfterAutomaticFlush = false
         lastCompressedDelivery = compressed ? delivered : nil
         renderer.enqueue(delivered)
+        queued.append(delivered)
+        queued = Self.pruned(queued, at: synchronizer.currentTime(), limit: Self.queuedLimit)
         #if DEBUG
         rendererEnqueueObserverForTesting?(delivered)
         afterRendererEnqueueForTesting?()
@@ -473,6 +565,7 @@ final class AudioOutput: @unchecked Sendable {
         // The decoder starts over with a flush like this one, priming itself.
         lastCompressedDelivery = nil
         primeAfterAutomaticFlush = false
+        queued.removeAll()
     }
 
     func stop() {
@@ -481,6 +574,7 @@ final class AudioOutput: @unchecked Sendable {
         _epoch &+= 1
         lastCompressedDelivery = nil
         primeAfterAutomaticFlush = false
+        queued.removeAll()
         disarmPreroll()
         synchronizer.setRate(0.0, time: .zero)
         renderer.flush()
