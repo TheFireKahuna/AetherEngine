@@ -190,6 +190,12 @@ the public-API contract.
 
 ### Changed
 
+- **LibTrueHD 4.0.0** (API 3; `TrueHDObjectAudio`). Each object metadata update carries the trims and warp
+  mode in force for it, so the shipping bed split reads warp per update, timed with it, instead of the
+  block's, which 3.0.0 switched when a payload was read, up to a few thousand frames early; trims reach
+  the guide too. The OAMD parser conforms to ETSI TS 103 420 and the Evolution container to TS 102 366
+  Annex H, metadata at 96 and 192 kHz is timed in its own units, and elements carry their dialogue
+  indication. Same audio decode, matrix interpolation still off in the shipped binary.
 - **LibDovi comes from this fork's TheFireKahuna/LibDovi 2.2.0-fire.1**, built from
   TheFireKahuna/dovi_tool at 2.3.4. Same crate version, 3.4.0, plus the unreleased level 253 support;
   the header change is additive (`DoviDmData.level253`, two constants). Every upstream slice ships;
