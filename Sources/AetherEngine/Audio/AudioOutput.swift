@@ -72,9 +72,15 @@ final class AudioOutput: @unchecked Sendable {
         AudioRatePolicy.apply(to: renderer)
         observeAutomaticFlush()
         observeOutputConfigurationChange()
+        // The change can be posted from inside `renderer.enqueue`, under `lock`: the report runs off that thread.
+        statusObservation = renderer.observe(\.status, options: [.new]) { [weak self] renderer, _ in
+            guard renderer.status == .failed else { return }
+            self?.automaticFlushQueue.async { [weak self] in self?.reportRendererFailure() }
+        }
     }
 
     deinit {
+        statusObservation?.invalidate()
         for observer in [automaticFlushObserver, outputConfigurationObserver].compactMap({ $0 }) {
             NotificationCenter.default.removeObserver(observer)
         }
@@ -134,12 +140,16 @@ final class AudioOutput: @unchecked Sendable {
     }
     private var outputConfigurationObserver: NSObjectProtocol?
 
-    /// Called once when an enqueue finds the renderer failed, off the main actor, with its error. A failed audio
-    /// renderer is terminal "from which recovery is not always possible" (its header), and silent: the clock it
-    /// drives runs on. `flush()` rearms it, so a recovery that fails again reports again. Set before the feed starts.
+    /// Called once when the renderer fails, off the main actor, with its error. A failed audio renderer is terminal
+    /// "from which recovery is not always possible" (its header), and silent: the clock it drives runs on. Seen through
+    /// the status, which the header makes key-value observable, so a failure while nothing is being fed (paused, or
+    /// the lead full) is seen when it happens; and checked after every enqueue, since a status that stays failed across
+    /// a flush makes no change to observe. `flush()` rearms it, so a recovery that does not hold reports again. Set
+    /// before the feed starts.
     var onRendererFailed: (@Sendable (String) -> Void)?
     /// Guarded by `lock`.
     private var reportedRendererFailure = false
+    private var statusObservation: NSKeyValueObservation?
 
     /// Where the AE#549 flush runs. The posting thread must never wait on `lock`: `enqueue` holds it
     /// across `renderer.enqueue` (DEC-106), and a renderer that posts from inside that call would make the
@@ -440,6 +450,9 @@ final class AudioOutput: @unchecked Sendable {
         lock.unlock()
         if let offsetLine { EngineLog.emit(offsetLine, category: .swPlayback) }
         if renderer.status == .failed { reportRendererFailure() }
+        #if DEBUG
+        if simulatesRendererFailureForTesting { reportRendererFailure() }
+        #endif
 
         #if DEBUG
         // Once per session: first enqueue + any renderer rejection, to distinguish "nothing enqueued" from
@@ -460,6 +473,11 @@ final class AudioOutput: @unchecked Sendable {
         #endif
         return true
     }
+
+    #if DEBUG
+    /// Test-only: every enqueue reports as if the renderer had failed, the one state a test cannot put it in.
+    var simulatesRendererFailureForTesting = false
+    #endif
 
     private func reportRendererFailure() {
         lock.lock()

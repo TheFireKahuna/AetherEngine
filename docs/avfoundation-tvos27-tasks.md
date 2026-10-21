@@ -31,8 +31,8 @@ Items 1–5 are implemented and unit-tested, but haven't been tried on the TV ye
    rebuilds the players, but the category, mode, policy and multichannel flag are lost too
    (QA1749). With item 1's per-load declaration this needs a forced re-declare.
 
-   Follow-up: the audio-only FFmpeg host (`AudioPlaybackHost`) uses the same `AudioOutput` but doesn't wire
-   `onRendererFailed` yet, so a failure there is only logged.
+   The recovery climbs `RendererRecoveryLadder`: reposition, then a rebuild with new renderers, then the session's
+   failure. It covers the software host and the audio-only FFmpeg host.
 
 ## Modernise
 
