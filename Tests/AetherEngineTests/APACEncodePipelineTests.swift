@@ -44,11 +44,17 @@ struct APACEncodePipelineTests {
         let planes = (0..<Self.layout.channelCount).map { _ in UnsafeMutablePointer<Float>.allocate(capacity: Self.chunk) }
         defer { planes.forEach { $0.deallocate() } }
         var expected: [APACEncoder.Packet] = []
-        for k in 0..<40 {
-            fill(planes, frames: Self.chunk, startFrame: k * Self.chunk)
-            expected += try reference.encode(planes: planes.map { UnsafePointer($0) }, frameCount: Self.chunk)
+        // On a dispatch queue, as the pipeline's worker is: the encoder's output differs in its last
+        // bits between a dispatch queue and the test's own thread, whatever the queue's QoS (measured
+        // on macOS 27: 78 of 82 packets, the decoded audio 103 dB apart), and is the same every time
+        // within either.
+        try DispatchQueue(label: "reference").sync {
+            for k in 0..<40 {
+                fill(planes, frames: Self.chunk, startFrame: k * Self.chunk)
+                expected += try reference.encode(planes: planes.map { UnsafePointer($0) }, frameCount: Self.chunk)
+            }
+            expected += try reference.flush()
         }
-        expected += try reference.flush()
 
         let pipeline = APACEncodePipeline(encoder: try makeEncoder(), channels: Self.layout.channelCount,
                                           bufferFrames: Self.chunk)
