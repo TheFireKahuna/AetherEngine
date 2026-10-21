@@ -2029,6 +2029,8 @@ extension AetherEngine {
         host.dolbyVisionHandling = loadedOptions.dolbyVisionHandling
         host.preferDualLayerDolbyVision = loadedOptions.preferDualLayerDolbyVision
         host.elType = elType ?? sourceElType
+        host.objectAudioRendering = loadedOptions.objectAudioRendering
+        host.objectDialogueGain = loadedOptions.objectDialogueGain
         host.setAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens
         // AE#813: a live ingest delivers whole segments, and the host's holdback follows their length.
         if isLive, let ingest = customReader as? LiveIngestSourceInfo {
@@ -2202,6 +2204,8 @@ extension AetherEngine {
             host.stop()
             try checkLoadCurrent(generation)
         }
+        // A TrueHD Atmos track the host renders to APAC wants the activator, as the HLS route's does.
+        followAtmosOutput()
     }
 
     /// Open `AudioPlaybackHost` for an audio-only source. No HLS pipeline, display layer, or display-criteria handshake. Same lifecycle as `loadSoftware`.
@@ -2661,7 +2665,7 @@ extension AetherEngine {
                     isSoftware: !(softwareHost?.usesHardwareVideoDecoder ?? false)
                 )
                 // AE#462: the rebuilt host's own resolved index (see the load site).
-                activeAudioDecoder = Self.softwareAudioDecoderLabel(
+                activeAudioDecoder = softwareHost?.audioPipelineDescription ?? Self.softwareAudioDecoderLabel(
                     audioTracks: audioTracks, activeIndex: softwareHost?.audioStreamIndex ?? -1
                 )
                 presentCurrentLayer()

@@ -24,6 +24,9 @@ final class AtmosOutputActivator {
     private var looper: AVPlayerLooper?
     private weak var host: AVPlayer?
     private var playsAPAC: @MainActor (AVPlayerItem) -> Bool = { _ in false }
+    /// A programme that is not an `AVPlayer` (the software host): whether it plays APAC and is paused.
+    /// It has nothing to observe, so its owner calls `refresh()` when either may have changed.
+    private var programme: (playsAPAC: @MainActor () -> Bool, isPaused: @MainActor () -> Bool)?
     private var observations: [NSKeyValueObservation] = []
     private var selectionObserver: NSObjectProtocol?
     private var routeObserver: NSObjectProtocol?
@@ -59,6 +62,7 @@ final class AtmosOutputActivator {
         detach()
         self.host = host
         self.playsAPAC = playsAPAC
+        observeRoute()
         // A host play() changes timeControlStatus synchronously on the main thread, so the stream
         // starts inside that call, ahead of the APAC output.
         observations = [
@@ -69,6 +73,24 @@ final class AtmosOutputActivator {
                 Self.onMain { self?.update() }
             },
         ]
+    }
+
+    /// Follows a programme the engine plays without an `AVPlayer`: the software host, whose
+    /// `AVSampleBufferAudioRenderer` sends APAC to the sink as multichannel PCM until this runs beside it.
+    func attach(playsAPAC: @escaping @MainActor () -> Bool, isPaused: @escaping @MainActor () -> Bool) {
+        detach()
+        programme = (playsAPAC, isPaused)
+        observeRoute()
+        update()
+    }
+
+    /// Re-reads an `attach(playsAPAC:isPaused:)` programme's state.
+    func refresh() {
+        guard programme != nil else { return }
+        update()
+    }
+
+    private func observeRoute() {
         #if os(iOS) || os(tvOS)
         routeObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil
@@ -84,6 +106,7 @@ final class AtmosOutputActivator {
         if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
         routeObserver = nil
         host = nil
+        programme = nil
         loggedRouteVerdict = nil
         follow(nil)
     }
@@ -101,9 +124,19 @@ final class AtmosOutputActivator {
     }
 
     private func update() {
-        guard let host, let item = host.currentItem, playsAPAC(item) else {
-            release()
-            return
+        let paused: Bool
+        if let programme {
+            guard programme.playsAPAC() else {
+                release()
+                return
+            }
+            paused = programme.isPaused()
+        } else {
+            guard let host, let item = host.currentItem, playsAPAC(item) else {
+                release()
+                return
+            }
+            paused = host.timeControlStatus == .paused
         }
         let ports = outputPortTypes()
         let routeTakesIt = Self.routeTakesActivator(outputPortTypes: ports)
@@ -118,7 +151,7 @@ final class AtmosOutputActivator {
             release()
             return
         }
-        guard host.timeControlStatus != .paused else {
+        guard !paused else {
             player.pause()
             return
         }
@@ -150,13 +183,21 @@ extension AetherEngine {
     /// engine's would compete with it for Now Playing and the audio session for no gain.
     func followAtmosOutput() {
         #if os(tvOS)
-        guard let player = currentAVPlayer else {
+        if let player = currentAVPlayer {
+            let activator = atmosOutputActivator ?? AtmosOutputActivator()
+            atmosOutputActivator = activator
+            activator.attach(to: player) { [weak self] _ in self?.nativeVideoSession?.audioIsAPAC == true }
+        } else if let host = softwareHost, host.audioIsAPAC {
+            // The software host plays APAC through its own renderer (the Dolby Vision FEL route): followed
+            // by the engine's state, which `state`'s didSet refreshes.
+            let activator = atmosOutputActivator ?? AtmosOutputActivator()
+            atmosOutputActivator = activator
+            activator.attach(
+                playsAPAC: { [weak self, weak host] in host != nil && self?.softwareHost === host },
+                isPaused: { [weak self] in self?.state != .playing })
+        } else {
             atmosOutputActivator?.detach()
-            return
         }
-        let activator = atmosOutputActivator ?? AtmosOutputActivator()
-        atmosOutputActivator = activator
-        activator.attach(to: player) { [weak self] _ in self?.nativeVideoSession?.audioIsAPAC == true }
         #endif
     }
 

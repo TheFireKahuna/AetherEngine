@@ -199,6 +199,17 @@ final class SoftwarePlaybackHost {
     /// Forwarded Dolby Vision profile number (e.g. 7, 8) if detected from bitstream or container
     var configuredDVProfile: Int?
 
+    /// `LoadOptions.objectAudioRendering` / `objectDialogueGain`: with `.apac` and the TrueHDObjectAudio
+    /// trait, a TrueHD Atmos track is rendered to APAC (`objectAudioDecoder`) instead of decoded to LPCM.
+    var objectAudioRendering: ObjectAudioRendering = .off
+    var objectDialogueGain: Float = 0
+
+    /// The audio track plays as APAC, which the engine keeps the Atmos output activator beside, as it does
+    /// for the HLS route. Set at load.
+    private(set) var audioIsAPAC = false
+    /// How the audio is carried, when it is not a plain decode (the engine's `audioPipelineDescription`).
+    private(set) var audioPipelineDescription: String?
+
     /// #315: `AVSampleBufferDisplayLayer.isReadyForDisplay` for the renderer's layer, this path's
     /// answer to "there is a picture". Frames enqueued is not that answer: it counts what the
     /// decoder handed over, and #298 is the report where every one of them went into a layer no
@@ -268,7 +279,7 @@ final class SoftwarePlaybackHost {
     private let renderer: SampleBufferRenderer
     /// Swapped per codec at load(): SoftwareVideoDecoder for AV1/VP9, HardwareVideoDecoder for HEVC. Protocol keeps the demux loop codec-agnostic.
     private var videoDecoder: any VideoDecodingPipeline
-    private var audioDecoder: AudioDecoder?
+    private var audioDecoder: (any SoftwareAudioDecoding)?
     private var audioOutput: AudioOutput?
     private var demuxer: Demuxer?
     private var vodPacketReadAhead: SoftwarePacketReadAhead?
@@ -1321,15 +1332,23 @@ final class SoftwarePlaybackHost {
                     category: .swPlayback
                 )
             }
-            let aDec = AudioDecoder()
             do {
                 // AE#462 harness (TEST-ONLY): same forced drop the loopback cascade honors.
                 if AetherEngine.forceAudioPipelineFailureForTesting {
                     throw NSError(domain: "AetherEngineTestHook", code: -462, userInfo: [
                         NSLocalizedDescriptionKey: "audio pipeline forced to fail (TEST-ONLY)"])
                 }
-                try aDec.open(stream: aStream)
-                self.audioDecoder = aDec
+                if let objects = Self.objectAudioDecoder(
+                    rendering: objectAudioRendering, dialogueGain: objectDialogueGain, stream: aStream,
+                    demuxer: dem, streamIndex: resolvedAudioIdx, isLive: isLive) {
+                    self.audioDecoder = objects.decoder
+                    self.audioIsAPAC = true
+                    self.audioPipelineDescription = objects.pipelineDescription
+                } else {
+                    let aDec = AudioDecoder()
+                    try aDec.open(stream: aStream)
+                    self.audioDecoder = aDec
+                }
                 self.audioStreamIndex = resolvedAudioIdx
                 let atb = aStream.pointee.time_base
                 self.audioTimeBaseSeconds = atb.den > 0 ? Double(atb.num) / Double(atb.den) : 0
@@ -1341,7 +1360,7 @@ final class SoftwarePlaybackHost {
         // AE#462: after the decoder has had its chance, whichever way the block above left it, so a
         // stream present but unusable (no codecpar) classifies as the drop it is rather than as a
         // source without audio.
-        self.audioDelivery = Self.audioDelivery(resolvedAudioIndex: resolvedAudioIdx,
+        self.audioDelivery = audioIsAPAC ? .bridged : Self.audioDelivery(resolvedAudioIndex: resolvedAudioIdx,
                                                 decoderOpened: self.audioDecoder != nil,
                                                 sourceCarriesAudio: dem.firstAudioStreamIndexByType >= 0)
         // #112 rework: capture embedded subtitle stream indices + time bases for the demux
@@ -2139,7 +2158,7 @@ final class SoftwarePlaybackHost {
     nonisolated static func feedRingPacket(
         _ pkt: PacketRingBuffer.Packet,
         videoDecoder: any VideoDecodingPipeline,
-        audioDecoder: AudioDecoder?,
+        audioDecoder: (any SoftwareAudioDecoding)?,
         audioOutput: AudioOutput?,
         videoStreamIndex: Int32,
         audioStreamIndex: Int32,
@@ -2225,6 +2244,7 @@ final class SoftwarePlaybackHost {
         audioOutput = nil
         audioDecoder?.close()
         audioDecoder = nil
+        audioIsAPAC = false
         videoDecoder.close()
         renderer.flush()
         demuxer?.close()
@@ -2283,8 +2303,10 @@ final class SoftwarePlaybackHost {
         }
         let getStopRequested: @Sendable () -> Bool = { [weak self] in self?.stopRequested ?? true }
         // #95: resolved per packet so a tap installed mid-session is picked up by running loops.
+        // The tap reads LPCM; a session decoding to APAC (`APACSampleBufferDecoder`) has none to give it.
+        let tapReadsAudio = audioDecoder?.producesPCM ?? true
         let getAudioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?) = { [weak self] in
-            self?.audioTapSink
+            tapReadsAudio ? self?.audioTapSink : nil
         }
         // #112 rework: same late-install resolution for the subtitle tap.
         let getSubtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { [weak self] in
@@ -2716,7 +2738,7 @@ final class SoftwarePlaybackHost {
     /// Ring cursor -> decoders -> renderer with back-pressure. Pause = timeshift (reader keeps filling); DVR seek = cursor move.
     nonisolated private static func runLiveFeederLoop(
         videoDecoder: any VideoDecodingPipeline,
-        audioDecoder: AudioDecoder?,
+        audioDecoder: (any SoftwareAudioDecoding)?,
         audioOutput: AudioOutput?,
         videoStreamIndex: Int32,
         audioStreamIndex: Int32,
@@ -3098,7 +3120,7 @@ final class SoftwarePlaybackHost {
         readAhead: SoftwarePacketReadAhead?,
         videoDecoder: any VideoDecodingPipeline,
         videoStreamIndex: Int32,
-        audioDecoder: AudioDecoder?,
+        audioDecoder: (any SoftwareAudioDecoding)?,
         audioOutput: AudioOutput?,
         audioStreamIndex: Int32,
         renderer: SampleBufferRenderer,
@@ -3600,7 +3622,7 @@ final class SoftwarePlaybackHost {
                     // requires a DECLARED audio track, not a producing one). The stream that
                     // produces NO packets at all is #337's case and exits at the read gate.
                     if !clockArmed(), let aOut = audioOutput,
-                       audioPacketsSeen >= 50, !audioBuffersProduced {
+                       audioPacketsSeen >= (audioDecoder?.packetsBeforeClockFallback ?? 50), !audioBuffersProduced {
                         armFromVideoPacket(packet, aOut)
                     }
                     drainParkedVideoNonblocking()
@@ -3664,9 +3686,11 @@ final class SoftwarePlaybackHost {
                 }
                 setDecodeGeneration(genBeforeRead)
                 videoDecoder.decode(packet: packet, epoch: epochBeforeRead)
-                // Video-only / undecodable audio fallback: arm clock off first video packet (50+ audio packets with zero buffers = decoder not recovering).
+                // Video-only / undecodable audio fallback: arm clock off first video packet once the decoder has
+                // taken its `packetsBeforeClockFallback` (50 for FFmpeg's) without a buffer = not recovering.
                 if !clockArmed(), let aOut = audioOutput,
-                   audioDecoder == nil || (audioPacketsSeen >= 50 && !audioBuffersProduced) {
+                   audioDecoder == nil
+                    || (audioPacketsSeen >= (audioDecoder?.packetsBeforeClockFallback ?? 50) && !audioBuffersProduced) {
                     armFromVideoPacket(packet, aOut)
                 }
             } else if streamIdx == audioStreamIndex, let aDec = audioDecoder, let aOut = audioOutput {

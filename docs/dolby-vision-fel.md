@@ -127,14 +127,27 @@ it to; `DoviShaderSyncTests` pins the serialized size and that every kernel is p
 
 ### 3.1 Audio
 
-Known trade-off of the route, following the maintainer's request to document it rather than work around it.
-The dual-layer route runs on `SoftwarePlaybackHost`, so its audio is the host's own `AudioDecoder` (FFmpeg
-decode to PCM, played through the sample-buffer audio renderer) and never AVPlayer. On tvOS only AVPlayer
-emits Dolby Atmos objects, and the platform does not pass a bitstream through. An E-AC-3 (JOC) track
-therefore plays as its channel-bed core (5.1 or 7.1), without the Atmos objects; on the native route the
-same track is handed to AVPlayer unchanged. TrueHD behaves as on the native route, which decodes it too and
-loses the objects either way. Hosts that want E-AC-3 Atmos on a Profile 7 FEL title leave
-`preferDualLayerDolbyVision` off for it. `DualLayerRouteAudioTests` pins the routing half of this.
+The dual-layer route runs on `SoftwarePlaybackHost`, so its audio goes through the host's own
+`AVSampleBufferAudioRenderer`, never AVPlayer.
+
+- **TrueHD Atmos with `objectAudioRendering = .apac(...)`** (the `TrueHDObjectAudio` trait) is rendered to
+  APAC exactly as on the HLS route (`SpatialAudioBridge`) and handed to the renderer as compressed sample
+  buffers (`APACSampleBufferDecoder`), with the HLS route's `apac` sample entry as their format. On an Apple TV
+  4K (tvOS 27.2) into a Samsung HW-Q990B the renderer renders the APAC, heights and objects included, but sends
+  the HDMI sink multichannel PCM; with `AtmosOutputActivator`'s silent Atmos player beside it the sink shows
+  Dolby Atmos and the objects still move. The engine therefore runs the activator for such a session too,
+  following the engine's play state. DTS:X is not rendered on this path and plays as LPCM.
+- **Everything else** is FFmpeg's decode to LPCM (`AudioDecoder`). An E-AC-3 (JOC) track therefore plays as its
+  channel-bed core (5.1 or 7.1), without the Atmos objects; on the native route the same track is handed to
+  AVPlayer unchanged. Hosts that want E-AC-3 Atmos on a Profile 7 FEL title leave
+  `preferDualLayerDolbyVision` off for it. `DualLayerRouteAudioTests` pins the routing half of this.
+
+Running the route inside AVPlayer instead was tried and ruled out (2026-10-22). An `AVMutableComposition` with a
+custom compositor does decode both layers, hands the compositor each frame with its RPU, keeps Dolby Vision and its
+trims on the TV, and plays E-AC-3 Atmos as objects; but AVPlayer runs a composition only over sources it can index
+completely up front. HLS assets expose no tracks to compose, a byte-range MP4 is read fragment by fragment to its
+end before playback (with or without `mfra`/`sidx`), and a growing local `AVFragmentedAsset` did not pick up
+appended fragments.
 
 ## 4. Evidence
 
