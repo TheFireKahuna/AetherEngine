@@ -67,6 +67,8 @@ struct TrueHDAtmosSampleTests {
         }
     }
 
+    #if TrueHDReferenceRender
+    // The exact decode it measures against is only built with the measurement trait.
     @Test("the bed split's guide with ramps and hop-exact snapshots is closer to the exact render than without",
           .enabled(if: ProcessInfo.processInfo.environment["AE_TRUEHD_ATMOS_SAMPLE"] != nil))
     func bedSplitGuideTiming() throws {
@@ -185,6 +187,7 @@ struct TrueHDAtmosSampleTests {
         // Helicopter 0.441 -> 0.026, Furiosa and Dolby's 7.1.4 test unchanged.
         #expect(levelErr.new <= levelErr.old * 1.01 + 1e-3, "no further from the exact render than before")
     }
+    #endif
 
     @Test("the bridge turns the whole sample into contiguous APAC packets in real time and then some")
     func bridgesToAPAC() throws {
