@@ -135,6 +135,12 @@ the public-API contract.
 
 ### Fixed
 
+- **A failed renderer on the software route is recovered or reported.** A failed video renderer was flushed on
+  every frame for the rest of the session, black with the audio running, and a failed audio renderer was a
+  debug-only log line under a clock that ran on in silence. One that stays failed now gets a reposition to the
+  playhead, which flushes both renderers (the documented reset); a second failure within a minute fails the
+  session with `softwarePipelineFailed` (`liveSourceUnavailable` live), where the host app sees it.
+
 - **The software route follows an output reconfiguration.** When the output is set up for another format under
   the audio renderer (`AVSampleBufferAudioRendererOutputConfigurationDidChange`: the Atmos activator's keep-alive
   player starting beside an APAC session, an HDMI input switch, a soundbar power cycle) the renderer kept playing

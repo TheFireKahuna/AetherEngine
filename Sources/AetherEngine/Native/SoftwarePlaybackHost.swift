@@ -941,6 +941,62 @@ final class SoftwarePlaybackHost {
         // VT-backed one when the source's video codec is HEVC.
         self.videoDecoder = SoftwareVideoDecoder()
         armDisplaySizeObserver()
+        renderer.setPersistentFailureObserver { [weak self] error in
+            Task { @MainActor in self?.handleRendererFailure(.video, error: error) }
+        }
+    }
+
+    // MARK: Renderer failure
+
+    enum FailedRenderer: String { case video, audio }
+    enum RendererFailureAction: Equatable { case reposition, fail }
+
+    /// How long after a recovery a second failure counts as the recovery not holding.
+    nonisolated static let rendererRecoveryWindow: TimeInterval = 60
+
+    /// The first failure repositions; a second inside the window fails the session.
+    nonisolated static func rendererFailureAction(now: Date, lastRecovery: Date?) -> RendererFailureAction {
+        guard let lastRecovery, now.timeIntervalSince(lastRecovery) < rendererRecoveryWindow else { return .reposition }
+        return .fail
+    }
+
+    /// Main actor only.
+    private var lastRendererRecovery: Date?
+
+    /// A renderer that stays failed: the video one after the flushes it makes itself, the audio one at once (its
+    /// header calls the state terminal). Before this the video renderer flushed on every frame, black for the rest
+    /// of the session, and a failed audio renderer was a debug-only log line under a clock that ran on in silence.
+    ///
+    /// The first recovery is the reposition AE#739 makes after a lost decoder session: the seek flushes both
+    /// renderers, the documented reset of a failed one, and the picture comes back on the frame the audio is at.
+    /// A live source with no rewind ring cannot go back, so there the flush is all: the audio one here, the video
+    /// one the renderer already made. A second failure inside `rendererRecoveryWindow` means the reset does not
+    /// hold, and it surfaces as the session's failure, which the host app can see and act on.
+    private func handleRendererFailure(_ which: FailedRenderer, error: String) {
+        guard !stopRequested else { return }
+        let now = Date()
+        switch Self.rendererFailureAction(now: now, lastRecovery: lastRendererRecovery) {
+        case .fail:
+            EngineLog.emit("[SWHost] \(which.rawValue) renderer failed again within "
+                           + "\(Int(Self.rendererRecoveryWindow)) s of its recovery (\(error)): failing the session",
+                           category: .swPlayback)
+            failure = PlaybackErrorInfo(kind: isLive ? .liveSourceUnavailable : .softwarePipelineFailed,
+                                        message: "Playback error: the \(which.rawValue) renderer failed (\(error))")
+        case .reposition:
+            lastRendererRecovery = now
+            if isLive && dvrRing == nil {
+                EngineLog.emit("[SWHost] \(which.rawValue) renderer failed (\(error)) on a live source: flushed, "
+                               + "resuming with the feed", category: .swPlayback)
+                if which == .audio { audioOutput?.flush() }
+                return
+            }
+            let target = currentTime
+            EngineLog.emit("[SWHost] \(which.rawValue) renderer failed (\(error)): repositioning to the playhead at "
+                           + "\(String(format: "%.3f", target))s to reset it", category: .swPlayback)
+            Task { @MainActor [weak self] in
+                _ = await self?.seek(to: target)
+            }
+        }
     }
 
     /// #353: the renderer settles the picture size on the decode thread, where it builds the format
@@ -1381,6 +1437,9 @@ final class SoftwarePlaybackHost {
         // AudioOutput owns the AVSampleBufferRenderSynchronizer (master clock). Created unconditionally: video-only previously got no clock (frozen frame, currentTime=0). Layer attached in play() after the engine hangs it in the view hierarchy (attaching free-floating fails FigVideoQueueRemote -12080 on tvOS 26+).
         let audioOutput = AudioOutput()
         self.audioOutput = audioOutput
+        audioOutput.onRendererFailed = { [weak self] error in
+            Task { @MainActor in self?.handleRendererFailure(.audio, error: error) }
+        }
         renderer.setTimeline(audioOutput.timeline)   // AE#395
         self.audioOutput?.volume = volume
         self.audioOutput?.setPresentationOffset(seconds: audioDelaySeconds)   // AE#464
