@@ -43,6 +43,11 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     /// `ObjectMetadataHold`), and the released block last handed out, whose planes it owns.
     private let hold = ObjectMetadataHold()
     private var lent: ObjectMetadataHold.Copy?
+    /// A 96 or 192 kHz stream's elements and bed, brought to 48 kHz (`ObjectAudioDecimator`), and a
+    /// discontinuity the decimator has not yet produced a block to carry.
+    private var decimator: ObjectAudioDecimator?
+    private var bedDecimator: ObjectAudioDecimator?
+    private var discontinuityPending = false
 
     /// `splitsBed` is false only for the measurement reference (`TrueHDReferenceRender` trait).
     init(splitsBed: Bool = true, objectOutput: Bool = false) throws {
@@ -98,8 +103,51 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         }
     }
 
-    /// The library's next block, with every element's state as of its first metadata update.
+    /// The next block at 48 kHz, with every element's state as of its first metadata update.
     private func pull() throws -> (ObjectAudioDecodedBlock, [ObjectAudioElementState?]?)? {
+        while let (block, firstStates) = try pullLibrary() {
+            guard let factor = ObjectAudioDecimator.factor(from: block.sampleRate) else { return (block, firstStates) }
+            if let decimated = decimate(block, factor: factor) { return (decimated, decimated.updates.first?.states) }
+        }
+        return nil
+    }
+
+    /// `block` at 48 kHz, nil while the decimator's look-ahead has taken all of it (a stream's first
+    /// frames, a short final access unit).
+    private func decimate(_ block: ObjectAudioDecodedBlock, factor: Int) -> ObjectAudioDecodedBlock? {
+        if decimator?.factor != factor {
+            decimator = ObjectAudioDecimator(factor: factor)
+            bedDecimator = ObjectAudioDecimator(factor: factor)
+        }
+        guard let decimator, let bedDecimator else { return nil }
+        if block.isDiscontinuity {
+            decimator.reset()
+            bedDecimator.reset()
+            discontinuityPending = true
+        }
+        let main = decimator.process(planes: block.planes, frames: block.frameCount,
+                                     inputStart: block.inputFrameOffset, updates: block.updates)
+        var out = block
+        if let bed = block.bed {
+            let decimatedBed = bedDecimator.process(planes: bed.planes, frames: block.frameCount,
+                                                    inputStart: block.inputFrameOffset, updates: [])
+            out.bed = ObjectAudioBed(roles: bed.roles, planes: decimatedBed.planes)
+        } else {
+            bedDecimator.reset()
+        }
+        guard main.frames > 0 else { return nil }
+        out.sampleRate = ObjectAudioRendering.sampleRate
+        out.frameCount = main.frames
+        out.inputFrameOffset = main.start
+        out.planes = main.planes
+        out.updates = main.updates
+        out.isDiscontinuity = discontinuityPending
+        discontinuityPending = false
+        return out
+    }
+
+    /// The library's next block, at the stream's rate.
+    private func pullLibrary() throws -> (ObjectAudioDecodedBlock, [ObjectAudioElementState?]?)? {
         var block = TrueHDAtmosBlock()
         let status = truehd_atmos_decoder_pull(handle, &block)
         if status == TRUEHD_ATMOS_NEED_MORE_DATA { return nil }
@@ -142,13 +190,9 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             for u in 0..<Int(md.update_count) {
                 let update = md.updates[u]
                 if u == 0 { firstStates = (0..<count).map { state(for: update.elements[$0], stream) } }
-                var states: [ObjectAudioElementState?] = []
-                states.reserveCapacity(count)
-                for e in 0..<count {
-                    let element = update.elements[e]
-                    states.append(element.flags & TRUEHD_ATMOS_ELEMENT_CHANGED != 0
-                                  ? state(for: element, stream) : nil)
-                }
+                // Every element, unchanged ones included: an update restarts every ramp (TS 103 448
+                // pseudocode 19).
+                let states: [ObjectAudioElementState?] = (0..<count).map { state(for: update.elements[$0], stream) }
                 updates.append(ObjectAudioMetadataUpdate(
                     frameOffset: Int(update.frame_offset),
                     // Splitting the bed, each update is taken as it stands, without the ramp towards it.
@@ -172,6 +216,9 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         _ = truehd_atmos_decoder_reset(handle)
         hold.arm()
         lent = nil
+        decimator?.reset()
+        bedDecimator?.reset()
+        discontinuityPending = false
     }
 
     func releaseHeldBlocks() {
@@ -246,7 +293,8 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             stream.trim = ObjectAudioTrim(configs: trims.map { t in
                 switch t.mode {
                 case TRUEHD_ATMOS_TRIM_DISABLED: .disabled
-                case TRUEHD_ATMOS_TRIM_CUSTOM: .custom(centre: t.centre_db, surround: t.surround_db, height: t.height_db)
+                case TRUEHD_ATMOS_TRIM_CUSTOM: .custom(centre: t.centre_db, surround: t.surround_db, height: t.height_db,
+                                                       balanceTop: t.balance_top, balanceListener: t.balance_listener)
                 default: .default
                 }
             })
@@ -267,7 +315,8 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     #if TrueHDReferenceRender || APACObjectOutput
     /// An element as TS 103 420 decodes it and TS 103 448 prepares it for panning, which the
     /// reference render and object output share. In order: the room position (distance, screen
-    /// anchoring), warp, the elevation switch, snap; zones and trims travel on to the panner.
+    /// anchoring), warp, the elevation switch, snap; zones, trims and the elevation switch's ear-level
+    /// position, which depends on the layout, travel on to the panner.
     static func state(for element: TrueHDAtmosElement, stream: StreamMetadata = .init()) -> ObjectAudioElementState {
         let active = element.flags & TRUEHD_ATMOS_ELEMENT_ACTIVE != 0
         var p = SIMD3(element.position.0, element.position.1, element.position.2)
@@ -288,12 +337,13 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             p = beyondTheRoom(p)
         }
         if isObject, stream.warp { p.y = min(1, 2 * p.y) }
-        if isObject, element.flags & TRUEHD_ATMOS_ELEMENT_ELEVATION == 0 {
-            // TS 103 448 5.1.3.2: no height speakers, and the object down on the listener's plane.
-            excluded.formUnion(heights)
-            p.z = 0
-        }
-        if isObject, element.flags & TRUEHD_ATMOS_ELEMENT_SNAP != 0 {
+        let elevation = !isObject || element.flags & TRUEHD_ATMOS_ELEMENT_ELEVATION != 0
+        // TS 103 448 5.1.3.2: no height speakers (`ObjectAudioRenderer.renderPosition` puts it at ear
+        // level where there are some to keep off).
+        if !elevation { excluded.formUnion(heights) }
+        // TS 103 448 5.1.2.2: a screen-anchored object does not snap.
+        let screenAnchored = element.flags & TRUEHD_ATMOS_ELEMENT_SCREEN_REF != 0
+        if isObject, element.flags & TRUEHD_ATMOS_ELEMENT_SNAP != 0, !screenAnchored {
             p = snapped(p, zone: element.zone, elevation: element.flags & TRUEHD_ATMOS_ELEMENT_ELEVATION != 0)
             size = 0
             divergence = 0
@@ -305,6 +355,7 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             size: size,
             divergence: divergence,
             excluded: excluded,
+            elevation: elevation,
             trim: bypassTrim ? nil : stream.trim)
     }
 

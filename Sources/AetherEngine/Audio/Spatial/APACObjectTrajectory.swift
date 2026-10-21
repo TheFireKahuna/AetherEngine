@@ -40,6 +40,8 @@ struct APACObjectTrajectory {
         var length: Int64
         var from: Values
         var to: Values
+        /// The gain on the frame before `start`, which a ramp steps from.
+        var before: Float
 
         /// Position and size move as the renderer interpolates a block: `from` at `start`, `to` after
         /// `length` frames. The gain, applied to the audio here, ramps as TS 103 448 ramps speaker
@@ -52,6 +54,14 @@ struct APACObjectTrajectory {
             v.gain = from.gain + (to.gain - from.gain) * Float(t - start + 1) / Float(length + 1)
             return v
         }
+
+        /// The gain played on the frame before `t`. A jump at `t` itself already holds: a second update
+        /// on its frame (the encoder silences a slot and fades it in again) starts from it.
+        func gain(before t: Int64) -> Float {
+            if t > start { return value(at: t - 1).gain }
+            return length == 0 ? to.gain : before
+        }
+
     }
 
     /// The piece in force now, and the ones it replaced since the last `blocks` call (oldest first),
@@ -64,10 +74,14 @@ struct APACObjectTrajectory {
     private(set) var needsJump = true
 
     init(_ initial: Values) {
-        piece = Piece(start: 0, length: 0, from: initial, to: initial)
+        piece = Piece(start: 0, length: 0, from: initial, to: initial, before: initial.gain)
     }
 
     func value(at t: Int64) -> Values { piece.value(at: t) }
+
+    /// The gain played on the frame before `t`, where a ramp starting at `t` steps from (TS 103 448
+    /// pseudocode 19 takes mix_gain as it stands before the update's frame).
+    func gain(before t: Int64) -> Float { piece.gain(before: t) }
 
     /// Apply an update at absolute frame `t`. Updates come in time order, none before the start of
     /// the packet `blocks` will describe next.
@@ -77,10 +91,11 @@ struct APACObjectTrajectory {
         if hasMetadata, values == piece.to, t >= piece.start + piece.length { return }
         let jump = rampFrames <= 0 || !hasMetadata
         hasMetadata = true
-        let now = piece.value(at: t)
+        var now = piece.value(at: t)
+        now.gain = piece.gain(before: t)
         replaced.append(piece)
         if jump {
-            piece = Piece(start: t, length: 0, from: values, to: values)
+            piece = Piece(start: t, length: 0, from: values, to: values, before: now.gain)
             return
         }
         var to = values
@@ -92,14 +107,14 @@ struct APACObjectTrajectory {
             from.position = to.position
             from.size = to.size
         }
-        piece = Piece(start: t, length: Int64(rampFrames), from: from, to: to)
+        piece = Piece(start: t, length: Int64(rampFrames), from: from, to: to, before: now.gain)
     }
 
     /// Hold every value where it has got to: the encoder restarted at `t`, and the renderer starts
     /// again from its default.
     mutating func restart(at t: Int64) {
         let now = piece.value(at: t)
-        piece = Piece(start: t, length: 0, from: now, to: now)
+        piece = Piece(start: t, length: 0, from: now, to: now, before: now.gain)
         replaced.removeAll()
         needsJump = true
     }

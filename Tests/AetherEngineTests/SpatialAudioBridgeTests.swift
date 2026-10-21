@@ -154,14 +154,19 @@ struct SpatialAudioBridgeTests {
     #endif
 
     #if TrueHDObjectAudio
-    @Test("only TrueHD that FFmpeg marks Atmos, at 48 kHz or not yet known, is rendered")
+    @Test("only TrueHD that FFmpeg marks Atmos, at 48, 96 or 192 kHz or not yet known, is rendered")
     func eligibility() {
         let on = ObjectAudioRendering.apac(.l714)
         #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 48_000) == .l714)
         #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 0) == .l714)
         #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_TRUEHD, profile: 0, sampleRate: 48_000) == nil,
                 "TrueHD without Atmos keeps its lossless 7.1")
-        #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 96_000) == nil)
+        for rate: Int32 in [96_000, 192_000] {
+            #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: rate) == .l714,
+                    "decimated to 48 kHz after decoding")
+        }
+        #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 88_200) == nil)
+        #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 44_100) == nil)
         #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_EAC3, profile: 30, sampleRate: 48_000) == nil,
                 "E-AC-3 JOC is already Atmos and stream-copies")
         #expect(HLSVideoEngine.spatialRenderingLayout(rendering: .off, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 48_000) == nil)

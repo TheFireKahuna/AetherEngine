@@ -84,9 +84,11 @@ extension HLSVideoEngine {
         profile: Int32,
         sampleRate: Int32
     ) -> SpatialSpeakerLayout? {
+        // TrueHD at 96 or 192 kHz is brought to 48 kHz after decoding (`ObjectAudioDecimator`).
+        let rates = codecID == AV_CODEC_ID_TRUEHD ? [0, 48_000, 96_000, 192_000] : [0, 48_000]
         guard let layout = rendering.layout, layout.isBed,
               objectAudioSource(codecID: codecID, profile: profile)?.isBuiltIn == true,
-              sampleRate == 0 || sampleRate == Int32(ObjectAudioRendering.sampleRate)
+              rates.contains(Int(sampleRate))
         else { return nil }
         if objectAudioSource(codecID: codecID, profile: profile) == .dtsHDMasterAudio,
            !layout.carriesDTSXOneToOne {
@@ -231,7 +233,7 @@ extension HLSVideoEngine {
             } else if par.codec_id == AV_CODEC_ID_TRUEHD {
                 if objectAudioRendering != .off {
                     EngineLog.emit(
-                        "[HLSVideoEngine] object rendering requested but TrueHD is not 48 kHz Atmos "
+                        "[HLSVideoEngine] object rendering requested but TrueHD is not Atmos at 48, 96 or 192 kHz "
                         + "(profile=\(par.profile) rate=\(par.sample_rate)); keeping the channel bridge",
                         category: .session
                     )
