@@ -24,7 +24,31 @@ the public-API contract.
   fixed objects on the 7.1.4 speakers, crossfading over the update's ramp; an object switched off fades
   where it is instead of gliding to the room's centre. An object that jumps across the room ramps as Atmos
   does, fading out where it was (on the bus) and in where it goes, instead of sweeping through the
-  speakers between; 3–5% of position changes in films are such jumps.
+  speakers between; 3–5% of position changes in films are such jumps. Objects are rendered for the output tvOS actually renders to (7.1.4
+  for Dolby Atmos over HDMI and for headphones, otherwise the route's 7.1, 5.1 or stereo), followed as the
+  route changes: the speaker bus sits on that output's speakers, trims are that layout's, objects go to
+  layouts without heights at ear level (tvOS would lower them by their height), and on stereo every object
+  is rendered by the engine, as tvOS's stereo pan law is not TS 103 448's. Measured through Apple's
+  renderer on each output against the engine's TS 103 448 render: within 0.04 dB and 0.12 points.
+  `SpatialSpeakerLayout` gains `.l20`, `.l51` and `.l71` for this; they are outputs, not beds, so
+  `allCases` leaves them out and `objectAudioRendering` refuses them. Object metadata leaves more room in APAC's 2,048-byte
+  metadata channel: a restatement of where an object already is no longer costs a block (the largest
+  packet on Helicopter fell from 1,888 to 1,392 bytes), and a packet that still does not fit halves the
+  block budget of its busiest object first instead of every object's. The session log reports the largest
+  packet and any reductions. **Codec quality:** every object is now coded at its own 1 Mbit/s (the Object
+  component's `Bit Rate`, honoured although the codec lists it as not allowed), where the encoder codes to
+  quality rather than rate. Without it every object got 128 kbit/s whatever the stream's target, and a full
+  scene came back at 24–28 dB SNR with its top octave gone. Measured through Apple's renderer against the
+  exact objects: Helicopter 50 dB at 1.5 Mbit/s, Unfold 50 dB at 7.5 Mbit/s (peak 10.3), a Furiosa action
+  minute 60 dB at 5.5 Mbit/s, the last above the 7.1.4 bed encoder's 55 dB on the same scene. The playlist
+  declares 17 Mbit/s for the audio. Slot and bus gain ramps now step as TS 103 448's do (ramp + 1 steps,
+  the first on the update's frame), so a crossfaded jump sums exactly; a jump arriving mid-ramp hands the
+  bus what the slot is actually playing, with a second bus voice per object so a fade still running
+  finishes; and on stereo, bed channels are rendered by the engine too. An object stream no longer loses
+  all its metadata (every object at the room's centre) when a bed encoder in the process ends its stream
+  between the object codec's set-up and its first frames: the object encoder now sets its codec up for
+  coding when it codes them, and after a reset, under a lock it shares with the bed encoder's end of
+  stream (`APACCodecGate`). This was the placement test that failed now and then beside the bridge suite.
 - **Object metadata applied as TS 103 420 and TS 103 448 specify, personal builds** (`TrueHDReferenceRender`,
   `APACObjectOutput`): snap to the 22.2 targets by weighted distance, distance to the room boundary, warp
   mode, divergence, default and custom trims (the latter through the private LibTrueHD's

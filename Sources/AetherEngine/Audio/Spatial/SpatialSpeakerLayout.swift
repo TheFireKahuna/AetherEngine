@@ -12,12 +12,25 @@ import Foundation
 ///
 /// Channel order is CoreAudio's for the matching `kAudioChannelLayoutTag_Atmos_*` tag, because
 /// that tag is what the APAC encoder is opened with and the encoder reads planes in that order.
+///
+/// 2.0, 5.1 and 7.1 are not beds: they are the outputs tvOS can render object APAC to when the route
+/// is not Atmos, at the positions TS 103 448 gives them (tables A.2 to A.4), and `allCases` leaves
+/// them out.
 public enum SpatialSpeakerLayout: String, Sendable, CaseIterable, Codable {
     case l512 = "5.1.2"
     case l514 = "5.1.4"
     case l712 = "7.1.2"
     case l714 = "7.1.4"
     case l916 = "9.1.6"
+    case l20 = "2.0"
+    case l51 = "5.1"
+    case l71 = "7.1"
+
+    /// The bed layouts, the ones a host can ask to render into.
+    public static var allCases: [SpatialSpeakerLayout] { [.l512, .l514, .l712, .l714, .l916] }
+
+    /// Whether this is a bed (it has height speakers) rather than one of the plain outputs.
+    var isBed: Bool { trimTopCount > 0 }
 
     /// Speakers in CoreAudio channel order for `channelLayoutTag`.
     public var speakers: [SpatialSpeaker] {
@@ -32,6 +45,9 @@ public enum SpatialSpeakerLayout: String, Sendable, CaseIterable, Codable {
         case .l916: return [.left, .right, .center, .lfe, .sideLeft, .sideRight, .rearLeft, .rearRight,
                             .wideLeft, .wideRight, .topFrontLeft, .topFrontRight,
                             .topMiddleLeft, .topMiddleRight, .topRearLeft, .topRearRight]
+        case .l20: return [.left, .right, .lfe]
+        case .l51: return [.left, .right, .center, .lfe, .surroundLeft, .surroundRight]
+        case .l71: return [.left, .right, .center, .lfe, .sideLeft, .sideRight, .rearLeft, .rearRight]
         }
     }
 
@@ -61,10 +77,13 @@ public enum SpatialSpeakerLayout: String, Sendable, CaseIterable, Codable {
         case .l712: return kAudioChannelLayoutTag_Atmos_7_1_2
         case .l714: return kAudioChannelLayoutTag_Atmos_7_1_4
         case .l916: return kAudioChannelLayoutTag_Atmos_9_1_6
+        case .l20: return kAudioChannelLayoutTag_DVD_4
+        case .l51: return kAudioChannelLayoutTag_MPEG_5_1_A
+        case .l71: return kAudioChannelLayoutTag_MPEG_7_1_C
         }
     }
 
-    /// Index of the LFE channel. Every layout here has exactly one, in slot 3.
+    /// Index of the LFE channel. Every layout here has exactly one: in slot 3, or 2 for 2.0.
     public var lfeIndex: Int { speakers.firstIndex(of: .lfe)! }
 }
 

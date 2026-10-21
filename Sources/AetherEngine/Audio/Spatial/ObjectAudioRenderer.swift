@@ -64,11 +64,19 @@ struct ObjectAudioTrim: Sendable, Equatable {
             let gY = clamp(p.y / 0.6)
             let gZ = clamp((abs(p.z) - 0.2) / 0.8)
             db = maxTrim * clamp(gY + gZ)
-        case .custom(_, let surround, let height):
-            // The centre trim applies to a 2.0 layout only (output_speaker_config 0); none here is.
+        case .custom(let centre, let surround, let height):
             db = height * abs(p.z) + (p.y >= 0.5 ? surround : surround * 2 * p.y)
+                + (layout == .l20 ? Self.centreWeight(p) * centre : 0)
         }
         return powf(10, db / 20)
+    }
+
+    /// Pseudocode 17's trim_C weight on a 2.0 layout: 1 for an object at the front centre, falling
+    /// to 0 over 0.1 of the room beyond 0.05 of it in any direction.
+    static func centreWeight(_ p: SIMD3<Float>) -> Float {
+        let (siz, tran): (Float, Float) = (0.05, 0.1)
+        let reach = max(max(abs(p.x - 0.5) - siz, p.y - siz), abs(p.z) - siz)
+        return 1 - min(max(reach / tran, 0), 1)
     }
 }
 
