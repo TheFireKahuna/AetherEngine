@@ -135,6 +135,14 @@ the public-API contract.
 
 ### Fixed
 
+- **APAC fragments state their pre-roll, as Apple's HLS writer writes them.** Every APAC packet reports one
+  packet of pre-roll (`AudioStreamPacketDependencyDescription`), which Apple's own HLS fMP4 carries as a
+  fragment-local `prol` sample group with roll distance 1; movenc, muxing the track as its ALAC stand-in,
+  wrote none, so a player starting at a fragment could not know the first packet wants the one before it. The
+  APAC track's `moof`s now carry it, every size and data offset corrected. On the software route, where an
+  automatic renderer flush (AE#549) restarts the decoder mid-stream, the packet before goes in again first,
+  trimmed for its whole duration.
+
 - **The Atmos output activator runs on HDMI again.** #834 compared the route's port type with "HDMI",
   but `AVAudioSession.Port.HDMI` is "HDMIOutput" (as the session's own route line logs it), so no route
   ever matched and the activator stayed off everywhere, the HDMI sinks it exists for included. A
