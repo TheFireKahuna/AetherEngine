@@ -5,9 +5,9 @@ import Foundation
 
 /// What one signal in an object-audio presentation is.
 enum ObjectAudioRole: Sendable, Equatable {
-    /// A bed channel at a fixed speaker position. Rendered like a static object so a bed channel the
-    /// target layout lacks (a 7.1.2 bed's top-middle pair on a 5.1.4 layout) still lands where it
-    /// should, as a phantom between the speakers that bracket it.
+    /// A bed channel at a fixed speaker position: on its speaker where the layout has it, and where
+    /// it does not, folded onto the speakers TS 103 448 table 6 names (a 7.1.2 bed's top-middle pair
+    /// on a 5.1.4 layout: half the power to each top on its side).
     case bed(SpatialSpeaker)
     /// A bed channel at a fixed position the room model names no speaker for (screen, centre back,
     /// top centre). Rendered as a phantom from the moment the renderer exists, like a bed channel the
@@ -29,8 +29,11 @@ struct ObjectAudioElementState: Sendable, Equatable {
     var size: Float = 0
     /// Atmos divergence (TS 103 448 5.2.4): 0 = one source; more splits it into two, spread along x.
     var divergence: Float = 0
-    /// Speakers the object must not use (Atmos zone masks).
+    /// Speakers the object must not use (Atmos zone masks, and the heights when `elevation` is off).
     var excluded: Set<SpatialSpeaker> = []
+    /// b_enable_elevation. Off, the object keeps off the height speakers and, on a layout that has
+    /// them, is rendered at ear level (TS 103 448 5.1.3.2: only the layouts of its table 5).
+    var elevation = true
     /// How the object is trimmed on smaller layouts (TS 103 448 5.3); nil = not at all.
     var trim: ObjectAudioTrim?
 }
@@ -41,7 +44,9 @@ struct ObjectAudioElementState: Sendable, Equatable {
 struct ObjectAudioTrim: Sendable, Equatable {
     enum Mode: Sendable, Equatable {
         case `default`, disabled
-        case custom(centre: Float, surround: Float, height: Float)
+        /// The trims in dB, and the front/back balances (TS 103 420 5.6.5.9-12), -1...1 with
+        /// negative towards the front: in the top and bottom planes and in the listener plane.
+        case custom(centre: Float, surround: Float, height: Float, balanceTop: Float = 0, balanceListener: Float = 0)
     }
 
     /// Indexed by trim_cfg (TS 103 448 table 7).
@@ -64,11 +69,25 @@ struct ObjectAudioTrim: Sendable, Equatable {
             let gY = clamp(p.y / 0.6)
             let gZ = clamp((abs(p.z) - 0.2) / 0.8)
             db = maxTrim * clamp(gY + gZ)
-        case .custom(let centre, let surround, let height):
+        case .custom(let centre, let surround, let height, let balanceTop, let balanceListener):
             db = height * abs(p.z) + (p.y >= 0.5 ? surround : surround * 2 * p.y)
                 + (layout == .l20 ? Self.centreWeight(p) * centre : 0)
+            return powf(10, db / 20) * Self.balanceGain(at: p, top: balanceTop, listener: balanceListener)
         }
         return powf(10, db / 20)
+    }
+
+    /// The front/back balance of a custom trim. TS 103 420 gives each plane's balance (table 33:
+    /// only with custom_trim) but no renderer specifies how to apply it, so it is applied as a
+    /// fader: a balance b towards the back lowers an object at the front wall to 1 - b of its level
+    /// and one at the back wall not at all, linearly in between, and the other way round towards the
+    /// front. The listener plane's balance holds at ear level, the top and bottom planes' at the
+    /// ceiling and floor, and between them they mix by height.
+    static func balanceGain(at p: SIMD3<Float>, top: Float, listener: Float) -> Float {
+        let w = min(abs(p.z), 1)
+        let b = min(max(listener + (top - listener) * w, -1), 1)
+        let y = min(max(p.y, 0), 1)
+        return b >= 0 ? 1 - b * (1 - y) : 1 + b * y
     }
 
     /// Pseudocode 17's trim_C weight on a 2.0 layout: 1 for an object at the front centre, falling
@@ -88,8 +107,8 @@ struct ObjectAudioMetadataUpdate: Sendable {
     /// many frames plus the update's own (TS 103 448 5.5). 0 jumps.
     var rampFrames: Int
     /// One entry per element, indexed like `ObjectAudioRenderer.roles`. Nil leaves that element
-    /// alone, ramp included: encoders restate unchanged elements, and restarting their ramps on
-    /// every restatement would stall anything still moving.
+    /// alone, ramp included. Atmos restarts every element's ramp at every update, restated values
+    /// included (TS 103 448 pseudocode 19), so its decoder sends every element.
     var states: [ObjectAudioElementState?]
 }
 
@@ -119,6 +138,8 @@ final class ObjectAudioRenderer {
     private(set) var roles: [ObjectAudioRole]
 
     private var panners: [Set<SpatialSpeaker>: AllocentricPanner] = [:]
+    /// Whether the bed has the back pair, which sets table 6's gain g (TS 103 448 5.2.5.2).
+    private let bedHasBacks: Bool
 
     /// Per element, per output channel: the gains currently applied, the gains being ramped
     /// towards, and how many frames of that ramp remain.
@@ -140,6 +161,7 @@ final class ObjectAudioRenderer {
     init(layout: SpatialSpeakerLayout, roles: [ObjectAudioRole]) {
         self.layout = layout
         self.roles = roles
+        bedHasBacks = Self.bedHasBacks(roles)
         let channels = layout.channelCount
         current = Array(repeating: [Float](repeating: 0, count: channels), count: roles.count)
         target = current
@@ -287,9 +309,10 @@ final class ObjectAudioRenderer {
             var gains = [Float](repeating: 0, count: layout.channelCount)
             switch roles[index] {
             case .object:
+                let position = Self.renderPosition(state, on: layout)
                 panner(excluding: state.excluded).objectGains(
-                    position: state.position, size: state.size, divergence: state.divergence, into: &gains)
-                let gain = state.gain * (state.trim?.gain(at: state.position, on: layout) ?? 1)
+                    position: position, size: state.size, divergence: state.divergence, into: &gains)
+                let gain = state.gain * (state.trim?.gain(at: position, on: layout) ?? 1)
                 if gain != 1 { for c in gains.indices { gains[c] *= gain } }
             case .bed, .lfe, .fixed:
                 staticGains(for: roles[index], state: state, into: &gains)
@@ -321,9 +344,9 @@ final class ObjectAudioRenderer {
             for c in gains.indices { gains[c] = 0 }
             gains[layout.lfeIndex] = state.gain
         case .bed(let speaker):
-            if let direct = layout.speakers.firstIndex(of: speaker) ?? Self.downmixTarget(speaker, in: layout) {
+            if let routes = Self.speakerAnchoredRoutes(speaker, in: layout, bedHasBacks: bedHasBacks) {
                 for c in gains.indices { gains[c] = 0 }
-                gains[direct] = state.gain
+                for route in routes { gains[route.channel] += route.gain * state.gain }
             } else {
                 panner(excluding: []).pointGains(speaker.position, into: &gains)
                 if state.gain != 1 { for c in gains.indices { gains[c] *= state.gain } }
@@ -336,20 +359,78 @@ final class ObjectAudioRenderer {
         }
     }
 
-    /// Where a speaker-anchored bed channel the layout lacks goes when panning it would be wrong. A
-    /// 7.1 bed's side and rear surrounds both belong on a 5.1 layout's surround pair, the way a 7.1 to
-    /// 5.1 downmix folds them, and a 5.1 bed's surrounds on a 7.1 layout's sides, which sit where
-    /// TS 103 448 puts the 5.1 surrounds. Panned by position, a 5.1 surround would split between a
-    /// 7.1 layout's sides and rears.
-    static func downmixTarget(_ speaker: SpatialSpeaker, in layout: SpatialSpeakerLayout) -> Int? {
-        let speakers = layout.speakers
-        switch speaker {
-        case .sideLeft, .rearLeft: return speakers.firstIndex(of: .surroundLeft)
-        case .sideRight, .rearRight: return speakers.firstIndex(of: .surroundRight)
-        case .surroundLeft: return speakers.firstIndex(of: .sideLeft)
-        case .surroundRight: return speakers.firstIndex(of: .sideRight)
+    /// Where an object is panned and trimmed from on `layout`: at ear level with its elevation off,
+    /// on a layout with height speakers (TS 103 448 5.1.3.2, table 5). Without them it keeps its
+    /// height, which the default trim lowers it by.
+    static func renderPosition(_ state: ObjectAudioElementState, on layout: SpatialSpeakerLayout) -> SIMD3<Float> {
+        var p = state.position
+        if !state.elevation, layout.isBed { p.z = 0 }
+        return p
+    }
+
+    static func bedHasBacks(_ roles: [ObjectAudioRole]) -> Bool {
+        roles.contains(.bed(.rearLeft)) && roles.contains(.bed(.rearRight))
+    }
+
+    /// TS 103 448 table 6: the output channels and gains a speaker-anchored bed channel goes to on
+    /// the layouts of its table A.1, the ones the layout has at gain 1 and the others folded onto
+    /// the speakers it names. Nil for a layout the table has no column for (9.1.6, which has every
+    /// channel the table has a row for) and for a channel it has no row for (those are panned).
+    /// `bedHasBacks` is its g: m when the bed has the back pair, else 1.
+    static func speakerAnchoredRoutes(_ speaker: SpatialSpeaker, in layout: SpatialSpeakerLayout,
+                                      bedHasBacks: Bool) -> [(channel: Int, gain: Float)]? {
+        let config: Int
+        switch layout {
+        case .l20: config = 0
+        case .l51: config = 1
+        case .l71: config = 2
+        case .l714: config = 3
+        case .l712: config = 4
+        case .l514: config = 5
+        case .l512: config = 6
+        case .l916: return layout.speakers.firstIndex(of: speaker).map { [(channel: $0, gain: Float(1))] }
+        }
+        let right = speaker.isRight
+        let left = right ? speaker.mirrored : speaker
+        let m = Float(0.5).squareRoot(), g: Float = bedHasBacks ? m : 1
+        // Table A.3 to A.8 put a 5.1-style surround or a 7.1 side at the layout's index 3.
+        let surround: SpatialSpeaker = layout.speakers.contains(.sideLeft) ? .sideLeft : .surroundLeft
+        let routes: [(SpatialSpeaker, Float)]
+        switch left {
+        case .left: routes = [(.left, 1)]
+        case .center: routes = config == 0 ? [(.left, m), (.right, m)] : [(.center, 1)]
+        case .sideLeft, .surroundLeft:
+            switch config {
+            case 0: routes = [(.left, g * m)]
+            case 1, 5, 6: routes = [(surround, g)]
+            default: routes = [(surround, 1)]
+            }
+        case .rearLeft:
+            switch config {
+            case 0: routes = [(.left, 0.5)]
+            case 1, 5, 6: routes = [(surround, m)]
+            default: routes = [(.rearLeft, 1)]
+            }
+        case .topFrontLeft, .topMiddleLeft, .topRearLeft:
+            switch (left, config) {
+            case (_, 0): routes = [(.left, 0.5)]
+            case (_, 1), (_, 2): routes = [(surround, m)]
+            case (.topMiddleLeft, 3), (.topMiddleLeft, 5): routes = [(.topFrontLeft, m), (.topRearLeft, m)]
+            case (_, 3), (_, 5): routes = [(left, 1)]
+            case (.topMiddleLeft, _): routes = [(.topMiddleLeft, 1)]
+            default: routes = [(.topMiddleLeft, m)]
+            }
+        case .wideLeft: routes = [(.left, config == 0 ? 0.5 : m)]
         default: return nil
         }
+        var out: [(channel: Int, gain: Float)] = []
+        for (target, gain) in routes {
+            // Mirrored, the centre's pair stays a pair.
+            let t = right && target != .center ? target.mirrored : target
+            guard let channel = layout.speakers.firstIndex(of: t) else { return nil }
+            out.append((channel, gain))
+        }
+        return out
     }
 
     private func panner(excluding excluded: Set<SpatialSpeaker>) -> AllocentricPanner {

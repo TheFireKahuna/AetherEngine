@@ -79,13 +79,17 @@ struct TrueHDObjectMetadataMappingTests {
         #expect(state.gain == 0)
     }
 
-    @Test("an object without elevation comes down to ear level and stays off every height speaker")
+    @Test("an object without elevation stays off every height speaker, and comes down to ear level only where there are some")
     func noElevation() {
         let state = TrueHDObjectAudioDecoder.state(for: element(flags: TRUEHD_ATMOS_ELEMENT_ACTIVE))
         let heights = Set(SpatialSpeaker.allCases.filter(\.isHeight))
         #expect(heights.isSubset(of: state.excluded))
         #expect(!state.excluded.contains(.left))
-        #expect(state.position.z == 0)
+        #expect(!state.elevation)
+        // TS 103 448 table 5 lists the layouts with heights only: elsewhere the height stays, for the trim.
+        #expect(ObjectAudioRenderer.renderPosition(state, on: .l714).z == 0)
+        #expect(ObjectAudioRenderer.renderPosition(state, on: .l51).z == 0.75)
+        #expect(ObjectAudioRenderer.renderPosition(state, on: .l20).z == 0.75)
     }
 
     @Test("a position below the ear-level plane is clamped to it")
@@ -144,6 +148,18 @@ struct TrueHDObjectMetadataMappingTests {
         let constrained = element(flags: TRUEHD_ATMOS_ELEMENT_ACTIVE | TRUEHD_ATMOS_ELEMENT_SNAP, position: (0.2, 0.1, 0.8),
                                   zone: TRUEHD_ATMOS_ZONE_SURROUND_ONLY)
         #expect(TrueHDObjectAudioDecoder.state(for: constrained).position == SIMD3(0, 0.5, 0))
+    }
+
+    @Test("a screen-anchored object does not snap (TS 103 448 5.1.2.2)")
+    func screenAnchoredDoesNotSnap() {
+        var e = element(flags: TRUEHD_ATMOS_ELEMENT_ACTIVE | TRUEHD_ATMOS_ELEMENT_ELEVATION | TRUEHD_ATMOS_ELEMENT_SNAP
+                            | TRUEHD_ATMOS_ELEMENT_SCREEN_REF, position: (0.2, 0.1, 0), size: (0.3, 0.3, 0.3))
+        e.screen_factor = 1
+        e.depth_factor = 1
+        let state = TrueHDObjectAudioDecoder.state(for: e)
+        // Where it is (the screen fills the front wall), not on the nearest target, L.
+        #expect(simd_distance(state.position, SIMD3(0.2, 0.1, 0)) < 1e-6)
+        #expect(state.size == 0.3)
     }
 
     @Test("a distance puts the object on the room boundary along its ray from the centre")

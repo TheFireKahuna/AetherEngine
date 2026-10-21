@@ -123,7 +123,7 @@ struct APACObjectOutputTests {
     func elevationOff() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let heights = Set(SpatialSpeaker.allCases.filter(\.isHeight))
-        let state = ObjectAudioElementState(position: SIMD3(0.25, 0.25, 1), excluded: heights)
+        let state = ObjectAudioElementState(position: SIMD3(0.25, 0.25, 1), excluded: heights, elevation: false)
         let out = try render(roles: Self.roles, signalOn: 2, frames: 48_000,
                              updates: [.init(frameOffset: 0, rampFrames: 0, states: [nil, nil, state, nil, nil])])
         let shares = Self.shares(out, from: 8192, to: 48_000)
@@ -178,8 +178,8 @@ struct APACObjectOutputTests {
         for plane in buffer.planes { plane.update(repeating: 0, count: 1024) }
         buffer.objectRoles = [.object, .object, .object]
         buffer.objectUpdates = [.init(frameOffset: 0, rampFrames: 0, states: [
-            ObjectAudioElementState(excluded: heights),                                  // elevation off
-            ObjectAudioElementState(excluded: heights.union([.sideLeft, .sideRight])),   // + no sides
+            ObjectAudioElementState(excluded: heights, elevation: false),                                  // elevation off
+            ObjectAudioElementState(excluded: heights.union([.sideLeft, .sideRight]), elevation: false),   // + no sides
             ObjectAudioElementState(divergence: 0.5),
         ])]
         _ = try encoder.encode(buffer, frames: 1024)
@@ -282,14 +282,14 @@ struct APACObjectOutputTests {
         #expect(step < 0.05, "largest amplitude step around the jumps: \(step) of full")
     }
 
-    @Test("on stereo a height bed channel pans as TS 103 448 does, through the bus")
+    @Test("on stereo a height bed channel folds as TS 103 448 table 6 has it, through the bus")
     func stereoHeightBed() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let out = try render(roles: [.bed(.topFrontLeft)], signalOn: 0, frames: 24_576, updates: [], tone: true,
                              output: kAudioChannelLayoutTag_Stereo, renderedFor: .l20)
         let shares = Self.shares(out, from: 8192, to: 24_576)
-        // (0.25, 0.25) on 2.0: x a quarter of the way from L to R, cos² = 0.854.
-        #expect(abs(shares[0] - 0.854) < 0.015, "L share \(shares[0])")
+        // Tfl on 2.0: L alone, at 0.5.
+        #expect(shares[0] > 0.98, "L share \(shares[0])")
     }
 
     @Test("only a ramp whose positions and gains part ways goes over the bus")
@@ -681,6 +681,44 @@ struct APACObjectOutputTests {
         for frame in 10..<frames {
             #expect(abs(outputs[0][frame] + t.value(at: Int64(frame)).gain - 1) < 1e-5, "frame \(frame)")
         }
+    }
+
+    @Test("a fade restated mid-ramp steps on from the frame before it, as the speaker bus does (pseudocode 19)")
+    func restartedRampMatchesTheBus() {
+        let renderer = ObjectAudioRenderer(layout: .l714, roles: [.object])
+        let left = ObjectAudioElementState(position: SIMD3(0, 0, 0))
+        var silent = left
+        silent.gain = 0
+        let frames = 400
+        let ones = [Float](repeating: 1, count: frames)
+        let outputs = (0..<12).map { _ in UnsafeMutablePointer<Float>.allocate(capacity: frames) }
+        defer { outputs.forEach { $0.deallocate() } }
+        ones.withUnsafeBufferPointer { input in
+            renderer.render(inputs: [input.baseAddress!], frameCount: frames, updates: [
+                .init(frameOffset: 0, rampFrames: 0, states: [left]),
+                .init(frameOffset: 10, rampFrames: 200, states: [silent]),
+                .init(frameOffset: 110, rampFrames: 200, states: [silent]),
+            ], outputs: outputs)
+        }
+        // Updated as the encoder updates it, each when its frame comes.
+        var t = APACObjectTrajectory(.init(position: SIMD3(0, 0, 0), size: 0, gain: 1))
+        let updates: [Int: (gain: Float, ramp: Int)] = [0: (1, 0), 10: (0, 200), 110: (0, 200)]
+        for frame in 0..<frames {
+            if let u = updates[frame] {
+                t.apply(.init(position: SIMD3(0, 0, 0), size: 0, gain: u.gain), at: Int64(frame), rampFrames: u.ramp)
+            }
+            #expect(abs(outputs[0][frame] - t.value(at: Int64(frame)).gain) < 1e-5, "frame \(frame)")
+        }
+    }
+
+    @Test("a sized object without elevation goes to the bus where there are heights to keep off")
+    func sizedElevationOffNeedsBus() {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let heights = Set(SpatialSpeaker.allCases.filter(\.isHeight))
+        let sized = ObjectAudioElementState(size: 0.3, excluded: heights, elevation: false)
+        #expect(APACObjectEncoder.needsBus(sized, on: .l714))
+        #expect(!APACObjectEncoder.needsBus(sized, on: .l51))
+        #expect(!APACObjectEncoder.needsBus(ObjectAudioElementState(excluded: heights, elevation: false), on: .l714))
     }
 
     @Test("a packet too busy for the metadata channel still goes out, its busiest objects simplified")

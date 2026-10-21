@@ -140,6 +140,17 @@ public enum SpatialSpeaker: String, Sendable, CaseIterable {
 
     var isLFE: Bool { self == .lfe }
     var isHeight: Bool { position.z > 0 }
+    var isRight: Bool { position.x > 0.5 }
+
+    /// The speaker at the same place on the other side of the room (itself on the centre line).
+    var mirrored: SpatialSpeaker {
+        let p = position
+        let x = SIMD3(1 - p.x, p.y, p.z)
+        return Self.allCases.first { $0 != .lfe && $0.position == x && $0.isSurroundStyle == isSurroundStyle } ?? self
+    }
+
+    /// The 5.1-style surrounds, which share their position with the 7.1 sides.
+    private var isSurroundStyle: Bool { self == .surroundLeft || self == .surroundRight }
 
     /// The CoreAudio label for this position, so the bed's log line names channels the way the
     /// route line and CoreAudioBaseTypes.h do. 5.1-style surrounds and 7.1 sides share

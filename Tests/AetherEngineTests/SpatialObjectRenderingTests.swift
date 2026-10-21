@@ -36,6 +36,22 @@ struct SpatialObjectRenderingTests {
         } } }
     }
 
+    @Test("a position exactly on a speaker row or column gives that speaker all of it and the others nothing",
+          arguments: SpatialSpeakerLayout.allCases + [.l20, .l51, .l71])
+    func exactRowsAndColumns(layout: SpatialSpeakerLayout) {
+        let panner = AllocentricPanner(layout: layout)
+        var gains: [Float] = []
+        for speaker in layout.speakers where !speaker.isLFE {
+            panner.pointGains(speaker.position, into: &gains)
+            let own = layout.speakers.firstIndex(of: speaker)!
+            #expect(gains.indices.allSatisfy { gains[$0] == ($0 == own ? 1 : 0) }, "\(layout.rawValue) \(speaker): \(gains)")
+        }
+        for size: Float in [0.3, 0.9] {
+            panner.objectGains(position: SIMD3(0, 0.5, 0), size: size, into: &gains)
+            #expect(gains.allSatisfy { $0.isFinite && $0 >= 0 }, "\(layout.rawValue) size \(size)")
+        }
+    }
+
     @Test("an overhead object in the middle of the room splits evenly across the four tops")
     func overheadCentre() {
         let layout = SpatialSpeakerLayout.l714
@@ -269,6 +285,37 @@ struct SpatialObjectRenderingTests {
         #expect(abs(out[r][199] - 1) < 1e-5)
     }
 
+    @Test("an update restating an element restarts its ramp from where it has got to (pseudocode 19)")
+    func restatementRestartsRamp() {
+        let layout = SpatialSpeakerLayout.l714
+        let renderer = ObjectAudioRenderer(layout: layout, roles: [.object])
+        let ones = [Float](repeating: 1, count: 300)
+        let r = layout.speakers.firstIndex(of: .right)!
+        let left = ObjectAudioElementState(position: SIMD3(0, 0, 0))
+        let right = ObjectAudioElementState(position: SIMD3(1, 0, 0))
+        let out = render(renderer, inputs: [ones], frames: 300, updates: [
+            .init(frameOffset: 0, rampFrames: 0, states: [left]),
+            .init(frameOffset: 0, rampFrames: 199, states: [right]),
+            // Restated at frame 100, halfway, over another 200 frames: from 0.5, a quarter of the way on at 149.
+            .init(frameOffset: 100, rampFrames: 199, states: [right]),
+        ])
+        #expect(abs(out[r][149] - 0.625) < 0.01)
+        #expect(abs(out[r][299] - 1) < 1e-5)
+    }
+
+    @Test("a custom trim's balance fades the far end of the room (TS 103 420 5.6.5.9-12)")
+    func trimBalance() {
+        // Towards the back by 0.5 at ear level: the front wall at half its level, the back untouched.
+        #expect(ObjectAudioTrim.balanceGain(at: SIMD3(0.5, 0, 0), top: 0, listener: 0.5) == 0.5)
+        #expect(ObjectAudioTrim.balanceGain(at: SIMD3(0.5, 1, 0), top: 0, listener: 0.5) == 1)
+        // Towards the front by 1 overhead: the back of the ceiling silent, halfway up half of it.
+        #expect(ObjectAudioTrim.balanceGain(at: SIMD3(0.5, 1, 1), top: -1, listener: 0) == 0)
+        #expect(ObjectAudioTrim.balanceGain(at: SIMD3(0.5, 1, 0.5), top: -1, listener: 0) == 0.5)
+        var configs = [ObjectAudioTrim.Mode](repeating: .default, count: 9)
+        configs[1] = .custom(centre: 0, surround: 0, height: 0, balanceTop: 0, balanceListener: 0.5)   // 5.1: trim_cfg 1
+        #expect(abs(ObjectAudioTrim(configs: configs).gain(at: SIMD3(0.5, 0, 0), on: .l51) - 0.5) < 1e-6)
+    }
+
     @Test("a new target mid-ramp starts from where the ramp had got to")
     func retargetMidRamp() {
         let layout = SpatialSpeakerLayout.l714
@@ -348,19 +395,62 @@ struct SpatialObjectRenderingTests {
         #expect(out.allSatisfy { $0.allSatisfy { $0 == 0 } })
     }
 
-    @Test("7.1 bed surrounds fold onto a 5.1 layout's surround pair, never into the front", arguments: [
-        SpatialSpeakerLayout.l512, .l514])
+    /// One bed channel's gains on `layout`, the rest of a `bed` silent.
+    private func bedGains(_ speaker: SpatialSpeaker, of bed: [SpatialSpeaker], on layout: SpatialSpeakerLayout) -> [Float] {
+        let renderer = ObjectAudioRenderer(layout: layout, roles: bed.map { .bed($0) })
+        let inputs = bed.map { [Float](repeating: $0 == speaker ? 1 : 0, count: 4) }
+        return render(renderer, inputs: inputs, frames: 4, updates: []).map { $0[0] }
+    }
+
+    private static let bed712: [SpatialSpeaker] = [.left, .right, .center, .sideLeft, .sideRight, .rearLeft, .rearRight,
+                                                   .topMiddleLeft, .topMiddleRight]
+    private static let bed514: [SpatialSpeaker] = [.left, .right, .center, .sideLeft, .sideRight,
+                                                   .topFrontLeft, .topFrontRight, .topRearLeft, .topRearRight]
+
+    @Test("TS 103 448 table 6: a 7.1 bed's sides and backs fold onto 5.1's surrounds at -3 dB each, never into the front",
+          arguments: [SpatialSpeakerLayout.l51, .l512, .l514])
     func bedSurroundsFoldOnFiveOne(layout: SpatialSpeakerLayout) {
-        let renderer = ObjectAudioRenderer(
-            layout: layout, roles: [.bed(.sideLeft), .bed(.rearRight)])
-        let ones = [Float](repeating: 1, count: 16)
-        let zeros = [Float](repeating: 0, count: 16)
-        var out = render(renderer, inputs: [ones, zeros], frames: 16, updates: [])
-        #expect(out[layout.speakers.firstIndex(of: .surroundLeft)!] == ones)
-        #expect(out[layout.speakers.firstIndex(of: .left)!] == zeros)
-        out = render(renderer, inputs: [zeros, ones], frames: 16, updates: [])
-        #expect(out[layout.speakers.firstIndex(of: .surroundRight)!] == ones)
-        #expect(out[layout.speakers.firstIndex(of: .right)!] == zeros)
+        let m = Float(0.5).squareRoot()
+        for (speaker, target) in [(SpatialSpeaker.sideLeft, SpatialSpeaker.surroundLeft), (.rearRight, .surroundRight)] {
+            let g = bedGains(speaker, of: Self.bed712, on: layout)
+            #expect(abs(g[layout.speakers.firstIndex(of: target)!] - m) < 1e-6, "\(speaker)")
+            #expect(abs(power(g) - 0.5) < 1e-6, "\(speaker) only there")
+        }
+        // A 5.1 bed has no backs: its surrounds go straight through (g = 1).
+        let g = bedGains(.sideLeft, of: Self.bed514, on: layout)
+        #expect(g[layout.speakers.firstIndex(of: .surroundLeft)!] == 1)
+    }
+
+    @Test("TS 103 448 table 6 on stereo: centre and surrounds at -3 dB, backs, tops and wides at -6 dB")
+    func bedOnStereo() {
+        let m = Float(0.5).squareRoot()
+        let (l, r) = (0, 1)
+        let centre = bedGains(.center, of: Self.bed712, on: .l20)
+        #expect(abs(centre[l] - m) < 1e-6 && abs(centre[r] - m) < 1e-6)
+        // With backs, g = m: a side surround at g * m.
+        #expect(abs(bedGains(.sideRight, of: Self.bed712, on: .l20)[r] - 0.5) < 1e-6)
+        #expect(abs(bedGains(.sideRight, of: Self.bed514, on: .l20)[r] - m) < 1e-6)
+        for speaker in [SpatialSpeaker.rearLeft, .topMiddleLeft] {
+            let g = bedGains(speaker, of: Self.bed712, on: .l20)
+            #expect(g[l] == 0.5 && g[r] == 0, "\(speaker)")
+        }
+        #expect(bedGains(.topFrontRight, of: Self.bed514, on: .l20) == [0, 0.5, 0])
+    }
+
+    @Test("TS 103 448 table 6: top channels a layout lacks fold onto the surrounds or split between the tops it has")
+    func bedTopsFold() {
+        let m = Float(0.5).squareRoot()
+        // 7.1.2's top middles on 7.1.4: half the power to the front and back tops.
+        let onAtmos = bedGains(.topMiddleLeft, of: Self.bed712, on: .l714)
+        #expect(abs(onAtmos[SpatialSpeakerLayout.l714.speakers.firstIndex(of: .topFrontLeft)!] - m) < 1e-6)
+        #expect(abs(onAtmos[SpatialSpeakerLayout.l714.speakers.firstIndex(of: .topRearLeft)!] - m) < 1e-6)
+        // On 7.1, onto the sides at -3 dB; on 5.1, onto the surrounds.
+        let onSeven = bedGains(.topRearRight, of: Self.bed514, on: .l71)
+        #expect(abs(onSeven[SpatialSpeakerLayout.l71.speakers.firstIndex(of: .sideRight)!] - m) < 1e-6)
+        #expect(abs(power(onSeven) - 0.5) < 1e-6)
+        // 5.1.4's tops on 7.1.2: onto the top middles at -3 dB.
+        let onTwo = bedGains(.topFrontLeft, of: Self.bed514, on: .l712)
+        #expect(abs(onTwo[SpatialSpeakerLayout.l712.speakers.firstIndex(of: .topMiddleLeft)!] - m) < 1e-6)
     }
 
     @Test("a 5.1 bed's surrounds land on a 7.1 layout's sides")
