@@ -1876,9 +1876,7 @@ final class NativeAVPlayerHost {
     /// nil when no frame arrives inside `timeout`, which the caller treats as "nothing to hold".
     func captureDisplayedFrame(timeout: Duration = .milliseconds(500)) async -> CVPixelBuffer? {
         guard let item = playerItem else { return nil }
-        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-            kCVPixelBufferIOSurfacePropertiesKey as String: [String: String]()
-        ])
+        let output = ItemVideoOutput.make(.ioSurface)
         item.add(output)
         defer { item.remove(output) }
         let clock = ContinuousClock()
@@ -1887,8 +1885,7 @@ final class NativeAVPlayerHost {
             // A playing item vends at the host clock, a paused one only at the time it holds.
             let itemTime = avPlayer.rate == 0 ? item.currentTime()
                 : output.itemTime(forHostTime: CACurrentMediaTime())
-            if itemTime.isNumeric,
-               let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) {
+            if itemTime.isNumeric, let buffer = ItemVideoOutput.frame(of: output, at: itemTime).pixelBuffer {
                 return buffer
             }
             try? await Task.sleep(for: .milliseconds(8))
@@ -2349,9 +2346,7 @@ final class NativeAVPlayerHost {
         }
         if diagnosticVideoOutput == nil {
             guard isVideoReadyForDisplay else { return true }
-            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-                kCVPixelBufferIOSurfacePropertiesKey as String: [String: String]()
-            ])
+            let output = ItemVideoOutput.make(.ioSurface)
             output.suppressesPlayerRendering = false
             item.add(output)
             diagnosticVideoOutput = output
@@ -2359,11 +2354,11 @@ final class NativeAVPlayerHost {
         }
         guard let output = diagnosticVideoOutput else { return true }
         let itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
-        var displayTime = CMTime.invalid
         var frame: Double?
-        if itemTime.isNumeric, output.hasNewPixelBuffer(forItemTime: itemTime),
-           output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &displayTime) != nil,
-           displayTime.isNumeric { frame = displayTime.seconds }
+        if itemTime.isNumeric, output.hasNewPixelBuffer(forItemTime: itemTime) {
+            let read = ItemVideoOutput.frame(of: output, at: itemTime)
+            if read.pixelBuffer != nil, read.displayTime.isNumeric { frame = read.displayTime.seconds }
+        }
         let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
         if let previous = videoFrameSampleAt, now - previous > 0.25 {
             EngineLog.emit("[NativeVideoFrames] event=observer_delay sid=\(session) age=\(String(format: "%.3f", now - previous)) kind=sampling_delay", category: .engine)

@@ -212,9 +212,7 @@ final class PresentedFrameProbe: @unchecked Sendable {
         let already = attachedID == id
         lock.unlock()
         guard !already else { return }
-        let fresh = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        ])
+        let fresh = ItemVideoOutput.make(.pixelFormat(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange))
         if let output, let attachedItem { attachedItem.remove(output) }
         item.add(fresh)
         lock.lock()
@@ -245,9 +243,8 @@ final class PresentedFrameProbe: @unchecked Sendable {
         guard let current else { return }
         let itemTime = current.itemTime(forHostTime: CACurrentMediaTime())
         guard itemTime.isValid, current.hasNewPixelBuffer(forItemTime: itemTime) else { return }
-        var display = CMTime.zero
-        guard current.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &display) != nil,
-              display.isValid else { return }
+        let (image, display) = ItemVideoOutput.frame(of: current, at: itemTime)
+        guard image != nil, display.isValid else { return }
         let seconds = display.seconds
         lock.lock()
         defer { lock.unlock() }
