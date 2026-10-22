@@ -36,13 +36,23 @@ Items 1–6 are implemented and unit-tested, but haven't been tried on the TV ye
 
 ## Modernise
 
-7. **[ ] Use the tvOS 27 renderer `Receiver` for all renderer I/O.** The renderers are attached with
-   `sampleBufferReceiver(adding:)` but still fed with `enqueue`, `flush` and `isReadyForMoreMediaData`,
-   which are deprecated for Swift in 27. The receiver offers:
-   - an `EnqueueResult` per buffer (`.enqueuedWithSuggestedFlush`, `.cancelledDueToFlush`);
-   - `flush(fromSourceTime:)`, so a lip-sync offset change applies at once;
-   - an awaitable `enqueue`, in place of the 5 ms back-pressure poll (`SoftwarePlaybackHost.swift:3700`).
-   Large change; A/B it on the device.
+7. **[ ] Move renderer I/O onto the tvOS 27 `Receiver`, where it is a drop-in.** Researched 2026-10-22: the SDK,
+   the overlay and AVFCore decompiled from macOS 27.0.1, and a probe. Full notes:
+   `research/renderer-receiver/README.md`.
+   - The receiver is a Swift wrapper in the overlay over the same renderer, Fig callbacks and notifications.
+     It adds no capability. `flush(fromSourceTime:)` is `flushFromSourceTime:` (tvOS 11), so the lip-sync
+     offset can apply at once with or without it.
+   - The awaitable `enqueue` cannot replace the 5 ms polls (`SoftwarePlaybackHost.swift:3062,3707,3752`).
+     Those gates wait before a compressed packet is decoded, and the receiver can only wait with a decoded
+     buffer in hand. Keep the deprecated readiness check there unless the demux loop is redesigned.
+   - Video decode results don't apply: the engine enqueues decoded pixel buffers.
+   - Order: AudioOutput (`enqueueImmediately`, receiver `flush`, one event stream in place of two notifications
+     and the status KVO); then the lip-sync flush; then SampleBufferRenderer and HeldStill. A/B through
+     `usesSampleBufferReceivers`.
+   - Gotchas: a result reports a reason only on the next enqueue, and the stream reports it as well. A cancelled
+     waiting enqueue reports `.cancelledDueToFlush` without flushing or enqueueing.
+   - Finding for item 3: on macOS a flush does not revive a failed audio renderer, so the ladder's reposition
+     step cannot help audio. Check on tvOS.
 8. **[ ] Interruptions through `didBecomeInactiveNotification` and `resumptionRecommendationNotification` (27).**
    `interruptionNotification` and its keys are deprecated, and its reason key isn't available on tvOS.
    `DeactivationContext` tells `.routeDisconnected` (an HDMI/eARC drop) apart from Siri or a call.
