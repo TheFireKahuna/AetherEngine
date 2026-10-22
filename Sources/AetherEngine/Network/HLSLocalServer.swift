@@ -2088,6 +2088,10 @@ final class HLSLocalServer: @unchecked Sendable {
         var lines: [String] = []
         lines.append("#EXTM3U")
         lines.append("#EXT-X-VERSION:7")
+        // Every segment this server cuts opens on an IDR (authoring 7.4), and an item can load this
+        // playlist without the master that already says so, so it says so too (authoring 9.12): a seek
+        // then knows its target's own segment is enough, rather than fetching the one before it.
+        lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
         if typeIsLive {
             var serverControl: [String] = []
             // CAN-BLOCK-RELOAD: AVPlayer sends ?_HLS_msn=N and the server holds the response until that segment is cut (see waitForLiveSegment), so AVPlayer gets each segment the instant it exists instead of a poll-interval late. Segment-level only (no EXT-X-PART). Gated on liveBlockingReloadEnabled: bursty sources can't honor the contract (-15410 and periodic stalls on device repro 2026-06-11); they fall back to plain reloads with a raised TARGETDURATION.
