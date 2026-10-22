@@ -151,6 +151,46 @@ final class AudioRendererIO: @unchecked Sendable {
         renderer.flush()
     }
 
+    /// How long a partial flush is waited for. It completes in well under a millisecond (macOS 27); the bound is for a
+    /// stranded media server, which must not hold the caller.
+    static let partialFlushTimeout: DispatchTimeInterval = .milliseconds(250)
+
+    enum PartialFlush: Equatable {
+        /// Everything from the time on is gone; what comes before it plays on.
+        case flushed
+        /// The renderer declined; its header says the queue is then unchanged.
+        case refused
+        /// No answer within `partialFlushTimeout`. The flush may still happen later, so the queue's state is
+        /// unknown; only a full flush makes it known again.
+        case unanswered
+    }
+
+    /// Flushes what is queued from renderer time `time` on and keeps what comes before it playing
+    /// (`flushFromSourceTime:completionHandler:`; on 27 the receiver's `flush(fromSourceTime:)`). Blocks until the
+    /// renderer answers, at most `partialFlushTimeout`. The renderer may decline, which its header allows for a
+    /// time too close to the clock or a configuration that cannot flush there.
+    func flush(fromSourceTime time: CMTime) -> PartialFlush {
+        let answered = DispatchSemaphore(value: 0)
+        let succeeded = OSAllocatedUnfairLock(initialState: false)
+        if #available(macOS 27, iOS 27, tvOS 27, visionOS 27, *),
+           let receiver = receiver as? AVSampleBufferAudioRenderer.Receiver {
+            nonisolated(unsafe) let flushing = receiver
+            BlockingWork.detached {
+                nonisolated(unsafe) let receiver = flushing
+                let ok = await receiver.flush(fromSourceTime: time)
+                succeeded.withLock { $0 = ok }
+                answered.signal()
+            }
+        } else {
+            renderer.flush(fromSourceTime: time) { ok in
+                succeeded.withLock { $0 = ok }
+                answered.signal()
+            }
+        }
+        guard answered.wait(timeout: .now() + Self.partialFlushTimeout) == .success else { return .unanswered }
+        return succeeded.withLock { $0 } ? .flushed : .refused
+    }
+
     /// The renderer's own readiness. Deprecated with the rest of its queue calls, and kept: the receiver offers no
     /// way to wait without a buffer in hand.
     var isReadyForMoreMediaData: Bool {
