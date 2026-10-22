@@ -2050,7 +2050,7 @@ extension AetherEngine {
         host.elType = elType ?? sourceElType
         host.objectAudioRendering = loadedOptions.objectAudioRendering
         host.objectDialogueGain = loadedOptions.objectDialogueGain
-        host.setAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens
+        host.prepareAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens
         // AE#813: a live ingest delivers whole segments, and the host's holdback follows their length.
         if isLive, let ingest = customReader as? LiveIngestSourceInfo {
             host.liveDeliveryUnit = { [weak ingest] in

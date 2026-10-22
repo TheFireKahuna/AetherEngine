@@ -1864,10 +1864,17 @@ final class SoftwarePlaybackHost {
     /// could not, the renderer having declined its partial flush: the samples already queued then carry the
     /// previous offset, and a caller that wants the change audible now re-anchors at the playhead, as
     /// `AetherEngine.setAudioDelay` does. A session without audio has nothing to move.
-    @discardableResult
-    func setAudioDelay(_ seconds: Double) -> Bool {
+    /// The delay a session starts with, set before the host loads: the audio output is built with it, so nothing
+    /// queued needs moving.
+    func prepareAudioDelay(_ seconds: Double) {
         audioDelaySeconds = seconds
-        return audioOutput?.setPresentationOffset(seconds: seconds) ?? true
+        audioOutput?.setPresentationOffset(seconds: seconds)
+    }
+
+    func setAudioDelay(_ seconds: Double) async -> Bool {
+        audioDelaySeconds = seconds
+        guard let audioOutput else { return true }
+        return await audioOutput.changePresentationOffset(seconds: seconds)
     }
 
     func setResumeRate(_ rate: Float) {

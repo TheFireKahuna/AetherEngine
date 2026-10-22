@@ -151,9 +151,10 @@ final class AudioRendererIO: @unchecked Sendable {
         renderer.flush()
     }
 
-    /// How long a partial flush is waited for. It completes in well under a millisecond (macOS 27); the bound is for a
-    /// stranded media server, which must not hold the caller.
-    static let partialFlushTimeout: DispatchTimeInterval = .milliseconds(250)
+    /// How long a partial flush is waited for. It completes in well under a millisecond on an idle machine (macOS 27)
+    /// and took past 250 ms on a loaded one; the bound is for a stranded media server. The wait holds the audio
+    /// feed (seconds of lead) and never the main actor (`AudioOutput.changePresentationOffset`).
+    static let partialFlushTimeout: DispatchTimeInterval = .seconds(1)
 
     enum PartialFlush: Equatable {
         /// Everything from the time on is gone; what comes before it plays on.
