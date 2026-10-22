@@ -1039,6 +1039,25 @@ final class NativeAVPlayerHost {
         return true
     }
 
+    /// #98: a master rejection is handed to the engine, which reloads the media playlist, instead of surfacing.
+    private func signalMasterRejection(_ error: NSError, desc: String, item: AVPlayerItem, withheld: Bool) {
+        let code = MasterFallbackDecision.rejectionCode(for: error, iFramePlaylistWithheld: withheld)
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sessionID) startup .failed is a master rejection "
+            + "(code=\(code)); signalling engine for media fallback instead of surfacing",
+            category: .engine)
+        pendingDisplayRejection = DisplayRejection(code: code, message: desc, domain: error.domain)
+    }
+
+    /// A startup failure that is not a master rejection.
+    private func failStartup(_ desc: String, item: AVPlayerItem) {
+        // AE#561: a startup failure on the media itself (a segment Apple's parser refuses) is
+        // not the end of the source, only of this consumer's opinion of it.
+        if offerToSoftwarePath(desc, item: item, position: renderedTime) { return }
+        failure = Self.itemFailureInfo(desc: desc, itemError: item.error,
+                                       relayRefusalCode: upstreamTrustRefusal?())
+    }
+
     private func handleItemFailed(_ desc: String, item: AVPlayerItem) {
         // Ignore a late `.failed` KVO from an item we have already replaced.
         guard playerItem === item else { return }
@@ -1077,25 +1096,35 @@ final class NativeAVPlayerHost {
                 remoteHLSOriginRefused = true
                 return
             }
-            if let error = item.error as NSError?, MasterFallbackDecision.isMasterRejection(error,
-                mediaErrorCodes: item.errorLog()?.events.map(\.errorStatusCode) ?? [],
-                iFramePlaylistWithheld: iFramePlaylistWithheld?() ?? false) {
-                let code = MasterFallbackDecision.rejectionCode(for: error,
-                    iFramePlaylistWithheld: iFramePlaylistWithheld?() ?? false)
-                EngineLog.emit(
-                    "[NativeAVPlayerHost] #\(sessionID) startup .failed is a master rejection "
-                    + "(code=\(code)); signalling engine for media fallback instead of surfacing",
-                    category: .engine)
-                pendingDisplayRejection = DisplayRejection(code: code,
-                                                           message: desc,
-                                                           domain: (item.error as NSError?)?.domain)
+            let withheld = iFramePlaylistWithheld?() ?? false
+            if let error = item.error as NSError?,
+               MasterFallbackDecision.isMasterRejection(error, iFramePlaylistWithheld: withheld) {
+                // The item's own error reads as a master rejection. The one thing that can still overrule
+                // it is a -12642 in the item's error log (a malformed media playlist wrapped in the same
+                // code). That log is read without blocking the main actor: tvOS 27's fetch, or the getter
+                // off it before 27 (the synchronous getter here was the main-actor stall item 9 names).
+                // A withheld I-frame playlist decides on the error alone and needs no log.
+                guard !(withheld && MasterFallbackDecision.isWithheldIFramePlaylistFailure(error)) else {
+                    signalMasterRejection(error, desc: desc, item: item, withheld: withheld)
+                    return
+                }
+                let sid = sessionID
+                Task { @MainActor [weak self] in
+                    let codes = await ItemLogs.errorStatusCodes(of: item)
+                    // Whatever happened while the log was read (a replaced item, a teardown, playback that
+                    // started after all) decides instead.
+                    guard let self, self.sessionID == sid, self.playerItem === item, !self.hasEverPlayed,
+                          self.failure == nil, self.pendingDisplayRejection == nil else { return }
+                    if MasterFallbackDecision.isMasterRejection(error, mediaErrorCodes: codes,
+                                                                iFramePlaylistWithheld: withheld) {
+                        self.signalMasterRejection(error, desc: desc, item: item, withheld: withheld)
+                    } else {
+                        self.failStartup(desc, item: item)
+                    }
+                }
                 return
             }
-            // AE#561: a startup failure on the media itself (a segment Apple's parser refuses) is
-            // not the end of the source, only of this consumer's opinion of it.
-            if offerToSoftwarePath(desc, item: item, position: renderedTime) { return }
-            failure = Self.itemFailureInfo(desc: desc, itemError: item.error,
-                                           relayRefusalCode: upstreamTrustRefusal?())
+            failStartup(desc, item: item)
             return
         }
 

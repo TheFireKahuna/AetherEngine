@@ -61,13 +61,13 @@ struct ItemDiagnosticSnapshot: Sendable {
     nonisolated static func read(_ item: AVPlayerItem, _ request: ItemDiagnosticRequest) -> Self {
         var snapshot = Self()
         if !request.intersection([.error, .failure]).isEmpty {
-            snapshot.errors = item.errorLog()?.events.map {
+            snapshot.errors = ItemLogs.errors(of: item)?.events.map {
                 Error(code: $0.errorStatusCode, domain: $0.errorDomain, comment: $0.errorComment,
                       uri: $0.uri, server: $0.serverAddress)
             }
         }
         if !request.intersection([.access, .failure, .counters]).isEmpty {
-            snapshot.access = item.accessLog()?.events.map {
+            snapshot.access = ItemLogs.access(of: item)?.events.map {
                 Access(uri: $0.uri, server: $0.serverAddress, bytes: $0.numberOfBytesTransferred,
                        requests: $0.numberOfMediaRequests, stalls: $0.numberOfStalls,
                        droppedFrames: $0.numberOfDroppedVideoFrames)

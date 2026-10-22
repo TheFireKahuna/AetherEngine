@@ -41,7 +41,7 @@ Items 1–6 are implemented and unit-tested, but haven't been tried on the TV ye
 
 ## Modernise
 
-7. **[ ] Move renderer I/O onto the tvOS 27 `Receiver`, where it is a drop-in.** Researched 2026-10-22: the SDK,
+7. **[x] Move renderer I/O onto the tvOS 27 `Receiver`, where it is a drop-in.** Researched 2026-10-22: the SDK,
    the overlay and AVFCore decompiled from macOS 27.0.1, and a probe. Full notes:
    `research/renderer-receiver/README.md`.
    - The receiver is a Swift wrapper in the overlay over the same renderer, Fig callbacks and notifications.
@@ -63,15 +63,23 @@ Items 1–6 are implemented and unit-tested, but haven't been tried on the TV ye
        terminal has no screen-recording permission.
      - The held still frame gets its own synchronizer and a timed frame: the header advises against
        `DisplayImmediately` with a synchronizer.
-   - Left: the lip-sync offset applied at once (`flush(fromSourceTime:)`).
+   - The lip-sync offset applies at once (done 2026-10-22): a change on the software path is in force a
+     quarter-second past the playhead through the renderer's partial flush, with no seek; a renderer that
+     declines the flush falls back to the seek.
    - Gotcha: a cancelled waiting enqueue reports `.cancelledDueToFlush` without flushing or enqueueing.
    - Finding for item 3, since acted on: on macOS a flush does not revive a failed audio renderer, so the ladder
      now replaces it instead of repositioning. Not yet seen on tvOS.
 8. **[ ] Interruptions through `didBecomeInactiveNotification` and `resumptionRecommendationNotification` (27).**
    `interruptionNotification` and its keys are deprecated, and its reason key isn't available on tvOS.
    `DeactivationContext` tells `.routeDisconnected` (an HDMI/eARC drop) apart from Siri or a call.
-9. **[ ] `AVMetricEventStream` in place of polling `accessLog()`/`errorLog()`** (deprecated in 27). A synchronous
-   `errorLog()` call on the main actor in `NativeAVPlayerHost.swift:1081` (item failed) can block.
+9. **[x] The item logs through tvOS 27's fetch.** Done 2026-10-22 (`ItemLogs`). The SDK deprecates `accessLog()`
+   and `errorLog()` for `fetchAccessLogWithCompletionHandler:` / `fetchErrorLogWithCompletionHandler:` (Swift:
+   async `accessLog()` / `errorLog()`), not for `AVMetricEventStream`, whose events carry neither the byte and
+   dropped-frame counters nor the HTTP status codes the engine reads.
+   - The item-failure handler no longer reads the error log on the main actor: it awaits it, and only when the
+     item's own error reads as a master rejection, the one case the log can still overrule (a -12642).
+   - The telemetry sampler and the diagnostic lanes wait on the fetch for at most 2 s on 27, so a stranded media
+     server costs a reading instead of the thread.
 10. **[ ] Small items:**
     - `AVPlayerItemVideoOutput` uses the dictionary init and `copyPixelBuffer` (`NativeAVPlayerHost.swift:1850,2323`).
     - `AVDisplayManagerModeSwitchSettingsChangedNotification` and `eligibleForHDRPlaybackDidChangeNotification` aren't observed.

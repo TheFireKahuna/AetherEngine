@@ -583,12 +583,13 @@ final class LiveTelemetrySampler {
         return current + retired
     }
 
-    /// The real batch, run on `readQueue`: one accessLog() shared by the snapshot fields and the
+    /// The real batch, run on `readQueue`: one access log shared by the snapshot fields and the
     /// LagDiag lifetime drop sum, one currentTime() shared by the forward-buffer math and the
     /// LagDiag clock (previously two of each per tick, all on the main actor).
     private nonisolated static func batchReadNativeAVF(player: AVPlayer, item: AVPlayerItem) -> NativeAVFReadings {
         var readings = NativeAVFReadings()
-        let events = item.accessLog()?.events
+        // The fetch on 27 (bounded, so a stranded media server costs this tick, not the queue), the getter before.
+        let events = ItemLogs.access(of: item)?.events
         // The rate is a `.last` read on purpose: it describes the link right now.
         if let event = events?.last {
             let observed = event.observedBitrate
