@@ -1859,13 +1859,15 @@ final class SoftwarePlaybackHost {
 
     /// AE#464: set the audio presentation offset. Positive delivers audio later relative to video.
     ///
-    /// Only the stamp changes; nothing is flushed here. The samples already decoded (up to
-    /// `AudioLookaheadPolicy.targetLeadSeconds` of them on the decoupled VOD arm) still carry the
-    /// previous offset, so a caller that wants the change to be audible now re-anchors at the
-    /// playhead afterwards. `AetherEngine.setAudioDelay` does exactly that.
-    func setAudioDelay(_ seconds: Double) {
+    /// The audio output brings the change to within a quarter-second of the playhead itself, replacing what
+    /// the renderer has queued past that point (`AudioOutput.setPresentationOffset`). Returns false when it
+    /// could not, the renderer having declined its partial flush: the samples already queued then carry the
+    /// previous offset, and a caller that wants the change audible now re-anchors at the playhead, as
+    /// `AetherEngine.setAudioDelay` does. A session without audio has nothing to move.
+    @discardableResult
+    func setAudioDelay(_ seconds: Double) -> Bool {
         audioDelaySeconds = seconds
-        audioOutput?.setPresentationOffset(seconds: seconds)
+        return audioOutput?.setPresentationOffset(seconds: seconds) ?? true
     }
 
     func setResumeRate(_ rate: Float) {

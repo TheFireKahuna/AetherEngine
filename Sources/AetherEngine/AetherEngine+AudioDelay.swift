@@ -30,8 +30,11 @@ extension AetherEngine {
     /// rule). So a change is brought to the playhead rather than left to arrive when that media
     /// drains, and what that costs differs:
     ///
-    /// - `.software`: a seek to the current position. Measured on a 30 fps H.264 fixture: set at
-    ///   t=4.90 s, landed at 4.90 s, the new offset delivered on the next buffer.
+    /// - `.software`: in place, with no seek. What the audio renderer has queued past a quarter-second
+    ///   from the playhead is replaced by the same audio restamped (its partial flush), so the change is
+    ///   heard there: a later offset as a gap of the change, an earlier one as a skip of it. A renderer
+    ///   that declines that flush falls back to a seek to the current position (measured on a 30 fps
+    ///   H.264 fixture: set at t=4.90 s, landed at 4.90 s, the new offset delivered on the next buffer).
     /// - `.loopback`: the session-preserving reload (#460). A seek is not enough and measuring it is
     ///   what settled this: seeking to the position AVPlayer already holds is a buffer hit, so it
     ///   plays its old-offset segments out regardless, and dropping those segments under it only
@@ -86,15 +89,20 @@ extension AetherEngine {
             )
 
         case .sampleTimestamps:
-            // The renderer takes the new stamp on the next buffer. What is already decoded still
-            // carries the old one, so re-anchor to bring the change to the playhead: on this path
-            // that is a flush and a demuxer reposition, and it lands inside a seek.
-            softwareHost?.setAudioDelay(clamped)
+            // The audio output replaces what its renderer has queued past a quarter-second from the
+            // playhead with the same audio restamped (the renderer's partial flush), so the change is
+            // heard there without a seek. Only a renderer that declines that flush still needs one:
+            // what it holds keeps the old stamp, and the re-anchor (a flush and a demuxer reposition,
+            // inside a seek) is what brings the change to the playhead then.
+            let inPlace = softwareHost?.setAudioDelay(clamped) ?? false
             EngineLog.emit(
-                "[AetherEngine] AE#464: audio delay = \(Self.ms(clamped)) on the software path",
+                "[AetherEngine] AE#464: audio delay = \(Self.ms(clamped)) on the software path"
+                + (inPlace ? ", in force a quarter-second past the playhead" : "; re-anchoring at the playhead"),
                 category: .engine
             )
-            reanchorForAudioDelay { position, _ in await self.seek(to: position, origin: .host) }
+            if !inPlace {
+                reanchorForAudioDelay { position, _ in await self.seek(to: position, origin: .host) }
+            }
 
         case .segmentTimestamps:
             // A seek is NOT enough here, and measuring it is what settled the shape: seeking to the

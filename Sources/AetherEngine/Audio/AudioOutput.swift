@@ -359,13 +359,108 @@ final class AudioOutput: @unchecked Sendable {
     /// AE#464: set the audio presentation offset. Positive presents audio later than video, which on
     /// this path means stamping its samples further ahead on the synchronizer's timeline: at clock
     /// time t the renderer then plays what was recorded at t minus the offset, while the video layer
-    /// still presents t. Applied to buffers enqueued from here on; the samples already inside the
-    /// renderer keep the previous offset until something flushes them.
-    func setPresentationOffset(seconds: Double) {
+    /// still presents t.
+    ///
+    /// A change takes effect `offsetChangeLead` past the clock rather than after the lead already queued
+    /// (seconds of audio). The renderer's partial flush is what its header documents for replacing media
+    /// scheduled in the future without interrupting playback: everything from the first buffer past that point
+    /// is flushed and enqueued again shifted by the change, while what plays before it is left alone. A later
+    /// offset leaves a gap of the change there; an earlier one skips as much, the buffers it would put on top of
+    /// audio still queued being dropped, behind a decode-only primer for a compressed stream. Under `lock`, so the
+    /// feed's next buffer, stamped with the new offset, lands after them. A renderer that declines keeps its queue
+    /// and the change applies from the next buffer, as before; one that does not answer in time is flushed whole
+    /// and fed again from the clock, because its queue is no longer known.
+    ///
+    /// Returns whether the change is in force from `offsetChangeLead` on, so nothing else need re-anchor for it:
+    /// false only when the renderer declined the partial flush.
+    @discardableResult
+    func setPresentationOffset(seconds: Double) -> Bool {
         lock.lock()
-        defer { lock.unlock() }
+        let previous = presentationOffset
         presentationOffset = seconds == 0 ? .zero : CMTime(seconds: seconds, preferredTimescale: 90000)
         loggedOffsetInEffect = false
+        let change = CMTimeSubtract(presentationOffset, previous)
+        let now = synchronizer.currentTime()
+        let threshold = CMTimeAdd(now, CMTime(seconds: Self.offsetChangeLead, preferredTimescale: 90000))
+        guard change != .zero, let first = queued.firstIndex(where: {
+            CMSampleBufferGetPresentationTimeStamp($0) >= threshold
+        }) else {
+            // Nothing queued past the lead: the next buffer carries the new offset, which is as soon as it can be.
+            lock.unlock()
+            return true
+        }
+        let from = CMSampleBufferGetPresentationTimeStamp(queued[first])
+        let line: String
+        let inForce: Bool
+        switch io.flush(fromSourceTime: from) {
+        case .flushed:
+            let shifted = Self.shiftedTail(Array(queued[first...]), by: change, notBefore: from)
+            queued.removeSubrange(first...)
+            enqueueAgainLocked(shifted)
+            inForce = true
+            line = "applied at once: flushed from \(String(format: "%.3f", timeline.sourceSeconds(forRenderer: from.seconds)))s "
+                + "and enqueued \(shifted.count) buffer(s) again shifted by \(String(format: "%+.0f", change.seconds * 1000)) ms"
+        case .refused:
+            inForce = false
+            line = "the renderer declined the partial flush; it applies from the next buffer"
+        case .unanswered:
+            let shifted = Self.shiftedTail(Self.refeed(queued, at: now), by: change, notBefore: now)
+            io.flush()
+            queued.removeAll()
+            enqueueAgainLocked(shifted)
+            inForce = true
+            line = "the partial flush went unanswered; flushed whole and enqueued \(shifted.count) buffer(s) again "
+                + "from the clock"
+        }
+        lock.unlock()
+        EngineLog.emit("[AudioOutput] AE#464 audio delay changed to \(String(format: "%+.0f", seconds * 1000)) ms, "
+                       + line, category: .swPlayback)
+        return inForce
+    }
+
+    /// How far past the clock an offset change takes effect: beyond the route's output latency (138 ms on the
+    /// measured HDMI route), so the partial flush is not "too close to the current time" for the renderer, and
+    /// the change is heard within about a quarter of a second.
+    static let offsetChangeLead: Double = 0.25
+
+    /// Enqueues `buffers` and records them as queued, as the feed would. Called with `lock` held.
+    private func enqueueAgainLocked(_ buffers: [CMSampleBuffer]) {
+        for buffer in buffers {
+            _ = io.enqueue(buffer)
+            // A primer is the renderer's, not part of what it holds to play.
+            if !Self.isTrimmedWhole(buffer) { queued.append(buffer) }
+            #if DEBUG
+            rendererEnqueueObserverForTesting?(buffer)
+            #endif
+        }
+        // The feed's next compressed packet follows the last one put back, not the one it replaced.
+        if let last = buffers.last(where: { !Self.isTrimmedWhole($0) }), Self.isCompressed(last) {
+            lastCompressedDelivery = last
+        }
+    }
+
+    /// `tail` moved by `change`, without the buffers that would start before `notBefore` (an earlier offset would
+    /// put them on top of audio still queued there). For a compressed stream whose head was dropped, the last
+    /// dropped buffer goes in first as a decode-only primer, so the decoder that continues there is not cold.
+    /// Pure, so the choice is checkable without a renderer.
+    nonisolated static func shiftedTail(_ tail: [CMSampleBuffer], by change: CMTime,
+                                        notBefore: CMTime) -> [CMSampleBuffer] {
+        let shifted = tail.map { retimed($0, by: change) }
+        guard let keep = shifted.firstIndex(where: { CMSampleBufferGetPresentationTimeStamp($0) >= notBefore }) else {
+            return []
+        }
+        var out = Array(shifted[keep...])
+        if keep > 0, isCompressed(shifted[keep - 1]), let primer = decodeOnlyCopy(shifted[keep - 1]) {
+            out.insert(primer, at: 0)
+        }
+        return out
+    }
+
+    /// Whether `buffer` plays nothing: a decode-only primer.
+    nonisolated static func isTrimmedWhole(_ buffer: CMSampleBuffer) -> Bool {
+        guard let trim = CMGetAttachment(buffer, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
+                                         attachmentModeOut: nil) as? NSDictionary else { return false }
+        return CMTimeMakeFromDictionary(trim) >= CMSampleBufferGetDuration(buffer)
     }
 
     /// Enqueue a decoded audio CMSampleBuffer. Always enqueues (renderer buffers internally); gating on
