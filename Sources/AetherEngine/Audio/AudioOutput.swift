@@ -8,7 +8,17 @@ import os
 /// **master clock** for the whole player: video frames check synchronizer.currentTime() to decide presentation.
 final class AudioOutput: @unchecked Sendable {
 
-    let renderer: AVSampleBufferAudioRenderer
+    /// The renderer playing now. A failed one is replaced (`replaceFailedRenderer()`). Code holding `lock` uses
+    /// `_renderer`; everything else reads this, which never waits on `lock` (held across renderer calls, and taken
+    /// by callbacks a renderer may post from inside them).
+    var renderer: AVSampleBufferAudioRenderer {
+        rendererSlot.withLockUnchecked { $0 }
+    }
+    /// Guarded by `lock`, and changed only together with `rendererSlot`.
+    private var _renderer: AVSampleBufferAudioRenderer {
+        didSet { let current = _renderer; rendererSlot.withLockUnchecked { $0 = current } }
+    }
+    private let rendererSlot: OSAllocatedUnfairLock<AVSampleBufferAudioRenderer>
     let synchronizer: AVSampleBufferRenderSynchronizer
 
     /// AE#395: the renderers' axis. Every time this object takes or returns is on the source axis;
@@ -56,34 +66,59 @@ final class AudioOutput: @unchecked Sendable {
     private var videoReceiver: AnyObject?
 
     init() {
-        renderer = AVSampleBufferAudioRenderer()
+        let renderer = AVSampleBufferAudioRenderer()
+        _renderer = renderer
+        rendererSlot = OSAllocatedUnfairLock(uncheckedState: renderer)
         synchronizer = AVSampleBufferRenderSynchronizer()
-        if #available(macOS 27, iOS 27, tvOS 27, visionOS 27, *), Self.usesSampleBufferReceivers {
-            audioReceiver = synchronizer.sampleBufferReceiver(adding: renderer)
-        } else {
-            synchronizer.addRenderer(renderer)
-        }
-
-        // Spatial audio for AirPods Pro/Max and HomePod: renderer spatializes multichannel when system-enabled.
-        renderer.allowedAudioSpatializationFormats = .multichannel
-
-        // Rate changes ride the synchronizer timebase, and this renderer's algorithm is what decides
-        // whether they keep pitch (#434). Pinned here, while the timebase is still stopped.
-        AudioRatePolicy.apply(to: renderer)
-        observeAutomaticFlush()
-        observeOutputConfigurationChange()
-        // The change can be posted from inside `renderer.enqueue`, under `lock`: the report runs off that thread.
-        statusObservation = renderer.observe(\.status, options: [.new]) { [weak self] renderer, _ in
-            guard renderer.status == .failed else { return }
-            self?.automaticFlushQueue.async { [weak self] in self?.reportRendererFailure() }
-        }
+        Self.configure(renderer, volume: 1)
+        audioReceiver = Self.attach(renderer, to: synchronizer)
+        observe(renderer)
     }
 
     deinit {
+        stopObserving()
+    }
+
+    /// What every renderer this output plays through is set up with, before it joins the synchronizer.
+    private static func configure(_ renderer: AVSampleBufferAudioRenderer, volume: Float) {
+        renderer.volume = volume
+        // Spatial audio for AirPods Pro/Max and HomePod: renderer spatializes multichannel when system-enabled.
+        renderer.allowedAudioSpatializationFormats = .multichannel
+        // Rate changes ride the synchronizer timebase, and this renderer's algorithm is what decides
+        // whether they keep pitch (#434). Pinned here, before the renderer is under a running timebase.
+        AudioRatePolicy.apply(to: renderer)
+    }
+
+    /// Joins `renderer` to the synchronizer, through a receiver where `usesSampleBufferReceivers` says so. Returns the
+    /// receiver, which is held for as long as the renderer is attached.
+    private static func attach(_ renderer: AVSampleBufferAudioRenderer,
+                               to synchronizer: AVSampleBufferRenderSynchronizer) -> AnyObject? {
+        if #available(macOS 27, iOS 27, tvOS 27, visionOS 27, *), usesSampleBufferReceivers {
+            return synchronizer.sampleBufferReceiver(adding: renderer)
+        }
+        synchronizer.addRenderer(renderer)
+        return nil
+    }
+
+    /// The notifications and status this output follows, for `renderer` alone: a replaced renderer's are let go.
+    private func observe(_ renderer: AVSampleBufferAudioRenderer) {
+        observeAutomaticFlush(renderer)
+        observeOutputConfigurationChange(renderer)
+        // The change can be posted from inside `renderer.enqueue`, under `lock`: the report runs off that thread.
+        statusObservation = renderer.observe(\.status, options: [.new]) { [weak self] renderer, _ in
+            guard renderer.status == .failed else { return }
+            self?.automaticFlushQueue.async { [weak self] in self?.reportRendererFailure(of: renderer) }
+        }
+    }
+
+    private func stopObserving() {
         statusObservation?.invalidate()
+        statusObservation = nil
         for observer in [automaticFlushObserver, outputConfigurationObserver].compactMap({ $0 }) {
             NotificationCenter.default.removeObserver(observer)
         }
+        automaticFlushObserver = nil
+        outputConfigurationObserver = nil
     }
 
     /// The synchronizer's rate. A stopped clock and a running clock whose timebase has stalled read
@@ -171,7 +206,7 @@ final class AudioOutput: @unchecked Sendable {
     /// The line is also the witness the field log lacked. Across an automatic flush the timebase
     /// keeps RUNNING at its rate, so a session that froze did not freeze because of this, and only a
     /// log carrying both can tell the two apart.
-    private func observeAutomaticFlush() {
+    private func observeAutomaticFlush(_ renderer: AVSampleBufferAudioRenderer) {
         automaticFlushObserver = NotificationCenter.default.addObserver(
             forName: .AVSampleBufferAudioRendererWasFlushedAutomatically,
             object: renderer,
@@ -180,12 +215,18 @@ final class AudioOutput: @unchecked Sendable {
             guard let self else { return }
             let flushedFrom = (note.userInfo?[AVSampleBufferAudioRendererFlushTimeKey] as? NSValue)
                 .map { self.timeline.sourceTime(forRenderer: $0.timeValue).seconds }
+            let posted = ObjectIdentifier(renderer)
             automaticFlushQueue.async { [weak self] in
                 guard let self else { return }
                 lock.lock()
+                // Posted by a renderer that has since been replaced: flushing would throw away its successor's refeed.
+                guard ObjectIdentifier(_renderer) == posted else {
+                    lock.unlock()
+                    return
+                }
                 _automaticFlushCount += 1
                 let count = _automaticFlushCount
-                renderer.flush()
+                _renderer.flush()
                 // What it held is gone; an output reconfiguration after this has nothing of it to put back.
                 queued.removeAll()
                 // A compressed stream picks up mid-run here, where its decoder starts cold: the packet
@@ -214,13 +255,18 @@ final class AudioOutput: @unchecked Sendable {
     /// held. It goes back in from the buffer the clock is in, the one before it first as a decode-only primer for a
     /// compressed stream, so the gap is the renderer's restart, not the lead. Under `lock`, so the feed's next
     /// buffer lands after them; off the posting thread, for the reason `automaticFlushQueue` gives.
-    private func observeOutputConfigurationChange() {
+    private func observeOutputConfigurationChange(_ renderer: AVSampleBufferAudioRenderer) {
         outputConfigurationObserver = NotificationCenter.default.addObserver(
             forName: .AVSampleBufferAudioRendererOutputConfigurationDidChange,
             object: renderer,
             queue: nil
         ) { [weak self] _ in
-            self?.automaticFlushQueue.async { [weak self] in self?.reenqueueAfterOutputConfigurationChange() }
+            let posted = ObjectIdentifier(renderer)
+            self?.automaticFlushQueue.async { [weak self] in
+                // A replaced renderer's reconfiguration is not the playing one's: its successor was just fed afresh.
+                guard let self, ObjectIdentifier(self.renderer) == posted else { return }
+                self.reenqueueAfterOutputConfigurationChange()
+            }
         }
     }
 
@@ -230,9 +276,9 @@ final class AudioOutput: @unchecked Sendable {
         let count = _outputReconfigurationCount
         let now = synchronizer.currentTime()
         let refeed = Self.refeed(queued, at: now)
-        renderer.flush()
+        _renderer.flush()
         for buffer in refeed {
-            renderer.enqueue(buffer)
+            _renderer.enqueue(buffer)
             #if DEBUG
             rendererEnqueueObserverForTesting?(buffer)
             #endif
@@ -336,10 +382,21 @@ final class AudioOutput: @unchecked Sendable {
         }
     }
 
+    /// Kept here as well as on the renderer, so a replacement plays at the volume its predecessor was set to.
     var volume: Float {
-        get { renderer.volume }
-        set { renderer.volume = newValue }
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _volume
+        }
+        set {
+            lock.lock()
+            defer { lock.unlock() }
+            _volume = newValue
+            _renderer.volume = newValue
+        }
     }
+    private var _volume: Float = 1
 
     /// Set playback speed (0.5-2.0). Hosts own rate state (lastRate/pausedByHost); this object is stateless about it.
     func setRate(_ rate: Float) {
@@ -433,14 +490,15 @@ final class AudioOutput: @unchecked Sendable {
         // decoder restarts with it, and an APAC encoder run opens on its own trimmed priming packets.
         let compressed = Self.isCompressed(delivered)
         if compressed, primeAfterAutomaticFlush, let last = lastCompressedDelivery, let primer = Self.decodeOnlyCopy(last) {
-            renderer.enqueue(primer)
+            _renderer.enqueue(primer)
             #if DEBUG
             rendererEnqueueObserverForTesting?(primer)
             #endif
         }
         primeAfterAutomaticFlush = false
         lastCompressedDelivery = compressed ? delivered : nil
-        renderer.enqueue(delivered)
+        _renderer.enqueue(delivered)
+        let enqueuedInto = _renderer
         queued.append(delivered)
         queued = Self.pruned(queued, at: synchronizer.currentTime(), limit: Self.queuedLimit)
         #if DEBUG
@@ -449,9 +507,9 @@ final class AudioOutput: @unchecked Sendable {
         #endif
         lock.unlock()
         if let offsetLine { EngineLog.emit(offsetLine, category: .swPlayback) }
-        if renderer.status == .failed { reportRendererFailure() }
+        if enqueuedInto.status == .failed { reportRendererFailure(of: enqueuedInto) }
         #if DEBUG
-        if simulatesRendererFailureForTesting { reportRendererFailure() }
+        if simulatesRendererFailureForTesting { reportRendererFailure(of: enqueuedInto) }
         #endif
 
         #if DEBUG
@@ -465,8 +523,8 @@ final class AudioOutput: @unchecked Sendable {
             let sr = fmt.map { "\($0.mSampleRate)Hz" } ?? "?"
             let ch = fmt.map { "\($0.mChannelsPerFrame)ch" } ?? "?"
             let count = CMSampleBufferGetNumSamples(sampleBuffer)
-            EngineLog.emit("[AudioOutput] first enqueue: \(sr) \(ch), \(count) samples, renderer.error=\(String(describing: renderer.error))", category: .swPlayback)
-        } else if let err = renderer.error, !_loggedRendererError {
+            EngineLog.emit("[AudioOutput] first enqueue: \(sr) \(ch), \(count) samples, renderer.error=\(String(describing: enqueuedInto.error))", category: .swPlayback)
+        } else if let err = enqueuedInto.error, !_loggedRendererError {
             _loggedRendererError = true
             EngineLog.emit("[AudioOutput] renderer error: \(err)", category: .swPlayback)
         }
@@ -479,15 +537,87 @@ final class AudioOutput: @unchecked Sendable {
     var simulatesRendererFailureForTesting = false
     #endif
 
-    private func reportRendererFailure() {
+    /// Reports `failed` once, if it is still the renderer playing: a replaced renderer's late report is not a failure
+    /// of the one that took over.
+    private func reportRendererFailure(of failed: AVSampleBufferAudioRenderer) {
         lock.lock()
-        let first = !reportedRendererFailure
-        reportedRendererFailure = true
+        let first = !reportedRendererFailure && failed === _renderer
+        if first { reportedRendererFailure = true }
         lock.unlock()
         guard first else { return }
-        let error = (renderer.error as NSError?).map { "\($0.domain)/\($0.code) \($0.localizedDescription)" } ?? "no error"
+        let error = (failed.error as NSError?).map { "\($0.domain)/\($0.code) \($0.localizedDescription)" } ?? "no error"
         EngineLog.emit("[AudioOutput] renderer failed: \(error)", category: .swPlayback)
         onRendererFailed?(error)
+    }
+
+    /// How often a failed renderer was replaced, for the diagnostic line and tests. Guarded by `lock`.
+    private var _rendererReplacementCount = 0
+    var rendererReplacementCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _rendererReplacementCount
+    }
+
+    /// A failed audio renderer is replaced, not flushed. Its header calls the failed status terminal "from which
+    /// recovery is not always possible" and, unlike the video renderer's, names no reset; a flush does not bring one
+    /// back (macOS 27: still failed after a flush and valid PCM, `research/renderer-receiver`). The synchronizer takes
+    /// renderers in and out while its rate is non-zero, so the cutover happens under the running clock and leaves it
+    /// and the video renderer where they are:
+    ///
+    /// 1. a new renderer, set up like the first (volume, spatialization, rate algorithm), joins the synchronizer;
+    /// 2. it is given again what the failed one held from the buffer the clock is in on (`refeed`, primer included),
+    ///    under `lock`, so the feed's next buffer lands after them, into it;
+    /// 3. the failed renderer leaves the synchronizer, at once.
+    ///
+    /// The gap is the new renderer's start, not the lead. Its failures are reported afresh; anything the failed one
+    /// reports from here on is not. Returns how many buffers went in again.
+    @discardableResult
+    func replaceFailedRenderer() -> Int {
+        let fresh = AVSampleBufferAudioRenderer()
+        lock.lock()
+        let failed = _renderer
+        let failedReceiver = audioReceiver
+        Self.configure(fresh, volume: _volume)
+        stopObserving()
+        audioReceiver = Self.attach(fresh, to: synchronizer)
+        _renderer = fresh
+        observe(fresh)
+        let now = synchronizer.currentTime()
+        let refeed = Self.refeed(queued, at: now)
+        for buffer in refeed {
+            fresh.enqueue(buffer)
+            #if DEBUG
+            rendererEnqueueObserverForTesting?(buffer)
+            #endif
+        }
+        // The primer above, if any, stands in for one an automatic flush of the failed renderer asked for.
+        primeAfterAutomaticFlush = false
+        reportedRendererFailure = false
+        _rendererReplacementCount += 1
+        let count = _rendererReplacementCount
+        lock.unlock()
+        Self.detach(failed, receiver: failedReceiver, from: synchronizer)
+        EngineLog.emit(
+            "[AudioOutput] failed renderer replaced (#\(count)): \(refeed.count) buffer(s) enqueued again from the "
+            + "clock at \(String(format: "%.3f", timeline.sourceSeconds(forRenderer: now.seconds)))s rate=\(rate)",
+            category: .swPlayback)
+        return refeed.count
+    }
+
+    /// Takes a renderer out of the synchronizer at once, the way it was attached. Nothing waits for it: the renderer
+    /// that replaced it is already playing.
+    private static func detach(_ renderer: AVSampleBufferAudioRenderer, receiver: AnyObject?,
+                               from synchronizer: AVSampleBufferRenderSynchronizer) {
+        if #available(macOS 27, iOS 27, tvOS 27, visionOS 27, *),
+           let receiver = receiver as? AVSampleBufferAudioRenderer.Receiver {
+            nonisolated(unsafe) let handedOver = receiver
+            BlockingWork.detached {
+                nonisolated(unsafe) let receiver = handedOver
+                _ = await synchronizer.removeReceiver(receiver, at: .invalid)
+            }
+        } else {
+            synchronizer.removeRenderer(renderer, at: .invalid, completionHandler: nil)
+        }
     }
 
     nonisolated static func isCompressed(_ buffer: CMSampleBuffer) -> Bool {
@@ -598,7 +728,7 @@ final class AudioOutput: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         _epoch &+= 1
-        renderer.flush()
+        _renderer.flush()
         // The decoder starts over with a flush like this one, priming itself.
         lastCompressedDelivery = nil
         primeAfterAutomaticFlush = false
@@ -615,7 +745,7 @@ final class AudioOutput: @unchecked Sendable {
         queued.removeAll()
         disarmPreroll()
         synchronizer.setRate(0.0, time: .zero)
-        renderer.flush()
+        _renderer.flush()
     }
 
     /// Atomically jump the master clock to a time and resume at a rate. The ONLY way the clock is (re)anchored:

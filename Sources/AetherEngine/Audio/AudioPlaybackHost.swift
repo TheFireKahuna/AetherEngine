@@ -657,15 +657,12 @@ final class AudioPlaybackHost {
     /// for the software host. Main actor.
     var onRendererFailed: ((FailedRenderer, String) -> Void)?
 
-    /// The ladder's first step: reposition to the playhead, whose flush is the renderer's reset and rearms its report.
-    func repositionToResetRenderers() {
-        guard !stopRequested else { return }
-        let target = currentTime
-        EngineLog.emit("[AudioHost] repositioning to the playhead at \(String(format: "%.3f", target))s to reset the "
-                       + "renderer", category: .swPlayback)
-        Task { @MainActor [weak self] in
-            _ = await self?.seek(to: target)
-        }
+    /// The ladder's first step for this host, whose one renderer is audio: a new one in its place, under the running
+    /// clock (`AudioOutput.replaceFailedRenderer`). False when there is no output to replace it in.
+    func replaceFailedAudioRenderer() -> Bool {
+        guard !stopRequested, let audioOutput else { return false }
+        audioOutput.replaceFailedRenderer()
+        return true
     }
 
     // MARK: - Time updates

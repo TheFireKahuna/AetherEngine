@@ -21,44 +21,52 @@ extension AetherEngine {
                            + "reset: left to its recovery", category: .engine)
             return
         }
-        let step = rendererRecoveryLadder.next(at: Date())
+        let step = rendererRecoveryLadder.next(for: which, at: Date())
         EngineLog.emit(
             "[AetherEngine] \(which.rawValue) renderer failed (\(error)): recovery step \(step.rawValue)",
             category: .engine)
         switch step {
         case .reposition:
-            if let softwareHost {
-                softwareHost.repositionToResetRenderers()
-            } else {
-                audioHost?.repositionToResetRenderers()
+            // Only the software host has a video renderer.
+            softwareHost?.repositionToResetRenderers()
+        case .replace:
+            let replaced = softwareHost?.replaceFailedAudioRenderer() ?? audioHost?.replaceFailedAudioRenderer() ?? false
+            if !replaced {
+                EngineLog.emit("[AetherEngine] no audio output to replace the renderer in; rebuilding instead",
+                               category: .engine)
+                rebuildForRenderer(which, error: error)
             }
         case .rebuild:
-            if let refusal = sessionReloadRefusal {
-                EngineLog.emit(
-                    "[AetherEngine] the session cannot be rebuilt in place (\(refusal.rawValue)); failing it instead",
-                    category: .engine)
-                failSessionForRenderer(which, error: error)
-                return
-            }
-            rendererRebuildInFlight = true
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                defer { self.rendererRebuildInFlight = false }
-                do {
-                    try await self.reloadAtCurrentPosition()
-                    EngineLog.emit("[AetherEngine] session rebuilt at the playhead with new renderers", category: .engine)
-                } catch is CancellationError {
-                    // A newer load took over: whatever it builds has renderers of its own.
-                    EngineLog.emit("[AetherEngine] the renderer rebuild was superseded by a newer load", category: .engine)
-                } catch {
-                    EngineLog.emit("[AetherEngine] the renderer rebuild failed: \(error)", category: .engine)
-                    // A load that failed has published its own error; one that threw before loading has not.
-                    if case .error = self.state { return }
-                    self.failSessionForRenderer(which, error: error.localizedDescription)
-                }
-            }
+            rebuildForRenderer(which, error: error)
         case .fail:
             failSessionForRenderer(which, error: error)
+        }
+    }
+
+    private func rebuildForRenderer(_ which: FailedRenderer, error: String) {
+        if let refusal = sessionReloadRefusal {
+            EngineLog.emit(
+                "[AetherEngine] the session cannot be rebuilt in place (\(refusal.rawValue)); failing it instead",
+                category: .engine)
+            failSessionForRenderer(which, error: error)
+            return
+        }
+        rendererRebuildInFlight = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.rendererRebuildInFlight = false }
+            do {
+                try await self.reloadAtCurrentPosition()
+                EngineLog.emit("[AetherEngine] session rebuilt at the playhead with new renderers", category: .engine)
+            } catch is CancellationError {
+                // A newer load took over: whatever it builds has renderers of its own.
+                EngineLog.emit("[AetherEngine] the renderer rebuild was superseded by a newer load", category: .engine)
+            } catch {
+                EngineLog.emit("[AetherEngine] the renderer rebuild failed: \(error)", category: .engine)
+                // A load that failed has published its own error; one that threw before loading has not.
+                if case .error = self.state { return }
+                self.failSessionForRenderer(which, error: error.localizedDescription)
+            }
         }
     }
 
