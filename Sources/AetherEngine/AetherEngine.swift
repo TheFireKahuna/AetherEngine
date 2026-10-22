@@ -199,6 +199,48 @@ public final class AetherEngine: ObservableObject {
         hasTransportRolled || !transportIntentIsPlaying
     }
 
+    /// A native seek has landed and AVPlayer is still prerolling the new position: the completion handler fires
+    /// as the seek finishes, and the transport sits in `waitingToPlayAtSpecifiedRate` for a fraction of a second
+    /// more before it rolls (0.08 to 0.97 s across ten seeks of a 4K Dolby Vision title, 2026-10-23). Published
+    /// as `isBuffering` alone, that tail read `.rebuffering` after every seek, and a host that covers a
+    /// rebuffer (Sodalite's loading backdrop) faded to black and back on each one. While this is set the phase
+    /// stays `.seeking`; it clears when the transport rolls or pauses, or after `nativeSeekSettleGraceSeconds`,
+    /// past which the wait is the starved landing #394 exists to report and reads `.rebuffering` as before.
+    var nativeSeekSettling = false {
+        didSet { if nativeSeekSettling != oldValue { recomputePlaybackPhase() } }
+    }
+    private var nativeSeekSettleGeneration = 0
+    nonisolated static let nativeSeekSettleGraceSeconds: Double = 2
+
+    /// Whether a native landing is AVPlayer's preroll rather than a starve: a playing landing still waiting
+    /// on the rate, reached by an ordinary completion. A deadline recovery's landing is starved by definition.
+    nonisolated static func nativeSeekPrerolls(isStarved: Bool, recoveredState: PlaybackState,
+                                               liveStatus: AVPlayer.TimeControlStatus?) -> Bool {
+        !isStarved && recoveredState == .playing && liveStatus == .waitingToPlayAtSpecifiedRate
+    }
+
+    /// Opens (or closes) the settle window for the landing just reconciled.
+    private func beginNativeSeekSettle(_ prerolling: Bool) {
+        nativeSeekSettleGeneration += 1
+        nativeSeekSettling = prerolling
+        guard prerolling else { return }
+        let generation = nativeSeekSettleGeneration
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(Self.nativeSeekSettleGraceSeconds))
+            guard let self, self.nativeSeekSettleGeneration == generation, self.nativeSeekSettling else { return }
+            self.nativeSeekSettling = false
+            EngineLog.emit("[AetherEngine] seek landing still waiting on the rate after "
+                           + "\(Self.nativeSeekSettleGraceSeconds)s: reads as rebuffering", category: .engine)
+        }
+    }
+
+    /// Ends the settle window: the transport rolled or paused, a new seek began, or the session ended.
+    func endNativeSeekSettle() {
+        guard nativeSeekSettling else { return }
+        nativeSeekSettleGeneration += 1
+        nativeSeekSettling = false
+    }
+
     /// Reader source-fetch axis feeding `playbackPhase`. Updated off the demux thread via
     /// `setReaderNetworkPhase`. `didSet` keeps `playbackPhase` in sync (#85).
     private var readerStall: ReaderNetworkPhase = .flowing {
@@ -211,6 +253,7 @@ public final class AetherEngine: ObservableObject {
         let next = PlaybackPhase.derive(state: state,
                                         isBuffering: isBuffering,
                                         isSeeking: isSeeking,
+                                        settlingSeek: nativeSeekSettling,
                                         stall: readerStall,
                                         transportHasRolled: hasTransportRolled)
         if playbackPhase != next { playbackPhase = next }
@@ -332,6 +375,7 @@ public final class AetherEngine: ObservableObject {
     }
 
     private func setProgrammaticSeek(inFlight: Bool, target: Double?) {
+        if inFlight { endNativeSeekSettle() }
         programmaticSeekInFlight = inFlight
         programmaticSeekTarget = inFlight ? target : nil
         recomputeSeekSignal()
@@ -3432,6 +3476,9 @@ public final class AetherEngine: ObservableObject {
             statusIsPaused: statusIsPaused,
             shouldReassertPausedStatus: shouldReassertPausedStatus
         )
+        // Before `isBuffering`, so the phase never passes through `.rebuffering` on the way.
+        beginNativeSeekSettle(Self.nativeSeekPrerolls(isStarved: isStarved, recoveredState: recoveredState,
+                                                      liveStatus: liveStatus))
         state = recoveredState
         isBuffering = recoveredState == .playing
             && liveStatus == .waitingToPlayAtSpecifiedRate
@@ -7917,6 +7964,7 @@ public final class AetherEngine: ObservableObject {
         // item's rate across the swap, and crediting the next load with it would publish `.playing`
         // over the new source's whole join.
         hasTransportRolled = false
+        endNativeSeekSettle()
         sessionPublishesVideoDisplaySignal = false
         pendingPreReadySeek = nil
         liveItemAxisOffsetSeconds = 0
