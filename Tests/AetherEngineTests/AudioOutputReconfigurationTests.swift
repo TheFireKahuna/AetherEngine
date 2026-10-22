@@ -110,6 +110,41 @@ struct AudioOutputReconfigurationTests {
         #expect(Self.trimmedWhole(all[4]))
     }
 
+    @Test("a reconfiguration both the stream and the next enqueue report is refed once", arguments: audioOutputPaths)
+    func reportedTwiceRefeedsOnce(throughReceivers: Bool) async throws {
+        let output = AudioOutput(throughReceivers: throughReceivers)
+        let buffers = try run(compressed: false)
+        for b in buffers.dropLast() { output.enqueue(sampleBuffer: b) }
+        NotificationCenter.default.post(name: .AVSampleBufferAudioRendererOutputConfigurationDidChange, object: output.renderer)
+        try await waitFor { output.outputReconfigurationCount == 1 }
+        // On the receiver this enqueue's result carries the same change again.
+        output.enqueue(sampleBuffer: try #require(buffers.last))
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(output.outputReconfigurationCount == 1)
+    }
+
+    @Test("the ledger hands each change to whichever source reports it first, and drops the other's report")
+    func ledger() {
+        var ledger = ReconfigurationLedger()
+        var handled = ledger.reportedByStream()
+        #expect(handled)
+        var fresh = ledger.reportedByResult(1)
+        #expect(fresh == 0, "the stream had it")
+        fresh = ledger.reportedByResult(1)
+        #expect(fresh == 1, "a change only a result has seen")
+        handled = ledger.reportedByStream()
+        #expect(!handled, "the result had it")
+        #expect(ledger == ReconfigurationLedger())
+        // Two in a row from the stream, one result carrying both, then one more on the result alone.
+        _ = ledger.reportedByStream()
+        _ = ledger.reportedByStream()
+        fresh = ledger.reportedByResult(3)
+        #expect(fresh == 1)
+        handled = ledger.reportedByStream()
+        #expect(!handled)
+        #expect(ledger == ReconfigurationLedger())
+    }
+
     @Test("a flush (a seek) empties what a reconfiguration would put back", arguments: audioOutputPaths)
     func flushEmptiesTheQueue(throughReceivers: Bool) async throws {
         let output = AudioOutput(throughReceivers: throughReceivers)

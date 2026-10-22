@@ -36,9 +36,10 @@ enum AudioRendererEvent: Sendable {
 ///     comes back invalid), so it is reported in `AudioEnqueueReport` and handled serialized with that enqueue, which
 ///     is the renderer header's own advice for it. Its `renderingEventsAfterFinishedEnqueuing` event never came;
 ///     were it to, it is ignored rather than handled twice;
-///   - the output reconfiguration through the rendering-events stream, opened before the first enqueue, at once,
-///     even while nothing is fed. The same reason comes back on the next result and is not acted on again; a result
-///     reason the stream did not deliver is logged, the witness for a system where the stream behaves otherwise;
+///   - the output reconfiguration through whichever reports it first: the rendering-events stream (opened before the
+///     first enqueue, at once even while nothing is fed; it delivered every one on macOS) or the next enqueue's result
+///     (which carried every one too). Each change is handled once: `ReconfigurationLedger` drops the second report of
+///     it, from whichever source that is. The Atmos output depends on this refeed, so it must not rest on one source;
 ///   - the failure through `cancelledDueToError` on the next enqueue, and through the stream's `.failed` if it comes
 ///     (it did not for a real failure on macOS). The output reports it once either way.
 /// - **Renderer** (before 27, and the A/B fallback): `enqueue`, `flush`, the two notifications and the `status` KVO.
@@ -65,15 +66,16 @@ final class AudioRendererIO: @unchecked Sendable {
     /// are deprecated with it. Guarded by the caller's serialization, read racily by the diagnostic line only.
     private var enqueuedSinceFlush = false
     private var failure: String?
-    /// Output reconfigurations the stream delivered and the results did not yet repeat: the stream's task writes it,
-    /// the enqueue reads it.
-    private let reconfigurationsFromStream = OSAllocatedUnfairLock(initialState: 0)
+    /// Output reconfigurations reported by one source and not yet by the other, so each is handled once.
+    private let reconfigurations = OSAllocatedUnfairLock(initialState: ReconfigurationLedger())
+    private let onEvent: @Sendable (AudioRendererIO, AudioRendererEvent) -> Void
 
     /// Joins `renderer` to `synchronizer`. `onEvent` gets this instance with each event, so an event from a renderer
     /// that has since been replaced can be told apart.
     init(renderer: AVSampleBufferAudioRenderer, joining synchronizer: AVSampleBufferRenderSynchronizer,
          throughReceiver: Bool, onEvent: @escaping @Sendable (AudioRendererIO, AudioRendererEvent) -> Void) {
         self.renderer = renderer
+        self.onEvent = onEvent
         if #available(macOS 27, iOS 27, tvOS 27, visionOS 27, *), throughReceiver {
             let receiver = synchronizer.sampleBufferReceiver(adding: renderer)
             self.receiver = receiver
@@ -127,18 +129,16 @@ final class AudioRendererIO: @unchecked Sendable {
         return AudioEnqueueReport(failure: Self.describe(renderer.error))
     }
 
-    /// The reconfigurations a result repeated are the stream's, already handled. More than the stream delivered
-    /// means the stream missed some, which only a log can show on a device.
+    /// Reconfigurations a result reports that the stream has not: handled now, from here (the handler runs
+    /// asynchronously, so this is safe under the caller's lock), and logged, since only a device log can show which
+    /// source a system relies on.
     private func noteReconfigurationsInResult(_ count: Int) {
         guard count > 0 else { return }
-        let missed = reconfigurationsFromStream.withLock { delivered in
-            defer { delivered = max(0, delivered - count) }
-            return max(0, count - delivered)
-        }
-        if missed > 0 {
-            EngineLog.emit("[AudioOutput] the receiver reported \(missed) output reconfiguration(s) its event stream "
-                           + "did not", category: .swPlayback)
-        }
+        let fresh = reconfigurations.withLock { $0.reportedByResult(count) }
+        guard fresh > 0 else { return }
+        EngineLog.emit("[AudioOutput] the receiver reported \(fresh) output reconfiguration(s) with an enqueue before "
+                       + "its event stream did: handled from the result", category: .swPlayback)
+        for _ in 0..<fresh { onEvent(self, .outputConfigurationChanged) }
     }
 
     func flush() {
@@ -218,8 +218,9 @@ final class AudioRendererIO: @unchecked Sendable {
                     // Handled through the result of the enqueue after it (`AudioEnqueueReport`), never twice.
                     break
                 case .outputConfigurationChanged:
-                    self.reconfigurationsFromStream.withLock { $0 += 1 }
-                    onEvent(self, .outputConfigurationChanged)
+                    if self.reconfigurations.withLock({ $0.reportedByStream() }) {
+                        onEvent(self, .outputConfigurationChanged)
+                    }
                 case .failed(let error):
                     let described = Self.describe(error)
                     self.failure = described
@@ -265,5 +266,34 @@ final class AudioRendererIO: @unchecked Sendable {
     static func describe(_ error: (any Error)?) -> String {
         guard let error = error as NSError? else { return "no error" }
         return "\(error.domain)/\(error.code) \(error.localizedDescription)"
+    }
+}
+
+/// Output reconfigurations reach the output from two sources on the 27 receiver, the event stream and the next
+/// enqueue's result, each reporting every change once and in no fixed order between them. Whichever reports a change
+/// first gets it handled; the other's report of the same change is then dropped.
+struct ReconfigurationLedger: Equatable {
+    /// Changes the stream reported that a result has not yet.
+    private(set) var streamAhead = 0
+    /// Changes a result reported that the stream has not yet.
+    private(set) var resultAhead = 0
+
+    /// The stream reported a change. True when it is new and must be handled.
+    mutating func reportedByStream() -> Bool {
+        if resultAhead > 0 {
+            resultAhead -= 1
+            return false
+        }
+        streamAhead += 1
+        return true
+    }
+
+    /// A result reported `count` changes. Returns how many of them are new and must be handled.
+    mutating func reportedByResult(_ count: Int) -> Int {
+        let known = min(count, streamAhead)
+        streamAhead -= known
+        let fresh = count - known
+        resultAhead += fresh
+        return fresh
     }
 }
