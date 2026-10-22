@@ -443,6 +443,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         let layer = Self.makeDisplayLayer(isHDR: false, gravity: videoGravity)
         displayLayer = layer
         videoRenderer = layer.sampleBufferRenderer
+        io = VideoRendererIO(renderer: videoRenderer)
     }
 
     /// The pixel buffer attributes the renderer asks frames to be made with (`recommendedPixelBufferAttributes`,
@@ -523,20 +524,31 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     // MARK: - Queue rendering target
 
-    /// `videoRenderer` as the protocol the enqueue path has always called it through, so the per-frame
-    /// enqueue and back-pressure calls keep the dispatch they had.
-    var queueTarget: any AVQueuedSampleBufferRendering { videoRenderer }
+    /// Every enqueue, flush and readiness read of `videoRenderer` (`VideoRendererIO`: the tvOS 27 receiver once
+    /// joined to the synchronizer, the renderer's own calls before 27).
+    private let io: VideoRendererIO
+
+    /// Joins the renderer to the session's synchronizer (`AudioOutput.attachVideoRenderer`), through a receiver on
+    /// 27 when `throughReceiver`.
+    func join(_ synchronizer: AVSampleBufferRenderSynchronizer, throughReceiver: Bool) {
+        io.join(synchronizer, throughReceiver: throughReceiver)
+    }
+
+    /// Takes the renderer out of the synchronizer, blocking until it is out (`AudioOutput.detachVideoRenderer`).
+    /// Flush before this: once out, the receiver is gone.
+    func leave(_ synchronizer: AVSampleBufferRenderSynchronizer) {
+        io.leave(synchronizer)
+    }
+
+    /// Whether frames go through the synchronizer's receiver, for tests and the log.
+    var usesReceiver: Bool { io.usesReceiver }
 
     /// Demux-loop back-pressure gate. Read from the renderer, never the layer: the layer's own
     /// isReadyForMoreMediaData stays optimistically true even when the renderer queue is full, causing
     /// FigVideoQueueRemote -12080 on over-enqueue.
     var isReadyForMoreMediaData: Bool {
-        queueTarget.isReadyForMoreMediaData
+        io.isReadyForMoreMediaData
     }
-
-    private var queueStatus: AVQueuedSampleBufferRenderingStatus { videoRenderer.status }
-
-    private var queueError: Error? { videoRenderer.error }
 
     @MainActor
     private static func makeDisplayLayer(isHDR: Bool, gravity: AVLayerVideoGravity = .resizeAspect) -> AVSampleBufferDisplayLayer {
@@ -749,7 +761,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         cachedFormatKey = nil
         reorderLock.unlock()
 
-        videoRenderer.flush(removingDisplayedImage: removingDisplayedImage) { }
+        io.flush(removingDisplayedImage: removingDisplayedImage)
     }
 
     /// Send all buffered frames to the display layer (call at EOF).
@@ -815,10 +827,10 @@ final class SampleBufferRenderer: @unchecked Sendable {
                 EngineLog.emit("[Renderer] HDR10+ attachment count: \(hdr10PlusAttachedCount) (last payload \(hdr10PlusData.count) bytes)", category: .swPlayback)
             }
         }
-        // Recover from failed queue target (Synchronizer/controlTimebase handoff races can push it here; flush recovers it).
-        let target = queueTarget
-        switch queueStatus {
-        case .failed:
+        // A failed renderer is recovered the way its header says: a flush resets it, then the frame again
+        // (Synchronizer/controlTimebase handoff races can push it here). Persistent failure climbs the engine's ladder.
+        switch io.enqueue(sampleBuffer) {
+        case .failed(let error):
             reorderLock.lock()
             consecutiveFailedEnqueues += 1
             let failedRun = consecutiveFailedEnqueues
@@ -826,27 +838,31 @@ final class SampleBufferRenderer: @unchecked Sendable {
             reorderLock.unlock()
             if !loggedLayerFailed {
                 loggedLayerFailed = true
-                EngineLog.emit("[Renderer] queue target failed at enqueue #\(enqueueCount + 1): \(queueError?.localizedDescription ?? "nil"), attempting recovery via flush()", category: .swPlayback)
+                EngineLog.emit("[Renderer] queue target failed at enqueue #\(enqueueCount + 1): \(error), attempting recovery via flush()", category: .swPlayback)
             }
             if Self.reportsFailure(afterConsecutiveFailedEnqueues: failedRun) {
-                let error = queueError.map { "\(($0 as NSError).domain)/\(($0 as NSError).code) \($0.localizedDescription)" } ?? "no error"
                 EngineLog.emit("[Renderer] queue target still failed after \(failedRun) flushes: \(error)", category: .swPlayback)
                 observer?(error)
             }
-            target.flush()
-        case .rendering:
-            reorderLock.lock()
-            consecutiveFailedEnqueues = 0
-            reorderLock.unlock()
-        default:
-            // Unknown: what a flush leaves until the next buffer lands, which is no sign the failure cleared.
-            break
+            io.flush(removingDisplayedImage: false)
+            if !io.isReadyForMoreMediaData, !loggedNotReady {
+                loggedNotReady = true
+                EngineLog.emit("[Renderer] isReadyForMoreMediaData=false at enqueue #\(enqueueCount + 1) status=\(statusName)", category: .swPlayback)
+            }
+            _ = io.enqueue(sampleBuffer)
+        case .enqueued(let confirmed):
+            // A frame taken by a renderer that had been rendering ends a run of failures. One taken straight after a
+            // flush says nothing yet: the failure may not have come back.
+            if confirmed {
+                reorderLock.lock()
+                consecutiveFailedEnqueues = 0
+                reorderLock.unlock()
+            }
+            if !io.isReadyForMoreMediaData, !loggedNotReady {
+                loggedNotReady = true
+                EngineLog.emit("[Renderer] isReadyForMoreMediaData=false at enqueue #\(enqueueCount + 1) status=\(statusName)", category: .swPlayback)
+            }
         }
-        if !target.isReadyForMoreMediaData, !loggedNotReady {
-            loggedNotReady = true
-            EngineLog.emit("[Renderer] isReadyForMoreMediaData=false at enqueue #\(enqueueCount + 1) status=\(statusName)", category: .swPlayback)
-        }
-        target.enqueue(sampleBuffer)
         reorderLock.lock()
         _lastEnqueuedFrame = pixelBuffer
         reorderLock.unlock()
@@ -877,18 +893,11 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.unlock()
         // Sparse milestones so a stall is distinguishable from "logging stopped at #30"; bounded to 4 lines/hour at 60 fps.
         if handed == 1 || handed == 30 || handed == 100 || handed == 1000 || handed == 5000 {
-            EngineLog.emit("[Renderer] enqueue #\(handed): status=\(statusName) ready=\(queueTarget.isReadyForMoreMediaData) error=\(queueError?.localizedDescription ?? "nil")", category: .swPlayback)
+            EngineLog.emit("[Renderer] enqueue #\(handed): status=\(statusName) ready=\(io.isReadyForMoreMediaData) receiver=\(io.usesReceiver) error=\(io.failureDescription ?? "nil")", category: .swPlayback)
         }
     }
 
-    private var statusName: String {
-        switch queueStatus {
-        case .unknown: "unknown"
-        case .rendering: "rendering"
-        case .failed: "failed"
-        @unknown default: "?"
-        }
-    }
+    private var statusName: String { io.statusName }
 
     /// [SWDiag] surface: current queue-target status for the 1 Hz diagnostic line. A mid-session
     /// flip away from `rendering` is the layer-side stall the per-frame counters cannot show.

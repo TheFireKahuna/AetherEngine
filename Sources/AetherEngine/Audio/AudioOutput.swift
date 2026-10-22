@@ -8,15 +8,16 @@ import os
 /// **master clock** for the whole player: video frames check synchronizer.currentTime() to decide presentation.
 final class AudioOutput: @unchecked Sendable {
 
-    /// The renderer playing now. A failed one is replaced (`replaceFailedRenderer()`). Code holding `lock` uses
-    /// `_renderer`; everything else reads this, which never waits on `lock` (held across renderer calls, and taken
+    /// The renderer playing now, and the calls the output makes to it (`AudioRendererIO`: the tvOS 27 receiver, or
+    /// the renderer's own calls before 27). A failed one is replaced (`replaceFailedRenderer()`). Code holding `lock`
+    /// uses `io`; everything else reads `renderer`, which never waits on `lock` (held across renderer calls, and taken
     /// by callbacks a renderer may post from inside them).
     var renderer: AVSampleBufferAudioRenderer {
         rendererSlot.withLockUnchecked { $0 }
     }
     /// Guarded by `lock`, and changed only together with `rendererSlot`.
-    private var _renderer: AVSampleBufferAudioRenderer {
-        didSet { let current = _renderer; rendererSlot.withLockUnchecked { $0 = current } }
+    private var io: AudioRendererIO {
+        didSet { let current = io.renderer; rendererSlot.withLockUnchecked { $0 = current } }
     }
     private let rendererSlot: OSAllocatedUnfairLock<AVSampleBufferAudioRenderer>
     let synchronizer: AVSampleBufferRenderSynchronizer
@@ -46,37 +47,39 @@ final class AudioOutput: @unchecked Sendable {
         return _epoch
     }
 
-    /// Whether renderers join the synchronizer through `sampleBufferReceiver(adding:)` (tvOS / macOS 27) rather
-    /// than the `addRenderer` / `removeRenderer` pair the 27 SDKs deprecate. Only the attach and detach move:
-    /// buffers still go to the renderers themselves, which a receiver-attached renderer accepts (checked on
-    /// macOS 27). Process-wide, read at each attach; a switch back to the old pair for A/B on a device,
-    /// since this attach path is where tvOS has failed before (-12080, #351). Earlier systems always use it.
+    /// Whether renderers are driven through the tvOS / macOS 27 synchronizer receivers
+    /// (`sampleBufferReceiver(adding:)`, then the receiver's enqueue, flush and events) rather than the renderer calls
+    /// the 27 SDKs deprecate for Swift. The receivers wrap the same renderers (`research/renderer-receiver`), so this
+    /// changes the API, not the media path. Process-wide, read when a renderer is attached; a switch back to the old
+    /// calls for A/B on a device, since the attach path is where tvOS has failed before (-12080, #351). Earlier
+    /// systems always use the old calls.
     static var usesSampleBufferReceivers: Bool {
         get { receiverSwitch.withLock { $0 } }
         set { receiverSwitch.withLock { $0 = newValue } }
     }
     private static let receiverSwitch = OSAllocatedUnfairLock(initialState: true)
 
-    /// The receivers the renderers were attached with. Typed `AnyObject` because the receiver types exist
-    /// only on 27. The video one is what `removeReceiver(_:at:)` takes; the audio renderer is never removed
-    /// (it lives as long as the synchronizer), and its receiver is held anyway: dropping one did not detach
-    /// its renderer on macOS 27, but that is not documented, so neither is let go while attached. Guarded
-    /// by `lock`.
-    private var audioReceiver: AnyObject?
-    private var videoReceiver: AnyObject?
+    /// Whether this output's renderers are driven through the 27 receivers: `usesSampleBufferReceivers` when it was
+    /// built, so a replacement renderer goes the same way as the first.
+    let throughReceivers: Bool
 
-    init() {
+    /// `throughReceivers` defaults to `usesSampleBufferReceivers`; tests pin it to exercise both paths side by side.
+    init(throughReceivers: Bool = AudioOutput.usesSampleBufferReceivers) {
+        self.throughReceivers = throughReceivers
         let renderer = AVSampleBufferAudioRenderer()
-        _renderer = renderer
-        rendererSlot = OSAllocatedUnfairLock(uncheckedState: renderer)
-        synchronizer = AVSampleBufferRenderSynchronizer()
+        let synchronizer = AVSampleBufferRenderSynchronizer()
         Self.configure(renderer, volume: 1)
-        audioReceiver = Self.attach(renderer, to: synchronizer)
-        observe(renderer)
+        self.synchronizer = synchronizer
+        rendererSlot = OSAllocatedUnfairLock(uncheckedState: renderer)
+        let target = EventTarget()
+        eventSink = { io, event in target.output?.handle(event, from: io) }
+        io = AudioRendererIO(renderer: renderer, joining: synchronizer, throughReceiver: throughReceivers,
+                             onEvent: eventSink)
+        target.output = self
     }
 
     deinit {
-        stopObserving()
+        io.detach(from: synchronizer)
     }
 
     /// What every renderer this output plays through is set up with, before it joins the synchronizer.
@@ -89,36 +92,28 @@ final class AudioOutput: @unchecked Sendable {
         AudioRatePolicy.apply(to: renderer)
     }
 
-    /// Joins `renderer` to the synchronizer, through a receiver where `usesSampleBufferReceivers` says so. Returns the
-    /// receiver, which is held for as long as the renderer is attached.
-    private static func attach(_ renderer: AVSampleBufferAudioRenderer,
-                               to synchronizer: AVSampleBufferRenderSynchronizer) -> AnyObject? {
-        if #available(macOS 27, iOS 27, tvOS 27, visionOS 27, *), usesSampleBufferReceivers {
-            return synchronizer.sampleBufferReceiver(adding: renderer)
-        }
-        synchronizer.addRenderer(renderer)
-        return nil
+    /// Where every renderer's events go. The first IO is built before `self` can be captured, so the sink finds
+    /// its output through a weak reference set once init is done; a renderer cannot report before it is fed.
+    private let eventSink: @Sendable (AudioRendererIO, AudioRendererEvent) -> Void
+    private final class EventTarget: @unchecked Sendable {
+        weak var output: AudioOutput?
     }
 
-    /// The notifications and status this output follows, for `renderer` alone: a replaced renderer's are let go.
-    private func observe(_ renderer: AVSampleBufferAudioRenderer) {
-        observeAutomaticFlush(renderer)
-        observeOutputConfigurationChange(renderer)
-        // The change can be posted from inside `renderer.enqueue`, under `lock`: the report runs off that thread.
-        statusObservation = renderer.observe(\.status, options: [.new]) { [weak self] renderer, _ in
-            guard renderer.status == .failed else { return }
-            self?.automaticFlushQueue.async { [weak self] in self?.reportRendererFailure(of: renderer) }
+    /// Every event is handled on `automaticFlushQueue`: the thread it arrives on may be inside `enqueue`, under
+    /// `lock`. An event from a renderer that has since been replaced is not the playing one's: acting on it would
+    /// throw away its successor's refeed.
+    private func handle(_ event: AudioRendererEvent, from source: AudioRendererIO) {
+        automaticFlushQueue.async { [weak self] in
+            guard let self else { return }
+            switch event {
+            case .flushedAutomatically(let at):
+                self.flushAfterAutomaticFlush(by: source, droppedFrom: at)
+            case .outputConfigurationChanged:
+                self.reenqueueAfterOutputConfigurationChange(from: source)
+            case .failed:
+                self.reportRendererFailure(of: source)
+            }
         }
-    }
-
-    private func stopObserving() {
-        statusObservation?.invalidate()
-        statusObservation = nil
-        for observer in [automaticFlushObserver, outputConfigurationObserver].compactMap({ $0 }) {
-            NotificationCenter.default.removeObserver(observer)
-        }
-        automaticFlushObserver = nil
-        outputConfigurationObserver = nil
     }
 
     /// The synchronizer's rate. A stopped clock and a running clock whose timebase has stalled read
@@ -132,17 +127,17 @@ final class AudioOutput: @unchecked Sendable {
     /// A session that is silent on one route while its clock runs at 1.00 has nothing else that could
     /// say whether the renderer is playing what it was given, and the renderer error was only ever
     /// logged in DEBUG builds.
+    /// Whether the renderer playing now is driven through a 27 receiver (false before 27 whatever was asked).
+    var usesReceiver: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return io.usesReceiver
+    }
+
     var diagRendererState: String {
-        let status: String
-        switch renderer.status {
-        case .rendering: status = "rendering"
-        case .failed: status = "failed"
-        case .unknown: status = "unknown"
-        @unknown default: status = "?"
-        }
-        let sufficient = renderer.hasSufficientMediaDataForReliablePlaybackStart ? "y" : "n"
-        let error = (renderer.error as NSError?).map { "\($0.domain)/\($0.code)" } ?? "-"
-        return "\(status)/\(sufficient)/\(error)"
+        lock.lock()
+        defer { lock.unlock() }
+        return io.diagnosticState
     }
 
     /// AE#549: how often this renderer has flushed itself, for the diagnostic line.
@@ -152,7 +147,6 @@ final class AudioOutput: @unchecked Sendable {
         return _automaticFlushCount
     }
 
-    private var automaticFlushObserver: NSObjectProtocol?
     private var _automaticFlushCount = 0
     /// The last compressed buffer the renderer took, as delivered, and whether the next one needs it again
     /// as its pre-roll (after an AE#549 automatic flush). Guarded by `lock`.
@@ -173,22 +167,19 @@ final class AudioOutput: @unchecked Sendable {
         defer { lock.unlock() }
         return _outputReconfigurationCount
     }
-    private var outputConfigurationObserver: NSObjectProtocol?
 
     /// Called once when the renderer fails, off the main actor, with its error. A failed audio renderer is terminal
-    /// "from which recovery is not always possible" (its header), and silent: the clock it drives runs on. Seen through
-    /// the status, which the header makes key-value observable, so a failure while nothing is being fed (paused, or
-    /// the lead full) is seen when it happens; and checked after every enqueue, since a status that stays failed across
-    /// a flush makes no change to observe. `flush()` rearms it, so a recovery that does not hold reports again. Set
-    /// before the feed starts.
+    /// "from which recovery is not always possible" (its header), and silent: the clock it drives runs on. Seen when it
+    /// happens, even while nothing is being fed (paused, or the lead full), through the renderer's failure event; and
+    /// on every enqueue, since a renderer that stays failed across a flush has no change to report. `flush()` rearms
+    /// it, so a recovery that does not hold reports again. Set before the feed starts.
     var onRendererFailed: (@Sendable (String) -> Void)?
     /// Guarded by `lock`.
     private var reportedRendererFailure = false
-    private var statusObservation: NSKeyValueObservation?
 
-    /// Where the AE#549 flush runs. The posting thread must never wait on `lock`: `enqueue` holds it
-    /// across `renderer.enqueue` (DEC-106), and a renderer that posts from inside that call would make the
-    /// feed thread wait on a lock it already holds, with every `flush()` / `stop()` / `seekClock()` behind it.
+    /// Where every renderer event is handled. The thread an event arrives on must never wait on `lock`: `enqueue`
+    /// holds it across the renderer's enqueue (DEC-106), and a renderer that posts from inside that call would make
+    /// the feed thread wait on a lock it already holds, with every `flush()` / `stop()` / `seekClock()` behind it.
     private let automaticFlushQueue = DispatchQueue(label: "engine.audio.autoflush")
 
     /// AE#549: the renderer throws its queue away when the route changes under it, and posts the
@@ -206,42 +197,29 @@ final class AudioOutput: @unchecked Sendable {
     /// The line is also the witness the field log lacked. Across an automatic flush the timebase
     /// keeps RUNNING at its rate, so a session that froze did not freeze because of this, and only a
     /// log carrying both can tell the two apart.
-    private func observeAutomaticFlush(_ renderer: AVSampleBufferAudioRenderer) {
-        automaticFlushObserver = NotificationCenter.default.addObserver(
-            forName: .AVSampleBufferAudioRendererWasFlushedAutomatically,
-            object: renderer,
-            queue: nil
-        ) { [weak self] note in
-            guard let self else { return }
-            let flushedFrom = (note.userInfo?[AVSampleBufferAudioRendererFlushTimeKey] as? NSValue)
-                .map { self.timeline.sourceTime(forRenderer: $0.timeValue).seconds }
-            let posted = ObjectIdentifier(renderer)
-            automaticFlushQueue.async { [weak self] in
-                guard let self else { return }
-                lock.lock()
-                // Posted by a renderer that has since been replaced: flushing would throw away its successor's refeed.
-                guard ObjectIdentifier(_renderer) == posted else {
-                    lock.unlock()
-                    return
-                }
-                _automaticFlushCount += 1
-                let count = _automaticFlushCount
-                _renderer.flush()
-                // What it held is gone; an output reconfiguration after this has nothing of it to put back.
-                queued.removeAll()
-                // A compressed stream picks up mid-run here, where its decoder starts cold: the packet
-                // before the next one goes in again first, decoded only to prime (see `enqueue`).
-                primeAfterAutomaticFlush = lastCompressedDelivery != nil
-                lock.unlock()
-                EngineLog.emit(
-                    "[AudioOutput] AE#549 renderer flushed itself (#\(count)): "
-                    + "dropped from \(flushedFrom.map { String(format: "%.3f", $0) } ?? "unknown")s, "
-                    + "clock at \(String(format: "%.3f", currentTimeSeconds))s rate=\(rate); "
-                    + "audio returns once the feed reaches the clock",
-                    category: .swPlayback
-                )
-            }
+    private func flushAfterAutomaticFlush(by source: AudioRendererIO, droppedFrom: CMTime?) {
+        let flushedFrom = droppedFrom.map { timeline.sourceTime(forRenderer: $0).seconds }
+        lock.lock()
+        guard io === source else {
+            lock.unlock()
+            return
         }
+        _automaticFlushCount += 1
+        let count = _automaticFlushCount
+        io.flush()
+        // What it held is gone; an output reconfiguration after this has nothing of it to put back.
+        queued.removeAll()
+        // A compressed stream picks up mid-run here, where its decoder starts cold: the packet
+        // before the next one goes in again first, decoded only to prime (see `enqueue`).
+        primeAfterAutomaticFlush = lastCompressedDelivery != nil
+        lock.unlock()
+        EngineLog.emit(
+            "[AudioOutput] AE#549 renderer flushed itself (#\(count)): "
+            + "dropped from \(flushedFrom.map { String(format: "%.3f", $0) } ?? "unknown")s, "
+            + "clock at \(String(format: "%.3f", currentTimeSeconds))s rate=\(rate); "
+            + "audio returns once the feed reaches the clock",
+            category: .swPlayback
+        )
     }
 
     /// The output was configured for another format under the renderer (`…OutputConfigurationDidChange`): another
@@ -254,31 +232,21 @@ final class AudioOutput: @unchecked Sendable {
     /// Unlike AE#549's automatic flush, the audio is still here to enqueue again: `queued` holds what the renderer
     /// held. It goes back in from the buffer the clock is in, the one before it first as a decode-only primer for a
     /// compressed stream, so the gap is the renderer's restart, not the lead. Under `lock`, so the feed's next
-    /// buffer lands after them; off the posting thread, for the reason `automaticFlushQueue` gives.
-    private func observeOutputConfigurationChange(_ renderer: AVSampleBufferAudioRenderer) {
-        outputConfigurationObserver = NotificationCenter.default.addObserver(
-            forName: .AVSampleBufferAudioRendererOutputConfigurationDidChange,
-            object: renderer,
-            queue: nil
-        ) { [weak self] _ in
-            let posted = ObjectIdentifier(renderer)
-            self?.automaticFlushQueue.async { [weak self] in
-                // A replaced renderer's reconfiguration is not the playing one's: its successor was just fed afresh.
-                guard let self, ObjectIdentifier(self.renderer) == posted else { return }
-                self.reenqueueAfterOutputConfigurationChange()
-            }
-        }
-    }
-
-    func reenqueueAfterOutputConfigurationChange() {
+    /// buffer lands after them; off the posting thread, for the reason `automaticFlushQueue` gives. `source`, when
+    /// given, is the renderer that reported it; a replaced one's report is ignored.
+    func reenqueueAfterOutputConfigurationChange(from source: AudioRendererIO? = nil) {
         lock.lock()
+        if let source, source !== io {
+            lock.unlock()
+            return
+        }
         _outputReconfigurationCount += 1
         let count = _outputReconfigurationCount
         let now = synchronizer.currentTime()
         let refeed = Self.refeed(queued, at: now)
-        _renderer.flush()
+        io.flush()
         for buffer in refeed {
-            _renderer.enqueue(buffer)
+            _ = io.enqueue(buffer)
             #if DEBUG
             rendererEnqueueObserverForTesting?(buffer)
             #endif
@@ -320,66 +288,18 @@ final class AudioOutput: @unchecked Sendable {
         return duration.isValid ? CMTimeAdd(start, duration) : start
     }
 
-    /// Add the video renderer to the synchronizer for automatic A/V sync + frame pacing. The display layer's
-    /// `sampleBufferRenderer`, never the layer: addRenderer(layer) still type-checks but on tvOS 26+ fails with
-    /// FigVideoQueueRemote err=-12080 after the first enqueue. Taken as the renderer rather than read off the
-    /// layer here, because the layer is main-actor isolated in the 27 SDKs and this runs off it (#351).
-    func attachVideoRenderer(_ videoRenderer: AVSampleBufferVideoRenderer) {
-        if #available(macOS 27, iOS 27, tvOS 27, visionOS 27, *), Self.usesSampleBufferReceivers {
-            let receiver = synchronizer.sampleBufferReceiver(adding: videoRenderer)
-            lock.lock()
-            videoReceiver = receiver
-            lock.unlock()
-        } else {
-            synchronizer.addRenderer(videoRenderer)
-        }
+    /// Joins the video renderer to this output's synchronizer, for A/V sync and frame pacing
+    /// (`SampleBufferRenderer.join`). Never the layer: addRenderer(layer) still type-checks but on tvOS 26+ fails with
+    /// FigVideoQueueRemote err=-12080 after the first enqueue (#351).
+    func attachVideoRenderer(_ videoRenderer: SampleBufferRenderer) {
+        // The same way as this output's own renderer: one session, one API.
+        videoRenderer.join(synchronizer, throughReceiver: throughReceivers)
     }
 
-    /// Remove the video renderer and block until removal completes. The synchronizer detaches asynchronously;
-    /// if the caller immediately assigns displayLayer.controlTimebase for a new Atmos session the layer is briefly
-    /// owned by both (Apple-documented UB). Symptom: first PCM->Atmos switch after launch throws FigVideoQueueRemote
-    /// err=-12080 and the display layer stops rendering (audio keeps going). The semaphore wait (sub-100ms) makes
-    /// the handoff deterministic.
-    func detachVideoRenderer(_ videoRenderer: AVSampleBufferVideoRenderer) {
-        let semaphore = DispatchSemaphore(value: 0)
-        lock.lock()
-        let attachedReceiver = videoReceiver
-        videoReceiver = nil
-        lock.unlock()
-        if #available(macOS 27, iOS 27, tvOS 27, visionOS 27, *),
-           let receiver = attachedReceiver as? AVSampleBufferVideoRenderer.Receiver {
-            // Attached through a receiver: removed through it, the async counterpart of removeRenderer.
-            Self.removeReceiver(receiver, from: synchronizer, at: synchronizer.currentTime()) { semaphore.signal() }
-        } else {
-            synchronizer.removeRenderer(videoRenderer, at: synchronizer.currentTime()) { _ in
-                semaphore.signal()
-            }
-        }
-        let result = semaphore.wait(timeout: .now() + .seconds(1))
-        #if DEBUG
-        if result == .timedOut {
-            EngineLog.emit("[AudioOutput] detachVideoRenderer: timed out waiting for synchronizer removal", category: .swPlayback)
-        }
-        #endif
-    }
-
-    /// Removes a receiver-attached video renderer and calls `done` once the synchronizer has, off the caller's
-    /// thread. The receiver is handed over (`sending`): nothing else holds it once `detachVideoRenderer` cleared
-    /// `videoReceiver`.
-    @available(macOS 27, iOS 27, tvOS 27, visionOS 27, *)
-    private static func removeReceiver(_ receiver: sending AVSampleBufferVideoRenderer.Receiver,
-                                       from synchronizer: AVSampleBufferRenderSynchronizer,
-                                       at time: CMTime, done: @escaping @Sendable () -> Void) {
-        // A closure's captures cannot be `sending` (the compiler cannot know it runs once); this one
-        // runs once and is the receiver's only holder, which is what the opt-out below asserts.
-        nonisolated(unsafe) let handedOver = receiver
-        // Off the caller's executor and off the cooperative pool (BlockingWork): the caller (the host's stop(),
-        // on the main actor) blocks on `done` for up to a second, as it did on removeRenderer's callback.
-        BlockingWork.detached {
-            nonisolated(unsafe) let receiver = handedOver
-            _ = await synchronizer.removeReceiver(receiver, at: time)
-            done()
-        }
+    /// Takes the video renderer out of this output's synchronizer, and blocks until it is out
+    /// (`SampleBufferRenderer.leave`).
+    func detachVideoRenderer(_ videoRenderer: SampleBufferRenderer) {
+        videoRenderer.leave(synchronizer)
     }
 
     /// Kept here as well as on the renderer, so a replacement plays at the volume its predecessor was set to.
@@ -393,7 +313,7 @@ final class AudioOutput: @unchecked Sendable {
             lock.lock()
             defer { lock.unlock() }
             _volume = newValue
-            _renderer.volume = newValue
+            io.renderer.volume = newValue
         }
     }
     private var _volume: Float = 1
@@ -489,16 +409,41 @@ final class AudioOutput: @unchecked Sendable {
         // decoder (`kCMSampleBufferAttachmentKey_TrimDurationAtStart`). A seek needs none of this: the
         // decoder restarts with it, and an APAC encoder run opens on its own trimmed priming packets.
         let compressed = Self.isCompressed(delivered)
-        if compressed, primeAfterAutomaticFlush, let last = lastCompressedDelivery, let primer = Self.decodeOnlyCopy(last) {
-            _renderer.enqueue(primer)
+        let previousCompressed = lastCompressedDelivery
+        if compressed, primeAfterAutomaticFlush, let last = previousCompressed, let primer = Self.decodeOnlyCopy(last) {
+            _ = io.enqueue(primer)
             #if DEBUG
             rendererEnqueueObserverForTesting?(primer)
             #endif
         }
         primeAfterAutomaticFlush = false
         lastCompressedDelivery = compressed ? delivered : nil
-        _renderer.enqueue(delivered)
-        let enqueuedInto = _renderer
+        var report = io.enqueue(delivered)
+        let enqueuedInto = io
+        var automaticFlushLine: String?
+        if report.flushedAutomatically {
+            // AE#549 through the tvOS 27 receiver, which reports the renderer's automatic flush only on the enqueue
+            // after it: this buffer is the first the renderer took since. The header's advice, a flush serialized
+            // with enqueueing, happens here, in that order: the queue is emptied of whatever slipped in, then this
+            // buffer goes in again on its own, behind a decode-only primer (the packet before it) for a compressed
+            // stream, whose decoder restarts cold mid-run.
+            _automaticFlushCount += 1
+            io.flush()
+            queued.removeAll()
+            if compressed, let last = previousCompressed, let primer = Self.decodeOnlyCopy(last) {
+                _ = io.enqueue(primer)
+                #if DEBUG
+                rendererEnqueueObserverForTesting?(primer)
+                #endif
+            }
+            let again = io.enqueue(delivered)
+            report.failure = report.failure ?? again.failure
+            automaticFlushLine = "[AudioOutput] AE#549 renderer flushed itself (#\(_automaticFlushCount)), reported "
+                + "with the next buffer: flushed and enqueued it again at "
+                + "\(String(format: "%.3f", timeline.sourceSeconds(forRenderer: CMSampleBufferGetPresentationTimeStamp(delivered).seconds)))s; "
+                + "clock at \(String(format: "%.3f", timeline.sourceSeconds(forRenderer: synchronizer.currentTime().seconds)))s"
+        }
+        let failure = report.failure
         queued.append(delivered)
         queued = Self.pruned(queued, at: synchronizer.currentTime(), limit: Self.queuedLimit)
         #if DEBUG
@@ -507,7 +452,8 @@ final class AudioOutput: @unchecked Sendable {
         #endif
         lock.unlock()
         if let offsetLine { EngineLog.emit(offsetLine, category: .swPlayback) }
-        if enqueuedInto.status == .failed { reportRendererFailure(of: enqueuedInto) }
+        if let automaticFlushLine { EngineLog.emit(automaticFlushLine, category: .swPlayback) }
+        if failure != nil { reportRendererFailure(of: enqueuedInto) }
         #if DEBUG
         if simulatesRendererFailureForTesting { reportRendererFailure(of: enqueuedInto) }
         #endif
@@ -523,8 +469,8 @@ final class AudioOutput: @unchecked Sendable {
             let sr = fmt.map { "\($0.mSampleRate)Hz" } ?? "?"
             let ch = fmt.map { "\($0.mChannelsPerFrame)ch" } ?? "?"
             let count = CMSampleBufferGetNumSamples(sampleBuffer)
-            EngineLog.emit("[AudioOutput] first enqueue: \(sr) \(ch), \(count) samples, renderer.error=\(String(describing: enqueuedInto.error))", category: .swPlayback)
-        } else if let err = enqueuedInto.error, !_loggedRendererError {
+            EngineLog.emit("[AudioOutput] first enqueue: \(sr) \(ch), \(count) samples, renderer=\(failure ?? "accepted")", category: .swPlayback)
+        } else if let err = failure, !_loggedRendererError {
             _loggedRendererError = true
             EngineLog.emit("[AudioOutput] renderer error: \(err)", category: .swPlayback)
         }
@@ -539,13 +485,13 @@ final class AudioOutput: @unchecked Sendable {
 
     /// Reports `failed` once, if it is still the renderer playing: a replaced renderer's late report is not a failure
     /// of the one that took over.
-    private func reportRendererFailure(of failed: AVSampleBufferAudioRenderer) {
+    private func reportRendererFailure(of failed: AudioRendererIO) {
         lock.lock()
-        let first = !reportedRendererFailure && failed === _renderer
+        let first = !reportedRendererFailure && failed === io
         if first { reportedRendererFailure = true }
         lock.unlock()
         guard first else { return }
-        let error = (failed.error as NSError?).map { "\($0.domain)/\($0.code) \($0.localizedDescription)" } ?? "no error"
+        let error = failed.failureDescription
         EngineLog.emit("[AudioOutput] renderer failed: \(error)", category: .swPlayback)
         onRendererFailed?(error)
     }
@@ -575,17 +521,14 @@ final class AudioOutput: @unchecked Sendable {
     func replaceFailedRenderer() -> Int {
         let fresh = AVSampleBufferAudioRenderer()
         lock.lock()
-        let failed = _renderer
-        let failedReceiver = audioReceiver
+        let failed = io
         Self.configure(fresh, volume: _volume)
-        stopObserving()
-        audioReceiver = Self.attach(fresh, to: synchronizer)
-        _renderer = fresh
-        observe(fresh)
+        io = AudioRendererIO(renderer: fresh, joining: synchronizer, throughReceiver: throughReceivers,
+                             onEvent: eventSink)
         let now = synchronizer.currentTime()
         let refeed = Self.refeed(queued, at: now)
         for buffer in refeed {
-            fresh.enqueue(buffer)
+            _ = io.enqueue(buffer)
             #if DEBUG
             rendererEnqueueObserverForTesting?(buffer)
             #endif
@@ -596,28 +539,12 @@ final class AudioOutput: @unchecked Sendable {
         _rendererReplacementCount += 1
         let count = _rendererReplacementCount
         lock.unlock()
-        Self.detach(failed, receiver: failedReceiver, from: synchronizer)
+        failed.detach(from: synchronizer)
         EngineLog.emit(
             "[AudioOutput] failed renderer replaced (#\(count)): \(refeed.count) buffer(s) enqueued again from the "
             + "clock at \(String(format: "%.3f", timeline.sourceSeconds(forRenderer: now.seconds)))s rate=\(rate)",
             category: .swPlayback)
         return refeed.count
-    }
-
-    /// Takes a renderer out of the synchronizer at once, the way it was attached. Nothing waits for it: the renderer
-    /// that replaced it is already playing.
-    private static func detach(_ renderer: AVSampleBufferAudioRenderer, receiver: AnyObject?,
-                               from synchronizer: AVSampleBufferRenderSynchronizer) {
-        if #available(macOS 27, iOS 27, tvOS 27, visionOS 27, *),
-           let receiver = receiver as? AVSampleBufferAudioRenderer.Receiver {
-            nonisolated(unsafe) let handedOver = receiver
-            BlockingWork.detached {
-                nonisolated(unsafe) let receiver = handedOver
-                _ = await synchronizer.removeReceiver(receiver, at: .invalid)
-            }
-        } else {
-            synchronizer.removeRenderer(renderer, at: .invalid, completionHandler: nil)
-        }
     }
 
     nonisolated static func isCompressed(_ buffer: CMSampleBuffer) -> Bool {
@@ -720,7 +647,9 @@ final class AudioOutput: @unchecked Sendable {
     /// video renderer; in background-audio-only mode (video dropped) it paces on this instead, so it does
     /// not buffer the rest of the file unbounded.
     var isReadyForMoreMediaData: Bool {
-        renderer.isReadyForMoreMediaData
+        lock.lock()
+        defer { lock.unlock() }
+        return io.isReadyForMoreMediaData
     }
 
     /// Flush the audio renderer (call on seek).
@@ -728,7 +657,7 @@ final class AudioOutput: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         _epoch &+= 1
-        _renderer.flush()
+        io.flush()
         // The decoder starts over with a flush like this one, priming itself.
         lastCompressedDelivery = nil
         primeAfterAutomaticFlush = false
@@ -745,7 +674,7 @@ final class AudioOutput: @unchecked Sendable {
         queued.removeAll()
         disarmPreroll()
         synchronizer.setRate(0.0, time: .zero)
-        _renderer.flush()
+        io.flush()
     }
 
     /// Atomically jump the master clock to a time and resume at a rate. The ONLY way the clock is (re)anchored:

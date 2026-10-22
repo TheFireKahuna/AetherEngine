@@ -1578,7 +1578,7 @@ final class SoftwarePlaybackHost {
             break
         }
         if !demuxLoopStarted, let aOut = audioOutput {
-            aOut.attachVideoRenderer(renderer.videoRenderer)
+            aOut.attachVideoRenderer(renderer)
             if let recommended = renderer.recommendedPixelBufferAttributes() {
                 let line = recommended.keys.sorted().map { "\($0)=\(String(describing: recommended[$0]!).replacingOccurrences(of: "\n", with: ""))" }
                 EngineLog.emit("[SoftwarePlaybackHost] video renderer recommends [\(line.joined(separator: ", "))]", category: .swPlayback)
@@ -2286,9 +2286,11 @@ final class SoftwarePlaybackHost {
         newestSourcePts = .nan
         liveEdgeLock.unlock()
 
+        // Flushed (picture removed) while still joined, so through the synchronizer's receiver where there is one.
+        renderer.flush()
         if let aOut = audioOutput {
             aOut.stop()
-            aOut.detachVideoRenderer(renderer.videoRenderer)
+            aOut.detachVideoRenderer(renderer)
         }
         audioOutput = nil
         audioDecoder?.close()

@@ -12,10 +12,12 @@ extension AetherEngine {
         set { AudioOutput.prerollStartMargin = newValue }
     }
 
-    /// Whether renderers join the clock through `sampleBufferReceiver(adding:)` on tvOS / macOS 27 (default
-    /// true) or through the `addRenderer` / `removeRenderer` pair the 27 SDKs deprecate. Buffers reach the
-    /// renderers the same way either way. A switch for A/B on a device; read at each attach, so it applies
-    /// from the next session. No effect before 27.
+    /// Whether the software path drives its renderers through the tvOS / macOS 27 synchronizer receivers (default
+    /// true): `sampleBufferReceiver(adding:)` to join the clock, then the receiver's enqueue, flush and events, for
+    /// the audio renderer, the video renderer and the held still frame. Off, it uses the renderer calls the 27 SDKs
+    /// deprecate for Swift, as every system before 27 does. The receivers wrap the same renderers, so this changes
+    /// the API, not the media path. A switch for A/B on a device; read when a session's audio output is built, so it
+    /// applies from the next session. No effect before 27.
     @_spi(Diagnostics)
     public nonisolated static var usesSampleBufferReceivers: Bool {
         get { AudioOutput.usesSampleBufferReceivers }

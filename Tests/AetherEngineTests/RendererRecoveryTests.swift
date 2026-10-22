@@ -119,47 +119,64 @@ struct RendererRecoveryTests {
         return condition()
     }
 
-    @Test("a flush does not bring a failed audio renderer back, which is why the ladder replaces it")
-    func flushDoesNotReviveAudio() async throws {
-        let output = AudioOutput()
+    /// Feeds PCM the way a playing session does, from `pts` on, until `reports` reaches `count`. The renderer's own
+    /// path sees a failure through its status at once; the receiver reports it with the enqueue after it, so the
+    /// feed carrying on is what delivers it on that path. Returns the next free timestamp.
+    private func feed(_ output: AudioOutput, from pts: Int64, until reports: Count, reach count: Int) async throws -> Int64 {
+        var next = pts
+        for _ in 0..<100 where reports.value < count {
+            output.enqueue(sampleBuffer: try pcm(pts: next))
+            next += 1024
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        return next
+    }
+
+    @Test("a flush does not bring a failed audio renderer back, which is why the ladder replaces it",
+          arguments: audioOutputPaths)
+    func flushDoesNotReviveAudio(throughReceivers: Bool) async throws {
+        let output = AudioOutput(throughReceivers: throughReceivers)
         let reports = Count()
         output.onRendererFailed = { _ in reports.bump() }
         output.enqueue(sampleBuffer: try unplayable(pts: 0))
-        #expect(try await waitUntil { reports.value == 1 })
+        let next = try await feed(output, from: 1024, until: reports, reach: 1)
+        #expect(reports.value == 1)
         output.flush()
-        output.enqueue(sampleBuffer: try pcm(pts: 1024))
-        #expect(try await waitUntil { reports.value == 2 }, "still failed after a flush and valid PCM")
+        _ = try await feed(output, from: next, until: reports, reach: 2)
+        #expect(reports.value == 2, "still failed after a flush and valid PCM")
         #expect(output.renderer.status == .failed)
     }
 
-    @Test("a failed audio renderer is replaced under the clock: a new one attached, fed again, at the old volume")
-    func replacesTheFailedRenderer() async throws {
-        let output = AudioOutput()
+    @Test("a failed audio renderer is replaced under the clock: a new one attached, fed again, at the old volume",
+          arguments: audioOutputPaths)
+    func replacesTheFailedRenderer(throughReceivers: Bool) async throws {
+        let output = AudioOutput(throughReceivers: throughReceivers)
         output.volume = 0.25
         let reports = Count()
         output.onRendererFailed = { _ in reports.bump() }
         // The renderer fails on a buffer it cannot play only when that is its first format.
         output.enqueue(sampleBuffer: try unplayable(pts: 0))
-        output.enqueue(sampleBuffer: try pcm(pts: 1024))
-        output.enqueue(sampleBuffer: try pcm(pts: 2048))
-        #expect(try await waitUntil { reports.value == 1 })
+        let next = try await feed(output, from: 1024, until: reports, reach: 1)
+        #expect(reports.value == 1)
         let failed = output.renderer
         #expect(failed.status == .failed)
 
         let refed = output.replaceFailedRenderer()
         let fresh = output.renderer
         #expect(fresh !== failed)
-        #expect(refed == 3, "everything from the buffer the stopped clock is in on")
+        #expect(refed == Int(next / 1024), "everything from the buffer the stopped clock is in on")
         #expect(fresh.volume == 0.25)
+        #expect(output.usesReceiver == throughReceivers, "the replacement goes the way the first renderer went")
         #expect(output.rendererReplacementCount == 1)
         #expect(try await waitUntil { !output.synchronizer.renderers.contains { $0 === failed } },
                 "the failed renderer leaves the synchronizer")
         #expect(output.synchronizer.renderers.contains { $0 === fresh })
 
         // The refeed carried the unplayable buffer too, so the new renderer fails on it and says so: reported afresh.
-        #expect(try await waitUntil { reports.value == 2 })
+        let after = try await feed(output, from: next, until: reports, reach: 2)
+        #expect(reports.value == 2)
         // The replaced renderer is no longer listened to: its automatic flush would throw away the refeed.
-        NotificationCenter.default.post(name: .AVSampleBufferAudioRendererWasFlushedAutomatically, object: failed)
+        postAutomaticFlush(of: failed)
         NotificationCenter.default.post(name: .AVSampleBufferAudioRendererOutputConfigurationDidChange, object: failed)
         try await Task.sleep(for: .milliseconds(100))
         #expect(output.automaticFlushCount == 0)
@@ -168,7 +185,7 @@ struct RendererRecoveryTests {
         output.flush()
         let replacedAgain = output.replaceFailedRenderer()
         #expect(replacedAgain == 0, "a flush left nothing to give back")
-        output.enqueue(sampleBuffer: try pcm(pts: 4096))
+        for i in 0..<5 { output.enqueue(sampleBuffer: try pcm(pts: after + Int64(i) * 1024)) }
         try await Task.sleep(for: .milliseconds(200))
         #expect(reports.value == 2)
         #expect(output.renderer.status != .failed)
