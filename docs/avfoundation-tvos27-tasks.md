@@ -81,7 +81,7 @@ Items 1–6 are implemented and unit-tested, but haven't been tried on the TV ye
    - The telemetry sampler and the diagnostic lanes wait on the fetch for at most 2 s on 27, so a stranded media
      server costs a reading instead of the thread.
 10. **[ ] Small items:**
-    - `AVPlayerItemVideoOutput` uses the dictionary init and `copyPixelBuffer` (`NativeAVPlayerHost.swift:1850,2323`).
+    - Done: `AVPlayerItemVideoOutput` goes through `ItemVideoOutput`, which uses the typed `CVPixelBufferAttributes` init and `pixelBufferAndDisplayTime(forItemTime:)` from 26 on.
     - `AVDisplayManagerModeSwitchSettingsChangedNotification` and `eligibleForHDRPlaybackDidChangeNotification` aren't observed.
     - The stats overlay shows the source's "Atmos", not the output's `renderingMode` or channel count.
 
