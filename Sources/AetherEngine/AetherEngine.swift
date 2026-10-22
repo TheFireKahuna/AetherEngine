@@ -4102,6 +4102,7 @@ public final class AetherEngine: ObservableObject {
             abandonStartupContinuation()
             throw CancellationError()
         }
+        DisplaySignalProbe.sessionBegan(self)
         let attempt = LoadAttempt()
         defer { if let gen = attempt.generation { waitingLoadGenerations.remove(gen) } }
         do {
@@ -6800,6 +6801,7 @@ public final class AetherEngine: ObservableObject {
                      finalTeardown: finalTeardown ?? resetDisplayCriteria,
                      cacheCleanupReason: .sessionStopped)
         state = .idle
+        DisplaySignalProbe.sessionEnded(self)
         // #361: the sequence ends here without ever reaching its last checkpoint, which is the whole
         // point: nothing about a stop should read as a finished startup. Cleared in stop() and not in
         // stopInternal, because every load() runs stopInternal and a reroute's teardown must leave the

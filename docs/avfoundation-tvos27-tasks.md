@@ -87,6 +87,7 @@ Items 1–6 are implemented and unit-tested, but haven't been tried on the TV ye
 
 ## Experiments
 
+- Running: `DisplaySignalProbe` (started by Sodalite) logs every public display reading beside the private reference (`CADisplay` current mode and HDR modes, PineBoard's separate dynamic-range and frame-rate matching flags) in the `display.signals` category, plus an HLS variant oracle run while idle. Read a sysdiagnose with `log show --predicate 'category == "display.signals"'` to see which public readings track the display.
 - Display criteria are built from a synthetic 3840x2160 format description with no `dvcC`, mastering or light-level data (`DisplayCriteriaController.swift:816`). Try the stream's real description and judge the result by eye on the G5.
 - APAC on the software route without `setPreferredOutputNumberOfChannels`: does MAT come up without the keep-alive player?
 - Control Center skip buttons on the AVKit path through its private `_nowPlayingSession` `remoteCommandCenter`.

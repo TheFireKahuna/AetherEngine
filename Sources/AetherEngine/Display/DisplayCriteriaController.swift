@@ -1318,6 +1318,7 @@ final class DisplayCriteriaController {
                 proven: panelProvenToEngageHDR,
                 headroomLimit: Self.headroomLimitLabel(window.traitCollection)),
             category: .engine)
+        DisplaySignalProbe.snapshot(trigger: "criteria:\(phase)")
     }
 
     /// The trait's own three states, spelled out rather than mapped to a Bool: "unspecified" is a real
