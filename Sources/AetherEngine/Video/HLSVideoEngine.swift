@@ -966,6 +966,27 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// latency on a 24 fps 1440p LAN source and stays within the spec's 2-6 s range.
     static let targetSegmentDuration: Double = 4.0
 
+    /// Cut target of the VOD keyframe plan (2 s). A native seek is served the whole segment holding its
+    /// target before AVPlayer sees a byte, and AVPlayer buffers about one segment before it starts, so the
+    /// segment length is the seek latency: on a UHD remux a 4 s cut measured 0.62 s to serve and 1.46 s
+    /// from seek to motion on the device. Live and the uniform-stride fallback keep `targetSegmentDuration`:
+    /// live window sizing is tuned around it, and a grid finer than an unmeasured GOP advertises segments
+    /// no keyframe opens (#358). A GOP longer than this still cuts once per GOP.
+    static let vodKeyframeSegmentTarget: Double = 2.0
+
+    /// `LoadOptions.forwardBufferSegments` and the cache's backward window count `targetSegmentDuration`
+    /// segments. A VOD session holds this many of its own per counted one, so both keep their depth in
+    /// seconds.
+    static let vodSegmentsPerCountedSegment = Int((targetSegmentDuration / vodKeyframeSegmentTarget).rounded())
+
+    /// The session's forward window in its own segments: the clamped request, scaled for VOD.
+    static func sessionForwardWindow(requested: Int?, isLive: Bool) -> Int {
+        let counted = clampedForwardWindow(requested)
+        guard !isLive else { return counted }
+        let (scaled, overflow) = counted.multipliedReportingOverflow(by: vodSegmentsPerCountedSegment)
+        return overflow ? counted : scaled
+    }
+
     /// Live cut target under `LiveJoinProfile.fastZap` (AE#195): cut at every keyframe past 0.5 s, so
     /// segments quantize to the source GOP and the served TARGETDURATION (whose 3 x holdback gates the
     /// first live manifest, AE#189) is driven by `ceil(max EXTINF)` instead of the
@@ -1180,7 +1201,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.sourceReopenableByURL = sourceReopenableByURL
         self.customSourceReopenFactory = customSourceReopenFactory
         self.companionAudioReader = companionAudioReader
-        self.forwardWindowSegments = Self.clampedForwardWindow(forwardBufferSegments)
+        self.forwardWindowSegments = Self.sessionForwardWindow(requested: forwardBufferSegments,
+                                                               isLive: isLiveSession)
         self.requestedSessionCacheBudgetBytes = sessionCacheByteBudget.map { max(0, $0) }
     }
 
@@ -1740,7 +1762,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage
         #endif
-        let capRelaxed = Self.retentionCapRelaxed(forwardWindowSegments: forwardWindowSegments)
+        // The ceiling counts 4 s segments, so the opt-in reads the host's request, not the scaled window.
+        let capRelaxed = Self.retentionCapRelaxed(
+            forwardWindowSegments: forwardWindowSegments / (isLiveSession ? 1 : Self.vodSegmentsPerCountedSegment))
         // Size the custom byte ceiling against capacity left by other running sessions.
         var resolvedBudget: SessionCacheBudgetResolution?
         let claim = RetentionClaims.shared.claim(volumeAvailableBytes: availableBytes) { remaining in
@@ -1756,6 +1780,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let retentionBudget = claim.bytes
         let segmentCache = SegmentCache(
             forwardWindow: forwardWindowSegments,
+            backwardWindow: SegmentCache.defaultBackwardWindow
+                * (isLiveSession ? 1 : Self.vodSegmentsPerCountedSegment),
             retentionBudgetBytes: retentionBudget,
             nativeLiveDVRPolicy: isLiveSession ? nativeLiveDVRPolicy : nil,
             onResidentSetChanged: { [weak self] in self?.noteResidentSetChanged() }
