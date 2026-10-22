@@ -960,7 +960,15 @@ final class SoftwarePlaybackHost {
         onRendererFailed?(which, error)
     }
 
-    /// The ladder's first step: reposition to the playhead, the reposition AE#739 makes after a lost decoder session.
+    /// The ladder's first step for a failed audio renderer: a new one in its place, under the running clock, so the
+    /// picture carries on (`AudioOutput.replaceFailedRenderer`). False when there is no output to replace it in.
+    func replaceFailedAudioRenderer() -> Bool {
+        guard !stopRequested, let audioOutput else { return false }
+        audioOutput.replaceFailedRenderer()
+        return true
+    }
+
+    /// The ladder's first step for a failed video renderer: reposition to the playhead, the reposition AE#739 makes after a lost decoder session.
     /// The seek flushes both renderers (the documented reset of a failed one, and what rearms their reports), and the
     /// picture comes back on the frame the audio is at. A live source with no rewind ring cannot go back, so there the
     /// renderers are flushed in place and the feed carries on from where it is.

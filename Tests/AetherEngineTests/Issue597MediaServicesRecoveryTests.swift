@@ -68,7 +68,7 @@ struct Issue597MediaServicesRecoveryTests {
         engine.climbRendererRecovery(.audio, error: "test")
         engine.climbRendererRecovery(.audio, error: "test")
         #expect(engine.errorInfo == nil)
-        #expect(engine.rendererRecoveryLadder.next(at: Date()) == .reposition, "no step was taken")
+        #expect(engine.rendererRecoveryLadder.next(for: .audio, at: Date()) == .replace, "no step was taken")
     }
 
     @MainActor

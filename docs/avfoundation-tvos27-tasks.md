@@ -21,6 +21,11 @@ Items 1–6 are implemented and unit-tested, but haven't been tried on the TV ye
 3. **[x] A failed renderer is never escalated.** A failed video renderer gets flushed on every enqueue
    (AE `Renderer/SampleBufferRenderer.swift:794`). A failed audio renderer is only logged, and only in DEBUG
    builds. Both should go through the reload-at-position recovery.
+   Done as each renderer's header intends (`RendererRecoveryLadder`):
+   - video: flush in place, then reposition, then rebuild, then fail;
+   - audio: replace the failed renderer under the running synchronizer (`AudioOutput.replaceFailedRenderer`), then
+     rebuild, then fail. Its header calls the failed status terminal and names no reset, and a flush does not
+     revive one (macOS 27, `research/renderer-receiver`).
 4. **[x] The software route has no Now Playing and no remote commands.** SO `PlayerHostController.swift`
    detaches AVKit's player on that route, so nothing publishes Now Playing, and play/pause/seek from
    Control Center, the iPhone remote or Siri do nothing for Dolby Vision FEL or TrueHD→APAC titles.
@@ -51,8 +56,8 @@ Items 1–6 are implemented and unit-tested, but haven't been tried on the TV ye
      `usesSampleBufferReceivers`.
    - Gotchas: a result reports a reason only on the next enqueue, and the stream reports it as well. A cancelled
      waiting enqueue reports `.cancelledDueToFlush` without flushing or enqueueing.
-   - Finding for item 3: on macOS a flush does not revive a failed audio renderer, so the ladder's reposition
-     step cannot help audio. Check on tvOS.
+   - Finding for item 3, since acted on: on macOS a flush does not revive a failed audio renderer, so the ladder
+     now replaces it instead of repositioning. Not yet seen on tvOS.
 8. **[ ] Interruptions through `didBecomeInactiveNotification` and `resumptionRecommendationNotification` (27).**
    `interruptionNotification` and its keys are deprecated, and its reason key isn't available on tvOS.
    `DeactivationContext` tells `.routeDisconnected` (an HDMI/eARC drop) apart from Siri or a call.
