@@ -3708,6 +3708,10 @@ public final class AetherEngine: ObservableObject {
     /// the rebuild already in flight delivers the newest one. See `reanchorForAudioDelay`.
     var audioDelayReanchorInFlight = false
 
+    /// True while the software path applies an audio delay in place (`deliverSoftwareAudioDelay`); presses during it
+    /// are folded into its next pass the same way.
+    var softwareAudioDelayInFlight = false
+
     /// The playhead a rebuild of this session has to come back to (#464 round 2).
     var positionForSessionRebuild: Double {
         let pending = !isLive && nativeHost != nil

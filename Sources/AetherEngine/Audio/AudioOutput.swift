@@ -418,6 +418,16 @@ final class AudioOutput: @unchecked Sendable {
         return inForce
     }
 
+    /// `setPresentationOffset` for a session that is playing, run on the output's own queue so the partial flush is
+    /// waited for there, holding the feed (which has seconds of lead) and never the caller's actor.
+    func changePresentationOffset(seconds: Double) async -> Bool {
+        await withCheckedContinuation { (done: CheckedContinuation<Bool, Never>) in
+            automaticFlushQueue.async { [self] in
+                done.resume(returning: setPresentationOffset(seconds: seconds))
+            }
+        }
+    }
+
     /// How far past the clock an offset change takes effect: beyond the route's output latency (138 ms on the
     /// measured HDMI route), so the partial flush is not "too close to the current time" for the renderer, and
     /// the change is heard within about a quarter of a second.

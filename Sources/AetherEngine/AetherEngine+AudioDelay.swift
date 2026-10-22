@@ -94,15 +94,11 @@ extension AetherEngine {
             // heard there without a seek. Only a renderer that declines that flush still needs one:
             // what it holds keeps the old stamp, and the re-anchor (a flush and a demuxer reposition,
             // inside a seek) is what brings the change to the playhead then.
-            let inPlace = softwareHost?.setAudioDelay(clamped) ?? false
             EngineLog.emit(
-                "[AetherEngine] AE#464: audio delay = \(Self.ms(clamped)) on the software path"
-                + (inPlace ? ", in force a quarter-second past the playhead" : "; re-anchoring at the playhead"),
+                "[AetherEngine] AE#464: audio delay = \(Self.ms(clamped)) on the software path",
                 category: .engine
             )
-            if !inPlace {
-                reanchorForAudioDelay { position, _ in await self.seek(to: position, origin: .host) }
-            }
+            deliverSoftwareAudioDelay()
 
         case .segmentTimestamps:
             // A seek is NOT enough here, and measuring it is what settled the shape: seeking to the
@@ -194,6 +190,36 @@ extension AetherEngine {
     /// complete re-anchor; a burst in one runloop turn arrives before the Task reads the value and
     /// costs one. The pass starts the moment the first re-anchor returns, which on `.loopback` is
     /// before the rebuilt host has published a position; `rebuildPosition` covers that window.
+    /// The software path's delivery: the newest value applied in place by the host's audio output, off the main
+    /// actor, presses during it folded into one more pass. A renderer that declines falls back to the re-anchor.
+    private func deliverSoftwareAudioDelay() {
+        guard !softwareAudioDelayInFlight else { return }
+        softwareAudioDelayInFlight = true
+        Task { @MainActor in
+            defer { self.softwareAudioDelayInFlight = false }
+            var delivered: Double
+            repeat {
+                delivered = self.loadedOptions.audioDelaySeconds
+                guard let host = self.softwareHost else { return }
+                let inPlace = await host.setAudioDelay(delivered)
+                guard inPlace else {
+                    EngineLog.emit(
+                        "[AetherEngine] AE#464: audio delay = \(Self.ms(delivered)) could not be applied in place; "
+                        + "re-anchoring at the playhead",
+                        category: .engine
+                    )
+                    self.reanchorForAudioDelay { position, _ in await self.seek(to: position, origin: .host) }
+                    return
+                }
+                EngineLog.emit(
+                    "[AetherEngine] AE#464: audio delay = \(Self.ms(delivered)) in force a quarter-second past the "
+                    + "playhead",
+                    category: .engine
+                )
+            } while AudioDelayPolicy.isChange(from: delivered, to: self.loadedOptions.audioDelaySeconds)
+        }
+    }
+
     private func reanchorForAudioDelay(_ reanchor: @escaping (_ position: Double, _ delay: Double) async -> Void) {
         guard Self.audioDelayRecutIsPossible(state: state, isLive: isLive, liveWindow: liveWindow) else {
             EngineLog.emit(
