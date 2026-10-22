@@ -58,20 +58,16 @@ struct AudioOutputPrerollTests {
             .map { CMTimeMakeFromDictionary($0) }
     }
 
-    private func flushAutomatically(_ output: AudioOutput, expecting count: Int) async throws {
-        NotificationCenter.default.post(name: .AVSampleBufferAudioRendererWasFlushedAutomatically, object: output.renderer)
-        try await waitFor { output.automaticFlushCount == count }
-    }
-
-    @Test("after an automatic flush the last compressed packet goes in again, decoded only to prime, then the next")
-    func compressedStreamIsPrimed() async throws {
-        let output = AudioOutput()
+    @Test("after an automatic flush the last compressed packet goes in again, decoded only to prime, then the next",
+          arguments: audioOutputPaths)
+    func compressedStreamIsPrimed(throughReceivers: Bool) async throws {
+        let output = AudioOutput(throughReceivers: throughReceivers)
         let seen = Seen()
         output.rendererEnqueueObserverForTesting = { seen.add($0) }
         output.enqueue(sampleBuffer: try #require(buffer(pts: 0, compressed: true)))
         output.enqueue(sampleBuffer: try #require(buffer(pts: 1024, compressed: true)))
-        try await flushAutomatically(output, expecting: 1)
-        output.enqueue(sampleBuffer: try #require(buffer(pts: 2048, compressed: true)))
+        try await deliverAutomaticFlush(to: output, expecting: 1,
+                                        then: try #require(buffer(pts: 2048, compressed: true)))
         output.enqueue(sampleBuffer: try #require(buffer(pts: 3072, compressed: true)))
 
         let all = seen.all
@@ -83,20 +79,21 @@ struct AudioOutputPrerollTests {
         #expect(Self.trimAtStart(all[1]) == nil, "the original keeps its own attachments")
     }
 
-    @Test("LPCM needs no pre-roll and gets none")
-    func pcmIsNotPrimed() async throws {
-        let output = AudioOutput()
+    @Test("LPCM needs no pre-roll and gets none", arguments: audioOutputPaths)
+    func pcmIsNotPrimed(throughReceivers: Bool) async throws {
+        let output = AudioOutput(throughReceivers: throughReceivers)
         let seen = Seen()
         output.rendererEnqueueObserverForTesting = { seen.add($0) }
         output.enqueue(sampleBuffer: try #require(buffer(pts: 0, compressed: false)))
-        try await flushAutomatically(output, expecting: 1)
-        output.enqueue(sampleBuffer: try #require(buffer(pts: 1024, compressed: false)))
+        try await deliverAutomaticFlush(to: output, expecting: 1,
+                                        then: try #require(buffer(pts: 1024, compressed: false)))
         #expect(seen.all.count == 2)
     }
 
-    @Test("a flush the engine makes itself (a seek) restarts the decoder, so it adds nothing")
-    func explicitFlushIsNotPrimed() throws {
-        let output = AudioOutput()
+    @Test("a flush the engine makes itself (a seek) restarts the decoder, so it adds nothing",
+          arguments: audioOutputPaths)
+    func explicitFlushIsNotPrimed(throughReceivers: Bool) throws {
+        let output = AudioOutput(throughReceivers: throughReceivers)
         let seen = Seen()
         output.rendererEnqueueObserverForTesting = { seen.add($0) }
         output.enqueue(sampleBuffer: try #require(buffer(pts: 0, compressed: true)))

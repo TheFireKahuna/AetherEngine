@@ -95,9 +95,9 @@ struct AudioOutputReconfigurationTests {
         #expect(Self.pts(AudioOutput.pruned(queued, at: .zero, limit: 2)) == [2048, 3072])
     }
 
-    @Test("the notification flushes and enqueues the renderer's queue again from the clock")
-    func notificationRefeeds() async throws {
-        let output = AudioOutput()
+    @Test("the notification flushes and enqueues the renderer's queue again from the clock", arguments: audioOutputPaths)
+    func notificationRefeeds(throughReceivers: Bool) async throws {
+        let output = AudioOutput(throughReceivers: throughReceivers)
         let seen = Seen()
         output.rendererEnqueueObserverForTesting = { seen.add($0) }
         for b in try run(compressed: true) { output.enqueue(sampleBuffer: b) }
@@ -110,9 +110,9 @@ struct AudioOutputReconfigurationTests {
         #expect(Self.trimmedWhole(all[4]))
     }
 
-    @Test("a flush (a seek) empties what a reconfiguration would put back")
-    func flushEmptiesTheQueue() async throws {
-        let output = AudioOutput()
+    @Test("a flush (a seek) empties what a reconfiguration would put back", arguments: audioOutputPaths)
+    func flushEmptiesTheQueue(throughReceivers: Bool) async throws {
+        let output = AudioOutput(throughReceivers: throughReceivers)
         let seen = Seen()
         output.rendererEnqueueObserverForTesting = { seen.add($0) }
         for b in try run(compressed: false) { output.enqueue(sampleBuffer: b) }

@@ -51,11 +51,20 @@ Items 1–6 are implemented and unit-tested, but haven't been tried on the TV ye
      Those gates wait before a compressed packet is decoded, and the receiver can only wait with a decoded
      buffer in hand. Keep the deprecated readiness check there unless the demux loop is redesigned.
    - Video decode results don't apply: the engine enqueues decoded pixel buffers.
-   - Order: AudioOutput (`enqueueImmediately`, receiver `flush`, one event stream in place of two notifications
-     and the status KVO); then the lip-sync flush; then SampleBufferRenderer and HeldStill. A/B through
-     `usesSampleBufferReceivers`.
-   - Gotchas: a result reports a reason only on the next enqueue, and the stream reports it as well. A cancelled
-     waiting enqueue reports `.cancelledDueToFlush` without flushing or enqueueing.
+   - Done 2026-10-22: the audio renderer (`AudioRendererIO`), the video renderer (`VideoRendererIO`) and the
+     held still frame go through receivers on 27; the renderer's own calls remain only in their pre-27 branches
+     and in the readiness reads. A/B through `usesSampleBufferReceivers`, per session.
+     - Events come from where the receiver delivers them (macOS 27.0.1): the automatic flush and the failure
+       only with the next enqueue's result, so the automatic flush is handled inside that enqueue; the output
+       reconfiguration through the event stream at once (its repeat in the result is ignored, and a result the
+       stream missed is logged).
+     - The receiver's removing flush is async only and lands after the next line even from `Task.immediate`,
+       so the picture is removed in order with `flush()` and an empty-media marker. Not seen on screen: the
+       terminal has no screen-recording permission.
+     - The held still frame gets its own synchronizer and a timed frame: the header advises against
+       `DisplayImmediately` with a synchronizer.
+   - Left: the lip-sync offset applied at once (`flush(fromSourceTime:)`).
+   - Gotcha: a cancelled waiting enqueue reports `.cancelledDueToFlush` without flushing or enqueueing.
    - Finding for item 3, since acted on: on macOS a flush does not revive a failed audio renderer, so the ladder
      now replaces it instead of repositioning. Not yet seen on tvOS.
 8. **[ ] Interruptions through `didBecomeInactiveNotification` and `resumptionRecommendationNotification` (27).**
