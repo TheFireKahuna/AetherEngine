@@ -65,7 +65,8 @@ struct Issue597MediaServicesResetTests {
     /// Audit LIF-104: `reloadWithAudioOverride` (the audio pick, the disc-title pick, the custom-source
     /// reload) keeps the native host on the native route, and it never read the flag, so the first
     /// rebuild after a reset mounted the item on the invalidated AVPlayer while the flag stayed up.
-    @Test("a custom-source rebuild after a reset builds a fresh native player and consumes the reset",
+    /// Since round 2 the reset rebuilds an open session itself, through that same reload.
+    @Test("a reset with a custom-source session open rebuilds it with a fresh native player and consumes the reset",
           .timeLimit(.minutes(2)))
     @MainActor
     func customRebuildConsumesTheReset() async throws {
@@ -77,7 +78,8 @@ struct Issue597MediaServicesResetTests {
         engine.audioAVPlayerHost = AudioAVPlayerHost()
         engine.noteMediaServicesReset(lost: false)
 
-        try await engine.reloadAtCurrentPosition()
+        #expect(engine.mediaServicesRebuildInFlight, "an open foreground session is rebuilt at once")
+        try await waitFor { !engine.mediaServicesRebuildInFlight }
 
         #expect(engine.nativeHost != nil)
         #expect(engine.nativeHost !== invalidated)

@@ -1114,6 +1114,15 @@ public final class AetherEngine: ObservableObject {
     var rendererRecoveryLadder = RendererRecoveryLadder()
     var rendererRebuildInFlight = false
 
+    /// When `mediaServicesWereLost` arrived, nil once its reset has: while the server is gone nothing is rebuilt against
+    /// it, and the failures its objects report are symptoms, not something to recover from one by one.
+    var mediaServicesLostAt: Date?
+    /// A reset arrived while a load was in flight; the load's exit rebuilds (`runOwedMediaServicesRecovery`).
+    var mediaServicesRecoveryOwed = false
+    var mediaServicesRebuildInFlight = false
+    /// When the last reset arrived, for an AVFoundation -11819 that reaches the engine before or after it.
+    var lastMediaServicesReset: Date?
+
     func noteMediaServicesReset(lost: Bool) {
         mediaServicesResetPending = true
         dropAtmosOutputActivator()
@@ -1122,6 +1131,11 @@ public final class AetherEngine: ObservableObject {
             + "video object this process holds is invalid, so the next load builds fresh native and "
             + "audio-only players",
             category: .engine)
+        if lost {
+            mediaServicesLostAt = Date()
+        } else {
+            recoverFromMediaServicesReset()
+        }
     }
 
     func consumeMediaServicesReset() -> Bool {
@@ -3006,6 +3020,13 @@ public final class AetherEngine: ObservableObject {
                 : Self.startupGateReloadSeconds
             let outcome = await host.awaitStartupReadiness(timeoutSeconds: timeout)
             try checkLoadCurrent(gen)
+            // AE#597: a reset under the gate killed the player it would swap items on; the rebuild the reset is owed
+            // when this load exits builds a fresh one. A -11819 with no reset stays the cold handshake below.
+            if mediaServicesRecoveryCoversFailures {
+                EngineLog.emit("[AetherEngine] #597 readiness gate: media services were reset during startup; "
+                               + "leaving the item to the rebuild at the load's exit", category: .session)
+                return
+            }
 
             // AE#169 round 3: the data-wait exists for a first segment still being produced. A pump
             // that already exited with nothing served (tail resume onto an unproducible final
@@ -3918,17 +3939,19 @@ public final class AetherEngine: ObservableObject {
     }
 
     /// The blocking half of `declareAudioSessionCategory`: the XPC calls are made only when something differs.
-    nonisolated static func applyAudioSessionCategory(mode: AVAudioSession.Mode) {
+    /// `force` after a media services reset: the server's session is new, and the settings are declared again
+    /// without trusting what the process reads back for them (QA1749).
+    nonisolated static func applyAudioSessionCategory(mode: AVAudioSession.Mode, force: Bool = false) {
         let session = AVAudioSession.sharedInstance()
         let policy = audioSessionRouteSharingPolicy
-        guard session.category != .playback || session.mode != mode || session.routeSharingPolicy != policy
+        guard force || session.category != .playback || session.mode != mode || session.routeSharingPolicy != policy
                 || !session.supportsMultichannelContent else { return }
         let before = "\(session.category.rawValue)/\(session.mode.rawValue) policy=\(session.routeSharingPolicy.rawValue) "
             + "multichannel=\(session.supportsMultichannelContent)"
         do {
             try session.setCategory(.playback, mode: mode, policy: policy)
             try session.setSupportsMultichannelContent(true)
-            EngineLog.emit("[AetherEngine] AVAudioSession re-declared for this load: \(before) -> "
+            EngineLog.emit("[AetherEngine] AVAudioSession re-declared \(force ? "after a media services reset" : "for this load"): \(before) -> "
                            + "\(session.category.rawValue)/\(mode.rawValue) policy=\(policy.rawValue)", category: .engine)
         } catch {
             EngineLog.emit("[AetherEngine] AVAudioSession re-declaration error: \(error)", category: .engine)
@@ -8229,7 +8252,12 @@ public final class AetherEngine: ObservableObject {
         guard loadInFlightGeneration == generation else { return }
         loadInFlightGeneration = nil
         settleOwedBackgroundAction()
+        runOwedMediaServicesRecovery()
     }
+
+    /// Whether a load is still running, for the media services recovery, which must not rebuild under it.
+    var loadIsInFlight: Bool { loadInFlightGeneration == loadGeneration }
+    var appIsBackgrounded: Bool { isBackgrounded }
 
     /// didEnterBackground's bookkeeping. Audit CORE-2: a load or seek in flight has a pipeline
     /// (loopback server, AVIO connection, the item) but no settled state to judge it by, and it

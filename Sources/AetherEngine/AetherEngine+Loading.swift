@@ -301,9 +301,15 @@ extension AetherEngine {
             .compactMap { $0 }
             .sink { [weak self] info in
                 guard let self else { return }
-                self.publishError(Self.reclassifiedForCredentialRefusal(
-                    info, refusal: self.sessionRequestHeaders.recentCredentialRefusal(
-                        within: HLSVideoEngine.rateLimitVerdictWindowSeconds)))
+                let publish: @MainActor (PlaybackErrorInfo) -> Void = { [weak self] info in
+                    guard let self else { return }
+                    self.publishError(Self.reclassifiedForCredentialRefusal(
+                        info, refusal: self.sessionRequestHeaders.recentCredentialRefusal(
+                            within: HLSVideoEngine.rateLimitVerdictWindowSeconds)))
+                }
+                // AE#597: a media services reset fails the session's objects with -11819; its recovery answers it.
+                if self.takeOverMediaServicesResetFailure(info, publish: publish) { return }
+                publish(info)
             }
             .store(in: &cancellables)
         didReachEnd

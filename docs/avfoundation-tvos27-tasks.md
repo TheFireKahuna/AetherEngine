@@ -3,7 +3,7 @@
 An audit of the engine (AE) and Sodalite (SO) against the tvOS 27.2 SDK (Xcode 27.2 beta), 2026-10-22.
 Each item was checked against the code and the SDK headers. Line numbers are from when the audit was done.
 
-Items 1–5 are implemented and unit-tested, but haven't been tried on the TV yet (2026-10-22).
+Items 1–6 are implemented and unit-tested, but haven't been tried on the TV yet (2026-10-22).
 
 ## Fix
 
@@ -27,7 +27,7 @@ Items 1–5 are implemented and unit-tested, but haven't been tried on the TV ye
 5. **[x] Returning to the foreground activates the session directly.** SO `PlayerHostController.swift:1070,1083`
    call `setActive(true)` on the main thread, bypassing the engine's transition queue. On the native path
    this is the activation #24 forbids: it latches an idle HDMI link at stereo.
-6. **[ ] A media-services reset leaves the category undeclared.** AE `noteMediaServicesReset` (`AetherEngine.swift:1112`)
+6. **[x] A media-services reset leaves the category undeclared.** AE `noteMediaServicesReset` (`AetherEngine.swift:1112`)
    rebuilds the players, but the category, mode, policy and multichannel flag are lost too
    (QA1749). With item 1's per-load declaration this needs a forced re-declare.
 

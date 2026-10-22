@@ -14,6 +14,13 @@ extension AetherEngine {
         }
         // The rebuild's own teardown and load are not a new failure of the session being rebuilt.
         guard !rendererRebuildInFlight else { return }
+        // AE#597: a renderer failing because the media server went away is answered by the reset's recovery, which
+        // rebuilds everything at once; a reposition against a dead server would only spend a step.
+        guard !mediaServicesRecoveryCoversFailures else {
+            EngineLog.emit("[AetherEngine] \(which.rawValue) renderer failed (\(error)) during a media services "
+                           + "reset: left to its recovery", category: .engine)
+            return
+        }
         let step = rendererRecoveryLadder.next(at: Date())
         EngineLog.emit(
             "[AetherEngine] \(which.rawValue) renderer failed (\(error)): recovery step \(step.rawValue)",

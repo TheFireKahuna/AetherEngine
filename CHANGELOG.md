@@ -135,6 +135,18 @@ the public-API contract.
 
 ### Fixed
 
+- **A media services reset is recovered from when it happens.** The reset only flagged the next load, so a
+  session open at the time ran on dead objects until something failed: a native item with -11819, a software
+  renderer climbing the recovery ladder one step at a time, or nothing at all while paused, and the Atmos output
+  activator stayed gone for the rest of the title. Now, per the platform contract (QA1749): the session's
+  category, mode, policy and multichannel content are declared again unconditionally; an open session in the
+  foreground is rebuilt at its position, keeping its transport state; a load in flight is rebuilt when it exits;
+  in the background or with nothing open the next load consumes the reset, as before. While the server is lost
+  (up to 10 s) or the reset is being recovered from, renderer failures and -11819 item failures are taken for
+  its symptoms rather than recovered one by one, and the startup gate leaves its dead item to the rebuild. A
+  -11819 that no reset accompanies within 2 s is published as before and logged, since the startup gate reads a
+  bare one as a cold Dolby Vision handshake.
+
 - **A failed renderer is recovered, or reported.** A failed video renderer on the software route was flushed on
   every frame for the rest of the session, black with the audio running, and a failed audio renderer (software
   route or audio-only) was a debug-only log line under a clock that ran on in silence. A renderer that stays
