@@ -202,9 +202,13 @@ extension PlaybackPhase {
     /// the whole reason this phase exists. Over a delivering source nothing changes: the reader is
     /// `.flowing` and a seek reads `.seeking` exactly as before, and a seek that can land from cache over a
     /// reconnecting reader clears itself in milliseconds.
+    /// `settlingSeek`: a native seek has landed and AVPlayer is still prerolling the new position (see
+    /// `AetherEngine.nativeSeekSettling`). That wait is the seek's own tail, so it reads `.seeking`, not
+    /// `.rebuffering`, which is reserved for an underrun of playback that was already running.
     static func derive(state: PlaybackState,
                        isBuffering: Bool,
                        isSeeking: Bool,
+                       settlingSeek: Bool = false,
                        stall: ReaderNetworkPhase,
                        transportHasRolled: Bool) -> PlaybackPhase {
         switch state {
@@ -218,7 +222,7 @@ extension PlaybackPhase {
             case .exhausted:    return .stalled(reconnecting: false)
             case .flowing:      break
             }
-            if isSeeking { return .seeking }
+            if isSeeking || settlingSeek { return .seeking }
             // AE#440: `state` is transport INTENT, and every autostart writes it before AVPlayer has
             // rolled anything. On a live join that gap is seconds wide, so a phase of `.playing` there
             // describes a picture that is standing still. Until the transport has moved once, the

@@ -550,6 +550,9 @@ extension AetherEngine {
                 @unknown default:
                     break
                 }
+                // A landed seek's preroll ends when the transport rolls or pauses. After the `isBuffering`
+                // write above, so the phase goes from `.seeking` straight to where it lands.
+                if status != .waitingToPlayAtSpecifiedRate { self.endNativeSeekSettle() }
                 // AE#440: the rate is rolling, which is what `playbackPhase` reports as `.playing`.
                 // Last, so this load's `state` and `isBuffering` writes are already in and the phase
                 // recomputes once, onto the roll.
@@ -1607,6 +1610,9 @@ extension AetherEngine {
                 // isBuffering only once playback has started (not during initial load spin-up).
                 let startedPlaying = self.state == .playing || self.state == .paused
                 self.isBuffering = startedPlaying && status == .waitingToPlayAtSpecifiedRate
+                // A landed seek's preroll ends when the transport rolls or pauses; after the write above,
+                // for the same reason as the latch below.
+                if status != .waitingToPlayAtSpecifiedRate { self.endNativeSeekSettle() }
                 // AE#440: the rate is rolling. The autostart wrote `state = .playing` before AVPlayer had
                 // moved anything, and on a live join AVPlayer can hold a presented first frame still for
                 // seconds past that, so `playbackPhase` reports `.loading` until this latches.
