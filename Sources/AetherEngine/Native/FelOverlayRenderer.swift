@@ -1,0 +1,270 @@
+// Only with the DualLayerDolbyVision trait (off by default).
+#if DualLayerDolbyVision
+import AVFoundation
+import CoreMedia
+import CoreVideo
+import QuartzCore
+
+/// Draws a Profile 7 FEL picture over an `AVPlayer` that plays the source's base layer.
+///
+/// AVPlayer keeps everything it is good at (loading, seeking, audio, AVKit's transport, menus and native
+/// subtitles) and decodes the base layer as usual; `AVPlayerItemVideoOutput` hands each decoded frame back,
+/// bit-identical to our own VideoToolbox decode and before any reshaping. Each one is paired by timestamp
+/// with its enhancement picture and parameters from a ``FelEnhancementSource``, composed on the dual-layer
+/// composer, given its composed-form RPU, and enqueued on ``layer``: an `AVSampleBufferDisplayLayer` whose
+/// timebase follows the item's 1:1, so it shows each frame when AVPlayer would have shown its own.
+///
+/// The layer is opaque and covers AVPlayer's picture, so AVPlayer dropping or holding a frame never shows.
+/// It belongs inside the `AVPlayerLayer`, between the video and the subtitle layers, so native subtitles
+/// stay on top (``install(in:)``). A frame whose enhancement picture has not decoded yet is composed with
+/// its residual off; one with no parameters at all (just after a seek, before the reader reaches it) is
+/// not drawn, and AVPlayer's own picture shows through for that moment.
+public final class FelOverlayRenderer: @unchecked Sendable {
+
+    public struct Counters: Sendable {
+        public var pulled = 0
+        public var composed = 0
+        public var residualOff = 0
+        public var notReady = 0
+        public var composeFailed = 0
+        public var repositions = 0
+    }
+
+    public let layer = AVSampleBufferDisplayLayer()
+    /// Test seam: every composed frame with the item time it was enqueued for, on the render queue.
+    public var onComposed: (@Sendable (CMTime, CVPixelBuffer) -> Void)?
+
+    private let output: AVPlayerItemVideoOutput
+    private weak var item: AVPlayerItem?
+    private let source: FelEnhancementSource
+    private let composer: DoviFelComposer
+    /// Source time minus item time.
+    private let sourceOffset: Double
+    private let queue = DispatchQueue(label: "aether.fel-overlay", qos: .userInteractive)
+    private var timer: DispatchSourceTimer?
+    private var jumpObserver: NSObjectProtocol?
+    private var readyObservation: NSKeyValueObservation?
+    private var boundsObservation: NSKeyValueObservation?
+    private var gravityObservation: NSKeyValueObservation?
+    private let lifecycle = NSLock()
+    private var started = false
+    private var stopped = false
+    /// Render-queue state.
+    private var lastPulled = CMTime.invalid
+    private var frameIndex: UInt32 = 0
+    private var blankEnhancement: CVPixelBuffer?
+    private var lastLog = CACurrentMediaTime()
+    private let countersLock = NSLock()
+    private var _counters = Counters()
+
+    /// How far ahead of the clock frames are pulled and composed: enough for the GPU, short enough that a
+    /// seek's first frame is not held back.
+    static let pullLead = 0.1
+
+    public var counters: Counters { countersLock.withLock { _counters } }
+
+    /// Nil when the composer cannot be built (no Metal device).
+    public init?(item: AVPlayerItem, sourceURL: URL, headers: [String: String] = [:], sourceOffset: Double = 0) {
+        guard let composer = DoviFelComposer() else { return nil }
+        self.composer = composer
+        self.item = item
+        self.sourceOffset = sourceOffset
+        self.source = FelEnhancementSource(url: sourceURL, headers: headers)
+        output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: any Sendable](),
+        ])
+        layer.videoGravity = .resizeAspect
+        layer.backgroundColor = CGColor(gray: 0, alpha: 0)
+    }
+
+    deinit { stop() }
+
+    /// Attaches to the item and starts, now or as soon as the item is ready to play (its timebase exists).
+    public func start() {
+        guard let item else { return }
+        if item.timebase != nil {
+            begin()
+            return
+        }
+        readyObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+            guard item.status == .readyToPlay else { return }
+            self?.begin()
+        }
+    }
+
+    private func begin() {
+        lifecycle.lock()
+        guard !started, !stopped, let item, let itemTimebase = item.timebase else { lifecycle.unlock(); return }
+        started = true
+        lifecycle.unlock()
+        readyObservation?.invalidate()
+        readyObservation = nil
+        item.add(output)
+        var timebase: CMTimebase?
+        CMTimebaseCreateWithSourceTimebase(allocator: kCFAllocatorDefault, sourceTimebase: itemTimebase, timebaseOut: &timebase)
+        if let timebase {
+            // A child timebase starts at rate 0 relative to its source; run it 1:1 with the item's clock.
+            let now = CMTimebaseGetTime(itemTimebase)
+            CMTimebaseSetRateAndAnchorTime(timebase, rate: 1, anchorTime: now, immediateSourceTime: now)
+            layer.controlTimebase = timebase
+        }
+        source.start(at: CMTimebaseGetTime(itemTimebase).seconds + sourceOffset)
+        // A seek moves the item's clock before its first frame decodes: start reading there right away.
+        jumpObserver = NotificationCenter.default.addObserver(forName: CMTimebase.timeJumped, object: itemTimebase, queue: nil) { [weak self] _ in
+            guard let self else { return }
+            let t = CMTimebaseGetTime(itemTimebase).seconds + self.sourceOffset
+            self.source.reposition(to: t)
+            self.countersLock.withLock { self._counters.repositions += 1 }
+        }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(4), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in self?.tick() }
+        timer.resume()
+        self.timer = timer
+    }
+
+    public func stop() {
+        lifecycle.lock()
+        stopped = true
+        lifecycle.unlock()
+        readyObservation?.invalidate()
+        readyObservation = nil
+        boundsObservation?.invalidate()
+        boundsObservation = nil
+        gravityObservation?.invalidate()
+        gravityObservation = nil
+        timer?.cancel()
+        timer = nil
+        if let jumpObserver { NotificationCenter.default.removeObserver(jumpObserver) }
+        jumpObserver = nil
+        source.close()
+        if let item, item.outputs.contains(output) { item.remove(output) }
+    }
+
+    /// Puts ``layer`` inside `playerLayer`, above its video and below its subtitles, sized to it.
+    /// AVPlayerLayer's sublayers are private: the video container and `FigSubtitleCALayer` share an
+    /// intermediate layer. Falls back to the top of `playerLayer` when that shape is not found.
+    @discardableResult
+    public func install(in playerLayer: AVPlayerLayer) -> Bool {
+        func intermediate(of l: CALayer) -> CALayer? {
+            l.sublayers?.first { String(describing: type(of: $0)) == "AVPlayerLayerIntermediateLayer" && !$0.isHidden }
+        }
+        let host: CALayer
+        let belowSubtitles: Bool
+        if let candidate = intermediate(of: playerLayer),
+           let subtitles = candidate.sublayers?.firstIndex(where: { String(describing: type(of: $0)) == "FigSubtitleCALayer" }) {
+            candidate.insertSublayer(layer, at: UInt32(subtitles))
+            host = candidate
+            belowSubtitles = true
+        } else {
+            playerLayer.addSublayer(layer)
+            host = playerLayer
+            belowSubtitles = false
+        }
+        layer.videoGravity = playerLayer.videoGravity
+        layer.frame = host.bounds
+        // AVKit resizes its player layer (PiP, picture modes, rotation on iOS); follow it.
+        boundsObservation = host.observe(\.bounds, options: [.new]) { [weak self] host, _ in
+            guard let self else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            self.layer.frame = host.bounds
+            CATransaction.commit()
+        }
+        // The host's picture modes (fit / fill) set the player layer's gravity; the overlay matches it.
+        gravityObservation = playerLayer.observe(\.videoGravity, options: [.new]) { [weak self] playerLayer, _ in
+            self?.layer.videoGravity = playerLayer.videoGravity
+        }
+        EngineLog.emit("[FelOverlayRenderer] installed \(belowSubtitles ? "below the native subtitles" : "on top of the player layer (subtitle layer not found)")",
+                       category: .swPlayback)
+        return belowSubtitles
+    }
+
+    // MARK: - Render queue
+
+    private func tick() {
+        let ahead = output.itemTime(forHostTime: CACurrentMediaTime() + Self.pullLead)
+        guard output.hasNewPixelBuffer(forItemTime: ahead) else { return }
+        var shown = CMTime.invalid
+        guard let base = output.copyPixelBuffer(forItemTime: ahead, itemTimeForDisplay: &shown), shown.isValid else { return }
+        countersLock.withLock { _counters.pulled += 1 }
+
+        if lastPulled.isValid, shown < lastPulled || (shown - lastPulled).seconds > 1 {
+            // Backward or far: whatever the layer holds belongs to the old position.
+            layer.sampleBufferRenderer.flush()
+            source.reposition(to: shown.seconds + sourceOffset)
+        }
+        lastPulled = shown
+        let seconds = shown.seconds + sourceOffset
+        source.advance(to: seconds)
+        logCountersIfDue()
+
+        guard let frame = source.frame(at: seconds) else {
+            countersLock.withLock { _counters.notReady += 1 }
+            return
+        }
+        var params = frame.params
+        let enhancement: CVPixelBuffer
+        if let el = frame.enhancement {
+            enhancement = el
+        } else if let blank = blankEnhancement(for: base) {
+            params.flags.insert(.disableResidual)
+            enhancement = blank
+            countersLock.withLock { _counters.residualOff += 1 }
+        } else {
+            return
+        }
+        frameIndex &+= 1
+        let rpu = frame.composedRpu
+        composer.composeAsync(baseBuffer: base, enhancementBuffer: enhancement, params: params, frameIndex: frameIndex) { [weak self] composed in
+            guard let self else { return }
+            guard let composed else {
+                self.countersLock.withLock { self._counters.composeFailed += 1 }
+                return
+            }
+            DoviDisplayMetadata.attach(rpuNAL: rpu, to: composed)
+            self.queue.async { self.enqueue(composed, at: shown) }
+        }
+    }
+
+    private func enqueue(_ buffer: CVPixelBuffer, at time: CMTime) {
+        // A frame composed for the old position after a backward jump would play as a stale flash.
+        if lastPulled.isValid, time < lastPulled - CMTime(seconds: 1, preferredTimescale: 600) { return }
+        var format: CMVideoFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: buffer, formatDescriptionOut: &format)
+        guard let format else { return }
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: time, decodeTimeStamp: .invalid)
+        var sample: CMSampleBuffer?
+        CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: buffer, formatDescription: format,
+                                                 sampleTiming: &timing, sampleBufferOut: &sample)
+        guard let sample else { return }
+        layer.sampleBufferRenderer.enqueue(sample)
+        countersLock.withLock { _counters.composed += 1 }
+        onComposed?(time, buffer)
+    }
+
+    /// An enhancement-sized picture the kernels can bind when the residual is off; its content is never read.
+    private func blankEnhancement(for base: CVPixelBuffer) -> CVPixelBuffer? {
+        if let blankEnhancement { return blankEnhancement }
+        var buffer: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, CVPixelBufferGetWidth(base) / 2, CVPixelBufferGetHeight(base) / 2,
+                            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                            [kCVPixelBufferIOSurfacePropertiesKey: [String: Any](),
+                             kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary, &buffer)
+        blankEnhancement = buffer
+        return buffer
+    }
+
+    private func logCountersIfDue() {
+        let now = CACurrentMediaTime()
+        guard now - lastLog >= 10 else { return }
+        lastLog = now
+        let c = counters
+        let held = source.heldFrames
+        EngineLog.emit("[FelOverlayRenderer] composed \(c.composed), residual off \(c.residualOff), not ready \(c.notReady), compose failed \(c.composeFailed), "
+                       + "repositions \(c.repositions), held \(held.side)/\(held.enhancement)", category: .swPlayback)
+    }
+}
+#endif
