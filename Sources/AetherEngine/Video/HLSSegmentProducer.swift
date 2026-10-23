@@ -4399,7 +4399,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                 EngineLog.emit(
                                     "[HLSSegmentProducer] DV P7 source carries a Full Enhancement Layer (FEL); "
                                     + "it is discarded in the P8.1 conversion, so some highlight/detail refinement "
-                                    + "is lost versus a native P7 player",
+                                    + "is lost versus a native P7 player unless LoadOptions.felOverlay composes it over AVPlayer",
                                     category: .session
                                 )
                             }

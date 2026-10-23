@@ -408,8 +408,9 @@ enum SessionOptionCorrection {
     ) -> SessionReloadRefusal? {
         guard DualLayerRouteDecision.isBuiltIn, isCustomSource, dvProfile == 7 else { return nil }
         let preferenceChanged = proposed.preferDualLayerDolbyVision != current.preferDualLayerDolbyVision
+            || proposed.felOverlay != current.felOverlay
         let handlingMovesRoute = proposed.dolbyVisionHandling != current.dolbyVisionHandling
-            && proposed.preferDualLayerDolbyVision
+            && (proposed.preferDualLayerDolbyVision || proposed.felOverlay)
         guard preferenceChanged || handlingMovesRoute else { return nil }
         return .dualLayerRouteNeedsFreshLoad
     }
@@ -444,7 +445,7 @@ enum SessionOptionCorrection {
     /// deliberately. Update this list and, if the field names the session, `loadIdentityFields`.
     static let knownFields: [String] = [
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "displayCriteriaOwner", "httpHeaders", "nativeVideoFrameDiagnostics", "nativeVideoFrameRecovery", "hostRetriesExhaustedLiveReplay",
-        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "preferDualLayerDolbyVision", "matchContentEnabled",
+        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "preferDualLayerDolbyVision", "felOverlay", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
         "audioBridgeMode", "objectAudioRendering", "objectDialogueGain", "isLive", "audioOnly",
         "dvrWindowSeconds",

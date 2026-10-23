@@ -674,6 +674,18 @@ public final class AetherEngine: ObservableObject {
     /// Enhancement layer type for Profile 7 streams ("FEL" or "MEL") extracted from the first RPU.
     var sourceElType: String? = nil
 
+    /// `LoadOptions.felOverlay` was decided for this load: a FEL on the native route, its enhancement
+    /// layer composed over AVPlayer's picture by `felOverlay`.
+    var felOverlayWanted = false
+
+    #if DualLayerDolbyVision
+    /// The FEL overlay for the current native item, nil unless `LoadOptions.felOverlay` put a Profile 7
+    /// FEL on the native route. A new renderer comes with every item (`replaceCurrentItem` on an audio
+    /// switch or a reload), so a host installs it again whenever this changes: `install(in:)` the
+    /// `AVPlayerLayer` that shows `currentAVPlayer`, AVKit's own included.
+    @Published public internal(set) var felOverlay: FelOverlayRenderer?
+    #endif
+
     /// Whether the loaded source's Dolby Vision has a base layer `LoadOptions.dolbyVisionHandling =
     /// .baseLayerOnly` can present (`VideoRoutingPolicy.dolbyVisionBaseLayerIsPresentable`), decided
     /// on the probe stream for the same reason as `sourceDVBLCompatID`: a correction that turns the
@@ -4466,6 +4478,7 @@ public final class AetherEngine: ObservableObject {
         dolbyVisionConversion = nil
         sourceCarriesHDR10PlusMetadata = false
         sourceElType = nil
+        felOverlayWanted = false
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
@@ -5300,6 +5313,11 @@ public final class AetherEngine: ObservableObject {
                 category: .engine
             )
         }
+        // The FEL overlay (`LoadOptions.felOverlay`) composes the same two layers, so it runs every gate and
+        // probe the dual-layer route runs; only the route a taken decision leads to differs (below).
+        let composesDualLayers = options.preferDualLayerDolbyVision
+            || (options.felOverlay && DualLayerRouteDecision.isBuiltIn)
+        felOverlayWanted = false
         // A Profile 7 source with in-band parameter sets (`hev1` with an empty hvcC) is unclassifiable
         // to the strict verdict below and would stay native for that reason alone. When the dual-layer
         // route is wanted, complete the probe's record from the head of the stream first; the session
@@ -5310,7 +5328,7 @@ public final class AetherEngine: ObservableObject {
                codecID: detectedCodecID,
                dvProfile: detectedDVProfileNum,
                dolbyVisionHandling: options.dolbyVisionHandling,
-               preferDualLayerDolbyVision: options.preferDualLayerDolbyVision,
+               preferDualLayerDolbyVision: composesDualLayers,
                canHardwareDecode: nil) {
             try await settlePanelRouting(ownsProbe: true)
         }
@@ -5319,7 +5337,7 @@ public final class AetherEngine: ObservableObject {
                codecID: detectedCodecID,
                dvProfile: detectedDVProfileNum,
                dolbyVisionHandling: options.dolbyVisionHandling,
-               preferDualLayerDolbyVision: options.preferDualLayerDolbyVision,
+               preferDualLayerDolbyVision: composesDualLayers,
                canHardwareDecode: nil) {
             let vIdx = probe.videoStreamIndex
             await BlockingWork.detached(priority: .userInitiated) { [probe] in
@@ -5362,7 +5380,7 @@ public final class AetherEngine: ObservableObject {
             codecID: detectedCodecID,
             dvProfile: detectedDVProfileNum,
             dolbyVisionHandling: options.dolbyVisionHandling,
-            preferDualLayerDolbyVision: options.preferDualLayerDolbyVision,
+            preferDualLayerDolbyVision: composesDualLayers,
             isLive: options.isLive,
             isSourceSeekable: dualLayerSeekable,
             canHardwareDecode: opensHardwareHEVC,
@@ -5383,7 +5401,7 @@ public final class AetherEngine: ObservableObject {
             codecID: detectedCodecID,
             dvProfile: detectedDVProfileNum,
             dolbyVisionHandling: options.dolbyVisionHandling,
-            preferDualLayerDolbyVision: options.preferDualLayerDolbyVision,
+            preferDualLayerDolbyVision: composesDualLayers,
             isLive: options.isLive,
             isSourceSeekable: dualLayerSeekable,
             canHardwareDecode: opensHardwareHEVC,
@@ -5396,6 +5414,13 @@ public final class AetherEngine: ObservableObject {
         // A route that was not taken leaves no el_type behind, so neither the routing below nor a
         // software host the session reaches for another reason composes the dual layers.
         if !dualLayerDecision.isTaken { elType = nil }
+        // The overlay keeps a FEL on the native route: AVPlayer plays its base layer and `felOverlay`
+        // composes the enhancement layer over it, so neither the routing nor a software host sees an el_type.
+        if options.felOverlay, dualLayerDecision.isTaken, elType == "FEL" {
+            felOverlayWanted = true
+            elType = nil
+            EngineLog.emit("[AetherEngine] Profile 7 FEL: native route with the enhancement layer composed over AVPlayer (felOverlay)", category: .engine)
+        }
         sourceElType = elType
         var useSoftwarePath = VideoRoutingPolicy.requiresSoftwarePath(
             codecID: detectedCodecID,
@@ -6900,6 +6925,7 @@ public final class AetherEngine: ObservableObject {
         dolbyVisionConversion = nil
         sourceCarriesHDR10PlusMetadata = false
         sourceElType = nil
+        felOverlayWanted = false
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
@@ -6947,7 +6973,9 @@ public final class AetherEngine: ObservableObject {
     /// Item currently loaded into `currentAVPlayer` (#260). Published separately because items are swapped in
     /// place (`replaceCurrentItem`, on every audio-track reload and episode autoplay) without the player itself
     /// changing, so a host holding the item or its timebase gets no signal from `currentAVPlayer` alone.
-    @Published public internal(set) var currentAVPlayerItem: AVPlayerItem?
+    @Published public internal(set) var currentAVPlayerItem: AVPlayerItem? {
+        didSet { if currentAVPlayerItem !== oldValue { refreshFelOverlay() } }
+    }
     private var currentItemObservation: NSKeyValueObservation?
 
     private func observeCurrentItem() {

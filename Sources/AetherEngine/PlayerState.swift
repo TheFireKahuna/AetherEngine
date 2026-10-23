@@ -514,6 +514,15 @@ public struct LoadOptions: Sendable, Equatable {
     /// which also decodes it and loses the objects. Not engineered around.
     public var preferDualLayerDolbyVision: Bool = false
 
+    /// A Profile 7 FEL stays on the native route, and its enhancement layer is composed over AVPlayer's
+    /// picture instead: `AetherEngine.felOverlay` pairs each base-layer frame AVPlayer decodes with the
+    /// source's enhancement layer, composes it on the dual-layer composer and presents it in a layer the
+    /// host puts inside its `AVPlayerLayer` (`FelOverlayRenderer.install(in:)`). AVPlayer keeps the
+    /// transport, AVKit's controls and menus, native subtitles and the audio (Dolby Atmos included).
+    /// Same capability gate as `preferDualLayerDolbyVision`, which it takes precedence over. Needs the
+    /// `DualLayerDolbyVision` trait; without it the option does nothing. Default off.
+    public var felOverlay: Bool = false
+
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
 
@@ -1013,6 +1022,7 @@ public struct LoadOptions: Sendable, Equatable {
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
         preferDualLayerDolbyVision: Bool = false,
+        felOverlay: Bool = false,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
@@ -1071,6 +1081,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
         self.dolbyVisionHandling = dolbyVisionHandling
         self.preferDualLayerDolbyVision = preferDualLayerDolbyVision
+        self.felOverlay = felOverlay
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel
