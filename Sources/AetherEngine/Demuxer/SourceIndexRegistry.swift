@@ -3,17 +3,19 @@ import Foundation
 /// A source's container index, parsed once for every reader of it.
 ///
 /// The index is what tells a reader where a source's bytes are by time: a Matroska file's Cues name
-/// the cluster and offset of every subtitle block and every video keyframe. Read once, it lets each
+/// the cluster and offset of every subtitle block and every video keyframe, an MP4's sample tables
+/// every sample (`SourceIndex`). Read once, it lets each
 /// consumer (the indexed subtitle fill, the subtitle prefetch, the I-frame rendition, seeking) fetch
 /// exactly the bytes it needs. Read once per consumer, it is the same tens of megabytes of Cues
 /// parsed again for each, and the consumers disagree the moment one of them reads a different
-/// version. So there is one index per source, and the parser is reachable only from here:
-/// `MatroskaCueIndex.read` takes a `ParseToken`, which nothing outside this file can make.
+/// version. So there is one index per source, and the readers are reachable only from here:
+/// `MatroskaCueIndex.read` and `MP4SampleIndex.read` take a `ParseToken`, which nothing outside this
+/// file can make.
 ///
 /// An index is per source and per size, the source cache's identity (`SourceCacheKey`) plus the
 /// total, so a body that changes under the same request is a new entry rather than a stale one. The
-/// first caller's byte source is the one parsed; a caller arriving while the parse runs waits for
-/// it, and every later caller is handed the result. A source that is not Matroska or carries no Cues
+/// first caller's source is the one read; a caller arriving while the read runs waits for it, and
+/// every later caller is handed the result. A container no reader covers, or a file without an index,
 /// is a permanent answer and is kept; a read that broke off mid-way (`malformed`, which an origin
 /// dropping a range produces as readily as a corrupt file) is not, so the next consumer tries again.
 /// The parse reads through whatever source the caller opened, which over HTTP is a cache-backed
@@ -25,8 +27,8 @@ final class SourceIndexRegistry: @unchecked Sendable {
     /// kilobytes of block positions, and a session reads one source at a time.
     static let capacity = 8
 
-    /// Proof that a parse was asked for by the registry. The parser requires one, so a second parse
-    /// of a source cannot be added anywhere else by accident.
+    /// Proof that a read was asked for by the registry. The index readers require one, so a second
+    /// read of a source cannot be added anywhere else by accident.
     struct ParseToken: Sendable {
         fileprivate init() {}
 
@@ -43,11 +45,11 @@ final class SourceIndexRegistry: @unchecked Sendable {
     }
 
     enum Outcome: Sendable {
-        case matroska(MatroskaCueIndex)
-        case unavailable(MatroskaCueIndex.ReadError)
+        case indexed(any SourceIndex)
+        case unavailable(SourceIndexError)
 
-        var index: MatroskaCueIndex? {
-            if case .matroska(let index) = self { return index }
+        var index: (any SourceIndex)? {
+            if case .indexed(let index) = self { return index }
             return nil
         }
     }
@@ -57,29 +59,40 @@ final class SourceIndexRegistry: @unchecked Sendable {
     private var order: [Key] = []
     private var parses = 0
 
-    /// The Matroska index of `url` as asked for with `headers`, parsed (if it has not been) through
-    /// `reader`. The key is derived here, from the request and the reader's own size, so two consumers
-    /// of one source cannot name it differently and parse it twice. `reader` stays the caller's.
-    func matroskaIndex(of url: URL, headers: [String: String], through reader: IOReader) async -> Outcome {
+    /// The index of `url` as asked for with `headers`, which `demuxer` opened, read (if it has not
+    /// been) through `reader`. The key is derived here, from the request and the reader's own size, so
+    /// two consumers of one source cannot name it differently and read it twice. The container is the
+    /// one libavformat opened: Matroska's Cues are parsed off `reader`; an MP4's sample tables are the
+    /// ones `demuxer` built. `reader` and `demuxer` stay the caller's.
+    func index(of url: URL, headers: [String: String], demuxer: Demuxer, through reader: IOReader) async -> Outcome {
         let key = Key(source: SourceCacheKey(url: url, headers: headers),
                       size: reader.seek(offset: 0, whence: 65536))
         let source = IOReaderByteSource(reader, closesReader: false)
-        return await matroskaIndex(for: key, open: { source })
+        let format = demuxer.containerFormatName ?? ""
+        if format.contains("matroska") {
+            return await index(for: key) { token in try MatroskaCueIndex.read(from: source, token: token) }
+        }
+        if format.contains("mp4") {
+            let streams = AetherEngine.indexedSubtitleStreams(of: demuxer)
+            return await index(for: key) { token in
+                try MP4SampleIndex.read(demuxer: demuxer, streams: streams, source: source, token: token)
+            }
+        }
+        return .unavailable(.unsupportedContainer)
     }
 
-    /// The Matroska index of the source at `key`. Parsed by the first caller, from the byte source
-    /// `open` hands over (nil reads as not readable and is not remembered), and by no caller after it.
-    /// The parse runs on its own task, so a caller that is cancelled while waiting leaves it to finish
-    /// for the others.
-    func matroskaIndex(for key: Key, open: @escaping @Sendable () -> RandomAccessByteSource?) async -> Outcome {
-        let task = parseTask(for: key, open: open)
+    /// The index of the source at `key`. Read by the first caller, with `read`, and by no caller after
+    /// it. The read runs on its own task, so a caller that is cancelled while waiting leaves it to
+    /// finish for the others.
+    func index(for key: Key, read: @escaping @Sendable (ParseToken) throws -> any SourceIndex) async -> Outcome {
+        let task = parseTask(for: key, read: read)
         let outcome = await task.value
         if case .unavailable(.malformed) = outcome { forget(key, ifStill: task) }
         return outcome
     }
 
     /// The one parse of `key`: the running or finished one, or a new one started here.
-    private func parseTask(for key: Key, open: @escaping @Sendable () -> RandomAccessByteSource?)
+    private func parseTask(for key: Key, read: @escaping @Sendable (ParseToken) throws -> any SourceIndex)
         -> Task<Outcome, Never>
     {
         lock.lock(); defer { lock.unlock() }
@@ -89,11 +102,10 @@ final class SourceIndexRegistry: @unchecked Sendable {
             return existing
         }
         let task = BlockingWork.detached(priority: .utility) { [self] () -> Outcome in
-            guard let source = open() else { return .unavailable(.malformed("source not range-readable")) }
             noteParse()
             do {
-                return .matroska(try MatroskaCueIndex.read(from: source, token: ParseToken()))
-            } catch let error as MatroskaCueIndex.ReadError {
+                return .indexed(try read(ParseToken()))
+            } catch let error as SourceIndexError {
                 return .unavailable(error)
             } catch {
                 return .unavailable(.malformed("\(error)"))

@@ -2018,23 +2018,44 @@ public final class Demuxer: @unchecked Sendable {
               let stream = ctx.pointee.streams[Int(streamIndex)] else {
             return []
         }
-        let count = avformat_index_get_entries_count(stream)
-        guard count > 0 else { return [] }
         let tb = stream.pointee.time_base
         var result: [(pts: Int64, pos: Int64)] = []
-        for i in 0..<count {
+        for entry in Self.indexEntries(of: stream) {
             // AVINDEX_KEYFRAME = 0x0001. Fold each entry onto the contiguous timeline (multi-clip disc)
             // so the segment plan built from these IRAP positions matches the normalized packets
             // (AE#105), then onto the repaired decode ladder if #409 moved it.
-            guard let entry = avformat_index_get_entry(stream, i),
-                  entry.pointee.flags & 0x0001 != 0,
-                  Self.isPlausibleIndexTimestamp(entry.pointee.timestamp, timeBase: tb),
-                  let folded = normalizedTimestamp(entry.pointee.timestamp, pos: entry.pointee.pos, timeBase: tb),
+            guard entry.flags & 0x0001 != 0,
+                  Self.isPlausibleIndexTimestamp(entry.timestamp, timeBase: tb),
+                  let folded = normalizedTimestamp(entry.timestamp, pos: entry.pos, timeBase: tb),
                   let placed = Self.offsetIndexTimestamp(folded, by: compositionOffset)
             else { continue }
-            result.append((pts: placed, pos: entry.pointee.pos))
+            result.append((pts: placed, pos: entry.pos))
         }
         return result
+    }
+
+    /// `streamIndex`'s sample table as libavformat built it at open, edit lists applied: the entries
+    /// `av_read_frame` reads its packets from, which is what `MP4SampleIndex` is made of. Under
+    /// `accessLock`, since a fragmented file's entries grow inside `av_read_frame`.
+    func sampleTable(streamIndex: Int32) -> DemuxedSampleTable? {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let ctx = formatContext, streamIndex >= 0, streamIndex < Int32(ctx.pointee.nb_streams),
+              let stream = ctx.pointee.streams[Int(streamIndex)] else { return nil }
+        return DemuxedSampleTable(startTime: stream.pointee.start_time,
+                                  duration: stream.pointee.duration, entries: Self.indexEntries(of: stream))
+    }
+
+    /// libavformat's index of `stream`, entry by entry. Callers hold `accessLock`.
+    private static func indexEntries(of stream: UnsafeMutablePointer<AVStream>) -> [DemuxedSampleTable.Entry] {
+        let count = avformat_index_get_entries_count(stream)
+        guard count > 0 else { return [] }
+        return (0..<count).compactMap { i in
+            avformat_index_get_entry(stream, i).map {
+                .init(timestamp: $0.pointee.timestamp, pos: $0.pointee.pos, size: Int($0.pointee.size),
+                      flags: $0.pointee.flags)
+            }
+        }
     }
 
     func readPacket(isCurrent: @Sendable () -> Bool = { true }) throws -> UnsafeMutablePointer<AVPacket>? {

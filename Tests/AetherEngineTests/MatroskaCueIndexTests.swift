@@ -1,12 +1,13 @@
 import Testing
 import Foundation
 import Compression
+import AetherLibavutil
 @testable import AetherEngine
 
 /// `MatroskaCueIndex` on a Matroska file assembled here byte by byte: the index is read through the
 /// SeekHead, blocks are found from their cue positions whatever length their cluster's size field has,
-/// a track is complete only when its cues number its frames, and frames come back as the decoder takes
-/// them (a stripped header restored, zlib left wrapped).
+/// a track is complete only when its cues number its frames, and frames come back as libavformat hands
+/// them over (a stripped header restored, zlib inflated, a WebVTT block split).
 @Suite("Matroska cue index")
 struct MatroskaCueIndexTests {
 
@@ -167,6 +168,16 @@ struct MatroskaCueIndexTests {
         #expect(MatroskaCueIndex.webVTTCue(Array("id\nsettings\n\n".utf8)) == nil, "an empty text is refused")
     }
 
+    @Test("a WebVTT block is read as its packet: the cue text, with the settings beside it")
+    func webVTTFrames() throws {
+        let fixture = Self.fixture(webVTT: true)
+        let src = source(fixture)
+        let index = try MatroskaCueIndex.read(from: src, token: .forParserTests)
+        let frames = try index.blocks(track: 2).map { try #require(index.readFrame($0, track: 2, from: src)) }
+        #expect(frames.map(\.payload) == [Array("Hello".utf8), Array("World".utf8)])
+        #expect(frames.map(\.webVTTSettings) == ["line:90% align:start", nil])
+    }
+
     /// The video track's cues are its keyframes: kept with the cluster they name even where the muxer
     /// wrote no relative position (the fixture's video cues have none), in time order, and each one's
     /// byte offset is where its cluster begins.
@@ -241,31 +252,33 @@ struct MatroskaCueIndexTests {
 
     @Test("a file that is not Matroska, or has no Cues, is refused")
     func refusals() {
-        #expect(throws: MatroskaCueIndex.ReadError.notMatroska) {
+        #expect(throws: SourceIndexError.unsupportedContainer) {
             try MatroskaCueIndex.read(from: IOReaderByteSource(DataIOReader(data: Data(repeating: 7, count: 4096))), token: .forParserTests)
         }
     }
 
     // MARK: - Streams to tracks
 
+    private static let ms = AVRational(num: 1, den: 1000)
+
     private static func mappingIndex() -> MatroskaCueIndex {
         var index = MatroskaCueIndex(segmentDataStart: 0, timestampScale: 1_000_000, blocksByTrack: [:],
                                           tracksMissingRelativePosition: [], encodingByTrack: [:])
-        index.subtitleTracks = [.init(number: 18, codecID: "S_HDMV/PGS", language: "eng"),
-                                .init(number: 19, codecID: "S_TEXT/UTF8", language: "eng"),
-                                .init(number: 22, codecID: "S_HDMV/PGS", language: "eng")]
-        index.statistics = [18: .init(frames: 2909, bytes: 30_000_000), 19: .init(frames: 1326, bytes: 40_000),
-                            22: .init(frames: 2909, bytes: 31_000_000)]
+        index.subtitleTracks = [
+            .init(number: 18, codecName: "hdmv_pgs_subtitle", language: "eng", frames: 2909, bytes: 30_000_000),
+            .init(number: 19, codecName: "subrip", language: "eng", frames: 1326, bytes: 40_000),
+            .init(number: 22, codecName: "hdmv_pgs_subtitle", language: "eng", frames: 2909, bytes: 31_000_000),
+        ]
         return index
     }
 
     @Test("a stream carrying its TrackNumber maps to that track")
     func mapsByTrackID() {
         let index = Self.mappingIndex()
-        let streams: [MatroskaCueIndex.SubtitleStream] = [
-            .init(streamIndex: 17, trackID: 18, codecName: "hdmv_pgs_subtitle", language: "eng", frames: 2909, bytes: 30_000_000),
-            .init(streamIndex: 18, trackID: 19, codecName: "subrip", language: "eng", frames: 1326, bytes: 40_000),
-            .init(streamIndex: 21, trackID: 22, codecName: "hdmv_pgs_subtitle", language: "eng", frames: 2909, bytes: 31_000_000),
+        let streams: [IndexedSubtitleStream] = [
+            .init(streamIndex: 17, trackID: 18, codecName: "hdmv_pgs_subtitle", language: "eng", frames: 2909, bytes: 30_000_000, timeBase: Self.ms),
+            .init(streamIndex: 18, trackID: 19, codecName: "subrip", language: "eng", frames: 1326, bytes: 40_000, timeBase: Self.ms),
+            .init(streamIndex: 21, trackID: 22, codecName: "hdmv_pgs_subtitle", language: "eng", frames: 2909, bytes: 31_000_000, timeBase: Self.ms),
         ]
         #expect(index.trackNumbers(for: streams) == [17: 18, 18: 19, 21: 22])
     }
@@ -273,10 +286,10 @@ struct MatroskaCueIndexTests {
     @Test("without track numbers the order maps, and a pair whose statistics disagree refuses the whole map")
     func mapsByOrderAndRefuses() {
         let index = Self.mappingIndex()
-        var streams: [MatroskaCueIndex.SubtitleStream] = [
-            .init(streamIndex: 17, codecName: "hdmv_pgs_subtitle", language: "eng", frames: 2909, bytes: 30_000_000),
-            .init(streamIndex: 18, codecName: "subrip", language: "eng", frames: 1326, bytes: 40_000),
-            .init(streamIndex: 21, codecName: "hdmv_pgs_subtitle", language: "eng", frames: 2909, bytes: 31_000_000),
+        var streams: [IndexedSubtitleStream] = [
+            .init(streamIndex: 17, codecName: "hdmv_pgs_subtitle", language: "eng", frames: 2909, bytes: 30_000_000, timeBase: Self.ms),
+            .init(streamIndex: 18, codecName: "subrip", language: "eng", frames: 1326, bytes: 40_000, timeBase: Self.ms),
+            .init(streamIndex: 21, codecName: "hdmv_pgs_subtitle", language: "eng", frames: 2909, bytes: 31_000_000, timeBase: Self.ms),
         ]
         #expect(index.trackNumbers(for: streams) == [17: 18, 18: 19, 21: 22])
         // Two PGS tracks with the same frame count swapped: only the byte count tells them apart.
