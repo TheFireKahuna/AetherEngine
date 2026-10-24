@@ -23,6 +23,9 @@
 #   bridge-eac3-51.mkv            - 5.1 PCM in MKV, drives the EAC3 audio bridge (AE#561 follow-up)
 #   avsync/*                      - a white frame and a click at exactly 1 s, per audio codec and
 #                                   container, for AVSyncTests (audio against video, to the sample)
+#   decmem/*                      - 12 s of music-like audio in every codec the audio bridge decodes,
+#                                   for AudioDecoderMemoryTests (a decode started anywhere matches a
+#                                   continuous one past the decoder's declared memory)
 #
 # Real-world DV / Atmos / multichannel sources have to come from your
 # own library. Drop those into ./Fixtures/user/ (also gitignored)
@@ -417,6 +420,31 @@ avsync_clip pcm.mkv "$AVSYNC_STEREO" -c:a pcm_s24le
 avsync_clip truehd.mkv "$AVSYNC_51" -c:a truehd -strict -2
 avsync_clip opus.mkv "$AVSYNC_STEREO" -c:a libopus
 avsync_clip mp3.mkv "$AVSYNC_STEREO" -c:a libmp3lame
+
+# AudioDecoderMemoryTests: per channel, a tone with vibrato and a slow swell, a gated harmonic, a
+# repeating chirp, gated noise bursts and a noise floor, so every band carries something that changes.
+# Pure steady tones are avoided: Opus can settle into alternating between two rounded values on one.
+echo "→ decmem/* (12 s of music-like audio per bridged codec)"
+mkdir -p "$FIXTURES_DIR/decmem"
+decmem_channel() {  # <base Hz> <noise seed> <phase>
+    echo "0.18*sin(2*PI*$1*t+2*sin(2*PI*5.1*t))*(0.6+0.4*sin(2*PI*0.37*t+$3))+0.12*sin(2*PI*($1*2.71)*t)*lt(mod(t+$3,2.3),1.4)+0.1*sin(2*PI*(150*mod(t+$3,3.1)+900*mod(t+$3,3.1)*mod(t+$3,3.1)))+0.15*(random($2)*2-1)*lt(mod(t*1.13+$3,1.7),0.21)+0.05*(random($2+1)*2-1)"
+}
+DECMEM_ST="aevalsrc=exprs='$(decmem_channel 220 0 0)|$(decmem_channel 330 2 0.7)':d=12"
+DECMEM_51="aevalsrc=exprs='$(decmem_channel 220 0 0)|$(decmem_channel 330 2 0.7)|$(decmem_channel 440 4 1.1)|$(decmem_channel 55 6 0.3)|$(decmem_channel 277 8 1.9)|$(decmem_channel 369 10 2.5)':d=12:c=5.1"
+decmem_clip() {  # <name> <audio source> <rate> <audio args...>
+    local name="$1" source="$2" rate="$3"; shift 3
+    ffmpeg -hide_banner -loglevel error -y -f lavfi -i "$source:s=$rate" "$@" "$FIXTURES_DIR/decmem/$name"
+}
+decmem_clip mp2.mkv "$DECMEM_ST" 48000 -c:a mp2 -b:a 192k
+decmem_clip mp3-64k.mp3 "$DECMEM_ST" 44100 -c:a libmp3lame -b:a 64k
+decmem_clip mp3-vbr.mkv "$DECMEM_ST" 48000 -c:a libmp3lame -q:a 6
+decmem_clip mp3-lsf.mp3 "$DECMEM_ST" 24000 -c:a libmp3lame -b:a 32k
+decmem_clip vorbis.ogg "$DECMEM_ST" 48000 -c:a vorbis -strict -2
+decmem_clip opus.mkv "$DECMEM_ST" 48000 -c:a libopus -b:a 128k
+decmem_clip dts-51.mkv "$DECMEM_51" 48000 -c:a dca -strict -2
+decmem_clip truehd-51.mkv "$DECMEM_51" 48000 -c:a truehd -strict -2
+decmem_clip truehd-96k.mkv "$DECMEM_ST" 96000 -c:a truehd -strict -2
+decmem_clip flac.mkv "$DECMEM_ST" 48000 -c:a flac
 
 echo ""
 echo "Done. Try:"

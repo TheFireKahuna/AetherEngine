@@ -35,11 +35,12 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     /// out as APAC objects. No bed companion.
     let objectOutput: Bool
     var playsBedOnly: Bool { splitsBed }
-    /// A decode starts at a major sync, and one recurs at least every 128 access units (Dolby TrueHD
-    /// bitstream specification; `TrueHDMajorSync`), 40 frames each at 48 kHz: from there the restart
-    /// header gives the lossless decode every state it has. A 96 or 192 kHz stream adds the
-    /// decimator's filter.
-    let span = AudioStageSpan(latency: 0, memory: 128 * 40 + ObjectAudioDecimator.span.memory)
+    /// The TrueHD decoder's (`AudioStageSpan.trueHDDecoderMemory`, `TrueHDMajorSync`) at the rendering
+    /// rate; a 96 or 192 kHz stream adds the decimator's filter.
+    let span = AudioStageSpan(
+        latency: 0,
+        memory: AudioStageSpan.trueHDDecoderMemory(outputRate: Int32(ObjectAudioRendering.sampleRate))
+            + ObjectAudioDecimator.span.memory)
     private var bedRoles: [ObjectAudioRole] = []
     private var bedRolesSerial: UInt32?
     private var bedPlanes: [UnsafePointer<Float>] = []
