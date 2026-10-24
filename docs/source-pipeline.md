@@ -1,10 +1,19 @@
 # Source pipeline: every byte once, every index once, every output on demand
 
 Status: in progress, written 2026-10-24 against `research/12bit-fel` at `a7a725e8` and the tvOS 27.2
-SDK (Xcode 27.2). Layers 1 and 2 are built (layer 2 for Matroska and MP4; the MP4 index not yet on
-device); layer 3 is the remaining work. Each
-section says what is done, which tests hold it, and what is not yet ideal, with the steps to get
-there.
+SDK (Xcode 27.2), brought up to `503c69f5`. Layers 1 and 2 are built (layer 2 for Matroska and MP4);
+MPEG-TS has no index and is handled on its own terms (its section below), including programs that
+change mid-stream; layer 3 is the remaining work. Each section says what is done, which tests hold
+it, what is not yet ideal with the steps to get there, and what still waits for a device run.
+
+Waiting for a device run, in the order worth doing them:
+
+1. The single byte store (layer 1, "On device"): one title with subtitles, a few scrubs back, against
+   the 06:15 session's open timings, reconnects, ledger and `memprobe`.
+2. An MP4 with mov_text subtitles: the `MP4SampleIndex` path (`#151 forward prefetch started from the
+   index`, `[IndexedSubtitles] ... complete`).
+3. A transport stream whose PMT changes: a live channel with server-side ads, or a DVR `.ts` that
+   crosses a programme boundary, ideally one whose codec changes there (the TS section).
 
 ## Why
 
@@ -191,6 +200,50 @@ the index lists every stream completely (`SubtitleForwardPrefetcher.IndexSource`
    read is a cache hit, but it is a second parse and decode.
    - Layer 3: one subtitle source feeds every store.
 
+## MPEG-TS: no index, and programs that change (built)
+
+A transport stream has no index of its own, and a program's stream table (its PMT) can change in the
+middle of it: an ad on its own PIDs, a recording crossing a programme boundary, an encoder restart.
+
+### What it is
+
+| Piece | File | What it does |
+|---|---|---|
+| The cue prewarm only where a seek loads an index | `HLSVideoEngine+SegmentPlanning.swift` (`cuePrewarmMayRun`), `Demuxer.loadsIndexOnFirstSeek` | The mid-file seek that makes libavformat read Matroska's Cues ran on every container. On mpegts and mpegps (every disc) it was a whole-file timestamp search, mostly network reads into unwatched parts of the file, whose only product was probe entries flagged keyframe whatever they are (`mpegts_get_dts`). One rule now gates it for the pump and both subtitle side readers. |
+| The uniform plan anchored on the first IRAP | `measureKeyframeSpacing`, `uniformPlanAnchor` | Segment 0 sits on the content's first random-access point on the plan's own (decode) axis, read from the head of the source. It sat on the index's first entry (on TS, whatever packet was at byte 0) or on `start_time`, a presentation time a composition offset above the IRAP's decode time, which put the IRAP below segment 0 (the AE#561 failure). Matroska's untrusted-index fallback had the same mismatch with its Cues. |
+| Keyframes kept for seeks | `Demuxer.recordKeyframeLocked` | Each video keyframe read on a seekable, non-disc mpegts/mpegps source goes into libavformat's own index (position, decode time), within `max_index_size`, so `ff_seek_frame_binary` bounds a seek back into what was read instead of searching the file. |
+| Program succession | `Demuxer/ProgramSuccession.swift`, `Demuxer` | A role (program, media type, ordinal in PMT order) is taken from the first PMT at the open. A new PID that holds a role's place, once the role's stream has left the program, is read under the role's stream index; each such packet says the stream it came from (`Demuxer.sourceStream(of:)`, in `AVPacket.opaque`). An added track is never folded in. The old PID's last frames, which libavformat's parser lets go only at its next frame or at EOF, are dropped by position. Successors are nobody's new track in the track lists. |
+| The producer across a change | `HLSSegmentProducer` (`sourceChange`, `noteProgramChange`) | Each pump compares a packet's source with what its roles are set up for. Live: an ad gets a versioned init on its first keyframe with in-band SPS/PPS (the programme's DV/colour overrides dropped, P7 off); the programme coming back opens on any keyframe with the open's own init and gets them back. VOD plays on through a same-codec change; a video or audio codec change ends the epoch for the software path. Live audio of another codec is left out of the init until the role is back. |
+| The software path across a change | `SoftwarePlaybackHost.roleSources`, `SoftwareSourceWatch` | `load` positions first and opens decoders for the stream each role is on there. Where packets are consumed (the read-ahead spool and the live ring carry the source), the same codec on a new stream decodes on; another codec is held out and the session is rebuilt once at the playhead (`reloadAtCurrentPosition`, `programCodecRebuildLimit`). |
+
+### Guarantees and the tests that hold them
+
+| Guarantee | Tests |
+|---|---|
+| A prewarm runs only on Matroska; the uniform plan anchors on the first IRAP's decode time from a clean or a mid-GOP start; the keyframes read go into libavformat's index, and a seek back reads nothing (631 KB cold on the test stream) | `TransportStreamSeekIndexTests`, `Issue550CuePrewarmPolicyTests` |
+| A new video or audio PID takes its role, every frame in order on the chosen stream; an added track takes none; an ad and the programme's return; warm and cold seeks; discard inheritance; roles by type and order | `ProgramSuccessionTests` |
+| Live ad and return as three inits; VOD plays through a same-codec boundary; VOD video and audio codec changes escalate, also for a pump started past the change; live audio on a new PID | `ProgramChangeProducerTests` |
+| The software watch's verdicts; the source through the spool envelope and the stored form; the decoders' streams before and after a cold seek past an H.264 to HEVC change | `SoftwareProgramChangeTests` |
+
+`TransportStreamFixture` writes these streams cell by cell around real H.264, HEVC and AC-3, so
+libavformat's own parsers and PMT handling are what the tests run against.
+
+### Not yet ideal, and the steps
+
+1. **Live audio of another codec is silent for the length of the change.** The fMP4 init describes one
+   audio codec, so the pump leaves the new one out until the role is back.
+   - A versioned init for audio, as video has, if a real stream ever needs it.
+2. **A same-codec change on the software path relies on the decoder.** libavcodec reads the new
+   stream's in-band parameters; a VideoToolbox session built from the open's `hvcC` may not take a
+   successor whose parameter sets differ.
+   - Rebuild on any source change for a hardware decoder, if the device shows it.
+3. **The old PID's last frame or two are lost at a change.** libavformat's parser holds them until the
+   next frame on that PID or the end of the stream; they arrive after the new PID's frames and are
+   dropped as leftovers.
+4. **libavformat's program list is not always exact.** After `find_stream_info`'s duration estimate it
+   can name the old and the new streams together, and after a seek it is corrected only at the next
+   PMT cell. A new stream judged to take no role is therefore judged again when the programs change.
+
 ## Layer 3: every output on request (next)
 
 In order, each step replacing a reader rather than adding one:
@@ -255,6 +308,15 @@ else; the ledger's per-reader lines should show exactly that.
   for what is hot. If the device measurement shows a regression, one generalised RAM tier in front of
   the cache is the fallback, not three.
 - **Sodalite keeps its own sessions** (see layer 1, item 8).
+- **`merge_pmt_versions` was measured and refused.** It keeps the old `AVStream` across a PMT change,
+  which looks like the fix for a reader stuck on the old index, but `mpegts.c` updates the stream type
+  before the check that would update the codec, so an H.264 to HEVC change carried on labelled H.264,
+  with nothing public to tell. Following the change ourselves (`ProgramSuccession`) keeps libavformat's
+  correctly typed new streams.
+- **A program change is a property of the packet, not an event.** The first version announced each
+  change once and reset on a seek, assuming every reader restarts on the open's streams. A software
+  host rebuilt onto a successor does not, so each packet now says where it came from and every reader
+  compares with its own configuration.
 
 ## Reading the logs
 
@@ -267,3 +329,10 @@ else; the ledger's per-reader lines should show exactly that.
 | `[AVIOReader] <reader> source cache served the read at ...; no reconnect for it` | The first out-of-window read served from the cache, once per reader |
 | `#151 forward prefetch started from the index` / `walking the stream` | Which subtitle prefetch source a session got (Matroska or MP4 alike) |
 | `[IndexedSubtitles] index read in ... ms` | The fill's index, parsed or shared |
+| `[HLSVideoEngine] cue prewarm: skipped, mpegts has no index a seek loads` | The prewarm left out on a container without a lazy index |
+| `segment plan: uniform stride fallback (..., anchorPts=... (first IRAP read), ...)` | The uniform plan's anchor and where it came from |
+| `[Demuxer] program change: stream N (PID 0x...) takes the role of stream M (PID 0x...)` | A PMT change followed: the new PID read as the role's stream |
+| `[Demuxer] program change reaches the read: stream M now reads stream N (was K)` | The first packet of the role from another stream |
+| `[HLSSegmentProducer] program change: video now on stream N (was M)[, another codec]` | What a pump makes of it |
+| `SSAI video program switch: ...` / `muxer rotation (programme back)` | The live ad's init, and the programme's again |
+| `[SWHost] program change: ...; rebuilding at the playhead` | The software path's rebuild for another codec |
