@@ -2500,10 +2500,12 @@ public final class AetherEngine: ObservableObject {
         /// Phase D: bitmap (PGS/DVB/DVD) entry whose store is filled by the OCR worker /
         /// sidecar OCR fill, not by the pump tap or the side readers.
         var needsOCR: Bool = false
-        /// `LoadOptions.forcedSubtitleRenditions`: the forced-only rendition of an embedded bitmap track,
+        /// `LoadOptions.forcedSubtitleTrack`: the forced-only rendition of an embedded bitmap track,
         /// holding just the lines the track flags as forced. Same source stream as the full track's
         /// entry, which comes before it in the table.
         var forcedCuesOnly: Bool = false
+        /// The session's one rendition declared FORCED=YES (`LoadOptions.forcedSubtitleTrack`).
+        var declaresForced: Bool = false
     }
     var nativeSubtitleTrackTable: [NativeSubtitleTrackEntry] = []
 
@@ -3735,6 +3737,10 @@ public final class AetherEngine: ObservableObject {
     /// rendition is the forced one. Any other selection or a subtitles-off clears it.
     var forcedSubtitleSelection = false
 
+    /// The forced rendition the player asked for this session (`fillForcedRendition`), kept so a
+    /// selection change that took the OCR worker away can hand it back. Cleared with the track table.
+    var forcedRenditionRequestedOrdinal: Int?
+
     /// AE#464 round 2: the position the load currently in flight was handed, parked across the window
     /// in which `load` has already zeroed the clock but the rebuilt session has not reached it yet.
     /// Written at the two sites that raise `state = .loading` for a load, retired by an accepted seek;
@@ -4474,6 +4480,7 @@ public final class AetherEngine: ObservableObject {
         nativeSubtitleTrackTable = []
         nativeSubtitleReapplyOrdinal = nil
         forcedSubtitleSelection = false
+        forcedRenditionRequestedOrdinal = nil
         nativeSubtitleTracks = []
         nativeSubtitleReaderParams = nil
         metadata = nil
@@ -8146,6 +8153,7 @@ public final class AetherEngine: ObservableObject {
         nativeSubtitleTrackTable = []
         nativeSubtitleReapplyOrdinal = nil
         forcedSubtitleSelection = false
+        forcedRenditionRequestedOrdinal = nil
         nativeSubtitleTracks = []
         nativeSubtitleReaderParams = nil
         cancelNativeSubtitleReaders()

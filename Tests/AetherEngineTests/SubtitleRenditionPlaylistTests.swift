@@ -137,7 +137,7 @@ struct SubtitleRenditionPlaylistTests {
         // DEFAULT/AUTOSELECT and the CC-off preference, self-engaging a rendition the overlay owns
         // (Sodalite#38 follow-on: forced German track shown on German audio with subtitles off). The
         // forced/full pair stays disambiguated by NAME, so neither carries FORCED=YES. The disposition is
-        // dropped where the rendition infos are built, unless `LoadOptions.forcedSubtitleRenditions` asks
+        // dropped where the rendition infos are built, unless `LoadOptions.forcedSubtitleTrack` names it
         // for it (ForcedSubtitleRenditionTests).
         let infos = AetherEngine.nativeSubtitleRenditionInfos(for: [
             .init(sourceStreamIndex: 2, language: "ger", isForced: true),

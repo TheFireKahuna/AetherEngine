@@ -31,8 +31,38 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     /// lines cover foreign dialogue only) can sit minutes behind the reading: there "no cue yet" and "no
     /// line here" read the same off the cues, and only this tells them apart.
     private var readSpan: (from: Double, through: Double)?
+    /// When a feeder last started on this track or reported reading it: whether anyone is filling it.
+    private var lastFeedActivity: DispatchTime?
+    /// Called the first time the player asks for this rendition (its media playlist), which is the
+    /// moment AVKit selected it, whoever asked it to.
+    private var renditionRequestedHandler: (@Sendable () -> Void)?
 
     init() {}
+
+    /// What to do when the player asks for this rendition. Fires once per request; the handler makes
+    /// repeated requests harmless.
+    func onRenditionRequested(_ handler: (@Sendable () -> Void)?) {
+        lock.lock(); renditionRequestedHandler = handler; lock.unlock()
+    }
+
+    /// The player fetched this rendition's media playlist.
+    func noteRenditionRequested() {
+        lock.lock(); let handler = renditionRequestedHandler; lock.unlock()
+        handler?()
+    }
+
+    /// A feeder has started on this track: it counts as being filled from now, before its first report.
+    func markFeeding() {
+        lock.lock(); lastFeedActivity = .now(); lock.unlock()
+    }
+
+    /// Whether something started on or reported reading this track within `seconds`. A track nobody is
+    /// filling is never worth waiting for.
+    func isBeingFed(within seconds: Double) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let last = lastFeedActivity else { return false }
+        return Double(DispatchTime.now().uptimeNanoseconds &- last.uptimeNanoseconds) / 1e9 <= seconds
+    }
 
     private static func key(start: Double, end: Double, text: String) -> String {
         let start = SourceTimestampBounds.clampedSeconds(start), end = SourceTimestampBounds.clampedSeconds(end)
@@ -85,6 +115,7 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     func noteRead(from: Double, through: Double) {
         guard from.isFinite, through.isFinite, through >= from else { return }
         lock.lock(); defer { lock.unlock() }
+        lastFeedActivity = .now()
         if let span = readSpan, from >= span.from, from <= span.through + Self.readSeamSeconds {
             readSpan = (span.from, max(span.through, through))
         } else {

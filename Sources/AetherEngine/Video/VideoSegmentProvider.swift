@@ -5,8 +5,8 @@ import Foundation
 /// Per-rendition master-playlist metadata (#15): NAME must be unique within the subtitle group
 /// (HLS requirement; duplicates make AVFoundation collapse same-language renditions into one
 /// legible option). `isForced` is the rendition declared FORCED=YES, which happens only under
-/// `LoadOptions.forcedSubtitleRenditions`. Built once at load by
-/// `AetherEngine.nativeSubtitleRenditionInfos(for:declaresForced:)`.
+/// `LoadOptions.forcedSubtitleTrack`. Built once at load by
+/// `AetherEngine.nativeSubtitleRenditionInfos(for:)`.
 struct NativeSubtitleRenditionInfo: Sendable, Equatable {
     let language: String?
     let name: String
@@ -3067,6 +3067,11 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// `DocumentedConstantsTests` holds the two together.
     static let atmosChannelsAttribute = "16/JOC"
 
+    /// A subtitle store counts as being filled while a feeder started on it or reported reading within this.
+    /// Generous next to every feeder's cadence (the OCR worker ticks well under a second, a side reader
+    /// reports per packet), so a feeder that is reading never misses it.
+    static let subtitleFeedAliveSeconds = 5.0
+
     // MARK: - Native subtitle renditions (#15)
 
     var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] {
@@ -3089,6 +3094,11 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// the AVPlayer timeline. `segments[i].startSeconds` is the absolute output-axis start (correct for both
     /// VOD and the live sliding window, where a cumulative EXTINF sum from firstVisible would not be), so the
     /// window is read straight off the segment plan rather than recomputed.
+    func nativeSubtitleRenditionRequested(ordinal: Int) {
+        guard ordinal >= 0, ordinal < nativeSubStores.count else { return }
+        nativeSubStores[ordinal].noteRenditionRequested()
+    }
+
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? {
         guard ordinal >= 0, ordinal < nativeSubStores.count else { return nil }
         let store = nativeSubStores[ordinal]
@@ -3128,9 +3138,13 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // cover THIS window (read head within the horizon, or still warming up), and only briefly.
         // Measured on how far the track has been READ, not on its last cue: a sparse (forced) track's last
         // cue can trail its reading by minutes, and waiting on the cue made every one of its windows wait.
+        // And only while something is filling it: a rendition the player selected by itself before
+        // anyone fed it used to cost 3 s a request, which held the item's start past the readiness gate
+        // (a FORCED=YES rendition tvOS picked at load, 2026-10-24).
         let horizonSeconds = 30.0
         let deadline = Date().addingTimeInterval(3.0)
         while !store.isFinished,
+              store.isBeingFed(within: Self.subtitleFeedAliveSeconds),
               store.readThrough(at: start) < end,
               end <= store.readThrough(at: start) + horizonSeconds || store.readThrough(at: start) <= 0,
               Date() < deadline {

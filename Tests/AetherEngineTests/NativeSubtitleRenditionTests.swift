@@ -17,8 +17,9 @@ struct NativeSubtitleRenditionTests {
 
     @Test("same-language renditions get unique numbered names")
     func uniqueNames() {
-        let infos = AetherEngine.nativeSubtitleRenditionInfos(
-            for: [entry("ger", forced: true), entry("ger"), entry("eng")], declaresForced: true)
+        var forced = entry("ger", forced: true)
+        forced.declaresForced = true
+        let infos = AetherEngine.nativeSubtitleRenditionInfos(for: [forced, entry("ger"), entry("eng")])
         #expect(infos.count == 3)
         #expect(infos[0].name != infos[1].name)
         #expect(infos[1].name == "\(infos[0].name) 2")
