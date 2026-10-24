@@ -6,7 +6,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/TheFireKahuna/FFmpegBuild",
       "state" : {
-        "revision" : "e672b191ec9195a3a964ed205c97303d02087cc6",
+        "revision" : "8923abf32f0787d3d91a18b1b9fbee67031221f9",
         "version" : "3.10.1"
       }
     },
