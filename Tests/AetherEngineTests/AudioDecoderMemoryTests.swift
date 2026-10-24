@@ -6,7 +6,7 @@ import Foundation
 import Testing
 @testable import AetherEngine
 
-private func decmemFixture(_ name: String) -> String {
+func decmemFixture(_ name: String) -> String {
     URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         .appendingPathComponent("Fixtures/decmem").appendingPathComponent(name).path

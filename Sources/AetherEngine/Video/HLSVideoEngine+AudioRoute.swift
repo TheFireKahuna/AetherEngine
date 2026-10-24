@@ -140,6 +140,29 @@ extension HLSVideoEngine {
     /// reporting `.bridged`. Live hands it to the engine, which rebuilds video-only; VOD surfaces
     /// the same verdict the E-AC-3 route reaches through its failed cut, so a host can hand the
     /// position to a player that decodes the track itself.
+    /// Seekable VOD makes each segment's bridged audio in a run of its own (`AudioSegmentRuns`), so
+    /// a segment comes out the same however playback reached it; `makeRun` builds a run like
+    /// `template`. Nil keeps `template` as the one run of the session: live and sequential sources,
+    /// which are never re-read, and a decoder whose memory is not known (`AudioStageSpan.decoder`).
+    func segmentRuns(template: any AudioTranscodingBridge, sourceStream: UnsafeMutablePointer<AVStream>,
+                     makeRun: @escaping () throws -> any AudioTranscodingBridge) -> (any AudioTranscodingBridge)? {
+        guard !isLiveSession, !sequentialOrigin else { return nil }
+        let codec = avcodec_get_name(sourceStream.pointee.codecpar.pointee.codec_id).map { String(cString: $0) } ?? "?"
+        guard let runs = AudioSegmentRuns(template: template, sourceCodecpar: sourceStream.pointee.codecpar,
+                                          sourceTimeBase: sourceStream.pointee.time_base, makeRun: makeRun) else {
+            EngineLog.emit(
+                "[HLSVideoEngine] audio: \(codec)'s decoder memory is not known, so one run makes every segment "
+                + "and a seek's segments can differ from continuous playback's",
+                category: .session)
+            return nil
+        }
+        EngineLog.emit(
+            "[HLSVideoEngine] audio: each segment from a run of its own (\(codec)), the source read "
+            + "\(String(format: "%.2f", runs.preRollSeconds)) s ahead of it",
+            category: .session)
+        return runs
+    }
+
     func handleBridgeDecodedNothing(streamIndex: Int32, summary: String) {
         if isLiveSession {
             onLiveAudioDecodesNothing?(streamIndex, summary)
@@ -320,20 +343,33 @@ extension HLSVideoEngine {
                     bridge.close()
                     break bridged
                 }
+                let watchesDecoder = sideAudioDemuxer == nil
+                let streamIndex = sourceAudioStreamIndex
+                let delivered = segmentRuns(template: bridge, sourceStream: audioStream) { [weak self, audioBridgeMode, isLiveSession] in
+                    let run = try AudioBridge(srcCodecpar: audioStream.pointee.codecpar,
+                                              srcTimeBase: audioStream.pointee.time_base,
+                                              mode: audioBridgeMode, followsSourceContinuity: !isLiveSession,
+                                              announces: false)
+                    if watchesDecoder {
+                        run.onDecoderProducedNothing = { [weak self] stats in
+                            self?.handleBridgeDecodedNothing(streamIndex: streamIndex, summary: stats.summary)
+                        }
+                    }
+                    return run
+                } ?? bridge
                 let cfg = HLSSegmentProducer.AudioConfig(
                     codecpar: cp,
                     timeBase: bridge.encoderTimeBase,
                     sourceStreamIndex: sourceAudioStreamIndex,
                     inputTimeBase: bridge.encoderTimeBase,
                     sourceTimeBase: audioStream.pointee.time_base,
-                    bridge: bridge,
+                    bridge: delivered,
                     language: audioLanguage,
                     sourceStart: audioStream.pointee.start_time == Int64.min ? nil : audioStream.pointee.start_time
                 )
                 self.savedAudioConfig = cfg
-                self.audioBridge = bridge
-                if sideAudioDemuxer == nil {
-                    let streamIndex = sourceAudioStreamIndex
+                self.audioBridge = delivered
+                if watchesDecoder {
                     bridge.onDecoderProducedNothing = { [weak self] stats in
                         self?.handleBridgeDecodedNothing(streamIndex: streamIndex, summary: stats.summary)
                     }
@@ -355,7 +391,7 @@ extension HLSVideoEngine {
                     )
                     self.savedAudioConfig = nil
                     self.audioBridge = nil
-                    bridge.close()
+                    delivered.close()
                 }
             }
         }

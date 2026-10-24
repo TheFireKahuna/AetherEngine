@@ -218,4 +218,21 @@ struct BedLevelMeter {
         amplitude > 0 ? String(format: "%.1f", 20 * log10(amplitude)) : "-inf"
     }
 }
+/// A session's `BedLevelMeter`, shared by the bridges that make it: the runs that each make one
+/// segment (`AudioSegmentRuns`), each measuring only its own segment's frames, so the level lines
+/// come at the windows one run's would.
+final class SessionLevelMeter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var meter: BedLevelMeter
+
+    init(layout: SpatialSpeakerLayout, sampleRate: Int) {
+        meter = BedLevelMeter(layout: layout, sampleRate: sampleRate)
+    }
+
+    func with<T>(_ body: (inout BedLevelMeter) -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(&meter)
+    }
+}
 #endif

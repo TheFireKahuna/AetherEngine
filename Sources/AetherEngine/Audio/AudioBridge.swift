@@ -281,6 +281,11 @@ final class AudioBridge: @unchecked Sendable {
     /// decoder whose memory is not known. The resampler is declared from the source's rate, the one
     /// it is built for; packing PCM into packets touches each frame on its own.
     private(set) var span: AudioStageSpan?
+    /// The encoder's part of `span`.
+    private(set) var encoderSpan = AudioStageSpan.instant
+    /// Where a VOD segment's run puts the encoder's first input frame (`startRun(atFrame:segment:)`), until
+    /// the run's first decoded frame anchors it.
+    private var runStartFrame: Int64?
 
     private let srcTimeBase: AVRational
     private let mode: Mode
@@ -350,7 +355,8 @@ final class AudioBridge: @unchecked Sendable {
         srcCodecpar: UnsafeMutablePointer<AVCodecParameters>,
         srcTimeBase: AVRational,
         mode: Mode = .surroundCompat,
-        followsSourceContinuity: Bool = true
+        followsSourceContinuity: Bool = true,
+        announces: Bool = true
     ) throws {
         self.srcTimeBase = srcTimeBase
         self.mode = mode
@@ -482,8 +488,10 @@ final class AudioBridge: @unchecked Sendable {
         } else if output == .eac3,
                   let name = Self.eac3LayoutName(channels: cappedChannels, hasLFE: sourceHasLFE, sourceIs: sourceIs),
                   av_channel_layout_from_string(&encLayout, name) >= 0 {
-            EngineLog.emit("[AudioBridge] encoding \(cappedChannels) source channels as \(name), so the LFE keeps "
-                           + "its place", category: .session)
+            if announces {
+                EngineLog.emit("[AudioBridge] encoding \(cappedChannels) source channels as \(name), so the LFE keeps "
+                               + "its place", category: .session)
+            }
         } else {
             av_channel_layout_default(&encLayout, cappedChannels)
         }
@@ -492,7 +500,7 @@ final class AudioBridge: @unchecked Sendable {
         let logBitRate: String = output == .eac3
             ? "\(Int64(nChannels) * 128) kbps"
             : "\(pcmBitsPerRawSample)-bit PCM"
-        EngineLog.emit(
+        if announces { EngineLog.emit(
             "[AudioBridge] init: mode=\(mode.rawValue) encoder=\(encoderName)"
             + " srcCodec=\(srcCodecID.rawValue) sampleRate=\(sampleRate)"
             + (sampleRate != sourceSampleRate ? " (resampled from \(sourceSampleRate), encoder has no such rate)" : "")
@@ -501,7 +509,7 @@ final class AudioBridge: @unchecked Sendable {
             + "encoderChannels=\(nChannels) bitRate=\(logBitRate) "
             + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))",
             category: .session
-        )
+        ) }
 
         enc.pointee.sample_rate = sampleRate
         enc.pointee.sample_fmt = pcmSampleFmt
@@ -521,10 +529,11 @@ final class AudioBridge: @unchecked Sendable {
         }
         encoderTimeBase = AVRational(num: 1, den: sampleRate)
         packetFrames = output == .eac3 ? enc.pointee.frame_size : Self.pcmPacketFrames
+        encoderSpan = output == .eac3
+            ? .eac3Encoder(frameSize: Int(enc.pointee.frame_size), initialPadding: Int(enc.pointee.initial_padding))
+            : .instant
         span = AudioStageSpan.decoder(srcCodecpar, outputRate: sampleRate).map {
-            .series([$0, .resampler(inputRate: sourceSampleRate, outputRate: sampleRate),
-                     output == .eac3 ? .eac3Encoder(frameSize: Int(enc.pointee.frame_size),
-                                                    initialPadding: Int(enc.pointee.initial_padding)) : .instant])
+            .series([$0, .resampler(inputRate: sourceSampleRate, outputRate: sampleRate), encoderSpan])
         }
 
         // 4. Codecpar describing the encoder output for the muxer.
@@ -665,6 +674,29 @@ final class AudioBridge: @unchecked Sendable {
 
         /// Fed real source, answered with nothing at all.
         var isSilent: Bool { packetsFed > 0 && packetsEmitted == 0 }
+
+        /// Both bridges' counts together (`AudioSegmentRuns`, over its runs); the last error codes
+        /// are `other`'s where it has one.
+        func adding(_ other: FeedStats) -> FeedStats {
+            var sum = self
+            sum.packetsFed += other.packetsFed
+            sum.packetsRejected += other.packetsRejected
+            sum.framesDecoded += other.framesDecoded
+            sum.decodeErrors += other.decodeErrors
+            if other.lastDecodeErrorCode != 0 { sum.lastDecodeErrorCode = other.lastDecodeErrorCode }
+            sum.framesDroppedBeforeFIFO += other.framesDroppedBeforeFIFO
+            sum.samplesEnqueued += other.samplesEnqueued
+            sum.packetsFedSinceLastEnqueue = other.packetsFedSinceLastEnqueue
+            sum.packetsEmitted += other.packetsEmitted
+            sum.encodeErrors += other.encodeErrors
+            if other.lastEncodeErrorCode != 0 { sum.lastEncodeErrorCode = other.lastEncodeErrorCode }
+            sum.timestampMismatches += other.timestampMismatches
+            sum.blocksDroppedUnplaced += other.blocksDroppedUnplaced
+            sum.continuityGaps += other.continuityGaps
+            sum.continuityOverlaps += other.continuityOverlaps
+            sum.continuityJumps += other.continuityJumps
+            return sum
+        }
 
         /// The DECODER is the arm that failed, which no rebuild can change: a producer restart opens a
         /// fresh encoder (#99 failure mode B) but hands the same decoder the same bytes. That is the
@@ -818,6 +850,12 @@ final class AudioBridge: @unchecked Sendable {
         pendingTrimSamples = 0
         continuityBreakCause = nil
         runBreakPending = true
+    }
+
+    func startRun(atFrame frame: Int64, segment: Range<Int64>) {
+        opLock.lock()
+        defer { opLock.unlock() }
+        runStartFrame = frame
     }
 
     func setOutputOffset(seconds: Double) {
@@ -1095,7 +1133,21 @@ final class AudioBridge: @unchecked Sendable {
                                                    / Double(max(encoderTimeBase.num, 1))).rounded())
                     }
                     let position = start &+ Int64(enc.pointee.initial_padding) &+ outputOffsetTicks
-                    if rebaseFromNextSourcePTS {
+                    if rebaseFromNextSourcePTS, let runStart = runStartFrame {
+                        // A segment's run: the encoder starts on its grid point whatever the first frame
+                        // is. Audio decoded before it only settles the decoder and resampler and comes
+                        // off; a stream that begins after it is preceded by silence.
+                        let anchor = runStart &+ Int64(enc.pointee.initial_padding)
+                        nextEncoderPTS = anchor
+                        rebaseFromNextSourcePTS = false
+                        runStartFrame = nil
+                        continuityBreakCause = nil
+                        if position < anchor {
+                            pendingTrimSamples = anchor - position
+                        } else if position > anchor {
+                            injectSilence(position - anchor, frameRate: sf.pointee.sample_rate, enc: enc, swr: swr)
+                        }
+                    } else if rebaseFromNextSourcePTS {
                         // Never below zero: `baseMediaDecodeTime` is unsigned (AE#561). Audio before the
                         // timeline's start comes off the frame instead of wrapping.
                         let floor = Int64(enc.pointee.initial_padding)
@@ -1411,10 +1463,7 @@ final class AudioBridge: @unchecked Sendable {
         case .continue:
             return
         case .gap(let samples):
-            let rate = Int64(max(frameRate, 1))
-            let inputSamples = (samples * rate + Int64(outRate) / 2) / Int64(max(outRate, 1))
-            guard inputSamples > 0, inputSamples < Int64(Int32.max) else { return }
-            _ = swr_inject_silence(swr, Int32(inputSamples))
+            guard injectSilence(samples, frameRate: frameRate, enc: enc, swr: swr) else { return }
             stats.continuityGaps += 1
             note("gap filled with silence", samples)
         case .overlap(let samples):
@@ -1434,6 +1483,18 @@ final class AudioBridge: @unchecked Sendable {
             stats.continuityJumps += 1
             note("jump re-anchored", samples)
         }
+    }
+
+    /// Caller holds `opLock`. `samples` encoder ticks of silence into the resampler, at the input rate,
+    /// so it lands in order behind what is still inside it. False when there was none to inject.
+    @discardableResult
+    private func injectSilence(_ samples: Int64, frameRate: Int32, enc: UnsafeMutablePointer<AVCodecContext>,
+                               swr: OpaquePointer) -> Bool {
+        let outRate = Int64(max(enc.pointee.sample_rate, 1))
+        let inputSamples = (samples * Int64(max(frameRate, 1)) + outRate / 2) / outRate
+        guard inputSamples > 0, inputSamples < Int64(Int32.max) else { return false }
+        _ = swr_inject_silence(swr, Int32(inputSamples))
+        return true
     }
 
     /// `count` samples of silence in the encoder's format, appended to `fifo`.

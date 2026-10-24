@@ -825,8 +825,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     }
     private let silentBridgeSurfaceLock = NSLock()
     private var silentBridgeFailureSurfaced = false
-    /// Session-long audio bridge for codecs illegal in fMP4. Engine-owned (not producer-owned) so
-    /// encoder state survives producer restarts; `startSegment()` rebases PTS on each restart.
+    /// Session-long audio bridge for codecs illegal in fMP4, or the runs that make each segment of a
+    /// seekable VOD session (`AudioSegmentRuns`). Engine-owned (not producer-owned) so the muxer's
+    /// parameters and a single run's encoder survive producer restarts; `startSegment()` rebases a
+    /// single run's PTS on each restart, and drops the segment runs.
     var audioBridge: (any AudioTranscodingBridge)?
     var segmentPlan: [Segment] = []
     /// AE#682: every indexed keyframe of a keyframe-aligned plan, on its axis; the I-frame timeline is
@@ -5015,16 +5017,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         }
 
-        // Seek to the exact video-stream plan timestamp with the target as the lower bound. A
-        // global time seek can choose a much earlier sync point in a multi-stream MP4 (#191).
         // Seek outside restartLock (network-bound). Concurrent stop() calls markClosed() so the
         // seek fails fast instead of racing teardown.
         let seekStart = DispatchTime.now()
-        // Disc plans use folded multi-clip timestamps that are not valid raw seek targets.
-        if activeDem.isDiscSource || !activeDem.seek(to: targetStartPts, streamIndex: videoStreamIndex) {
-            let absoluteTargetSeconds = Double(targetStartPts) * Double(videoTb.num) / Double(videoTb.den)
-            activeDem.seek(to: absoluteTargetSeconds)
-        }
+        seekToProducerStart(activeDem, targetPts: targetStartPts, audioPreRollSeconds: ab?.preRollSeconds ?? 0)
         // AE#782: after the seek, so a container whose seek reads (a TS bisection) spends none of it.
         activeDem.notePlaybackRepositioned()
         // Re-arm bridge PTS rebase so the encoder timeline starts from the new demuxer cursor.
@@ -5100,11 +5096,23 @@ extension HLSVideoEngine {
     func seekToInitialProducerStart(_ dem: Demuxer) {
         let plan = segmentPlan
         guard initialProducerBaseIndex > 0, initialProducerBaseIndex < plan.count else { return }
-        let targetPts = plan[initialProducerBaseIndex].startPts
-        // Disc plans use folded multi-clip timestamps that are not valid raw seek targets.
-        if dem.isDiscSource || !dem.seek(to: targetPts, streamIndex: videoStreamIndex) {
-            let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
-            dem.seek(to: Double(targetPts) * Double(tb.num) / Double(tb.den))
+        seekToProducerStart(dem, targetPts: plan[initialProducerBaseIndex].startPts,
+                            audioPreRollSeconds: audioBridge?.preRollSeconds ?? 0)
+    }
+
+    /// Where a producer starting at the plan's `targetPts` reads from. Without audio pre-roll: the
+    /// exact video-stream plan timestamp as the lower bound, since a global time seek can choose a
+    /// much earlier sync point in a multi-stream MP4 and leave the producer scanning a whole GOP over
+    /// the origin (#191). With it: the sync point at or before the pre-roll, which the bridge's runs
+    /// need read (`AudioSegmentRuns`), the producer dropping the video up to the target's keyframe.
+    func seekToProducerStart(_ dem: Demuxer, targetPts: Int64, audioPreRollSeconds: Double) {
+        let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
+        let preRollTicks = tb.num > 0 ? Int64((audioPreRollSeconds * Double(tb.den) / Double(tb.num)).rounded(.up)) : 0
+        let readFrom = targetPts - preRollTicks
+        // Disc plans use folded multi-clip timestamps that are not valid raw seek targets; their
+        // tables seek to the sync point at or before.
+        if dem.isDiscSource || !dem.seek(to: readFrom, streamIndex: videoStreamIndex, atOrBefore: preRollTicks > 0) {
+            dem.seek(to: Double(readFrom) * Double(tb.num) / Double(tb.den))
         }
     }
 }

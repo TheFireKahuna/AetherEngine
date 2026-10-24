@@ -2627,9 +2627,11 @@ public final class Demuxer: @unchecked Sendable {
         return ret >= 0
     }
 
-    /// Seek on one stream's native timestamp axis, never before `timestamp`.
+    /// Seek on one stream's native timestamp axis, never before `timestamp`; or, `atOrBefore`, never
+    /// after it: to the sync point at or before, for a reader that needs what precedes `timestamp`
+    /// (a restart's audio pre-roll, `AudioSegmentRuns`).
     @discardableResult
-    func seek(to timestamp: Int64, streamIndex: Int32) -> Bool {
+    func seek(to timestamp: Int64, streamIndex: Int32, atOrBefore: Bool = false) -> Bool {
         accessLock.lock()
         defer { accessLock.unlock() }
         guard let ctx = formatContext,
@@ -2661,9 +2663,9 @@ public final class Demuxer: @unchecked Sendable {
         let ret = avformat_seek_file(
             ctx,
             streamIndex,
+            atOrBefore ? Int64.min : timestamp,
             timestamp,
-            timestamp,
-            Int64.max,
+            atOrBefore ? timestamp : Int64.max,
             0
         )
         if ret < 0 {

@@ -4395,12 +4395,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         // A copied packet plays whole from its timestamp, so it has to start at the target. A
                         // bridge places what it decodes by each frame's own time, so a packet belongs as soon
                         // as any of its audio reaches the target; dropping a leading one (Opus's, which carries
-                        // the pre-skip) made the decoder skip the next packet's real audio instead.
+                        // the pre-skip) made the decoder skip the next packet's real audio instead. A bridge
+                        // that makes each segment in a run of its own reads its pre-roll ahead of the target.
                         let bridged = audioConfig?.bridge != nil
+                        let target = restartTargetAudioDts &- audioPreRollTicks
                         let meetsTarget = packet.pointee.dts != Int64.min
                             && (bridged && packet.pointee.duration > 0
-                                ? SourceTimestampBounds.sum(packet.pointee.dts, packet.pointee.duration) > restartTargetAudioDts
-                                : packet.pointee.dts >= restartTargetAudioDts)
+                                ? SourceTimestampBounds.sum(packet.pointee.dts, packet.pointee.duration) > target
+                                : packet.pointee.dts >= target)
                         // Live escape: backward PCR wrap between video gate-open and first audio packet strands the target
                         // in the old clock domain (permanently silent). Timeout + accept; VOD keeps unbounded wait.
                         var escape = false
@@ -4461,13 +4463,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         }
                         // The bridge's grid starts where the stream does, on the axis it is fed on.
                         audioConfig?.bridge?.setSourceStart(audioConfig?.sourceStart.map { $0 - audioShiftPts })
+                        if let audio = audioConfig, !isLive, !audioFollowsVideoCut {
+                            audio.bridge?.setRunPlan(audioRunPlan(audio))
+                        }
                         let gapInAudioTb: Int64
                         if restartTargetVideoPts == Int64.min {
                             gapInAudioTb = 0
                         } else {
                             gapInAudioTb = restartTargetAudioDts == Int64.min
                                 ? 0
-                                : SourceTimestampBounds.difference(firstActualAudioDts, restartTargetAudioDts)
+                                : SourceTimestampBounds.difference(firstActualAudioDts, restartTargetAudioDts &- audioPreRollTicks)
                         }
                         let gapMs = audioTb.den > 0
                             ? Double(gapInAudioTb) * Double(audioTb.num) * 1000.0 / Double(audioTb.den)
@@ -4964,8 +4969,24 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private func bridgedAudioSegmentIndex(_ packet: UnsafeMutablePointer<AVPacket>, audio: AudioConfig) -> Int {
         if isLive { return liveCurrentSegmentIndex }
         if audioFollowsVideoCut { return vodCutter.current }
-        let delay = Int64((audioDelaySeconds * Double(audio.inputTimeBase.den) / Double(max(audio.inputTimeBase.num, 1))).rounded())
-        return segmentIndex(forSourcePts: av_rescale_q(packet.pointee.pts - delay, audio.inputTimeBase, sourceVideoTimeBase))
+        return audioRunPlan(audio).segment(ofOutputPts: packet.pointee.pts)
+    }
+
+    /// This producer's segments as bridged audio is routed to them: the routing above, and the runs
+    /// that make each segment's audio (`AudioSegmentRuns`).
+    private func audioRunPlan(_ audio: AudioConfig) -> AudioRunPlan {
+        AudioRunPlan(
+            baseIndex: baseIndex, boundaries: segmentBoundaries, planAnchor: planAnchorVideoPts,
+            videoTimeBase: sourceVideoTimeBase, outputTimeBase: audio.inputTimeBase,
+            delayTicks: Int64((audioDelaySeconds * Double(audio.inputTimeBase.den)
+                               / Double(max(audio.inputTimeBase.num, 1))).rounded()))
+    }
+
+    /// The bridge's pre-roll (`AudioTranscodingBridge.preRollSeconds`), source audio time base.
+    private var audioPreRollTicks: Int64 {
+        guard let audio = audioConfig, let seconds = audio.bridge?.preRollSeconds, seconds > 0,
+              audio.sourceTimeBase.num > 0 else { return 0 }
+        return Int64((seconds * Double(audio.sourceTimeBase.den) / Double(audio.sourceTimeBase.num)).rounded(.up))
     }
 
     // MARK: - Look-behind finalize helpers

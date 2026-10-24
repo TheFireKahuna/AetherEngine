@@ -319,18 +319,20 @@ extension HLSVideoEngine {
         source: ObjectAudioSource
     ) -> HLSSegmentProducer? {
         let bridge: SpatialAudioBridge
+        /// A decoder for each segment's run, made as the session's own.
+        let makeDecoder: () throws -> ObjectAudioDecoding
         do {
             let decoder: ObjectAudioDecoding
             switch source {
             case .trueHDAtmos:
                 #if TrueHDObjectAudio
-                if APACObjectOutputSwitch.isOn {
-                    decoder = try TrueHDObjectAudioDecoder(splitsBed: false, objectOutput: true,
-                                                           dialogueGain: objectDialogueGain)
-                } else {
-                    decoder = try TrueHDObjectAudioDecoder(splitsBed: !TrueHDReferenceRender.isOn,
-                                                           dialogueGain: objectDialogueGain)
+                let dialogueGain = objectDialogueGain
+                makeDecoder = {
+                    APACObjectOutputSwitch.isOn
+                        ? try TrueHDObjectAudioDecoder(splitsBed: false, objectOutput: true, dialogueGain: dialogueGain)
+                        : try TrueHDObjectAudioDecoder(splitsBed: !TrueHDReferenceRender.isOn, dialogueGain: dialogueGain)
                 }
+                decoder = try makeDecoder()
                 #else
                 return nil
                 #endif
@@ -356,6 +358,7 @@ extension HLSVideoEngine {
                     // The verdict decoded the first packets; the bridge starts from the same ones again.
                     dtsx.reset()
                     decoder = dtsx
+                    makeDecoder = { try DTSXObjectAudioDecoder() }
                     audioIsConfirmedDTSX = true
                 case .refused(let reason):
                     EngineLog.emit(
@@ -390,21 +393,35 @@ extension HLSVideoEngine {
             bridge.close()
             return nil
         }
+        // Same surfacing as the channel bridge: a decoder that never answers is a failure, not silence.
+        let watchesDecoder = sideAudioDemuxer == nil
+        let streamIndex = sourceAudioStreamIndex
+        let objectOutput = source == .trueHDAtmos && APACObjectOutputSwitch.isOn
+        let levels = bridge.levels
+        let delivered = segmentRuns(template: bridge, sourceStream: audioStream) { [weak self] in
+            let run = try SpatialAudioBridge(srcTimeBase: audioStream.pointee.time_base, layout: layout,
+                                             decoder: try makeDecoder(), objectOutput: objectOutput,
+                                             sessionLevels: levels)
+            if watchesDecoder {
+                run.onDecoderProducedNothing = { [weak self] stats in
+                    self?.handleBridgeDecodedNothing(streamIndex: streamIndex, summary: stats.summary)
+                }
+            }
+            return run
+        } ?? bridge
         let cfg = HLSSegmentProducer.AudioConfig(
             codecpar: cp,
             timeBase: bridge.encoderTimeBase,
             sourceStreamIndex: sourceAudioStreamIndex,
             inputTimeBase: bridge.encoderTimeBase,
             sourceTimeBase: audioStream.pointee.time_base,
-            bridge: bridge,
+            bridge: delivered,
             language: audioLanguage,
             sourceStart: audioStream.pointee.start_time == Int64.min ? nil : audioStream.pointee.start_time
         )
         savedAudioConfig = cfg
-        audioBridge = bridge
-        // Same surfacing as the channel bridge: a decoder that never answers is a failure, not silence.
-        if sideAudioDemuxer == nil {
-            let streamIndex = sourceAudioStreamIndex
+        audioBridge = delivered
+        if watchesDecoder {
             bridge.onDecoderProducedNothing = { [weak self] stats in
                 self?.handleBridgeDecodedNothing(streamIndex: streamIndex, summary: stats.summary)
             }
@@ -441,7 +458,7 @@ extension HLSVideoEngine {
             )
             savedAudioConfig = nil
             audioBridge = nil
-            bridge.close()
+            delivered.close()
             return nil
         }
     }

@@ -48,6 +48,30 @@ protocol AudioTranscodingBridge: AnyObject, Sendable {
     func setSourceStart(_ pts: Int64?)
     /// Live splice gap correction, in seconds.
     func noteTimelineJump(deltaSeconds: Double)
+    /// The producer's segments, for a bridge that makes each segment's audio in a run of its own
+    /// (`AudioSegmentRuns`); every other bridge ignores it. Set when the audio gate opens, before the
+    /// first feed.
+    func setRunPlan(_ plan: AudioRunPlan)
+    /// How far before a segment's start the bridge reads the source to make it: a restart seeks that
+    /// much earlier, and the producer feeds from there. Zero for a bridge that makes the session in
+    /// one run.
+    var preRollSeconds: Double { get }
+
+    /// A segment's run (`AudioSegmentRuns`): the run's anchor puts the encoder's first input frame at
+    /// `frame` on the output timeline, encoder ticks with the output offset in (an encoder's padding
+    /// goes in front of it). Audio decoded before it settles the stages ahead of the encoder and
+    /// comes off, as does audio the offset puts before it; a stream that begins after it is preceded
+    /// by silence. `segment` is the run's own part of the output timeline, which it reports on
+    /// (`SessionLevelMeter`). Set before the run's first feed.
+    func startRun(atFrame frame: Int64, segment: Range<Int64>)
+    /// What a run's output at a position takes from its input, decoder to encoder; nil where a
+    /// stage's memory is not known.
+    var runSpan: AudioStageSpan? { get }
+    /// The encoder's part of `runSpan`'s memory: a run starts that far before its segment's first
+    /// packet at least.
+    var runEncoderMemory: Int { get }
+    /// Frames per output packet: the grid every run starts on.
+    var runPacketFrames: Int { get }
     func close()
 
     var feedStats: AudioBridge.FeedStats { get }
@@ -63,6 +87,9 @@ protocol AudioTranscodingBridge: AnyObject, Sendable {
 extension AudioBridge: AudioTranscodingBridge {
     var soundSampleEntryOverride: Data? { nil }
     var servedChannelCount: Int? { nil }
+    var runSpan: AudioStageSpan? { span }
+    var runEncoderMemory: Int { encoderSpan.memory }
+    var runPacketFrames: Int { Int(packetFrames) }
     var peakOutputBitRate: Int64 {
         guard let cp = encoderCodecpar else { return 0 }
         return Self.peakBitRate(bitRate: cp.pointee.bit_rate,
@@ -83,4 +110,6 @@ extension AudioBridge: AudioTranscodingBridge {
 
 extension AudioTranscodingBridge {
     var objectAudioActivity: ObjectAudioActivity? { nil }
+    func setRunPlan(_ plan: AudioRunPlan) {}
+    var preRollSeconds: Double { 0 }
 }

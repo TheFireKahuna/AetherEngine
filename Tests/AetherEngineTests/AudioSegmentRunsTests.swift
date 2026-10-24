@@ -1,0 +1,153 @@
+import AetherLibavcodec
+import AetherLibavformat
+import AetherLibavutil
+import Foundation
+import Testing
+@testable import AetherEngine
+
+/// A segment's bridged audio comes out the same however playback reached it (`AudioSegmentRuns`):
+/// a seek, which reads the source from its pre-roll before the segment, makes the segments that
+/// continuous playback made, byte for byte and on the same timestamps; and continuous playback's
+/// segments follow one another a packet at a time across every run's handoff.
+@Suite("Segment runs: a seek makes continuous playback's segments")
+struct AudioSegmentRunsTests {
+
+    private struct Clip {
+        let packets: [UnsafeMutablePointer<AVPacket>]
+        let codecpar: UnsafeMutablePointer<AVCodecParameters>
+        let timeBase: AVRational
+        let start: Int64?
+        func free() {
+            for p in packets { var q: UnsafeMutablePointer<AVPacket>? = p; av_packet_free(&q) }
+            var c: UnsafeMutablePointer<AVCodecParameters>? = codecpar
+            avcodec_parameters_free(&c)
+        }
+    }
+
+    private func read(_ name: String) throws -> Clip {
+        let path = decmemFixture(name)
+        try #require(FileManager.default.fileExists(atPath: path), "run Scripts/fetch-fixtures.sh to generate Fixtures/decmem/")
+        var fmt: UnsafeMutablePointer<AVFormatContext>?
+        try #require(avformat_open_input(&fmt, path, nil, nil) == 0)
+        defer { avformat_close_input(&fmt) }
+        try #require(avformat_find_stream_info(fmt, nil) >= 0)
+        let index = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nil, 0)
+        try #require(index >= 0)
+        let stream = fmt!.pointee.streams[Int(index)]!
+        let par = avcodec_parameters_alloc()!
+        avcodec_parameters_copy(par, stream.pointee.codecpar)
+        var packets: [UnsafeMutablePointer<AVPacket>] = []
+        var pkt = av_packet_alloc()
+        defer { av_packet_free(&pkt) }
+        while av_read_frame(fmt, pkt) >= 0 {
+            if pkt!.pointee.stream_index == index, let c = av_packet_clone(pkt) { packets.append(c) }
+            av_packet_unref(pkt)
+        }
+        return Clip(packets: packets, codecpar: par, timeBase: stream.pointee.time_base,
+                    start: stream.pointee.start_time == Int64.min ? nil : stream.pointee.start_time)
+    }
+
+    /// Two-second segments from 0, on a 90 kHz video axis.
+    private func plan(from base: Int, bridge: any AudioTranscodingBridge, seconds: Int, delay: Double) -> AudioRunPlan {
+        AudioRunPlan(baseIndex: base, boundaries: stride(from: base * 2, through: seconds + 2, by: 2).map { Int64($0) * 90_000 },
+                     planAnchor: 0, videoTimeBase: AVRational(num: 1, den: 90_000),
+                     outputTimeBase: bridge.encoderTimeBase,
+                     delayTicks: Int64((delay * Double(bridge.encoderTimeBase.den)).rounded()))
+    }
+
+    private struct Out: Equatable {
+        let pts: Int64
+        let bytes: [UInt8]
+    }
+
+    /// Every packet the runs hand on from `first` on, by segment.
+    private func produce(_ clip: Clip, mode: AudioBridgeMode, from first: Int, base: Int, seconds: Int,
+                         delay: Double = 0) throws
+        -> (segments: [Int: [Out]], packetFrames: Int64, preRoll: Double) {
+        let make = { try AudioBridge(srcCodecpar: clip.codecpar, srcTimeBase: clip.timeBase, mode: mode) as any AudioTranscodingBridge }
+        let runs = try #require(AudioSegmentRuns(template: try make(), sourceCodecpar: clip.codecpar,
+                                                 sourceTimeBase: clip.timeBase, makeRun: make))
+        defer { runs.close() }
+        runs.setSourceStart(clip.start)
+        runs.setOutputOffset(seconds: delay)
+        let plan = plan(from: base, bridge: runs, seconds: seconds, delay: delay)
+        runs.setRunPlan(plan)
+        var segments: [Int: [Out]] = [:]
+        func take(_ packets: [UnsafeMutablePointer<AVPacket>]) {
+            for p in packets {
+                segments[plan.segment(ofOutputPts: p.pointee.pts), default: []]
+                    .append(Out(pts: p.pointee.pts, bytes: Array(UnsafeBufferPointer(start: p.pointee.data, count: Int(p.pointee.size)))))
+                var q: UnsafeMutablePointer<AVPacket>? = p
+                trackedPacketFree(&q)
+            }
+        }
+        for p in clip.packets[first...] { take(try runs.feed(packet: p)) }
+        take(runs.flush())
+        return (segments, Int64(runs.runPacketFrames), runs.preRollSeconds)
+    }
+
+    @Test("a seek makes the segments continuous playback made",
+          arguments: [("mp2.mkv", AudioBridgeMode.lossless), ("mp3-64k.mp3", .lossless), ("mp3-vbr.mkv", .lossless),
+                      ("mp3-lsf.mp3", .lossless), ("vorbis.ogg", .lossless), ("opus.mkv", .lossless),
+                      ("dts-51.mkv", .lossless), ("dts-51.mkv", .surroundCompat), ("truehd-51.mkv", .lossless),
+                      ("truehd-51.mkv", .surroundCompat), ("truehd-96k.mkv", .lossless), ("flac.mkv", .lossless)])
+    func seekMatchesContinuous(_ name: String, _ mode: AudioBridgeMode) throws {
+        try check(name, mode, delay: 0)
+    }
+
+    @Test("with an audio delay, too", arguments: [("dts-51.mkv", AudioBridgeMode.surroundCompat, 0.15),
+                                                  ("dts-51.mkv", .surroundCompat, -0.15), ("opus.mkv", .lossless, 0.15),
+                                                  ("opus.mkv", .lossless, -0.15)])
+    func seekMatchesContinuousWithDelay(_ name: String, _ mode: AudioBridgeMode, _ delay: Double) throws {
+        try check(name, mode, delay: delay)
+    }
+
+    private func check(_ name: String, _ mode: AudioBridgeMode, delay: Double) throws {
+        let clip = try read(name)
+        defer { clip.free() }
+        let seconds = 12
+        let continuous = try produce(clip, mode: mode, from: 0, base: 0, seconds: seconds, delay: delay)
+        #expect(continuous.segments.values.joined().allSatisfy { $0.pts >= 0 }, "\(name): nothing below the timeline's zero")
+        let rate = Int64(clip.codecpar.pointee.sample_rate)
+
+        // Continuous playback: one packet after another on the grid, across every handoff.
+        let all = continuous.segments.keys.sorted().flatMap { continuous.segments[$0]! }
+        try #require(all.count > 100)
+        for (a, b) in zip(all, all.dropFirst()) {
+            #expect(b.pts - a.pts == continuous.packetFrames, "\(name): \(a.pts) then \(b.pts)")
+        }
+
+        for k in [1, 2, 4] {
+            // The seek reads from the last packet at or before the pre-roll ahead of segment k.
+            let readFrom = Int64(k * 2) * Int64(clip.timeBase.den) / Int64(clip.timeBase.num)
+                - Int64((continuous.preRoll * Double(clip.timeBase.den) / Double(clip.timeBase.num)).rounded(.up))
+            let first = clip.packets.lastIndex { $0.pointee.pts <= readFrom } ?? 0
+            let seek = try produce(clip, mode: mode, from: first, base: k, seconds: seconds, delay: delay)
+            for segment in k...(k + 1) {
+                let want = continuous.segments[segment] ?? []
+                let got = seek.segments[segment] ?? []
+                #expect(!want.isEmpty, "\(name): segment \(segment) is empty")
+                #expect(got.map(\.pts) == want.map(\.pts), "\(name): segment \(segment)'s timestamps after a seek to \(k)")
+                #expect(got == want, "\(name): segment \(segment)'s bytes after a seek to \(k) (\(rate) Hz)")
+            }
+            #expect(seek.segments.keys.min() == k, "\(name): nothing before the segment sought to")
+        }
+    }
+
+    @Test("an MP3 run starts where the stream's own reservoir says, short of the format's worst case")
+    func mp3RunStartsAtItsReservoir() throws {
+        let clip = try read("mp3-lsf.mp3")
+        defer { clip.free() }
+        let buffers = clip.packets.map { UnsafeRawBufferPointer(start: $0.pointee.data, count: Int($0.pointee.size)) }
+        // 32 kbps at 24 kHz: the format allows 255 bytes, 85 frames' worth at 8 kbps.
+        let frameSamples: Int64 = 576
+        var furthest = 0
+        for needed in stride(from: 50, to: clip.packets.count, by: 7) {
+            let first = try #require(MP3MainData.firstPacket(feeding: needed, of: buffers))
+            furthest = max(furthest, needed - first)
+        }
+        let bound = Int64(AudioStageSpan.mp3DecoderMemory(sampleRate: 24_000, channels: 2) - AudioStageSpan.mp3OverlapFrames) / frameSamples
+        #expect(furthest >= 1, "a reservoir that never reaches back is not one")
+        #expect(Int64(furthest) < bound, "\(furthest) frames back against the format's \(bound)")
+    }
+}
