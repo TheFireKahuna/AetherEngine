@@ -3070,9 +3070,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// `DocumentedConstantsTests` holds the two together.
     static let atmosChannelsAttribute = "16/JOC"
 
-    /// A subtitle store counts as being filled while a feeder started on it or reported reading within this.
-    /// Generous next to every feeder's cadence (the OCR worker ticks well under a second, a side reader
-    /// reports per packet), so a feeder that is reading never misses it.
+    /// A subtitle store's reading counts as advancing while it moved forward within this. Generous next to
+    /// every progressive feeder's cadence (a side reader reports per packet, the OCR worker per recognized
+    /// batch), so a feeder that is reading never misses it.
     static let subtitleFeedAliveSeconds = 5.0
 
     /// The longest a subtitle segment request is held for a feeder to reach its window. AVPlayer gives
@@ -3147,14 +3147,16 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // cover THIS window (read head within the horizon, or still warming up), and only briefly.
         // Measured on how far the track has been READ, not on its last cue: a sparse (forced) track's last
         // cue can trail its reading by minutes, and waiting on the cue made every one of its windows wait.
-        // And only while something is filling it: a rendition the player selected by itself before
-        // anyone fed it used to cost 3 s a request, which held the item's start past the readiness gate
-        // (a FORCED=YES rendition tvOS picked at load, 2026-10-24).
+        // And only while a feeder's reading is moving toward it: AVPlayer waits for a selected
+        // rendition's first segments before it starts the item, so a request held for a feeder that has
+        // only started, or for one that hands its result over all at once, held the start past the
+        // readiness gate and cost a master reload (FORCED=YES renditions tvOS picked at load,
+        // 2026-10-24).
         store.noteRequested(through: end)
         let horizonSeconds = 30.0
         let deadline = Date().addingTimeInterval(Self.subtitleRequestWaitSeconds)
         while !store.isFinished,
-              store.isBeingFed(within: Self.subtitleFeedAliveSeconds),
+              store.isReadingAdvancing(within: Self.subtitleFeedAliveSeconds),
               store.readThrough(at: start) < end,
               end <= store.readThrough(at: start) + horizonSeconds || store.readThrough(at: start) <= 0,
               Date() < deadline {
