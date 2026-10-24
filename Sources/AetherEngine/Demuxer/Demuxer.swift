@@ -931,20 +931,8 @@ public final class Demuxer: @unchecked Sendable {
         refreshStreamTableLocked()
         accessLock.unlock()
         reportOpenStage(.streamsProbed)     // #361
-        // #281: every parse seek this open performs has happened by now, so the provider can drop
-        // the cold-start state that only exists to serve them. Deliberately after probeStreams:
-        // find_stream_info is where the trailing-index ping-pong lives, not avformat_open_input.
-        avioProvider?.markOpenPhaseFinished()
         promoteAlternativeTransferHLG()
     }
-
-    /// AE#585: bracket the host's bounded index pass (the cue prewarm and the cursor reset that
-    /// follows it), so a provider holding cold-start state does not release it to a read that is
-    /// index work and is followed immediately by a read at the position it started from.
-    func beginIndexPass() { avioProvider?.beginIndexPass() }
-
-    /// AE#585: ends the bracket above. Safe to call without a matching `beginIndexPass`.
-    func endIndexPass() { avioProvider?.endIndexPass() }
 
     /// AE#782: a producer restart just seeked here, so the reader anchors its connection at the next
     /// read it cannot serve from memory instead of detouring.

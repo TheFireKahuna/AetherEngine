@@ -63,30 +63,12 @@ protocol AVIOProvider: AnyObject {
     /// Free the `AVIOContext` and release the underlying source. Idempotent.
     func close()
 
-    /// #281: the demuxer's header + stream-info pass is done, so any further seek is playback, not
-    /// parsing. A provider that keeps cold-start state (AVIOReader parks a discarded window for the
-    /// parse seek's return trip) releases it here. Default no-op: a provider without that state,
-    /// like the custom-reader bridge, ignores it.
-    func markOpenPhaseFinished()
-
-    /// AE#585: the host is about to run a bounded index pass (the cue prewarm), which is index work
-    /// rather than playback, and it returns the cursor to where it started. A provider that releases
-    /// cold-start state on a read that moved away holds it across this. Default no-op.
-    func beginIndexPass()
-
-    /// AE#585: the index pass is over, so the next read that lands outside a resident span is
-    /// playback's. Default no-op.
-    func endIndexPass()
-
     /// AE#782: the demuxer was just repositioned for playback (a producer restart), so the next read
     /// that needs the network is where playback continues, not index work that returns. Default no-op.
     func notePlaybackRepositioned()
 }
 
 extension AVIOProvider {
-    func markOpenPhaseFinished() {}
-    func beginIndexPass() {}
-    func endIndexPass() {}
     func notePlaybackRepositioned() {}
     var currentSourceOffset: Int64? { nil }
     var sourceSurvivesReopen: Bool { false }
