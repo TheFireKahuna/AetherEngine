@@ -142,6 +142,11 @@ final class APACObjectEncoder: APACChunkEncoding {
     private var busUpdatesReported = 0
     private var busRampsReported = 0
     private var outputBuffer: [UInt8]
+    /// What went into the packet being assembled, and into the few before it, for the line a codec
+    /// failure writes. The codec looks ahead, so the packet it refuses may hold input from earlier ones.
+    private var packetTrace = PacketTrace()
+    private var recentTraces: [PacketTrace] = []
+    static let tracedPackets = 4
     private var ended = false
     /// Whether the codec is initialized for coding: not until the first encode (`APACCodecGate`).
     private var started = false
@@ -265,12 +270,18 @@ final class APACObjectEncoder: APACChunkEncoding {
         }
         defer { if gated { APACCodecGate.lock.unlock() } }
         try start()
-        if buffer.objectRoles != roles { configure(buffer.objectRoles) }
+        if buffer.objectRoles != roles {
+            configure(buffer.objectRoles)
+            packetTrace.configured = true
+        }
         outputLock.lock()
         let requested = pendingOutput
         pendingOutput = nil
         outputLock.unlock()
-        if let requested, requested != output { switchOutput(to: requested) }
+        if let requested, requested != output {
+            packetTrace.outputSwitch = "\(output.rawValue)->\(requested.rawValue)"
+            switchOutput(to: requested)
+        }
         var packets: [APACEncoder.Packet] = []
         var events = buffer.objectUpdates.map { (offset: $0.frameOffset, update: Optional($0)) }
             + buffer.objectDiscontinuities.map { (offset: $0, update: Optional<ObjectAudioMetadataUpdate>.none) }
@@ -281,6 +292,7 @@ final class APACObjectEncoder: APACChunkEncoding {
         while cursor < frames || (next < events.endIndex && events[next].offset <= cursor) {
             while next < events.endIndex, events[next].offset <= cursor {
                 if let update = events[next].update { apply(update) } else { markDiscontinuity() }
+                packetTrace.note(events[next].update)
                 next += 1
             }
             guard cursor < frames else { break }
@@ -293,6 +305,7 @@ final class APACObjectEncoder: APACChunkEncoding {
         // Stamped at or past the chunk's end: they take effect from here, as in `ObjectAudioRenderer`.
         for event in events[next...] {
             if let update = event.update { apply(update) } else { markDiscontinuity() }
+            packetTrace.note(event.update)
         }
         return packets
     }
@@ -759,10 +772,12 @@ final class APACObjectEncoder: APACChunkEncoding {
         // budget, and so on until the packet fits: only the busiest objects lose timing detail.
         var budgets = [Int](repeating: APACObjectMetadata.maxBlocks, count: slots.count)
         var packet: [UInt8]?
+        var blockCounts: [Int] = []
         while true {
             let objects = slots.indices.map {
                 used[$0] ? slots[$0].blocks(packetStart: packetStart, maxBlocks: budgets[$0], map: map) : []
             }
+            blockCounts = objects.indices.filter { used[$0] }.map { objects[$0].count }
             if let p = APACObjectMetadata.packet(objects: objects) {
                 packet = p
                 largestMetadataPacket = max(largestMetadataPacket, p.count)
@@ -774,6 +789,10 @@ final class APACObjectEncoder: APACChunkEncoding {
             budgetFallbacks += 1
         }
         metadataPackets += 1
+        packetTrace.clock = packetStart
+        packetTrace.metadataBytes = packet?.count
+        packetTrace.blocks = blockCounts
+        packetTrace.halvedBudgets = budgets.filter { $0 < APACObjectMetadata.maxBlocks }.count
         for i in slots.indices { slots[i].finishPacket() }
         lfe.finishPacket()
         if let packet {
@@ -785,18 +804,42 @@ final class APACObjectEncoder: APACChunkEncoding {
         let total = staging.count * 4
         var offset = 0
         var stalled = 0
-        while offset < total {
-            var bytes = UInt32(total - offset)
-            var packetsIn: UInt32 = 0
-            let status = staging.withUnsafeBytes {
-                AudioCodecAppendInputData(codec, $0.baseAddress! + offset, &bytes, &packetsIn, nil)
-            }
-            guard status == 0 else { throw EncoderError.encode("append", status) }
-            offset += Int(bytes)
-            try produce(into: &packets)
-            stalled = bytes == 0 ? stalled + 1 : 0
-            if stalled > 1 { throw EncoderError.encode("append (no progress)", -1) }
+        defer {
+            recentTraces.append(packetTrace)
+            if recentTraces.count > Self.tracedPackets { recentTraces.removeFirst() }
+            packetTrace = PacketTrace()
         }
+        do {
+            while offset < total {
+                var bytes = UInt32(total - offset)
+                var packetsIn: UInt32 = 0
+                let status = staging.withUnsafeBytes {
+                    AudioCodecAppendInputData(codec, $0.baseAddress! + offset, &bytes, &packetsIn, nil)
+                }
+                guard status == 0 else { throw EncoderError.encode("append", status) }
+                offset += Int(bytes)
+                packetTrace.appended = offset
+                try produce(into: &packets)
+                stalled = bytes == 0 ? stalled + 1 : 0
+                if stalled > 1 { throw EncoderError.encode("append (no progress)", -1) }
+            }
+        } catch {
+            reportFailure(error, appendedBytes: offset, of: total)
+            throw error
+        }
+    }
+
+    /// The codec refused a packet: everything known about what went into it, once per failure. The
+    /// codec's own status says only "bad parameter", so the inputs are the evidence.
+    private func reportFailure(_ error: Error, appendedBytes: Int, of total: Int) {
+        let audit = SampleAudit(staging, channels: inputChannels, metadataChannel: metadataChannel,
+                                bedChannels: bedChannels)
+        let history = recentTraces.map(\.summary).joined(separator: " | ")
+        EngineLog.emit(
+            "[APACObjectEncoder] TRACE \(error): packet \(packetTrace.summary); appended \(appendedBytes)/\(total) bytes; "
+            + "samples \(audit.summary); output \(output.rawValue), roles \(roles.count), "
+            + "slots used \(used.filter { $0 }.count); previous (oldest first) \(history.isEmpty ? "-" : history)",
+            category: .session)
     }
 
     private func produce(into packets: inout [APACEncoder.Packet]) throws {
@@ -894,3 +937,64 @@ final class APACObjectEncoder: APACChunkEncoding {
     private static func fourCC(_ s: String) -> UInt32 { s.utf8.reduce(0) { $0 << 8 | UInt32($1) } }
 }
 #endif
+
+/// One packet's inputs, for `APACObjectEncoder.reportFailure`.
+private struct PacketTrace {
+    var clock: Int64 = 0
+    var updates = 0
+    var discontinuities = 0
+    var maxRampFrames = 0
+    var configured = false
+    var outputSwitch: String?
+    var metadataBytes: Int?
+    var blocks: [Int] = []
+    var halvedBudgets = 0
+    var appended = 0
+
+    mutating func note(_ update: ObjectAudioMetadataUpdate?) {
+        guard let update else { discontinuities += 1; return }
+        updates += 1
+        maxRampFrames = max(maxRampFrames, update.rampFrames)
+    }
+
+    var summary: String {
+        var parts = ["@\(clock)", "upd \(updates)", "disc \(discontinuities)", "ramp<=\(maxRampFrames)",
+                     "meta \(metadataBytes.map(String.init) ?? "none")B", "blocks \(blocks.reduce(0, +))/max \(blocks.max() ?? 0)"]
+        if halvedBudgets > 0 { parts.append("halved \(halvedBudgets)") }
+        if configured { parts.append("reconfigured") }
+        if let outputSwitch { parts.append("output \(outputSwitch)") }
+        return parts.joined(separator: " ")
+    }
+}
+
+/// Non-finite and out-of-range samples in a staged packet, by kind of channel.
+private struct SampleAudit {
+    var nonFinite = 0
+    var bedPeak: Float = 0
+    var objectPeak: Float = 0
+    var metadataPeak: Float = 0
+    var firstBad: (frame: Int, channel: Int)?
+
+    init(_ staging: [Float], channels: Int, metadataChannel: Int, bedChannels: Int) {
+        for (i, v) in staging.enumerated() {
+            let channel = i % channels
+            guard v.isFinite else {
+                nonFinite += 1
+                if firstBad == nil { firstBad = (i / channels, channel) }
+                continue
+            }
+            let a = abs(v)
+            if channel == metadataChannel { metadataPeak = max(metadataPeak, a) }
+            else if channel < bedChannels { bedPeak = max(bedPeak, a) }
+            else { objectPeak = max(objectPeak, a) }
+        }
+    }
+
+    var summary: String {
+        var text = String(format: "peak bed %.3f objects %.3f metadata %.3f", bedPeak, objectPeak, metadataPeak)
+        if nonFinite > 0, let bad = firstBad {
+            text += ", NON-FINITE \(nonFinite) (first frame \(bad.frame) channel \(bad.channel))"
+        }
+        return text
+    }
+}
