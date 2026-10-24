@@ -3488,7 +3488,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // Audio target set dynamically after video lands.
         let videoTarget: Int64
         let desiredVideoTfdt: Int64
-        let desiredAudioTfdt: Int64
         if let endSeconds = liveReopenOutputEndSeconds {
             // Live reopen: no scan target (join head), but tfdt must continue where the
             // failed producer's last segment ended (seam carries #EXT-X-DISCONTINUITY).
@@ -3496,9 +3495,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
             desiredVideoTfdt = sourceVideoTbSeconds > 0
                 ? Int64(endSeconds / sourceVideoTbSeconds)
                 : 0
-            desiredAudioTfdt = savedAudioConfig.map {
-                av_rescale_q(desiredVideoTfdt, cfg.timeBase, $0.sourceTimeBase)
-            } ?? 0
         } else if baseIndex > 0, baseIndex < segmentPlan.count {
             videoTarget = segmentPlan[baseIndex].startPts
             // The produced timeline continues at the segment's ADVERTISED item-axis start, never at
@@ -3509,15 +3505,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             desiredVideoTfdt = sourceVideoTbSeconds > 0
                 ? Int64((segmentPlan[baseIndex].startSeconds / sourceVideoTbSeconds).rounded())
                 : segmentPlan[baseIndex].startPts - firstKeyframePts
-            // Rescale into source audio TB (not bridge.inputTimeBase=1/48000). The pre-fix bug
-            // was FLAC-bridge-only: shift=-152485195 (off by 48x); stream-copy unaffected.
-            desiredAudioTfdt = savedAudioConfig.map {
-                av_rescale_q(desiredVideoTfdt, cfg.timeBase, $0.sourceTimeBase)
-            } ?? 0
         } else {
             videoTarget = Int64.min
             desiredVideoTfdt = 0
-            desiredAudioTfdt = 0
         }
 
         // Segment boundary slice: startPts per segment + endPts of final (producer upper bound).
@@ -3547,7 +3537,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
             subtitleTapStreamIndices: Set(nativeSubtitleSourceStreamIndicesForSession.compactMap { $0 }),
             subtitlePacketStreamIndices: allEmbeddedSubtitleStreamIndices,   // #112 rework
             desiredFirstVideoTfdtPts: desiredVideoTfdt,
-            desiredFirstAudioTfdtPts: desiredAudioTfdt,
             segmentBoundaries: segmentBoundaries,
             planAnchorVideoPts: firstKeyframePts,
             isLive: isLiveSession,

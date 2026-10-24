@@ -108,7 +108,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         /// inputTimeBase instead landed the target 48x too far into the source for bridged DTS.
         let sourceTimeBase: AVRational
         /// Non-nil routes each packet through bridge.feed and muxes the returned FLAC packets.
-        let bridge: (any AudioTranscodingBridge)?
+        var bridge: (any AudioTranscodingBridge)?
         /// The framing a stream-copied track's packets arrive in.
         let framing: AudioFraming
         /// AE#458: the source track's language as ISO 639-2/T, carried into every muxer this config builds
@@ -864,9 +864,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private static let moovPrimeHuntTimeoutSeconds: TimeInterval = 20
     private static let moovPrimeHuntFractions: [Double] = [0.5, 0.9, 0.25, 0.75]
 
-    /// Desired tfdt for each stream: 0 for baseIndex==0; plan[baseIndex].startSeconds for restarts.
+    /// Desired video tfdt: 0 for baseIndex==0; plan[baseIndex].startSeconds for restarts. Audio inherits
+    /// the video's shift.
     private let desiredFirstVideoTfdtPts: Int64
-    private var desiredFirstAudioTfdtPts: Int64
 
     /// Dynamic PTS shift = firstActualDts - desiredFirstTfdt; Int64.min = not yet computed.
     private var videoShiftPts: Int64 = Int64.min
@@ -1560,7 +1560,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
         subtitleTapStreamIndices: Set<Int32> = [],
         subtitlePacketStreamIndices: Set<Int32> = [],
         desiredFirstVideoTfdtPts: Int64,
-        desiredFirstAudioTfdtPts: Int64 = 0,
         segmentBoundaries: [Int64],
         planAnchorVideoPts: Int64 = 0,
         isLive: Bool = false,
@@ -1575,6 +1574,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
         servesSegmentsProgressively: Bool = false,
         epoch: UInt64 = 0
     ) throws {
+        // What this producer feeds: the engine's bridge, or a session of its own made from it
+        // (`AudioSegmentRuns`), which the pump ends.
+        var audio = audio
+        let fed = audio?.bridge?.producerBridge()
+        audio?.bridge = fed
         self.epoch = epoch
         self.servesSegmentsProgressively = servesSegmentsProgressively
         self.audioDelaySeconds = audioDelaySeconds
@@ -1678,7 +1682,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // anchoring audio early would desync by firstVideoKeyDts - firstAudioDts even with tfdt == 0.
         self.audioWaitForVideo = true
         self.desiredFirstVideoTfdtPts = desiredFirstVideoTfdtPts
-        self.desiredFirstAudioTfdtPts = desiredFirstAudioTfdtPts
 
         // Discard streams we don't read (matroska queues PGS bitmaps, secondary audio -- heap churn).
         // Dual-demuxer: side audio index can alias a main-demuxer stream, so keep sets are split.
@@ -4452,8 +4455,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             )
                             pendingAudioInheritSeamOut = nil
                         } else {
-                            // Restart: inherit the session mapping exactly like head-of-stream. The old snap onto
-                            // the video seam (firstActualAudioDts - desiredFirstAudioTfdtPts) compensated for the
+                            // Restart: inherit the session mapping exactly like head-of-stream. A snap onto the
+                            // video seam (the first audio dts against a desired audio tfdt) would compensate for a
                             // fresh muxer zero-basing each restart epoch; with tfdt continuity (frag_discont) the
                             // snap itself became the divergence: it moved audio off the source frame grid by up to
                             // one frame per epoch and skewed the shift fold-back in segmentIndex(forSourcePts:) by
@@ -4486,7 +4489,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             "[HLSSegmentProducer] audio gate open: "
                             + "actual=\(firstActualAudioDts) "
                             + "target=\(restartTargetAudioDts) "
-                            + "desired=\(desiredFirstAudioTfdtPts) "
                             + "shift=\(audioShiftPts) "
                             + "gapMs=\(String(format: "%.1f", gapMs))",
                             category: .session
@@ -4934,6 +4936,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             category: .session
         )
 
+        audioConfig?.bridge?.producerFinished()
         finishCondition.lock()
         didFinishFlag = true
         finishCondition.broadcast()

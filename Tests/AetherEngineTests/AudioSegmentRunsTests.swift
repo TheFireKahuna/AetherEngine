@@ -134,6 +134,51 @@ struct AudioSegmentRunsTests {
         }
     }
 
+    @Test("a producer a restart abandoned feeds only its own session, not the new producer's")
+    func abandonedProducerCannotFeedTheNewOne() throws {
+        let clip = try read("dts-51.mkv")
+        defer { clip.free() }
+        let make = { try AudioBridge(srcCodecpar: clip.codecpar, srcTimeBase: clip.timeBase, mode: .surroundCompat)
+            as any AudioTranscodingBridge }
+        let engine = try #require(AudioSegmentRuns(template: try make(), sourceCodecpar: clip.codecpar,
+                                                   sourceTimeBase: clip.timeBase, makeRun: make))
+        defer { engine.close() }
+        func session(base: Int) -> (any AudioTranscodingBridge, AudioRunPlan) {
+            let bridge = engine.producerBridge()
+            bridge.setSourceStart(clip.start)
+            let plan = plan(from: base, bridge: bridge, seconds: 12, delay: 0)
+            bridge.setRunPlan(plan)
+            return (bridge, plan)
+        }
+        func bytes(_ packets: [UnsafeMutablePointer<AVPacket>]) -> [Out] {
+            packets.map { p in
+                defer { var q: UnsafeMutablePointer<AVPacket>? = p; trackedPacketFree(&q) }
+                return Out(pts: p.pointee.pts, bytes: Array(UnsafeBufferPointer(start: p.pointee.data, count: Int(p.pointee.size))))
+            }
+        }
+        // The new producer alone, from its pre-roll before segment 3.
+        let first = clip.packets.firstIndex { $0.pointee.pts >= 4_000 } ?? 0
+        let (alone, _) = session(base: 3)
+        var want: [Out] = []
+        for p in clip.packets[first...] { want += bytes(try alone.feed(packet: p)) }
+        want += bytes(alone.flush())
+        alone.producerFinished()
+        // The same, while the producer it replaced keeps feeding from where it was.
+        let (old, _) = session(base: 0)
+        let (new, _) = session(base: 3)
+        var got: [Out] = []
+        for (i, p) in clip.packets[first...].enumerated() {
+            _ = bytes(try old.feed(packet: clip.packets[i]))
+            got += bytes(try new.feed(packet: p))
+        }
+        got += bytes(new.flush())
+        old.producerFinished()
+        new.producerFinished()
+        #expect(!want.isEmpty)
+        #expect(got == want)
+        #expect(engine.outputBytesLifetime > 0, "the engine's counts the session's output")
+    }
+
     @Test("an MP3 run starts where the stream's own reservoir says, short of the format's worst case")
     func mp3RunStartsAtItsReservoir() throws {
         let clip = try read("mp3-lsf.mp3")
