@@ -95,7 +95,7 @@ struct DoviComposedRpuOverrideTests {
         // Same framing as the converted RPU: the RPU prefix first, emulation prevention kept, the trailing 0x80.
         #expect(overridden.first == 0x19 && plain?.first == 0x19)
         #expect(overridden.last == 0x80 && plain?.last == 0x80)
-        #expect(DualLayerVideoDecoder.validatedRpuOverride(overridden) == override, "the attached payload parses back to the override")
+        #expect(DoviComposedRpuOverride.validated(overridden) == override, "the attached payload parses back to the override")
     }
 
     @Test("A frame whose composition failed goes out as its base layer with the mapping-kept RPU, override or not")
@@ -108,21 +108,21 @@ struct DoviComposedRpuOverrideTests {
     @Test("Validation takes a libdovi unspec62 NAL with or without its header and refuses anything libdovi cannot parse")
     func validation() throws {
         let (_, _, override) = try Self.fixtureRpus()
-        #expect(DualLayerVideoDecoder.validatedRpuOverride(Data(override)) == override)
-        #expect(DualLayerVideoDecoder.validatedRpuOverride(Data(override.dropFirst(2))) == override)
-        #expect(DualLayerVideoDecoder.validatedRpuOverride(Data()) == nil)
-        #expect(DualLayerVideoDecoder.validatedRpuOverride(Data([0x7C, 0x01])) == nil)
-        #expect(DualLayerVideoDecoder.validatedRpuOverride(Data([0x00, 0x00, 0x00, 0x01] + override)) == nil, "an Annex-B start code is not stripped")
+        #expect(DoviComposedRpuOverride.validated(Data(override)) == override)
+        #expect(DoviComposedRpuOverride.validated(Data(override.dropFirst(2))) == override)
+        #expect(DoviComposedRpuOverride.validated(Data()) == nil)
+        #expect(DoviComposedRpuOverride.validated(Data([0x7C, 0x01])) == nil)
+        #expect(DoviComposedRpuOverride.validated(Data([0x00, 0x00, 0x00, 0x01] + override)) == nil, "an Annex-B start code is not stripped")
         var corrupt = override
         corrupt[corrupt.count / 2] ^= 0x55
-        #expect(DualLayerVideoDecoder.validatedRpuOverride(Data(corrupt)) == nil, "a bad CRC never reaches libdovi")
+        #expect(DoviComposedRpuOverride.validated(Data(corrupt)) == nil, "a bad CRC never reaches libdovi")
     }
 
     @Test("The public switch refuses unparseable bytes and leaves the override off")
     func publicSwitchRefusesGarbage() {
         AetherEngine.felComposedRpuOverride = Data([0x7C, 0x01, 0x19, 0x00, 0x01, 0x02, 0x03, 0x04, 0x80])
         #expect(AetherEngine.felComposedRpuOverride == nil)
-        #expect(DualLayerVideoDecoder.composedRpuOverride == nil)
+        #expect(DoviComposedRpuOverride.current == nil)
     }
 }
 #endif
