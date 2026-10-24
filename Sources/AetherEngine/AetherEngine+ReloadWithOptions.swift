@@ -456,7 +456,7 @@ enum SessionOptionCorrection {
         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "preferredAudioLanguages",
         "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "sessionCacheByteBudget", "softwarePacketCacheStorage", "progressiveSegmentDelivery", "autoplay",
-        "audioDelaySeconds", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
+        "audioDelaySeconds", "teletextPage", "deinterlaceFieldRate", "preferredDecodePath",
         "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover",
     ]
 }

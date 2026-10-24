@@ -1,7 +1,8 @@
 # The software route: one GPU pass, inside the native player
 
-Status: plan, written 2026-10-24 on `research/12bit-fel`. Part 2 (the GPU finisher and H.273 colour) is built and
-committed; parts 1, 3, 4 and 5 are open. The colour equations are in [colour-representation.md](colour-representation.md).
+Status: plan, written 2026-10-24 on `research/12bit-fel`. Parts 2 (the GPU finisher and H.273 colour) and 3 (AV1 into
+the slabs) are built and committed; part 4 (deinterlacing after the finisher) is built and awaits its device test;
+parts 1 and 5 are open. The colour equations are in [colour-representation.md](colour-representation.md).
 
 ## Why
 
@@ -107,10 +108,13 @@ path with exact rounding, block threads, luma table), `3df7eaa6` (the colour doc
 - Speed, 4K frame, M4 Pro, warm GPU: pack 0.2 to 0.6 ms, matrix conversion 4:2:0 to 4:4:4 1.5 ms, constant luminance
   1.2 to 1.5 ms. Not measured on the Apple TV yet.
 
-## Part 3. libdav1d into the slabs (open)
+## Part 3. libdav1d into the slabs (built)
 
 FFmpeg's libdav1d wrapper allocates through its own `av_buffer_pool_init(size, NULL)` (`libavcodec/libdav1d.c:92`,
-plain `av_malloc`) and never calls `get_buffer2`, so AV1 pictures are still copied into a slab today.
+plain `av_malloc`) and never called `get_buffer2`, so AV1 pictures were copied into a slab. Built: FFmpegBuild
+`1385171` (`patches/libdav1d-get-buffer2.patch`, in 3.10.1 at `768d164`); the engine installs its allocator on libdav1d
+as on every DR1 decoder, and `Dav1dSlabDecodeTests` checks every picture lands in a slab and equals libdav1d's own
+decode.
 
 1. FFmpegBuild patch (`patches/`): `libdav1d_picture_allocator` asks `avctx->get_buffer2` for a picture of the
    128-aligned size when the caller supplied one, and uses its `buf[0]` as `allocator_data`. dav1d's contract: planes
@@ -120,11 +124,12 @@ plain `av_malloc`) and never calls `get_buffer2`, so AV1 pictures are still copi
 2. Release FFmpegBuild, bump the engine's pin, and add AV1 to the parity tests (a decode through the slab path equals
    the copied path).
 
-## Part 4. Deinterlacing after the finisher (open)
+## Part 4. Deinterlacing after the finisher (built; device test open)
 
-Today: `format=nv12,hwupload,yadif_videotoolbox` (two CPU passes: swscale in the filter graph and `av_frame_copy` into
+Before: `format=nv12,hwupload,yadif_videotoolbox` (two CPU passes: swscale in the filter graph and `av_frame_copy` into
 an IOSurface), then a VTPixelTransferSession copy into our pool; a CPU `bwdif` fallback when the hardware graph
-fails, and `DeinterlaceMode.software`.
+failed, and `DeinterlaceMode.software`. Built: steps 1, 2 and 4 below (FFmpegBuild `1385171`, the engine commit that
+follows this status line); `DeinterlaceMode` is gone from `LoadOptions` altogether. Step 3, the device test, is open.
 
 1. **Deinterlace after the finisher**, on display-format buffers. Every format the decoder outputs (NV12, P010, NV16,
    P210, P216, NV24, P410, P416) is in `yadif_videotoolbox`'s and VideoToolbox's supported sets, so the hardware

@@ -44,7 +44,7 @@ struct Issue203SoftwareColdStartTests {
         }
     }
 
-    @Test("construction starts one process warm-up shared by concurrent auto waiters")
+    @Test("construction starts one process warm-up shared by concurrent waiters")
     func oneTaskServesConcurrentWaiters() async {
         let started = Gate()
         let release = Gate()
@@ -58,32 +58,13 @@ struct Issue203SoftwareColdStartTests {
 
         await started.wait()
 
-        async let first = warmup.waitIfNeeded(for: .auto)
-        async let second = warmup.waitIfNeeded(for: .auto)
+        async let first = warmup.wait()
+        async let second = warmup.wait()
         await release.open()
 
         #expect(await first == .ready)
         #expect(await second == .ready)
         #expect(counter.value == 1)
-    }
-
-    @Test("forced software mode bypasses an unfinished hardware warm-up")
-    func softwareModeDoesNotWait() async {
-        let release = Gate()
-        let warmup = DeinterlaceHardwareWarmup {
-            await release.wait()
-            return .ready
-        }
-
-        let started = DispatchTime.now()
-        let result = await warmup.waitIfNeeded(for: .software)
-        let elapsed = Double(
-            DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds
-        ) / 1_000_000_000
-
-        await release.open()
-        #expect(result == nil)
-        #expect(elapsed < 1)
     }
 
     @Test("cancelling a waiter does not cancel the process warm-up")
@@ -98,13 +79,13 @@ struct Issue203SoftwareColdStartTests {
         await started.wait()
 
         let waiter = Task {
-            await warmup.waitIfNeeded(for: .auto)
+            await warmup.wait()
         }
         waiter.cancel()
         await release.open()
 
         #expect(await waiter.value == .ready)
-        #expect(await warmup.waitIfNeeded(for: .auto) == .ready)
+        #expect(await warmup.wait() == .ready)
     }
 
     @Test("hardware unavailability completes the gate without throwing")
@@ -113,6 +94,6 @@ struct Issue203SoftwareColdStartTests {
             .unavailable
         }
 
-        #expect(await warmup.waitIfNeeded(for: .auto) == .unavailable)
+        #expect(await warmup.wait() == .unavailable)
     }
 }

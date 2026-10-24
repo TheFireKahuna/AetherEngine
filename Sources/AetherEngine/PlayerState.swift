@@ -344,27 +344,14 @@ public struct DisplayCapabilities: Sendable, Equatable {
     }
 }
 
-/// Deinterlacer selection for the software-decode path (interlaced MPEG-2 / VC-1 / MPEG-4, and
+/// Output cadence of the software-decode path's deinterlacer (interlaced MPEG-2 / VC-1 / MPEG-4, and
 /// interlaced H.264, which routes software because AVPlayer does not deinterlace, #107 /
-/// `VideoRoutingPolicy`).
-public enum DeinterlaceMode: String, Sendable, Equatable {
-    /// yadif_videotoolbox (Metal compute over VideoToolbox frames) when the linked FFmpeg build
-    /// ships it AND a Metal device exists at runtime; otherwise falls back to software bwdif.
-    /// The hardware path also skips the sws_scale copy: the filter sink emits IOSurface-backed
-    /// CVPixelBuffers that go straight to the renderer.
-    case auto
-    /// Force the software bwdif/yadif path (previous engine behavior).
-    case software
-}
-
-/// Output cadence of the HARDWARE deinterlacer (`DeinterlaceMode.auto` when the hw graph engages).
-/// The software fallback always runs frame-rate: doubling sws_scale + CPU bwdif for field-rate
-/// output is the wrong trade without the GPU, and a fallback should not change cost class.
+/// `VideoRoutingPolicy`): yadif_videotoolbox, a Metal kernel over the display buffers.
 public enum DeinterlaceFieldRate: String, Sendable, Equatable {
     /// One output frame per FIELD (25i -> 50p, 29.97i -> 59.94p): full temporal resolution,
-    /// smoother motion. Default for the hardware path.
+    /// smoother motion. The default.
     case field
-    /// One output frame per FRAME (25i -> 25p): halves filter output, matches the sw path.
+    /// One output frame per FRAME (25i -> 25p): half the filter output.
     case frame
 }
 
@@ -967,14 +954,8 @@ public struct LoadOptions: Sendable, Equatable {
     /// libzvbi does not flag as a subtitle page. Only affects teletext streams (#107).
     public var teletextPage: Int? = nil
 
-    /// Deinterlacer for the software-decode path: `.auto` (default) tries the Metal/VideoToolbox
-    /// hardware graph and falls back to software bwdif; `.software` forces the CPU path. See
-    /// `DeinterlaceMode`.
-    public var deinterlaceMode: DeinterlaceMode = .auto
-
-    /// Cadence of the hardware deinterlacer: `.field` (default) doubles output to field rate
-    /// (50/60 fps), `.frame` keeps frame rate. Ignored by the software fallback (always frame
-    /// rate). See `DeinterlaceFieldRate`.
+    /// Cadence of the software-decode path's deinterlacer: `.field` (default) doubles output to field
+    /// rate (50/60 fps), `.frame` keeps frame rate. See `DeinterlaceFieldRate`.
     public var deinterlaceFieldRate: DeinterlaceFieldRate = .field
 
     /// AE#461: which decode path this session runs on when the host needs to overrule the engine's
@@ -1082,7 +1063,6 @@ public struct LoadOptions: Sendable, Equatable {
         autoplay: Bool = true,
         teletextPage: Int? = nil,
         audioDelaySeconds: Double = 0,
-        deinterlaceMode: DeinterlaceMode = .auto,
         deinterlaceFieldRate: DeinterlaceFieldRate = .field,
         preferredDecodePath: DecodePath = .automatic,
         escalatesToSoftwarePath: Bool = true,
@@ -1142,7 +1122,6 @@ public struct LoadOptions: Sendable, Equatable {
         self.autoplay = autoplay
         self.teletextPage = teletextPage
         self.audioDelaySeconds = audioDelaySeconds
-        self.deinterlaceMode = deinterlaceMode
         self.deinterlaceFieldRate = deinterlaceFieldRate
         self.preferredDecodePath = preferredDecodePath
         self.escalatesToSoftwarePath = escalatesToSoftwarePath

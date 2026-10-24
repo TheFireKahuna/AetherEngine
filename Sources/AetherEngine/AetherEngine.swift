@@ -5019,7 +5019,7 @@ public final class AetherEngine: ObservableObject {
         // content rate for everything else that reads it.
         let displayRate = Self.displayFrameRate(
             contentRate: detectedRate, codecID: detectedCodecID, fieldOrder: detectedFieldOrder,
-            deinterlaceMode: options.deinterlaceMode, deinterlaceFieldRate: options.deinterlaceFieldRate)
+            deinterlaceFieldRate: options.deinterlaceFieldRate)
         if let displayRate, let detectedRate, displayRate != detectedRate {
             EngineLog.emit("[AetherEngine] interlaced (fieldOrder=\(detectedFieldOrder.rawValue)) at "
                            + String(format: "%.3f", detectedRate) + " fps deinterlaces at field rate; "
@@ -5329,7 +5329,7 @@ public final class AetherEngine: ObservableObject {
         //    - MPEG-4 Part 2, MPEG-2, VC-1: not in the HLS Authoring Spec CODECS list; libavcodec handles all.
         //    - qtrle and the rest of the QuickTime long tail: same reason, whatever libavcodec was
         //      built with decodes them.
-        // #107: interlaced H.264 joins MPEG-2/VC-1 on the software path so DeinterlaceFilter (bwdif)
+        // #107: interlaced H.264 joins MPEG-2/VC-1 on the software path so DeinterlaceFilter
         // can deinterlace it; tvOS AVPlayer does not. Decision is pure and unit-tested in
         // VideoRoutingPolicyTests. deint=interlaced passes progressive frames through untouched, so a
         // mis-signalled progressive stream only pays an unnecessary SW decode, never a wrong deinterlace.
