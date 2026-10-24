@@ -26,6 +26,13 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         public var residualOff = 0
         public var notReady = 0
         public var composeFailed = 0
+        /// Composed frames that reached the layer after their own display time (the layer drops those).
+        public var late = 0
+        /// Frames AVPlayer decoded that the render loop never pulled (it skipped past them).
+        public var skipped = 0
+        /// Longest compose (pull to enqueue) and longest render-loop gap since the last log line, in ms.
+        public var maxComposeMs = 0.0
+        public var maxTickGapMs = 0.0
     }
 
     public let layer = AVSampleBufferDisplayLayer()
@@ -49,9 +56,12 @@ public final class FelOverlayRenderer: @unchecked Sendable {
     private var lastPulled = CMTime.invalid
     /// Bumped on every clock jump: a composition finishing for an older generation is for a left position.
     private var generation = 0
+    /// The shortest step between pulled frames: the stream's frame duration, for counting skips.
+    private var frameDuration: Double?
     private var frameIndex: UInt32 = 0
     private var blankEnhancement: CVPixelBuffer?
     private var lastLog = CACurrentMediaTime()
+    private var lastTick = CACurrentMediaTime()
     private let countersLock = NSLock()
     private var _counters = Counters()
 
@@ -180,11 +190,23 @@ public final class FelOverlayRenderer: @unchecked Sendable {
     // MARK: - Render queue
 
     private func tick() {
+        let tickTime = CACurrentMediaTime()
+        let gap = (tickTime - lastTick) * 1000
+        lastTick = tickTime
+        countersLock.withLock { _counters.maxTickGapMs = max(_counters.maxTickGapMs, gap) }
         let ahead = output.itemTime(forHostTime: CACurrentMediaTime() + Self.pullLead)
         guard output.hasNewPixelBuffer(forItemTime: ahead) else { return }
         var shown = CMTime.invalid
         guard let base = output.copyPixelBuffer(forItemTime: ahead, itemTimeForDisplay: &shown), shown.isValid else { return }
         countersLock.withLock { _counters.pulled += 1 }
+        if lastPulled.isValid, shown > lastPulled, let rate = frameDuration, rate > 0 {
+            let missed = Int(((shown - lastPulled).seconds / rate).rounded()) - 1
+            if missed > 0, missed < 12 { countersLock.withLock { _counters.skipped += missed } }
+        }
+        if lastPulled.isValid, shown > lastPulled {
+            let step = (shown - lastPulled).seconds
+            if step > 0.01 { frameDuration = min(frameDuration ?? step, step) }
+        }
         if lastPulled.isValid, shown < lastPulled { restartPresentation() }
         lastPulled = shown
         let generation = self.generation
@@ -208,8 +230,11 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         }
         frameIndex &+= 1
         let rpu = frame.composedRpu
+        let pulledAt = CACurrentMediaTime()
         composer.composeAsync(baseBuffer: base, enhancementBuffer: enhancement, params: params, frameIndex: frameIndex) { [weak self] composed in
             guard let self else { return }
+            let ms = (CACurrentMediaTime() - pulledAt) * 1000
+            self.countersLock.withLock { self._counters.maxComposeMs = max(self._counters.maxComposeMs, ms) }
             guard let composed else {
                 self.countersLock.withLock { self._counters.composeFailed += 1 }
                 return
@@ -238,6 +263,9 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: buffer, formatDescription: format,
                                                  sampleTiming: &timing, sampleBufferOut: &sample)
         guard let sample else { return }
+        if let timebase = layer.controlTimebase, CMTimebaseGetTime(timebase) > time {
+            countersLock.withLock { _counters.late += 1 }
+        }
         layer.sampleBufferRenderer.enqueue(sample)
         countersLock.withLock { _counters.composed += 1 }
         onComposed?(time, buffer)
@@ -259,10 +287,17 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         let now = CACurrentMediaTime()
         guard now - lastLog >= 10 else { return }
         lastLog = now
-        let c = counters
+        let c = countersLock.withLock {
+            let c = _counters
+            _counters.maxComposeMs = 0
+            _counters.maxTickGapMs = 0
+            return c
+        }
         let held = tap.held
-        EngineLog.emit("[FelOverlayRenderer] composed \(c.composed), residual off \(c.residualOff), not ready \(c.notReady), "
-                       + "compose failed \(c.composeFailed), held \(held.accessUnits) units / \(held.decoded) decoded",
+        EngineLog.emit("[FelOverlayRenderer] pulled \(c.pulled), composed \(c.composed), skipped \(c.skipped), late \(c.late), "
+                       + "residual off \(c.residualOff), not ready \(c.notReady), compose failed \(c.composeFailed), "
+                       + String(format: "max compose %.0f ms, max loop gap %.0f ms, ", c.maxComposeMs, c.maxTickGapMs)
+                       + "held \(held.accessUnits) units / \(held.decoded) decoded",
                        category: .swPlayback)
     }
 }
