@@ -119,7 +119,7 @@ struct Issue230PrefetchReadPositionParkTests {
                 demuxer: demuxer, store: store,
                 streamIndices: [subtitleIndex], assemblyIndices: [],
                 pacingIndex: pacingIndex,
-                leadSeconds: 4.0,
+                lead: { _ in 4.0 },
                 parkPollNanoseconds: 1_000_000,
                 playhead: { await calls.next() == 0 ? 0.0 : nil })
             return store.entries(streamIndex: subtitleIndex, from: 0, through: 1000)
@@ -162,7 +162,7 @@ struct Issue230PrefetchReadPositionParkTests {
             demuxer: demuxer, store: store,
             streamIndices: [subtitleIndex], assemblyIndices: [],
             pacingIndex: pacingIndex,
-            leadSeconds: 3600,
+            lead: { _ in 3600 },
             parkPollNanoseconds: 1_000_000,
             playhead: { 0.0 })
 

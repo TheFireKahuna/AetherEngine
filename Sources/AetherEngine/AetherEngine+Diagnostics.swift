@@ -301,12 +301,12 @@ extension AetherEngine {
                 // and the #174 field crash it was built against (HTTPS origin, boringssl in
                 // the stack) was on this path. Reporting software-only hid that.
                 let pumpWin = self.pumpIOWindow
-                let prefetchWin = self.subtitleForwardPrefetchDemuxer?.ioWindowDiagnostics
+                let prefetchWin = self.subtitleSource?.walkDemuxer?.ioWindowDiagnostics
                 let readerStr = Self.readerWindowFragment(
                     pump: pumpWin, prefetch: prefetchWin,
                     pumpFetchedBytes: self.softwareHost?.demuxerBytesFetched
                         ?? self.nativeVideoSession?.demuxerBytesFetched,
-                    prefetchFetchedBytes: self.subtitleForwardPrefetchDemuxer?.avioBytesFetched)
+                    prefetchFetchedBytes: self.subtitleSource?.walkDemuxer?.avioBytesFetched)
 
                 // #303: the software path's own read-ahead, and what the display did with it.
                 // `avBufAhead` covers the AVPlayer path only, and `frameAhead` is the native

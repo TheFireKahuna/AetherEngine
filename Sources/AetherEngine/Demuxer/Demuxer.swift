@@ -76,7 +76,7 @@ struct DemuxerOpenProfile: Sendable {
     var declaredDurationSeconds: Double? = nil
 
     /// #240: what to call this demuxer's network reader in the log. Several readers run against the
-    /// same origin at once (the pump, the subtitle forward prefetcher, the native subtitle readers),
+    /// same origin at once (the pump, the subtitle source's walk, the I-frame reader),
     /// and a connection line without a name cannot say which one opened it: the reporter of #240 read
     /// one reader's generation counter as several concurrent connections, because nothing in the line
     /// distinguished them. Defaults to the pump, since every other path builds its profile explicitly.

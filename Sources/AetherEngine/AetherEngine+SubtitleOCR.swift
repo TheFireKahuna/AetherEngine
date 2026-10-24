@@ -2,20 +2,22 @@ import Foundation
 
 // Phase D: selection-armed worker feeding a bitmap track's native WebVTT rendition with
 // OCR-recognized text cues, so PGS/DVB/DVD subtitles survive PiP / AirPlay / external display
-// on the native path. Packet source is the session SubtitlePacketStore (#112 harvest); the tick
+// on the native path. Packet source is the session SubtitlePacketStore, which the worker's demand on
+// the subtitle source keeps ahead of its window (from the container's index or the walk alike); the tick
 // plans and resolves on the MainActor, decodes off it (AE#628), and Vision runs on a dedicated thread.
 extension AetherEngine {
 
     /// Arm for the selected embedded bitmap track. The per-ordinal cursor survives re-arming.
     func startSubtitleOCRWorker(ordinal: Int, streamIndex: Int32) {
         cancelSubtitleOCRWorker()
-        // A track the container indexes in full is recognized from the index, not from the packet store.
-        if startIndexedBitmapFill(ordinal: ordinal) {
-            subtitleOCRArmedOrdinal = ordinal
-            return
-        }
         guard let store = nativeStore(atOrdinal: ordinal) else { return }
         subtitleOCRArmedOrdinal = ordinal
+        // The packet store has to hold the worker's window before the worker gets there: the source reads
+        // a margin past it, as far as the player asks the rendition.
+        subtitleSource?.demand(.ocr, lead: { playhead in
+            Self.subtitleReadAhead(base: Self.subtitleOCRPrefetchLeadSeconds, playhead: playhead,
+                                   requested: store.furthestRequestedSourceSeconds())
+        })
         let language = ordinal < nativeSubtitleTrackTable.count
             ? nativeSubtitleTrackTable[ordinal].language : nil
         // A forced-only rendition (`LoadOptions.forcedSubtitleTrack`) keeps just the compositions the
@@ -68,10 +70,7 @@ extension AetherEngine {
         }
         subtitleOCRBatchInFlight = false
         subtitleOCRArmedOrdinal = nil
-        // The index fill keeps what it recognized (`IndexedSubtitleState`) and resumes from there.
-        indexedBitmapFillTask?.cancel()
-        indexedBitmapFillTask = nil
-        indexedBitmapFillOrdinal = nil
+        subtitleSource?.withdraw(.ocr)
         subtitleOCRWorkerTask?.cancel()
         subtitleOCRWorkerTask = nil
         subtitleOCRSidecarFillTask?.cancel()
@@ -104,12 +103,6 @@ extension AetherEngine {
             backscan: Self.subtitleDrainBackscanSeconds,
             jumpThreshold: Self.subtitleDrainJumpThresholdSeconds,
             elapsedSinceLastPlan: elapsed)
-        // The prefetcher has to stay ahead of the window; a lead the player outgrew rebuilds it.
-        if let active = subtitleForwardPrefetchActiveLead,
-           subtitleOCRDemandLead(base: Self.subtitleOCRPrefetchLeadSeconds, playhead: playhead)
-            > active + Self.subtitleDemandMarginSeconds {
-            startSubtitleForwardPrefetcher(startAt: playhead)
-        }
         let window: (from: Double, through: Double)
         switch plan {
         case .idle:

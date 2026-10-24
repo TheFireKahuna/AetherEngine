@@ -86,7 +86,7 @@ struct Issue151SubtitleForwardPrefetchTests {
                 demuxer: demuxer, store: store,
                 streamIndices: [0], assemblyIndices: [],
                 pacingIndex: -1,   // #230: subtitle-only fixture, nothing to pace with
-                leadSeconds: 60, parkPollNanoseconds: 10_000_000,
+                lead: { _ in 60 }, parkPollNanoseconds: 10_000_000,
                 playhead: { playhead.current })
         }
 
@@ -125,7 +125,7 @@ struct Issue151SubtitleForwardPrefetchTests {
             demuxer: demuxer, store: store,
             streamIndices: [0], assemblyIndices: [],
             pacingIndex: -1,
-            leadSeconds: 60, parkPollNanoseconds: 1_000_000,
+            lead: { _ in 60 }, parkPollNanoseconds: 1_000_000,
             playhead: { provider.next() })
         #expect(outcome.harvested == 2)
         #expect(outcome.exit == .cancelled, "a vanished engine is not a restartable failure (#231)")

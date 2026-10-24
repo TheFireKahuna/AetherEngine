@@ -4,7 +4,7 @@ import AetherLibavformat
 import AetherLibavutil
 
 /// What every consumer of a source's container index shares, so they read it the same way: the
-/// reader its blocks are fetched through, and the subtitle streams its tracks map onto.
+/// reader its blocks are fetched through, and the streams its tracks map onto.
 extension AetherEngine {
 
     /// The exact range reader a remote source's index and blocks are read through
@@ -65,41 +65,5 @@ extension AetherEngine {
             index += 1
         }
         return out
-    }
-
-    /// The forward subtitle prefetch's packets from the container's index (#151), or nil to walk the
-    /// stream: a remote source whose index lists every stream the walk would harvest completely
-    /// (`SubtitleForwardPrefetcher.IndexSource.plan`). A local file has no film to save and a custom
-    /// source's reader is the host's. The reader comes back with the source because it is the
-    /// session's to cancel and close.
-    nonisolated func indexedForwardPrefetchSource(
-        url: URL, headers: [String: String], headerStore: RequestHeaderStore?, demuxer: Demuxer,
-        streams: Set<Int32>, assembly: Set<Int32>, startAt: Double
-    ) async -> (source: SubtitleForwardPrefetcher.IndexSource, reader: HTTPDiscIOReader)? {
-        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
-        var requestHeaders = headers
-        requestHeaders.merge(headerStore?.current ?? [:]) { _, new in new }
-        guard let reader = Self.indexedSourceReader(url: url, headers: requestHeaders, label: "prefetch")
-        else { return nil }
-        guard let index = await SourceIndexRegistry.shared.index(
-            of: url, headers: requestHeaders, demuxer: demuxer, through: reader).index
-        else {
-            reader.close()
-            return nil
-        }
-        let plan = SubtitleForwardPrefetcher.IndexSource.plan(
-            index: index, listed: Self.indexedSubtitleStreams(of: demuxer), streams: streams)
-        guard plan.refused.isEmpty else {
-            EngineLog.emit(
-                "[AetherEngine] #151 forward prefetch: the index does not cover every stream "
-                + "(\(plan.refused.joined(separator: ", "))); walking the stream",
-                category: .engine)
-            reader.close()
-            return nil
-        }
-        let source = SubtitleForwardPrefetcher.IndexSource(
-            index: index, bytes: IOReaderByteSource(reader, closesReader: false), streams: plan.streams,
-            assemblyIndices: assembly, from: startAt)
-        return (source, reader)
     }
 }

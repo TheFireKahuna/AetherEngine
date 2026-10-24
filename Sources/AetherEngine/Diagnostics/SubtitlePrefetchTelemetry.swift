@@ -1,7 +1,7 @@
 import Foundation
 import os
 
-/// #220: live gauge for the #151 subtitle forward prefetcher.
+/// #220: live gauge for the #151 subtitle forward read, the loop of the session's `SubtitleSource`.
 ///
 /// The prefetcher is a second reader against the same origin, and server-side per-connection
 /// byte totals showed it consuming 2.6x media rate at playhead + 333 s against a 60 s lead
@@ -12,7 +12,7 @@ import os
 /// Written from the prefetch task (off the main actor, one lock acquisition per routed subtitle
 /// packet, never per demuxed packet) and read by the 30 s memprobe on the main actor. The
 /// generation guard keeps a cancelled session's exit from clearing the successor it was
-/// replaced by: `startSubtitleForwardPrefetcher` cancels and restarts in the same call, and
+/// replaced by: a stop and a fresh demand on `SubtitleSource` can follow each other at once, and
 /// the outgoing loop can still be unwinding when the new one begins.
 enum SubtitlePrefetchTelemetry {
 

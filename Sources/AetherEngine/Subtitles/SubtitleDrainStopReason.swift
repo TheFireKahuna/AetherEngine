@@ -1,6 +1,6 @@
 import Foundation
 
-/// #496: why the overlay drainer, and with it the #151 forward prefetcher, was torn down.
+/// #496: why the overlay drainer, and with it the session's subtitle reading, was torn down.
 ///
 /// The teardown used to leave no trace at all. `#151 forward prefetch exited (reason=cancelled
 /// cancelled=true)` says only that somebody called `cancel()`, and the cancel itself printed
@@ -30,7 +30,4 @@ enum SubtitleDrainStopReason: String, Sendable {
     case subtitlesCleared
     /// The session itself is going away (`stopInternal`), so nothing is expected to survive.
     case sessionStopped
-    /// `startSubtitleForwardPrefetcher` is replacing a running session with a new one (a changed
-    /// lead, or a jump the in-place re-anchor cannot serve). The one reason that is not a loss.
-    case prefetchRebuild
 }

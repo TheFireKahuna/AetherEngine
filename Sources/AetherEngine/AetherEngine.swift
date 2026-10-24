@@ -1419,20 +1419,12 @@ public final class AetherEngine: ObservableObject {
     /// moment a channel stopped (or resumed) publishing rather than repeating itself at 2 Hz. nil
     /// before a channel's first decoding tick.
     var subtitleDeliveryLastOutcome: [SubtitleChannel: SubtitleDeliveryStatement.Outcome] = [:]
-    /// #151: subtitle-only forward side reader filling the session packet store up to
-    /// playhead + subtitleDrainLeadSeconds independent of the producer's forward park, so the
-    /// drainer's lead window holds cues for host-applied ADVANCE sync offsets (text and bitmap).
-    /// nil while idle (subs off, live session, EOF reached).
-    var subtitleForwardPrefetchTask: Task<Void, Never>?
-    var subtitleForwardPrefetchDemuxer: Demuxer?
-    /// #240: the running session's in-place anchor box, so a playhead jump moves its cursor instead
-    /// of rebuilding the session. nil while no session is live.
-    var subtitleForwardPrefetchReanchor: SubtitleForwardPrefetcher.SideReaderReanchor?
-    /// #240: the lead the running session was started with. A changed lead (the OCR worker arming)
-    /// is the one anchor change that still needs a rebuild, since the loop captures it at start.
-    var subtitleForwardPrefetchActiveLead: Double?
-    /// #496: why the last live prefetch session was cancelled. Set only when a task was actually
-    /// running, so it names a real teardown rather than the many no-op cancels on the way through
+    /// The session's one reader of its embedded subtitle streams (`SubtitleSource`): the overlay
+    /// drainer, the OCR worker and the native renditions state how far ahead they want packets, and it
+    /// reads them from the container's index or by one walk of the stream. nil without a session.
+    var subtitleSource: SubtitleSource?
+    /// #496: why the session's subtitle reading last stopped. Set only when the reading actually
+    /// stopped, so it names a real teardown rather than the many no-op withdrawals on the way through
     /// a selection. Mirrors the log line; kept as state so a test can assert the routing.
     var lastSubtitleDrainStopReason: SubtitleDrainStopReason?
     /// #240: link arbitration between the video path and the subtitle side readers. On Matroska a
@@ -2626,11 +2618,6 @@ public final class AetherEngine: ObservableObject {
     /// each other. Empty when no proxy is standing.
     var injectedSubtitleRenditionNames: [Int: String] = [:]
 
-    /// Deferred lazy-reader start while a producer restart is in flight (#93 residual): the
-    /// readers' side demuxer competed with the restart for the starved link. Cancelled by
-    /// cancelNativeSubtitleReaders (deselect / clear / stop / load).
-    var nativeSubtitleReaderDeferralTask: Task<Void, Never>? = nil
-
     /// #93 residual spurious-pause window: after a playbackStalled notification (or a consumer
     /// re-engage nudge), AVPlayer can drop to `.paused` with rate 0 and no wait reason WITHOUT any
     /// user action (device: stall, -15628 errorLog, fetches stop, then the pause). Latching that as
@@ -2766,12 +2753,10 @@ public final class AetherEngine: ObservableObject {
     var masterFallbackUsed = false
 
     /// #93 PiP skips: AVKit-side seeks (PiP +-15s buttons) bypass the engine seek API, so a far
-    /// playhead jump is detected on $renderedTime and, once settled, the native subtitle readers
-    /// re-anchor and the remembered rendition selection replays (its deselect/reselect busts
-    /// AVKit's cached empty .vtt windows). Cancelled on load reset / stop; newer jumps supersede.
+    /// playhead jump is detected on $renderedTime and, once settled, the remembered rendition selection
+    /// replays: its demand moves the subtitle source to the playhead and its deselect/reselect busts
+    /// AVKit's cached empty .vtt windows. Cancelled on load reset / stop; newer jumps supersede.
     var nativeSubtitleReanchorTask: Task<Void, Never>? = nil
-    /// seekTo anchor of the currently running native subtitle readers; nil = no readers running.
-    var nativeSubtitleReaderCoverageStart: Double?
     nonisolated static let subtitleReanchorJumpSeconds: Double = 60
     nonisolated static let subtitleReanchorSettleNanos: UInt64 = 2_500_000_000
     nonisolated static let subtitleReanchorBackwardSlack: Double = 5
@@ -3458,9 +3443,9 @@ public final class AetherEngine: ObservableObject {
         abs(to - from) >= subtitleReanchorJumpSeconds
     }
 
-    /// Pure decision (#93 PiP skips): do the running readers cover `position`? Slightly ahead of
-    /// readMax is covered (the parked reader catches up on its own); far ahead or anywhere behind
-    /// the read anchor is not.
+    /// Pure decision (#93 PiP skips): does a rendition's reading cover `position`? Slightly ahead of
+    /// readMax is covered (the parked source catches up on its own); far ahead or anywhere behind
+    /// where the reading starts is not.
     nonisolated static func nativeSubtitleReadersCover(
         position: Double, coverageStart: Double?, readMax: Double
     ) -> Bool {
@@ -3766,12 +3751,6 @@ public final class AetherEngine: ObservableObject {
     /// selection change that took the OCR worker away can hand it back. Cleared with the track table.
     var forcedRenditionRequestedOrdinal: Int?
 
-    /// Native subtitle renditions filled from the container's index (`AetherEngine+IndexedSubtitles`):
-    /// the load-time fill, the index once read, and the on-demand fill of a selected bitmap rendition.
-    var indexedSubtitleTask: Task<Void, Never>?
-    var indexedSubtitles: IndexedSubtitleState?
-    var indexedBitmapFillTask: Task<Void, Never>?
-    var indexedBitmapFillOrdinal: Int?
 
     /// AE#464 round 2: the position the load currently in flight was handed, parked across the window
     /// in which `load` has already zeroed the clock but the rebuilt session has not reached it yet.
@@ -3855,25 +3834,6 @@ public final class AetherEngine: ObservableObject {
     /// The background policy released the video item while retaining the source, playhead,
     /// selection and native host. A foreground host must rebuild before sending play().
     public var needsForegroundVideoRestore: Bool { backgroundTeardownSelection != nil }
-
-    /// Detached reader that decodes ALL embedded text subtitle streams in one side-demuxer pass into their
-    /// ordinal's NativeSubtitleCueStore (#55, all-tracks). Parallel to the packet-store drainer (which drives
-    /// subtitleCues for the active track with full styling). Cancelled on stop/clear/load.
-    var nativeSubtitleReadersTask: Task<Void, Never>?
-
-    /// Abort handle for the native multi-decode side demuxer. markClosed unblocks AVIO reconnect loops
-    /// (mirrors the old primary side-demuxer teardown).
-    var nativeSubtitleReadersDemuxer: Demuxer?
-
-    /// Lazy-start params for the native subtitle readers (#15): captured at load when prepareNativeSubtitles
-    /// declared the mov_text track, but the readers only start on the first setNativeSubtitleSelected (PiP),
-    /// so a session that never selects a native track pays no standing side-demuxer cost. Cleared on stop/clear.
-    var nativeSubtitleReaderParams: (url: URL, stores: [NativeSubtitleCueStore])?
-
-    /// True while the running native readers were started in read-to-EOF (eager) mode (Sodalite#32).
-    /// Deselect must NOT cancel such a reader (it is building whole-session coverage for the next PiP
-    /// entry), and select must not replace it with a playhead-anchored parking reader.
-    var nativeSubtitleReadersRunToEOF = false
 
     /// #357: budget for the per-cue `[applySubtitleEvent #N]` line, refilled per seek generation.
     /// Was a per-load counter, which went blind after 20 events and left every later seek landing
@@ -4525,9 +4485,9 @@ public final class AetherEngine: ObservableObject {
         nativeSubtitleReapplyOrdinal = nil
         forcedSubtitleSelection = false
         forcedRenditionRequestedOrdinal = nil
-        cancelIndexedSubtitleFill()
+        subtitleSource?.close()
+        subtitleSource = nil
         nativeSubtitleTracks = []
-        nativeSubtitleReaderParams = nil
         metadata = nil
         fontAttachments = []
         discTitles = []
@@ -8189,10 +8149,9 @@ public final class AetherEngine: ObservableObject {
         nativeSubtitleReapplyOrdinal = nil
         forcedSubtitleSelection = false
         forcedRenditionRequestedOrdinal = nil
-        cancelIndexedSubtitleFill()
+        subtitleSource?.close()
+        subtitleSource = nil
         nativeSubtitleTracks = []
-        nativeSubtitleReaderParams = nil
-        cancelNativeSubtitleReaders()
         nativeSubtitleRenditionAvailable = false
         cancelSidecarTask(channel: .secondary)
         activeSecondaryEmbeddedSubtitleStreamIndex = -1

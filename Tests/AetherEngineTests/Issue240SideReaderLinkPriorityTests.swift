@@ -140,7 +140,7 @@ struct Issue240SideReaderLinkPriorityTests {
             demuxer: demuxer, store: store,
             streamIndices: [subtitleIndex], assemblyIndices: [],
             pacingIndex: pacingIndex,
-            leadSeconds: leadSeconds,          // 3600 disables the park: the arbitration is the subject
+            lead: { _ in leadSeconds },          // 3600 disables the park: the arbitration is the subject
             parkPollNanoseconds: 1_000_000,
             link: link,
             reanchor: reanchor,

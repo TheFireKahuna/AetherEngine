@@ -40,7 +40,7 @@ struct Issue231PrefetchRestartTests {
             demuxer: demuxer, store: store,
             streamIndices: [0], assemblyIndices: [],
             pacingIndex: -1,
-            leadSeconds: 3600, parkPollNanoseconds: 1_000_000,
+            lead: { _ in 3600 }, parkPollNanoseconds: 1_000_000,
             playhead: { 0.0 })
 
         #expect(outcome.exit == .readFailed,

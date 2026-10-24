@@ -3,8 +3,8 @@ import Testing
 import AetherLibavcodec
 @testable import AetherEngine
 
-/// The forward prefetch read from the container's index (#151): the same packets the stream walk
-/// would store, in one time order, through the one prefetch loop.
+/// The subtitle source's reads from the container's index (#151): the same packets the stream walk
+/// would store, in one time order, through the one loop.
 @Suite("Forward subtitle prefetch from the container's index")
 struct SubtitleIndexPrefetchTests {
 
@@ -94,17 +94,24 @@ struct SubtitleIndexPrefetchTests {
         }
     }
 
-    @Test("All or nothing: one stream the index cannot stand in for leaves the whole session to the walk")
-    func planIsAllOrNothing() throws {
+    @Test("Per stream: a stream the index cannot stand in for is the walk's, and only that one")
+    func planIsPerStream() throws {
         let (index, _) = try Self.indexed()
-        var webvtt = Self.listed()
-        webvtt[0] = .init(streamIndex: 10, codecName: "webvtt", frames: 2, timeBase: webvtt[0].timeBase)
-        #expect(!SubtitleForwardPrefetcher.IndexSource.plan(index: index, listed: webvtt, streams: [10, 11, 12])
-            .refused.isEmpty)
+        // A stream whose codec disagrees with its track's makes the pairing itself untrustworthy, so no
+        // stream is the index's.
+        var mismatched = Self.listed()
+        mismatched[0] = .init(streamIndex: 10, codecName: "webvtt", frames: 2, timeBase: mismatched[0].timeBase)
+        let unpaired = SubtitleForwardPrefetcher.IndexSource.plan(index: index, listed: mismatched, streams: [10, 11, 12])
+        #expect(unpaired.streams.isEmpty)
+        #expect(unpaired.refused == ["10: no track", "11: no track", "12: no track"])
         var incomplete = Self.listed()
         incomplete[0] = .init(streamIndex: 10, codecName: "subrip", frames: 3, timeBase: incomplete[0].timeBase)
-        #expect(!SubtitleForwardPrefetcher.IndexSource.plan(index: index, listed: incomplete, streams: [10, 11, 12])
-            .refused.isEmpty)
+        let partial = SubtitleForwardPrefetcher.IndexSource.plan(index: index, listed: incomplete, streams: [10, 11, 12])
+        #expect(partial.streams.map(\.streamIndex) == [11, 12])
+        #expect(partial.refused == ["10: incomplete"])
+        let unlisted = SubtitleForwardPrefetcher.IndexSource.plan(index: index, listed: Self.listed(), streams: [10, 11, 12, 13])
+        #expect(unlisted.streams.map(\.streamIndex) == [10, 11, 12])
+        #expect(unlisted.refused == ["13: not listed"])
         #expect(SubtitleForwardPrefetcher.IndexSource.plan(index: index, listed: Self.listed(), streams: [10, 11, 12])
             .refused.isEmpty)
     }
@@ -116,7 +123,7 @@ struct SubtitleIndexPrefetchTests {
         let source = try Self.source(index, fixture)
         let store = SubtitlePacketStore()
         let outcome = await SubtitleForwardPrefetcher.run(
-            source: source, store: store, leadSeconds: 60, parkPollNanoseconds: 1_000_000,
+            source: source, store: store, lead: { _ in 60 }, parkPollNanoseconds: 1_000_000,
             playhead: { 0 })
         #expect(outcome.exit == .endOfFile)
         #expect(outcome.harvested == 4)
