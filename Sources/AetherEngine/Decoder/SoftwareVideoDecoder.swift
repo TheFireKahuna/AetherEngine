@@ -6,17 +6,21 @@ import VideoToolbox
 import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
-import AetherLibswscale
+import Metal
 
 /// libavcodec software video decoder for codecs without VideoToolbox support (e.g. AV1/dav1d on Apple TV).
-/// Uses sws_scale (SIMD/NEON-optimized) for YUV→NV12/P010 conversion; required to hit 24fps at 1080p for AV1.
+/// The decoder writes its pictures into GPU-visible memory (`DecodeFrameAllocator`) and one GPU pass
+/// (`PlanarFrameFinisher`) turns each into the display buffer; the CPU never touches the pixels after decode.
 final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
-    // FFmpeg 8.x exposes SwsContext as a real struct (7.x was OpaquePointer); pointer type must match or call sites miscompile.
-    private var swsContext: UnsafeMutablePointer<SwsContext>?
-    /// What `swsContext` was built for; a different key rebuilds it. Guarded by `lock`, like the context.
-    private var swsKey: SwscaleSetup?
+    /// Where the decoder writes its pictures, and the GPU pass that reads them. Made at `open`.
+    private var allocator: DecodeFrameAllocator?
+    private var finisher: PlanarFrameFinisher?
+    /// The finisher's plan per frame description, and the descriptions it refused (logged once each). Guarded by
+    /// `lock`, like everything `emit` touches.
+    private var plans: [PlanKey: PlanarFrameFinisher.Plan] = [:]
+    private var refusedPlans: Set<PlanKey> = []
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
     var onFrame: DecodedFrameHandler?
 
@@ -116,17 +120,15 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// was cut to 10 bits with no dither. The 16-bit formats (`sv22` / `sv44`) are video range only:
     /// their range is the 10-bit range shifted left six, so a full-range 12-bit picture goes to the
     /// 10-bit full-range format, dithered.
-    struct OutputFormat: Equatable {
-        enum Chroma: Equatable { case yuv420, yuv422, yuv444 }
-        enum Depth: Equatable { case eight, ten, sixteen }
+    struct OutputFormat: Hashable {
+        enum Chroma: Hashable { case yuv420, yuv422, yuv444 }
+        enum Depth: Hashable { case eight, ten, sixteen }
 
         var chroma: Chroma
         var depth: Depth
         var fullRange: Bool
-        /// The frame has more bits than `depth` keeps. swscale's P010 / P210 / P410 writers round with
-        /// no dither (and its unscaled 4:2:0 path just shifts, leaving the extra bits in what CoreVideo
-        /// defines as padding), so swscale writes the 16-bit sibling, which has the same memory layout,
-        /// and `ditherTo10Bit` orders it down to the 10 bits the format keeps.
+        /// The frame has more bits than `depth` keeps: the finisher forms each value with six fraction bits
+        /// and orders it down to the 10 bits the format keeps.
         var dithers: Bool
 
         init(chroma: Chroma = .yuv420, depth: Depth, fullRange: Bool, dithers: Bool = false) {
@@ -162,20 +164,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             }
         }
 
-        var swscaleFormat: AVPixelFormat {
-            switch (chroma, depth == .sixteen || dithers ? Depth.sixteen : depth) {
-            case (.yuv420, .eight): AV_PIX_FMT_NV12
-            case (.yuv420, .ten): AV_PIX_FMT_P010LE
-            case (.yuv420, .sixteen): AV_PIX_FMT_P016LE
-            case (.yuv422, .eight): AV_PIX_FMT_NV16
-            case (.yuv422, .ten): AV_PIX_FMT_P210LE
-            case (.yuv422, .sixteen): AV_PIX_FMT_P216LE
-            case (.yuv444, .eight): AV_PIX_FMT_NV24
-            case (.yuv444, .ten): AV_PIX_FMT_P410LE
-            case (.yuv444, .sixteen): AV_PIX_FMT_P416LE
-            }
-        }
-
         /// The buffer's own format read back, for a buffer this decoder did not convert (the
         /// hardware deinterlacer's surfaces): nil for a format no `OutputFormat` describes.
         init?(pixelFormatType type: OSType) {
@@ -203,8 +191,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// #8: what a 12-bit 4:2:0 picture goes out as. No 16-bit 4:2:0 bi-planar format exists, so it is
     /// either cut to 10 bits (ordered dither, the default: 4:2:0 stays 4:2:0, at P010's size and on the
     /// display path every other 10-bit stream takes) or kept at full depth in 4:2:2 `sv22`, which
-    /// costs twice the chroma and swscale's vertical chroma upsample, for the measurement of whether
-    /// more than 10 bits survive the display path at all. Read at `open`.
+    /// costs twice the chroma and a vertical chroma upsample, for the measurement of whether more than
+    /// 10 bits survive the display path at all. Read at `open`. An interlaced picture stays 4:2:0: its
+    /// chroma rows alternate between the fields, so a vertical upsample would blend them.
     enum TwelveBit420Output: String, CaseIterable, Sendable {
         case p010Dithered = "p010-dither"
         case sv22 = "sv22"
@@ -221,27 +210,28 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var twelveBit420 = TwelveBit420Output.p010Dithered
 
     /// `streamIs10Bit` is the open-time verdict (declared depth or an HDR transfer) and only ever widens
-    /// the answer. The range is a LABEL: swscale is told the same range on both sides (`SwscaleSetup`),
-    /// so a full-range frame is copied across untouched and only has to be tagged as what it is. Asking
-    /// swscale to convert would take 4K off its unscaled NV12 / P010 path. A yuvj source is full range
-    /// by its pixel format whatever `color_range` says, and stays full range here; it used to be
-    /// converted to video range by swscale itself.
+    /// the answer. The range is kept: a full-range frame goes out full range, its codes taken to the output
+    /// depth as H.273 scales full range. A yuvj source is full range by its pixel format whatever
+    /// `color_range` says.
     ///
-    /// #8: subsampling from the descriptor. Full horizontal chroma is 4:4:4 (RGB and 4:4:0 included),
-    /// horizontal and vertical subsampling 4:2:0 (4:1:0 included), horizontal only 4:2:2 (4:1:1
+    /// #8: subsampling from the descriptor. Full horizontal chroma is 4:4:4 (RGB, palette and 4:4:0
+    /// included), horizontal and vertical subsampling 4:2:0 (4:1:0 included), horizontal only 4:2:2 (4:1:1
     /// included); grey goes out as 4:2:0 with neutral chroma.
     nonisolated static func outputFormat(pixelFormat: Int32, colorRange: AVColorRange,
                                          streamIs10Bit: Bool,
-                                         twelveBit420: TwelveBit420Output = .p010Dithered) -> OutputFormat {
+                                         twelveBit420: TwelveBit420Output = .p010Dithered,
+                                         interlaced: Bool = false) -> OutputFormat {
         let format = AVPixelFormat(rawValue: pixelFormat)
         let desc = av_pix_fmt_desc_get(format)?.pointee
         let depth = desc?.comp.0.depth ?? 8
-        let isRGB = ((desc?.flags ?? 0) & UInt64(AV_PIX_FMT_FLAG_RGB)) != 0
-        // RGB has no range of its own to keep: it is converted, to video range like every other source.
+        let isRGB = ((desc?.flags ?? 0) & UInt64(AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL)) != 0
+        // RGB has no Y'CbCr range of its own to keep: it is encoded at video range like every other source.
         let fullRange = !isRGB && (colorRange == AVCOL_RANGE_JPEG || isJPEGFormat(format))
 
         let chroma: OutputFormat.Chroma
-        if let desc, desc.nb_components >= 3 {
+        if isRGB {
+            chroma = .yuv444
+        } else if let desc, desc.nb_components >= 3 {
             chroma = desc.log2_chroma_w == 0 ? .yuv444 : (desc.log2_chroma_h > 0 ? .yuv420 : .yuv422)
         } else {
             chroma = .yuv420
@@ -251,7 +241,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                                 fullRange: fullRange)
         }
         switch (chroma, fullRange) {
-        case (.yuv420, false) where twelveBit420 == .sv22:
+        case (.yuv420, false) where twelveBit420 == .sv22 && !interlaced:
             return OutputFormat(chroma: .yuv422, depth: .sixteen, fullRange: false)
         case (.yuv420, _), (_, true):
             return OutputFormat(chroma: chroma, depth: .ten, fullRange: fullRange, dithers: true)
@@ -259,40 +249,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             return OutputFormat(chroma: chroma, depth: .sixteen, fullRange: false)
         }
     }
-
-    /// #8: order 16-bit MSB-aligned words down to the 10 bits P010 / P210 / P410 keep, in place: an
-    /// 8x8 Bayer threshold (0...63, one sixty-fourth of a 10-bit step) added before the low six bits are
-    /// cleared, saturating at the top code. Unbiased to half a 16-bit unit, and a smooth 12-bit
-    /// gradient comes out as a pattern of adjacent 10-bit codes instead of 4-code-wide bands.
-    static func ditherTo10Bit(plane base: UnsafeMutableRawPointer, bytesPerRow: Int, width words: Int, height: Int) {
-        for y in 0..<height {
-            let row = base.advanced(by: y * bytesPerRow).assumingMemoryBound(to: UInt16.self)
-            let threshold = bayer8x8Rows[y & 7]
-            var x = 0
-            while x + 8 <= words {
-                let raw = UnsafeMutableRawPointer(row + x)
-                let w = raw.loadUnaligned(as: SIMD8<UInt16>.self)
-                let sum = w &+ threshold
-                var out = sum & 0xFFC0
-                out.replace(with: 0xFFC0, where: sum .< w)
-                raw.storeBytes(of: out, as: SIMD8<UInt16>.self)
-                x += 8
-            }
-            while x < words {
-                let w = UInt32(row[x]) + UInt32(threshold[x & 7])
-                row[x] = UInt16(min(w, 0xFFFF)) & 0xFFC0
-                x += 1
-            }
-        }
-    }
-
-    /// The 8x8 Bayer matrix (0...63), one SIMD row per line.
-    private static let bayer8x8Rows: [SIMD8<UInt16>] = [
-        [0, 32, 8, 40, 2, 34, 10, 42], [48, 16, 56, 24, 50, 18, 58, 26],
-        [12, 44, 4, 36, 14, 46, 6, 38], [60, 28, 52, 20, 62, 30, 54, 22],
-        [3, 35, 11, 43, 1, 33, 9, 41], [51, 19, 59, 27, 49, 17, 57, 25],
-        [15, 47, 7, 39, 13, 45, 5, 37], [63, 31, 55, 23, 61, 29, 53, 21],
-    ]
 
     /// AE#499: what the container declared about colour, captured at `open` before a single frame
     /// exists. A decoded frame carries the VUI alone, and a remux whose VUI is empty would otherwise
@@ -327,6 +283,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// decoder, so a wedge that is a genuine decode error is distinguishable in a field log
     /// from one that is not.
     private var loggedSendFailure = false
+    private var loggedFinishFailure = false
 
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
         self.onFrame = onFrame
@@ -356,10 +313,28 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             throw VideoDecoderError.unsupportedCodec(id: codecpar.pointee.codec_id.rawValue)
         }
 
+        // The display path is the GPU finisher reading the decoder's own memory; without a Metal device there is
+        // no display path, and a format its reader cannot describe has none either.
+        let sourceFormat = AVPixelFormat(rawValue: codecpar.pointee.format)
+        if sourceFormat != AV_PIX_FMT_NONE, !PlanarFrameFinisher.reads(sourceFormat) {
+            throw VideoDecoderError.unsupportedPixelFormat(name: av_get_pix_fmt_name(sourceFormat).map { String(cString: $0) } ?? "\(sourceFormat.rawValue)")
+        }
+        guard let device = MTLCreateSystemDefaultDevice(), let frameAllocator = DecodeFrameAllocator(device: device) else {
+            throw VideoDecoderError.metalUnavailable
+        }
+        allocator = frameAllocator
+        finisher = try PlanarFrameFinisher(device: device)
+
         guard let ctx = avcodec_alloc_context3(codec) else {
             throw VideoDecoderError.sessionCreationFailed(status: -1)
         }
         codecContext = ctx
+        // Pictures go straight into the slabs the finisher reads (every decoder the route opens through
+        // libavcodec has DR1; one without it keeps libavcodec's buffers and its pictures are copied).
+        if codec.pointee.capabilities & AV_CODEC_CAP_DR1 != 0 { frameAllocator.install(on: ctx) }
+        // The conformance window exactly: libavcodec otherwise rounds a left crop down to keep the planes
+        // 32-byte aligned for CPU code, showing columns the stream crops. The GPU reads any offset.
+        ctx.pointee.flags |= AV_CODEC_FLAG_UNALIGNED
 
         guard avcodec_parameters_to_context(ctx, codecpar) >= 0 else {
             throw VideoDecoderError.noCodecParameters
@@ -543,8 +518,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 }
                 // No deinterlacer in linked build or graph failure: fall through and render as-is (combing, but playing).
             }
-            // emit() must stay under `lock`: close() frees swsContext/pixelBufferPool under the same lock;
-            // emitting unlocked raced a stop() into a use-after-free of the sws context.
+            // emit() must stay under `lock`: close() releases the pool and the plans under the same lock.
             emit(f, timeBase: timeBase)
             lock.unlock()
         }
@@ -670,8 +644,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             attachColorSpace(from: f, to: pixelBuffer)
             attachPixelAspectRatio(from: f, to: pixelBuffer)
         } else {
-            guard let converted = convertFrameToPixelBuffer(f) else { return }
-            pixelBuffer = converted
+            guard let finished = finishFrame(f) else { return }
+            pixelBuffer = finished
         }
 
         reportDecodedFormat(pixelBuffer: pixelBuffer)
@@ -745,11 +719,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             avcodec_free_context(&codecContext)
         }
         codecContext = nil
-        if swsContext != nil {
-            sws_freeContext(swsContext)
-            swsContext = nil
-        }
-        swsKey = nil
+        plans = [:]
+        refusedPlans = []
         pixelBufferPool = nil
         poolWidth = 0
         poolHeight = 0
@@ -835,275 +806,86 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             pixelBufferFormat: DecodedVideoFormat.fourCC(key.pixelBufferType)))
     }
 
-    // MARK: - AVFrame → CVPixelBuffer (sws_scale)
+    // MARK: - AVFrame → CVPixelBuffer (GPU finisher)
 
-    private func convertFrameToPixelBuffer(_ frame: UnsafeMutablePointer<AVFrame>) -> CVPixelBuffer? {
-        let width = Int(frame.pointee.width)
-        let height = Int(frame.pointee.height)
+    /// What a plan is decided by: the frame's format and range, the output, the siting and matrix it is written
+    /// with, and whether the picture is interlaced (no vertical chroma resampling then).
+    struct PlanKey: Hashable {
+        var pixelFormat: Int32
+        var output: OutputFormat
+        var sourceFullRange: Bool
+        var chromaLocation: UInt32
+        var matrix: String
+        var interlaced: Bool
+    }
+
+    /// The display buffer for one decoded picture, written by the GPU from the picture's own memory. Nil (and
+    /// one log line per kind) when the finisher cannot write this frame's format into the output.
+    private func finishFrame(_ frame: UnsafeMutablePointer<AVFrame>) -> CVPixelBuffer? {
+        guard let allocator, let finisher else { return nil }
+        let width = Int(frame.pointee.width), height = Int(frame.pointee.height)
         guard width > 0, height > 0 else { return nil }
-
-        let srcFmt = AVPixelFormat(rawValue: frame.pointee.format)
-
+        let format = AVPixelFormat(rawValue: frame.pointee.format)
+        let interlaced = (frame.pointee.flags & (1 << 3)) != 0  // AV_FRAME_FLAG_INTERLACED
         let outputFormat = Self.outputFormat(
             pixelFormat: frame.pointee.format, colorRange: frame.pointee.color_range, streamIs10Bit: use10Bit,
-            twelveBit420: twelveBit420)
-        let dstFmt = outputFormat.swscaleFormat
-        logOutputFormat(outputFormat, source: av_get_pix_fmt_name(srcFmt).map { String(cString: $0) } ?? "?",
+            twelveBit420: twelveBit420, interlaced: interlaced)
+        logOutputFormat(outputFormat, source: av_get_pix_fmt_name(format).map { String(cString: $0) } ?? "?",
                         colorRange: frame.pointee.color_range)
 
-        let directShift = Self.directCopyShift(source: srcFmt, destination: dstFmt)
-        if directShift == nil {
-            let setup = SwscaleSetup(
-                width: Int32(width), height: Int32(height), source: srcFmt, destination: dstFmt,
-                sourceFullRange: frame.pointee.color_range == AVCOL_RANGE_JPEG || Self.isJPEGFormat(srcFmt),
-                destinationFullRange: outputFormat.fullRange,
-                colorspace: Self.swscaleColorspace(ColorAttachments.presented(
-                    ColorDescription(frame: frame), frameSize: (frame.pointee.width, frame.pointee.height)).matrix))
-            if setup != swsKey {
-                sws_freeContext(swsContext)
-                swsContext = setup.makeContext()
-                swsKey = swsContext == nil ? nil : setup
+        let isRGB = (av_pix_fmt_desc_get(format)?.pointee.flags ?? 0) & UInt64(AV_PIX_FMT_FLAG_RGB) != 0
+        // H.273: VideoFullRangeFlag applies to R'G'B' codes too. An RGB frame is full range unless it says
+        // video range; a Y'CbCr frame is video range unless it (or its yuvj format) says full.
+        let sourceFullRange = isRGB ? frame.pointee.color_range != AVCOL_RANGE_MPEG : outputFormat.fullRange
+        let matrix = ColorAttachments.presented(ColorDescription(frame: frame),
+                                                frameSize: (frame.pointee.width, frame.pointee.height)).matrix
+        let location = Self.resolvedChromaLocation(frame.pointee.chroma_location, isJPEG: Self.isJPEGFormat(format))
+        let key = PlanKey(pixelFormat: frame.pointee.format, output: outputFormat, sourceFullRange: sourceFullRange,
+                          chromaLocation: UInt32(location.rawValue), matrix: matrix as String, interlaced: interlaced)
+        let plan: PlanarFrameFinisher.Plan
+        if let known = plans[key] {
+            plan = known
+        } else if let made = PlanarFrameFinisher.plan(source: format, output: outputFormat, sourceFullRange: sourceFullRange,
+                                                      chromaLocation: location, matrix: matrix, interlaced: interlaced) {
+            plans[key] = made
+            plan = made
+        } else {
+            if refusedPlans.insert(key).inserted {
+                EngineLog.emit("[SWDecoder] cannot write \(av_get_pix_fmt_name(format).map { String(cString: $0) } ?? "?")"
+                               + "\(interlaced ? " (interlaced)" : "") as \(outputFormat.logDescription); frames dropped",
+                               category: .swPlayback)
             }
-            guard swsContext != nil else { return nil }
+            return nil
         }
 
         var pixelBuffer: CVPixelBuffer?
-        guard let pool = ensurePixelBufferPool(width: width, height: height, format: outputFormat) else { return nil }
-        let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
-        guard status == kCVReturnSuccess, let pb = pixelBuffer else { return nil }
-
+        guard let pool = ensurePixelBufferPool(width: width, height: height, format: outputFormat),
+              CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer) == kCVReturnSuccess,
+              let pb = pixelBuffer else { return nil }
         attachColorSpace(from: frame, to: pb)
         attachPixelAspectRatio(from: frame, to: pb)
 
-        CVPixelBufferLockBaseAddress(pb, [])
-        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
-
-        if let directShift {
-            Self.copyPlanarToBiPlanar(frame, into: pb, shift: directShift)
-            if outputFormat.dithers { Self.ditherTo10Bit(pb) }
-            return pb
+        // The decoder's own slab, or (rawvideo, libavcodec's paletted buffers) a copy of the picture in one.
+        let planes: PlanarFrameFinisher.Planes
+        var copied: DecodeFrameAllocator.Slab?
+        if let slab = allocator.slab(of: frame), let own = PlanarFrameFinisher.planes(of: frame, in: slab) {
+            planes = own
+        } else if let copy = allocator.copy(frame) {
+            planes = copy
+            copied = copy.slab
+        } else {
+            return nil
         }
-
-        let yPlane = CVPixelBufferGetBaseAddressOfPlane(pb, 0)!
-            .assumingMemoryBound(to: UInt8.self)
-        let cbcrPlane = CVPixelBufferGetBaseAddressOfPlane(pb, 1)!
-            .assumingMemoryBound(to: UInt8.self)
-
-        var dstData: (UnsafeMutablePointer<UInt8>?, UnsafeMutablePointer<UInt8>?, UnsafeMutablePointer<UInt8>?, UnsafeMutablePointer<UInt8>?,
-                      UnsafeMutablePointer<UInt8>?, UnsafeMutablePointer<UInt8>?, UnsafeMutablePointer<UInt8>?, UnsafeMutablePointer<UInt8>?)
-        dstData.0 = yPlane
-        dstData.1 = cbcrPlane
-        dstData.2 = nil
-        dstData.3 = nil
-
-        var dstLinesize: (Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32) = (0, 0, 0, 0, 0, 0, 0, 0)
-        dstLinesize.0 = Int32(CVPixelBufferGetBytesPerRowOfPlane(pb, 0))
-        dstLinesize.1 = Int32(CVPixelBufferGetBytesPerRowOfPlane(pb, 1))
-
-        withUnsafePointer(to: &frame.pointee.data) { srcDataPtr in
-            withUnsafePointer(to: &frame.pointee.linesize) { srcLinesizePtr in
-                withUnsafeMutablePointer(to: &dstData) { dstPtr in
-                    withUnsafeMutablePointer(to: &dstLinesize) { dstLsPtr in
-                        let srcSlice = UnsafeRawPointer(srcDataPtr)
-                            .assumingMemoryBound(to: UnsafePointer<UInt8>?.self)
-                        let srcLs = UnsafeRawPointer(srcLinesizePtr)
-                            .assumingMemoryBound(to: Int32.self)
-                        let dstSlice = UnsafeMutableRawPointer(dstPtr)
-                            .assumingMemoryBound(to: UnsafeMutablePointer<UInt8>?.self)
-                        let dstLs = UnsafeMutableRawPointer(dstLsPtr)
-                            .assumingMemoryBound(to: Int32.self)
-
-                        sws_scale(
-                            swsContext,
-                            srcSlice, srcLs,
-                            0, Int32(height),
-                            dstSlice, dstLs
-                        )
-                    }
-                }
+        defer { if let copied { allocator.release(copied) } }
+        guard finisher.finish(planes, plan: plan, width: width, height: height, into: pb) else {
+            if !loggedFinishFailure {
+                loggedFinishFailure = true
+                EngineLog.emit("[SWDecoder] GPU finish failed for \(outputFormat.logDescription) (logged once)",
+                               category: .swPlayback)
             }
+            return nil
         }
-
-        if outputFormat.dithers { Self.ditherTo10Bit(pb) }
-
         return pb
-    }
-
-    /// Both planes of a locked bi-planar 16-bit buffer, through `ditherTo10Bit(plane:...)`.
-    static func ditherTo10Bit(_ pb: CVPixelBuffer) {
-        for plane in 0..<2 {
-            // Words per row: one per luma pixel, two per sample of the interleaved chroma plane.
-            ditherTo10Bit(plane: CVPixelBufferGetBaseAddressOfPlane(pb, plane)!,
-                          bytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pb, plane),
-                          width: CVPixelBufferGetWidthOfPlane(pb, plane) * (plane == 0 ? 1 : 2),
-                          height: CVPixelBufferGetHeightOfPlane(pb, plane))
-        }
-    }
-
-    /// #8: the left shift that turns the source's planar samples into the destination's bi-planar
-    /// words, when the conversion is nothing more than that: planar YCbCr into the bi-planar format
-    /// with the same subsampling and the same sample size (8-bit into 8-bit, 9...16-bit into 16-bit
-    /// words, MSB-aligned). nil otherwise, and for 4:2:0, where swscale has unscaled converters of its
-    /// own (NV12 0.17 ms, P010 0.70 ms per 4K frame). For 4:2:2 and 4:4:4 it has none and runs its full
-    /// vertical scaler at the identity size: 4.9 ms for NV16, 9.2 ms for P210, 15 ms for P410 per 4K
-    /// frame on an M4 Pro, against well under a millisecond for this copy. The range and the matrix
-    /// are unchanged by construction (`SwscaleSetup` would copy the levels across all the same).
-    static func directCopyShift(source: AVPixelFormat, destination: AVPixelFormat) -> Int? {
-        guard let src = av_pix_fmt_desc_get(source)?.pointee,
-              let dst = av_pix_fmt_desc_get(destination)?.pointee else { return nil }
-        let excluded = UInt64(AV_PIX_FMT_FLAG_RGB) | UInt64(AV_PIX_FMT_FLAG_ALPHA) | UInt64(AV_PIX_FMT_FLAG_FLOAT)
-            | UInt64(AV_PIX_FMT_FLAG_BE) | UInt64(AV_PIX_FMT_FLAG_PAL) | UInt64(AV_PIX_FMT_FLAG_BITSTREAM)
-        guard src.nb_components == 3, (src.flags & UInt64(AV_PIX_FMT_FLAG_PLANAR)) != 0, (src.flags & excluded) == 0,
-              src.log2_chroma_h == 0, src.log2_chroma_w <= 1,
-              src.log2_chroma_w == dst.log2_chroma_w, src.log2_chroma_h == dst.log2_chroma_h,
-              src.comp.0.plane == 0, src.comp.1.plane == 1, src.comp.2.plane == 2,
-              src.comp.0.shift == 0, src.comp.1.shift == 0, src.comp.2.shift == 0,
-              dst.comp.0.plane == 0, dst.comp.1.plane == 1, dst.comp.2.plane == 1,
-              (dst.flags & UInt64(AV_PIX_FMT_FLAG_BE)) == 0 else { return nil }
-        let srcBytes = Int(src.comp.0.step), dstBytes = Int(dst.comp.0.step)
-        guard srcBytes == dstBytes, srcBytes == 1 || srcBytes == 2,
-              src.comp.1.step == src.comp.0.step, src.comp.2.step == src.comp.0.step else { return nil }
-        let shift = Int(dst.comp.0.depth + dst.comp.0.shift) - Int(src.comp.0.depth)
-        guard shift >= 0, shift < 8 * srcBytes else { return nil }
-        return shift
-    }
-
-    /// The copy `directCopyShift` allows: luma shifted row by row, the two chroma planes shifted and
-    /// interleaved into the bi-planar chroma plane. Buffer locked by the caller.
-    static func copyPlanarToBiPlanar(_ frame: UnsafePointer<AVFrame>, into pb: CVPixelBuffer, shift: Int) {
-        let desc = av_pix_fmt_desc_get(AVPixelFormat(rawValue: frame.pointee.format))!.pointee
-        let wide = desc.comp.0.step == 2
-        let width = Int(frame.pointee.width), height = Int(frame.pointee.height)
-        let chromaWidth = (width + (1 << Int(desc.log2_chroma_w)) - 1) >> Int(desc.log2_chroma_w)
-        let srcY = UnsafeRawPointer(frame.pointee.data.0!), srcU = UnsafeRawPointer(frame.pointee.data.1!)
-        let srcV = UnsafeRawPointer(frame.pointee.data.2!)
-        let lumaStride = Int(frame.pointee.linesize.0), chromaStride = Int(frame.pointee.linesize.1)
-        let chromaStrideV = Int(frame.pointee.linesize.2)
-        let dstY = CVPixelBufferGetBaseAddressOfPlane(pb, 0)!, dstC = CVPixelBufferGetBaseAddressOfPlane(pb, 1)!
-        let dstYStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), dstCStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 1)
-        for y in 0..<height {
-            let sy = srcY + y * lumaStride, dy = dstY + y * dstYStride
-            let su = srcU + y * chromaStride, sv = srcV + y * chromaStrideV, dc = dstC + y * dstCStride
-            if wide {
-                let s = UInt16(shift)
-                var x = 0
-                while x + 8 <= width {
-                    dy.storeBytes(of: sy.loadUnaligned(fromByteOffset: 2 * x, as: SIMD8<UInt16>.self) &<< s,
-                                  toByteOffset: 2 * x, as: SIMD8<UInt16>.self)
-                    x += 8
-                }
-                while x < width {
-                    dy.storeBytes(of: sy.loadUnaligned(fromByteOffset: 2 * x, as: UInt16.self) << s,
-                                  toByteOffset: 2 * x, as: UInt16.self)
-                    x += 1
-                }
-                x = 0
-                while x + 8 <= chromaWidth {
-                    let u = su.loadUnaligned(fromByteOffset: 2 * x, as: SIMD8<UInt16>.self) &<< s
-                    let v = sv.loadUnaligned(fromByteOffset: 2 * x, as: SIMD8<UInt16>.self) &<< s
-                    dc.storeBytes(of: SIMD8(u[0], v[0], u[1], v[1], u[2], v[2], u[3], v[3]),
-                                  toByteOffset: 4 * x, as: SIMD8<UInt16>.self)
-                    dc.storeBytes(of: SIMD8(u[4], v[4], u[5], v[5], u[6], v[6], u[7], v[7]),
-                                  toByteOffset: 4 * x + 16, as: SIMD8<UInt16>.self)
-                    x += 8
-                }
-                while x < chromaWidth {
-                    dc.storeBytes(of: sv.loadUnaligned(fromByteOffset: 2 * x, as: UInt16.self) << s,
-                                  toByteOffset: 4 * x + 2, as: UInt16.self)
-                    dc.storeBytes(of: su.loadUnaligned(fromByteOffset: 2 * x, as: UInt16.self) << s,
-                                  toByteOffset: 4 * x, as: UInt16.self)
-                    x += 1
-                }
-            } else {
-                dy.copyMemory(from: sy, byteCount: width)
-                var x = 0
-                while x + 16 <= chromaWidth {
-                    let u = su.loadUnaligned(fromByteOffset: x, as: SIMD16<UInt8>.self)
-                    let v = sv.loadUnaligned(fromByteOffset: x, as: SIMD16<UInt8>.self)
-                    dc.storeBytes(of: SIMD16(u[0], v[0], u[1], v[1], u[2], v[2], u[3], v[3],
-                                             u[4], v[4], u[5], v[5], u[6], v[6], u[7], v[7]),
-                                  toByteOffset: 2 * x, as: SIMD16<UInt8>.self)
-                    dc.storeBytes(of: SIMD16(u[8], v[8], u[9], v[9], u[10], v[10], u[11], v[11],
-                                             u[12], v[12], u[13], v[13], u[14], v[14], u[15], v[15]),
-                                  toByteOffset: 2 * x + 16, as: SIMD16<UInt8>.self)
-                    x += 16
-                }
-                while x < chromaWidth {
-                    dc.storeBytes(of: su.load(fromByteOffset: x, as: UInt8.self), toByteOffset: 2 * x, as: UInt8.self)
-                    dc.storeBytes(of: sv.load(fromByteOffset: x, as: UInt8.self), toByteOffset: 2 * x + 1, as: UInt8.self)
-                    x += 1
-                }
-            }
-        }
-    }
-
-    /// Everything a conversion context is built from (`sws_getCachedContext` exposes neither range nor
-    /// matrix, so the decoder keeps its own key).
-    ///
-    /// - Ranges: equal on both sides wherever the picture stays YCbCr, so swscale copies the levels
-    ///   across and keeps its unscaled converters (NV12 / P010 at 4K). A yuvj source is full range on
-    ///   both sides too: it used to be squeezed to video range, which also pushed it off the unscaled
-    ///   path. Only RGB has a real range conversion, to whatever the buffer is tagged.
-    /// - Matrix: one table for both sides, the one the buffer is tagged with. YCbCr to YCbCr is then a
-    ///   copy (different tables would make swscale cascade through RGB), and RGB is converted with the
-    ///   coefficients the display layer will decode it with: it used to get swscale's default BT.601
-    ///   on a buffer tagged BT.709.
-    /// - Flags: `SWS_ACCURATE_RND` for exact rounding where the vertical scaler runs, and, only when
-    ///   chroma is resampled (4:2:0 into `sv22`, 4:1:1, 4:4:0, RGB), bicubic with full-resolution chroma
-    ///   in and out instead of bilinear. Luma is never scaled: the destination is the source size, so
-    ///   the filter choice only reaches chroma. swscale's own `sws_dither` is left alone: it applies to
-    ///   RGB and 8-bit outputs, neither of which this decoder writes from a deeper source (the one
-    ///   depth reduction left, 12+ to 10 bits, is `ditherTo10Bit`).
-    struct SwscaleSetup: Equatable {
-        var width: Int32
-        var height: Int32
-        var source: AVPixelFormat
-        var destination: AVPixelFormat
-        var sourceFullRange: Bool
-        var destinationFullRange: Bool
-        var colorspace: Int32
-
-        var resamplesChroma: Bool {
-            guard let src = av_pix_fmt_desc_get(source)?.pointee,
-                  let dst = av_pix_fmt_desc_get(destination)?.pointee else { return true }
-            return (src.flags & UInt64(AV_PIX_FMT_FLAG_RGB)) != 0 || src.nb_components < 3
-                || src.log2_chroma_w != dst.log2_chroma_w || src.log2_chroma_h != dst.log2_chroma_h
-        }
-
-        var flags: Int32 {
-            // FFmpeg 8 turned the SWS_* constants into a typed `SwsFlags` enum; the option wants an int.
-            resamplesChroma
-                ? Int32(SWS_BICUBIC.rawValue | SWS_ACCURATE_RND.rawValue | SWS_FULL_CHR_H_INT.rawValue
-                        | SWS_FULL_CHR_H_INP.rawValue)
-                : Int32(SWS_BILINEAR.rawValue | SWS_ACCURATE_RND.rawValue)
-        }
-
-        func makeContext() -> UnsafeMutablePointer<SwsContext>? {
-            guard let ctx = sws_alloc_context() else { return nil }
-            var owned: UnsafeMutablePointer<SwsContext>? = ctx
-            let raw = UnsafeMutableRawPointer(ctx)
-            av_opt_set_int(raw, "srcw", Int64(width), 0)
-            av_opt_set_int(raw, "srch", Int64(height), 0)
-            av_opt_set_int(raw, "dstw", Int64(width), 0)
-            av_opt_set_int(raw, "dsth", Int64(height), 0)
-            av_opt_set_int(raw, "src_format", Int64(source.rawValue), 0)
-            av_opt_set_int(raw, "dst_format", Int64(destination.rawValue), 0)
-            av_opt_set_int(raw, "src_range", sourceFullRange ? 1 : 0, 0)
-            av_opt_set_int(raw, "dst_range", destinationFullRange ? 1 : 0, 0)
-            av_opt_set_int(raw, "sws_flags", Int64(flags), 0)
-            guard sws_init_context(ctx, nil, nil) >= 0 else {
-                sws_freeContext(owned)
-                return nil
-            }
-            let table = sws_getCoefficients(colorspace)
-            guard sws_setColorspaceDetails(ctx, table, sourceFullRange ? 1 : 0, table, destinationFullRange ? 1 : 0,
-                                           0, 1 << 16, 1 << 16) >= 0 else {
-                sws_freeContext(owned)
-                owned = nil
-                return nil
-            }
-            return owned
-        }
     }
 
     nonisolated static func isJPEGFormat(_ format: AVPixelFormat) -> Bool {
@@ -1112,16 +894,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             true
         default:
             false
-        }
-    }
-
-    /// The swscale coefficient table for the matrix the buffer is tagged with.
-    nonisolated static func swscaleColorspace(_ matrix: CFString) -> Int32 {
-        switch matrix {
-        case kCVImageBufferYCbCrMatrix_ITU_R_601_4: SWS_CS_ITU601
-        case kCVImageBufferYCbCrMatrix_ITU_R_2020: SWS_CS_BT2020
-        case kCVImageBufferYCbCrMatrix_SMPTE_240M_1995: SWS_CS_SMPTE240M
-        default: SWS_CS_ITU709
         }
     }
 
@@ -1187,10 +959,15 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// assumes, and nothing documents that. On a 4:2:2 buffer only the horizontal half of the siting
     /// exists, so the vertical variants fold onto Left / Center (a 4:2:0 picture swscale widened into
     /// `sv22` keeps its horizontal siting).
+    /// The frame's chroma siting with UNSPECIFIED filled: centred for JPEG (yuvj) formats, LEFT otherwise (the
+    /// H.264 / HEVC inference when the VUI carries no chroma_loc_info, and MPEG-2's 4:2:0).
+    nonisolated static func resolvedChromaLocation(_ location: AVChromaLocation, isJPEG: Bool) -> AVChromaLocation {
+        location == AVCHROMA_LOC_UNSPECIFIED ? (isJPEG ? AVCHROMA_LOC_CENTER : AVCHROMA_LOC_LEFT) : location
+    }
+
     nonisolated static func chromaLocation(_ location: AVChromaLocation, output: OutputFormat.Chroma,
                                            isJPEG: Bool) -> CFString? {
-        let resolved = location == AVCHROMA_LOC_UNSPECIFIED
-            ? (isJPEG ? AVCHROMA_LOC_CENTER : AVCHROMA_LOC_LEFT) : location
+        let resolved = resolvedChromaLocation(location, isJPEG: isJPEG)
         switch output {
         case .yuv444:
             return nil

@@ -1,53 +1,157 @@
-/// Metal source for ``PlanarFrameFinisher``: a decoded picture, read in any in-memory layout FFmpeg describes,
-/// written into a bi-planar display buffer.
+/// Metal source for ``PlanarFrameFinisher``. The equations are docs/colour-representation.md's (H.273); the
+/// numbers in parentheses below are H.273's.
+///
+/// One kernel, specialised per source format with function constants: the component layout, the read width,
+/// the range, the output depth and the path are all compile-time values, so each format gets a kernel with its
+/// branches and address arithmetic folded away. One thread per output chroma sample writes that sample and the
+/// luma block it covers (2x2 for 4:2:0, 2x1 for 4:2:2, 1x1 for 4:4:4).
 enum PlanarFrameShaderSource {
     static let source = """
 #include <metal_stdlib>
 using namespace metal;
 
-// AVComponentDescriptor, as av_read_image_line2 reads it.
-struct PFComponent {
-    uint plane;
-    uint step;
-    uint offset;
-    uint shift;
-    uint depth;
-};
+// MARK: - Specialisation
 
-// Mirrors PlanarFrameFinisher.Params (Swift); every field is 32 bits, the float4s 16-byte aligned.
-struct PFParams {
+// 0 pack (Y'CbCr, output keeps the source's chroma subsampling), 1 resample (Y'CbCr, output keeps more chroma),
+// 2 grey (neutral chroma), 3 RGB (R'G'B' codes or a palette, to Y'CbCr through the affine rows).
+constant uint FC_MODE        [[function_constant(0)]];
+constant uint FC_OUT_LOG2_W  [[function_constant(1)]];
+constant uint FC_OUT_LOG2_H  [[function_constant(2)]];
+constant uint FC_SRC_LOG2_W  [[function_constant(3)]];
+constant uint FC_SRC_LOG2_H  [[function_constant(4)]];
+// AVComponentDescriptor of components 0...3: plane, step, offset, shift, depth.
+constant uint FC_C0_PLANE [[function_constant(5)]];  constant uint FC_C0_STEP [[function_constant(6)]];
+constant uint FC_C0_OFFSET [[function_constant(7)]]; constant uint FC_C0_SHIFT [[function_constant(8)]];
+constant uint FC_C0_DEPTH [[function_constant(9)]];
+constant uint FC_C1_PLANE [[function_constant(10)]]; constant uint FC_C1_STEP [[function_constant(11)]];
+constant uint FC_C1_OFFSET [[function_constant(12)]]; constant uint FC_C1_SHIFT [[function_constant(13)]];
+constant uint FC_C1_DEPTH [[function_constant(14)]];
+constant uint FC_C2_PLANE [[function_constant(15)]]; constant uint FC_C2_STEP [[function_constant(16)]];
+constant uint FC_C2_OFFSET [[function_constant(17)]]; constant uint FC_C2_SHIFT [[function_constant(18)]];
+constant uint FC_C2_DEPTH [[function_constant(19)]];
+constant bool FC_BIG_ENDIAN  [[function_constant(20)]];
+constant bool FC_BITSTREAM   [[function_constant(21)]];
+constant bool FC_PALETTE     [[function_constant(22)]];
+// The source's VideoFullRangeFlag (for RGB: the R'G'B' codes' range).
+constant bool FC_FULL_RANGE  [[function_constant(23)]];
+// Output: T significant bits (8, 10 or 16), F fraction bits kept for the dither (6, else 0), and the left shift
+// that MSB-aligns an undithered value in its container.
+constant uint FC_TARGET_BITS     [[function_constant(24)]];
+constant uint FC_FRACTION_BITS   [[function_constant(25)]];
+constant uint FC_CONTAINER_SHIFT [[function_constant(26)]];
+// AVChromaLocation, UNSPECIFIED already resolved.
+constant uint FC_CHROMA_LOCATION [[function_constant(27)]];
+
+constant bool PF_DITHER = FC_FRACTION_BITS > 0u;
+constant uint PF_BLOCK_W = 1u << FC_OUT_LOG2_W;
+constant uint PF_BLOCK_H = 1u << FC_OUT_LOG2_H;
+
+// MARK: - Per-frame values
+
+struct PFFrame {
     uint width;
     uint height;
-    uint out_chroma_width;
-    uint out_chroma_height;
-    uint src_log2_w;
-    uint src_log2_h;
-    uint out_log2_w;
-    uint out_log2_h;
-    uint flags;
-    // Bits of every value before it is placed in its container: 8, 10 or 16.
-    uint precision;
-    // Left shift that MSB-aligns a value in its container: 16 - precision for 16-bit containers, else 0.
-    uint container_shift;
-    // AVChromaLocation with UNSPECIFIED already resolved.
-    uint chroma_location;
-    PFComponent comp[4];
+    uint chroma_width;      // output chroma plane
+    uint chroma_height;
     uint plane_offset[4];
     uint linesize[4];
-    // RGB to Y'CbCr at `precision` bits, video range: value = dot(row.xyz, rgb) + row.w, rgb in [0, 1].
-    float4 rgb_y;
-    float4 rgb_cb;
-    float4 rgb_cr;
+    // RGB: output code (with F fraction bits) = ( row[0] R + row[1] G + row[2] B + row[3] ) / 2^30, before Round.
+    // Fixed point: at 16-bit outputs float32 cannot place a value against its rounding tie, 64-bit integers
+    // with 30 fraction bits err by under 2^-14 of a code.
+    long rgb_rows[12];
 };
 
-constant uint PF_RGB = 1u;
-constant uint PF_BIG_ENDIAN = 2u;
-constant uint PF_BITSTREAM = 4u;
-constant uint PF_PALETTE = 8u;
-constant uint PF_GRAY = 16u;
-constant uint PF_DITHER = 32u;
+// MARK: - Reading (av_read_image_line2)
 
-// Integer Bayer 8x8 thresholds (0...63), one sixty-fourth of a 10-bit step, by row then word.
+// The component at (x, y) of its own plane's grid. Every argument but the frame and the position is a function
+// constant, so the load width and the address arithmetic fold away.
+static inline uint pf_read(device const uchar* src, constant PFFrame& f,
+                           uint plane, uint step, uint offset, uint shift, uint depth, uint x, uint y) {
+    device const uchar* row = src + f.plane_offset[plane] + y * f.linesize[plane];
+    uint mask = depth >= 32u ? 0xFFFFFFFFu : ((1u << depth) - 1u);
+    if (FC_BITSTREAM) {
+        if (step > 8u) {
+            uint v = as_type<uint>(*(device const packed_uchar4*)(row + x * 4u));
+            return (((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24)) >> offset & mask;
+        }
+        uint skip = x * step + offset;
+        return (uint(row[skip >> 3]) >> (8u - depth - (skip & 7u))) & mask;
+    }
+    device const uchar* q = row + x * step + offset;
+    uint bits = shift + depth;
+    uint v;
+    if (bits <= 8u) {
+        v = uint(q[FC_BIG_ENDIAN ? 1 : 0]);
+    } else if (bits <= 16u) {
+        // A typed load when the component sits on its own alignment (plane offsets and linesizes are checked by
+        // PlanarFrameFinisher); bytes otherwise, as for x2rgb10's green at byte 1 of its word.
+        if (step % 2u == 0u && offset % 2u == 0u) {
+            ushort w = *(device const ushort*)q;
+            v = FC_BIG_ENDIAN ? uint((w >> 8) | (w << 8)) & 0xFFFFu : uint(w);
+        } else {
+            v = FC_BIG_ENDIAN ? (uint(q[0]) << 8 | uint(q[1])) : (uint(q[1]) << 8 | uint(q[0]));
+        }
+    } else {
+        uint w;
+        if (step % 4u == 0u && offset % 4u == 0u) {
+            w = *(device const uint*)q;
+        } else {
+            w = uint(q[0]) | uint(q[1]) << 8 | uint(q[2]) << 16 | uint(q[3]) << 24;
+        }
+        v = FC_BIG_ENDIAN ? (((w & 0xFFu) << 24) | ((w & 0xFF00u) << 8) | ((w >> 8) & 0xFF00u) | (w >> 24)) : w;
+    }
+    return (v >> shift) & mask;
+}
+
+static inline uint pf_c0(device const uchar* s, constant PFFrame& f, uint x, uint y) {
+    return pf_read(s, f, FC_C0_PLANE, FC_C0_STEP, FC_C0_OFFSET, FC_C0_SHIFT, FC_C0_DEPTH, x, y);
+}
+static inline uint pf_c1(device const uchar* s, constant PFFrame& f, uint x, uint y) {
+    return pf_read(s, f, FC_C1_PLANE, FC_C1_STEP, FC_C1_OFFSET, FC_C1_SHIFT, FC_C1_DEPTH, x, y);
+}
+static inline uint pf_c2(device const uchar* s, constant PFFrame& f, uint x, uint y) {
+    return pf_read(s, f, FC_C2_PLANE, FC_C2_STEP, FC_C2_OFFSET, FC_C2_SHIFT, FC_C2_DEPTH, x, y);
+}
+
+// MARK: - Codes at the output depth
+
+constant uint PF_WORD_MAX = FC_TARGET_BITS + FC_FRACTION_BITS >= 16u ? 0xFFFFu
+                          : ((1u << (FC_TARGET_BITS + FC_FRACTION_BITS)) - 1u);
+
+// A d-bit luma (or grey) code at T bits with F fraction bits. Video range: a left shift, exact. Full range:
+// Round( Y * ( 2^T - 1 ) / ( 2^d - 1 ) ) (36), in 64-bit integers: the quotient has an odd denominator, so it
+// never ties, but float32 cannot resolve it at 16-bit words.
+static inline uint pf_luma_word(uint v, uint d) {
+    if (!FC_FULL_RANGE) { return v << (FC_TARGET_BITS + FC_FRACTION_BITS - d); }
+    ulong num = ulong(v) * ulong((1u << FC_TARGET_BITS) - 1u) << (FC_FRACTION_BITS + 1u);
+    ulong den = ulong((1u << d) - 1u);
+    return min(uint((num + den) / (2ul * den)), PF_WORD_MAX);
+}
+
+// A d-bit chroma code at T bits with F fraction bits: video range a shift; full range
+// Round( ( C - 2^(d-1) ) * ( 2^T - 1 ) / ( 2^d - 1 ) + 2^(T-1) ) (37), clipped at 0 (Clip1C).
+static inline uint pf_chroma_word(uint v, uint d) {
+    if (!FC_FULL_RANGE) { return v << (FC_TARGET_BITS + FC_FRACTION_BITS - d); }
+    long den = long((1u << d) - 1u);
+    long num = (long(v) - long(1u << (d - 1u))) * long((1u << FC_TARGET_BITS) - 1u) * long(1u << (FC_FRACTION_BITS + 1u))
+             + den * (long(1u << (FC_TARGET_BITS - 1u + FC_FRACTION_BITS + 1u)) + 1l);
+    if (num <= 0l) { return 0u; }
+    return min(uint(num / (2l * den)), PF_WORD_MAX);
+}
+
+// An RGB row applied to codes: Round( x ) = Floor( x + 0.5 ) (8) in 2^-30 fixed point, clipped.
+static inline uint pf_rgb_word(constant PFFrame& f, uint row, int3 rgb) {
+    long acc = f.rgb_rows[row * 4u] * long(rgb.x) + f.rgb_rows[row * 4u + 1u] * long(rgb.y)
+             + f.rgb_rows[row * 4u + 2u] * long(rgb.z) + f.rgb_rows[row * 4u + 3u] + (1l << 29);
+    return acc <= 0l ? 0u : min(uint(min(acc >> 30, long(PF_WORD_MAX))), PF_WORD_MAX);
+}
+
+// A real-valued code (with F fraction bits) rounded: Round( x ) = Floor( x + 0.5 ) for x >= 0 (8), clipped.
+static inline uint pf_round_word(float x) {
+    return uint(clamp(floor(x + 0.5f), 0.0f, float(PF_WORD_MAX)));
+}
+
+// Integer Bayer 8x8 thresholds (0...63), by row then word.
 constant ushort pf_bayer[64] = {
      0, 32,  8, 40,  2, 34, 10, 42,  48, 16, 56, 24, 50, 18, 58, 26,
     12, 44,  4, 36, 14, 46,  6, 38,  60, 28, 52, 20, 62, 30, 54, 22,
@@ -55,166 +159,119 @@ constant ushort pf_bayer[64] = {
     15, 47,  7, 39, 13, 45,  5, 37,  63, 31, 55, 23, 61, 29, 53, 21,
 };
 
-// Component `c` of the sample at (x, y) of that component's own grid, exactly as av_read_image_line2 reads it.
-static inline uint pf_read(device const uchar* src, constant PFParams& p, uint c, uint x, uint y) {
-    PFComponent k = p.comp[c];
-    device const uchar* row = src + p.plane_offset[k.plane] + y * p.linesize[k.plane];
-    uint mask = k.depth >= 32u ? 0xFFFFFFFFu : ((1u << k.depth) - 1u);
-    if ((p.flags & PF_BITSTREAM) != 0u) {
-        if (k.step > 8u) {
-            device const uchar* q = row + x * 4u;
-            uint v = (uint(q[0]) << 24) | (uint(q[1]) << 16) | (uint(q[2]) << 8) | uint(q[3]);
-            return (v >> k.offset) & mask;
-        }
-        uint skip = x * k.step + k.offset;
-        int shift = 8 - int(k.depth) - int(skip & 7u);
-        return (uint(row[skip >> 3]) >> uint(shift)) & mask;
-    }
-    device const uchar* q = row + x * k.step + k.offset;
-    bool big = (p.flags & PF_BIG_ENDIAN) != 0u;
-    uint bits = k.shift + k.depth;
-    uint v;
-    if (bits <= 8u) {
-        v = uint(q[big ? 1 : 0]);
-    } else if (bits <= 16u) {
-        v = big ? (uint(q[0]) << 8 | uint(q[1])) : (uint(q[1]) << 8 | uint(q[0]));
-    } else {
-        v = big ? (uint(q[0]) << 24 | uint(q[1]) << 16 | uint(q[2]) << 8 | uint(q[3]))
-                : (uint(q[3]) << 24 | uint(q[2]) << 16 | uint(q[1]) << 8 | uint(q[0]));
-    }
-    return (v >> k.shift) & mask;
-}
-
-// R, G, B in [0, 1] at (x, y): an RGB format's three components, or a palette entry (native-endian ARGB).
-static inline float3 pf_rgb(device const uchar* src, constant PFParams& p, uint x, uint y) {
-    if ((p.flags & PF_PALETTE) != 0u) {
-        uint index = pf_read(src, p, 0u, x, y);
-        device const uchar* e = src + p.plane_offset[1] + index * 4u;
-        return float3(float(e[2]), float(e[1]), float(e[0])) / 255.0f;
-    }
-    return float3(float(pf_read(src, p, 0u, x, y)) / float((1u << p.comp[0].depth) - 1u),
-                  float(pf_read(src, p, 1u, x, y)) / float((1u << p.comp[1].depth) - 1u),
-                  float(pf_read(src, p, 2u, x, y)) / float((1u << p.comp[2].depth) - 1u));
-}
-
-// A value at `precision` bits into its container word, ordered down to 10 bits when PF_DITHER: the threshold is
-// added to the 16-bit word before its low six bits are cleared, saturating at the top code.
-static inline uint pf_word(uint value, constant PFParams& p, uint word_x, uint y) {
-    uint w = value << p.container_shift;
-    if ((p.flags & PF_DITHER) != 0u) {
+// A word into its container: ordered down to 10 bits when dithering (the threshold added to the 16-bit word
+// before the six fraction bits are cleared, saturating at the top code), else MSB-aligned.
+static inline uint pf_container(uint w, uint word_x, uint y) {
+    if (PF_DITHER) {
         uint sum = w + uint(pf_bayer[(y & 7u) * 8u + (word_x & 7u)]);
-        w = sum > 0xFFFFu ? 0xFFC0u : (sum & 0xFFC0u);
+        return sum > 0xFFFFu ? 0xFFC0u : (sum & 0xFFC0u);
     }
-    return w;
+    return w << FC_CONTAINER_SHIFT;
 }
 
-// A component sample, `depth` bits, raised to `precision`.
-static inline uint pf_raise(uint v, uint depth, constant PFParams& p) {
-    return v << (p.precision - depth);
+// MARK: - Chroma resampling
+
+// Where sample i sits on one axis, in luma samples, for a plane subsampled by 2^log2 there. Horizontal:
+// co-sited with the left luma sample (LEFT / TOPLEFT / BOTTOMLEFT) or centred on the samples it covers.
+// Vertical: on the top row (TOPLEFT / TOP), centred (LEFT / CENTER) or on the bottom row (BOTTOMLEFT / BOTTOM).
+static inline float pf_site(float i, uint log2, bool vertical) {
+    float span = float(1u << log2) - 1.0f;
+    uint l = FC_CHROMA_LOCATION;
+    float offset = !vertical ? ((l == 1u || l == 3u || l == 5u) ? 0.0f : 0.5f * span)
+                             : ((l == 3u || l == 4u) ? 0.0f : ((l == 5u || l == 6u) ? span : 0.5f * span));
+    return i * float(1u << log2) + offset;
 }
 
-static inline uint pf_quantise(float v, constant PFParams& p) {
-    return uint(clamp(floor(v + 0.5f), 0.0f, float((1u << p.precision) - 1u)));
-}
-
-// Where chroma sample i sits on one axis, in luma samples, for a plane subsampled by 2^log2 there. Horizontal:
-// co-sited with the left luma sample (LEFT / TOPLEFT / BOTTOMLEFT) or centred between the samples it covers.
-// Vertical: on the top row (TOP / TOPLEFT), centred (LEFT / CENTER), or on the bottom row (BOTTOM / BOTTOMLEFT).
-static inline float pf_site(uint i, uint log2, bool vertical, uint location) {
-    float r = float(1u << log2);
-    float span = r - 1.0f;
-    float offset;
-    if (!vertical) {
-        offset = (location == 1u || location == 3u || location == 5u) ? 0.0f : span * 0.5f;
-    } else {
-        offset = (location == 3u || location == 4u) ? 0.0f : ((location == 5u || location == 6u) ? span : span * 0.5f);
-    }
-    return float(i) * r + offset;
-}
-
-// Catmull-Rom (cubic B = 0, C = 0.5) weights at fraction t over samples -1, 0, 1, 2. t = 0 is the sample itself;
-// t = 1/4 gives (-9, 111, 29, -3) / 128, the taps DoviFelComposer's 4:2:2 kernel uses.
+// Catmull-Rom (B = 0, C = 0.5) weights at fraction t over samples -1, 0, 1, 2.
 static inline float4 pf_cubic(float t) {
     float t2 = t * t, t3 = t2 * t;
-    return float4((-t3 + 2.0f * t2 - t) * 0.5f,
-                  (3.0f * t3 - 5.0f * t2 + 2.0f) * 0.5f,
-                  (-3.0f * t3 + 4.0f * t2 + t) * 0.5f,
-                  (t3 - t2) * 0.5f);
+    return 0.5f * float4(-t3 + 2.0f * t2 - t, 3.0f * t3 - 5.0f * t2 + 2.0f, -3.0f * t3 + 4.0f * t2 + t, t3 - t2);
 }
 
-// Source chroma (components 1 and 2) at output chroma sample (x, y), in source units, resampled where the output
-// keeps more chroma than the source.
-static inline float2 pf_chroma(device const uchar* src, constant PFParams& p, uint x, uint y) {
-    uint src_w = (p.width + (1u << p.src_log2_w) - 1u) >> p.src_log2_w;
-    uint src_h = (p.height + (1u << p.src_log2_h) - 1u) >> p.src_log2_h;
-    float ux = (pf_site(x, p.out_log2_w, false, p.chroma_location) - pf_site(0u, p.src_log2_w, false, p.chroma_location))
-             / float(1u << p.src_log2_w);
-    float uy = (pf_site(y, p.out_log2_h, true, p.chroma_location) - pf_site(0u, p.src_log2_h, true, p.chroma_location))
-             / float(1u << p.src_log2_h);
+// Source chroma (components 1, 2) in source code units at output chroma sample `o`.
+static inline float2 pf_resample(device const uchar* s, constant PFFrame& f, uint2 o) {
+    int src_w = int((f.width + (1u << FC_SRC_LOG2_W) - 1u) >> FC_SRC_LOG2_W);
+    int src_h = int((f.height + (1u << FC_SRC_LOG2_H) - 1u) >> FC_SRC_LOG2_H);
+    float ux = (pf_site(float(o.x), FC_OUT_LOG2_W, false) - pf_site(0.0f, FC_SRC_LOG2_W, false)) / float(1u << FC_SRC_LOG2_W);
+    float uy = (pf_site(float(o.y), FC_OUT_LOG2_H, true) - pf_site(0.0f, FC_SRC_LOG2_H, true)) / float(1u << FC_SRC_LOG2_H);
     float fx = floor(ux), fy = floor(uy);
-    float tx = ux - fx, ty = uy - fy;
     int x0 = int(fx), y0 = int(fy);
-    if (tx == 0.0f && ty == 0.0f) {
-        uint sx = uint(clamp(x0, 0, int(src_w) - 1)), sy = uint(clamp(y0, 0, int(src_h) - 1));
-        return float2(float(pf_read(src, p, 1u, sx, sy)), float(pf_read(src, p, 2u, sx, sy)));
-    }
-    float4 wx = tx == 0.0f ? float4(0, 1, 0, 0) : pf_cubic(tx);
-    float4 wy = ty == 0.0f ? float4(0, 1, 0, 0) : pf_cubic(ty);
-    float2 sum = float2(0.0f);
+    float4 wx = FC_SRC_LOG2_W == FC_OUT_LOG2_W ? float4(0, 1, 0, 0) : pf_cubic(ux - fx);
+    float4 wy = FC_SRC_LOG2_H == FC_OUT_LOG2_H ? float4(0, 1, 0, 0) : pf_cubic(uy - fy);
+    float2 sum = 0.0f;
     for (int j = 0; j < 4; ++j) {
-        if (wy[j] == 0.0f) { continue; }
-        uint sy = uint(clamp(y0 - 1 + j, 0, int(src_h) - 1));
-        float2 rowsum = float2(0.0f);
+        if (FC_SRC_LOG2_H == FC_OUT_LOG2_H && j != 1) { continue; }
+        uint sy = uint(clamp(y0 - 1 + j, 0, src_h - 1));
+        float2 row = 0.0f;
         for (int i = 0; i < 4; ++i) {
-            if (wx[i] == 0.0f) { continue; }
-            uint sx = uint(clamp(x0 - 1 + i, 0, int(src_w) - 1));
-            rowsum += wx[i] * float2(float(pf_read(src, p, 1u, sx, sy)), float(pf_read(src, p, 2u, sx, sy)));
+            if (FC_SRC_LOG2_W == FC_OUT_LOG2_W && i != 1) { continue; }
+            uint sx = uint(clamp(x0 - 1 + i, 0, src_w - 1));
+            row += wx[i] * float2(float(pf_c1(s, f, sx, sy)), float(pf_c2(s, f, sx, sy)));
         }
-        sum += wy[j] * rowsum;
+        sum += wy[j] * row;
     }
     return sum;
 }
 
-kernel void pf_luma(device const uchar*              src     [[buffer(0)]],
-                    constant PFParams&                p       [[buffer(1)]],
-                    texture2d<uint, access::write>    out_y   [[texture(0)]],
-                    uint2                             gid     [[thread_position_in_grid]]) {
-    if (gid.x >= p.width || gid.y >= p.height) { return; }
-    uint value;
-    if ((p.flags & (PF_RGB | PF_PALETTE)) != 0u) {
-        float3 rgb = pf_rgb(src, p, gid.x, gid.y);
-        value = pf_quantise(dot(p.rgb_y.xyz, rgb) + p.rgb_y.w, p);
-    } else {
-        value = pf_raise(pf_read(src, p, 0u, gid.x, gid.y), p.comp[0].depth, p);
-    }
-    out_y.write(uint4(pf_word(value, p, gid.x, gid.y), 0, 0, 0), gid);
+// A resampled chroma value (source units, real) as an output word: (31) / (37) with the real value.
+static inline uint pf_resampled_word(float c, uint d) {
+    float top = float((1u << d) - 1u);
+    c = clamp(c, 0.0f, top);
+    float scale = float(1u << FC_FRACTION_BITS);
+    float x = FC_FULL_RANGE
+        ? ((c - float(1u << (d - 1u))) * float((1u << FC_TARGET_BITS) - 1u) / top + float(1u << (FC_TARGET_BITS - 1u))) * scale
+        : c * float(1u << (FC_TARGET_BITS - d)) * scale;
+    return pf_round_word(x);
 }
 
-kernel void pf_chroma_kernel(device const uchar*           src     [[buffer(0)]],
-                             constant PFParams&             p       [[buffer(1)]],
-                             texture2d<uint, access::write> out_uv  [[texture(0)]],
-                             uint2                          gid     [[thread_position_in_grid]]) {
-    if (gid.x >= p.out_chroma_width || gid.y >= p.out_chroma_height) { return; }
-    uint cb, cr;
-    if ((p.flags & PF_GRAY) != 0u) {
-        cb = cr = 1u << (p.precision - 1u);
-    } else if ((p.flags & (PF_RGB | PF_PALETTE)) != 0u) {
-        // RGB goes out 4:4:4, so the chroma grid is the pixel grid.
-        float3 rgb = pf_rgb(src, p, gid.x, gid.y);
-        cb = pf_quantise(dot(p.rgb_cb.xyz, rgb) + p.rgb_cb.w, p);
-        cr = pf_quantise(dot(p.rgb_cr.xyz, rgb) + p.rgb_cr.w, p);
-    } else if (p.src_log2_w == p.out_log2_w && p.src_log2_h == p.out_log2_h) {
-        cb = pf_raise(pf_read(src, p, 1u, gid.x, gid.y), p.comp[1].depth, p);
-        cr = pf_raise(pf_read(src, p, 2u, gid.x, gid.y), p.comp[2].depth, p);
-    } else {
-        // Resampled in source units, then raised: the extra bits of a wider container keep the filter's fraction.
-        float2 c = pf_chroma(src, p, gid.x, gid.y);
-        float2 top = float2(float((1u << p.comp[1].depth) - 1u), float((1u << p.comp[2].depth) - 1u));
-        c = clamp(c, float2(0.0f), top);
-        cb = pf_quantise(c.x * float(1u << (p.precision - p.comp[1].depth)), p);
-        cr = pf_quantise(c.y * float(1u << (p.precision - p.comp[2].depth)), p);
+// MARK: - RGB
+
+static inline int3 pf_rgb_codes(device const uchar* s, constant PFFrame& f, uint x, uint y) {
+    if (FC_PALETTE) {
+        // AV_PIX_FMT_PAL8: an index into 256 native-endian ARGB words in plane 1.
+        uint e = *(device const uint*)(s + f.plane_offset[1] + pf_c0(s, f, x, y) * 4u);
+        return int3(int((e >> 16) & 0xFFu), int((e >> 8) & 0xFFu), int(e & 0xFFu));
     }
-    out_uv.write(uint4(pf_word(cb, p, 2u * gid.x, gid.y), pf_word(cr, p, 2u * gid.x + 1u, gid.y), 0, 0), gid);
+    return int3(int(pf_c0(s, f, x, y)), int(pf_c1(s, f, x, y)), int(pf_c2(s, f, x, y)));
+}
+
+// MARK: - Kernel
+
+kernel void pf_finish(device const uchar*            src     [[buffer(0)]],
+                      constant PFFrame&               f       [[buffer(1)]],
+                      texture2d<uint, access::write>  out_y   [[texture(0)]],
+                      texture2d<uint, access::write>  out_c   [[texture(1)]],
+                      uint2                           gid     [[thread_position_in_grid]]) {
+    if (gid.x >= f.chroma_width || gid.y >= f.chroma_height) { return; }
+    uint cb, cr;
+    if (FC_MODE == 3u) {
+        // RGB goes out 4:4:4: one pixel, all three outputs from one read.
+        int3 rgb = pf_rgb_codes(src, f, gid.x, gid.y);
+        out_y.write(uint4(pf_container(pf_rgb_word(f, 0u, rgb), gid.x, gid.y)), gid);
+        cb = pf_rgb_word(f, 1u, rgb);
+        cr = pf_rgb_word(f, 2u, rgb);
+    } else {
+        uint2 base = gid * uint2(PF_BLOCK_W, PF_BLOCK_H);
+        for (uint j = 0u; j < PF_BLOCK_H; ++j) {
+            for (uint i = 0u; i < PF_BLOCK_W; ++i) {
+                uint2 p = base + uint2(i, j);
+                if (p.x < f.width && p.y < f.height) {
+                    out_y.write(uint4(pf_container(pf_luma_word(pf_c0(src, f, p.x, p.y), FC_C0_DEPTH), p.x, p.y)), p);
+                }
+            }
+        }
+        if (FC_MODE == 2u) {
+            cb = cr = 1u << (FC_TARGET_BITS - 1u + FC_FRACTION_BITS);
+        } else if (FC_MODE == 1u) {
+            float2 c = pf_resample(src, f, gid);
+            cb = pf_resampled_word(c.x, FC_C1_DEPTH);
+            cr = pf_resampled_word(c.y, FC_C2_DEPTH);
+        } else {
+            cb = pf_chroma_word(pf_c1(src, f, gid.x, gid.y), FC_C1_DEPTH);
+            cr = pf_chroma_word(pf_c2(src, f, gid.x, gid.y), FC_C2_DEPTH);
+        }
+    }
+    out_c.write(uint4(pf_container(cb, 2u * gid.x, gid.y), pf_container(cr, 2u * gid.x + 1u, gid.y), 0u, 0u), gid);
 }
 """
 }

@@ -195,5 +195,27 @@ siting) and the result is not subsampled again.
 
 ## 5. Precision
 
-The kernels evaluate in float32, the reference in float64. Every output code must agree exactly, except where
-the reference value lies within 1e-3 of a rounding tie, where they may differ by one code.
+- **Integer paths** (pack, grey, full-range scaling, the dither) are exact: video range is a shift, and full
+  range is evaluated in 64-bit integers. Its quotients have odd denominators, so they never tie, but float32
+  cannot place them against the tie at 16-bit words.
+- **RGB** is evaluated in 64-bit fixed point with 30 fraction bits (the affine rows are computed in double on the
+  host). The error is under 2^-14 of a code.
+- **Chroma resampling** is float32. At quarter and half phases the Catmull-Rom weights are n / 128, so the
+  sums are exact.
+
+`PlanarFrameFinisherTests` checks every output code against a float64 reference of this page, reading the
+source through FFmpeg's `av_read_image_line2`. Every code must match, except where the reference lies within
+1e-4 of a rounding tie.
+
+## 6. Chroma siting
+
+The resampler places samples by FFmpeg's `chroma_location`, which carries each codec's signal:
+
+- H.264 / HEVC: `chroma_sample_loc_type` k is location k + 1; type 0 (LEFT) when the VUI carries none, as the
+  specs infer.
+- AV1: `CSP_VERTICAL` is LEFT and `CSP_COLOCATED` TOPLEFT (libdav1d).
+- UNSPECIFIED resolves to LEFT, or CENTER for a JPEG (yuvj) format.
+
+Horizontally, LEFT / TOPLEFT / BOTTOMLEFT are co-sited with the left luma sample and the others are centred.
+Vertically, TOPLEFT / TOP sit on the top row, LEFT / CENTER between the rows, and BOTTOMLEFT / BOTTOM on the
+bottom row. An interlaced picture is never resampled vertically: its chroma rows alternate between the fields.
