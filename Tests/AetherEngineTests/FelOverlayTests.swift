@@ -3,6 +3,8 @@
 import AVFoundation
 import Foundation
 import Testing
+import AetherLibavcodec
+import AetherLibavutil
 @testable import AetherEngine
 
 @Suite("FEL overlay")
@@ -17,9 +19,11 @@ struct FelOverlayTests {
 #if DualLayerDolbyVision
 extension FelOverlayTests {
 
-    private func makeRenderer() throws -> FelOverlayRenderer {
-        try #require(FelOverlayRenderer(item: AVPlayerItem(url: URL(fileURLWithPath: "/dev/null")),
-                                        sourceURL: URL(fileURLWithPath: "/dev/null")))
+    /// A renderer over an idle tap, both closed by the caller.
+    private func makeRenderer() throws -> (FelOverlayRenderer, FelEnhancementTap) {
+        let tap = FelEnhancementTap()
+        let renderer = try #require(FelOverlayRenderer(item: AVPlayerItem(url: URL(fileURLWithPath: "/dev/null")), tap: tap))
+        return (renderer, tap)
     }
 
     /// AVPlayerLayer builds its private sublayers at init: an intermediate layer holding the video
@@ -28,8 +32,8 @@ extension FelOverlayTests {
     func installBelowSubtitles() throws {
         let playerLayer = AVPlayerLayer()
         playerLayer.frame = CGRect(x: 0, y: 0, width: 640, height: 360)
-        let renderer = try makeRenderer()
-        defer { renderer.stop() }
+        let (renderer, tap) = try makeRenderer()
+        defer { renderer.stop(); tap.close() }
         #expect(renderer.install(in: playerLayer))
         let host = try #require(renderer.layer.superlayer)
         let siblings = try #require(host.sublayers)
@@ -49,8 +53,8 @@ extension FelOverlayTests {
         let playerLayer = AVPlayerLayer()
         playerLayer.frame = CGRect(x: 0, y: 0, width: 640, height: 360)
         playerLayer.sublayers?.forEach { $0.isHidden = true }
-        let renderer = try makeRenderer()
-        defer { renderer.stop() }
+        let (renderer, tap) = try makeRenderer()
+        defer { renderer.stop(); tap.close() }
         #expect(renderer.install(in: playerLayer) == false)
         #expect(renderer.layer.superlayer === playerLayer)
         #expect(renderer.layer.frame == playerLayer.bounds)
@@ -70,51 +74,67 @@ struct FelOverlayRealFileTests {
         return condition()
     }
 
-    @Test("the enhancement source reads a bounded window ahead of the clock",
-          .enabled(if: DoviFelRealFileTests.available("fel-clip-a.mkv"), DoviFelRealFileTests.needsClips))
-    func readsBoundedWindow() throws {
-        let source = FelEnhancementSource(url: DoviFelRealFileTests.url("fel-clip-a.mkv"))
-        defer { source.close() }
-        source.start(at: 0)
-        // The first frames arrive with their enhancement picture decoded.
-        #expect(Self.waitUntil(10) { source.heldFrames.enhancement >= 10 })
-        // Held: what is behind the clock by at most `keepBehindSeconds`, ahead by about `readAheadSeconds`.
-        Thread.sleep(forTimeInterval: 0.5)
-        let ceiling = Int((FelEnhancementSource.readAheadSeconds + FelEnhancementSource.keepBehindSeconds + 0.5) * 60)
-        #expect(source.heldFrames.side <= ceiling)
-        // Moving the clock trims behind it and reads further.
-        for step in 1...8 {
-            source.advance(to: Double(step) * 0.25)
-            Thread.sleep(forTimeInterval: 0.1)
+    /// Feeds `seconds` of the clip through the tap the way the segment producer does (output timestamps
+    /// equal source timestamps on these clips), returning the presentation times fed and whether every
+    /// rewrite matched `convertPacketToProfile81` byte for byte.
+    private static func feed(_ tap: FelEnhancementTap, clip: String, seconds: Double) throws -> (pts: [Double], rewritesMatch: Bool) {
+        let demuxer = Demuxer()
+        try demuxer.open(url: DoviFelRealFileTests.url(clip))
+        defer { demuxer.close() }
+        let index = demuxer.videoStreamIndex
+        let stream = try #require(demuxer.stream(at: index))
+        let tb = stream.pointee.time_base
+        var fed: [Double] = []
+        var match = true
+        while let packet = try demuxer.readPacket() {
+            var owned: UnsafeMutablePointer<AVPacket>? = packet
+            defer { trackedPacketFree(&owned) }
+            guard packet.pointee.stream_index == index else { continue }
+            let t = Double(packet.pointee.pts) * av_q2d(tb)
+            if t > seconds { break }
+            let reference = try #require(av_packet_clone(packet))
+            var referenceOwned: UnsafeMutablePointer<AVPacket>? = reference
+            defer { trackedPacketFree(&referenceOwned) }
+            _ = DoviRpuConverter.convertPacketToProfile81(reference)
+            _ = tap.rewrite(packet, framing: .lengthPrefixed(size: 4), timeBase: tb, chromaLocation: 0)
+            if packet.pointee.size != reference.pointee.size
+                || memcmp(packet.pointee.data, reference.pointee.data, Int(packet.pointee.size)) != 0 { match = false }
+            fed.append(t)
         }
-        #expect(Self.waitUntil(5) { source.frame(at: 2.0) != nil || source.frame(at: 2.002) != nil || source.heldFrames.side > 0 })
-        #expect(source.heldFrames.side <= ceiling)
+        return (fed, match)
     }
 
-    @Test("a far reposition starts over at the target",
+    @Test("the tap rewrites the base layer as the plain conversion does and decodes near the clock",
           .enabled(if: DoviFelRealFileTests.available("fel-clip-a.mkv"), DoviFelRealFileTests.needsClips))
-    func repositionsFar() throws {
-        let url = DoviFelRealFileTests.url("fel-clip-a.mkv")
-        let demuxer = Demuxer()
-        try demuxer.open(url: url)
-        let duration = demuxer.duration
-        demuxer.close()
-        try #require(duration > 8)
-        let target = (duration / 2).rounded(.down)
+    func decodesNearTheClock() throws {
+        let tap = FelEnhancementTap()
+        defer { tap.close() }
+        let (fed, rewritesMatch) = try Self.feed(tap, clip: "fel-clip-a.mkv", seconds: 12)
+        // What AVPlayer is served is the same as without a tap (FEL RPUs in the composed form either way).
+        #expect(rewritesMatch)
+        let first = try #require(fed.min())
+        tap.advance(to: first + 1)
+        let near = fed.filter { $0 >= first + 1 && $0 < first + 1.5 }
+        #expect(!near.isEmpty)
+        #expect(Self.waitUntil(5) { near.allSatisfy { tap.frame(at: $0)?.enhancement != nil } })
+        // Nothing further than the decode window ahead is decoded.
+        #expect(tap.held.decoded <= Int((FelEnhancementTap.decodeAheadSeconds + 1) * 60))
+    }
 
-        let source = FelEnhancementSource(url: url)
-        defer { source.close() }
-        source.start(at: 0)
-        #expect(Self.waitUntil(10) { source.heldFrames.side > 0 })
-        source.reposition(to: target)
-        // Some frame within a second of the target arrives with its parameters and enhancement picture.
-        let found = Self.waitUntil(10) {
-            stride(from: target, to: target + 1, by: 0.001).contains { t in
-                guard let f = source.frame(at: t) else { return false }
-                return f.enhancement != nil
-            }
-        }
-        #expect(found)
+    @Test("a far clock jump decodes from the keyframe before the target",
+          .enabled(if: DoviFelRealFileTests.available("fel-clip-a.mkv"), DoviFelRealFileTests.needsClips))
+    func jumpRestartsAtKeyframe() throws {
+        let tap = FelEnhancementTap()
+        defer { tap.close() }
+        let (fed, _) = try Self.feed(tap, clip: "fel-clip-a.mkv", seconds: 12)
+        let first = try #require(fed.min())
+        tap.advance(to: first + 0.5)
+        #expect(Self.waitUntil(5) { tap.held.decoded > 0 })
+        let target = try #require(fed.filter { $0 >= first + 9 }.min())
+        tap.advance(to: target)
+        #expect(Self.waitUntil(5) { tap.frame(at: target)?.enhancement != nil })
+        // Parameters exist for every fed frame whether or not its picture is decoded.
+        #expect(fed.allSatisfy { tap.frame(at: $0) != nil })
     }
 
     @Test("a FEL loaded with felOverlay stays native and composes over AVPlayer",
@@ -131,12 +151,15 @@ struct FelOverlayRealFileTests {
         engine.play()
         let renderer = try #require(engine.felOverlay)
         let deadline = Date().addingTimeInterval(15)
-        while renderer.counters.composed < 24, Date() < deadline {
+        while renderer.counters.composed < 48, Date() < deadline {
             try await Task.sleep(for: .milliseconds(100))
         }
         let counters = renderer.counters
-        #expect(counters.composed >= 24)
+        #expect(counters.composed >= 48)
         #expect(counters.composeFailed == 0)
+        #expect(counters.notReady == 0)
+        // Past the first second the enhancement layer is decoded in time: the residual is on.
+        #expect(counters.residualOff < counters.composed / 4)
     }
 }
 #endif

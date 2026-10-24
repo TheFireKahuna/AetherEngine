@@ -559,6 +559,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `playlistShiftSeconds` (updated dynamically per gate open).
     public private(set) var firstKeyframeSeconds: Double = 0
 
+    #if DualLayerDolbyVision
+    /// `LoadOptions.felOverlay`: every producer of the session hands its enhancement layer to this tap, which
+    /// the FEL overlay reads. Set by the engine before the session starts.
+    var felTap: FelEnhancementTap?
+    #endif
+
     /// AE#270: source PTS the container's timeline starts at, clamped at 0. The published playhead folds
     /// it out so it stays on the same 0-based axis as `duration`.
     public private(set) var sourceStartSeconds: Double = 0
@@ -3182,6 +3188,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     public func stop(reason: SessionCacheCleanupReason) {
         preparedServe = nil
+        #if DualLayerDolbyVision
+        felTap?.close()
+        #endif
         cancelResidentRangesPublish()
         // Sodalite#32: drop the tap routes first so a pump still draining its last packets no-ops
         // instead of decoding into stores being torn down.
@@ -3524,6 +3533,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // below. The side readers read one gate for the whole session, so a restart must not leave
         // a gap where nobody claims the link.
         prod.sideReaderLinkGate = sideReaderLinkGate
+        #if DualLayerDolbyVision
+        prod.felTap = felTap
+        #endif
         prod.playedMediaLedger = playedMediaLedger
         prod.onFirstHDR10PlusDetected = { [weak self] in
             self?.notifyHDR10PlusOnce()

@@ -519,6 +519,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var loggedEnhancementLayerType = false
     /// Latched false at SSAI program switch (ad creatives are H.264; mirrors muxer's isReinit ? false : videoConfig.convertP7ToProfile81).
     private var convertP7Active: Bool = false
+    #if DualLayerDolbyVision
+    /// `LoadOptions.felOverlay`: the P7 -> 8.1 rewrite keeps the enhancement layer and parameters for the
+    /// overlay instead of dropping them. Set before the pump starts, on every producer of the session.
+    var felTap: FelEnhancementTap?
+    #endif
     private var loggedFirstDtsBump = false
     private var loggedFirstDtsDrop = false
     private var loggedFirstAudioDtsBump = false
@@ -4404,8 +4409,18 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                 )
                             }
                         }
-                        if !DoviRpuConverter.convertPacketToProfile81(
-                            packet, framing: a53NALFraming) {
+                        let converted: Bool
+                        #if DualLayerDolbyVision
+                        if let felTap {
+                            converted = felTap.rewrite(packet, framing: a53NALFraming, timeBase: videoConfig.timeBase,
+                                                       chromaLocation: UInt32(max(0, videoConfig.codecpar.pointee.chroma_location.rawValue)))
+                        } else {
+                            converted = DoviRpuConverter.convertPacketToProfile81(packet, framing: a53NALFraming)
+                        }
+                        #else
+                        converted = DoviRpuConverter.convertPacketToProfile81(packet, framing: a53NALFraming)
+                        #endif
+                        if !converted {
                             if !loggedP7ConversionFailure {
                                 loggedP7ConversionFailure = true
                                 EngineLog.emit(

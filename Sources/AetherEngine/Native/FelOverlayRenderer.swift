@@ -9,16 +9,15 @@ import QuartzCore
 ///
 /// AVPlayer keeps everything it is good at (loading, seeking, audio, AVKit's transport, menus and native
 /// subtitles) and decodes the base layer as usual; `AVPlayerItemVideoOutput` hands each decoded frame back,
-/// bit-identical to our own VideoToolbox decode and before any reshaping. Each one is paired by timestamp
-/// with its enhancement picture and parameters from a ``FelEnhancementSource``, composed on the dual-layer
-/// composer, given its composed-form RPU, and enqueued on ``layer``: an `AVSampleBufferDisplayLayer` whose
-/// timebase follows the item's 1:1, so it shows each frame when AVPlayer would have shown its own.
+/// bit-identical to a VideoToolbox decode of the base layer and before any reshaping. Each one is paired by
+/// item time with its enhancement picture and parameters from the session's ``FelEnhancementTap``, composed
+/// on the dual-layer composer, given its composed-form RPU, and enqueued on ``layer``: an
+/// `AVSampleBufferDisplayLayer` whose timebase follows the item's 1:1, so it shows each frame when AVPlayer
+/// would have shown its own.
 ///
-/// The layer is opaque and covers AVPlayer's picture, so AVPlayer dropping or holding a frame never shows.
-/// It belongs inside the `AVPlayerLayer`, between the video and the subtitle layers, so native subtitles
-/// stay on top (``install(in:)``). A frame whose enhancement picture has not decoded yet is composed with
-/// its residual off; one with no parameters at all (just after a seek, before the reader reaches it) is
-/// not drawn, and AVPlayer's own picture shows through for that moment.
+/// The layer covers AVPlayer's picture, so AVPlayer dropping or holding a frame never shows. It belongs
+/// inside the `AVPlayerLayer`, between the video and the subtitle layers, so native subtitles stay on top
+/// (``install(in:)``). A frame whose enhancement picture has not decoded is composed with its residual off.
 public final class FelOverlayRenderer: @unchecked Sendable {
 
     public struct Counters: Sendable {
@@ -27,7 +26,6 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         public var residualOff = 0
         public var notReady = 0
         public var composeFailed = 0
-        public var repositions = 0
     }
 
     public let layer = AVSampleBufferDisplayLayer()
@@ -36,10 +34,8 @@ public final class FelOverlayRenderer: @unchecked Sendable {
 
     private let output: AVPlayerItemVideoOutput
     private weak var item: AVPlayerItem?
-    private let source: FelEnhancementSource
+    private let tap: FelEnhancementTap
     private let composer: DoviFelComposer
-    /// Source time minus item time.
-    private let sourceOffset: Double
     private let queue = DispatchQueue(label: "aether.fel-overlay", qos: .userInteractive)
     private var timer: DispatchSourceTimer?
     private var jumpObserver: NSObjectProtocol?
@@ -51,6 +47,8 @@ public final class FelOverlayRenderer: @unchecked Sendable {
     private var stopped = false
     /// Render-queue state.
     private var lastPulled = CMTime.invalid
+    /// Bumped on every clock jump: a composition finishing for an older generation is for a left position.
+    private var generation = 0
     private var frameIndex: UInt32 = 0
     private var blankEnhancement: CVPixelBuffer?
     private var lastLog = CACurrentMediaTime()
@@ -64,19 +62,17 @@ public final class FelOverlayRenderer: @unchecked Sendable {
     public var counters: Counters { countersLock.withLock { _counters } }
 
     /// Nil when the composer cannot be built (no Metal device).
-    public init?(item: AVPlayerItem, sourceURL: URL, headers: [String: String] = [:], sourceOffset: Double = 0) {
+    init?(item: AVPlayerItem, tap: FelEnhancementTap) {
         guard let composer = DoviFelComposer() else { return nil }
         self.composer = composer
         self.item = item
-        self.sourceOffset = sourceOffset
-        self.source = FelEnhancementSource(url: sourceURL, headers: headers)
+        self.tap = tap
         output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
             kCVPixelBufferMetalCompatibilityKey as String: true,
             kCVPixelBufferIOSurfacePropertiesKey as String: [String: any Sendable](),
         ])
         layer.videoGravity = .resizeAspect
-        layer.backgroundColor = CGColor(gray: 0, alpha: 0)
     }
 
     deinit { stop() }
@@ -110,13 +106,13 @@ public final class FelOverlayRenderer: @unchecked Sendable {
             CMTimebaseSetRateAndAnchorTime(timebase, rate: 1, anchorTime: now, immediateSourceTime: now)
             layer.controlTimebase = timebase
         }
-        source.start(at: CMTimebaseGetTime(itemTimebase).seconds + sourceOffset)
-        // A seek moves the item's clock before its first frame decodes: start reading there right away.
+        tap.advance(to: CMTimebaseGetTime(itemTimebase).seconds)
+        // A seek moves the item's clock before its first frame decodes: point the tap's decoder there at once,
+        // and drop what the layer queued for the old position.
         jumpObserver = NotificationCenter.default.addObserver(forName: CMTimebase.timeJumped, object: itemTimebase, queue: nil) { [weak self] _ in
             guard let self else { return }
-            let t = CMTimebaseGetTime(itemTimebase).seconds + self.sourceOffset
-            self.source.reposition(to: t)
-            self.countersLock.withLock { self._counters.repositions += 1 }
+            self.tap.advance(to: CMTimebaseGetTime(itemTimebase).seconds)
+            self.queue.async { self.restartPresentation() }
         }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), repeating: .milliseconds(4), leeway: .milliseconds(1))
@@ -139,7 +135,6 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         timer = nil
         if let jumpObserver { NotificationCenter.default.removeObserver(jumpObserver) }
         jumpObserver = nil
-        source.close()
         if let item, item.outputs.contains(output) { item.remove(output) }
     }
 
@@ -190,18 +185,13 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         var shown = CMTime.invalid
         guard let base = output.copyPixelBuffer(forItemTime: ahead, itemTimeForDisplay: &shown), shown.isValid else { return }
         countersLock.withLock { _counters.pulled += 1 }
-
-        if lastPulled.isValid, shown < lastPulled || (shown - lastPulled).seconds > 1 {
-            // Backward or far: whatever the layer holds belongs to the old position.
-            layer.sampleBufferRenderer.flush()
-            source.reposition(to: shown.seconds + sourceOffset)
-        }
+        if lastPulled.isValid, shown < lastPulled { restartPresentation() }
         lastPulled = shown
-        let seconds = shown.seconds + sourceOffset
-        source.advance(to: seconds)
+        let generation = self.generation
+        tap.advance(to: shown.seconds)
         logCountersIfDue()
 
-        guard let frame = source.frame(at: seconds) else {
+        guard let frame = tap.frame(at: shown.seconds) else {
             countersLock.withLock { _counters.notReady += 1 }
             return
         }
@@ -225,13 +215,21 @@ public final class FelOverlayRenderer: @unchecked Sendable {
                 return
             }
             DoviDisplayMetadata.attach(rpuNAL: rpu, to: composed)
-            self.queue.async { self.enqueue(composed, at: shown) }
+            self.queue.async {
+                guard generation == self.generation else { return }
+                self.enqueue(composed, at: shown)
+            }
         }
     }
 
+    /// Render queue: what the layer holds belongs to the position the clock just left.
+    private func restartPresentation() {
+        layer.sampleBufferRenderer.flush()
+        lastPulled = .invalid
+        generation += 1
+    }
+
     private func enqueue(_ buffer: CVPixelBuffer, at time: CMTime) {
-        // A frame composed for the old position after a backward jump would play as a stale flash.
-        if lastPulled.isValid, time < lastPulled - CMTime(seconds: 1, preferredTimescale: 600) { return }
         var format: CMVideoFormatDescription?
         CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: buffer, formatDescriptionOut: &format)
         guard let format else { return }
@@ -262,9 +260,10 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         guard now - lastLog >= 10 else { return }
         lastLog = now
         let c = counters
-        let held = source.heldFrames
-        EngineLog.emit("[FelOverlayRenderer] composed \(c.composed), residual off \(c.residualOff), not ready \(c.notReady), compose failed \(c.composeFailed), "
-                       + "repositions \(c.repositions), held \(held.side)/\(held.enhancement)", category: .swPlayback)
+        let held = tap.held
+        EngineLog.emit("[FelOverlayRenderer] composed \(c.composed), residual off \(c.residualOff), not ready \(c.notReady), "
+                       + "compose failed \(c.composeFailed), held \(held.accessUnits) units / \(held.decoded) decoded",
+                       category: .swPlayback)
     }
 }
 #endif
