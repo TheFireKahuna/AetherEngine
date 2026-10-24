@@ -146,11 +146,6 @@ static inline uint pf_rgb_word(constant PFFrame& f, uint row, int3 rgb) {
     return acc <= 0l ? 0u : min(uint(min(acc >> 30, long(PF_WORD_MAX))), PF_WORD_MAX);
 }
 
-// A real-valued code (with F fraction bits) rounded: Round( x ) = Floor( x + 0.5 ) for x >= 0 (8), clipped.
-static inline uint pf_round_word(float x) {
-    return uint(clamp(floor(x + 0.5f), 0.0f, float(PF_WORD_MAX)));
-}
-
 // Integer Bayer 8x8 thresholds (0...63), by row then word.
 constant ushort pf_bayer[64] = {
      0, 32,  8, 40,  2, 34, 10, 42,  48, 16, 56, 24, 50, 18, 58, 26,
@@ -171,57 +166,63 @@ static inline uint pf_container(uint w, uint word_x, uint y) {
 
 // MARK: - Chroma resampling
 
-// Where sample i sits on one axis, in luma samples, for a plane subsampled by 2^log2 there. Horizontal:
+// Where sample i sits on one axis, in half luma samples, for a plane subsampled by 2^log2 there. Horizontal:
 // co-sited with the left luma sample (LEFT / TOPLEFT / BOTTOMLEFT) or centred on the samples it covers.
 // Vertical: on the top row (TOPLEFT / TOP), centred (LEFT / CENTER) or on the bottom row (BOTTOMLEFT / BOTTOM).
-static inline float pf_site(float i, uint log2, bool vertical) {
-    float span = float(1u << log2) - 1.0f;
+static inline int pf_site2(int i, uint log2, bool vertical) {
+    int r = 1 << log2, span = r - 1;
     uint l = FC_CHROMA_LOCATION;
-    float offset = !vertical ? ((l == 1u || l == 3u || l == 5u) ? 0.0f : 0.5f * span)
-                             : ((l == 3u || l == 4u) ? 0.0f : ((l == 5u || l == 6u) ? span : 0.5f * span));
-    return i * float(1u << log2) + offset;
+    int offset2 = !vertical ? ((l == 1u || l == 3u || l == 5u) ? 0 : span)
+                            : ((l == 3u || l == 4u) ? 0 : ((l == 5u || l == 6u) ? 2 * span : span));
+    return 2 * i * r + offset2;
 }
 
-// Catmull-Rom (B = 0, C = 0.5) weights at fraction t over samples -1, 0, 1, 2.
-static inline float4 pf_cubic(float t) {
-    float t2 = t * t, t3 = t2 * t;
-    return 0.5f * float4(-t3 + 2.0f * t2 - t, 3.0f * t3 - 5.0f * t2 + 2.0f, -3.0f * t3 + 4.0f * t2 + t, t3 - t2);
+// Catmull-Rom (B = 0, C = 0.5) weights times 1024 at phase k / 8, over samples -1, 0, 1, 2. Every phase the
+// sitings produce is a multiple of 1/8 (sites are half samples apart, ratios are at most 4), so the weights are
+// exact integers: k = 2 gives (-72, 888, 232, -24), i.e. (-9, 111, 29, -3) / 128.
+static inline int4 pf_cubic8(int k) {
+    int k2 = k * k, k3 = k2 * k;
+    return int4(-k3 + 16 * k2 - 64 * k, 3 * k3 - 40 * k2 + 1024, -3 * k3 + 32 * k2 + 64 * k, k3 - 8 * k2);
 }
 
-// Source chroma (components 1, 2) in source code units at output chroma sample `o`.
-static inline float2 pf_resample(device const uchar* s, constant PFFrame& f, uint2 o) {
+// Source chroma (components 1, 2) at output chroma sample `o`, as exact numerators over 2^20 (2^10 per axis).
+static inline long2 pf_resample(device const uchar* s, constant PFFrame& f, uint2 o) {
     int src_w = int((f.width + (1u << FC_SRC_LOG2_W) - 1u) >> FC_SRC_LOG2_W);
     int src_h = int((f.height + (1u << FC_SRC_LOG2_H) - 1u) >> FC_SRC_LOG2_H);
-    float ux = (pf_site(float(o.x), FC_OUT_LOG2_W, false) - pf_site(0.0f, FC_SRC_LOG2_W, false)) / float(1u << FC_SRC_LOG2_W);
-    float uy = (pf_site(float(o.y), FC_OUT_LOG2_H, true) - pf_site(0.0f, FC_SRC_LOG2_H, true)) / float(1u << FC_SRC_LOG2_H);
-    float fx = floor(ux), fy = floor(uy);
-    int x0 = int(fx), y0 = int(fy);
-    float4 wx = FC_SRC_LOG2_W == FC_OUT_LOG2_W ? float4(0, 1, 0, 0) : pf_cubic(ux - fx);
-    float4 wy = FC_SRC_LOG2_H == FC_OUT_LOG2_H ? float4(0, 1, 0, 0) : pf_cubic(uy - fy);
-    float2 sum = 0.0f;
+    // Source coordinate in eighths: 8 * ( site_out - site_src(0) ) / 2^src_log2, sites in half samples.
+    // Both divisions are exact (4 / 2^src_log2 is whole); the floor of a negative coordinate is taken by removing
+    // its phase first, so nothing depends on how a signed shift rounds.
+    int ux8 = 4 * (pf_site2(int(o.x), FC_OUT_LOG2_W, false) - pf_site2(0, FC_SRC_LOG2_W, false)) / (1 << FC_SRC_LOG2_W);
+    int uy8 = 4 * (pf_site2(int(o.y), FC_OUT_LOG2_H, true) - pf_site2(0, FC_SRC_LOG2_H, true)) / (1 << FC_SRC_LOG2_H);
+    int x0 = (ux8 - (ux8 & 7)) / 8, y0 = (uy8 - (uy8 & 7)) / 8;
+    int4 wx = FC_SRC_LOG2_W == FC_OUT_LOG2_W ? int4(0, 1024, 0, 0) : pf_cubic8(ux8 & 7);
+    int4 wy = FC_SRC_LOG2_H == FC_OUT_LOG2_H ? int4(0, 1024, 0, 0) : pf_cubic8(uy8 & 7);
+    long2 sum = 0;
     for (int j = 0; j < 4; ++j) {
-        if (FC_SRC_LOG2_H == FC_OUT_LOG2_H && j != 1) { continue; }
+        if (wy[j] == 0) { continue; }
         uint sy = uint(clamp(y0 - 1 + j, 0, src_h - 1));
-        float2 row = 0.0f;
+        long2 row = 0;
         for (int i = 0; i < 4; ++i) {
-            if (FC_SRC_LOG2_W == FC_OUT_LOG2_W && i != 1) { continue; }
+            if (wx[i] == 0) { continue; }
             uint sx = uint(clamp(x0 - 1 + i, 0, src_w - 1));
-            row += wx[i] * float2(float(pf_c1(s, f, sx, sy)), float(pf_c2(s, f, sx, sy)));
+            row += long(wx[i]) * long2(long(pf_c1(s, f, sx, sy)), long(pf_c2(s, f, sx, sy)));
         }
-        sum += wy[j] * row;
+        sum += long(wy[j]) * row;
     }
     return sum;
 }
 
-// A resampled chroma value (source units, real) as an output word: (31) / (37) with the real value.
-static inline uint pf_resampled_word(float c, uint d) {
-    float top = float((1u << d) - 1u);
-    c = clamp(c, 0.0f, top);
-    float scale = float(1u << FC_FRACTION_BITS);
-    float x = FC_FULL_RANGE
-        ? ((c - float(1u << (d - 1u))) * float((1u << FC_TARGET_BITS) - 1u) / top + float(1u << (FC_TARGET_BITS - 1u))) * scale
-        : c * float(1u << (FC_TARGET_BITS - d)) * scale;
-    return pf_round_word(x);
+// A resampled chroma value (numerator over 2^20, clamped to the source's codes) as an output word, exactly:
+// video range Round( c * 2^(T - d) ) with the fraction bits, full range (37) with the real value.
+static inline uint pf_resampled_word(long c, uint d) {
+    c = clamp(c, 0l, long((1u << d) - 1u) << 20);
+    if (!FC_FULL_RANGE) {
+        return min(uint(((c << (FC_TARGET_BITS + FC_FRACTION_BITS - d)) + (1l << 19)) >> 20), PF_WORD_MAX);
+    }
+    long den = long((1u << d) - 1u) << 20;
+    long num = (c - (long(1u << (d - 1u)) << 20)) * long((1u << FC_TARGET_BITS) - 1u) * long(1u << (FC_FRACTION_BITS + 1u))
+             + den * (long(1u << (FC_TARGET_BITS + FC_FRACTION_BITS)) + 1l);
+    return num <= 0l ? 0u : min(uint(num / (2l * den)), PF_WORD_MAX);
 }
 
 // MARK: - RGB
@@ -263,7 +264,7 @@ kernel void pf_finish(device const uchar*            src     [[buffer(0)]],
         if (FC_MODE == 2u) {
             cb = cr = 1u << (FC_TARGET_BITS - 1u + FC_FRACTION_BITS);
         } else if (FC_MODE == 1u) {
-            float2 c = pf_resample(src, f, gid);
+            long2 c = pf_resample(src, f, gid);
             cb = pf_resampled_word(c.x, FC_C1_DEPTH);
             cr = pf_resampled_word(c.y, FC_C2_DEPTH);
         } else {

@@ -200,8 +200,9 @@ siting) and the result is not subsampled again.
   cannot place them against the tie at 16-bit words.
 - **RGB** is evaluated in 64-bit fixed point with 30 fraction bits (the affine rows are computed in double on the
   host). The error is under 2^-14 of a code.
-- **Chroma resampling** is float32. At quarter and half phases the Catmull-Rom weights are n / 128, so the
-  sums are exact.
+- **Chroma resampling** is exact. Every phase the sitings produce is a multiple of 1/8 (sites are half samples
+  apart and ratios at most 4), so the Catmull-Rom weights are integers over 1024 per axis, and the result is a
+  64-bit numerator over 2^20, rounded once.
 
 `PlanarFrameFinisherTests` checks every output code against a float64 reference of this page, reading the
 source through FFmpeg's `av_read_image_line2`. Every code must match, except where the reference lies within
