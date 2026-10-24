@@ -134,11 +134,13 @@ final class AudioBridge: @unchecked Sendable {
     static func applyResamplerQuality(_ swr: OpaquePointer, outputFormat: AVSampleFormat) {
         let options = UnsafeMutableRawPointer(swr)
         _ = av_opt_set_double(options, "rematrix_maxval", 1.0, 0)
-        _ = av_opt_set_int(options, "filter_size", 64, 0)
+        _ = av_opt_set_int(options, "filter_size", Int64(resamplerFilterSize), 0)
         if av_get_packed_sample_fmt(outputFormat) == AV_SAMPLE_FMT_S16 {
             _ = av_opt_set_int(options, "dither_method", Int64(SWR_DITHER_TRIANGULAR_HIGHPASS.rawValue), 0)
         }
     }
+
+    static let resamplerFilterSize = 64
 
     /// The sample rates an encoder in THIS build accepts, as libavcodec itself reports them. Empty means
     /// unconstrained (the codec advertises no list), which is the answer for PCM.
@@ -275,6 +277,10 @@ final class AudioBridge: @unchecked Sendable {
 
     /// Output stream time base (1 / sample_rate). Caller passes as StreamConfig.timeBase.
     private(set) var encoderTimeBase: AVRational = AVRational(num: 1, den: 1)
+    /// What the output at a position takes input from, decoder to encoder (`AudioStageSpan`); nil for a
+    /// decoder whose memory is not known. The resampler is declared from the source's rate, the one
+    /// it is built for; packing PCM into packets touches each frame on its own.
+    private(set) var span: AudioStageSpan?
 
     private let srcTimeBase: AVRational
     private let mode: Mode
@@ -515,6 +521,11 @@ final class AudioBridge: @unchecked Sendable {
         }
         encoderTimeBase = AVRational(num: 1, den: sampleRate)
         packetFrames = output == .eac3 ? enc.pointee.frame_size : Self.pcmPacketFrames
+        span = AudioStageSpan.decoder(srcCodecpar, outputRate: sampleRate).map {
+            .series([$0, .resampler(inputRate: sourceSampleRate, outputRate: sampleRate),
+                     output == .eac3 ? .eac3Encoder(frameSize: Int(enc.pointee.frame_size),
+                                                    initialPadding: Int(enc.pointee.initial_padding)) : .instant])
+        }
 
         // 4. Codecpar describing the encoder output for the muxer.
         guard let cp = avcodec_parameters_alloc() else {
