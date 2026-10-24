@@ -188,7 +188,8 @@ in tmp, LRU by 4 MB block, budgeted beside the segment caches), and every fetch
 path asks it first: the pump replays held spans as ranges of their own, side
 readers and the indexed subtitle reads are served from it, and a warm (#551) is
 simply the cache filled ahead of the load. A source's container index is parsed
-once and shared (`SourceIndexRegistry`).
+once and shared (`SourceIndexRegistry`). The design, what each layer guarantees, and what is left:
+[source-pipeline.md](source-pipeline.md).
 
 Finite AVIO requests release their ticket in the completion callback, before the
 synchronous caller resumes to process its result. A lock-guarded lease makes that
