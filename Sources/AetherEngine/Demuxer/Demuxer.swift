@@ -1545,7 +1545,8 @@ public final class Demuxer: @unchecked Sendable {
     /// call walks however many bytes lie between them, and on a sparse or forced track that is the
     /// rest of the file. Delivering one non-subtitle stream at `AVDISCARD_NONKEY` restores a
     /// control point without restoring the payload: video yields one packet per IRAP, which is the
-    /// natural granularity for a 60 s park window.
+    /// natural granularity for a 60 s park window. Matroska and mov thin it so; mpegts does not
+    /// (every frame arrives, which costs little: see `discardAllStreamsExcept`).
     ///
     /// Video is preferred because `AVDISCARD_NONKEY` genuinely thins it; audio (where every packet
     /// is a keyframe, so nothing is thinned) is the fallback, and its packets are small. Selection
@@ -1972,7 +1973,9 @@ public final class Demuxer: @unchecked Sendable {
     /// that cycle. Call after open, before readPacket. Safe to call multiple times.
     /// `pacing`, when >= 0 and not already in `keep`, is delivered at `AVDISCARD_NONKEY` instead of
     /// being dropped: keyframes only, enough to give a side reader a read-position control point
-    /// between sparse target packets (#230). -1 keeps the original all-or-nothing behavior.
+    /// between sparse target packets (#230). -1 keeps the original all-or-nothing behavior. mpegts
+    /// does not implement `AVDISCARD_NONKEY`, so on a transport stream the pacing stream arrives whole
+    /// (every frame, parsed); measured, that walk still runs at memcpy speed (~5 GB/s), so it is left so.
     func discardAllStreamsExcept(_ keep: Set<Int32>, pacing: Int32 = -1) {
         accessLock.lock()
         defer { accessLock.unlock() }
