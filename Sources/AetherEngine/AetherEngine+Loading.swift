@@ -2100,6 +2100,12 @@ extension AetherEngine {
                 self.decodedVideoFormat = format
             }
         }
+        // A program change moved a role to another codec than this host's decoders: rebuilt at the
+        // playhead, where the next host opens decoders for the stream that carries it there.
+        host.onProgramCodecChange = { [weak self, weak host] summary in
+            guard let self, let host, self.softwareHost === host else { return }
+            self.rebuildForProgramCodecChange(summary)
+        }
         // The clock's real session zero, for the chapter axis (`mediaChapters`).
         host.onClockSessionZero = { [weak self, weak host] zero in
             Task { @MainActor in
@@ -3016,5 +3022,26 @@ extension AetherEngine {
     func refreshNativeBufferedPosition() {
         guard nativeVideoSession != nil, let host = nativeHost else { return }
         refreshNativeBufferedPosition(playlistSeconds: host.renderedTime)
+    }
+}
+
+extension AetherEngine {
+    /// The software session rebuilt at the playhead for a program change to another codec
+    /// (`SoftwareSourceWatch`), through the session-preserving reload. Bounded per load
+    /// (`programCodecRebuildLimit`): a rebuild that lands without reaching the change would ask again.
+    func rebuildForProgramCodecChange(_ summary: String) {
+        guard programCodecRebuilds < Self.programCodecRebuildLimit else {
+            publishError(PlaybackErrorInfo(kind: .softwarePipelineFailed,
+                                           message: "Playback error: \(summary), and rebuilding did not reach it"))
+            return
+        }
+        programCodecRebuilds += 1
+        Task { @MainActor [weak self] in
+            do {
+                try await self?.reloadAtCurrentPosition()
+            } catch {
+                EngineLog.emit("[AetherEngine] program change rebuild failed: \(error)", category: .engine)
+            }
+        }
     }
 }

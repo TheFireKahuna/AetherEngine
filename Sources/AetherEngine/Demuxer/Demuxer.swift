@@ -362,19 +362,22 @@ public final class Demuxer: @unchecked Sendable {
 
     /// A transport stream's program changes, followed under the stream indices readers chose: a new
     /// PID that takes a role (`ProgramSuccession`) is read as that role's stream, and its first packet
-    /// says so (`programChange(on:)`). Built at the open (`probeStreams`); a new stream is judged on its
-    /// first packet (`routeProgramSuccessionLocked`). Guarded by `accessLock`.
+    /// says where it came from (`sourceStream(of:)`). Built at the open (`probeStreams`); a new stream is
+    /// judged on its first packet (`routeProgramSuccessionLocked`). Guarded by `accessLock`.
     private var succession: ProgramSuccession?
     /// Per logical stream, the stream its packets come from since the open or the last seek, and the
-    /// position its first one was read at; a packet from another one carries the change. A reader
-    /// configures from the streams chosen at open, so a seek starts it there again.
+    /// position its first one was read at: what tells the old PID's leftovers from the read.
     private var deliveredByLogical: [Int32: (stream: Int32, since: Int64)] = [:]
-    /// Every change handed over, in order; a packet's `opaque` is its position plus one.
-    private var programChanges: [ProgramSuccession.Change] = []
     /// Set by `discardAllStreamsExcept`: a stream a PMT change adds without a role is discarded too.
     private var discardsUnkeptStreams = false
     /// New streams already judged (`ProgramSuccession.adopt`), successor or not.
     private var judgedStreams: Set<Int32> = []
+    /// New streams judged to take no role, judged again when the programs change: the verdict can rest
+    /// on a stale list (after `find_stream_info`'s duration estimate the list can name the old and the
+    /// new streams together, and a seek has libavformat read the PMT again only at its next cell).
+    private var unadoptedStreams: Set<Int32> = []
+    /// Each program's PMT version and stream count when the unadopted streams were last judged.
+    private var programSignature: [Int32] = []
 
     /// Whether this source's video keyframes go into libavformat's index as they are read
     /// (`recordKeyframeLocked`), decided on the first packet after an open. Guarded by `accessLock`.
@@ -2099,14 +2102,14 @@ public final class Demuxer: @unchecked Sendable {
         }
     }
 
-    /// The program change `packet` carries: set on the first packet a role's new stream delivered
-    /// (`ProgramSuccession`), under the role's own stream index. Nil for every other packet.
-    func programChange(on packet: UnsafeMutablePointer<AVPacket>) -> ProgramSuccession.Change? {
-        guard let marker = packet.pointee.opaque else { return nil }
-        let position = Int(bitPattern: marker) - 1
-        accessLock.lock()
-        defer { accessLock.unlock() }
-        return programChanges.indices.contains(position) ? programChanges[position] : nil
+    /// The stream `packet` was read from: for a packet a program change's successor delivered under
+    /// its role's index (`ProgramSuccession`), the successor; for every other, its own. A reader that
+    /// has to know what it decodes compares this with the stream it was set up for, so the answer does
+    /// not depend on what the demuxer assumed about the reader. Carried in `AVPacket.opaque`, which
+    /// libavformat leaves to the caller and `av_packet_copy_props` copies.
+    static func sourceStream(of packet: UnsafePointer<AVPacket>) -> Int32 {
+        guard let marker = packet.pointee.opaque else { return packet.pointee.stream_index }
+        return Int32(Int(bitPattern: marker) - 1)
     }
 
     /// The composition the roles are read off: a transport stream's programs at the open. Nil for any
@@ -2136,8 +2139,34 @@ public final class Demuxer: @unchecked Sendable {
         return stream.pointee.codecpar.pointee.codec_type.rawValue
     }
 
-    /// Hands a successor's packet over under its role's stream index, and marks the first packet of
-    /// each change of stream with the change. False when the packet is not for the reader.
+    /// Judges a new stream a program names: a successor takes its role's discard, a stream without one is
+    /// discarded when the reader keeps only what it chose, and stays to be judged again. Caller holds
+    /// `accessLock`.
+    private func judgeLocked(_ physical: Int32, _ ctx: UnsafeMutablePointer<AVFormatContext>) {
+        guard var succession, let stream = ctx.pointee.streams[Int(physical)] else { return }
+        let adopted = succession.adopt(physical, programs: Self.programs(ctx), mediaType: { Self.mediaType(ctx, $0) })
+        self.succession = succession
+        if let adopted, let role = ctx.pointee.streams[Int(adopted)] {
+            unadoptedStreams.remove(physical)
+            stream.pointee.discard = role.pointee.discard
+            EngineLog.emit("[Demuxer] program change: stream \(physical) (PID 0x\(String(stream.pointee.id, radix: 16))) "
+                           + "takes the role of stream \(adopted) (PID 0x\(String(role.pointee.id, radix: 16)))",
+                           category: .demux)
+        } else {
+            unadoptedStreams.insert(physical)
+            if discardsUnkeptStreams { stream.pointee.discard = AVDISCARD_ALL }
+        }
+    }
+
+    private static func programSignature(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> [Int32] {
+        (0..<Int(ctx.pointee.nb_programs)).flatMap { i -> [Int32] in
+            guard let program = ctx.pointee.programs[i] else { return [] }
+            return [program.pointee.pmt_version, Int32(program.pointee.nb_stream_indexes)]
+        }
+    }
+
+    /// Hands a successor's packet over under its role's stream index, marked with where it came from.
+    /// False when the packet is not for the reader.
     ///
     /// A new stream is judged on its first packet once a program names it (libavformat can meet a new
     /// PID before the PMT that lists it, and guesses a stream of its own for it): a successor is
@@ -2149,43 +2178,39 @@ public final class Demuxer: @unchecked Sendable {
     /// Caller holds `accessLock`.
     private func routeProgramSuccessionLocked(_ packet: UnsafeMutablePointer<AVPacket>,
                                               _ ctx: UnsafeMutablePointer<AVFormatContext>) -> Bool {
-        guard var succession else { return true }
+        guard succession != nil else { return true }
         let physical = packet.pointee.stream_index
-        if succession.isNew(physical), !judgedStreams.contains(physical),
-           let stream = ctx.pointee.streams[Int(physical)] {
-            let programs = Self.programs(ctx)
-            guard programs.contains(where: { $0.streams.contains(physical) }) else { return true }
-            judgedStreams.insert(physical)
-            let adopted = succession.adopt(physical, programs: programs, mediaType: { Self.mediaType(ctx, $0) })
-            self.succession = succession
-            if let adopted, let role = ctx.pointee.streams[Int(adopted)] {
-                stream.pointee.discard = role.pointee.discard
-                EngineLog.emit("[Demuxer] program change: stream \(physical) (PID 0x\(String(stream.pointee.id, radix: 16))) "
-                               + "takes the role of stream \(adopted) (PID 0x\(String(role.pointee.id, radix: 16)))",
-                               category: .demux)
-            } else if discardsUnkeptStreams {
-                stream.pointee.discard = AVDISCARD_ALL
+        if !unadoptedStreams.isEmpty {
+            let signature = Self.programSignature(ctx)
+            if signature != programSignature {
+                programSignature = signature
+                for stream in unadoptedStreams.sorted() { judgeLocked(stream, ctx) }
             }
         }
+        if succession!.isNew(physical), !judgedStreams.contains(physical),
+           Self.programs(ctx).contains(where: { $0.streams.contains(physical) }) {
+            judgedStreams.insert(physical)
+            programSignature = Self.programSignature(ctx)
+            judgeLocked(physical, ctx)
+        }
+        guard let succession else { return true }
         // Discarded from here on, but packets libavformat queued before (`find_stream_info` buffers
         // what it read) still come out: a new stream's are not the reader's.
         if succession.isNew(physical), ctx.pointee.streams[Int(physical)]?.pointee.discard == AVDISCARD_ALL {
             return false
         }
         let logical = succession.logical(for: physical)
-        packet.pointee.stream_index = logical
+        if logical != physical {
+            packet.pointee.stream_index = logical
+            packet.pointee.opaque = UnsafeMutableRawPointer(bitPattern: Int(physical) + 1)
+        }
         let delivered = deliveredByLogical[logical]
         let previous = delivered?.stream ?? logical
         guard previous != physical else { return true }
         if let delivered, packet.pointee.pos >= 0, packet.pointee.pos < delivered.since { return false }
         deliveredByLogical[logical] = (physical, packet.pointee.pos)
-        let codec = { (index: Int32) in ctx.pointee.streams[Int(index)]?.pointee.codecpar.pointee.codec_id }
-        let change = ProgramSuccession.Change(logical: logical, from: previous, to: physical,
-                                              codecChanged: codec(previous) != codec(physical))
-        programChanges.append(change)
-        packet.pointee.opaque = UnsafeMutableRawPointer(bitPattern: programChanges.count)
-        EngineLog.emit("[Demuxer] program change reaches the reader: stream \(logical) now reads stream \(physical) "
-                       + "(was \(previous))\(change.codecChanged ? ", a different codec" : "")", category: .demux)
+        EngineLog.emit("[Demuxer] program change reaches the read: stream \(logical) now reads stream \(physical) "
+                       + "(was \(previous))", category: .demux)
         return true
     }
 
@@ -2294,8 +2319,8 @@ public final class Demuxer: @unchecked Sendable {
     /// that comes before the first read (the software host's resume, #699) settles the verdict at the
     /// head first: sampled at the landing, the stream would start on an open-GOP keyframe whose picture
     /// order is not 0, and the classifier refuses that, so the whole session played in decode order.
-    /// Program succession: a reader restarts on the streams it chose at open, so a landing past (or
-    /// before) a program change is announced on its first packet again. Caller holds `accessLock`.
+    /// Program succession: the leftovers are told by position, which a seek moves. Caller holds
+    /// `accessLock`.
     private func noteSeekLocked() {
         if !compositionRepairEvaluated { decideCompositionRepairLocked() }
         compositionRepair?.noteSeek()
@@ -3210,8 +3235,9 @@ public final class Demuxer: @unchecked Sendable {
         recordsKeyframes = nil
         succession = nil
         judgedStreams.removeAll()
+        unadoptedStreams.removeAll()
+        programSignature.removeAll()
         deliveredByLogical.removeAll()
-        programChanges.removeAll()
         discardsUnkeptStreams = false
         doviLayers = nil
         foldsBluRayDolbyVisionLayers = false

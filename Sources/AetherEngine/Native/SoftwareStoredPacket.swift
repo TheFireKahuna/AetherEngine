@@ -17,6 +17,9 @@ struct SoftwareStoredPacket: Sendable, Equatable {
     let timeBaseDenominator: Int32
     let bytes: Data
     let sideData: [SideData]
+    /// The stream it was read from when a program change handed it over under its role's index
+    /// (`Demuxer.sourceStream(of:)`); -1 when it is its own.
+    var sourceStream: Int32 = -1
 
     enum EnvelopeError: Error {
         case unknownVersion(UInt8)
@@ -29,10 +32,10 @@ struct SoftwareStoredPacket: Sendable, Equatable {
     // and that was the largest single cost of the software route's producer. The spool lives only
     // for its session, so the layout carries a version byte and no compatibility promise.
     //
-    //   u8 version | i64 pts, dts, duration, position | i32 streamIndex, flags, tbNum, tbDen
+    //   u8 version | i64 pts, dts, duration, position | i32 streamIndex, flags, tbNum, tbDen, sourceStream
     //   | u32 sideDataCount | u64 payloadCount | payload | per side data: u32 type, u64 count, bytes
-    static let version: UInt8 = 1
-    static let headerBytes = 1 + 4 * 8 + 4 * 4 + 4 + 8
+    static let version: UInt8 = 2
+    static let headerBytes = 1 + 4 * 8 + 5 * 4 + 4 + 8
     static let sideDataHeaderBytes = 4 + 8
 
     func encoded() throws -> Data {
@@ -42,7 +45,9 @@ struct SoftwareStoredPacket: Sendable, Equatable {
         var out = Data(capacity: total)
         out.append(Self.version)
         for value in [pts, dts, duration, position] { Self.append(value, to: &out) }
-        for value in [streamIndex, flags, timeBaseNumerator, timeBaseDenominator] { Self.append(value, to: &out) }
+        for value in [streamIndex, flags, timeBaseNumerator, timeBaseDenominator, sourceStream] {
+            Self.append(value, to: &out)
+        }
         Self.append(UInt32(sideData.count), to: &out)
         Self.append(UInt64(bytes.count), to: &out)
         out.append(bytes)
@@ -66,6 +71,7 @@ struct SoftwareStoredPacket: Sendable, Equatable {
         let flags: Int32 = try reader.read()
         let timeBaseNumerator: Int32 = try reader.read()
         let timeBaseDenominator: Int32 = try reader.read()
+        let sourceStream: Int32 = try reader.read()
         let sideDataCount: UInt32 = try reader.read()
         let payload = try reader.bytes(count: try reader.read() as UInt64)
         var sideData: [SideData] = []
@@ -79,7 +85,7 @@ struct SoftwareStoredPacket: Sendable, Equatable {
             pts: pts, dts: dts, duration: duration, position: position,
             streamIndex: streamIndex, flags: flags,
             timeBaseNumerator: timeBaseNumerator, timeBaseDenominator: timeBaseDenominator,
-            bytes: payload, sideData: sideData)
+            bytes: payload, sideData: sideData, sourceStream: sourceStream)
     }
 
     private static func append<T: FixedWidthInteger>(_ value: T, to out: inout Data) {

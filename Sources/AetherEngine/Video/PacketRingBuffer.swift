@@ -21,6 +21,9 @@ final class PacketRingBuffer: @unchecked Sendable {
         let isKeyframe: Bool
         let isVideo: Bool
         let bytes: Data
+        /// The stream it was read from when a program change handed it over under its role's index
+        /// (`Demuxer.sourceStream(of:)`); -1 when it is its own.
+        var source: Int32 = -1
     }
 
     /// Writes all of `bytes` at `offset` or throws. Injectable so tests can fill the disk.
@@ -53,6 +56,9 @@ final class PacketRingBuffer: @unchecked Sendable {
         let length: UInt32
         let chunk: UInt32
         let flags: UInt8
+        /// `Packet.source` in the padding after `flags`, so the entry stays 24 bytes. A stream index
+        /// fits: libavformat makes one stream per PID, and there are 8192 of them.
+        let source: Int16
 
         static let keyframeFlag: UInt8 = 1
         static let videoFlag: UInt8 = 2
@@ -182,15 +188,16 @@ final class PacketRingBuffer: @unchecked Sendable {
 
     // MARK: - Writer
 
-    func append(pts: Double, isKeyframe: Bool, isVideo: Bool, bytes: Data) throws {
+    func append(pts: Double, isKeyframe: Bool, isVideo: Bool, bytes: Data, source: Int32 = -1) throws {
         try bytes.withUnsafeBytes { raw in
-            try append(pts: pts, isKeyframe: isKeyframe, isVideo: isVideo, bytes: raw)
+            try append(pts: pts, isKeyframe: isKeyframe, isVideo: isVideo, bytes: raw, source: source)
         }
     }
 
     /// Takes the packet's memory as is, so the host appends straight from the `AVPacket` without an
     /// intermediate copy.
-    func append(pts: Double, isKeyframe: Bool, isVideo: Bool, bytes: UnsafeRawBufferPointer) throws {
+    func append(pts: Double, isKeyframe: Bool, isVideo: Bool, bytes: UnsafeRawBufferPointer,
+                source: Int32 = -1) throws {
         guard bytes.count <= Int(UInt32.max / 2) else { throw Failure.packetTooLarge }
         writeLock.lock()
         defer { writeLock.unlock() }
@@ -246,7 +253,7 @@ final class PacketRingBuffer: @unchecked Sendable {
         if isKeyframe { flags |= Entry.keyframeFlag }
         if isVideo { flags |= Entry.videoFlag }
         let entry = Entry(pts: pts, offset: UInt32(placement.offset), length: UInt32(bytes.count),
-                          chunk: placement.chunk, flags: flags)
+                          chunk: placement.chunk, flags: flags, source: Int16(source))
 
         lock.lock()
         guard !closed else {
@@ -351,7 +358,8 @@ final class PacketRingBuffer: @unchecked Sendable {
         lock.unlock()
         guard let handle = cached ?? openReadHandle(entry.chunk),
               let bytes = Self.read(handle.fd, offset: entry.offset, length: entry.length) else { return nil }
-        return Packet(pts: entry.pts, isKeyframe: entry.isKeyframe, isVideo: entry.isVideo, bytes: bytes)
+        return Packet(pts: entry.pts, isKeyframe: entry.isKeyframe, isVideo: entry.isVideo, bytes: bytes,
+                      source: Int32(entry.source))
     }
 
     func seq(forKeyframeAtOrBefore target: Double) -> Int? {
