@@ -10,11 +10,13 @@ enum BoundedPlaylistFetch {
 
     /// The body and response of `request`. A non-2xx answer comes back with an empty body: every
     /// caller throws on the status alone, so its body is not worth reading.
-    static func data(for request: URLRequest, session: URLSession, limit: Int) async throws
+    static func data(for request: URLRequest, session: URLSession, limit: Int,
+                     resourceTimeout: TimeInterval? = nil, owner: EngineHTTPRequests? = nil) async throws
         -> (Data, URLResponse)
     {
         do {
-            return try await BoundedFetch.data(for: request, session: session, limit: limit)
+            return try await BoundedFetch.data(for: request, session: session, limit: limit,
+                                               resourceTimeout: resourceTimeout, owner: owner)
         } catch let error as BoundedFetch.Exceeded {
             throw HLSIngestError.playlistInvalid(reason: "playlist exceeds \(error.limit) bytes")
         }
@@ -54,13 +56,21 @@ enum BoundedFetch {
 
     /// The body and response of `request`. A non-2xx answer comes back with an empty body, since every
     /// caller decides on the status alone. Throws `Exceeded` for a body over `limit`.
-    static func data(for request: URLRequest, session: URLSession, limit: Int) async throws
+    ///
+    /// `resourceTimeout` is the whole fetch's ceiling, the per-task form of the session ceiling the
+    /// callers' own sessions used to carry (`EngineHTTP`); its expiry throws `URLError(.timedOut)`, as
+    /// the session's did. `owner` records the task so its owner's teardown can end it.
+    static func data(for request: URLRequest, session: URLSession, limit: Int,
+                     resourceTimeout: TimeInterval? = nil, owner: EngineHTTPRequests? = nil) async throws
         -> (Data, URLResponse)
     {
         let delegate = BoundedBodyDelegate(limit: limit)
         defer { withExtendedLifetime(delegate) {} }
         let task = session.dataTask(with: request)
         task.delegate = delegate
+        owner?.track(task)
+        let expired = ExpiryFlag()
+        EngineHTTP.armResourceDeadline(task, seconds: resourceTimeout) { expired.set() }
         let outcome: BoundedBodyDelegate.Outcome = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 // Installed through the delegate's own lock, and it replays an outcome that has already
@@ -76,8 +86,18 @@ enum BoundedFetch {
         case .body(let data, let response): return (data, response)
         case .refused(let response): return (Data(), response)
         case .exceeded: throw Exceeded(limit: limit)
-        case .failed(let error): throw error
+        case .failed(let error):
+            if expired.isSet { throw URLError(.timedOut) }
+            throw error
         }
+    }
+
+    /// Set once by a resource deadline, read after the transfer ends.
+    private final class ExpiryFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        func set() { lock.lock(); value = true; lock.unlock() }
+        var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
     }
 }
 

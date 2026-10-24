@@ -10,8 +10,14 @@ extension PrewarmStoreSuites {
     /// socket) behind per open: 1000 opens measured as 1020 open sockets.
     ///
     /// The origin counts sockets that are still open, which is the one place the leak shows.
+    ///
+    /// The readers now run on the engine's one pool (`EngineHTTP`), so the fix holds by construction
+    /// and the invariant is no longer "zero sockets after close": a pooled keep-alive socket staying
+    /// open for the next request is the pool doing its job. What a leak looked like was a socket per
+    /// open, so the tests open repeatedly and require the origin never to hold more than the one
+    /// pooled connection.
     /// `.serialized`: the warm case goes through the process-wide prewarm store.
-    @Suite("Remote disc image sessions are released (audit NET-110)", .serialized, .timeLimit(.minutes(2)))
+    @Suite("Remote disc image opens do not leak connections (audit NET-110)", .serialized, .timeLimit(.minutes(2)))
     struct RemoteDiscSessionReleaseTests {
 
         /// 0.5 s of 64x64 MPEG-2 video in an MPEG-PS pack stream (ffmpeg `-f vob`), 4096 bytes: the
@@ -89,41 +95,44 @@ extension PrewarmStoreSuites {
             URL(string: "http://127.0.0.1:\(origin.port)/\(name)")!
         }
 
-        private func drained(_ origin: KeepAliveRangeOrigin) async throws {
-            try await waitFor { origin.openConnectionCount == 0 }
+        /// Opens that leaked a session each left a socket each; one pool leaves at most one.
+        private static let repeatedOpens = 6
+
+        private func heldAtMostThePooledConnection(_ origin: KeepAliveRangeOrigin) async throws {
+            try await waitFor { origin.openConnectionCount <= 1 }
         }
 
-        @Test("a disc image that opens releases its session when the demuxer closes")
+        @Test("disc images that open and close leave no connection of their own behind")
         func openedDiscReleasesOnClose() async throws {
             let origin = try #require(KeepAliveRangeOrigin(data: Self.isoImage(vob: Self.vob)))
             defer { origin.stop() }
 
-            let demuxer = Demuxer()
-            try demuxer.open(url: url(origin))
-            #expect(demuxer.isDiscSource, "the fixture was not taken for a disc")
-            // Accepted, not open: whether URLSession still pools the keep-alive socket at this
-            // instant is not this test's question, and on a CI runner it had already let go (0).
+            for _ in 0..<Self.repeatedOpens {
+                let demuxer = Demuxer()
+                try demuxer.open(url: url(origin))
+                #expect(demuxer.isDiscSource, "the fixture was not taken for a disc")
+                demuxer.close()
+            }
             #expect(origin.acceptedConnectionCount > 0, "the open never reached the origin")
-            demuxer.close()
 
-            try await drained(origin)
+            try await heldAtMostThePooledConnection(origin)
         }
 
-        @Test("a disc image whose open throws releases its session")
+        @Test("disc images whose open throws leave no connection of their own behind")
         func failedOpenReleasesItsSession() async throws {
             // A pack-start-code-only title: recognised as a disc, and mpegps then finds no stream.
             let image = ISO9660Fixture.make(files: [.init(name: "VTS_01_1.VOB", length: 2048)])
             let origin = try #require(KeepAliveRangeOrigin(data: image))
             defer { origin.stop() }
 
-            for _ in 0..<3 {
+            for _ in 0..<Self.repeatedOpens {
                 let demuxer = Demuxer()
                 #expect(throws: (any Error).self) { try demuxer.open(url: url(origin)) }
                 demuxer.close()
             }
             #expect(origin.acceptedConnectionCount > 0, "the open never reached the origin")
 
-            try await drained(origin)
+            try await heldAtMostThePooledConnection(origin)
         }
 
         /// The root directory's length, past the reader's extent cap: `wrap` throws `malformed` instead of
@@ -135,17 +144,19 @@ extension PrewarmStoreSuites {
             return image
         }
 
-        @Test("a disc image whose structure cannot be parsed releases its session")
+        @Test("disc images whose structure cannot be parsed leave no connection of their own behind")
         func throwingWrapReleasesItsSession() async throws {
             let origin = try #require(KeepAliveRangeOrigin(data: Self.unparseableImage()))
             defer { origin.stop() }
 
-            let demuxer = Demuxer()
-            #expect(throws: (any Error).self) { try demuxer.open(url: url(origin)) }
-            demuxer.close()
+            for _ in 0..<Self.repeatedOpens {
+                let demuxer = Demuxer()
+                #expect(throws: (any Error).self) { try demuxer.open(url: url(origin)) }
+                demuxer.close()
+            }
 
             #expect(origin.acceptedConnectionCount > 0, "the open never reached the origin")
-            try await drained(origin)
+            try await heldAtMostThePooledConnection(origin)
         }
 
         @Test("a disc image whose structure cannot be parsed hands the warm back")

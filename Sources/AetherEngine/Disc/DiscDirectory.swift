@@ -61,7 +61,8 @@ public final class HTTPDiscDirectoryReader: DiscDirectoryReader {
         // probe doubled the requests recognition made. A clip keeps the probe, which is what refuses an
         // origin that would answer a range with the whole file.
         let small = file.size > 0 && file.size <= DiscReader.maxSmallFileBytes
-        return HTTPDiscIOReader(url: file.url, extraHeaders: httpHeaders, knownSize: small ? file.size : nil)
+        return HTTPDiscIOReader(url: file.url, extraHeaders: httpHeaders, knownSize: small ? file.size : nil,
+                                sourceCache: .shared)
     }
 
     public func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 { -1 }

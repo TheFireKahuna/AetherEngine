@@ -412,7 +412,7 @@ enum SubtitleDecoder {
         var avioReader: AVIOReader?
 
         if isHTTP {
-            let reader = AVIOReader(url: url, extraHeaders: httpHeaders)
+            let reader = AVIOReader(url: url, extraHeaders: httpHeaders, sourceCache: .shared)
             // Register BEFORE open(): open does a synchronous network probe (up to ~60 s on stalled origins);
             // cancellation during the probe must abort via markClosed rather than waiting for timeout (#32).
             cancel.register(reader)

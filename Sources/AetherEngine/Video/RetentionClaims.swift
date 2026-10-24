@@ -54,6 +54,20 @@ final class RetentionClaims: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [UUID: Entry] = [:]
 
+    /// Free space on the tmp volume, the figure every claim is sized from. The important-usage key
+    /// is unavailable on tvOS; the plain capacity key exists on every platform and is close enough
+    /// for a quarter-of-free-space clamp.
+    static func tmpVolumeAvailableBytes() -> Int64? {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+        #if os(tvOS)
+        return (try? tmp.resourceValues(forKeys: [.volumeAvailableCapacityKey]))?
+            .volumeAvailableCapacity.map(Int64.init)
+        #else
+        return (try? tmp.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+            .volumeAvailableCapacityForImportantUsage
+        #endif
+    }
+
     /// Sizes a session with `sizing` over the free space the other claims leave, and records the
     /// result. Unknown capacity is passed through as unknown.
     ///

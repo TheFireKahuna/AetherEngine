@@ -761,7 +761,8 @@ public final class Demuxer: @unchecked Sendable {
         // the source is not a recognizable disc, fall through to the streaming reader.
         if !isLive, Self.isDiscImageURL(url) {
             let warm = HTTPDiscIOReader.takePrewarm(for: url, extraHeaders: extraHeaders)
-            if let discReader = try HTTPDiscIOReader.open(url: url, extraHeaders: extraHeaders, prewarmed: warm) {
+            if let discReader = try HTTPDiscIOReader.open(url: url, extraHeaders: extraHeaders, prewarmed: warm,
+                                                          sourceCache: .shared) {
                 adoptOwnedSourceReader(discReader)
                 if isCloseRequested {
                     releaseOwnedSourceReader()
@@ -806,7 +807,8 @@ public final class Demuxer: @unchecked Sendable {
             sequentialOnly: openProfile.avioSequentialOnly,
             heldConnection: openProfile.avioHeldConnection,
             sourceOpenPolicy: openProfile.sourceOpenPolicy,
-            requestHeaderStore: openProfile.requestHeaders
+            requestHeaderStore: openProfile.requestHeaders,
+            sourceCache: .shared
         )
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
         reader.playIntentProvider = playIntentProvider

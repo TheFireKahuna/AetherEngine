@@ -26,7 +26,16 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// Wider than the VOD reader's 2 MB: a live window with hours of DVR at short segments is a
     /// legitimately long playlist, and this one is refetched every few seconds rather than once.
     static let maximumPlaylistBytes = 8 * 1024 * 1024
-    private let session: URLSession
+    /// The engine's one pool (`EngineHTTP`). What this reader's own session used to configure rides
+    /// each fetch: the idle timeout on the request, the resource ceiling on the task, and teardown
+    /// ends this reader's requests (`requests`) rather than the pool.
+    private let session: URLSession = EngineHTTP.session
+    private let requests = EngineHTTPRequests()
+    /// The idle timeout and the ceiling: one-shot fetches must fail fast so the host can fall back.
+    /// The c7592ed no-ceiling lesson applies to long-lived stream connections, not bounded one-shot
+    /// fetches.
+    private static let idleTimeoutSeconds: TimeInterval = 10
+    private static let resourceTimeoutSeconds: TimeInterval = 30
     private var ingestTask: Task<Void, Never>?
     private let startLock = NSLock()
     private var started = false
@@ -220,12 +229,6 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         self.httpHeaders = httpHeaders
         self.credentialOrigin = credentialOrigin ?? playlistURL
         self.role = role
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 10
-        config.timeoutIntervalForResource = 30
-        // 30s resource ceiling: one-shot fetches must fail fast so the host can fall back. The c7592ed no-ceiling lesson applies to long-lived stream connections, not bounded one-shot fetches.
-        self.session = URLSession(
-            configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
     }
 
     // MARK: - IOReader
@@ -256,7 +259,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         fifo.cancel()
         wakeFormatResolveWaiters() // prevent resolveSegmentFormatHint from sleeping its full bound when never started
         if !wasStarted {
-            session.invalidateAndCancel() // sole owner when ingest never launched; runIngest's defer owns it otherwise
+            requests.cancelAll() // sole owner when ingest never launched; runIngest's defer owns it otherwise
         }
     }
 
@@ -280,7 +283,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     private func runIngest() async {
         defer {
-            session.invalidateAndCancel()
+            requests.cancelAll()
             wakeFormatResolveWaiters() // wake any pending format resolve regardless of exit path
         }
         do {
@@ -766,6 +769,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// origin is (audit NET-7). Internal for the header-contract tests.
     func makeRequest(_ url: URL) -> URLRequest {
         var request = URLRequest(url: url)
+        request.timeoutInterval = Self.idleTimeoutSeconds
         for (field, value) in RedirectHeaderPolicy.scoped(
             httpHeaders, grantedFor: credentialOrigin, sentTo: url) {
             request.setValue(value, forHTTPHeaderField: field)
@@ -777,7 +781,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private func fetchPlaylist(_ url: URL) async throws -> (HLSPlaylist, URL) {
         let (data, response) = try await budgeted(url, label: "ingest-playlist") {
             try await BoundedPlaylistFetch.data(
-                for: self.makeRequest(url), session: self.session, limit: Self.maximumPlaylistBytes)
+                for: self.makeRequest(url), session: self.session, limit: Self.maximumPlaylistBytes,
+                resourceTimeout: Self.resourceTimeoutSeconds, owner: self.requests)
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else {
@@ -803,7 +808,9 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                 let (data, response): (Data, URLResponse)
                 do {
                     (data, response) = try await budgeted(url, label: "ingest-segment") {
-                        try await BoundedFetch.data(for: self.makeRequest(url), session: self.session, limit: limit)
+                        try await BoundedFetch.data(for: self.makeRequest(url), session: self.session, limit: limit,
+                                                    resourceTimeout: Self.resourceTimeoutSeconds,
+                                                    owner: self.requests)
                     }
                 } catch is BoundedFetch.Exceeded {
                     // Audit NET-112: an endless body is the origin's answer, not a blip to retry.
@@ -854,7 +861,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         do {
             (data, response) = try await budgeted(url, label: "ingest-key") {
                 try await BoundedFetch.data(
-                    for: self.makeRequest(url), session: self.session, limit: BoundedFetch.keyLimit)
+                    for: self.makeRequest(url), session: self.session, limit: BoundedFetch.keyLimit,
+                    resourceTimeout: Self.resourceTimeoutSeconds, owner: self.requests)
             }
         } catch is BoundedFetch.Exceeded {
             throw HLSIngestError.segmentDecryptFailed(reason: "key exceeds \(BoundedFetch.keyLimit) bytes")

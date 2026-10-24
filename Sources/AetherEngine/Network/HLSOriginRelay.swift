@@ -69,10 +69,13 @@ final class HLSOriginRelay: @unchecked Sendable {
     }
     private var _upstreamTrustRefusalCode: Int?
 
-    /// Built in init rather than on first use: the server handles connections concurrently,
-    /// and a lazy var raced by two of them can build two sessions where only one is ever
-    /// invalidated.
-    private let session: URLSession
+    /// The engine's one pool (`EngineHTTP`), so the relay rides the connection the rest of the
+    /// session already has to the origin. The limits its own session used to carry ride each fetch:
+    /// 30 s idle on the request, a 120 s ceiling on the task; `stop()` ends this relay's requests.
+    private let session: URLSession = EngineHTTP.session
+    private let requests = EngineHTTPRequests()
+    private static let idleTimeoutSeconds: TimeInterval = 30
+    private static let resourceTimeoutSeconds: TimeInterval = 120
 
     private let heldBodyLimit: Int
     private let pendingLimit: Int
@@ -88,17 +91,10 @@ final class HLSOriginRelay: @unchecked Sendable {
          maximumPendingBytes: Int = HLSOriginRelay.maximumPendingBytes) {
         heldBodyLimit = maximumHeldBodyBytes
         pendingLimit = maximumPendingBytes
-        let config = URLSessionConfiguration.ephemeral
-        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        config.urlCache = nil
-        config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 120
-        session = URLSession(
-            configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
     }
 
     func stop() {
-        session.invalidateAndCancel()
+        requests.cancelAll()
     }
 
     // MARK: - Whether a relay is wanted at all
@@ -436,6 +432,7 @@ final class HLSOriginRelay: @unchecked Sendable {
         // ranges, and normalising or coalescing one here would quietly undo the sizing the
         // caller asked for. What comes back is relayed with the same framing.
         if let range { request.setValue(range, forHTTPHeaderField: "Range") }
+        request.timeoutInterval = Self.idleTimeoutSeconds
 
         let ticket = OriginRequestBudget.shared.acquire(
             for: origin, label: "relay", timeout: Self.slotWaitSeconds)
@@ -449,6 +446,8 @@ final class HLSOriginRelay: @unchecked Sendable {
         }
         let task = session.dataTask(with: request)
         task.delegate = pump
+        requests.track(task)
+        EngineHTTP.armResourceDeadline(task, seconds: Self.resourceTimeoutSeconds)
         task.resume()
         defer { pump.abandon(); task.cancel() }
 

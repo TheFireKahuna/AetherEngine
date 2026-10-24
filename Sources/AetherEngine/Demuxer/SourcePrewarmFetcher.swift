@@ -32,10 +32,8 @@ enum SourcePrewarmFetcher {
 
     static let defaultByteBudget = 8 * 1024 * 1024
 
-    private static let session: URLSession = URLSession(
-        configuration: AVIOReader.makeSessionConfig(),
-        delegate: EngineTLS.sessionDelegate,
-        delegateQueue: AVIOReader.makePlaybackDelegateQueue())
+    /// The engine's one pool (`EngineHTTP`), so a warm and the session that plays it share a connection.
+    private static let session: URLSession = EngineHTTP.session
 
     /// One warm at a time, process-wide.
     ///
@@ -187,6 +185,7 @@ enum RangeFetch {
                                           requestedLength: requestedLength)
         let task = session.dataTask(with: request)
         task.delegate = delegate
+        EngineHTTP.armResourceDeadline(task, seconds: AVIOReader.boundedResourceSeconds)
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Result, Error>) in
@@ -198,7 +197,13 @@ enum RangeFetch {
                 delegate.installOutcomeHandler { outcome in
                     OriginRequestBudget.shared.release(ticket)
                     switch outcome {
-                    case .body(let result): continuation.resume(returning: result)
+                    case .body(let result):
+                        SourceByteLedger.shared.record(url, reader: label, offset: result.range.start,
+                                                       count: result.body.count)
+                        let key = SourceCacheKey(url: url, headers: extraHeaders)
+                        SourceByteCache.shared.noteTotalSize(result.total, for: key)
+                        SourceByteCache.shared.store(result.body, at: result.range.start, for: key)
+                        continuation.resume(returning: result)
                     case .rejected(let reason): continuation.resume(throwing: PrewarmDecline(reason: reason))
                     }
                 }

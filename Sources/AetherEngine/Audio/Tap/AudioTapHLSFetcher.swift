@@ -29,15 +29,9 @@ final class AudioTapHLSFetcher: @unchecked Sendable {
     private var keyCache: [String: Data] = [:]
 
     init(session: URLSession? = nil, httpHeaders: [String: String] = [:], credentialOrigin: URL? = nil) {
-        if let session {
-            self.session = session
-        } else {
-            let cfg = URLSessionConfiguration.ephemeral
-            cfg.timeoutIntervalForRequest = 10
-            cfg.timeoutIntervalForResource = 30
-            self.session = URLSession(
-                configuration: cfg, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
-        }
+        // The engine's one pool unless a caller hands its own; its old 10 s idle timeout and 30 s
+        // ceiling ride each fetch (`get`).
+        self.session = session ?? EngineHTTP.session
         credentials = CredentialScope(headers: httpHeaders, anchor: credentialOrigin)
     }
 
@@ -49,11 +43,14 @@ final class AudioTapHLSFetcher: @unchecked Sendable {
 
     private func get(_ url: URL, limit: Int) async throws -> (Data, URLResponse) {
         var request = URLRequest(url: url)
+        let pooled = session === EngineHTTP.session
+        if pooled { request.timeoutInterval = 10 }
         for (field, value) in credentials.headers(for: url) {
             request.setValue(value, forHTTPHeaderField: field)
         }
         do {
-            return try await BoundedFetch.data(for: request, session: session, limit: limit)
+            return try await BoundedFetch.data(for: request, session: session, limit: limit,
+                                               resourceTimeout: pooled ? 30 : nil)
         } catch let error as BoundedFetch.Exceeded {
             throw FetchError.invalidPlaylist("body exceeds \(error.limit) bytes")
         }
