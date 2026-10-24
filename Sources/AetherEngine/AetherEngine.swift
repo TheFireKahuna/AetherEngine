@@ -3049,16 +3049,12 @@ public final class AetherEngine: ObservableObject {
         !wasAlreadyRebuilding
     }
 
-    /// #35 cold-DV-master startup-readiness gate. A DV master (P7->P8.1, or any HDR master)
-    /// instantiated while the HDMI DV/HDCP decode path is still warming right after an SDR->HDR switch
-    /// resolves 0 tracks (silent park) or fails -11819 "Cannot Complete Action"; neither is a
-    /// -11868/-11848 rejection, so the reactive #98 path never fires and startup surfaces "Playback
-    /// stopped". A second launch just works because the failed attempt warmed the link. This gate
-    /// replays that recovery in-session: play, poll readiness, and on a cold failure reload the SAME
-    /// master with a fresh asset (bounded) before falling back to the media playlist (HDR10 base, no
-    /// DV upgrade). Bounded at every stage, so a cold resume can never hang forever on 0 tracks.
+    /// Startup-readiness gate for a master handed to a wireless AirPlay receiver (#227): play, poll
+    /// readiness, and on a failure reload the SAME master with a fresh asset (bounded) before falling back
+    /// to the reduced HDR master and then the media playlist. Bounded at every stage, so a start can never
+    /// hang on a receiver that parks with 0 tracks. `StartupReadinessGate` holds the decision table.
     ///
-    /// #227: the same escalation is what a wireless AirPlay hop needs. The master kept for an SDR source
+    /// The master kept for an SDR source
     /// carries the subtitle renditions but assumes the receiver can take that variant, which the sender
     /// cannot check (a receiver without 4K HEVC would reject it). The gate covers the rejection and the
     /// silent park, and its reloads are rewritten onto the LAN IP so the receiver can reach them at all.
@@ -5101,11 +5097,6 @@ public final class AetherEngine: ObservableObject {
         }
 
         // 2. Display-criteria handshake. Use effective format so a non-DV panel isn't asked to switch to dvh1.
-        // #35: remember whether an actual SDR->HDR panel switch happened this load. The cold-DV-master
-        // startup-readiness gate only arms on a real switch, when the DV/HDCP decode path is still
-        // warming and the served master resolves 0 tracks / fails -11819; a warm start (no switch) keeps
-        // the unchanged immediate-play path.
-        var didSwitchPanel = false
         // #133: when apply() reports the criteria are already active (same-format zap), the panel never
         // starts a switch, so the post-load play-gate waitForSwitch() below has nothing to settle and would
         // otherwise burn its full ~3s cap on unobservable-DV panels. Skip it in exactly that case.
@@ -5132,7 +5123,6 @@ public final class AetherEngine: ObservableObject {
                 omitColorExtensions: options.omitCriteriaColorExtensions
             ) {
             case .willSwitch:
-                didSwitchPanel = true
                 // #339: consumesRecord: false, the play gate after loadNative is entitled to the same
                 // start/end timestamps; spending them here made it pay Stage 1's grace for a settled switch.
                 // AE#348: started here, at the write, so it releases exactly when it always did, but only
@@ -5823,19 +5813,19 @@ public final class AetherEngine: ObservableObject {
                     isCurrent: { self.loadGeneration == gen })
                 try checkLoadCurrent(gen)
                 // automaticallyWaitsToMinimizeStalling=true (default) handles play-before-ready.
-                // #35: on a real SDR->HDR switch while serving a VOD master, drive the bounded
-                // cold-start readiness gate (play -> poll -> reload master -> media fallback) instead
-                // of an unconditional play(); the gate calls play() itself. Warm/live/media paths keep
-                // the immediate play().
-                // #124: a paused mount skips the terminal play() AND the cold-start readiness gate
-                // (an autostart-path recovery: it plays to poll readiness). loadNative wired
-                // host.$isReady, which settles .loading -> .paused; the host resumes later with play().
-                // #227 follow-up: a master handed to a wireless AirPlay receiver arms the same gate. The
+                // A local start is a plain play(): a start that fails surfaces through the host's startup
+                // path as a failure, and nothing changes the served format behind the criteria already
+                // written. Cold Dolby Vision resumes after a fresh launch start cleanly on tvOS 27.2 with
+                // the item created during the switch (five of five, Apple TV 4K and LG G5).
+                // #124: a paused mount skips the terminal play() AND the readiness gate (it plays to poll
+                // readiness). loadNative wired host.$isReady, which settles .loading -> .paused; the host
+                // resumes later with play().
+                // #227: a master handed to a wireless AirPlay receiver runs the readiness gate. The
                 // receiver's HDR mode is unreadable from the sender, so an offered HDR/DV master can be
                 // rejected or park silently, and the escalation (reload master -> reduced HDR master ->
-                // media, all on the LAN IP) is exactly the recovery that hop needs.
+                // media, all on the LAN IP) is the recovery that hop needs.
                 if Self.loadPerformsAutostart(options) {
-                    if didSwitchPanel || airPlayServedMasterToReceiver, let session = nativeVideoSession,
+                    if airPlayServedMasterToReceiver, let session = nativeVideoSession,
                        session.servingMasterPlaylist, !options.isLive {
                         try await runStartupReadinessGate(
                             session: session, position: startPosition ?? 0, gen: gen)
