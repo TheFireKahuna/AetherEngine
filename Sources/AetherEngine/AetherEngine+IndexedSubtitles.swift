@@ -3,7 +3,7 @@ import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
 
-/// Native subtitle renditions filled from the container's own index (`MatroskaSubtitleIndex`) rather
+/// Native subtitle renditions filled from the container's own index (`MatroskaCueIndex`) rather
 /// than by reading the stream around them.
 ///
 /// AVKit fetches a subtitle rendition minutes ahead of playback (measured: about 4 minutes past the
@@ -17,7 +17,7 @@ import AetherLibavutil
 ///   display sets' composition headers, and only its own display sets are decoded and recognized;
 /// - a full bitmap track is recognized from the playhead forward, from the index, when it is selected.
 ///
-/// The index is trusted only for a track it provably lists in full (`MatroskaSubtitleIndex.isComplete`).
+/// The index is trusted only for a track it provably lists in full (`MatroskaCueIndex.isComplete`).
 /// Everything else keeps the stream-walking path, which follows how far ahead AVKit actually asks.
 extension AetherEngine {
 
@@ -36,14 +36,14 @@ extension AetherEngine {
 
     /// The session's indexed-subtitle state, shared with the fill tasks.
     final class IndexedSubtitleState: @unchecked Sendable {
-        let index: MatroskaSubtitleIndex
+        let index: MatroskaCueIndex
         let plans: [Int: IndexedRenditionPlan]
         private let root: IOReader
         private let lock = NSLock()
         /// Per ordinal, which of its blocks a bitmap fill has recognized.
         private var processed: [Int: [Bool]] = [:]
 
-        init(index: MatroskaSubtitleIndex, plans: [Int: IndexedRenditionPlan], root: IOReader) {
+        init(index: MatroskaCueIndex, plans: [Int: IndexedRenditionPlan], root: IOReader) {
             self.index = index
             self.plans = plans
             self.root = root
@@ -400,15 +400,15 @@ extension AetherEngine {
     }
 
     /// `items` read on parallel lanes; the result is indexed like the blocks' positions in the track.
-    nonisolated static func readFrames(_ items: [(Int, MatroskaSubtitleIndex.Block)], track: UInt64,
-                                       state: IndexedSubtitleState, prefix: Int?) -> [Int: MatroskaSubtitleIndex.Frame] {
+    nonisolated static func readFrames(_ items: [(Int, MatroskaCueIndex.Block)], track: UInt64,
+                                       state: IndexedSubtitleState, prefix: Int?) -> [Int: MatroskaCueIndex.Frame] {
         guard !items.isEmpty else { return [:] }
         let laneCount = min(indexedSubtitleReadLanes, items.count)
         let sources = (0..<laneCount).compactMap { _ in state.makeSource() }
         defer { sources.forEach { $0.close() } }
         guard !sources.isEmpty else { return [:] }
         let lock = NSLock()
-        var out: [Int: MatroskaSubtitleIndex.Frame] = [:]
+        var out: [Int: MatroskaCueIndex.Frame] = [:]
         DispatchQueue.concurrentPerform(iterations: sources.count) { lane in
             var k = lane
             while k < items.count, !Task.isCancelled {
@@ -423,8 +423,8 @@ extension AetherEngine {
     }
 
     /// One frame through the decoder, timed on the stream's time base.
-    nonisolated static func decode(_ frame: MatroskaSubtitleIndex.Frame, plan: IndexedRenditionPlan,
-                                   index: MatroskaSubtitleIndex,
+    nonisolated static func decode(_ frame: MatroskaCueIndex.Frame, plan: IndexedRenditionPlan,
+                                   index: MatroskaCueIndex,
                                    decoder: EmbeddedSubtitleDecoder) -> EmbeddedSubtitleDecoder.SubtitleEvent? {
         guard !frame.payload.isEmpty, let packet = trackedPacketAlloc() else { return nil }
         defer { var p: UnsafeMutablePointer<AVPacket>? = packet; trackedPacketFree(&p) }

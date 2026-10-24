@@ -3,12 +3,12 @@ import Foundation
 import Compression
 @testable import AetherEngine
 
-/// `MatroskaSubtitleIndex` on a Matroska file assembled here byte by byte: the index is read through the
+/// `MatroskaCueIndex` on a Matroska file assembled here byte by byte: the index is read through the
 /// SeekHead, blocks are found from their cue positions whatever length their cluster's size field has,
 /// a track is complete only when its cues number its frames, and frames come back as the decoder takes
 /// them (a stripped header restored, zlib left wrapped).
-@Suite("Matroska subtitle index")
-struct MatroskaSubtitleIndexTests {
+@Suite("Matroska cue index")
+struct MatroskaCueIndexTests {
 
     // MARK: - A small Matroska writer
 
@@ -149,10 +149,29 @@ struct MatroskaSubtitleIndexTests {
 
     // MARK: - Tests
 
+    /// The video track's cues are its keyframes: kept with the cluster they name even where the muxer
+    /// wrote no relative position (the fixture's video cues have none), in time order, and each one's
+    /// byte offset is where its cluster begins.
+    @Test("video keyframes are listed with their clusters, relative position or not")
+    func videoKeyframes() throws {
+        let fixture = Self.fixture()
+        let index = try MatroskaCueIndex.read(from: source(fixture), token: .forParserTests)
+        #expect(index.videoTracks.map(\.number) == [1])
+        let keyframes = index.keyframes(track: 1)
+        #expect(keyframes.map(\.ticks) == [0, 5000])
+        #expect(keyframes.allSatisfy { $0.relativePosition == nil })
+        for keyframe in keyframes {
+            let at = Int(index.byteOffset(of: keyframe))
+            #expect(Array(fixture.bytes[at..<(at + 4)]) == [0x1F, 0x43, 0xB6, 0x75],
+                    "keyframe at \(keyframe.ticks) does not point at a Cluster")
+        }
+        #expect(index.keyframes(track: 2).isEmpty, "a subtitle track is not a video track")
+    }
+
     @Test("the index is found through the SeekHead and lists every subtitle block in time order")
     func readsIndex() throws {
         let fixture = Self.fixture()
-        let index = try MatroskaSubtitleIndex.read(from: source(fixture), token: .forParserTests)
+        let index = try MatroskaCueIndex.read(from: source(fixture), token: .forParserTests)
         #expect(index.timestampScale == 1_000_000)
         #expect(index.blocksByTrack[2]?.map(\.ticks) == [10, 5100])
         #expect(index.blocksByTrack[3]?.count == 1)
@@ -166,7 +185,7 @@ struct MatroskaSubtitleIndexTests {
     func readsFrames() throws {
         let fixture = Self.fixture()
         let src = source(fixture)
-        let index = try MatroskaSubtitleIndex.read(from: src, token: .forParserTests)
+        let index = try MatroskaCueIndex.read(from: src, token: .forParserTests)
         for track: UInt64 in [2, 3, 4] {
             for (block, expected) in zip(index.blocksByTrack[track]!, fixture.expected[track]!) {
                 let frame = try #require(index.readFrame(block, track: track, from: src))
@@ -179,12 +198,12 @@ struct MatroskaSubtitleIndexTests {
 
     @Test("a track is complete only when its cues number its frames, all addressable and decodable")
     func completeness() throws {
-        let index = try MatroskaSubtitleIndex.read(from: source(Self.fixture()), token: .forParserTests)
+        let index = try MatroskaCueIndex.read(from: source(Self.fixture()), token: .forParserTests)
         #expect(index.isComplete(track: 2, frameCount: 2))
         #expect(!index.isComplete(track: 2, frameCount: 3))
         #expect(!index.isComplete(track: 2, frameCount: nil))
         #expect(!index.isComplete(track: 1, frameCount: 2))
-        let dropped = try MatroskaSubtitleIndex.read(from: source(Self.fixture(dropCueFor: 3)), token: .forParserTests)
+        let dropped = try MatroskaCueIndex.read(from: source(Self.fixture(dropCueFor: 3)), token: .forParserTests)
         #expect(!dropped.isComplete(track: 3, frameCount: 1))
     }
 
@@ -196,7 +215,7 @@ struct MatroskaSubtitleIndexTests {
         #expect(!plain.isForced && !plain.isSelfContained)
         let fixture = Self.fixture()
         let src = source(fixture)
-        let index = try MatroskaSubtitleIndex.read(from: src, token: .forParserTests)
+        let index = try MatroskaCueIndex.read(from: src, token: .forParserTests)
         let prefix = try #require(index.readFrame(index.blocksByTrack[3]![0], track: 3, from: src, prefix: 64))
         #expect(prefix.isPrefix)
         #expect(PGSCompositionHeader.parse(prefix.payload)?.isForced == true)
@@ -204,15 +223,15 @@ struct MatroskaSubtitleIndexTests {
 
     @Test("a file that is not Matroska, or has no Cues, is refused")
     func refusals() {
-        #expect(throws: MatroskaSubtitleIndex.ReadError.notMatroska) {
-            try MatroskaSubtitleIndex.read(from: IOReaderByteSource(DataIOReader(data: Data(repeating: 7, count: 4096))), token: .forParserTests)
+        #expect(throws: MatroskaCueIndex.ReadError.notMatroska) {
+            try MatroskaCueIndex.read(from: IOReaderByteSource(DataIOReader(data: Data(repeating: 7, count: 4096))), token: .forParserTests)
         }
     }
 
     // MARK: - Streams to tracks
 
-    private static func mappingIndex() -> MatroskaSubtitleIndex {
-        var index = MatroskaSubtitleIndex(segmentDataStart: 0, timestampScale: 1_000_000, blocksByTrack: [:],
+    private static func mappingIndex() -> MatroskaCueIndex {
+        var index = MatroskaCueIndex(segmentDataStart: 0, timestampScale: 1_000_000, blocksByTrack: [:],
                                           tracksMissingRelativePosition: [], encodingByTrack: [:])
         index.subtitleTracks = [.init(number: 18, codecID: "S_HDMV/PGS", language: "eng"),
                                 .init(number: 19, codecID: "S_TEXT/UTF8", language: "eng"),
@@ -225,7 +244,7 @@ struct MatroskaSubtitleIndexTests {
     @Test("a stream carrying its TrackNumber maps to that track")
     func mapsByTrackID() {
         let index = Self.mappingIndex()
-        let streams: [MatroskaSubtitleIndex.SubtitleStream] = [
+        let streams: [MatroskaCueIndex.SubtitleStream] = [
             .init(streamIndex: 17, trackID: 18, codecName: "hdmv_pgs_subtitle", language: "eng", frames: 2909, bytes: 30_000_000),
             .init(streamIndex: 18, trackID: 19, codecName: "subrip", language: "eng", frames: 1326, bytes: 40_000),
             .init(streamIndex: 21, trackID: 22, codecName: "hdmv_pgs_subtitle", language: "eng", frames: 2909, bytes: 31_000_000),
@@ -236,7 +255,7 @@ struct MatroskaSubtitleIndexTests {
     @Test("without track numbers the order maps, and a pair whose statistics disagree refuses the whole map")
     func mapsByOrderAndRefuses() {
         let index = Self.mappingIndex()
-        var streams: [MatroskaSubtitleIndex.SubtitleStream] = [
+        var streams: [MatroskaCueIndex.SubtitleStream] = [
             .init(streamIndex: 17, codecName: "hdmv_pgs_subtitle", language: "eng", frames: 2909, bytes: 30_000_000),
             .init(streamIndex: 18, codecName: "subrip", language: "eng", frames: 1326, bytes: 40_000),
             .init(streamIndex: 21, codecName: "hdmv_pgs_subtitle", language: "eng", frames: 2909, bytes: 31_000_000),
@@ -253,7 +272,7 @@ struct MatroskaSubtitleIndexTests {
     @Test("a subtitle TrackEntry libavformat skips (no S or D CodecID) is not counted")
     func skippedEntriesAreNotCounted() throws {
         let fixture = Self.fixture()
-        let index = try MatroskaSubtitleIndex.read(from: source(fixture), token: .forParserTests)
+        let index = try MatroskaCueIndex.read(from: source(fixture), token: .forParserTests)
         #expect(index.subtitleTracks.map(\.number) == [2, 3, 4])
     }
 

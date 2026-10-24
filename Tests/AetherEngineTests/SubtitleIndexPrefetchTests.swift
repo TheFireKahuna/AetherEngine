@@ -19,14 +19,14 @@ struct SubtitleIndexPrefetchTests {
         ]
     }
 
-    private static func indexed() throws -> (MatroskaSubtitleIndex, MatroskaSubtitleIndexTests.Fixture) {
-        let fixture = MatroskaSubtitleIndexTests.fixture()
-        let index = try MatroskaSubtitleIndex.read(
+    private static func indexed() throws -> (MatroskaCueIndex, MatroskaCueIndexTests.Fixture) {
+        let fixture = MatroskaCueIndexTests.fixture()
+        let index = try MatroskaCueIndex.read(
             from: IOReaderByteSource(DataIOReader(data: Data(fixture.bytes))), token: .forParserTests)
         return (index, fixture)
     }
 
-    private static func source(_ index: MatroskaSubtitleIndex, _ fixture: MatroskaSubtitleIndexTests.Fixture,
+    private static func source(_ index: MatroskaCueIndex, _ fixture: MatroskaCueIndexTests.Fixture,
                                from seconds: Double = 0) throws -> SubtitleForwardPrefetcher.IndexSource {
         let plan = SubtitleForwardPrefetcher.IndexSource.plan(
             index: index, listed: listed(), streams: [10, 11, 12])
