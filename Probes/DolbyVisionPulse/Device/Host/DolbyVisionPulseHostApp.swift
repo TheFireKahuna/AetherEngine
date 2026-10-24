@@ -1,6 +1,7 @@
 @_spi(Diagnostics) import AetherEngine
 import AVFoundation
 import AVKit
+import Combine
 import CoreMedia
 import SwiftUI
 import UIKit
@@ -32,6 +33,9 @@ import UIKit
 //   carries in place of its own for this arm only (`AetherEngine.felComposedRpuOverride`; a fetch or parse
 //   failure skips the arm); `secs=N`: play N seconds, looping the clip, instead of once through (80 s cap); on `avplayer`
 //   arms it only shortens the arm (no looping).
+// - `overlay`: as `engine`, but the FEL plays on the native route (`LoadOptions.felOverlay`): AVPlayer plays the
+//   8.1 base layer in an `AVPlayerViewController` and `FelOverlayRenderer` composes the enhancement layer over it
+//   inside AVKit's render layer, as Sodalite shows it. Takes `out=`, `rpu=` and `secs=` like `engine`.
 // - `soak`: `engine` for `minutes=` with a `seeks=at@to,...` schedule, sampled once a second, ending in
 //   one `soak summary` line; takes `out=` like `engine` (default sv22, the engine's).
 //
@@ -114,6 +118,8 @@ struct PulseArm {
 struct PulseHarnessView: View {
     let arms: [PulseArm]
     @State private var engine: AetherEngine?
+    /// The engine of an `overlay` arm, shown through AVKit instead of `AetherPlayerSurface`.
+    @State private var overlayEngine: AetherEngine?
     @State private var slate: String = ""
     @State private var host = PulseHostView()
     @State private var armInfo = ""
@@ -125,6 +131,9 @@ struct PulseHarnessView: View {
             PulseHostRepresentable(host: host).ignoresSafeArea()
             if let engine {
                 AetherPlayerSurface(engine: engine).ignoresSafeArea()
+            }
+            if let overlayEngine {
+                OverlayPlayerRepresentable(engine: overlayEngine).ignoresSafeArea()
             }
             if !slate.isEmpty {
                 VStack(spacing: 30) {
@@ -174,7 +183,7 @@ struct PulseHarnessView: View {
         displayMode.start(window: { [host] in host.window }, log: say)
         // Without the trait the engine accepts preferDualLayerDolbyVision and plays the native route, so
         // every `engine` and `soak` arm would film the wrong thing. Refuse the whole sequence instead.
-        if arms.contains(where: { $0.mode == "engine" || $0.mode == "soak" }),
+        if arms.contains(where: { ["engine", "overlay", "soak"].contains($0.mode) }),
            !AetherEngine.OptionalComponent.dualLayerDolbyVision.isBuiltIn {
             slate = "AetherEngine was built without the DualLayerDolbyVision trait"
             say("ERROR: the engine and soak arms need AetherEngine's DualLayerDolbyVision trait, which this "
@@ -197,7 +206,7 @@ struct PulseHarnessView: View {
                 await host.playAVPlayer(arm.url, seconds: arm.params["secs"].flatMap(Double.init), log: say)
             case "vt", "vtcopy", "vtstrip":
                 await host.playVT(arm.url, mode: arm.mode, log: say)
-            case "engine":
+            case "engine", "overlay":
                 let out = arm.params["out"] ?? AetherEngine.FelOutputMode.sv22.rawValue
                 guard let mode = AetherEngine.FelOutputMode(rawValue: out) else {
                     say("unknown out=\(out), arm skipped")
@@ -218,7 +227,8 @@ struct PulseHarnessView: View {
                 }
                 AetherEngine.felOutputMode = mode
                 say("fel output \(mode.rawValue)")
-                await playEngine(arm.url, fel: true, seconds: arm.params["secs"].flatMap(Double.init), log: say)
+                await playEngine(arm.url, fel: true, overlay: arm.mode == "overlay",
+                                 seconds: arm.params["secs"].flatMap(Double.init), log: say)
                 AetherEngine.felOutputMode = .sv22   // back to the engine default
                 AetherEngine.felComposedRpuOverride = nil
             case "enginenofel":
@@ -264,21 +274,24 @@ struct PulseHarnessView: View {
     }
 
     /// Plays `url` once through (at most 80 s), or for `seconds`, starting the clip over each time it ends.
+    /// `overlay` composes the FEL over AVPlayer on the native route (`LoadOptions.felOverlay`), shown through AVKit.
     @MainActor
-    private func playEngine(_ url: URL, fel: Bool, seconds: Double? = nil, log: @Sendable (String) -> Void) async {
+    private func playEngine(_ url: URL, fel: Bool, overlay: Bool = false, seconds: Double? = nil,
+                            log: @Sendable (String) -> Void) async {
         guard let e = try? AetherEngine() else { log("engine init failed"); return }
-        engine = e
+        if overlay { overlayEngine = e } else { engine = e }
+        defer { engine = nil; overlayEngine = nil }
         do {
             try await e.load(url: url, startPosition: nil,
                              options: LoadOptions(dolbyVisionHandling: .automatic, preferDualLayerDolbyVision: fel,
-                                                  audioBridgeMode: .surroundCompat),
+                                                  felOverlay: overlay, audioBridgeMode: .surroundCompat),
                              audioSourceStreamIndex: nil)
             e.play()
         } catch {
             log("engine load failed: \(error)")
-            engine = nil
             return
         }
+        if overlay { log("route=\(e.videoRoute.rawValue) felOverlay=\(e.felOverlay != nil ? "on" : "off")") }
         let deadline = Date().addingTimeInterval(min(seconds ?? 80, 80))
         while Date() < deadline {
             if e.state == .ended {
@@ -291,7 +304,6 @@ struct PulseHarnessView: View {
         }
         log("engine state=\(e.state) t=\(e.currentTime)")
         e.stop()
-        engine = nil
     }
 
     /// Long-run FEL playback with a seek schedule. Measures only what the engine exposes publicly:
@@ -401,4 +413,64 @@ private struct PulseHostRepresentable: UIViewRepresentable {
     let host: PulseHostView
     func makeUIView(context: Context) -> PulseHostView { host }
     func updateUIView(_ uiView: PulseHostView, context: Context) {}
+}
+
+/// An `overlay` arm's picture: the engine's AVPlayer in an `AVPlayerViewController`, with the engine's FEL
+/// overlay installed in AVKit's render layer (Sodalite's `PlayerHostController.installFelOverlay`).
+private struct OverlayPlayerRepresentable: UIViewControllerRepresentable {
+    let engine: AetherEngine
+
+    func makeUIViewController(context: Context) -> OverlayPlayerController { OverlayPlayerController(engine: engine) }
+    func updateUIViewController(_ controller: OverlayPlayerController, context: Context) {}
+}
+
+private final class OverlayPlayerController: AVPlayerViewController {
+    private let engine: AetherEngine
+    private var subscriptions: Set<AnyCancellable> = []
+
+    init(engine: AetherEngine) {
+        self.engine = engine
+        super.init(nibName: nil, bundle: nil)
+        showsPlaybackControls = false
+        // The engine writes the display criteria, as in Sodalite.
+        appliesPreferredDisplayCriteriaAutomatically = false
+        engine.$currentAVPlayer
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] player in
+                self?.player = player
+                self?.installOverlay()
+            }
+            .store(in: &subscriptions)
+        engine.$felOverlay
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.installOverlay() }
+            .store(in: &subscriptions)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        installOverlay()
+    }
+
+    /// Puts the overlay inside AVKit's player layer once both exist; a no-op when it is already there.
+    private func installOverlay() {
+        guard let overlay = engine.felOverlay, let player, let root = viewIfLoaded?.layer,
+              let renderLayer = Self.playerLayer(of: player, in: root) else { return }
+        var ancestor = overlay.layer.superlayer
+        while let current = ancestor, current !== renderLayer { ancestor = current.superlayer }
+        if ancestor === renderLayer { return }
+        overlay.layer.removeFromSuperlayer()
+        let belowSubtitles = overlay.install(in: renderLayer)
+        PulseLog.shared.note("[Pulse] FEL overlay installed in AVKit's render layer (\(belowSubtitles ? "below its subtitles" : "on top"))")
+    }
+
+    private static func playerLayer(of player: AVPlayer, in layer: CALayer) -> AVPlayerLayer? {
+        if let candidate = layer as? AVPlayerLayer, candidate.player === player { return candidate }
+        for sub in layer.sublayers ?? [] {
+            if let hit = playerLayer(of: player, in: sub) { return hit }
+        }
+        return nil
+    }
 }

@@ -16,6 +16,9 @@
 #   DEVICE=... SEQ=card ./run_tv.sh             amplifier RPU on p7fel_card (14 s per arm): TR p010-round, TD p010, TB p010-bluenoise,
 #                                               TF p010-full, TS sv22 (card_amp10.bin); TI identity
 #                                               control; BR/BF/BS the p7fel_bullseye banding fallback, no override
+#   DEVICE=... SEQ=cardov ./run_tv.sh           the amplifier card on both FEL routes (14 s per arm): TR/TS software host
+#                                               p010-round / sv22, then OR/OS the native route's FEL overlay (felOverlay),
+#                                               OI the overlay's identity control
 #   DEVICE=... SEQ=count ./run_tv.sh            counter clips: T / NE / TL (FEL route, residual, RPU pulse) and PM (8.1 control)
 #   DEVICE=... SEQ=soak SOAK_URL=<http url | file under $PULSE_OUT> [SOAK_MIN=5] [SOAK_SEEKS=60@1800,150@600,240@3000] ./run_tv.sh
 #                                               one FEL soak arm; its summary line is grepped at the end
@@ -134,7 +137,18 @@ case "$SEQ" in
     for f in p7fel_card.mp4 card_amp10.bin card_identity.bin p7fel_bullseye.mp4; do
       [[ -e "$OUT/$f" ]] || { echo "missing $OUT/$f (Scripts/build.sh makes it)"; exit 1; }
     done ;;
-  *) echo "unknown SEQ=$SEQ (main|el|vt|count|cm4|cm4q|l8ladder|fmt|bits|card|soak)"; exit 1 ;;
+  cardov)
+    # The card on the software host (T*) and on the native route's FEL overlay (O*), same clip and amplifier: does
+    # the overlay keep the sub-10-bit steps the software route was shown to keep (2026-10-19)?
+    C="$B/p7fel_card.mp4"; A10="rpu=$B/card_amp10.bin;secs=14"
+    ARMS="TR|engine|$C|out=p010-round;$A10,TS|engine|$C|out=sv22;$A10"
+    ARMS+=",OR|overlay|$C|out=p010-round;$A10,OS|overlay|$C|out=sv22;$A10"
+    ARMS+=",OI|overlay|$C|out=p010-full;rpu=$B/card_identity.bin;secs=14"
+    LABELS=TR,TS,OR,OS,OI
+    for f in p7fel_card.mp4 card_amp10.bin card_identity.bin; do
+      [[ -e "$OUT/$f" ]] || { echo "missing $OUT/$f (Scripts/build.sh makes it)"; exit 1; }
+    done ;;
+  *) echo "unknown SEQ=$SEQ (main|el|vt|count|cm4|cm4q|l8ladder|fmt|bits|card|cardov|soak)"; exit 1 ;;
 esac
 
 if [[ "${1:-}" != "--no-build" ]]; then
@@ -153,19 +167,19 @@ sleep 1
 
 LOG=tv_${SEQ}_$(date +%Y%m%d_%H%M%S).log
 echo "labels for analyze.py: --arms $LABELS"
-if [[ "$SEQ" == card ]]; then
+if [[ "$SEQ" == card || "$SEQ" == cardov ]]; then
   cat <<'LEGEND'
 what to look for (top-left label: arm, out=, rpu=, and the mode tvOS is sending; expect Dolby Vision):
-  border visible     the amplifier RPU is active (TI, the identity control: expect flat grey)
+  border visible     the amplifier RPU is active (TI and OI, the identity controls: expect flat grey)
   "½" visible        rounded or better
-  "12" clean         12 or more bits survive tvOS's output (watch TF/TS)
+  "12" clean         12 or more bits survive tvOS's output (watch TF/TS, and OS on the overlay)
   speckled           dither (TD ordered, TB blue noise)
   BR/BF/BS           the bullseye banding fallback, no override: compare the rings across the three
 LEGEND
 fi
 case "$SEQ" in
   soak) ;;
-  card|cm4q|l8ladder) echo "watch the TV (no recording needed); launching in 10 s" ;;
+  card|cardov|cm4q|l8ladder) echo "watch the TV (no recording needed); launching in 10 s" ;;
   *) echo "start the phone recording now; launching in 10 s" ;;
 esac
 sleep 10
