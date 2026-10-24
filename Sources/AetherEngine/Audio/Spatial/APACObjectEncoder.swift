@@ -151,6 +151,9 @@ final class APACObjectEncoder: APACChunkEncoding {
     private var ended = false
     /// Whether the codec is initialized for coding: not until the first encode (`APACCodecGate`).
     private var started = false
+    /// Packets the codec has made since it started: it makes an Audio Sync Packet every
+    /// `APACEncoder.syncPacketInterval` of them, from the first (`kAudioCodecPropertyASPFrequency`).
+    private var packetsSinceStart = 0
     /// Frames still to code under `APACCodecGate` since the codec started or was reset.
     private var gatedFramesLeft = APACObjectEncoder.gatedFrames
     static let gatedFrames = 4096
@@ -221,6 +224,8 @@ final class APACObjectEncoder: APACChunkEncoding {
             try set("bit rate control mode", kAudioCodecPropertyBitRateControlMode,
                     UInt32(kAudioCodecBitRateControlMode_Constant))
             try set("bit rate", kAudioCodecPropertyCurrentTargetBitRate, UInt32(bitRate))
+            // A sync packet on every segment's first packet (`APACEncoder.syncPacketInterval`).
+            try set("sync packet frequency", kAudioCodecPropertyASPFrequency, UInt32(APACEncoder.syncPacketInterval))
             var settings: Unmanaged<CFDictionary> = Unmanaged.passRetained(
                 try Self.settings(codec: codec, objectSettings: objectSettings, sceneSettings: sceneSettings) as CFDictionary)
             defer { settings.release() }
@@ -318,6 +323,7 @@ final class APACObjectEncoder: APACChunkEncoding {
         let status = AudioCodecInitialize(codec, nil, nil, nil, 0)
         guard status == 0 else { throw EncoderError.property("initialize", status) }
         started = true
+        packetsSinceStart = 0
     }
 
     func flush() throws -> [APACEncoder.Packet] {
@@ -866,9 +872,11 @@ final class APACObjectEncoder: APACChunkEncoding {
             }
             guard result == 0 else { throw EncoderError.encode("produce", result) }
             if count > 0, size > 0 {
-                // With the converter's defaults every APAC packet is an Audio Sync Packet
-                // (`APACEncoder`); this path sets nothing that changes that.
-                packets.append(.init(data: Data(outputBuffer.prefix(Int(size))), isSync: true))
+                // The codec states no packet dependencies here; its sync packets come on the cadence
+                // it was given.
+                packets.append(.init(data: Data(outputBuffer.prefix(Int(size))),
+                                     isSync: packetsSinceStart % APACEncoder.syncPacketInterval == 0))
+                packetsSinceStart += 1
             }
             if status == kAudioCodecProduceOutputPacketNeedsMoreInputData || count == 0 { return }
         }

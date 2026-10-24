@@ -254,7 +254,8 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         channels = layout.channelCount
         hlsCodecs = APACSampleEntry.codecsString(channelCount: layout.channelCount)
 #endif
-        peakOutputBitRate = Int64(rate)
+        // Constant mode holds the target; the sync packets each add about a packet (`APACEncoder.peakBitRate`).
+        peakOutputBitRate = Int64(APACEncoder.peakBitRate(target: rate))
         let pipeline = APACEncodePipeline(
             encoder: encoder, channels: channels, bufferFrames: Self.encodeChunkFrames * 4)
         self.pipeline = pipeline

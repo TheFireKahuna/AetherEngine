@@ -261,7 +261,10 @@ struct SpatialAudioBridgeTests {
         // frame plays on the anchor.
         #expect(packets.first?.pts == Int64(48_200))
         #expect(zip(packets, packets.dropFirst()).allSatisfy { $1.pts - $0.pts == 1024 })
-        #expect(packets.allSatisfy { $0.key && $0.size > 0 })
+        #expect(packets.allSatisfy { $0.size > 0 })
+        // The run's sync packets, keyframes to the muxer: every interval from its first packet.
+        #expect(packets.indices.filter { packets[$0].key }
+                == Array(stride(from: 0, to: packets.count, by: APACEncoder.syncPacketInterval)))
         // 96000 frames in, 200 of them skipped, after two packets of priming; the flush pads the
         // last partial packet.
         #expect(packets.count == 2 + Int((Double(96_000 - 200) / 1024).rounded(.up)))
