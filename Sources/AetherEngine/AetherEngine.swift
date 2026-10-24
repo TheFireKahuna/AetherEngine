@@ -2298,6 +2298,29 @@ public final class AetherEngine: ObservableObject {
 
     /// Throws CancellationError when the captured generation is stale. Callers must clean up local resources
     /// before calling; shared state belongs to the successor.
+    /// What a load's probe read of its video stream's shape.
+    struct ProbedGeometry: Equatable, Sendable {
+        let width: Int32
+        let height: Int32
+        let pixelAspect: Double?
+    }
+
+    /// Publishes the geometry a load's probe read, only while that load is still the current one
+    /// (audit LIF-107). The AE#532 RPU audit is a second read `stopInternal` cannot abort, so a
+    /// superseded load can come back from it after its successor's prologue has reset the geometry,
+    /// and writing then would put this source's width over the successor's. The generation is the
+    /// one fact that tells the two apart, so the check and the write are one step here rather than
+    /// two that a later edit could separate. Returns whether it published.
+    @discardableResult
+    func publishProbedGeometry(_ geometry: ProbedGeometry, codec: AVCodecID, forGeneration gen: UInt64) -> Bool {
+        guard loadGeneration == gen else { return false }
+        sourceVideoWidth = geometry.width
+        sourceVideoHeight = geometry.height
+        if let pixelAspect = geometry.pixelAspect { sourceVideoPixelAspectRatio = pixelAspect }
+        lastDetectedVideoCodec = codec
+        return true
+    }
+
     func checkLoadCurrent(_ gen: UInt64) throws {
         guard loadGeneration == gen else {
             EngineLog.emit(
@@ -4604,10 +4627,8 @@ public final class AetherEngine: ObservableObject {
         var probedAudioTracks: [TrackInfo] = []
         var probedSubtitleTracks: [TrackInfo] = []
         var probedDefaultAudioIndex: Int32 = -1
-        // Audit LIF-107: published only after the post-probe generation check below. The AE#532 audit
-        // is a second read `stopInternal` cannot abort, so a superseded load can return from it after
-        // its successor's prologue and would write this source's geometry over the reset.
-        var probedGeometry: (width: Int32, height: Int32, pixelAspect: Double?)?
+        // Audit LIF-107: published by `publishProbedGeometry`, which writes only for the current load.
+        var probedGeometry: ProbedGeometry?
         // AE#493: what this session takes the display to be. The observed table is what the platform
         // could answer; the session table adds what the host asserted, because Dolby Vision has no
         // public capability API on macOS and eligibility deliberately does not claim it. Composed once,
@@ -4765,7 +4786,8 @@ public final class AetherEngine: ObservableObject {
                     width: width,
                     height: height
                 )
-                probedGeometry = (width, height, sar.map { Double($0.num) / Double($0.den) })
+                probedGeometry = ProbedGeometry(
+                    width: width, height: height, pixelAspect: sar.map { Double($0.num) / Double($0.den) })
                 detectedVideoBitrate = probe.declaredBitrate(stream: stream)
                 detectedVideoStreamFormat = VideoStreamFormat(codecpar: stream.pointee.codecpar)
             }
@@ -4788,10 +4810,7 @@ public final class AetherEngine: ObservableObject {
             try checkLoadCurrent(gen)
         }
         if let probedGeometry {
-            sourceVideoWidth = probedGeometry.width
-            sourceVideoHeight = probedGeometry.height
-            if let pixelAspect = probedGeometry.pixelAspect { sourceVideoPixelAspectRatio = pixelAspect }
-            lastDetectedVideoCodec = detectedCodecID
+            publishProbedGeometry(probedGeometry, codec: detectedCodecID, forGeneration: gen)
         }
 
         // Custom sources have no URL to reopen from: a failed probe is fatal.

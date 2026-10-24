@@ -25,7 +25,7 @@ struct MatroskaSubtitleIndexLiveTests {
         let source = IOReaderByteSource(reader)
         defer { source.close() }
         var started = Date()
-        let index = try MatroskaSubtitleIndex.read(from: source)
+        let index = try MatroskaSubtitleIndex.read(from: source, token: .forParserTests)
         print("[MKVIndex] index read in \(String(format: "%.2f", Date().timeIntervalSince(started))) s: "
               + "tracks \(index.blocksByTrack.keys.sorted()), scale \(index.timestampScale), "
               + "cluster size field \(index.clusterSizeFieldLength.map(String.init) ?? "varies")")

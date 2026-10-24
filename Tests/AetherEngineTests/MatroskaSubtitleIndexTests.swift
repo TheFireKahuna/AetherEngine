@@ -55,7 +55,7 @@ struct MatroskaSubtitleIndexTests {
     /// Video track 1, text track 2, zlib PGS track 3, header-stripped track 4; clusters with 3- and
     /// 8-byte size fields; cues for every subtitle block, and for one video block without a relative
     /// position.
-    private static func fixture(dropCueFor dropTrack: UInt64? = nil) -> Fixture {
+    static func fixture(dropCueFor dropTrack: UInt64? = nil) -> Fixture {
         let ebml = element(0x1A45DFA3, element(0x4282, Array("matroska".utf8)))
         let info = element(0x1549A966, uint(0x2AD7B1, 1_000_000))
         let tracks = element(0x1654AE6B,
@@ -152,7 +152,7 @@ struct MatroskaSubtitleIndexTests {
     @Test("the index is found through the SeekHead and lists every subtitle block in time order")
     func readsIndex() throws {
         let fixture = Self.fixture()
-        let index = try MatroskaSubtitleIndex.read(from: source(fixture))
+        let index = try MatroskaSubtitleIndex.read(from: source(fixture), token: .forParserTests)
         #expect(index.timestampScale == 1_000_000)
         #expect(index.blocksByTrack[2]?.map(\.ticks) == [10, 5100])
         #expect(index.blocksByTrack[3]?.count == 1)
@@ -166,7 +166,7 @@ struct MatroskaSubtitleIndexTests {
     func readsFrames() throws {
         let fixture = Self.fixture()
         let src = source(fixture)
-        let index = try MatroskaSubtitleIndex.read(from: src)
+        let index = try MatroskaSubtitleIndex.read(from: src, token: .forParserTests)
         for track: UInt64 in [2, 3, 4] {
             for (block, expected) in zip(index.blocksByTrack[track]!, fixture.expected[track]!) {
                 let frame = try #require(index.readFrame(block, track: track, from: src))
@@ -179,12 +179,12 @@ struct MatroskaSubtitleIndexTests {
 
     @Test("a track is complete only when its cues number its frames, all addressable and decodable")
     func completeness() throws {
-        let index = try MatroskaSubtitleIndex.read(from: source(Self.fixture()))
+        let index = try MatroskaSubtitleIndex.read(from: source(Self.fixture()), token: .forParserTests)
         #expect(index.isComplete(track: 2, frameCount: 2))
         #expect(!index.isComplete(track: 2, frameCount: 3))
         #expect(!index.isComplete(track: 2, frameCount: nil))
         #expect(!index.isComplete(track: 1, frameCount: 2))
-        let dropped = try MatroskaSubtitleIndex.read(from: source(Self.fixture(dropCueFor: 3)))
+        let dropped = try MatroskaSubtitleIndex.read(from: source(Self.fixture(dropCueFor: 3)), token: .forParserTests)
         #expect(!dropped.isComplete(track: 3, frameCount: 1))
     }
 
@@ -196,7 +196,7 @@ struct MatroskaSubtitleIndexTests {
         #expect(!plain.isForced && !plain.isSelfContained)
         let fixture = Self.fixture()
         let src = source(fixture)
-        let index = try MatroskaSubtitleIndex.read(from: src)
+        let index = try MatroskaSubtitleIndex.read(from: src, token: .forParserTests)
         let prefix = try #require(index.readFrame(index.blocksByTrack[3]![0], track: 3, from: src, prefix: 64))
         #expect(prefix.isPrefix)
         #expect(PGSCompositionHeader.parse(prefix.payload)?.isForced == true)
@@ -205,7 +205,7 @@ struct MatroskaSubtitleIndexTests {
     @Test("a file that is not Matroska, or has no Cues, is refused")
     func refusals() {
         #expect(throws: MatroskaSubtitleIndex.ReadError.notMatroska) {
-            try MatroskaSubtitleIndex.read(from: IOReaderByteSource(DataIOReader(data: Data(repeating: 7, count: 4096))))
+            try MatroskaSubtitleIndex.read(from: IOReaderByteSource(DataIOReader(data: Data(repeating: 7, count: 4096))), token: .forParserTests)
         }
     }
 
@@ -253,7 +253,7 @@ struct MatroskaSubtitleIndexTests {
     @Test("a subtitle TrackEntry libavformat skips (no S or D CodecID) is not counted")
     func skippedEntriesAreNotCounted() throws {
         let fixture = Self.fixture()
-        let index = try MatroskaSubtitleIndex.read(from: source(fixture))
+        let index = try MatroskaSubtitleIndex.read(from: source(fixture), token: .forParserTests)
         #expect(index.subtitleTracks.map(\.number) == [2, 3, 4])
     }
 
