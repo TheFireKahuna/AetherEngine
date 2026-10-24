@@ -12,18 +12,28 @@ the public-API contract.
 
 ### Added
 
-- **An HDR session's I-frame rendition keeps its own keyframes and adds an SDR companion** (#682). With
+- **An HDR session's I-frame rendition keeps its own keyframes and adds a 10-bit SDR HEVC tier** (#682). With
   `serveIFramePlaylist`, an HDR10, HLG or Dolby Vision session used to list tone-mapped Motion JPEG stills
-  instead of its keyframes. It now lists the keyframes with the variant's own codec and range (on a Dolby Vision
-  session `hvc1` with `SUPPLEMENTAL-CODECS="dvh1.08.06/db1p"` and `VIDEO-RANGE=PQ`, a profile 7 FEL source
-  converted to 8.1 like the playing samples), so trick play scans in HDR, and beside it the SDR tier
-  `LoadOptions.iFrameHDRStills` names (`iframe_sdr.m3u8`): `.toneMappedJPEG` (default), `.keyframesOnly`, or the
-  experimental `.keyframesLabeledSDR`. The layout is Apple's own: decoding tvOS 27.2's AVKit and MediaToolbox
-  shows the scrub thumbnail comes from a second AVPlayer with the Scanning role, which the resource arbiter leaves
-  without a preferred range, so its variant filter takes the lowest video range on offer. Measured on an Apple TV
-  4K (tvOS 27) with a Dolby Vision profile 7 title: thumbnails with the JPEG companion; with the keyframes alone,
-  only the frame at the playhead; with SDR-labelled keyframes, none. The companion is built from the same keyframe
-  reads, so it costs no second reader, and the three-second refused-variant guard now applies to it alone.
+  instead of its keyframes. It now lists the keyframes with the variant's own codec, range and `HDCP-LEVEL` (on a
+  Dolby Vision session `hvc1` with `SUPPLEMENTAL-CODECS="dvh1.08.06/db1p"` and `VIDEO-RANGE=PQ`, a profile 7 FEL
+  source converted to 8.1 like the playing samples), so trick play scans in HDR, and beside it the SDR trick-play
+  tier the HLS Authoring Specification requires on tvOS (6.16), in Apple's own shape: 800x450 HEVC Main10
+  BT.709 stills (`iframe_sdr.m3u8`, `IFrameStillBuilder`), tone-mapped by VideoToolbox from the decoded keyframe
+  and encoded by the hardware encoder, declared with `AVERAGE-BANDWIDTH`, `BANDWIDTH`, `VIDEO-RANGE=SDR` and the
+  encoder's own codec string. The SDR tier is not optional: decoding tvOS 27.2's MediaToolbox shows the scrub
+  thumbnail comes from a second AVPlayer in the Scanning role, which the resource arbiter caps at SDR on Apple TV
+  (`CelestialShouldLimitHDRConcurrentPlayback`), so any HDR I-frame (PQ, HLG, Dolby Vision, at any size) fails
+  it with CoreMedia -16042 and SDR-labelled HDR keyframes with -12927. Measured on an Apple TV 4K with a Dolby
+  Vision profile 7 title: a thumbnail in about 110 ms, 25 ms of it the still, the rest the keyframe read. The
+  tier is built from the same keyframe reads, so it costs no second reader, and the three-second refused-variant
+  guard applies to it alone. `LoadOptions.iFrameHDRStills` and `IFrameHDRStills`, the experiment that found
+  this, are removed.
+
+- **I-frame playlists step about once a second** (#682). Both tiers list the source's own indexed keyframes,
+  at least 0.75 s apart, instead of one per media segment (the dense tier of 6.2, from the content's keyframes
+  as 6.3 allows), so fast-forward and rewind on the native transport bar move in finer strides; the media
+  segments are unchanged. The keyframe tier now declares `AVERAGE-BANDWIDTH` too: one keyframe, estimated at
+  2.5 times the variant's average frame (2.3 measured on a 71 Mbit/s Dolby Vision remux), over the mean entry.
 
 - **Dolby Vision FEL titles keep their TrueHD Atmos.** The dual-layer route plays on the software host, which
   decoded TrueHD to its 7.1 presentation. With `objectAudioRendering` on (and the `TrueHDObjectAudio` trait), a
@@ -265,8 +275,8 @@ the public-API contract.
 - **SDR scrub stills decode on one VideoToolbox session and touch no disk** (#682). Each still used to wrap its
   keyframe in an MP4 fragment written through a staging file, then open a demuxer, a decoder and a VideoToolbox
   session over it and discard them. `FrameDecodeContext` gains a packet-fed mode, opened once from the stream's
-  parameters, into which `IFrameJPEGBuilder` hands the keyframe directly; the tone map, Dolby Vision reshaping
-  and colour handling are the ones every still uses. The keyframe tier's fragments are muxed in memory
+  parameters, into which `IFrameStillBuilder` hands the keyframe directly, scaled and tone-mapped on
+  VideoToolbox (`decodeScaledStill`); Dolby Vision profile 5 and software decodes keep the CPU path every still uses. The keyframe tier's fragments are muxed in memory
   (`MP4SegmentMuxer` `inMemory`, `takeFragmentInMemory()`), the keyframe payload cache is in memory with a
   128 MB cap, and about 1,500 built stills stay in memory instead of 128. Before the change AVKit, which asks for
   one still at a time, received one every 110 to 250 ms during a scrub. Every 20 stills the session log

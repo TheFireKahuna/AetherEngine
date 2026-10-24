@@ -249,8 +249,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// AE#682: the host asked for an I-frame rendition. Whether the session can serve one is decided
     /// in `start()` and read back as `iFrameRenditionVerdict`.
     var iFramePlaylistRequested = false
-    /// `LoadOptions.iFrameHDRStills`: the SDR companion an HDR session lists beside its keyframes. Set before `start()`.
-    var iFrameHDRStills: IFrameHDRStills = .toneMappedJPEG
     /// AE#682: an independent reader for a custom-IO source, which this session cannot reopen by URL.
     /// Set before `start()`. The session owns it from then on and closes it: through the side reader
     /// that took it, at once when the rendition stays absent, or in `stop()`.
@@ -841,6 +839,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// encoder state survives producer restarts; `startSegment()` rebases PTS on each restart.
     var audioBridge: (any AudioTranscodingBridge)?
     var segmentPlan: [Segment] = []
+    /// AE#682: every indexed keyframe of a keyframe-aligned plan, on its axis; the I-frame timeline is
+    /// thinned from these (`iFrameEntries`). Empty for every other plan.
+    var planKeyframePts: [Int64] = []
 
     /// AE#408: true only while `segmentPlan` is the keyframe-aligned plan, whose boundaries are
     /// container index entries and therefore CLAIM to be random-access points. The producer re-aims
@@ -1562,6 +1563,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     sourceDurationSeconds: durationSeconds
                 )
                 planBoundariesClaimRandomAccess = true
+                planKeyframePts = keyframes
                 keyframeBytePositions = Dictionary(keyframeEntries.map { ($0.pts, $0.pos) },
                                                    uniquingKeysWith: { first, _ in first })
                 // AE#561: these boundaries ARE this container's index entries, so they carry its
@@ -2519,6 +2521,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             iFrameRendition = rendition
             prov.setIFrameSource(rendition)
             EngineLog.emit("[HLSVideoEngine] i-frame rendition: served segments=\(plan.count) "
+                           + "entries=\(rendition.entries.count) "
                            + "format=\(rendition.format.logName) "
                            + "sdrCompanion=\(rendition.companionFormat?.logName ?? "none")", category: .session)
         } else if iFramePlaylistRequested {
@@ -3253,6 +3256,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let reopenReader = reopenCustomReader
         reopenCustomReader = nil
         segmentPlan = []
+        planKeyframePts = []
         restartLock.unlock()
         reopening?.markClosed()
         // The restart that opened it closes it once it sees the epoch moved.
@@ -3306,9 +3310,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     // MARK: - I-frame rendition (AE#682)
 
-    /// The keyframes are always served with their own range. `sourceIsHDR` adds the SDR companion
-    /// `iFrameHDRStills` names: AVKit's scrub thumbnail player takes the lowest video range on offer, and
-    /// shows no thumbnail from a PQ or Dolby Vision keyframe.
+    /// The keyframes are always served with their own range, so the main player scans on them in HDR. An HDR
+    /// source adds the SDR HEVC stills tvOS requires (`IFrameStillBuilder`): AVKit's scrub thumbnail player is
+    /// capped at SDR and takes the lowest video range on offer.
     private func makeIFrameRendition(plan: [Segment], cache segmentCache: SegmentCache,
                                      sourceIsHDR: Bool) -> IFrameRendition? {
         guard let cfg = savedVideoConfig, !plan.isEmpty else { return nil }
@@ -3323,48 +3327,39 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 convertsAnnexBSamples: cfg.convertsAnnexBSamples,
                 nalFramingLatch: cfg.nalFramingLatch),
             stagingDir: staging)
+        let entries = Self.iFrameEntries(plan: plan, keyframes: planKeyframePts,
+                                         timeBaseSeconds: sourceVideoTbSeconds)
         let buildKeyframe: (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output? = { payload, index, entry in
             keyframeBuilder.build(payload: payload, index: index,
                                   startSeconds: entry.startSeconds, durationSeconds: entry.durationSeconds)
         }
-        // HDR keyframes are always listed with their own range (the Dolby Vision tier for a DV session),
-        // so the main player can scan on them; the SDR companion is what AVKit's thumbnail player takes.
         var companion: (format: IFrameRenditionFormat,
                         build: (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?)?
         let par = cfg.codecpar.pointee
-        if sourceIsHDR {
-            switch iFrameHDRStills {
-            case .toneMappedJPEG:
-                if let size = IFrameJPEGBuilder.size(
-                    codedWidth: Int(par.width), codedHeight: Int(par.height),
-                    sarNum: par.sample_aspect_ratio.num, sarDen: par.sample_aspect_ratio.den) {
-                    // The decoder reads the samples as the session serves them: Annex B ones with the
-                    // source's own extradata, length-prefixed ones with the record the muxer writes.
-                    let decoder = FrameDecodeContext(
-                        streamParameters: cfg.codecpar, timeBase: cfg.timeBase,
-                        extradata: cfg.convertsAnnexBSamples ? nil : cfg.extradataOverride)
-                    let jpeg = IFrameJPEGBuilder(decoder: decoder, width: size.width, height: size.height)
-                    let shortest = plan.map(\.durationSeconds).filter { $0 > 0 }.min() ?? 1
-                    companion = (.jpeg(width: size.width, height: size.height,
-                                       bandwidth: IFrameJPEGBuilder.bandwidth(shortestSegmentSeconds: shortest)),
-                                 { payload, index, entry in
-                                     jpeg.build(payload: payload, index: index,
-                                                startSeconds: entry.startSeconds, durationSeconds: entry.durationSeconds)
-                                 })
-                }
-            case .keyframesLabeledSDR:
-                companion = (.keyframesLabeledSDR, buildKeyframe)
-            case .keyframesOnly:
-                companion = nil
-            }
+        if sourceIsHDR, let size = IFrameStillBuilder.size(
+            codedWidth: Int(par.width), codedHeight: Int(par.height),
+            sarNum: par.sample_aspect_ratio.num, sarDen: par.sample_aspect_ratio.den),
+           // The decoder reads the samples as the session serves them: Annex B ones with the source's own
+           // extradata, length-prefixed ones with the record the muxer writes.
+           let still = IFrameStillBuilder(
+            decoder: FrameDecodeContext(streamParameters: cfg.codecpar, timeBase: cfg.timeBase,
+                                        extradata: cfg.convertsAnnexBSamples ? nil : cfg.extradataOverride),
+            width: size.width, height: size.height) {
+            let durations = entries.map(\.durationSeconds).filter { $0 > 0 }
+            let shortest = durations.min() ?? 1
+            let mean = durations.isEmpty ? 1 : durations.reduce(0, +) / Double(durations.count)
+            companion = (.sdrStills(width: still.width, height: still.height, codecs: still.codecs,
+                                    bandwidth: IFrameStillBuilder.bandwidth(shortestSegmentSeconds: shortest),
+                                    averageBandwidth: IFrameStillBuilder.averageBandwidth(meanSegmentSeconds: mean)),
+                         { payload, index, entry in
+                             still.build(payload: payload, index: index, startSeconds: entry.startSeconds,
+                                         durationSeconds: entry.durationSeconds)
+                                 .map { IFrameFragmentBuilder.Output(initSegment: $0.initSegment, fragment: $0.fragment) }
+                         })
         }
         // The side reader owns the clone from here; `stop()` must not close it a second time.
         let custom = customIFrameReader
         customIFrameReader = nil
-        let entries = plan.map {
-            IFrameRendition.Entry(startPts: $0.startPts, startSeconds: $0.startSeconds,
-                                  durationSeconds: $0.durationSeconds)
-        }
         return makeKeyframeRendition(
             config: cfg, entries: entries,
             cache: IFramePayloadCache(),

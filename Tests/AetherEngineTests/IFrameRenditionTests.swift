@@ -239,3 +239,14 @@ struct IFrameRenditionTests {
         #expect(throttle.shouldEmit(now: t0.addingTimeInterval(11)) == 1)
     }
 }
+
+struct IFrameBuildTimingTests {
+    @Test("the summary averages the whole window, not the last still")
+    func averagesTheWindow() {
+        var timing = IFrameBuildTiming(window: 2)
+        timing.noteRead(ms: 50, bytes: 1024)
+        #expect(timing.noteStill(totalMs: 100, buildMs: 40) == nil)
+        let line = timing.noteStill(totalMs: 200, buildMs: 60)
+        #expect(line == "2 answered, avg 150 ms (max 200): build 50 ms; 1 source reads avg 50 ms, 1 KB")
+    }
+}
