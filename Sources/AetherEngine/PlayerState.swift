@@ -1686,6 +1686,65 @@ func audioChannelLayoutTag(for channels: Int32) -> AudioChannelLayoutTag {
     }
 }
 
+/// Whether `layout` carries an LFE.
+func channelLayoutHasLFE(_ layout: UnsafePointer<AVChannelLayout>) -> Bool {
+    av_channel_layout_index_from_channel(layout, AV_CHAN_LOW_FREQUENCY) >= 0
+}
+
+/// Source layouts carrying an LFE that the default layout for their count has no slot for (4 and 5
+/// channels default to 4.0 and 5.0, and swr drops an input channel the output lacks, its
+/// `lfe_mix_level` being 0), but whose own order has an exact CoreAudio tag. They are resampled in
+/// that order and stamped with it. Each tag expands to these channels on tvOS 27.2 as on macOS 27
+/// (its AudioToolboxCore's `AudioFormatProperty_ChannelLayoutForTag`, run under emulation).
+let exactResamplerLayouts: [(name: String, tag: AudioChannelLayoutTag)] = [
+    ("3.1", kAudioChannelLayoutTag_DVD_10),            // FL FR FC LFE     -> L R C LFE
+    ("4.1", kAudioChannelLayoutTag_DVD_11),            // FL FR FC LFE BC  -> L R C LFE Cs
+    ("FL+FR+LFE+BC", kAudioChannelLayoutTag_DVD_5),    // FL FR LFE BC     -> L R LFE Cs
+    ("FL+FR+LFE+BL+BR", kAudioChannelLayoutTag_DVD_6), // FL FR LFE BL BR  -> L R LFE Ls Rs
+]
+
+/// What `AudioDecoder` resamples a source into and how it stamps it: the order the bytes are in and
+/// the tag that names that order come from this one decision (#401).
+struct ResamplerOutput: Equatable {
+    let channels: Int32
+    /// The source's own layout when it is one of `exactResamplerLayouts`; nil for the count's own.
+    let exactLayout: String?
+    let tag: AudioChannelLayoutTag
+
+    init(channels: Int32, exactLayout: String?, tag: AudioChannelLayoutTag) {
+        self.channels = channels
+        self.exactLayout = exactLayout
+        self.tag = tag
+    }
+
+    /// The count's layout and tag (`makeResamplerOutputLayout`, `audioChannelLayoutTag`).
+    init(channels: Int32) {
+        self.init(channels: channels, exactLayout: nil, tag: audioChannelLayoutTag(for: channels))
+    }
+
+    /// For a source of `layout`: its own order where `exactResamplerLayouts` has it; 5.1 for any
+    /// other source of 4 or 5 channels with an LFE; otherwise its count.
+    init(source layout: UnsafePointer<AVChannelLayout>) {
+        for exact in exactResamplerLayouts {
+            var candidate = AVChannelLayout()
+            defer { av_channel_layout_uninit(&candidate) }
+            if av_channel_layout_from_string(&candidate, exact.name) >= 0,
+               av_channel_layout_compare(layout, &candidate) == 0 {
+                self.init(channels: candidate.nb_channels, exactLayout: exact.name, tag: exact.tag)
+                return
+            }
+        }
+        let count = layout.pointee.nb_channels
+        self.init(channels: (4...5).contains(count) && channelLayoutHasLFE(layout) ? 6 : count)
+    }
+
+    /// The layout the resampler writes.
+    func makeLayout(into layout: inout AVChannelLayout) {
+        if let exactLayout, av_channel_layout_from_string(&layout, exactLayout) >= 0 { return }
+        makeResamplerOutputLayout(channels, into: &layout)
+    }
+}
+
 /// The layout `AudioDecoder` resamples INTO, i.e. the order the bytes are actually in. The
 /// counterpart of `audioChannelLayoutTag` above; a test holds the two against each other.
 ///

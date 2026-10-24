@@ -29,6 +29,9 @@ struct BedLevelMeter {
     private var sumSquares: [Double]
     private var peaks: [Float]
     private var frames = 0
+    /// Whether the window's frames came with the bed's planes (`add`), or were only counted
+    /// (`addUnmeasured`, object APAC).
+    private var bedMeasured = false
     private var windowsClosed = 0
     /// Where the window's first frame sits on the output timeline, in seconds, when the caller knows.
     private var windowStart: Double?
@@ -122,6 +125,19 @@ struct BedLevelMeter {
             vDSP_maxmgv(planes[c], 1, &peak, n)
             peaks[c] = max(peaks[c], peak)
         }
+        bedMeasured = true
+        return count(frameCount)
+    }
+
+    /// Count `frameCount` frames of a stream whose channels this meter never sees: object APAC, which
+    /// the system renderer mixes after the encode. Its line gives the objects and the LFE input only.
+    mutating func addUnmeasured(frameCount: Int, startSeconds: Double? = nil) -> String? {
+        guard frameCount > 0 else { return nil }
+        if frames == 0 { windowStart = startSeconds }
+        return count(frameCount)
+    }
+
+    private mutating func count(_ frameCount: Int) -> String? {
         frames += frameCount
         let due = (windowsClosed == 0 ? Self.firstWindowSeconds : Self.windowSeconds) * sampleRate
         return frames >= due ? closeWindow() : nil
@@ -141,7 +157,8 @@ struct BedLevelMeter {
     }
 
     /// `bed levels 7.1.4 at 3725.4 s over 30.0 s, rms/peak dBFS: L -22.4/-3.1, …; objects: up to 12
-    /// active, 5 elevated; LFE input -18.2 dBFS, metadata gain 0.0 dB`
+    /// active, 5 elevated; LFE input -18.2 dBFS, metadata gain 0.0 dB`, or for object APAC
+    /// `object stream at 3725.4 s over 30.0 s; objects: …; LFE input …`.
     private mutating func closeWindow() -> String {
         let channels = layout.speakers.enumerated().map { c, speaker in
             let rms = (sumSquares[c] / Double(max(frames, 1))).squareRoot()
@@ -150,8 +167,10 @@ struct BedLevelMeter {
         }
         let at = windowStart.map { String(format: " at %.1f s", $0) } ?? ""
         let seconds = String(format: "%.1f", Double(frames) / Double(sampleRate))
-        let line = "bed levels \(layout.rawValue)\(at) over \(seconds) s, rms/peak dBFS: "
-            + channels.joined(separator: ", ")
+        let levels = bedMeasured
+            ? "bed levels \(layout.rawValue)\(at) over \(seconds) s, rms/peak dBFS: " + channels.joined(separator: ", ")
+            : "object stream\(at) over \(seconds) s"
+        let line = levels
             + "; objects: up to \(maxActiveObjects) active, \(maxElevatedObjects) elevated"
             + "; " + lfeSummary()
         windowsClosed += 1
@@ -189,6 +208,7 @@ struct BedLevelMeter {
         lfeInputSquares = 0
         lfeInputFrames = 0
         frames = 0
+        bedMeasured = false
         windowStart = nil
         maxActiveObjects = activeObjects
         maxElevatedObjects = elevatedObjects

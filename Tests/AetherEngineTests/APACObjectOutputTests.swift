@@ -169,6 +169,33 @@ struct APACObjectOutputTests {
         return try Self.decode(packets, cookie: encoder.magicCookie)
     }
 
+    @Test("LFE and LFE2 both play from the LFE, summed, each at its own gain")
+    func twoLFEs() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let tone = { (i: Int) in 0.25 * sinf(Float(i) * 2 * .pi * 50 / 48_000) }
+        let one = try renderEach(roles: [.lfe], frames: 48_000, states: [nil]) { _, i in tone(i) }
+        let both = try renderEach(roles: [.lfe, .lfe], frames: 48_000, states: [nil, nil]) { _, i in tone(i) }
+        let halved = try renderEach(roles: [.lfe, .lfe], frames: 48_000,
+                                    states: [nil, ObjectAudioElementState(gain: 0.5)]) { _, i in tone(i) }
+        let lfe = { (o: [[Float]]) in Self.power(o[Out.lfe.rawValue], 8192, 40_000) }
+        let db = { (a: Float, b: Float) in 10 * log10(a / b) }
+        #expect(abs(db(lfe(both), lfe(one)) - 6.02) < 0.1, "\(db(lfe(both), lfe(one))) dB: the two add, in phase")
+        #expect(abs(db(lfe(halved), lfe(one)) - 3.52) < 0.1, "\(db(lfe(halved), lfe(one))) dB: 1 + 0.5 of the tone")
+    }
+
+    @Test("on stereo the LFE is left out, as a 2.0 downmix has it, and the rest still plays")
+    func stereoDropsLFE() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let tone = { (i: Int) in 0.25 * sinf(Float(i) * 2 * .pi * 50 / 48_000) }
+        let lfeOnly = try renderEach(roles: [.lfe, .bed(.center)], frames: 48_000, states: [nil, nil],
+                                     output: kAudioChannelLayoutTag_Stereo, renderedFor: .l20) { e, i in e == 0 ? tone(i) : 0 }
+        let centre = try renderEach(roles: [.lfe, .bed(.center)], frames: 48_000, states: [nil, nil],
+                                    output: kAudioChannelLayoutTag_Stereo, renderedFor: .l20) { e, i in e == 1 ? tone(i) : 0 }
+        let total = { (o: [[Float]]) in o.reduce(Float(0)) { $0 + Self.power($1, 8192, 40_000) } }
+        #expect(total(lfeOnly) < total(centre) * 1e-6, "the LFE is silent on stereo")
+        #expect(APACObjectEncoder.dropsLFE(on: .l20) && !APACObjectEncoder.dropsLFE(on: .l51))
+    }
+
     @Test("zone masks and divergence go to the speaker bus; an elevation switch alone does not")
     func busRouting() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
@@ -844,6 +871,31 @@ struct APACObjectOutputTests {
                 shifted.frameOffset -= start
                 return shifted
             }
+            packets += try encoder.encode(buffer, frames: n).map(\.data)
+            start += n
+        }
+        packets += try encoder.flush().map(\.data)
+        return try Self.decode(packets, cookie: encoder.magicCookie, output: output)
+    }
+
+    /// Like `render`, but every element plays `signal(element, frame)`, and `states` go out at frame 0.
+    @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
+    private func renderEach(roles: [ObjectAudioRole], frames: Int, states: [ObjectAudioElementState?],
+                            output: AudioChannelLayoutTag = kAudioChannelLayoutTag_Atmos_7_1_4,
+                            renderedFor: SpatialSpeakerLayout = .l714,
+                            signal: (Int, Int) -> Float) throws -> [[Float]] {
+        let encoder = try APACObjectEncoder(bitRate: 17 * 320_000, output: renderedFor)
+        let chunk = 2048
+        let buffer = APACEncodePipeline.PlaneBuffer(channels: APACObjectEncoder.elementCapacity, capacity: chunk)
+        buffer.objectRoles = roles
+        var packets: [Data] = []
+        var start = 0
+        while start < frames {
+            let n = min(chunk, frames - start)
+            for (e, plane) in buffer.planes.enumerated() {
+                for i in 0..<n { plane[i] = e < roles.count ? signal(e, start + i) : 0 }
+            }
+            buffer.objectUpdates = start == 0 ? [.init(frameOffset: 0, rampFrames: 0, states: states)] : []
             packets += try encoder.encode(buffer, frames: n).map(\.data)
             start += n
         }

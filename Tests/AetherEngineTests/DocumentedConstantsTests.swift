@@ -336,6 +336,7 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("(it waits at most 100 ms)", docs)
         #endif
         XCTAssertEqual(PeakLimiter.threshold, 0.98)
+        XCTAssertEqual(PeakLimiter.lfeThreshold, 1)
         assertDocumented("nothing leaves above −0.18 dBFS", docs)
         XCTAssertEqual(PeakLimiter.releaseSeconds, 0.25)
         assertDocumented("a 250 ms release", docs)
