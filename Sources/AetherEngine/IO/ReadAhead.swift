@@ -7,21 +7,21 @@ import Foundation
 ///
 /// The floor is a request-count bound, not a read-ahead: a read of a few bytes costs a request's
 /// worth of overhead either way. The ceiling is what one fetch may hold in memory.
-struct ReadAhead: Sendable, Equatable {
-    let floor: Int
-    let ceiling: Int
-    private(set) var current: Int
+package struct ReadAhead: Sendable, Equatable {
+    package let floor: Int
+    package let ceiling: Int
+    package private(set) var current: Int
     /// Where the last fetch ended; -1 before the first.
-    private(set) var lastFetchEnd: Int64 = -1
+    package private(set) var lastFetchEnd: Int64 = -1
 
-    init(floor: Int, ceiling: Int) {
+    package init(floor: Int, ceiling: Int) {
         self.floor = max(1, min(floor, ceiling))
         self.ceiling = max(1, ceiling)
         current = self.floor
     }
 
     /// The size to fetch for a read of `requested` bytes at `position`.
-    mutating func size(forReadAt position: Int64, requested: Int) -> Int {
+    package mutating func size(forReadAt position: Int64, requested: Int) -> Int {
         let base = min(ceiling, max(floor, requested))
         if position == lastFetchEnd, lastFetchEnd >= 0 {
             current = min(ceiling, max(base, current * 2))
@@ -32,7 +32,7 @@ struct ReadAhead: Sendable, Equatable {
     }
 
     /// Records a fetch (or a serve from held bytes) of `count` bytes at `position`.
-    mutating func fetched(at position: Int64, count: Int) {
+    package mutating func fetched(at position: Int64, count: Int) {
         lastFetchEnd = position + Int64(count)
     }
 }

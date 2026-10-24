@@ -1,4 +1,5 @@
 import Foundation
+import AetherEngine
 import SMBClient
 
 /// A read-only SMB2/3 byte source over one share + file path.
@@ -27,11 +28,14 @@ public final class SMBConnection: ByteRangeSource, @unchecked Sendable {
     private let client: SMBClient
     private let reader: FileReader
     public let byteSize: Int64
+    /// The server's negotiated MaxReadSize: the largest READ one round trip carries.
+    public let preferredReadSize: Int
 
-    private init(client: SMBClient, reader: FileReader, byteSize: Int64) {
+    private init(client: SMBClient, reader: FileReader, byteSize: Int64, preferredReadSize: Int) {
         self.client = client
         self.reader = reader
         self.byteSize = byteSize
+        self.preferredReadSize = preferredReadSize
     }
 
     /// Connect, authenticate (NTLMv2 / guest / anonymous), tree-connect to
@@ -77,7 +81,11 @@ public final class SMBConnection: ByteRangeSource, @unchecked Sendable {
             guard size > 0 else {
                 throw SMBError(message: "SMB file has zero size or could not be stat'd: \(path)")
             }
-            return SMBConnection(client: client, reader: reader, byteSize: Int64(size))
+            let maxReadSize = Int(client.session.maxReadSize)
+            EngineLog.emit("[SMBConnection] \(host) negotiated maxReadSize=\(maxReadSize) B, file \(size) B",
+                           category: .demux)
+            return SMBConnection(client: client, reader: reader, byteSize: Int64(size),
+                                 preferredReadSize: maxReadSize)
         } catch {
             client.session.disconnect()
             throw error

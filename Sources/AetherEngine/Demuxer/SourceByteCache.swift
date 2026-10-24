@@ -401,7 +401,9 @@ final class SourceByteCache: @unchecked Sendable {
             }) {
                 let from = Int(cursor - entry.offset)
                 let take = min(remaining, entry.data.count - from)
-                pieces.append(.memory(entry.data.subdata(in: from..<(from + take))))
+                // A slice shares the pending buffer; its bytes are copied once, into the result.
+                let lower = entry.data.startIndex + from
+                pieces.append(.memory(entry.data[lower..<(lower + take)]))
                 cursor += Int64(take)
                 remaining -= take
                 continue
@@ -421,25 +423,22 @@ final class SourceByteCache: @unchecked Sendable {
         touchLocked(source, start: offset, end: cursor)
         lock.unlock()
 
-        var data = Data(capacity: length)
+        // One buffer the result owns: each piece lands in place, read or copied exactly once.
+        guard let buffer = malloc(length) else { return nil }
+        var filled = 0
         var complete = true
         for piece in pieces {
             switch piece {
             case .memory(let bytes):
-                data.append(bytes)
+                bytes.copyBytes(to: UnsafeMutableRawBufferPointer(start: buffer + filled, count: bytes.count))
+                filled += bytes.count
             case .file(let at, let count):
-                var chunk = Data(count: count)
-                let read = chunk.withUnsafeMutableBytes { raw -> Bool in
-                    guard let base = raw.baseAddress else { return false }
-                    var done = 0
-                    while done < count {
-                        let n = pread(source.fd, base + done, count - done, off_t(at) + off_t(done))
-                        if n > 0 { done += n } else if n < 0, errno == EINTR { continue } else { return false }
-                    }
-                    return true
+                var done = 0
+                while done < count {
+                    let n = pread(source.fd, buffer + filled + done, count - done, off_t(at) + off_t(done))
+                    if n > 0 { done += n } else if n < 0, errno == EINTR { continue } else { complete = false; break }
                 }
-                guard read else { complete = false; break }
-                data.append(chunk)
+                filled += done
             }
             if !complete { break }
         }
@@ -447,7 +446,11 @@ final class SourceByteCache: @unchecked Sendable {
         let valid = complete && source.evictions == epoch && sources[key] === source
         if valid { source.servedBytes += Int64(length) }
         lock.unlock()
-        return valid ? data : nil
+        guard valid else {
+            free(buffer)
+            return nil
+        }
+        return Data(bytesNoCopy: buffer, count: length, deallocator: .free)
     }
 
     /// How many bytes from `offset` on are held for `url`, under the same size check `read` makes.
