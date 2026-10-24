@@ -35,8 +35,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var decodedFormatKey: DecodedFormatKey?
     private var reportedFormatKey: DecodedFormatKey?
 
-    /// The decoder's own output, taken before the deinterlacer can rewrite the frame (it hands `emit` a
-    /// VideoToolbox frame whose pixel format says nothing about the decode).
+    /// The decoder's own output, taken when the frame is decoded (a deinterlaced picture is written from its
+    /// planar equivalent, whose pixel format says nothing about the decode).
     struct DecodedFormatKey: Equatable {
         var pixelFormat: Int32
         var color: ColorDescription
@@ -95,21 +95,22 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Protects codecContext across the demux thread (decode) and main thread (close/flush).
     private let lock = NSLock()
 
-    /// Deinterlacer for interlaced MPEG-2/VC-1/MPEG-4 (DVD rips, SD broadcast); see DeinterlaceFilter class doc.
-    /// Engaged lazily on first interlaced frame; every subsequent frame routes through it. Guarded by `lock`.
-    private let deinterlacer = DeinterlaceFilter()
+    /// The deinterlacer's schedule for interlaced MPEG-2 / VC-1 / MPEG-4 / H.264 (DVD rips, broadcast): FFmpeg's bwdif,
+    /// the arithmetic on the GPU (``PlanarFrameFinisher/Field``). Made at `open`; engaged by the first interlaced
+    /// frame, after which every frame goes through it. Guarded by `lock`.
+    private var window: BwdifWindow?
+    /// The source format's reader for the deinterlacer and the planar format it writes, per decoded format; nil
+    /// where the deinterlacer does not take the format (logged once). Guarded by `lock`.
+    private var deinterlaceFormats: [Int32: (reader: PlanarFrameFinisher.Plan, planar: AVPixelFormat)?] = [:]
 
-    /// Deinterlacer cadence from LoadOptions. Set by the host BEFORE `open`; applied to the filter there
-    /// (mutating it mid-stream would need a graph rebuild).
+    /// Deinterlacer cadence from LoadOptions. Set by the host BEFORE `open`.
     var deinterlaceConfig = DeinterlaceConfig()
 
     /// False puts every picture out as decoded, interlaced or not. Set before `open`; the format probe is
     /// the only caller, it counts the decoder's own pictures.
     var deinterlaces = true
 
-    /// The attributes of every display buffer: the finisher's pool and the deinterlacer's output pool
-    /// (`DeinterlaceFilter`), so the display layer sees one kind of buffer whichever made it. Format and
-    /// size are each pool's own.
+    /// The attributes of every display buffer the finisher writes. Format and size are the pool's own.
     static var displayBufferAttributes: CFDictionary {
         [
             kCVPixelBufferMetalCompatibilityKey: true,
@@ -178,8 +179,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             }
         }
 
-        /// A display buffer's format read back (the deinterlacer reads its range): nil for a format no
-        /// `OutputFormat` describes.
+        /// A display buffer's format read back: nil for a format no `OutputFormat` describes.
         init?(pixelFormatType type: OSType) {
             guard let match = Self.all.first(where: { $0.pixelFormatType == type }) else { return nil }
             self = match
@@ -300,7 +300,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
         self.onFrame = onFrame
-        deinterlacer.config = deinterlaceConfig
 
         guard let codecpar = stream.pointee.codecpar else {
             throw VideoDecoderError.noCodecParameters
@@ -336,7 +335,17 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             throw VideoDecoderError.metalUnavailable
         }
         allocator = frameAllocator
-        finisher = try PlanarFrameFinisher(device: device)
+        let made = try PlanarFrameFinisher(device: device)
+        finisher = made
+        if deinterlaces {
+            window = BwdifWindow(timeBase: timeBase, fieldRate: deinterlaceConfig.fieldRate == .field)
+            // A stream that declares interlacing compiles the deinterlacer's pipeline now, off this thread, so its first
+            // field does not wait for the compiler.
+            if VideoRoutingPolicy.interlacedFieldOrders.contains(codecpar.pointee.field_order),
+               let reader = PlanarFrameFinisher.readerPlan(source: sourceFormat) {
+                DispatchQueue.global(qos: .userInitiated).async { _ = try? made.pipeline(for: reader, function: "pf_bwdif") }
+            }
+        }
 
         guard let ctx = avcodec_alloc_context3(codec) else {
             throw VideoDecoderError.sessionCreationFailed(status: -1)
@@ -471,8 +480,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         guard let f = frame else { lock.unlock(); return }
         lock.unlock()
 
-        var filtered: UnsafeMutablePointer<AVFrame>? = nil
-
         while true {
             lock.lock()
             guard codecContext != nil else { lock.unlock(); break }
@@ -521,19 +528,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             }
 
             let isInterlaced = (f.pointee.flags & AV_FRAME_FLAG_INTERLACED) != 0
-            if deinterlaces, isInterlaced || deinterlacer.isActive {
-                // The deinterlacer works on display buffers, so the picture is finished first, every one
-                // of them: a picture before a seek's target is still the next one's temporal context.
-                guard let finished = autoreleasepool(invoking: { finishFrame(f) }) else { lock.unlock(); continue }
-                if deinterlacer.ensureGraph(buffer: finished, properties: f, timeBase: timeBase),
-                   deinterlacer.push(finished, properties: f) >= 0 {
-                    if filtered == nil { filtered = av_frame_alloc() }
-                    if let out = filtered { emitDeinterlacedFrames(into: out) }
-                    lock.unlock()
-                    continue
-                }
-                // No deinterlacer in the linked build or no graph (logged by the filter): shown as decoded.
-                emit(f, timeBase: timeBase, finished: finished)
+            if let window, isInterlaced || window.isActive, let picture = hold(f) {
+                render(window.push(picture), timeBase: window.outputTimeBase)
                 lock.unlock()
                 continue
             }
@@ -543,34 +539,102 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
 
         av_frame_free(&frame)
-        if filtered != nil { av_frame_free(&filtered) }
     }
 
-    /// Pull and emit everything the deinterlacer has ready. Caller holds `lock`, as for `emit`.
-    private func emitDeinterlacedFrames(into out: UnsafeMutablePointer<AVFrame>) {
-        while deinterlacer.pull(into: out) >= 0 {  // filter holds 1-2 frames lookahead; push can yield EAGAIN
-            // Untimestamped output is unschedulable: yadif's SECOND field is
-            // cur.pts + next.pts, which is NOPTS whenever either source frame
-            // lacked a PTS (live TS delivers those); an invalid-PTS sample
-            // can't be paced by the render synchronizer and can wedge the
-            // display queue. Drop it; at field rate the neighbor field covers.
-            if out.pointee.pts == Int64.min {
+    /// `f` held for the deinterlacer: a reference to the frame and where its planes are (the decoder's own slab, or a
+    /// copy in one for rawvideo and libavcodec's paletted buffers). Nil when the deinterlacer does not take the
+    /// format or the picture (planes under 3 columns or 4 lines, as FFmpeg's bwdif), which then goes out as decoded.
+    /// Caller holds `lock`.
+    private func hold(_ f: UnsafeMutablePointer<AVFrame>) -> BwdifWindow.Picture? {
+        guard let allocator, deinterlaceFormat(f) != nil, let held = av_frame_clone(f) else { return nil }
+        if let slab = allocator.slab(of: held), let planes = PlanarFrameFinisher.planes(of: held, in: slab) {
+            return BwdifWindow.Picture(storage: .init(frame: held, planes: planes, release: nil), pts: held.pointee.pts)
+        }
+        guard let copy = allocator.copy(held) else {
+            var owned: UnsafeMutablePointer<AVFrame>? = held
+            av_frame_free(&owned)
+            return nil
+        }
+        return BwdifWindow.Picture(storage: .init(frame: held, planes: copy.planes, release: { [weak allocator] in
+            allocator?.release(copy.slab)
+        }), pts: held.pointee.pts)
+    }
+
+    /// The deinterlacer's reader and planar format for `f`'s format, or nil (logged once per format).
+    private func deinterlaceFormat(_ f: UnsafePointer<AVFrame>) -> (reader: PlanarFrameFinisher.Plan, planar: AVPixelFormat)? {
+        let format = f.pointee.format
+        if let known = deinterlaceFormats[format] { return known }
+        let source = AVPixelFormat(rawValue: format)
+        var found: (reader: PlanarFrameFinisher.Plan, planar: AVPixelFormat)?
+        if let reader = PlanarFrameFinisher.readerPlan(source: source), let planar = PlanarFrameFinisher.planarEquivalent(of: source),
+           BwdifWindow.referenceFormats.contains(planar.rawValue), let desc = av_pix_fmt_desc_get(source)?.pointee {
+            let chromaW = (Int(f.pointee.width) + (1 << Int(desc.log2_chroma_w)) - 1) >> Int(desc.log2_chroma_w)
+            let chromaH = (Int(f.pointee.height) + (1 << Int(desc.log2_chroma_h)) - 1) >> Int(desc.log2_chroma_h)
+            if chromaW >= 3, chromaH >= 4 { found = (reader, planar) }
+        }
+        if found == nil {
+            EngineLog.emit("[SWDecoder] the deinterlacer does not take \(av_get_pix_fmt_name(source).map { String(cString: $0) } ?? "?") "
+                           + "\(f.pointee.width)x\(f.pointee.height); interlaced pictures go out as decoded", category: .swPlayback)
+        }
+        deinterlaceFormats[format] = .some(found)
+        return found
+    }
+
+    /// Writes the window's outputs, all in one GPU submission, and emits them in order. Pictures before a seek's
+    /// target and pictures without a timestamp (yadif's second field is `cur + next`, missing when either is) are not
+    /// written. Caller holds `lock`, as for `emit`.
+    private func render(_ outputs: [BwdifWindow.Output], timeBase tb: AVRational) {
+        guard !outputs.isEmpty, let finisher else { return }
+        var jobs: [PlanarFrameFinisher.Job] = []
+        var emits: [(frame: UnsafeMutablePointer<AVFrame>, pts: Int64, buffer: CVPixelBuffer)] = []
+        var held: [BwdifWindow.Picture] = []
+        for output in outputs {
+            let picture: BwdifWindow.Picture, pts: Int64
+            switch output {
+            case .picture(let p, let t): (picture, pts) = (p, t)
+            case .field(_, let cur, _, _, _, _, let t): (picture, pts) = (cur, t)
+            }
+            guard pts != Int64.min else {
                 droppedUntimestampedFields += 1
                 if droppedUntimestampedFields == 1 || droppedUntimestampedFields % 250 == 0 {
-                    EngineLog.emit(
-                        "[SWDecoder] dropped \(droppedUntimestampedFields) untimestamped deinterlaced frame(s)",
-                        category: .swPlayback
-                    )
+                    EngineLog.emit("[SWDecoder] dropped \(droppedUntimestampedFields) untimestamped deinterlaced picture(s)",
+                                   category: .swPlayback)
                 }
-                av_frame_unref(out)
                 continue
             }
-            // Filtered PTS rides the sink's time_base, NOT the stream's: yadif/bwdif
-            // halve the link time_base, and send_field puts the two fields of a frame
-            // on odd/even ticks of that halved base (see DeinterlaceFilter class doc).
-            emit(out, timeBase: deinterlacer.outputTimeBase)
-            av_frame_unref(out)
+            if let threshold = skipUntilPTS {
+                let at = SourceTimestampBounds.cmTime(ticks: pts, timeBase: tb)
+                if at.isValid, CMTimeCompare(at, threshold) < 0 { continue }
+            }
+            let source: PlanarFrameFinisher.Job.Source
+            let prepared: (plan: PlanarFrameFinisher.Plan, buffer: CVPixelBuffer)?
+            switch output {
+            case .picture(let p, _):
+                prepared = prepare(p.frame, planFormat: AVPixelFormat(rawValue: p.frame.pointee.format),
+                                   interlaced: p.interlaced)
+                source = .picture(p.storage.planes)
+            case .field(let prev, let cur, let next, let parity, let fieldParity, let intra, _):
+                guard let formats = deinterlaceFormat(cur.frame) else { continue }
+                prepared = prepare(cur.frame, planFormat: formats.planar, interlaced: false)
+                source = .field(.init(prev: prev.storage.planes, cur: cur.storage.planes, next: next.storage.planes,
+                                      parity: parity, fieldParity: fieldParity, intra: intra, reader: formats.reader))
+            }
+            guard let prepared else { continue }
+            jobs.append(.init(source: source, plan: prepared.plan, width: Int(picture.frame.pointee.width),
+                              height: Int(picture.frame.pointee.height), buffer: prepared.buffer))
+            emits.append((picture.frame, pts, prepared.buffer))
+            held.append(picture)
         }
+        guard !jobs.isEmpty else { return }
+        guard finisher.finish(jobs) else {
+            if !loggedFinishFailure {
+                loggedFinishFailure = true
+                EngineLog.emit("[SWDecoder] GPU deinterlace and finish failed (logged once)", category: .swPlayback)
+            }
+            return
+        }
+        for e in emits { emit(e.frame, timeBase: tb, pts: e.pts, finished: e.buffer) }
+        withExtendedLifetime(held) {}
     }
 
     /// End of source or a live seam: deliver what libavcodec and the deinterlacer still hold, then
@@ -602,35 +666,33 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         defer { lock.unlock() }
         guard codecContext != nil else { return }
         // A flush that landed during the drain retired this stream; its frames are not owed.
-        if epoch == _feedEpoch, deinterlacer.isActive, deinterlacer.pushEndOfStream() >= 0,
-           let out = av_frame_alloc() {
-            emitDeinterlacedFrames(into: out)
-            var owned: UnsafeMutablePointer<AVFrame>? = out
-            av_frame_free(&owned)
+        if epoch == _feedEpoch, let window, window.isActive {
+            render(window.finish(), timeBase: window.outputTimeBase)
         }
-        deinterlacer.teardown()
+        window?.reset()
         avcodec_flush_buffers(ctx)
     }
 
     /// Convert + deliver one decoded (or deinterlaced) frame: skip threshold, pixel buffer
     /// extraction, HDR10+ side data, onFrame. Shared by the direct and deinterlaced paths.
     /// `tb` is the time_base the frame's PTS rides on: the stream time_base for direct frames,
-    /// `DeinterlaceFilter.outputTimeBase` for filtered ones (halved by yadif/bwdif; with
+    /// `BwdifWindow.outputTimeBase` for deinterlaced ones (halved, as FFmpeg's bwdif does; with
     /// send_field the fields sit on odd/even ticks, so rescaling into the stream base would
-    /// collapse each pair to duplicate timestamps). `finished` is the display buffer when the
-    /// picture was already finished for the deinterlacer.
-    private func emit(_ f: UnsafeMutablePointer<AVFrame>, timeBase tb: AVRational, finished: CVPixelBuffer? = nil) {
+    /// collapse each pair to duplicate timestamps). `pts` replaces the frame's own (a deinterlaced picture's, on the
+    /// deinterlacer's base) and `finished` is its display buffer, already written.
+    private func emit(_ f: UnsafeMutablePointer<AVFrame>, timeBase tb: AVRational, pts: Int64? = nil,
+                      finished: CVPixelBuffer? = nil) {
         // Per-frame autorelease pool: the decode/feed loops are single long-running dispatch
         // blocks, so without this, ObjC transients (Metal command buffers, CV bridging)
         // accumulate in the block's last-resort pool and only pop at session end, AFTER close()
         // tore the session down, crashing the pop with an over-release (EXC_BAD_ACCESS in
         // AutoreleasePoolPage::releaseUntil on engine.sw.feed), and bloating memory for the
         // whole channel visit meanwhile.
-        autoreleasepool { emitInner(f, timeBase: tb, finished: finished) }
+        autoreleasepool { emitInner(f, timeBase: tb, pts: pts ?? f.pointee.pts, finished: finished) }
     }
 
-    private func emitInner(_ f: UnsafeMutablePointer<AVFrame>, timeBase tb: AVRational, finished: CVPixelBuffer?) {
-        let cmPTS = SourceTimestampBounds.cmTime(ticks: f.pointee.pts, timeBase: tb)
+    private func emitInner(_ f: UnsafeMutablePointer<AVFrame>, timeBase tb: AVRational, pts: Int64, finished: CVPixelBuffer?) {
+        let cmPTS = SourceTimestampBounds.cmTime(ticks: pts, timeBase: tb)
         if let threshold = skipUntilPTS, cmPTS.isValid {
             if CMTimeCompare(cmPTS, threshold) < 0 {
                 return
@@ -642,15 +704,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let pixelBuffer: CVPixelBuffer
         if let finished {
             pixelBuffer = finished
-        } else if f.pointee.format == AV_PIX_FMT_VIDEOTOOLBOX.rawValue {
-            // The deinterlacer's output: a display buffer made with `displayBufferAttributes`, carrying the
-            // attachments of the buffer it was made from (colour, pixel aspect), or that buffer itself for a
-            // progressive picture it passed through.
-            guard let raw = f.pointee.data.3 else { return }
-            pixelBuffer = Unmanaged<CVPixelBuffer>.fromOpaque(UnsafeRawPointer(raw)).takeUnretainedValue()
         } else {
-            guard let finished = finishFrame(f) else { return }
-            pixelBuffer = finished
+            guard let made = finishFrame(f) else { return }
+            pixelBuffer = made
         }
 
         reportDecodedFormat(pixelBuffer: pixelBuffer)
@@ -683,7 +739,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // so a feed that has not reached `avcodec_send_packet` yet is refused from here on.
         _feedEpoch &+= 1
         // Deinterlacer temporal references are stale across seeks; drop the graph (lazily rebuilt on next interlaced frame).
-        if resetFilterGraph { deinterlacer.teardown() }
+        if resetFilterGraph { window?.reset() }
         guard let ctx = codecContext else { return }
         avcodec_flush_buffers(ctx)
     }
@@ -719,7 +775,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     func close() {
         lock.lock()
-        deinterlacer.teardown()
+        window?.reset()
         if codecContext != nil {
             avcodec_free_context(&codecContext)
         }
@@ -794,9 +850,41 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private func finishFrame(_ frame: UnsafeMutablePointer<AVFrame>) -> CVPixelBuffer? {
         guard let allocator, let finisher else { return nil }
         let width = Int(frame.pointee.width), height = Int(frame.pointee.height)
+        let interlaced = (frame.pointee.flags & AV_FRAME_FLAG_INTERLACED) != 0
+        guard let (plan, pb) = prepare(frame, planFormat: AVPixelFormat(rawValue: frame.pointee.format), interlaced: interlaced)
+        else { return nil }
+
+        // The decoder's own slab, or (rawvideo, libavcodec's paletted buffers) a copy of the picture in one.
+        let planes: PlanarFrameFinisher.Planes
+        var copied: DecodeFrameAllocator.Slab?
+        if let slab = allocator.slab(of: frame), let own = PlanarFrameFinisher.planes(of: frame, in: slab) {
+            planes = own
+        } else if let copy = allocator.copy(frame) {
+            planes = copy.planes
+            copied = copy.slab
+        } else {
+            return nil
+        }
+        defer { if let copied { allocator.release(copied) } }
+        guard finisher.finish(planes, plan: plan, width: width, height: height, into: pb) else {
+            if !loggedFinishFailure {
+                loggedFinishFailure = true
+                EngineLog.emit("[SWDecoder] GPU finish failed (logged once)", category: .swPlayback)
+            }
+            return nil
+        }
+        return pb
+    }
+
+    /// The finisher's plan for `frame` and the display buffer it writes, tagged with the frame's colour and aspect.
+    /// `planFormat` is the layout the finisher reads: the frame's own, or for a deinterlaced picture its planar
+    /// equivalent (``PlanarFrameFinisher/planarEquivalent(of:)``), with `interlaced` false. Range, siting and colour
+    /// come from the frame and its own format either way.
+    private func prepare(_ frame: UnsafeMutablePointer<AVFrame>, planFormat: AVPixelFormat,
+                         interlaced: Bool) -> (plan: PlanarFrameFinisher.Plan, buffer: CVPixelBuffer)? {
+        let width = Int(frame.pointee.width), height = Int(frame.pointee.height)
         guard width > 0, height > 0 else { return nil }
         let format = AVPixelFormat(rawValue: frame.pointee.format)
-        let interlaced = (frame.pointee.flags & (1 << 3)) != 0  // AV_FRAME_FLAG_INTERLACED
         let colour = ColorDescription(frame: frame)
         let representation = ColourRepresentation.resolve(format: format, matrix: colour.matrix, primaries: colour.primaries,
                                                           transfer: colour.transfer)
@@ -822,13 +910,13 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let convertedMatrix = representation.converts ? ColourRepresentation.targetMatrix(primaries: colour.primaries) : nil
         let matrix = convertedMatrix ?? ColorAttachments.presented(colour, frameSize: (frame.pointee.width, frame.pointee.height)).matrix
         let location = Self.resolvedChromaLocation(frame.pointee.chroma_location, isJPEG: Self.isJPEGFormat(format))
-        let key = PlanKey(pixelFormat: frame.pointee.format, output: outputFormat, sourceFullRange: sourceFullRange,
+        let key = PlanKey(pixelFormat: planFormat.rawValue, output: outputFormat, sourceFullRange: sourceFullRange,
                           chromaLocation: UInt32(location.rawValue), matrix: matrix as String, interlaced: interlaced,
                           representation: representation)
         let plan: PlanarFrameFinisher.Plan
         if let known = plans[key] {
             plan = known
-        } else if let made = PlanarFrameFinisher.plan(source: format, output: outputFormat, sourceFullRange: sourceFullRange,
+        } else if let made = PlanarFrameFinisher.plan(source: planFormat, output: outputFormat, sourceFullRange: sourceFullRange,
                                                       chromaLocation: location, matrix: matrix, interlaced: interlaced,
                                                       representation: representation) {
             plans[key] = made
@@ -850,27 +938,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         if let convertedMatrix { CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, convertedMatrix, .shouldPropagate) }
         attachPixelAspectRatio(from: frame, to: pb)
 
-        // The decoder's own slab, or (rawvideo, libavcodec's paletted buffers) a copy of the picture in one.
-        let planes: PlanarFrameFinisher.Planes
-        var copied: DecodeFrameAllocator.Slab?
-        if let slab = allocator.slab(of: frame), let own = PlanarFrameFinisher.planes(of: frame, in: slab) {
-            planes = own
-        } else if let copy = allocator.copy(frame) {
-            planes = copy
-            copied = copy.slab
-        } else {
-            return nil
-        }
-        defer { if let copied { allocator.release(copied) } }
-        guard finisher.finish(planes, plan: plan, width: width, height: height, into: pb) else {
-            if !loggedFinishFailure {
-                loggedFinishFailure = true
-                EngineLog.emit("[SWDecoder] GPU finish failed for \(outputFormat.logDescription) (logged once)",
-                               category: .swPlayback)
-            }
-            return nil
-        }
-        return pb
+        return (plan, pb)
     }
 
     nonisolated static func isJPEGFormat(_ format: AVPixelFormat) -> Bool {

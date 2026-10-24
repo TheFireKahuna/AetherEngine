@@ -450,7 +450,7 @@ Sources/AetherEngine/
 │   ├── OrderedDelivery.swift                SW FEL path (`DualLayerDolbyVision` trait): hands composed frames from the Metal completion queue to the renderer in decode order, with an epoch for seeks and a stall guard (#702)
 │   ├── CCDataParser.swift                   Parses the bare cc_data triplet stream from a demuxable CEA-608 caption track (#77)
 │   ├── CEA608Decoder.swift                  In-house CEA-608 line-21 decoder (field-1 / CC1), validated against FFmpeg ccaption_dec.c (#77)
-│   ├── DeinterlaceFilter.swift              SW path: persistent yadif_videotoolbox graph over the finisher's display buffers, its output displayed as it comes; engages on the first interlaced frame
+│   ├── BwdifWindow.swift                    SW path: FFmpeg bwdif's scheduling (yadif_common.c): the previous / current / next window, intra first and last fields, field-rate timestamps, progressive pass-through; the arithmetic runs in the finisher's `pf_bwdif`
 │   ├── EmbeddedSubtitleDecoder.swift        Inline subtitle decode from demuxed packets; opens DVB teletext with libzvbi_teletextdec text-format options (#107)
 │   ├── InterlaceProbe.swift                 Decodes a sample and applies the deinterlacer's own engagement predicate, so a declared field order that no frame backs up (PsF) stops costing a SW decode (#232)
 │   ├── VideoRoutingPolicy.swift             Pure codec-and-field-order dispatch rule: AV1 gated on HW, VP9/VP8/MPEG4/MPEG2/VC1 always SW, interlaced H.264 SW so the deinterlacer can run (#107, verified against decoded frames on VOD, #232), plus a second-stage gate routing H.264 High 4:2:2/4:4:4/10 + HEVC Rext to SW where VideoToolbox has no HW decoder (#2)
@@ -459,7 +459,6 @@ Sources/AetherEngine/
 │   ├── SoftwareVideoDecoder.swift           SW path: libavcodec/dav1d → CVPixelBuffer (NV12 / P010), HDR10+ side data
 │   ├── SubtitleDecoder.swift                Sidecar URL one-shot decode (text only); decodes several streams of one container in a single pass (#266)
 │   ├── VideoDecoderTypes.swift              DecodedFrameHandler typealias + VideoDecoderError
-│   ├── DeinterlaceHardwareWarmup.swift      Process-wide one-shot prewarm of the deinterlace filter's Metal pipeline, awaited by every software load, so the first interlaced frame does not pay for it
 │   └── PixelAspectPolicy.swift              Whether a declared sample aspect ratio deserves to be believed: an absurd-component gate (#177, live TS carrying 1088:1) plus a display-aspect gate judged against the frame the SAR applies to, since 2:1 is right on 960x1080 and wrong on 1920x1080 (#290)
 ├── Demuxer/
 │   ├── AVIOProvider.swift                   Internal seam over a custom-AVIO byte source; AVIOReader and CustomIOReaderBridge both plug into the Demuxer through it, incl. the bounded-seek read deadline and the resolved byte size backing the byte-estimate seek fallback (#112)

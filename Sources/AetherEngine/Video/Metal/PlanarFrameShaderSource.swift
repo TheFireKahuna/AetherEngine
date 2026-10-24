@@ -8,7 +8,7 @@ import Foundation
 /// branches and address arithmetic folded away. One thread per output chroma sample writes that sample and the
 /// luma block it covers (2x2 for 4:2:0, 2x1 for 4:2:2, 1x1 for 4:4:4).
 enum PlanarFrameShaderSource {
-    static let source: String = template.replacingOccurrences(of: "/*PF_TABLES*/", with: tables)
+    static let source: String = template.replacingOccurrences(of: "/*PF_TABLES*/", with: tables) + bwdif
 
     /// The double-float constants and the exp2 / log2 tables, computed in double and written as hex float pairs, so
     /// the kernel's values are exactly the host's.
@@ -253,11 +253,9 @@ static inline pf_df pf_pow(pf_df x, pf_df p) {
 
 // MARK: - Reading (av_read_image_line2)
 
-// The component at (x, y) of its own plane's grid. Every argument but the frame and the position is a function
-// constant, so the load width and the address arithmetic fold away.
-static inline uint pf_read(device const uchar* src, constant PFFrame& f,
-                           uint plane, uint step, uint offset, uint shift, uint depth, uint x, uint y) {
-    device const uchar* row = src + f.plane_offset[plane] + y * f.linesize[plane];
+// The component at column x of a plane row. Every argument but the row and x is a function constant, so the
+// load width and the address arithmetic fold away.
+static inline uint pf_read_row(device const uchar* row, uint step, uint offset, uint shift, uint depth, uint x) {
     uint mask = depth >= 32u ? 0xFFFFFFFFu : ((1u << depth) - 1u);
     if (FC_BITSTREAM) {
         if (step > 8u) {
@@ -291,6 +289,12 @@ static inline uint pf_read(device const uchar* src, constant PFFrame& f,
         v = FC_BIG_ENDIAN ? (((w & 0xFFu) << 24) | ((w & 0xFF00u) << 8) | ((w >> 8) & 0xFF00u) | (w >> 24)) : w;
     }
     return (v >> shift) & mask;
+}
+
+// The component at (x, y) of its own plane's grid.
+static inline uint pf_read(device const uchar* src, constant PFFrame& f,
+                           uint plane, uint step, uint offset, uint shift, uint depth, uint x, uint y) {
+    return pf_read_row(src + f.plane_offset[plane] + y * f.linesize[plane], step, offset, shift, depth, x);
 }
 
 static inline uint pf_c0(device const uchar* s, constant PFFrame& f, uint x, uint y) {

@@ -185,7 +185,7 @@ final class DecodeFrameAllocator: @unchecked Sendable {
     /// frames point into the demuxer's packet (for an uncompressed stream the copy is the decode), and the
     /// paletted formats libavcodec allocates itself. Planes 64-byte aligned, palette included. The slab goes
     /// back through ``release(_:)`` once the picture has been read.
-    func copy(_ frame: UnsafePointer<AVFrame>) -> PlanarFrameFinisher.Planes? {
+    func copy(_ frame: UnsafePointer<AVFrame>) -> (planes: PlanarFrameFinisher.Planes, slab: Slab)? {
         let format = AVPixelFormat(rawValue: frame.pointee.format)
         let width = frame.pointee.width, height = frame.pointee.height
         let size = av_image_get_buffer_size(format, width, height, Int32(Self.planeAlignment))
@@ -208,7 +208,7 @@ final class DecodeFrameAllocator: @unchecked Sendable {
             offsets[i] = UInt32(offset)
             sizes[i] = UInt32(linesize[i])
         }
-        return PlanarFrameFinisher.Planes(slab: slab, offsets: offsets, linesizes: sizes)
+        return (PlanarFrameFinisher.Planes(buffer: slab.buffer, offsets: offsets, linesizes: sizes), slab)
     }
 
     /// Returns a slab from ``copy(_:)``.

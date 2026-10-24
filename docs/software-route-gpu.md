@@ -1,8 +1,8 @@
 # The software route: one GPU pass, inside the native player
 
 Status: plan, written 2026-10-24 on `research/12bit-fel`. Parts 2 (the GPU finisher and H.273 colour) and 3 (AV1 into
-the slabs) are built and committed; part 4 (deinterlacing after the finisher) is built and awaits its device test;
-parts 1 and 5 are open. The colour equations are in [colour-representation.md](colour-representation.md).
+the slabs) are built and committed; part 4 (bwdif on the GPU) is built and awaits its device test; parts 1, 5 and 6 are
+open. The colour equations are in [colour-representation.md](colour-representation.md).
 
 ## Why
 
@@ -124,27 +124,51 @@ decode.
 2. Release FFmpegBuild, bump the engine's pin, and add AV1 to the parity tests (a decode through the slab path equals
    the copied path).
 
-## Part 4. Deinterlacing after the finisher (built; device test open)
+## Part 4. Deinterlacing: FFmpeg's bwdif on the GPU (built; device test open)
 
-Before: `format=nv12,hwupload,yadif_videotoolbox` (two CPU passes: swscale in the filter graph and `av_frame_copy` into
-an IOSurface), then a VTPixelTransferSession copy into our pool; a CPU `bwdif` fallback when the hardware graph
-failed, and `DeinterlaceMode.software`. Built: steps 1, 2 and 4 below (FFmpegBuild `1385171`, the engine commit that
-follows this status line); `DeinterlaceMode` is gone from `LoadOptions` altogether. Step 3, the device test, is open.
+The first attempt ran `yadif_videotoolbox` on the finisher's display buffers and displayed its output directly
+(`efeef135`). On the Apple TV the picture froze while frames kept being enqueued (`SEQ=deint`, 2026-10-25; the
+progressive control moved). Cause: FFmpeg's VideoToolbox frames context keeps an AVBufferPool in front of its
+CVPixelBufferPool and hands a buffer out again as soon as its AVFrame is freed, while the display layer still holds
+it. The old VTPixelTransfer copy had hidden that. Rather than patch FFmpeg's pool, the deinterlacer moved into the
+finisher, so every picture it shows comes from the finisher's own CoreVideo pool.
 
-1. **Deinterlace after the finisher**, on display-format buffers. Every format the decoder outputs (NV12, P010, NV16,
-   P210, P216, NV24, P410, P416) is in `yadif_videotoolbox`'s and VideoToolbox's supported sets, so the hardware
-   graph has no format it can fail on.
-2. **FFmpegBuild patch (about 25 lines):** `AVVTFramesContext` gains a pixel-buffer-attributes dictionary that
-   `vt_pool_alloc` merges into its pool; `vf_yadif_videotoolbox`'s `do_config_output` copies it from the input frame
-   context to the output. The engine creates the input frame context with the display pool's attributes (Metal
-   compatibility, the renderer's recommendation), so yadif's output buffers are made like the display buffers.
-   While there, `vf_yadif_videotoolbox`'s silent pass-through on an unsupported format becomes an error.
-3. **Device test:** yadif output displayed directly, without the VTPixelTransfer copy. The comment that the tvOS
-   direct video plane wedges on foreign IOSurfaces (commit `687178e1`, ported from a fork) is an unverified field
-   note; the attribute difference (`kCVPixelBufferMetalCompatibilityKey`) is the likely cause.
-4. Remove the CPU path: `bwdif`, `DeinterlaceMode.software`, the `hwDisabled` fallback latch. A hardware graph that
-   cannot be built is a logged error, not a switch to the CPU. A GPU bwdif port stays a later quality option (yadif
-   is what runs on the hardware path today); interlaced consumer content is 8-bit 4:2:0.
+**Reference.** bwdif has no specification beyond FFmpeg's C, so the C is the reference: `libavfilter/bwdifdsp.c`
+(the per-sample arithmetic), `vf_bwdif.c` (which rows, the reference offsets at the top and bottom, intra and edge
+rows) and `yadif_common.c` (the window, parities, first and last fields, timestamps, progressive pass-through), with
+`deint=interlaced` and `parity=auto`. `BwdifReferenceTests` runs libavfilter's bwdif and ours on the same frames and
+requires every output equal: count, timestamps, every sample of every plane, 8 to 16 bits, 4:2:0 / 4:2:2 / 4:4:4 /
+4:1:1 / 4:4:0 / 4:1:0, grey, semi-planar and packed sources (against bwdif on their planar equivalent), both field
+orders, field and frame rate, odd sizes, progressive and repeat-field pictures, missing timestamps, one- and
+two-picture streams.
+
+**Structure.** Two dispatches in one GPU submission:
+
+1. `pf_bwdif` (`BwdifShaderSource.swift`) reads the previous, current and next decoded pictures in their slabs through
+   the finisher's descriptor reader and writes the deinterlaced components at the source's depth into a planar scratch
+   picture (the source's planar equivalent: NV12 becomes yuv420p, P010 yuv420p10).
+2. `pf_finish` reads the scratch as an ordinary progressive picture: every conversion and rounding guarantee of Part 2
+   applies unchanged.
+
+Splitting the stages keeps exactness checkable per stage (the scratch against libavfilter, the finisher against its
+own reference) and costs one GPU-internal write and read of the source planes; a single kernel would run bwdif again
+for every resampling tap.
+
+**Throughput.** `BwdifWindow` (`Decoder/BwdifWindow.swift`) holds references to the decoded frames, no copies. All the
+outputs one decoded frame releases (the previous picture's second field, this one's first) go in one command buffer:
+one commit, one wait. The encoder is concurrent: every bwdif dispatch of every field and plane runs together, then
+one barrier, then every finishing dispatch (a constant-luminance job, whose later dispatches read its first's list,
+gets its own serial command buffer). One thread writes four columns of a row pair, the kept row copied and the row
+between interpolated, so the window's rows are shared through the cache. Integer arithmetic as the C (the 16-bit worst
+case stays under 2^31). The bwdif pipeline compiles off-thread when the decoder opens a stream that declares
+interlacing. Fields before a seek's target are scheduled (they are the next field's neighbours) but not written.
+
+**Removed:** the yadif graph and its VideoToolbox device (`DeinterlaceFilter`), the warm-up and its wait in the load
+path (`DeinterlaceHardwareWarmup`), `DeinterlaceMode`. FFmpegBuild's `videotoolbox-pixel-buffer-attributes.patch` is
+no longer used by the engine (dropping it from FFmpegBuild is a separate decision); the CoreVideo-pool patch written
+during the diagnosis was not committed.
+
+**Open:** the device test (`SEQ=deint`), and timings per frame on the M4 and the A15.
 
 ## Part 5. AV1 film grain on the GPU (open)
 
@@ -154,11 +178,93 @@ the finisher. AV1 specifies the synthesis exactly (section 7.18.3, its pseudo-ra
 builds the per-frame grain templates, the kernel applies them per 32x32 block, and the result must match dav1d's
 own grain bit for bit on test streams.
 
+## Part 6. Film in interlaced carriage: soft telecine, field matching, decimation (open)
+
+Film (24 or 23.976 frames a second) reaches the software route inside 29.97i / 25i carriage three ways. Each has
+one correct presentation: the film frames, each shown once, at the film rate, with the panel at that rate.
+
+### 6.1 Soft telecine: the codec standards' own signalling
+
+The pictures are coded progressive at the film rate; flags tell a field-based display which fields to repeat.
+FFmpeg's decoders map them onto `AVFrame.repeat_pict`, extra half-frame durations, so a picture is displayed for
+(2 + `repeat_pict`) fields:
+
+| Standard | Signalling | `repeat_pict` |
+|---|---|---|
+| H.262 / MPEG-2 (6.3.10), `progressive_sequence = 0` | `progressive_frame = 1`, `repeat_first_field = 1`: three fields | 1 |
+| H.262 / MPEG-2, `progressive_sequence = 1` (ATSC 720p film) | `repeat_first_field` with `top_field_first` 0 / 1: two / three frames | 2 / 4 |
+| H.264 Annex D, picture timing SEI `pic_struct` (Table D-1) | 5 / 6: top-bottom-top / bottom-top-bottom | 1 |
+| | 7 / 8: frame doubling / tripling | 2 / 4 |
+| SMPTE 421M / VC-1 (advanced profile, PULLDOWN) | `RFF` / `RPTFRM` | 1 / 2 x RPTFRM |
+
+The pictures are progressive and pass the deinterlacer untouched (yadif_common.c's `deint=interlaced`). What is
+missing is the timing:
+
+- **Cadence.** A run of progressive pictures whose field durations repeat 2, 3, 2, 3 (or frame durations 2, 3 in a
+  progressive sequence) is film at 4/5 of the carriage rate. Detected from the flags of the decoded pictures, in the
+  load probe's sample (for the panel rate) and continuously at playback (for the timestamps).
+- **Timestamps.** The container's timestamps follow the field timeline (33.4 ms, 50.0 ms, ...). On a 23.976 Hz panel
+  two of them can land on one refresh, depending on the refresh phase, and a picture is lost. A film run is therefore
+  re-timed onto a uniform grid of one film period, anchored at the run's first picture. The grid and the field
+  timeline agree at every cycle boundary (4 frames = 10 fields) and differ by at most half a field inside a cycle;
+  a picture further than that from its grid slot ends the run and re-anchors (an edit, a cadence break, a seek).
+- **Panel rate.** 4/5 of the carriage frame rate (24000/1001 from 30000/1001, 24 from 30) when the probe's sample is
+  a film run, instead of the doubled field rate.
+
+### 6.2 Hard telecine and progressive-segmented film: field matching
+
+The pulldown is in the pixels. Five interlaced frames carry four film frames (AA BB BC CD DD); progressive-segmented
+film (PsF, 2:2, European 25p in 1080i50) carries each film frame as its two fields. No standard defines recovery; the
+reference is FFmpeg's `fieldmatch` (VapourSynth VFM) at its defaults: `order=auto`, `mode=pc_n`, `field=auto`,
+`mchroma=1`, no exclusion band, `scthresh=12`, `combmatch=sc`, `cthresh=9`, `chroma=0`, `blockx=blocky=16`,
+`combpel=80`. Its scope is FFmpeg's: 8-bit planar 4:4:4, 4:2:2, 4:2:0, 4:1:1, 4:1:0. A picture it cannot match
+(still combed) is deinterlaced by bwdif at frame rate (`deint=interlaced`, FFmpeg's documented recipe with bwdif in
+yadif's place).
+
+- **GPU:** the per-pixel stages are integer: the field difference map (`build_diff_map`), the match accumulations
+  (`compare_fields`), the comb mask and its block counts (`calc_combed_score`), the luma differences of the scene
+  check. They run as kernels that write exact integer partial sums.
+- **CPU:** the decisions: `compare_fields`'s single-precision ratios, `checkmm`, the scene check, the match. The
+  same float operations in the same order give the same results.
+- **Output:** a weave of two fields: a copy, written into the scratch picture by the same first dispatch that runs
+  bwdif, then finished as any picture.
+
+### 6.3 Decimation
+
+The reference is FFmpeg's `decimate` (VapourSynth VDecimate) at its defaults: `cycle=5`, `dupthresh=1.1`,
+`scthresh=15`, `blockx=blocky=32`, `chroma=1`, `mixed=0`. Per cycle of five matched pictures it drops the one most
+like its predecessor (block sums of absolute differences: GPU partial sums, CPU decision) and stamps the four kept
+on the decimated time base (`dec_tb = 1001/24000` from 29.97). Panel rate 24000/1001.
+
+### 6.4 Engagement
+
+Which stage a stream gets is engine policy (FFmpeg leaves it to whoever builds the graph). The load probe already
+decodes a sample of a declared-interlaced stream (`InterlaceProbe`, #232); it also runs the field matcher and the
+decimator over it:
+
+| Sample | Stage | Panel |
+|---|---|---|
+| progressive pictures in a 2-3 repeat cadence | 6.1 | 4/5 of the carriage rate |
+| interlaced pictures that match into progressive frames, with one duplicate per cycle of five | 6.2 + 6.3 | 4/5 |
+| interlaced pictures that match their own fields (PsF) | 6.2, no decimation | the frame rate |
+| anything else | bwdif (Part 4), field rate | the field rate |
+
+A change of content during playback keeps the panel and the stage chosen at load, as a broadcast receiver's film
+mode does; the stages themselves cope with breaks (re-anchoring, combed pictures to bwdif).
+
+### 6.5 Conformance
+
+- 6.1 against the standards' arithmetic: field durations from each codec's flags on encoded test streams (MPEG-2
+  with RFF in both sequence types, H.264 with `pic_struct`), the uniform grid and its half-field invariant.
+- 6.2 and 6.3 against libavfilter on the same frames, as `BwdifReferenceTests` does for bwdif: the chain
+  `fieldmatch,bwdif=mode=send_frame:deint=interlaced,decimate`, every output picture and timestamp equal, on
+  generated 3:2 and 2:2 material with edits, a video-originated segment, scene changes and both field orders.
+- The engagement table on the probe, and a `SEQ` arm on the TV for each row.
+
 ## Banked
 
 - **Zero-copy rawvideo** by allocating its packets in slabs. Worth it only if a local or loopback producer ever feeds
   raw frames (then the copy is 300 to 750 MB/s, not bounded by the network).
-- **A GPU bwdif** port, as a quality upgrade over yadif.
 - **XYZ (ST 428 primaries) and MatrixCoefficients 11 / 15**: showing them is a gamut or model conversion, not a representation change; refused today.
 
 ## Open questions
