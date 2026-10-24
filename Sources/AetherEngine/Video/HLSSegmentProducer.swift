@@ -526,7 +526,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
     #endif
     private var loggedFirstDtsBump = false
     private var loggedFirstDtsDrop = false
-    private var loggedFirstAudioDtsBump = false
 
     /// Gate uses AV_PKT_FLAG_KEY (not libavformat's keyframe index) because MKV SimpleBlock keyframe bit can be off.
     /// Audio gate waits for video: without this, a non-IDR-keyframe miss puts video 10+ s past audio ("asynchron").
@@ -3963,30 +3962,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         continue
                     }
                 }
-                let monoGlitchAudioTicks: Int64 = {
-                    let tb = audioConfig?.sourceTimeBase
-                    guard let tb, tb.num > 0, tb.den > 0 else { return monoGlitchVideoTicks }
-                    return Int64(0.5 * Double(tb.den) / Double(tb.num))
-                }()
-                if isAudioPkt, lastAudioSourceDts != Int64.min,
-                   packet.pointee.dts != Int64.min,
-                   packet.pointee.dts <= lastAudioSourceDts,
-                   SourceTimestampBounds.difference(lastAudioSourceDts, packet.pointee.dts) <= monoGlitchAudioTicks {
-                    // Same logic for audio. Audio doesn't have B-frame
-                    // pts/dts skew so dts <= pts isn't a useful gate;
-                    // just bump.
-                    let original = packet.pointee.dts
-                    packet.pointee.dts = SourceTimestampBounds.sum(lastAudioSourceDts, 1)
-                    if !loggedFirstAudioDtsBump {
-                        loggedFirstAudioDtsBump = true
-                        EngineLog.emit(
-                            "[HLSSegmentProducer] audio dts non-monotonic at source: "
-                            + "orig=\(original) lastValid=\(lastAudioSourceDts) → bumped to \(packet.pointee.dts)",
-                            category: .session
-                        )
-                    }
-                }
-
+                // Audio is not bumped here. A repeated audio timestamp is the source's own rounding, not a
+                // glitch: Matroska stores 1 ms ticks, so TrueHD's 0.83 ms access units read 0, 1, 2, 3, 3,
+                // 4 ms. Bumping the repeat to "last plus one" and carrying the bumped value forward moved
+                // every later timestamp a tick per unit (1.2x real time) until the 0.5 s guard gave up,
+                // and everything reading the audio's time from here on (the gate, the restart target,
+                // the bridge's frame clock through FFmpeg's best-effort timestamp) read that instead.
+                // The muxer keeps output timestamps strictly increasing itself (`OutputTimestampSanitizer`,
+                // in its own 1/48000 ticks, where a repeat costs one sample and cannot cascade), and a
+                // bridge stamps its own output.
                 if isVideoPkt {
                     noCutWatchdog?.noteVideoPacket(
                         pts: packet.pointee.pts,
@@ -4266,8 +4250,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         continue
                     }
                     if restartTargetAudioDts != Int64.min && firstActualAudioDts == Int64.min {
+                        // A copied packet plays whole from its timestamp, so it has to start at the target. A
+                        // bridge places what it decodes by each frame's own time, so a packet belongs as soon
+                        // as any of its audio reaches the target; dropping a leading one (Opus's, which carries
+                        // the pre-skip) made the decoder skip the next packet's real audio instead.
+                        let bridged = audioConfig?.bridge != nil
                         let meetsTarget = packet.pointee.dts != Int64.min
-                            && packet.pointee.dts >= restartTargetAudioDts
+                            && (bridged && packet.pointee.duration > 0
+                                ? SourceTimestampBounds.sum(packet.pointee.dts, packet.pointee.duration) > restartTargetAudioDts
+                                : packet.pointee.dts >= restartTargetAudioDts)
                         // Live escape: backward PCR wrap between video gate-open and first audio packet strands the target
                         // in the old clock domain (permanently silent). Timeout + accept; VOD keeps unbounded wait.
                         var escape = false
@@ -4403,7 +4394,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // marginally negative out-dts. The muxer no longer absorbs negatives
                 // (avoid_negative_ts=disabled so restarts can continue the timeline; tfdt is
                 // unsigned), so drop such frames outright.
-                if !isVideoPkt, packet.pointee.dts != Int64.min, packet.pointee.dts < 0 {
+                // A bridge stamps its own output and keeps it at or above zero itself (`AudioBridge`).
+                if !isVideoPkt, audioConfig?.bridge == nil, packet.pointee.dts != Int64.min, packet.pointee.dts < 0 {
                     droppedLeadingAudioCount += 1
                     if droppedLeadingAudioCount == 1 {
                         EngineLog.emit(

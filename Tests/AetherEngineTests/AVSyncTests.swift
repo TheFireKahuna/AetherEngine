@@ -24,9 +24,6 @@ struct AVSyncTests {
         /// Matroska stores 1 ms ticks, so a clip's first audio timestamp is up to half of one off what
         /// the codec's frame grid says; the other containers state the sample.
         var toleranceSamples: Double { name.hasSuffix(".mkv") ? 24 : 1 }
-        /// Bridged codecs whose first frame the bridge stamps from its packet rather than from the
-        /// decoded frame (priming trimmed by the decoder): A/V audit item 4.
-        var knownIssue: Bool { name == "opus.mkv" || name == "mp3.mkv" }
         var testDescription: String { name }
     }
 
@@ -58,13 +55,7 @@ struct AVSyncTests {
         let origins = Self.firstTfdtSeconds(initBytes + segment)
         let video = flash + (origins.video ?? 0), audio = click + (origins.audio ?? 0)
         let offset = (audio - video) * 48_000
-        if clip.knownIssue {
-            withKnownIssue("A/V audit item 4: the bridge stamps the first frame from its packet") {
-                #expect(abs(offset) <= clip.toleranceSamples, "audio is \(offset) samples off the picture")
-            }
-        } else {
-            #expect(abs(offset) <= clip.toleranceSamples, "audio is \(offset) samples off the picture")
-        }
+        #expect(abs(offset) <= clip.toleranceSamples, "audio is \(offset) samples off the picture")
     }
 
     // MARK: - Measurement

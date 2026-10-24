@@ -4,8 +4,9 @@
 // encoder, and an encoder declaring `initial_padding` stamps its first PACKET a padding below that
 // frame (256 samples on the AC-3 family, 0 on FLAC). At source position 0 that published -256 as
 // 2^64 - 256, and AVPlayer placed the first audio fragment 584 thousand years out, losing its audio.
-// Nothing discards the priming here, because the muxer writes no edit list on purpose, so the
-// counter carries the padding and the content pays its 5.3 ms instead.
+// The muxer writes no edit list, so the counter carries the padding: the first packet lands on the
+// source position with the padding in front of the audio, and AVFoundation trims exactly that on
+// decode (an E-AC-3 click comes out on the sample; `AppleAudioDecoderDelay`, `AVSyncTests`).
 import Foundation
 import Testing
 @testable import AetherEngine
