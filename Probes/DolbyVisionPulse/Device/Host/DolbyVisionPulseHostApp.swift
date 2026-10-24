@@ -41,6 +41,8 @@ import UIKit
 // - `placeholder`: AVPlayer plays a placeholder clip (Scripts/build_placeholder.sh) in an AVPlayerViewController
 //   with its rendering suppressed, while frames decoded from `src=` show on a layer inside AVKit's player layer,
 //   timed by the item's clock: the software route inside the native player (PulsePlaceholder.swift has the params).
+// - `subs`: AVPlayer on Scripts/build_subs.sh's subtitle stream through an AVPlayerLayer, for AVKit's own subtitle
+//   selection and `suppressesPlayerRendering` (PulseSubtitles.swift has the cases).
 //
 // The VT modes request Dolby Vision display criteria from the track's own format description, as an
 // app on this path would.
@@ -124,6 +126,7 @@ struct PulseHarnessView: View {
     /// The engine of an `overlay` arm, shown through AVKit instead of `AetherPlayerSurface`.
     @State private var overlayEngine: AetherEngine?
     @State private var placeholder: PlaceholderSession?
+    @State private var subtitleProbe: SubtitleProbeSession?
     @State private var slate: String = ""
     @State private var host = PulseHostView()
     @State private var armInfo = ""
@@ -141,6 +144,9 @@ struct PulseHarnessView: View {
             }
             if let placeholder {
                 PlaceholderRepresentable(session: placeholder).ignoresSafeArea()
+            }
+            if let subtitleProbe {
+                SubtitleProbeRepresentable(session: subtitleProbe).ignoresSafeArea()
             }
             if !slate.isEmpty {
                 VStack(spacing: 30) {
@@ -249,6 +255,11 @@ struct PulseHarnessView: View {
                 await playEngine(arm.url, fel: false, log: say)
             case "placeholder":
                 await playPlaceholder(arm, log: say)
+            case "subs":
+                let session = SubtitleProbeSession(url: arm.url, params: arm.params, log: say)
+                subtitleProbe = session
+                await session.run()
+                subtitleProbe = nil
             case "soak":
                 // `out=` as on `engine` arms, so a soak measures the output buffer it will ship with.
                 let out = arm.params["out"] ?? AetherEngine.FelOutputMode.sv22.rawValue
