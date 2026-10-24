@@ -337,7 +337,7 @@ struct PulseHarnessView: View {
         do {
             try await e.load(url: arm.url, startPosition: nil,
                              options: LoadOptions(dolbyVisionHandling: .automatic, preferDualLayerDolbyVision: true,
-                                                  audioBridgeMode: .surroundCompat),
+                                                  felOverlay: false, audioBridgeMode: .surroundCompat),
                              audioSourceStreamIndex: nil)
             e.play()
         } catch {

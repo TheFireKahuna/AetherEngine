@@ -10,9 +10,9 @@ import AetherLibavutil
 @Suite("FEL overlay")
 struct FelOverlayTests {
 
-    @Test("the overlay is off unless asked for")
-    func optionDefaultsOff() {
-        #expect(LoadOptions().felOverlay == false)
+    @Test("the overlay is the default FEL route")
+    func optionDefaultsOn() {
+        #expect(LoadOptions().felOverlay == true)
     }
 }
 
