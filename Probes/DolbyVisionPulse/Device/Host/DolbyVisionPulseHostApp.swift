@@ -38,6 +38,9 @@ import UIKit
 //   inside AVKit's render layer, as Sodalite shows it. Takes `out=`, `rpu=` and `secs=` like `engine`.
 // - `soak`: `engine` for `minutes=` with a `seeks=at@to,...` schedule, sampled once a second, ending in
 //   one `soak summary` line; takes `out=` like `engine` (default sv22, the engine's).
+// - `placeholder`: AVPlayer plays a placeholder clip (Scripts/build_placeholder.sh) in an AVPlayerViewController
+//   with its rendering suppressed, while frames decoded from `src=` show on a layer inside AVKit's player layer,
+//   timed by the item's clock: the software route inside the native player (PulsePlaceholder.swift has the params).
 //
 // The VT modes request Dolby Vision display criteria from the track's own format description, as an
 // app on this path would.
@@ -120,6 +123,7 @@ struct PulseHarnessView: View {
     @State private var engine: AetherEngine?
     /// The engine of an `overlay` arm, shown through AVKit instead of `AetherPlayerSurface`.
     @State private var overlayEngine: AetherEngine?
+    @State private var placeholder: PlaceholderSession?
     @State private var slate: String = ""
     @State private var host = PulseHostView()
     @State private var armInfo = ""
@@ -134,6 +138,9 @@ struct PulseHarnessView: View {
             }
             if let overlayEngine {
                 OverlayPlayerRepresentable(engine: overlayEngine).ignoresSafeArea()
+            }
+            if let placeholder {
+                PlaceholderRepresentable(session: placeholder).ignoresSafeArea()
             }
             if !slate.isEmpty {
                 VStack(spacing: 30) {
@@ -233,6 +240,8 @@ struct PulseHarnessView: View {
                 AetherEngine.felComposedRpuOverride = nil
             case "enginenofel":
                 await playEngine(arm.url, fel: false, log: say)
+            case "placeholder":
+                await playPlaceholder(arm, log: say)
             case "soak":
                 // `out=` as on `engine` arms, so a soak measures the output buffer it will ship with.
                 let out = arm.params["out"] ?? AetherEngine.FelOutputMode.sv22.rawValue
@@ -305,6 +314,44 @@ struct PulseHarnessView: View {
         }
         log("engine state=\(e.state) t=\(e.currentTime)")
         e.stop()
+    }
+
+    /// A `placeholder` arm: the placeholder clip in AVKit, the `src=` clip's frames over it.
+    @MainActor
+    private func playPlaceholder(_ arm: PulseArm, log: @escaping @Sendable (String) -> Void) async {
+        guard let spec = arm.params["src"], let src = URL(string: spec, relativeTo: arm.url)?.absoluteURL else {
+            log("placeholder arm needs src=<clip>, skipped")
+            return
+        }
+        do {
+            // AVAssetReader only reads local files.
+            let (tmp, _) = try await URLSession.shared.download(from: src)
+            let local = FileManager.default.temporaryDirectory.appendingPathComponent(src.lastPathComponent)
+            try? FileManager.default.removeItem(at: local)
+            try FileManager.default.moveItem(at: tmp, to: local)
+            let asset = AVURLAsset(url: local)
+            guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+                log("placeholder src \(src.lastPathComponent): no video track")
+                return
+            }
+            var seeks: [(at: Double, to: Double)] = []
+            for item in (arm.params["seeks"] ?? "").split(separator: ",") {
+                let p = item.split(separator: "@")
+                if p.count == 2, let at = Double(p[0]), let to = Double(p[1]) { seeks.append((at, to)) }
+            }
+            if arm.params["criteria"] == "src", let fd = try await track.load(.formatDescriptions).first {
+                let fps = try await track.load(.nominalFrameRate)
+                host.window?.avDisplayManager.preferredDisplayCriteria = AVDisplayCriteria(refreshRate: fps, formatDescription: fd)
+                let sub = CMFormatDescriptionGetMediaSubType(fd)
+                log("criteria from src: \(String(bytes: [24, 16, 8, 0].map { UInt8((sub >> $0) & 0xff) }, encoding: .ascii) ?? "?") fps=\(fps)")
+            }
+            let session = PlaceholderSession(placeholder: arm.url, source: asset, track: track, params: arm.params, log: log)
+            placeholder = session
+            defer { placeholder = nil }
+            await session.run(seconds: min(arm.params["secs"].flatMap(Double.init) ?? 40, 300), seeks: seeks)
+        } catch {
+            log("placeholder src \(src.lastPathComponent): \(error)")
+        }
     }
 
     /// Long-run FEL playback with a seek schedule. Measures only what the engine exposes publicly:
@@ -414,6 +461,13 @@ private struct PulseHostRepresentable: UIViewRepresentable {
     let host: PulseHostView
     func makeUIView(context: Context) -> PulseHostView { host }
     func updateUIView(_ uiView: PulseHostView, context: Context) {}
+}
+
+private struct PlaceholderRepresentable: UIViewControllerRepresentable {
+    let session: PlaceholderSession
+
+    func makeUIViewController(context: Context) -> PlaceholderPlayerController { PlaceholderPlayerController(session: session) }
+    func updateUIViewController(_ controller: PlaceholderPlayerController, context: Context) {}
 }
 
 /// An `overlay` arm's picture: the engine's AVPlayer in an `AVPlayerViewController`, with the engine's FEL
