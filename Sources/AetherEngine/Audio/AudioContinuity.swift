@@ -32,13 +32,16 @@ enum AudioContinuity {
     /// The longest gap filled with silence, and the longest overlap trimmed, before re-anchoring.
     static let maxFillSeconds: Int64 = 5
 
-    /// The disagreement, in output samples, that is still the container's rounding: half a tick of
-    /// `sourceTimeBase`, rounded up, plus one sample for the conversion between the two.
+    /// The disagreement, in output samples, that is still the container's rounding: a tick of
+    /// `sourceTimeBase`, rounded up, plus one sample for the conversion between the two. A timestamp
+    /// rounded once is within half a tick, but one truncated, or rounded from a value that was
+    /// itself rounded, is within a whole one: `DTSX Emulator.mkv`'s scatter ±1.0 ms around its
+    /// frames, a DTS frame every 10.667 ms stamped 10, 11 and 12 ms apart.
     static func tolerance(sourceTimeBase: AVRational, sampleRate: Int32) -> Int64 {
         guard sourceTimeBase.num > 0, sourceTimeBase.den > 0, sampleRate > 0 else { return 1 }
-        let halfTick = (Int64(sourceTimeBase.num) * Int64(sampleRate) + 2 * Int64(sourceTimeBase.den) - 1)
-            / (2 * Int64(sourceTimeBase.den))
-        return halfTick + 1
+        let tick = (Int64(sourceTimeBase.num) * Int64(sampleRate) + Int64(sourceTimeBase.den) - 1)
+            / Int64(sourceTimeBase.den)
+        return tick + 1
     }
 
     static func decide(expected: Int64, actual: Int64, tolerance: Int64, sampleRate: Int32) -> Decision {

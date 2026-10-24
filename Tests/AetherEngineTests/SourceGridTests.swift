@@ -6,8 +6,8 @@ import Testing
 @Suite("Source grid")
 struct SourceGridTests {
 
-    /// Matroska: a timestamp rounded to the millisecond, 24 frames at 48 kHz either way.
-    static let matroska: Int64 = 25
+    /// Matroska: a timestamp good to the millisecond, 48 frames at 48 kHz either way.
+    static let matroska: Int64 = 49
 
     @Test("nothing is placed before the run's first timestamp")
     func unplacedWithoutTimestamp() {
@@ -33,17 +33,32 @@ struct SourceGridTests {
         #expect(grid.isResolved)
     }
 
-    @Test("TrueHD's 40-frame access unit is pinned by a second timestamp when the first allows two")
+    @Test("the start the lattice is laid from is rounded too, so a timestamp may sit a whole tick off its point",
+          arguments: [-96, -48, -16, 0, 32, 48, 96])
+    func originRounding(error: Int64) {
+        // DTSX Emulator.mkv: start_time 53 ms, its timestamps up to a tick either side of their frames.
+        let origin: Int64 = 53 * 48
+        var grid = SourceGrid(origin: origin, step: 512, tolerance: Self.matroska)
+        _ = grid.place(relative: 0, estimate: origin + 2 * 512 - 16)
+        let (placement, restarted) = grid.place(relative: 512, estimate: origin + 3 * 512 + error)
+        #expect(!restarted)
+        #expect(placement == .position(origin + 3 * 512))
+    }
+
+    @Test("TrueHD's 40-frame access unit is pinned by the timestamps that between them rule out its neighbours")
     func trueHDNeedsTwo() {
         var grid = SourceGrid(origin: 0, step: 40, tolerance: Self.matroska)
-        // 24 frames past access unit 100: it allows 100 and 101.
+        // 24 frames past access unit 100: within a timestamp's and the origin's rounding (96) of 99 to 103.
         _ = grid.place(relative: 0, estimate: 100 * 40 + 24)
         #expect(!grid.isResolved)
-        // Ten access units later, rounded the other way: only 100 fits both.
-        let (placement, restarted) = grid.place(relative: 400, estimate: 110 * 40 - 8)
+        // Ten access units later, 96 low: 99 and 100 fit both.
+        _ = grid.place(relative: 400, estimate: 110 * 40 - 96)
+        #expect(!grid.isResolved)
+        // Ten more, 96 high: only 100 fits all three.
+        let (placement, restarted) = grid.place(relative: 800, estimate: 120 * 40 + 96)
         #expect(!restarted)
         #expect(grid.isResolved)
-        #expect(placement == .position(110 * 40))
+        #expect(placement == .position(120 * 40))
         #expect(grid.place(relative: 0, estimate: nil).0 == .position(100 * 40))
     }
 

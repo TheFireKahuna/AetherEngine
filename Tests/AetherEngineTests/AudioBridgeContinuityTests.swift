@@ -140,13 +140,13 @@ struct AudioBridgeContinuityTests {
         #expect(s.continuityGaps == 0 && s.continuityOverlaps == 0 && s.continuityJumps == 0)
     }
 
-    @Test("the rule: within half a source tick and a sample it is rounding; past it, the frame is placed")
+    @Test("the rule: within a source tick and a sample it is rounding; past it, the frame is placed")
     func rule() {
         let ms = AudioContinuity.tolerance(sourceTimeBase: AVRational(num: 1, den: 1000), sampleRate: 48_000)
-        #expect(ms == 25)
+        #expect(ms == 49)
         #expect(AudioContinuity.tolerance(sourceTimeBase: AVRational(num: 1, den: 90_000), sampleRate: 48_000) == 2)
-        #expect(AudioContinuity.decide(expected: 1000, actual: 1024, tolerance: ms, sampleRate: 48_000) == .continue)
-        #expect(AudioContinuity.decide(expected: 1000, actual: 1026, tolerance: ms, sampleRate: 48_000) == .gap(26))
+        #expect(AudioContinuity.decide(expected: 1000, actual: 1048, tolerance: ms, sampleRate: 48_000) == .continue)
+        #expect(AudioContinuity.decide(expected: 1000, actual: 1050, tolerance: ms, sampleRate: 48_000) == .gap(50))
         #expect(AudioContinuity.decide(expected: 1000, actual: 900, tolerance: ms, sampleRate: 48_000) == .overlap(100))
         #expect(AudioContinuity.decide(expected: 0, actual: 6 * 48_000, tolerance: ms, sampleRate: 48_000) == .jump(6 * 48_000))
     }
