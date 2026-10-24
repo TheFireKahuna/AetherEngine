@@ -6,7 +6,7 @@ import AetherLibavutil
 @testable import AetherEngine
 
 /// A source's LFE keeps a channel of its own through the software host's resampler and the HLS
-/// bridge's encoder, and the bridge's FLAC carries every channel where the player will read it.
+/// bridge's encoder, and the bridge's PCM carries every channel where the player will read it.
 @Suite("LFE through the channel layouts")
 struct LFEChannelLayoutTests {
 
@@ -75,26 +75,36 @@ struct LFEChannelLayoutTests {
 
     private func sourceIs(_ layout: String) -> (String) -> Bool { { $0 == layout } }
 
-    @Test("the bridge keeps an LFE source's own layout on E-AC-3 where it can, 5.1 otherwise, and FLAC only in orders FLAC can say")
-    func bridgeEncoderLayout() {
-        let flac = AV_CODEC_ID_FLAC, eac3 = AV_CODEC_ID_EAC3
-        #expect(AudioBridge.encoderLayoutName(channels: 4, hasLFE: true, sourceIs: sourceIs("3.1"), encoder: eac3) == "3.1")
-        #expect(AudioBridge.encoderLayoutName(channels: 5, hasLFE: true, sourceIs: sourceIs("4.1"), encoder: eac3) == "4.1")
-        #expect(AudioBridge.encoderLayoutName(channels: 4, hasLFE: true, sourceIs: sourceIs("FL+FR+LFE+BC"),
-                                              encoder: eac3) == "FL+FR+LFE+BC")
-        #expect(AudioBridge.encoderLayoutName(channels: 5, hasLFE: true, sourceIs: sourceIs("FL+FR+LFE+BL+BR"),
-                                              encoder: eac3) == "5.1", "2/2 + LFE is not one FFmpeg's E-AC-3 encoder takes")
-        #expect(AudioBridge.encoderLayoutName(channels: 4, hasLFE: true, sourceIs: sourceIs("3.1"), encoder: flac) == "5.1")
-        #expect(AudioBridge.encoderLayoutName(channels: 3, hasLFE: true, sourceIs: sourceIs("2.1"), encoder: flac) == "5.1")
-        #expect(AudioBridge.encoderLayoutName(channels: 3, hasLFE: true, sourceIs: sourceIs("2.1"), encoder: eac3) == nil,
-                "E-AC-3 carries 2.1")
-        #expect(AudioBridge.encoderLayoutName(channels: 3, hasLFE: false, sourceIs: sourceIs("3.0"), encoder: flac) == "3.0")
-        #expect(AudioBridge.encoderLayoutName(channels: 4, hasLFE: false, sourceIs: sourceIs("4.0"), encoder: flac) == "5.0")
-        #expect(AudioBridge.encoderLayoutName(channels: 4, hasLFE: false, sourceIs: sourceIs("quad"), encoder: flac) == "quad")
-        #expect(AudioBridge.encoderLayoutName(channels: 4, hasLFE: false, sourceIs: sourceIs("4.0"), encoder: eac3) == nil)
-        #expect(AudioBridge.encoderLayoutName(channels: 6, hasLFE: true, sourceIs: sourceIs("5.1"), encoder: flac) == nil)
-        #expect(AudioBridge.encoderLayoutName(channels: 8, hasLFE: true, sourceIs: sourceIs("7.1"), encoder: flac) == nil)
-        #expect(AudioBridge.encoderLayoutName(channels: 2, hasLFE: false, sourceIs: sourceIs("stereo"), encoder: flac) == nil)
+    @Test("E-AC-3 keeps an LFE source's own layout where it can, 5.1 otherwise")
+    func eac3Layout() {
+        #expect(AudioBridge.eac3LayoutName(channels: 4, hasLFE: true, sourceIs: sourceIs("3.1")) == "3.1")
+        #expect(AudioBridge.eac3LayoutName(channels: 5, hasLFE: true, sourceIs: sourceIs("4.1")) == "4.1")
+        #expect(AudioBridge.eac3LayoutName(channels: 4, hasLFE: true, sourceIs: sourceIs("FL+FR+LFE+BC")) == "FL+FR+LFE+BC")
+        #expect(AudioBridge.eac3LayoutName(channels: 5, hasLFE: true, sourceIs: sourceIs("FL+FR+LFE+BL+BR")) == "5.1",
+                "2/2 + LFE is not one FFmpeg's E-AC-3 encoder takes")
+        #expect(AudioBridge.eac3LayoutName(channels: 3, hasLFE: true, sourceIs: sourceIs("2.1")) == nil, "E-AC-3 carries 2.1")
+        #expect(AudioBridge.eac3LayoutName(channels: 4, hasLFE: false, sourceIs: sourceIs("4.0")) == nil)
+        #expect(AudioBridge.eac3LayoutName(channels: 6, hasLFE: true, sourceIs: sourceIs("5.1")) == nil)
+    }
+
+    /// PCM goes out as `ipcm`, whose `chnl` names every channel's speaker, so the bridge has no layout of
+    /// its own to impose: every layout up to 8 channels, LFE or not, comes out as the source's.
+    @Test("PCM output keeps the source's own layout", arguments: ["2.1", "3.0", "quad", "4.0", "3.1", "4.1",
+                                                                  "FL+FR+LFE+BC", "FL+FR+LFE+BL+BR", "5.1", "5.1(side)", "7.1"])
+    func pcmKeepsTheSourceLayout(name: String) throws {
+        let par = try #require(avcodec_parameters_alloc())
+        var p: UnsafeMutablePointer<AVCodecParameters>? = par
+        defer { avcodec_parameters_free(&p) }
+        par.pointee.codec_type = AVMEDIA_TYPE_AUDIO
+        par.pointee.codec_id = AV_CODEC_ID_PCM_S24LE
+        par.pointee.sample_rate = 48_000
+        par.pointee.format = AV_SAMPLE_FMT_S32.rawValue
+        try #require(av_channel_layout_from_string(&par.pointee.ch_layout, name) >= 0)
+        let bridge = try AudioBridge(srcCodecpar: par, srcTimeBase: AVRational(num: 1, den: 48_000), mode: .lossless)
+        defer { bridge.close() }
+        #expect(bridge.output == .pcm)
+        let out = try #require(bridge.encoderCodecpar)
+        #expect(av_channel_layout_compare(&out.pointee.ch_layout, &par.pointee.ch_layout) == 0, "\(name)")
     }
 
     @Test("FFmpeg's E-AC-3 encoder takes every layout the bridge keeps for it")

@@ -946,22 +946,6 @@ extension HLSVideoEngine {
         return LATM.configuration(extradata: UnsafeRawBufferPointer(start: extradata, count: Int(codecpar.pointee.extradata_size)))
     }
 
-    /// The speakers a linear PCM track is copied with. The muxer has to name every channel's speaker
-    /// (`chnl`), and Matroska, like a WAV without a channel mask, states only how many there are; such a
-    /// file is written in the WAVE order, which is the count's default layout and how the bridge reads
-    /// it too. Nil where the count has no default layout, which leaves the track to the bridge.
-    static func pcmChannelLayout(_ codecpar: UnsafePointer<AVCodecParameters>) -> AVChannelLayout? {
-        var layout = AVChannelLayout()
-        if codecpar.pointee.ch_layout.order != AV_CHANNEL_ORDER_UNSPEC {
-            var source = codecpar.pointee.ch_layout
-            guard av_channel_layout_copy(&layout, &source) >= 0 else { return nil }
-            return layout
-        }
-        av_channel_layout_default(&layout, codecpar.pointee.ch_layout.nb_channels)
-        guard layout.order != AV_CHANNEL_ORDER_UNSPEC else { return nil }
-        return layout
-    }
-
     /// Name the speakers of a linear PCM track the muxer copies. The muxer has to give every channel
     /// a speaker (`chnl`), and Matroska, like a WAV without a channel mask, states only how many
     /// there are: such a file is written in the WAVE order, which is the count's default layout, and

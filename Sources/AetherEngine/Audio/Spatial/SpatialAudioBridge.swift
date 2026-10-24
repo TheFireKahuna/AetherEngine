@@ -8,7 +8,7 @@ import AetherLibavutil
 /// into a `SpatialSpeakerLayout` bed and encodes that as Apple Positional Audio, which tvOS delivers
 /// to an Atmos receiver as Dolby MAT with the heights intact.
 ///
-/// The FLAC bridge keeps TrueHD and DTS-HD lossless but can only carry the 7.1 presentation, so every
+/// The PCM bridge keeps TrueHD and DTS-HD lossless but can only carry the 7.1 presentation, so every
 /// height and every object position is gone before the audio leaves the engine. This bridge trades the
 /// lossless bed for the Atmos mix: APAC is lossy, at a few Mbit/s, several times the rate streaming
 /// services deliver Atmos at.

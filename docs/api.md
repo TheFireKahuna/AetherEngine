@@ -397,7 +397,7 @@ typed fact rather than as something to reconstruct (AE#462).
 | `.none` | no session |
 | `.noAudioInSource` | the source carries no audio track |
 | `.streamCopy` | the source bitstream is muxed into fMP4 unchanged (Atmos, DTS-HD and everything else reach the renderer as authored) |
-| `.bridged` | decoded and re-encoded for the fMP4 pipeline: by the channel bridge to FLAC or E-AC-3, lossless for the bed channels with object metadata lost in the PCM intermediate, or under `objectAudioRendering` in a build with the `TrueHDObjectAudio` / `DTSXObjectAudio` package traits (off by default) rendered with its objects and heights into a speaker bed and encoded as APAC (lossy) |
+| `.bridged` | decoded and re-encoded for the fMP4 pipeline: by the channel bridge to PCM or E-AC-3, lossless for the bed channels with object metadata lost in the PCM intermediate, or under `objectAudioRendering` in a build with the `TrueHDObjectAudio` / `DTSXObjectAudio` package traits (off by default) rendered with its objects and heights into a speaker bed and encoded as APAC (lossy) |
 | `.decoded` | libavcodec decodes and the engine renders it (the software path, the FFmpeg audio-only host) |
 | `.droppedNoPipeline` | the source HAS audio and none of it could be delivered: no decoder for it in this build, the bridge could not be built or could not write its header, the probe left its parameters empty so no stream could be picked, or (live only) the bridge was built and its decoder produced nothing, after which the engine rebuilds the session without the track (AE#641). The session plays video-only and silently |
 | `.playerManaged` | AVFoundation owns the audio (the remote-HLS bypass, the native audio-only host). The engine has no pipeline of its own to classify and does not answer on AVFoundation's behalf |
@@ -405,7 +405,7 @@ typed fact rather than as something to reconstruct (AE#462).
 **`.droppedNoPipeline` is the one a fallback ladder acts on**, the same way it demotes on
 `PlaybackErrorKind.audioBridgeProducedNoOutput`. The two are the same user outcome from opposite
 ends of the cascade: that kind fails loudly when a VOD bridge WAS built and then decoded nothing
-(on the FLAC route as well since AE#641, which used to play silently while reporting `.bridged`),
+(on the PCM route as well since AE#641, which used to play silently while reporting `.bridged`),
 this value reports a bridge that could never be built at all. A live session whose bridge decodes
 nothing arrives here as well rather than at the error: its video is playable and a live source has
 no position to hand to a second player, so the engine rebuilds it video-only by itself and the
@@ -424,7 +424,7 @@ player.$audioDelivery
 ```
 
 `$activeAudioDecoder` is the same fact for a human ("Stream-copy (EAC3+JOC Atmos)",
-`"TrueHD → FLAC bridge"`, `"libavcodec AC3 → CoreAudio"`) and stays the right thing to show in a
+`"TrueHD → PCM bridge"`, `"libavcodec AC3 → CoreAudio"`) and stays the right thing to show in a
 stats overlay. Do not classify on it: it cannot separate a source with no audio from a source whose
 audio was dropped, and before AE#462 it was outright wrong on the software path, where it was built
 from the probe's track list and so named a decoder that had refused to open. Both publishers are
@@ -1085,7 +1085,7 @@ already holds the one permitted connection and already demuxes every packet.
 
 The recording is a **stream copy of the source packets into MPEG-TS**, taken before any audio
 bridging. Nothing is decoded and nothing is re-encoded. A TrueHD or DTS channel therefore records
-its original audio while playback is listening to the bridged FLAC rendition, and a file cut short
+its original audio while playback is listening to the bridged PCM rendition, and a file cut short
 by a crash or a kill is still playable up to the truncation, which is why the container is MPEG-TS
 rather than fragmented MP4. The file opens on the first video keyframe after the call, so it starts
 on a decodable picture rather than mid-GOP.
@@ -1309,7 +1309,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `nativeRemoteHLS` | false | Hand a remote `master.m3u8` straight to AVPlayer: no demuxer probe, no loopback. Built for `isLive: true`; a remote HLS VOD URL reaches this route regardless (AE#154). The clock here is item time, see `clock.$sourceTime` (AE#616). |
 | `nativeRemoteHLSIngestFallback` | true | The #168 / #293 carriage recovery and the #363 401/403 bypass refusal recovery. Setting it false turns both off. |
 | `audioOnly` | false | Lean audio pipeline, no video machinery. Also set automatically when the probe finds no video stream. |
-| `audioBridgeMode` | `.lossless` | Bridge encoder for codecs that cannot stream-copy into fMP4. `.lossless` uses FLAC up to 7.1 throughout and needs a sink that accepts multichannel LPCM (an AVR over HDMI, an AVR or soundbar on eARC); behind legacy ARC it is downmixed to stereo. `.surroundCompat` uses EAC3 for a source with more than two channels and FLAC for one with two or fewer (no surround to carry), and keeps surround behind legacy ARC. |
+| `audioBridgeMode` | `.lossless` | Bridge encoder for codecs that cannot stream-copy into fMP4. `.lossless` hands on the decoded PCM up to 7.1 throughout and needs a sink that accepts multichannel LPCM (an AVR over HDMI, an AVR or soundbar on eARC); behind legacy ARC it is downmixed to stereo. `.surroundCompat` uses EAC3 for a source with more than two channels and PCM for one with two or fewer (no surround to carry), and keeps surround behind legacy ARC. |
 | `objectAudioRendering` | `.off` | TrueHD Atmos and DTS:X with heights (#731), in a build with the `TrueHDObjectAudio` / `DTSXObjectAudio` package traits (off by default, [README › Optional components](../README.md#optional-components)); without a codec's trait the option is accepted and that codec keeps `audioBridgeMode`. `.apac(SpatialSpeakerLayout)` decodes the Atmos objects, or DTS:X's heights, renders them into that bed (`.l512`, `.l514`, `.l712`, `.l714`, `.l916`) and delivers Apple Positional Audio, which tvOS sends to an Atmos receiver as Dolby MAT and iOS plays as Spatial Audio. Lossy (320 kbps per bed channel) in place of the lossless 7.1 the bridge delivers, so it is the host's choice. Only TrueHD that FFmpeg marks Atmos, and DTS-HD Master Audio whose first frames decode as DTS:X in its standard presentation (whatever FFmpeg's label; DTS:X only into `.l714` or `.l916`), at 48 kHz, on OS 26+; anything else, or any failure to start, keeps `audioBridgeMode`. With it on, the automatic audio pick prefers a TrueHD Atmos or DTS:X-labelled track over the other tracks of the same language (of the `preferredAudioLanguages` match, or of the default track when no preference decides; with no audio track tagged at all, of every track), never across a language or dub and never over `audioSourceStreamIndexOverride`, and only where the bed can be rendered (a VOD video session off the software path, on OS 26 or later). `SpatialSpeaker` names the positions. See [formats.md](formats.md#truehd-atmos-with-heights) and [DTS:X](formats.md#dtsx-with-heights). Without a codec's trait that codec keeps the channel bridge and the automatic audio pick does not prefer it; `AetherEngine.OptionalComponent` tells a host which codecs a build renders. |
 | `objectDialogueGain` | `0` | Dialogue enhancement in dB for TrueHD Atmos where the engine renders the objects itself (the exact decode or object APAC, personal builds; the bed split plays Dolby's own channel mix and has no objects to adjust): elements the stream marks as dialogue are raised or lowered by it, as AC-4 specifies for object audio. A boost is limited to the most the stream allows and TrueHD streams state none, so only a cut takes effect, and only on a stream that marks its dialogue. |
 | `confirmAtmos` | false | Background per-track JOC confirmation, republishing `audioTracks` as tracks confirm. Never on the start path; skipped for live and forward-only readers. |

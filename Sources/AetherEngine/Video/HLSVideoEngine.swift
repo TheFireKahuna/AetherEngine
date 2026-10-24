@@ -572,8 +572,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// mutable demuxer from the main actor while playback is reading or tearing down.
     private(set) var openedSourceIsSeekable = false
 
-    /// Result of the stream-copy / FLAC-bridge / video-only cascade. Possible values:
-    /// `"Stream-copy (EAC3+JOC Atmos)"`, `"Stream-copy (<CODEC>)"`, `"<CODEC> → FLAC bridge"`.
+    /// Result of the stream-copy / bridge / video-only cascade. Possible values:
+    /// `"Stream-copy (EAC3+JOC Atmos)"`, `"Stream-copy (<CODEC>)"`, `"<CODEC> → PCM bridge"`, `"<CODEC> → EAC3 bridge"`.
     /// nil when no audio pipeline is live.
     public internal(set) var audioPipelineDescription: String?
 
@@ -835,7 +835,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     }
     private let silentBridgeSurfaceLock = NSLock()
     private var silentBridgeFailureSurfaced = false
-    /// Session-long FLAC bridge for codecs illegal in fMP4. Engine-owned (not producer-owned) so
+    /// Session-long audio bridge for codecs illegal in fMP4. Engine-owned (not producer-owned) so
     /// encoder state survives producer restarts; `startSegment()` rebases PTS on each restart.
     var audioBridge: (any AudioTranscodingBridge)?
     var segmentPlan: [Segment] = []
@@ -2022,7 +2022,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             audioDem = dem
         }
 
-        // 6a. Audio routing: stream-copy (common case: ec-3/Atmos JOC) → FLAC bridge (EINVAL on
+        // 6a. Audio routing: stream-copy (common case: ec-3/Atmos JOC) → bridge (EINVAL on
         //     EAC3-from-MKV without dec3) → video-only. Override validated; stale index logs + falls back.
         var autoAudioStreamIndex = audioDem.audioStreamIndex
         // av_find_best_stream skips streams with empty codecpar (live TS probe bails early, -1381258232).
@@ -2094,8 +2094,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
             let sourceAudio = audioStream.pointee.codecpar.pointee
             let latmConfig = Self.latmConfiguration(audioStream.pointee.codecpar)
             let bluRayLPCM = BluRayLPCM(codecpar: audioStream.pointee.codecpar)
-            var pcmLayout = compat == .pcm ? Self.pcmChannelLayout(audioStream.pointee.codecpar) : nil
-            defer { if pcmLayout != nil { av_channel_layout_uninit(&pcmLayout!) } }
             // AE#764: CoreMedia refuses a FLAC min_blocksize under 192 and hangs on frames smaller than the
             // field claims, so a stream with small blocks cannot be copied, only decoded.
             let flacBlocksTooSmall = compat == .flac
@@ -2110,13 +2108,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     category: .session
                 )
             } else if compat.requiresBridge || (compat == .aacLatm && latmConfig == nil)
-                        || (compat == .bluRayLPCM && bluRayLPCM == nil) || (compat == .pcm && pcmLayout == nil) {
+                        || (compat == .bluRayLPCM && bluRayLPCM == nil) {
                 bridgePreferred = true
                 EngineLog.emit(
                     "[HLSVideoEngine] audio: codec=\(compat) "
                         + (compat == .aacLatm ? "(no AudioSpecificConfig read out of it while probing)"
                             : compat == .bluRayLPCM ? "(no format read out of it while probing)"
-                            : compat == .pcm ? "(\(sourceAudio.ch_layout.nb_channels) channels in no layout to name their speakers by)"
                             : "(bridge required)")
                         + ", decoding + "
                           + (Self.spatialRenderingLayout(
@@ -2127,9 +2124,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                                      ? "Atmos object render into \(layout.rawValue), APAC"
                                      : "DTS:X render into \(layout.rawValue) if its first frame decodes as DTS:X, APAC"
                              }
-                             ?? Self.encoderLabel(AudioBridge.bridgeEncoder(
-                                for: audioBridgeMode,
-                                sourceChannels: sourceAudio.ch_layout.nb_channels)).uppercased())
+                             ?? (AudioBridge.output(for: audioBridgeMode,
+                                                    sourceChannels: sourceAudio.ch_layout.nb_channels) == .eac3 ? "EAC3" : "PCM"))
                           + " re-encode",
                     category: .session
                 )
@@ -2166,12 +2162,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     )
                 }
                 // Linear PCM: the muxer names every channel's speaker.
-                if pcmLayout != nil {
-                    av_channel_layout_uninit(&ownedAudioParams.ptr.pointee.ch_layout)
-                    guard av_channel_layout_copy(&ownedAudioParams.ptr.pointee.ch_layout, &pcmLayout!) >= 0 else {
-                        throw HLSVideoEngineError.openFailed(reason: "audio channel layout allocation failed")
-                    }
-                }
                 if compat == .pcm { Self.namePCMSpeakers(ownedAudioParams.ptr) }
                 // Blu-ray LPCM: the muxer is given the samples behind its headers, as big-endian PCM.
                 if let bluRayLPCM {
@@ -2243,7 +2233,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 // decoder by id, not for a routing-table entry, so a codec the table does not name
                 // still gets sound as long as the FFmpeg build carries its decoder (measured
                 // 2026-09-10 on Nellymoser-in-FLV before its table entry existed: this line, then a
-                // NELLYMOSER -> FLAC bridge and a session with audio). What the missing entry costs
+                // NELLYMOSER -> bridge and a session with audio). What the missing entry costs
                 // is the stream-copy decision, which is why the next thing that happens is a bridge.
                 // The genuinely silent case is one line further down: no decoder in the build at
                 // all, which the cascade reports as `falling back to SILENT video-only`.
@@ -2289,7 +2279,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         }
 
-        // 6b. Run the stream-copy / FLAC-bridge / video-only cascade.
+        // 6b. Run the stream-copy / bridge / video-only cascade.
         let prod: HLSSegmentProducer
         prod = try buildProducerWithAudioCascade(
             preferBridge: bridgePreferred,

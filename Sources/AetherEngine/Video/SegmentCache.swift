@@ -42,7 +42,7 @@ final class SegmentCache: @unchecked Sendable {
 
     private let forwardWindow: Int
     /// 20 covers Continuous-Audio handover refetches (~7-10 segments backward); smaller values
-    /// cascaded into restart chains that reset the FLAC bridge PTS and caused audible glitches.
+    /// cascaded into restart chains that reset the bridge PTS and caused audible glitches.
     private let backwardWindow: Int
     /// Byte budget for retaining segments OUTSIDE the hard window (#93 / Sodalite#32). While the
     /// cache's total footprint fits the budget, already-produced segments beyond the window stay

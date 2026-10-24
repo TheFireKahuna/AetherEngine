@@ -11,7 +11,7 @@ import AetherLibavutil
 ///
 /// The resampler was always in the path and always asked for the encoder's rate, so the rate the
 /// encoder is opened at is a free choice. These pin that it is the encoder's choice, not the source's,
-/// and that a rate the encoder does accept survives untouched (FLAC at 96 kHz stays bit-perfect).
+/// and that a rate the output does accept survives untouched (PCM at 96 kHz stays bit-perfect).
 @Suite("AE#548 the bridge encoder opens at a rate it supports")
 struct Issue548BridgeSampleRateTests {
 
@@ -120,7 +120,7 @@ struct Issue548BridgeSampleRateTests {
         #expect(!bridge.feedStats.isSilent)
     }
 
-    @Test("a rate the encoder supports is left alone, so FLAC at 96 kHz stays bit-perfect")
+    @Test("a rate the output supports is left alone, so PCM at 96 kHz stays bit-perfect")
     func losslessKeepsTheSourceRate() throws {
         let codecpar = makeTrueHDCodecpar(sampleRate: 96_000, channels: 6)
         defer {
@@ -134,9 +134,9 @@ struct Issue548BridgeSampleRateTests {
         bridge.setSourceStart(0)
         defer { bridge.close() }
 
-        #expect(bridge.encoderCodecpar?.pointee.codec_id == AV_CODEC_ID_FLAC)
+        #expect(bridge.output == .pcm)
         #expect(bridge.encoderTimeBase.den == 96_000,
-                "FLAC carries 96 kHz, and a lossless mode that resampled it would not be lossless")
+                "PCM carries 96 kHz, and a lossless mode that resampled it would not be lossless")
     }
 
     // MARK: - The choice itself
@@ -147,8 +147,8 @@ struct Issue548BridgeSampleRateTests {
         #expect(eac3.contains(48_000))
         #expect(!eac3.contains(96_000), "if this ever fails, E-AC-3 grew a rate and the fix below is moot")
 
-        let flac = AudioBridge.supportedSampleRates(for: AV_CODEC_ID_FLAC)
-        #expect(flac.isEmpty || flac.contains(96_000))
+        let pcm = AudioBridge.supportedSampleRates(for: AV_CODEC_ID_PCM_S24LE)
+        #expect(pcm.isEmpty || pcm.contains(96_000))
     }
 
     @Test("an exact match wins")
