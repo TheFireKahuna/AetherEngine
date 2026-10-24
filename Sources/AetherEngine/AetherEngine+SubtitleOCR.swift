@@ -9,6 +9,11 @@ extension AetherEngine {
     /// Arm for the selected embedded bitmap track. The per-ordinal cursor survives re-arming.
     func startSubtitleOCRWorker(ordinal: Int, streamIndex: Int32) {
         cancelSubtitleOCRWorker()
+        // A track the container indexes in full is recognized from the index, not from the packet store.
+        if startIndexedBitmapFill(ordinal: ordinal) {
+            subtitleOCRArmedOrdinal = ordinal
+            return
+        }
         guard let store = nativeStore(atOrdinal: ordinal) else { return }
         store.markFeeding()
         subtitleOCRArmedOrdinal = ordinal
@@ -49,6 +54,12 @@ extension AetherEngine {
         }
     }
 
+    /// `base`, or further when the player has asked the armed rendition for windows beyond it.
+    func subtitleOCRDemandLead(base: Double, playhead: Double) -> Double {
+        let requested = subtitleOCRArmedOrdinal.flatMap { nativeStore(atOrdinal: $0)?.furthestRequestedSourceSeconds() }
+        return Self.subtitleReadAhead(base: base, playhead: playhead, requested: requested)
+    }
+
     /// Completed coverage survives a re-arm; an abandoned batch must be collected again.
     func cancelSubtitleOCRWorker() {
         if subtitleOCRBatchInFlight, let ordinal = subtitleOCRArmedOrdinal {
@@ -58,6 +69,10 @@ extension AetherEngine {
         }
         subtitleOCRBatchInFlight = false
         subtitleOCRArmedOrdinal = nil
+        // The index fill keeps what it recognized (`IndexedSubtitleState`) and resumes from there.
+        indexedBitmapFillTask?.cancel()
+        indexedBitmapFillTask = nil
+        indexedBitmapFillOrdinal = nil
         subtitleOCRWorkerTask?.cancel()
         subtitleOCRWorkerTask = nil
         subtitleOCRSidecarFillTask?.cancel()
@@ -86,10 +101,16 @@ extension AetherEngine {
         subtitleOCRLastTickUptime = tickUptime
         let plan = SubtitleOverlayDrainer.drainPlan(
             cursor: subtitleOCRCursors[ordinal], playhead: playhead,
-            lead: Self.subtitleOCRLeadSeconds,
+            lead: subtitleOCRDemandLead(base: Self.subtitleOCRLeadSeconds, playhead: playhead),
             backscan: Self.subtitleDrainBackscanSeconds,
             jumpThreshold: Self.subtitleDrainJumpThresholdSeconds,
             elapsedSinceLastPlan: elapsed)
+        // The prefetcher has to stay ahead of the window; a lead the player outgrew rebuilds it.
+        if let active = subtitleForwardPrefetchActiveLead,
+           subtitleOCRDemandLead(base: Self.subtitleOCRPrefetchLeadSeconds, playhead: playhead)
+            > active + Self.subtitleDemandMarginSeconds {
+            startSubtitleForwardPrefetcher(startAt: playhead)
+        }
         let window: (from: Double, through: Double)
         switch plan {
         case .idle:

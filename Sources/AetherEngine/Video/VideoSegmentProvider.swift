@@ -3075,6 +3075,12 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// reports per packet), so a feeder that is reading never misses it.
     static let subtitleFeedAliveSeconds = 5.0
 
+    /// The longest a subtitle segment request is held for a feeder to reach its window. AVPlayer gives
+    /// up on a subtitle segment after about 1.75 s ('No response for media file in 1.752s', device log
+    /// 2026-10-24), logs an error that the engine reads as a stall, and asks again; a hold past that
+    /// costs more than the empty answer it was meant to avoid.
+    static let subtitleRequestWaitSeconds = 1.0
+
     // MARK: - Native subtitle renditions (#15)
 
     var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] {
@@ -3144,8 +3150,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // And only while something is filling it: a rendition the player selected by itself before
         // anyone fed it used to cost 3 s a request, which held the item's start past the readiness gate
         // (a FORCED=YES rendition tvOS picked at load, 2026-10-24).
+        store.noteRequested(through: end)
         let horizonSeconds = 30.0
-        let deadline = Date().addingTimeInterval(3.0)
+        let deadline = Date().addingTimeInterval(Self.subtitleRequestWaitSeconds)
         while !store.isFinished,
               store.isBeingFed(within: Self.subtitleFeedAliveSeconds),
               store.readThrough(at: start) < end,

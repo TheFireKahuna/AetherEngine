@@ -33,6 +33,9 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     private var readSpan: (from: Double, through: Double)?
     /// When a feeder last started on this track or reported reading it: whether anyone is filling it.
     private var lastFeedActivity: DispatchTime?
+    /// The furthest window end the player has asked this rendition for (AVPlayer axis): how far ahead it
+    /// reads it, which is what a feeder has to be ahead of.
+    private var furthestRequestedEnd: Double = 0
     /// Called the first time the player asks for this rendition (its media playlist), which is the
     /// moment AVKit selected it, whoever asked it to.
     private var renditionRequestedHandler: (@Sendable () -> Void)?
@@ -49,6 +52,18 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     func noteRenditionRequested() {
         lock.lock(); let handler = renditionRequestedHandler; lock.unlock()
         handler?()
+    }
+
+    /// The player asked for this rendition's window ending at `end` (AVPlayer axis).
+    func noteRequested(through end: Double) {
+        guard end.isFinite else { return }
+        lock.lock(); if end > furthestRequestedEnd { furthestRequestedEnd = end }; lock.unlock()
+    }
+
+    /// The furthest window end the player has asked for, on the source axis; nil before any request.
+    func furthestRequestedSourceSeconds() -> Double? {
+        lock.lock(); defer { lock.unlock() }
+        return furthestRequestedEnd > 0 ? furthestRequestedEnd + shiftSeconds : nil
     }
 
     /// A feeder has started on this track: it counts as being filled from now, before its first report.
