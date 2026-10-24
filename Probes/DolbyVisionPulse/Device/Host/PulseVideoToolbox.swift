@@ -145,8 +145,8 @@ final class PulseHostView: UIView {
 }
 
 
-/// Frame copy for the `vtcopy` / `vtstrip` arms, used on the feed queue.
-nonisolated private final class PulseFrameCopier: @unchecked Sendable {
+/// Frame copy for the `vtcopy` / `vtstrip` arms and the `placeholder` arm's `strip=1`, used on a feed queue.
+nonisolated final class PulseFrameCopier: @unchecked Sendable {
     private var pool: CVPixelBufferPool?
     private var poolKey: (Int, Int, OSType)?
 

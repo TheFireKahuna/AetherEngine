@@ -19,6 +19,10 @@
 #   DEVICE=... SEQ=cardov ./run_tv.sh           the amplifier card on both FEL routes (14 s per arm): TR/TS software host
 #                                               p010-round / sv22, then OR/OS the native route's FEL overlay (felOverlay),
 #                                               OI the overlay's identity control
+#   DEVICE=... SEQ=placeholder ./run_tv.sh      the software route inside AVPlayer (Scripts/build_placeholder.sh): AVKit plays a
+#                                               flat placeholder, the picture is our own decode on a layer in AVKit's player layer.
+#                                               GD overlay pulses / placeholder constant, GX the reverse, GH HDR10 placeholder,
+#                                               GS seeks on the counter clip; by eye, about 2.5 min
 #   DEVICE=... SEQ=count ./run_tv.sh            counter clips: T / NE / TL (FEL route, residual, RPU pulse) and PM (8.1 control)
 #   DEVICE=... SEQ=soak SOAK_URL=<http url | file under $PULSE_OUT> [SOAK_MIN=5] [SOAK_SEEKS=60@1800,150@600,240@3000] ./run_tv.sh
 #                                               one FEL soak arm; its summary line is grepped at the end
@@ -148,7 +152,34 @@ case "$SEQ" in
     for f in p7fel_card.mp4 card_amp10.bin card_identity.bin; do
       [[ -e "$OUT/$f" ]] || { echo "missing $OUT/$f (Scripts/build.sh makes it)"; exit 1; }
     done ;;
-  *) echo "unknown SEQ=$SEQ (main|el|vt|count|cm4|cm4q|l8ladder|fmt|bits|card|cardov|soak)"; exit 1 ;;
+  placeholder)
+    # GD: Dolby Vision placeholder with a constant RPU, the overlay decodes pulse_l2: a pulse means the overlay's
+    #     RPU drives the panel. Press the remote here: the transport bar, pause, scrub.
+    # GX: the reverse, the placeholder pulses and the overlay is constant: a pulse means AVPlayer's own RPU leaks.
+    # GH: HDR10 placeholder, the overlay's frames without Dolby Vision attachments: HDR10 mode, steady.
+    # GV: HDR10 placeholder with Dolby Vision criteria from the source, as the FEL overlay route serves AVPlayer
+    #     (hvc1, DV only supplemental): a pulse means the overlay's RPU drives the panel. Press the remote here.
+    # GS: seeks on the counter clip (BL nnnn) in GV's arrangement: the number after each seek should be the target.
+    # GE: the intended design: the Dolby Vision placeholder carries the source's own per-frame RPU (ph_dv_l2 has
+    #     pulse_l2's), AVKit sets the mode from it, the overlay shows the source's frames: DV, pulse, Atmos.
+    # PH_ARMS (e.g. GE) plays a subset.
+    ARMS="GD|placeholder|$B/ph_dv_null.mp4|src=pulse_l2.mp4;secs=40"
+    ARMS+=",GX|placeholder|$B/ph_dv_l2.mp4|src=pulse_null.mp4;secs=25"
+    ARMS+=",GH|placeholder|$B/ph_hdr10.mp4|src=pulse_l2.mp4;strip=1;secs=25"
+    ARMS+=",GV|placeholder|$B/ph_hdr10.mp4|src=pulse_l2.mp4;criteria=src;secs=40"
+    ARMS+=",GS|placeholder|$B/ph_hdr10.mp4|src=count_mel.mp4;criteria=src;secs=40;seeks=10@40,20@5,30@60"
+    ARMS+=",GE|placeholder|$B/ph_dv_l2.mp4|src=pulse_l2.mp4;secs=45"
+    LABELS=GD,GX,GH,GV,GS,GE
+    if [[ -n "${PH_ARMS:-}" ]]; then
+      # Pieces without a `|` continue the arm before them (a seeks= list).
+      ARMS=$(print -r -- "$ARMS" | tr ',' '\n' | awk -v keep=",$PH_ARMS," -F'|' \
+        'NF > 1 { k = index(keep, "," $1 ",") > 0 } k' | paste -sd, -)
+      LABELS=$PH_ARMS
+    fi
+    for f in ph_dv_null.mp4 ph_dv_l2.mp4 ph_hdr10.mp4 pulse_l2.mp4 pulse_null.mp4 count_mel.mp4; do
+      [[ -e "$OUT/$f" ]] || { echo "missing $OUT/$f (Scripts/build.sh, then Scripts/build_placeholder.sh)"; exit 1; }
+    done ;;
+  *) echo "unknown SEQ=$SEQ (main|el|vt|count|cm4|cm4q|l8ladder|fmt|bits|card|cardov|placeholder|soak)"; exit 1 ;;
 esac
 
 if [[ "${1:-}" != "--no-build" ]]; then
@@ -177,9 +208,20 @@ what to look for (top-left label: arm, out=, rpu=, and the mode tvOS is sending;
   BR/BF/BS           the bullseye banding fallback, no override: compare the rings across the three
 LEGEND
 fi
+if [[ "$SEQ" == placeholder ]]; then
+  cat <<'LEGEND'
+what to look for (top-left: the arm and the mode tvOS is sending):
+  GD  Dolby Vision; steady (measured 2026-10-24: the placeholder's constant RPU drives the panel, not the overlay's)
+  GX  Dolby Vision; the picture pulses (measured: AVPlayer's own RPU reaches the TV)
+  GH  HDR10 (not Dolby Vision); steady picture
+  GV  steady (measured: the overlay's RPU never reaches the TV); Atmos; press the remote: bar, pause, scrub
+  GE  Dolby Vision; the picture pulses; Atmos; press the remote: bar, pause, scrub (the picture follows)
+  GS  after each seek (10 s: to 40, 20 s: to 5, 30 s: to 60) the BL counter shows the target frame within a moment
+LEGEND
+fi
 case "$SEQ" in
   soak) ;;
-  card|cardov|cm4q|l8ladder) echo "watch the TV (no recording needed); launching in 10 s" ;;
+  card|cardov|cm4q|l8ladder|placeholder) echo "watch the TV (no recording needed); launching in 10 s" ;;
   *) echo "start the phone recording now; launching in 10 s" ;;
 esac
 sleep 10

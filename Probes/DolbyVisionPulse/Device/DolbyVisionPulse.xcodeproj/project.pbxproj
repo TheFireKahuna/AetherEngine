@@ -9,14 +9,16 @@
 /* Begin PBXBuildFile section */
 		1254C205053EE036691617B5 /* DisplayModeReadout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1183C2E52D49E774C3701716 /* DisplayModeReadout.swift */; };
 		1CC1EA98D9C5F77AAC72F7CC /* PulseVideoToolbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9672B7938DDC09AAB435BC6 /* PulseVideoToolbox.swift */; };
+		57A5C1974F1445AF1B0F20AB /* PulsePlaceholder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74786F63BD0EE1685C8334AE /* PulsePlaceholder.swift */; };
 		77CB08AE958747D4126970C6 /* DolbyVisionPulseHostApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BCA97A8853B09B4E7B4B99A /* DolbyVisionPulseHostApp.swift */; };
-		C3F88D052478C6D03F65C74C /* PulseEngine in Frameworks */ = {isa = PBXBuildFile; productRef = 5DDCF6DD2D95C3E73D4B2B5C /* PulseEngine */; };
+		C3F88D052478C6D03F65C74C /* PulseEngine in Frameworks */ = {isa = PBXBuildFile; productRef = F205C8EA4205283B180F9C52 /* PulseEngine */; };
 		FB3139445F0E0031753BB397 /* PulseLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCACA2DF252349E564F73EAC /* PulseLog.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		1183C2E52D49E774C3701716 /* DisplayModeReadout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayModeReadout.swift; sourceTree = "<group>"; };
-		6EC0C4402B0A4CFAB2376CAB /* PulseEngine */ = {isa = PBXFileReference; lastKnownFileType = folder; path = PulseEngine; sourceTree = SOURCE_ROOT; };
+		6A80C80C8BE727528184B2A2 /* PulseEngine */ = {isa = PBXFileReference; lastKnownFileType = folder; name = PulseEngine; path = PulseEngine; sourceTree = SOURCE_ROOT; };
+		74786F63BD0EE1685C8334AE /* PulsePlaceholder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PulsePlaceholder.swift; sourceTree = "<group>"; };
 		7BCA97A8853B09B4E7B4B99A /* DolbyVisionPulseHostApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DolbyVisionPulseHostApp.swift; sourceTree = "<group>"; };
 		81B68F565101F4AD4C23902A /* DolbyVisionPulseHost.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = DolbyVisionPulseHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B9672B7938DDC09AAB435BC6 /* PulseVideoToolbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PulseVideoToolbox.swift; sourceTree = "<group>"; };
@@ -38,7 +40,7 @@
 		877A8AC0E76ED624DD6E3BF6 /* Packages */ = {
 			isa = PBXGroup;
 			children = (
-				6EC0C4402B0A4CFAB2376CAB /* PulseEngine */,
+				6A80C80C8BE727528184B2A2 /* PulseEngine */,
 			);
 			name = Packages;
 			sourceTree = "<group>";
@@ -66,6 +68,7 @@
 				1183C2E52D49E774C3701716 /* DisplayModeReadout.swift */,
 				7BCA97A8853B09B4E7B4B99A /* DolbyVisionPulseHostApp.swift */,
 				DCACA2DF252349E564F73EAC /* PulseLog.swift */,
+				74786F63BD0EE1685C8334AE /* PulsePlaceholder.swift */,
 				B9672B7938DDC09AAB435BC6 /* PulseVideoToolbox.swift */,
 			);
 			path = Host;
@@ -87,7 +90,7 @@
 			);
 			name = DolbyVisionPulseHost;
 			packageProductDependencies = (
-				5DDCF6DD2D95C3E73D4B2B5C /* PulseEngine */,
+				F205C8EA4205283B180F9C52 /* PulseEngine */,
 			);
 			productName = DolbyVisionPulseHost;
 			productReference = 81B68F565101F4AD4C23902A /* DolbyVisionPulseHost.app */;
@@ -117,7 +120,7 @@
 			mainGroup = 91F1FECFC9FBC63638DFB9F0;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				A1D5E5D261EA7A828134329D /* XCLocalSwiftPackageReference "PulseEngine" */,
+				27E0D3878058B162F37A9EF6 /* XCLocalSwiftPackageReference "PulseEngine" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = A0369D737D33D357FE77916A /* Products */;
@@ -137,6 +140,7 @@
 				1254C205053EE036691617B5 /* DisplayModeReadout.swift in Sources */,
 				77CB08AE958747D4126970C6 /* DolbyVisionPulseHostApp.swift in Sources */,
 				FB3139445F0E0031753BB397 /* PulseLog.swift in Sources */,
+				57A5C1974F1445AF1B0F20AB /* PulsePlaceholder.swift in Sources */,
 				1CC1EA98D9C5F77AAC72F7CC /* PulseVideoToolbox.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -329,14 +333,14 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		A1D5E5D261EA7A828134329D /* XCLocalSwiftPackageReference "PulseEngine" */ = {
+		27E0D3878058B162F37A9EF6 /* XCLocalSwiftPackageReference "PulseEngine" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = PulseEngine;
 		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		5DDCF6DD2D95C3E73D4B2B5C /* PulseEngine */ = {
+		F205C8EA4205283B180F9C52 /* PulseEngine */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = PulseEngine;
 		};
