@@ -44,8 +44,9 @@ public final class FelOverlayRenderer: @unchecked Sendable {
     /// Test seam: every composed frame with the item time it shows, on the render queue.
     public var onComposed: (@Sendable (CMTime, CVPixelBuffer) -> Void)?
 
-    /// Frames are chosen for the refresh this many refreshes ahead: compose takes under one.
-    static let leadRefreshes = 2.0
+    /// With no new frame for this long (paused, a still), the display link pauses until the output says frames
+    /// are coming again.
+    static let quiesceAfter = 0.5
 
     private let output: AVPlayerItemVideoOutput
     private weak var item: AVPlayerItem?
@@ -53,13 +54,15 @@ public final class FelOverlayRenderer: @unchecked Sendable {
     private let composer: DoviFelComposer
     private let queue = DispatchQueue(label: "aether.fel-overlay", qos: .userInteractive)
     private var displayLink: FelOverlayDisplayLink?
+    private var outputDelegate: FelOverlayOutputDelegate?
+    private var lastNewFrame = CACurrentMediaTime()
     private var jumpObserver: NSObjectProtocol?
     private var readyObservation: NSKeyValueObservation?
     private var boundsObservation: NSKeyValueObservation?
     private var gravityObservation: NSKeyValueObservation?
     private let timing = FelOverlayTiming()
     private var itemTimebase: CMTimebase?
-    /// The item's ultimate source clock (the audio device's), for the clock readings in the log.
+    /// The audio output's clock, for the clock readings in the log.
     private var audioClock: CMClock?
     /// Item time of the frame each output surface last carried, for reading back what is on screen. Pool
     /// surfaces are reused, so this stays as small as the pool.
@@ -71,8 +74,10 @@ public final class FelOverlayRenderer: @unchecked Sendable {
     private var lastPulled = CMTime.invalid
     /// Bumped on every clock jump: a composition finishing for an older generation is for a left position.
     private var generation = 0
-    /// The shortest step between pulled frames: the stream's frame duration, for counting skips.
-    private var frameDuration: Double?
+    /// The mean step between pulled frames: the stream's frame duration (container timestamps can be whole
+    /// milliseconds, so single steps are not), for counting skips.
+    private var frameSteps: (sum: Double, count: Int) = (0, 0)
+    private var frameDuration: Double? { frameSteps.count > 0 ? frameSteps.sum / Double(frameSteps.count) : nil }
     private var frameIndex: UInt32 = 0
     private var lastRefresh: CFTimeInterval?
     private var blankEnhancement: CVPixelBuffer?
@@ -126,7 +131,7 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         readyObservation = nil
         item.add(output)
         self.itemTimebase = itemTimebase
-        audioClock = CMTimebaseCopyUltimateSourceClock(itemTimebase)
+        audioClock = Self.audioOutputClock() ?? CMTimebaseCopyUltimateSourceClock(itemTimebase)
         // The layer's time is host time, the clock the display link stamps refreshes in.
         var hostTimebase: CMTimebase?
         CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault, sourceClock: CMClockGetHostTimeClock(), timebaseOut: &hostTimebase)
@@ -152,9 +157,20 @@ public final class FelOverlayRenderer: @unchecked Sendable {
                            + "the composer delivers \(Self.fourCC(DoviFelComposer.outputMode.pixelFormat))", category: .swPlayback)
         }
         logDecoderFormat(item: item)
-        let link = FelOverlayDisplayLink { [weak self] timestamp, duration in
-            self?.queue.async { self?.refresh(at: timestamp, duration: duration) }
+        let link = FelOverlayDisplayLink { [weak self] timestamp, targetTimestamp in
+            guard let self else { return }
+            // What is on screen, read at the callback itself: queued behind other work it could be a frame late.
+            let shownSurface = self.layer.sampleBufferRenderer.displayedPixelBuffer()
+                .flatMap { CVPixelBufferGetIOSurface($0)?.takeUnretainedValue() }
+                .map { IOSurfaceGetID($0) }
+            self.queue.async { self.refresh(at: timestamp, target: targetTimestamp, shownSurface: shownSurface) }
         }
+        let delegate = FelOverlayOutputDelegate { [weak self] in
+            self?.lastNewFrame = CACurrentMediaTime()
+            self?.displayLink?.setPaused(false)
+        }
+        output.setDelegate(delegate, queue: queue)
+        outputDelegate = delegate
         link.start()
         displayLink = link
     }
@@ -217,24 +233,32 @@ public final class FelOverlayRenderer: @unchecked Sendable {
 
     // MARK: - Render queue
 
-    /// One display refresh, at `timestamp` (host time), refreshes `duration` apart: what is on screen now is
-    /// measured, and the frame for the refresh `leadRefreshes` ahead is chosen and composed.
-    private func refresh(at timestamp: CFTimeInterval, duration: CFTimeInterval) {
+    /// One display refresh. `timestamp` is when the last frame displayed and `target` when the next one does,
+    /// so `target - timestamp` is the actual refresh interval. What is on screen is measured; the frame for the
+    /// refresh after `target` is chosen and composed (one refresh of time to compose it).
+    private func refresh(at timestamp: CFTimeInterval, target: CFTimeInterval, shownSurface: IOSurfaceID?) {
         guard let itemTimebase else { return }
+        let duration = target - timestamp
         if let lastRefresh {
             countersLock.withLock { _counters.maxRefreshGapMs = max(_counters.maxRefreshGapMs, (timestamp - lastRefresh) * 1000) }
         }
         lastRefresh = timestamp
-        measure(at: timestamp, duration: duration, itemTimebase: itemTimebase)
+        measure(at: timestamp, duration: duration, shownSurface: shownSurface, itemTimebase: itemTimebase)
         logCountersIfDue()
 
         // The documented use of the output: the item time for a coming refresh, and its frame if it is new.
-        let target = timestamp + duration * Self.leadRefreshes
-        let itemTime = output.itemTime(forHostTime: target)
-        guard output.hasNewPixelBuffer(forItemTime: itemTime) else { return }
-        var frameTime = CMTime.invalid
-        guard let base = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &frameTime),
-              frameTime.isValid else { return }
+        let presentAt = target + duration
+        let itemTime = output.itemTime(forHostTime: presentAt)
+        guard output.hasNewPixelBuffer(forItemTime: itemTime) else {
+            // Nothing new for a while (paused, a still): quiesce until the output says frames are coming.
+            if CACurrentMediaTime() - lastNewFrame > Self.quiesceAfter {
+                displayLink?.setPaused(true)
+                output.requestNotificationOfMediaDataChange(withAdvanceInterval: duration)
+            }
+            return
+        }
+        lastNewFrame = CACurrentMediaTime()
+        guard let (source, frameTime) = outputFrame(forItemTime: itemTime), frameTime.isValid else { return }
         countersLock.withLock { _counters.pulled += 1 }
         if lastPulled.isValid, frameTime > lastPulled {
             let step = (frameTime - lastPulled).seconds
@@ -242,63 +266,64 @@ public final class FelOverlayRenderer: @unchecked Sendable {
                 let missed = Int((step / frameDuration).rounded()) - 1
                 if missed > 0, missed < 12 { countersLock.withLock { _counters.skipped += missed } }
             }
-            if step > 0.005 { frameDuration = min(frameDuration ?? step, step) }
+            if step > 0.005, step < 0.2 { frameSteps = (frameSteps.sum + step, frameSteps.count + 1) }
         }
         if lastPulled.isValid, frameTime < lastPulled { restartPresentation() }
         lastPulled = frameTime
         tap.advance(to: frameTime.seconds)
 
-        guard let frame = tap.frame(at: frameTime.seconds) else {
-            countersLock.withLock { _counters.notReady += 1 }
-            return
-        }
-        var params = frame.params
-        let enhancement: CVPixelBuffer
-        if let el = frame.enhancement {
-            enhancement = el
-        } else if let blank = blankEnhancement(for: base) {
-            params.flags.insert(.disableResidual)
-            enhancement = blank
-            countersLock.withLock { _counters.residualOff += 1 }
-        } else {
-            return
-        }
-        frameIndex &+= 1
-        let generation = self.generation
-        let shownTime = frameTime
-        let rpu = frame.composedRpu
-        let composeStart = CACurrentMediaTime()
-        // Stamped half a refresh before the refresh it was chosen for: that refresh, and no other, shows it.
-        let presentation = CMTime(seconds: target - duration / 2, preferredTimescale: 1_000_000_000)
-        let shownFor = CMTime(seconds: duration, preferredTimescale: 1_000_000_000)
-        composer.composeAsync(baseBuffer: base, enhancementBuffer: enhancement, params: params, frameIndex: frameIndex) { [weak self] composed in
-            guard let self else { return }
-            let composeMs = (CACurrentMediaTime() - composeStart) * 1000
-            self.countersLock.withLock { self._counters.maxComposeMs = max(self._counters.maxComposeMs, composeMs) }
-            guard let composed else {
-                self.countersLock.withLock { self._counters.composeFailed += 1 }
+        source.withBuffer { base in
+            guard let frame = tap.frame(at: frameTime.seconds) else {
+                countersLock.withLock { _counters.notReady += 1 }
                 return
             }
-            DoviDisplayMetadata.attach(rpuNAL: rpu, to: composed)
-            if let surface = CVPixelBufferGetIOSurface(composed)?.takeUnretainedValue() {
-                let id = IOSurfaceGetID(surface)
-                self.surfaceTimes.withLock { $0[id] = shownTime.seconds }
+            var params = frame.params
+            let enhancement: CVPixelBuffer
+            if let el = frame.enhancement {
+                enhancement = el
+            } else if let blank = blankEnhancement(for: base) {
+                params.flags.insert(.disableResidual)
+                enhancement = blank
+                countersLock.withLock { _counters.residualOff += 1 }
+            } else {
+                return
             }
-            self.queue.async {
-                guard generation == self.generation else { return }
-                self.enqueue(composed, at: presentation, for: shownFor, frameTime: shownTime, composeMs: composeMs)
+            frameIndex &+= 1
+            let generation = self.generation
+            let shownTime = frameTime
+            let rpu = frame.composedRpu
+            let composeStart = CACurrentMediaTime()
+            // Stamped half a refresh before the refresh it was chosen for: that refresh, and no other, shows it.
+            let presentation = CMTime(seconds: presentAt - duration / 2, preferredTimescale: 1_000_000_000)
+            let shownFor = CMTime(seconds: duration, preferredTimescale: 1_000_000_000)
+            composer.composeAsync(baseBuffer: base, enhancementBuffer: enhancement, params: params, frameIndex: frameIndex) { [weak self] composed in
+                withExtendedLifetime(source) {}
+                guard let self else { return }
+                let composeMs = (CACurrentMediaTime() - composeStart) * 1000
+                self.countersLock.withLock { self._counters.maxComposeMs = max(self._counters.maxComposeMs, composeMs) }
+                guard let composed else {
+                    self.countersLock.withLock { self._counters.composeFailed += 1 }
+                    return
+                }
+                DoviDisplayMetadata.attach(rpuNAL: rpu, to: composed)
+                if let surface = CVPixelBufferGetIOSurface(composed)?.takeUnretainedValue() {
+                    let id = IOSurfaceGetID(surface)
+                    self.surfaceTimes.withLock { $0[id] = shownTime.seconds }
+                }
+                self.queue.async {
+                    guard generation == self.generation else { return }
+                    self.enqueue(composed, at: presentation, for: shownFor, frameTime: shownTime, composeMs: composeMs)
+                }
             }
         }
     }
 
     /// What is on screen at this refresh: which frame (by its surface), how far its item time is from the item
     /// clock's at this refresh (the picture against the audio), and the clocks.
-    private func measure(at timestamp: CFTimeInterval, duration: CFTimeInterval, itemTimebase: CMTimebase) {
+    private func measure(at timestamp: CFTimeInterval, duration: CFTimeInterval, shownSurface: IOSurfaceID?,
+                         itemTimebase: CMTimebase) {
         let playing = CMTimebaseGetRate(itemTimebase) != 0
-        let shown = layer.sampleBufferRenderer.displayedPixelBuffer()
-            .flatMap { CVPixelBufferGetIOSurface($0)?.takeUnretainedValue() }
-            .map { IOSurfaceGetID($0) }
-            .flatMap { id in surfaceTimes.withLock { $0[id] } }
+        let shown = shownSurface.flatMap { id in surfaceTimes.withLock { $0[id] } }
         let clockNow = output.itemTime(forHostTime: timestamp).seconds
         timing.refresh(at: timestamp, stated: duration, shown: shown,
                        offsetMs: shown.map { ($0 - clockNow) * 1000 }, playing: playing)
@@ -331,6 +356,48 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         layer.sampleBufferRenderer.enqueue(sample)
         countersLock.withLock { _counters.composed += 1 }
         onComposed?(frameTime, buffer)
+    }
+
+    /// A frame from the output: tvOS 26's read-only buffer (`pixelBufferAndDisplayTime(forItemTime:)`), or the
+    /// copied buffer before it. Its pixels are only read, inside `withBuffer`: the composer's Metal textures,
+    /// made there, keep the buffer alive until the GPU is done, and the frame itself is held until then too.
+    private enum OutputFrame: @unchecked Sendable {
+        case readOnly(AnyObject)
+        case copied(CVPixelBuffer)
+
+        func withBuffer(_ body: (CVPixelBuffer) -> Void) {
+            switch self {
+            case .copied(let buffer):
+                body(buffer)
+            case .readOnly(let frame):
+                if #available(macOS 26, iOS 26, tvOS 26, *), let frame = frame as? CVReadOnlyPixelBuffer {
+                    frame.withUnsafeBuffer { body($0) }
+                }
+            }
+        }
+    }
+
+    /// The output's frame for `itemTime` and the item time it is for.
+    private func outputFrame(forItemTime itemTime: CMTime) -> (OutputFrame, CMTime)? {
+        if #available(macOS 26, iOS 26, tvOS 26, *) {
+            let (readOnly, frameTime) = output.pixelBufferAndDisplayTime(forItemTime: itemTime)
+            guard let readOnly else { return nil }
+            return (.readOnly(readOnly), frameTime)
+        }
+        var frameTime = CMTime.invalid
+        guard let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &frameTime) else { return nil }
+        return (.copied(buffer), frameTime)
+    }
+
+    /// The audio output's own clock: the clock AVPlayer's item time follows, read directly for the log.
+    private static func audioOutputClock() -> CMClock? {
+        #if os(macOS)
+        return nil
+        #else
+        var clock: CMClock?
+        CMAudioClockCreate(allocator: kCFAllocatorDefault, clockOut: &clock)
+        return clock
+        #endif
     }
 
     /// An enhancement-sized picture the kernels can bind when the residual is off; its content is never read.

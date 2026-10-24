@@ -1,6 +1,8 @@
 // Only with the DualLayerDolbyVision trait (off by default).
 #if DualLayerDolbyVision
 import Foundation
+import AVFoundation
+import os
 import QuartzCore
 #if os(macOS)
 import AppKit
@@ -27,7 +29,7 @@ final class FelOverlayTiming: @unchecked Sendable {
     private var clockFirst: (host: Double, audio: Double?, item: Double)?
     private var clockLast: (host: Double, audio: Double?, item: Double)?
     private var refreshTimes: (first: Double, last: Double, count: Int)?
-    /// The refresh interval the system states for the current display mode (`CADisplayLink.duration`).
+    /// The refresh interval as the display link gives it, `targetTimestamp - timestamp`.
     private var statedRefresh: Double?
     /// The displayed frame's item time minus the item clock at that refresh: the picture against the audio.
     private var offsetMs: [Double] = []
@@ -110,7 +112,7 @@ final class FelOverlayTiming: @unchecked Sendable {
                 var text = String(format: "display %.4f ms measured", measured * 1000)
                 if let stated = statedRefresh {
                     displayPPM = (stated / measured - 1) * 1e6
-                    text += String(format: ", %.4f ms stated (%+.1f ppm on the host clock)", stated * 1000, displayPPM!)
+                    text += String(format: ", %.4f ms per refresh by targetTimestamp (%+.1f ppm)", stated * 1000, displayPPM!)
                 }
                 if let frameDuration {
                     text += String(format: ", content frame %.4f ms (%.3f refreshes per frame)", frameDuration * 1000, frameDuration / measured)
@@ -152,24 +154,31 @@ final class FelOverlayTiming: @unchecked Sendable {
     }
 }
 
-/// The display link that drives the overlay, on its own thread: at every refresh, its timestamp and the
-/// refresh interval, in host time. On a Mac without a screen (tests), a timer stands in at 60 Hz.
+/// The display link that drives the overlay, on its own thread. At every refresh it reports `timestamp`
+/// (when the last frame displayed) and `targetTimestamp` (when the next one displays), in host time; their
+/// difference is the actual refresh interval (`duration` is the interval at the screen's maximum rate). It
+/// can be paused while nothing changes. On a Mac without a screen (tests), a 60 Hz timer stands in.
 final class FelOverlayDisplayLink: NSObject, @unchecked Sendable {
-    private let onRefresh: (CFTimeInterval, CFTimeInterval) -> Void
+    private let onRefresh: (_ timestamp: CFTimeInterval, _ targetTimestamp: CFTimeInterval) -> Void
     private var thread: Thread?
+    private var link: CADisplayLink?
+    private let pausedState = OSAllocatedUnfairLock(initialState: false)
 
-    init(onRefresh: @escaping (_ timestamp: CFTimeInterval, _ duration: CFTimeInterval) -> Void) {
+    init(onRefresh: @escaping (_ timestamp: CFTimeInterval, _ targetTimestamp: CFTimeInterval) -> Void) {
         self.onRefresh = onRefresh
     }
 
     func start() {
         let thread = Thread { [self] in
             let link = makeLink()
+            self.link = link
             link?.add(to: .current, forMode: .common)
             var fallback: Timer?
             if link == nil {
                 fallback = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
-                    self?.onRefresh(CACurrentMediaTime(), 1.0 / 60)
+                    guard let self, !self.pausedState.withLock({ $0 }) else { return }
+                    let now = CACurrentMediaTime()
+                    self.onRefresh(now, now + 1.0 / 60)
                 }
                 RunLoop.current.add(fallback!, forMode: .common)
             }
@@ -187,6 +196,17 @@ final class FelOverlayDisplayLink: NSObject, @unchecked Sendable {
 
     func stop() { thread?.cancel() }
 
+    /// Pauses or resumes the callbacks, on the display link's own thread.
+    func setPaused(_ paused: Bool) {
+        guard pausedState.withLock({ state in
+            defer { state = paused }
+            return state != paused
+        }), let thread else { return }
+        perform(#selector(applyPaused), on: thread, with: nil, waitUntilDone: false)
+    }
+
+    @objc private func applyPaused() { link?.isPaused = pausedState.withLock { $0 } }
+
     private func makeLink() -> CADisplayLink? {
         #if os(macOS)
         return NSScreen.main?.displayLink(target: self, selector: #selector(fire(_:)))
@@ -195,6 +215,14 @@ final class FelOverlayDisplayLink: NSObject, @unchecked Sendable {
         #endif
     }
 
-    @objc private func fire(_ link: CADisplayLink) { onRefresh(link.timestamp, link.duration) }
+    @objc private func fire(_ link: CADisplayLink) { onRefresh(link.timestamp, link.targetTimestamp) }
+}
+
+/// The video output's pull delegate: AVFoundation says new frames are coming, so a paused display link
+/// resumes (the header's sample for quiescing a display link driving an `AVPlayerItemVideoOutput`).
+final class FelOverlayOutputDelegate: NSObject, AVPlayerItemOutputPullDelegate, @unchecked Sendable {
+    private let onWillChange: () -> Void
+    init(onWillChange: @escaping () -> Void) { self.onWillChange = onWillChange }
+    func outputMediaDataWillChange(_ sender: AVPlayerItemOutput) { onWillChange() }
 }
 #endif
