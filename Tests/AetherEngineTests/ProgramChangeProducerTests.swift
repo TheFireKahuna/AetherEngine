@@ -33,7 +33,7 @@ struct ProgramChangeProducerTests {
         if withAudio, let a = demuxer.stream(at: demuxer.audioStreamIndex) {
             audio = .init(codecpar: UnsafePointer(a.pointee.codecpar), timeBase: a.pointee.time_base,
                           sourceStreamIndex: demuxer.audioStreamIndex, inputTimeBase: a.pointee.time_base,
-                          sourceTimeBase: a.pointee.time_base, bridge: nil, stripAacAdts: false)
+                          sourceTimeBase: a.pointee.time_base, bridge: nil)
         }
         let cache = SegmentCache(forwardWindow: 64, backwardWindow: 64)
         let producer = try HLSSegmentProducer(

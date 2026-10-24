@@ -931,6 +931,27 @@ extension HLSVideoEngine {
             objectType: aacObjectType(profile: par.profile, frameSize: par.frame_size),
             sampleRate: par.sample_rate, frameSize: par.frame_size,
             channels: max(1, Int(par.ch_layout.nb_channels))) else { return false }
+        return installAudioSpecificConfig(asc, in: codecpar)
+    }
+
+    /// LOAS/LATM AAC (DVB, its IPTV restreams) as the AAC it carries: the codec id, the stream's own
+    /// AudioSpecificConfig (libavcodec's LATM decoder left it in `extradata` while probing, in the bytes
+    /// it started in; `LATM.configuration` cuts it at its end), and no TS codec_tag. Returns the
+    /// configuration the stream's elements must keep (`HLSSegmentProducer.AACTransport.latm`), nil
+    /// when probing read none or it lies outside what `LATM` reads, which leaves the stream to the
+    /// bridge.
+    static func latmConfiguration(_ codecpar: UnsafePointer<AVCodecParameters>) -> [UInt8]? {
+        guard codecpar.pointee.codec_id == AV_CODEC_ID_AAC_LATM, let extradata = codecpar.pointee.extradata,
+              codecpar.pointee.extradata_size > 0 else { return nil }
+        return LATM.configuration(extradata: UnsafeRawBufferPointer(start: extradata, count: Int(codecpar.pointee.extradata_size)))
+    }
+
+    static func prepareLATMForFMP4(_ codecpar: UnsafeMutablePointer<AVCodecParameters>, config: [UInt8]) -> Bool {
+        codecpar.pointee.codec_id = AV_CODEC_ID_AAC
+        return installAudioSpecificConfig(config, in: codecpar)
+    }
+
+    private static func installAudioSpecificConfig(_ asc: [UInt8], in codecpar: UnsafeMutablePointer<AVCodecParameters>) -> Bool {
         if codecpar.pointee.extradata != nil { av_freep(&codecpar.pointee.extradata) }
         codecpar.pointee.extradata_size = 0
         let total = asc.count + Int(AV_INPUT_BUFFER_PADDING_SIZE)
