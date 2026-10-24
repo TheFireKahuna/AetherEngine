@@ -15,7 +15,6 @@ extension AetherEngine {
             return
         }
         guard let store = nativeStore(atOrdinal: ordinal) else { return }
-        store.markFeeding()
         subtitleOCRArmedOrdinal = ordinal
         let language = ordinal < nativeSubtitleTrackTable.count
             ? nativeSubtitleTrackTable[ordinal].language : nil

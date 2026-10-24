@@ -88,14 +88,12 @@ extension AetherEngine {
                                + "serves the selected ordinal=\(armed) until it is released", category: .engine)
                 return
             }
-            store.markFeeding()
             startSubtitleOCRWorker(ordinal: ordinal, streamIndex: Int32(stream))
             // The index fill reads its own blocks; only the packet-store worker needs the prefetcher.
             if indexedBitmapFillOrdinal != ordinal, indexedSubtitles?.plans[ordinal] == nil {
                 startSubtitleForwardPrefetcher(startAt: sourceTime)
             }
         } else {
-            store.markFeeding()
             startLazyNativeSubtitleReadersWhenIdle()
         }
         EngineLog.emit("[AetherEngine] forced rendition ordinal=\(ordinal) requested by the player: filling "
@@ -2060,7 +2058,6 @@ extension AetherEngine {
             routes[pair.streamIndex] = (decoder, pair.store, stream.pointee.time_base)
         }
         guard !routes.isEmpty else { return }
-        for route in routes.values { route.store.markFeeding() }
 
         // #104: discard video/audio (and any non-routed subtitle stream) on this side demuxer. Without it the
         // reader pulls and allocs EVERY video+audio sample byte-for-byte through a second AVIOReader just to
