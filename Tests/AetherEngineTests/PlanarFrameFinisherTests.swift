@@ -20,9 +20,11 @@ struct PlanarFrameFinisherTests {
         var sv22 = false
         var location: AVChromaLocation = AVCHROMA_LOC_LEFT
         var matrix: CFString = kCVImageBufferYCbCrMatrix_ITU_R_709_2
+        var colorspace: AVColorSpace = AVCOL_SPC_UNSPECIFIED
+        var primaries: AVColorPrimaries = AVCOL_PRI_UNSPECIFIED
         var description: String {
             "\(String(cString: av_get_pix_fmt_name(format))) range=\(range.rawValue)\(tenBitStream ? " 10-bit stream" : "")"
-                + "\(sv22 ? " sv22" : "") loc=\(location.rawValue) \(matrix)"
+                + "\(sv22 ? " sv22" : "") loc=\(location.rawValue) \(matrix) mc=\(colorspace.rawValue) cp=\(primaries.rawValue)"
         }
     }
 
@@ -60,6 +62,20 @@ struct PlanarFrameFinisherTests {
         Case(format: AV_PIX_FMT_RGB24, range: AVCOL_RANGE_JPEG), Case(format: AV_PIX_FMT_BGRA, range: AVCOL_RANGE_JPEG),
         Case(format: AV_PIX_FMT_RGB565LE, range: AVCOL_RANGE_JPEG), Case(format: AV_PIX_FMT_X2RGB10LE, range: AVCOL_RANGE_JPEG),
         Case(format: AV_PIX_FMT_RGB48BE, range: AVCOL_RANGE_JPEG), Case(format: AV_PIX_FMT_PAL8),
+        // Matrices CoreVideo cannot tag, re-encoded 4:4:4 with the matrix the primaries call for.
+        Case(format: AV_PIX_FMT_YUV444P10LE, colorspace: AVCOL_SPC_FCC, primaries: AVCOL_PRI_BT709),
+        Case(format: AV_PIX_FMT_YUV420P, colorspace: AVCOL_SPC_FCC, primaries: AVCOL_PRI_BT470M),
+        Case(format: AV_PIX_FMT_YUV444P, colorspace: AVCOL_SPC_CHROMA_DERIVED_NCL, primaries: AVCOL_PRI_BT2020),
+        Case(format: AV_PIX_FMT_YUV444P12LE, range: AVCOL_RANGE_JPEG, colorspace: AVCOL_SPC_CHROMA_DERIVED_NCL, primaries: AVCOL_PRI_BT709),
+        Case(format: AV_PIX_FMT_YUV422P10LE, location: AVCHROMA_LOC_TOPLEFT, colorspace: AVCOL_SPC_CHROMA_DERIVED_NCL, primaries: AVCOL_PRI_SMPTE432),
+        Case(format: AV_PIX_FMT_YUV444P, colorspace: AVCOL_SPC_YCGCO, primaries: AVCOL_PRI_BT709),
+        Case(format: AV_PIX_FMT_YUV420P10LE, colorspace: AVCOL_SPC_YCGCO, primaries: AVCOL_PRI_BT709),
+        Case(format: AV_PIX_FMT_YUV444P, range: AVCOL_RANGE_JPEG, colorspace: AVCOL_SPC_YCGCO, primaries: AVCOL_PRI_BT709),
+        Case(format: AV_PIX_FMT_YUV444P10LE, colorspace: AVCOL_SPC_YCGCO_RE, primaries: AVCOL_PRI_BT709),
+        Case(format: AV_PIX_FMT_YUV444P10LE, range: AVCOL_RANGE_JPEG, colorspace: AVCOL_SPC_YCGCO_RO, primaries: AVCOL_PRI_BT2020),
+        Case(format: AV_PIX_FMT_YUV420P10LE, colorspace: AVCOL_SPC_YCGCO_RO, primaries: AVCOL_PRI_BT709),
+        Case(format: AV_PIX_FMT_YUV444P, range: AVCOL_RANGE_JPEG, colorspace: AVCOL_SPC_RGB, primaries: AVCOL_PRI_BT709),
+        Case(format: AV_PIX_FMT_YUV444P10LE, colorspace: AVCOL_SPC_RGB, primaries: AVCOL_PRI_BT2020),
     ]
 
     @Test("GPU output equals the H.273 reference", arguments: cases.indices, [(35, 9), (66, 34)])
@@ -81,6 +97,18 @@ struct PlanarFrameFinisherTests {
         #expect(!PlanarFrameFinisher.reads(AV_PIX_FMT_BAYER_RGGB8), "Bayer")
         #expect(!PlanarFrameFinisher.reads(AV_PIX_FMT_XYZ12LE), "XYZ")
         #expect(!PlanarFrameFinisher.reads(AV_PIX_FMT_VIDEOTOOLBOX), "hardware")
+        func refused(_ f: AVPixelFormat, _ m: AVColorSpace, _ p: AVColorPrimaries = AVCOL_PRI_BT709) -> Bool {
+            if case .refused = ColourRepresentation.resolve(format: f, matrix: m, primaries: p) { return true }
+            return false
+        }
+        #expect(refused(AV_PIX_FMT_YUV420P10LE, AVCOL_SPC_SMPTE2085), "Y'D'zD'x is XYZ colour")
+        #expect(refused(AV_PIX_FMT_YUV420P10LE, AVCOL_SPC_IPT_C2), "IPT-C2 needs its Dolby Vision RPU")
+        #expect(refused(AV_PIX_FMT_YUV444P, AVCOL_SPC_CHROMA_DERIVED_NCL, AVCOL_PRI_UNSPECIFIED), "no primaries, no K_R")
+        #expect(refused(AV_PIX_FMT_YUV420P, AVCOL_SPC_RGB), "GBR is 4:4:4")
+        #expect(refused(AV_PIX_FMT_GBRP, AVCOL_SPC_RGB, AVCOL_PRI_SMPTE428), "XYZ primaries")
+        #expect(refused(AV_PIX_FMT_YUV420P, AVColorSpace(rawValue: 3)), "reserved")
+        #expect(!refused(AV_PIX_FMT_YUV420P10LE, AVCOL_SPC_ICTCP), "ICtCp is tagged")
+        #expect(ColorAttachments.matrix(AVCOL_SPC_ICTCP) as String? == "ITU_R_2100_ICtCp")
         #expect(PlanarFrameFinisher.reads(AV_PIX_FMT_RGB4), "RGB at any depth decodes through its range")
         // An interlaced picture is never resampled vertically.
         let out = SoftwareVideoDecoder.OutputFormat(chroma: .yuv444, depth: .eight, fullRange: false)
@@ -170,20 +198,25 @@ struct PlanarFrameFinisherTests {
             }
         }
 
+        let representation = ColourRepresentation.resolve(format: c.format, matrix: c.colorspace, primaries: c.primaries)
         let output = SoftwareVideoDecoder.outputFormat(pixelFormat: c.format.rawValue, colorRange: c.range,
-                                                       streamIs10Bit: c.tenBitStream, twelveBit420: c.sv22 ? .sv22 : .p010Dithered)
+                                                       streamIs10Bit: c.tenBitStream, twelveBit420: c.sv22 ? .sv22 : .p010Dithered,
+                                                       representation: representation)
         let desc = try #require(av_pix_fmt_desc_get(c.format)).pointee
         let isRGB = desc.flags & UInt64(AV_PIX_FMT_FLAG_RGB) != 0
-        let sourceFullRange = isRGB ? c.range != AVCOL_RANGE_MPEG : output.fullRange
+        let sourceFullRange = isRGB ? c.range != AVCOL_RANGE_MPEG
+            : (c.range == AVCOL_RANGE_JPEG || SoftwareVideoDecoder.isJPEGFormat(c.format))
+        let matrix = representation.converts ? ColourRepresentation.targetMatrix(primaries: c.primaries) : c.matrix
         let plan = try #require(PlanarFrameFinisher.plan(source: c.format, output: output, sourceFullRange: sourceFullRange,
-                                                         chromaLocation: c.location, matrix: c.matrix), "\(c)")
+                                                         chromaLocation: c.location, matrix: matrix,
+                                                         representation: representation), "\(c)")
         let planes = try #require(allocator.copy(f))
         defer { allocator.release(planes.slab) }
         let pb = try makeBuffer(output, width: width, height: height)
         #expect(finisher.finish(planes, plan: plan, width: width, height: height, into: pb), "\(c)")
 
         let reference = Reference(frame: f, desc: desc, output: output, sourceFullRange: sourceFullRange,
-                                  location: c.location, matrix: c.matrix)
+                                  location: c.location, matrix: matrix, representation: representation)
         for plane in 0..<2 {
             let got = readPlane(pb, plane: plane)
             let expected = reference.plane(plane)
@@ -210,6 +243,7 @@ struct PlanarFrameFinisherTests {
         let sourceFullRange: Bool
         let location: AVChromaLocation
         let matrix: CFString
+        let representation: ColourRepresentation
 
         var width: Int { Int(frame.pointee.width) }
         var height: Int { Int(frame.pointee.height) }
@@ -218,7 +252,7 @@ struct PlanarFrameFinisherTests {
         var containerShift: Int { output.depth == .ten && !output.dithers ? 6 : 0 }
         var wordMax: Int { targetBits + fractionBits >= 16 ? 0xFFFF : (1 << (targetBits + fractionBits)) - 1 }
         var isPalette: Bool { desc.flags & UInt64(AV_PIX_FMT_FLAG_PAL) != 0 }
-        var isRGB: Bool { !isPalette && desc.flags & UInt64(AV_PIX_FMT_FLAG_RGB) != 0 }
+        var isRGB: Bool { representation == .identity || (!isPalette && desc.flags & UInt64(AV_PIX_FMT_FLAG_RGB) != 0) }
         var isGray: Bool { !isPalette && !isRGB && desc.nb_components < 3 }
         var outLog2: (Int, Int) { output.chroma == .yuv420 ? (1, 1) : (output.chroma == .yuv422 ? (1, 0) : (0, 0)) }
         func depth(_ c: Int) -> Int { Int(withUnsafeBytes(of: desc.comp) { $0.bindMemory(to: AVComponentDescriptor.self)[c].depth }) }
@@ -262,7 +296,7 @@ struct PlanarFrameFinisherTests {
         func rounded(_ x: Double) -> Word {
             let r = Int(min(max((x + 0.5).rounded(.down), 0), Double(wordMax)))
             let frac = x - x.rounded(.down)
-            return Word(word: r, real: x, nearTie: abs(frac - 0.5) < 1e-4, step: 1)
+            return Word(word: r, real: x, nearTie: abs(frac - 0.5) < 1e-6, step: 1)
         }
 
         func site(_ i: Double, log2: Int, vertical: Bool) -> Double {
@@ -318,13 +352,59 @@ struct PlanarFrameFinisherTests {
                 return (e(Int((entry >> 16) & 0xFF), 8, full: true), e(Int((entry >> 8) & 0xFF), 8, full: true),
                         e(Int(entry & 0xFF), 8, full: true))
             }
-            return (e(read(0, x, y), depth(0), full: sourceFullRange), e(read(1, x, y), depth(1), full: sourceFullRange),
-                    e(read(2, x, y), depth(2), full: sourceFullRange))
+            // Identity (MC 0 on Y'CbCr-labelled planes): G, B, R (H.273 (48)-(50)).
+            let (r, g, b) = representation == .identity ? (2, 0, 1) : (0, 1, 2)
+            return (e(read(r, x, y), depth(r), full: sourceFullRange), e(read(g, x, y), depth(g), full: sourceFullRange),
+                    e(read(b, x, y), depth(b), full: sourceFullRange))
+        }
+
+        /// E'R, E'G, E'B of a converted picture at (x, y): chroma resampled to the pixel (exact, in Double), then the
+        /// matrix's own decode (docs/colour-representation.md section 2).
+        func converted(_ x: Int, _ y: Int) -> (Double, Double, Double) {
+            let yc = Double(read(0, x, y))
+            var cb = resampled(1, ox: x, oy: y), cr = resampled(2, ox: x, oy: y)
+            let dy = depth(0), dc = depth(1)
+            func ergb(_ codes: (Double, Double, Double), _ d: Int) -> (Double, Double, Double) {
+                func e(_ v: Double) -> Double {
+                    sourceFullRange ? v / (pow(2, Double(d)) - 1) : (v / pow(2, Double(d - 8)) - 16) / 219
+                }
+                return (e(codes.0), e(codes.1), e(codes.2))
+            }
+            switch representation {
+            case .nonConstantLuminance(let kr, let kb):
+                let ey: Double, pb: Double, pr: Double
+                if sourceFullRange {
+                    ey = yc / (pow(2, Double(dy)) - 1)
+                    pb = (cb - pow(2, Double(dc - 1))) / (pow(2, Double(dc)) - 1)
+                    pr = (cr - pow(2, Double(dc - 1))) / (pow(2, Double(dc)) - 1)
+                } else {
+                    ey = (yc / pow(2, Double(dy - 8)) - 16) / 219
+                    pb = (cb / pow(2, Double(dc - 8)) - 128) / 224
+                    pr = (cr / pow(2, Double(dc - 8)) - 128) / 224
+                }
+                let r = ey + 2 * (1 - kr) * pr, b = ey + 2 * (1 - kb) * pb
+                return (r, (ey - kr * r - kb * b) / (1 - kr - kb), b)
+            case .ycgco:
+                let h = pow(2, Double(dc - 1)), top = pow(2, Double(dy)) - 1
+                let t = yc - (cb - h)
+                let g = min(max(yc + (cb - h), 0), top), b = min(max(t - (cr - h), 0), top), r = min(max(t + (cr - h), 0), top)
+                return ergb((r, g, b), dy)
+            case .ycgcoR(let bd):
+                let h = 1 << (dc - 1), top = (1 << bd) - 1
+                cb = min(max(cb, 0), pow(2, Double(dc)) - 1); cr = min(max(cr, 0), pow(2, Double(dc)) - 1)
+                let cg = Int((cb + 0.5).rounded(.down)) - h, co = Int((cr + 0.5).rounded(.down)) - h
+                func floorHalf(_ v: Int) -> Int { Int((Double(v) / 2).rounded(.down)) }
+                let t = Int(yc) - floorHalf(cg)
+                let g = min(max(t + cg, 0), top), b = min(max(t - floorHalf(co), 0), top), r = min(max(b + co, 0), top)
+                return ergb((Double(r), Double(g), Double(b)), bd)
+            default:
+                fatalError("not a conversion")
+            }
         }
 
         func rgbWords(_ x: Int, _ y: Int) -> (Word, Word, Word) {
             let (kr, kb) = PlanarFrameFinisher.coefficients(matrix)
-            let (r, g, b) = rgb(x, y)
+            let (r, g, b) = representation.converts && representation != .identity ? converted(x, y) : rgb(x, y)
             let ey = kr * r + (1 - kr - kb) * g + kb * b
             let pb = 0.5 * (b - ey) / (1 - kb), pr = 0.5 * (r - ey) / (1 - kr)
             let n = Double(targetBits), scale = Double(1 << fractionBits)
@@ -341,7 +421,7 @@ struct PlanarFrameFinisherTests {
             if p == 0 {
                 for y in 0..<height {
                     for x in 0..<width {
-                        var w = isRGB || isPalette ? rgbWords(x, y).0 : Word(word: exact(read(0, x, y), depth: depth(0), chroma: false), real: 0, nearTie: false, step: 0)
+                        var w = isRGB || isPalette || representation.converts ? rgbWords(x, y).0 : Word(word: exact(read(0, x, y), depth: depth(0), chroma: false), real: 0, nearTie: false, step: 0)
                         w.word = container(w.word, wordX: x, y: y)
                         w.step = 1 << (fractionBits > 0 ? 6 : containerShift)
                         out.append(w)
@@ -355,7 +435,7 @@ struct PlanarFrameFinisherTests {
                     var cb: Word, cr: Word
                     if isGray {
                         cb = Word(word: 1 << (targetBits - 1 + fractionBits), real: 0, nearTie: false, step: 0); cr = cb
-                    } else if isRGB || isPalette {
+                    } else if isRGB || isPalette || representation.converts {
                         let words = rgbWords(x, y); cb = words.1; cr = words.2
                     } else if Int(desc.log2_chroma_w) == outLog2.0 && Int(desc.log2_chroma_h) == outLog2.1 {
                         cb = Word(word: exact(read(1, x, y), depth: depth(1), chroma: true), real: 0, nearTie: false, step: 0)

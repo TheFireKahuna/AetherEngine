@@ -141,6 +141,10 @@ Integer inverses on the codes, `h = 1 << ( BitDepthC − 1 )`:
 `>>` is an arithmetic shift of a signed value (H.273 5.3). The variables are assigned in order, so the `B` in
 (65) is the clipped B of (64). The R, G, B codes then decode to E′ by section 1 (R′G′B′ codes).
 
+H.273 states both inverses on co-sited samples. For a subsampled source, chroma is first resampled to the
+luma site (section 6). YCgCo (54)–(57) is linear apart from its clips, so it takes the resampled value as it
+is. YCgCo-R (62)–(65) is integer lifting, so the resampled value is rounded to a code first.
+
 ### Identity (MC 0)
 
 `Y = G`, `Cb = B`, `Cr = R` (48–50): libavcodec hands these over as planar GBR, and they decode to E′ by
@@ -175,7 +179,7 @@ luminance stream with any other TC (2, 3, 9–12, 17, reserved) is refused: no i
 | 14 (ICtCp) | `ITU_R_2100_ICtCp` (CoreVideo's own; not in the public headers) | samples kept; tagged |
 | 0 (GBR) | none | decode R′G′B′ codes; encode Y′CbCr |
 | 4, 12 | none | decode NCL with the source K_R, K_B; encode |
-| 10, 13 | none (10 used to be tagged as 9, wrongly) | decode constant luminance; encode |
+| 10, 13 | none (10 used to be tagged as 9, wrongly) | decode constant luminance; encode (not built yet: refused until then) |
 | 8, 16, 17 | none | YCgCo / YCgCo-R inverse; encode |
 | 2 (unspecified) | inferred (`ColorAttachments.presented`) | samples kept; tagged |
 | 11 (Y′D′ZD′X), primaries 10 (XYZ) | none | refused: XYZ has no CoreVideo primaries; showing it is a gamut conversion, not a representation change |
@@ -198,15 +202,17 @@ siting) and the result is not subsampled again.
 - **Integer paths** (pack, grey, full-range scaling, the dither) are exact: video range is a shift, and full
   range is evaluated in 64-bit integers. Its quotients have odd denominators, so they never tie, but float32
   cannot place them against the tie at 16-bit words.
-- **RGB** is evaluated in 64-bit fixed point with 30 fraction bits (the affine rows are computed in double on the
-  host). The error is under 2^-14 of a code.
+- **RGB and the matrix conversions** are one affine map from codes to output words (composed in double on the
+  host), evaluated in double-float: each value is an unevaluated sum of two floats, about 48 significant bits,
+  with `fma` for the products. The inputs are exact (codes, and chroma numerators over 2^20), so the error is
+  around 2^-44 of a code. YCgCo and YCgCo-R reach their R, G, B codes exactly, in integers.
 - **Chroma resampling** is exact. Every phase the sitings produce is a multiple of 1/8 (sites are half samples
   apart and ratios at most 4), so the Catmull-Rom weights are integers over 1024 per axis, and the result is a
   64-bit numerator over 2^20, rounded once.
 
 `PlanarFrameFinisherTests` checks every output code against a float64 reference of this page, reading the
-source through FFmpeg's `av_read_image_line2`. Every code must match, except where the reference lies within
-1e-4 of a rounding tie.
+source through FFmpeg's `av_read_image_line2`. Every code must match. The integer paths get no allowance, and
+the double-float paths an allowance only where the reference lies within 1e-6 of a rounding tie.
 
 ## 6. Chroma siting
 
