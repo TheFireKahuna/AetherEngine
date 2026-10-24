@@ -37,6 +37,11 @@ protocol AudioTranscodingBridge: AnyObject, Sendable {
     func flush() -> [UnsafeMutablePointer<AVPacket>]
     /// A producer restart boundary: drop buffered audio and rebase timestamps off the next packet.
     func startSegment()
+    /// AE#464's audio delay, built into the output's timestamps. The bridge encodes, so audio a
+    /// negative delay puts before the timeline's start comes off at the exact sample, where a muxer
+    /// could only drop whole packets. Taken on the next anchor (the first since construction or
+    /// `startSegment`), so the producer sets it before it feeds.
+    func setOutputOffset(seconds: Double)
     /// Live splice gap correction, in seconds.
     func noteTimelineJump(deltaSeconds: Double)
     func close()

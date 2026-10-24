@@ -125,6 +125,19 @@ struct AudioBridgeContinuityTests {
         #expect(out.contains { $0.0 == 50 * 1024 + jump } || out.contains { $0.0 <= 50 * 1024 + jump && $0.0 + $0.1 > 50 * 1024 + jump })
     }
 
+    /// AE#464: the delay is in the output's timestamps, and what a negative one puts before zero comes
+    /// off at the exact sample: the output starts on zero and is shorter by exactly the cut.
+    @Test("an output offset moves the timeline exactly, and a negative one is cut at the sample",
+          arguments: [Int64(-7200), 9600])
+    func outputOffset(samples: Int64) throws {
+        let (bridge, par) = try makeBridge()
+        defer { bridge.close(); var p: UnsafeMutablePointer<AVCodecParameters>? = par; avcodec_parameters_free(&p) }
+        bridge.setOutputOffset(seconds: Double(samples) / 48_000)
+        expectSeamless(try run(bridge, unbroken), from: max(samples, 0), to: 100 * 1024 + samples)
+        let s = bridge.feedStats
+        #expect(s.continuityGaps == 0 && s.continuityOverlaps == 0 && s.continuityJumps == 0)
+    }
+
     @Test("the rule: within half a source tick and a sample it is rounding; past it, the frame is placed")
     func rule() {
         let ms = AudioContinuity.tolerance(sourceTimeBase: AVRational(num: 1, den: 1000), sampleRate: 48_000)

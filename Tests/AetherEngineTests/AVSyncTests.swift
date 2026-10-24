@@ -58,6 +58,51 @@ struct AVSyncTests {
         #expect(abs(offset) <= clip.toleranceSamples, "audio is \(offset) samples off the picture")
     }
 
+    /// AE#464's audio delay moves the sound against the picture by exactly what was asked, and a
+    /// negative one never publishes a negative `tfdt` (unsigned: -1 is 2^64 - 1, and AVPlayer placed
+    /// such a fragment 584 thousand years out, AE#561). Where the engine encodes, audio the delay puts
+    /// before zero comes off at the exact sample and the track starts on zero; a copied packet cannot
+    /// be cut, so there the start holds at most the one frame that straddled zero.
+    @Test("an audio delay lands exactly, and a negative one cuts the start instead of wrapping it",
+          .timeLimit(.minutes(4)), arguments: ["aac.mp4", "eac3.mp4", "aac.mkv", "flac.mkv", "pcm.mkv", "truehd.mkv"],
+          [-0.15, 0.2])
+    func audioDelay(_ name: String, _ seconds: Double) async throws {
+        let clip = Clip(name: name)
+        let url = avsyncFixture(name)
+        try #require(FileManager.default.fileExists(atPath: url.path),
+                     "run Scripts/fetch-fixtures.sh to generate Fixtures/avsync/")
+        let engine = HLSVideoEngine(url: url, dvModeAvailable: false)
+        engine.audioDelaySeconds = seconds
+        let playbackURL = try engine.start()
+        defer { engine.stop() }
+        let bridged = engine.audioBridge != nil
+        var comps = try #require(URLComponents(url: playbackURL.deletingLastPathComponent(), resolvingAgainstBaseURL: false))
+        comps.query = nil
+        let base = try #require(comps.url)
+        let bytes = try Data(contentsOf: base.appendingPathComponent("init.mp4"))
+            + Data(contentsOf: base.appendingPathComponent("seg0.mp4"))
+        let origins = Self.firstTfdtSeconds(bytes)
+        let audioOrigin = try #require(origins.audio)
+        #expect(audioOrigin >= 0 && audioOrigin < 1e6, "the first audio fragment starts at \(audioOrigin) s")
+        if seconds < 0 {
+            if bridged {
+                #expect(audioOrigin == 0, "bridged audio starts at \(audioOrigin * 48_000) samples, not on zero")
+            } else {
+                #expect(audioOrigin * 48_000 < 2048, "the copied track starts \(audioOrigin * 48_000) samples in")
+            }
+        }
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("avsync-\(UUID().uuidString).mp4")
+        try bytes.write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let measured = await withCheckedContinuation { (continuation: CheckedContinuation<(Double?, Double?), Never>) in
+            Thread.detachNewThread { continuation.resume(returning: Self.measure(file)) }
+        }
+        let flash = try #require(measured.0), click = try #require(measured.1)
+        let offset = ((click + audioOrigin) - (flash + (origins.video ?? 0))) * 48_000
+        #expect(abs(offset - seconds * 48_000) <= clip.toleranceSamples,
+                "audio is \(offset) samples off the picture (\(bridged ? "bridged" : "copied")), asked \(seconds * 48_000)")
+    }
+
     // MARK: - Measurement
 
     /// The white frame's presentation time and the click's (cross-correlated against the 144-sample

@@ -577,6 +577,49 @@ struct SpatialAudioBridgeTests {
         #expect(abs(heard - 0.25) < 0.001, "the click decodes at \(heard) s, not at its source position 0.25 s")
     }
 
+    /// AE#464: the audio delay goes into the anchor, and what a negative one puts before the
+    /// timeline's start comes off the rendered frames before the encoder: the run starts on zero with
+    /// its priming in front, as at any start, rather than a packet cut away with the priming in it.
+    @Test("an output offset moves the timeline by exactly that, and starts it on zero when negative",
+          arguments: [(-0.15, Int64(0)), (0.2, Int64(9600))])
+    func outputOffsetAnchors(seconds: Double, firstPts: Int64) throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
+            decoder: SyntheticDecoder(skipAfterReset: 0))
+        defer { bridge.close() }
+        bridge.setOutputOffset(seconds: seconds)
+        let packets = try feed(bridge, startMs: 0, count: 30)
+        #expect(packets.first?.pts == firstPts)
+        #expect(zip(packets, packets.dropFirst()).allSatisfy { $1.pts - $0.pts == 1024 })
+    }
+
+    @Test("with a negative output offset the click decodes exactly that much earlier", arguments: bedArms)
+    func outputOffsetMovesTheClick(withBed: Bool) async throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        // The click is 12000 frames in; 150 ms earlier it belongs at 0.10 s.
+        let bridge = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
+            decoder: ClickDecoder(clickFrame: 12_000, withBed: withBed))
+        defer { bridge.close() }
+        bridge.setOutputOffset(seconds: -0.15)
+        guard let muxed = try muxWithProbeVideo(bridge, startMs: 0, count: 30) else { return }
+        let sessionDir = muxed.sessionDir
+        defer { try? FileManager.default.removeItem(at: sessionDir) }
+        let file = sessionDir.appendingPathComponent("joined.mp4")
+        try (muxed.initBytes + Data(contentsOf: muxed.segment)).write(to: file)
+        let asset = AVURLAsset(url: file)
+        nonisolated(unsafe) let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
+        let decoded = await withCheckedContinuation {
+            (continuation: CheckedContinuation<Result<Double?, Error>, Never>) in
+            Thread.detachNewThread {
+                continuation.resume(returning: Result { try Self.clickOnset(asset: asset, track: track) })
+            }
+        }
+        let heard = try #require(try decoded.get(), "the click reaches the left channel")
+        #expect(abs(heard - 0.10) < 0.001, "the click decodes at \(heard) s, not at 0.10 s")
+    }
+
     #if APACObjectOutput
     @Test("object output: the init segment carries a low-profile apac entry, announced as 7.1.4")
     func objectOutputMuxedInit() throws {
@@ -609,13 +652,17 @@ struct SpatialAudioBridgeTests {
 
     /// The timestamp contract again, with the click carried by an object (`APACObjectEncoder`): its
     /// priming and packet stamping have to put it where the source did, like the bed encoder's.
-    @Test("object output: a click decodes back at its source position through AVFoundation")
-    func objectOutputClick() async throws {
+    /// With AE#464's delay at -150 ms the first 7200 frames come off before the encoder, the objects'
+    /// metadata with them, and the click is 150 ms earlier.
+    @Test("object output: a click decodes back at its source position through AVFoundation, plus any offset",
+          arguments: [0.0, -0.15])
+    func objectOutputClick(offset: Double) async throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
             decoder: ClickDecoder(clickFrame: 12_000), objectOutput: true)
         defer { bridge.close() }
+        bridge.setOutputOffset(seconds: offset)
         guard let muxed = try muxWithProbeVideo(bridge, startMs: 0, count: 30) else { return }
         let sessionDir = muxed.sessionDir
         defer { try? FileManager.default.removeItem(at: sessionDir) }
@@ -630,7 +677,7 @@ struct SpatialAudioBridgeTests {
             }
         }
         let heard = try #require(try decoded.get(), "the click reaches an output channel")
-        #expect(abs(heard - 0.25) < 0.001, "the click decodes at \(heard) s, not at its source position 0.25 s")
+        #expect(abs(heard - (0.25 + offset)) < 0.001, "the click decodes at \(heard) s, not at \(0.25 + offset) s")
     }
     #endif
 
@@ -1004,6 +1051,7 @@ extension SpatialAudioBridgeTests {
 
     /// `count` packets of 20 ms from `startMs`, packet i carrying a timestamp only when i % `every` == 0
     /// and i >= `firstStamped`. Returns the emitted packets' pts, drained.
+    @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
     private func feedLaced(_ bridge: SpatialAudioBridge, startMs: Int64, count: Int, every: Int,
                            firstStamped: Int = 0) throws -> [Int64] {
         var out: [Int64] = []
