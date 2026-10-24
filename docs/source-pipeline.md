@@ -52,7 +52,7 @@ engine should answer each request by reading exactly the bytes it needs, once, a
 How `AVIOReader` uses the cache:
 
 - A read outside the live window is served from the cache before any network path, outside `winCond`.
-- The pump plans its ranges around what is held: a held span replays as a range of its own (`CachedSpanTransfer`, the third `PersistentTransfer` shape), and a network range stops where a held span of at least 256 KB begins.
+- The pump plans its ranges around what is held: a held span replays as a range of its own (`CachedSpanTransfer`, the third `PersistentTransfer` shape), and a network range stops where a held span worth a split begins (one round trip of the link's bytes, `heldSpanWorthASplit`).
 - An open adopts the cached size and redirect target, so a warm head or another reader's head replays from disk and the open owes the origin nothing (#551).
 - A detour miss fetches its 4 MB block on the side as before (#69); the cache keeps it.
 - The tail prefetch is skipped when the tail is held, and a fetched tail is stored before the waiting read is woken.
@@ -98,12 +98,12 @@ releases what no session is reading.
    one of the same size, inside the five-minute grace, would be served stale.
    - Record `ETag` and `Last-Modified` from the first response per source; a reader whose response
      disagrees invalidates the source exactly as a size change does (`noteTotalSize`).
-3. **Small held spans are fetched through.** The pump does not split a range around a held span under
-   `minimumServeBytes` (256 KB), so subtitle blocks the index reads fetched ahead of the pump are
-   fetched again when the pump reaches them. Tiny, but not zero.
-   - Measure it in the ledger first. Over HTTP/3 a split costs a stream, not a handshake, so lower the
-     threshold until the request count stops paying for itself; or, better, layer 3 removes the reads
-     ahead of the pump that leave these spans.
+3. **Small held spans are fetched through.** The pump splits a range around a held span only when
+   the span is worth a split: `AVIOReader.heldSpanWorthASplit(bytesPerSecond:firstDataMs:)`, the bytes
+   the link moves in one round trip (64 KB floor; 256 KB until a rate is measured). A span below that
+   is cheaper to fetch through than to wait a round trip for, so subtitle blocks the index read ahead
+   of the pump can still be fetched again. Tiny, and now the right trade by the link's own numbers.
+   - Layer 3 removes the reads ahead of the pump that leave these spans.
 4. **Writes can be dropped.** Past 64 MB of pending writes the cache drops new ones (a fast link
    outrunning the disk), and a dropped range can be fetched again.
    - Count dropped bytes in the ledger. If they ever show, back-pressure the writer (the delivery
@@ -112,11 +112,10 @@ releases what no session is reading.
    not revisited if the disk fills during a long session.
    - Re-size on the segment caches' own schedule through `RetentionClaims`, evicting down to the new
      claim.
-6. **Fixed fetch sizes where exact would do.** The chunk path (the I-frame reader, probes) fetches 1 MB
-   chunks and a detour fetches a 4 MB block for a read of a few KB. With the cache beneath them that
-   is waste, not duplicate, and with HTTP/3 a smaller request costs little.
-   - Measure per path; size chunk and detour fetches to the read, grown on sequential continuation as
-     `HTTPDiscIOReader.nextChunkSize` already does. Layer 3 replaces the I-frame reads outright.
+6. **Fixed fetch sizes where exact would do. Done.** `IO/ReadAhead.swift` sizes the chunk path to the
+   read (a floor, doubling on sequential continuation up to a ceiling), and a detour fetches from the
+   read offset starting at 256 KB and growing to 4 MB (`ExactFetchSizeTests`). Layer 3 replaces the
+   I-frame reads outright.
 7. **The forward-prefetch runaway was never root-caused.** 31.7 GB in seven minutes on the walk path,
    far beyond any lead. On indexed Matroska the index path replaced the walk, so it no longer happens
    there, but the walk remains for other containers.
@@ -159,15 +158,17 @@ every stream completely (`SubtitleForwardPrefetcher.IndexSource`, one loop over 
    - For MPEG-TS and any source without one, have the pump record an index as it reads (keyframe and
      subtitle packet positions), registered under the same key, so later reads and seeks are served
      from the map instead of a walk.
-2. **The index is named for subtitles and exposes only them.** `MatroskaCueIndex` already parses
-   every track's cues, video included.
-   - Rename it to what it is (the source's cue index) and expose keyframe positions per video track,
-     for the I-frame playlist and for seeking.
-3. **WebVTT keeps the whole prefetch on the walk.** The index path is all or nothing, and WebVTT is
-   excluded because its cue settings travel in BlockAdditions, which libavformat turns into side data
-   (#233).
-   - Parse BlockAdditions in the index's block reader so a WebVTT block becomes the same packet and
-     settings, and drop it from the exclusion.
+2. **The index is named for subtitles and exposes only them. Done.** It is `MatroskaCueIndex`
+   (`Demuxer/MatroskaCueIndex.swift`), and it exposes `videoTracks`, `keyframes(track:)` and
+   `byteOffset(of:)` for the I-frame playlist and seeking (`MatroskaCueIndexTests.videoKeyframes`).
+3. **WebVTT kept the whole prefetch on the walk. Done.** A Matroska WebVTT block carries its
+   identifier, settings and text in the block itself; `MatroskaCueIndex.webVTTCue` splits it the way
+   `matroska_parse_webvtt` does, and both the prefetch and the indexed fill store the text with the
+   settings beside it (#233; `webVTTSplitMatchesTheDemuxer`, `webVTTFromTheIndex`). zlib-compressed
+   frames are inflated by the index reader as libavformat inflates them (`ZlibBlock`), so neither is
+   an exception any more. What still sends a session to the walk: a Matroska file with incomplete or
+   no Cues, a bzlib/lzo or encrypted track, a codec outside `indexableCodecs` (DVD and DVB bitmaps,
+   whose packet parity with FFmpeg is unverified), and every non-Matroska source (step 1).
 4. **The index outlives its source.** The registry keeps eight indexes, least recently asked for out;
    it is not tied to the source cache's lifetime.
    - Release an index with its source (`SourceByteCache` release), so the two share one lifetime.
