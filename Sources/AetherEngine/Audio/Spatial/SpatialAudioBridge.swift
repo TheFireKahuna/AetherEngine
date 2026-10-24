@@ -95,11 +95,21 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
 #endif
 
     /// Timeline, in 48 kHz frames on the output time base.
-    /// `originFrame`: the source PTS of the first packet pushed since the last reset.
+    /// `originFrame`: where input frame 0 sits, the first frame pushed since the last reset, whose
+    /// count the decoder's `inputFrameOffset` starts from. Taken from the first block that carries a
+    /// source timestamp (`originFromBlock`), which is exact whichever packet held it; until then from
+    /// the first push's own timestamp, and only that push's: a later packet's timestamp marks a
+    /// later frame, and anchoring on it put everything after a decoder reset in laced Matroska up
+    /// to a block (100 ms) late.
     /// `encoderStartFrame`: where the first frame handed to the encoder since the reset sits.
     /// `encoderFramesIn`: frames handed to the encoder since the reset, so the next chunk sits at
     /// `encoderStartFrame + encoderFramesIn`. The pipeline stamps the packets; see `wrap`.
     private var originFrame: Int64?
+    private var originFromBlock = false
+    private var firstPushPending = true
+    /// The encoder was anchored before `originFrame` was known (a reset whose first packets carried no
+    /// timestamp), on the running position; the first timestamped block moves it where it belongs.
+    private var anchorIsProvisional = false
     private var encoderStartFrame: Int64?
     private var encoderFramesIn: Int64 = 0
     private var nextExpectedInputOffset: Int64?
@@ -273,8 +283,9 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         defer { noteDecodedNothingIfNeeded() }
 
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return [] }
+        let ts = packet.pointee.pts != Self.avNoPTS ? packet.pointee.pts : packet.pointee.dts
         do {
-            try decoder.push(UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)))
+            try decoder.push(UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)), pts: ts)
         } catch {
             stats.packetsRejected += 1
             noteDecoderSelfReset()
@@ -284,11 +295,11 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             collectEncoded(into: &results, noteFailure: false)
             return results
         }
-        // The anchor is the first packet the decoder actually took, so its input offsets count from
-        // this packet. dts covers a packet whose pts the demuxer left unset.
-        if originFrame == nil {
-            let ts = packet.pointee.pts != Self.avNoPTS ? packet.pointee.pts : packet.pointee.dts
-            if ts != Self.avNoPTS { originFrame = av_rescale_q(ts, srcTimeBase, encoderTimeBase) }
+        // The first packet the decoder took since its reset is input frame 0, so its timestamp (if it
+        // has one) places the timeline; no later packet's can. dts covers an unset pts.
+        if firstPushPending {
+            firstPushPending = false
+            if originFrame == nil, ts != Self.avNoPTS { originFrame = av_rescale_q(ts, srcTimeBase, encoderTimeBase) }
         }
 
         // Packets already stamped stay in the result when a later block of the same packet fails:
@@ -315,6 +326,8 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         guard decoder.selfResetCount != decoderSelfResetsSeen else { return }
         decoderSelfResetsSeen = decoder.selfResetCount
         originFrame = nil
+        originFromBlock = false
+        firstPushPending = true
         nextExpectedInputOffset = nil
         reanchorPending = encoderStartFrame != nil
     }
@@ -403,6 +416,9 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         output.objectDiscontinuities.removeAll(keepingCapacity: true)
 #endif
         originFrame = nil
+        originFromBlock = false
+        firstPushPending = true
+        anchorIsProvisional = false
         encoderStartFrame = nil
         encoderFramesIn = 0
         nextExpectedInputOffset = nil
@@ -474,13 +490,30 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         // Anchor the encoder on the first block after a reset, and keep the encoder's input
         // contiguous with the source afterwards: a gap the decoder skipped (corrupt access units) is
         // filled with silence so everything after it stays on its timestamp.
+        noteBlockTimestamp(block)
         if encoderStartFrame == nil {
-            encoderStartFrame = (originFrame ?? 0) + block.inputFrameOffset
+            // Nothing says where this block plays yet (a first packet without a timestamp): it is
+            // dropped rather than placed at a guess. The next block that carries one anchors.
+            guard let origin = originFrame else {
+                stats.blocksDroppedUnplaced += 1
+                return
+            }
+            encoderStartFrame = origin + block.inputFrameOffset
         } else if reanchorPending, let start = encoderStartFrame {
             // After the decoder's own reset: put this block where the source says it plays.
             reanchorPending = false
+            anchorIsProvisional = originFrame == nil
             let target = (originFrame ?? start + encoderFramesIn + Int64(pendingFrames + heldBack))
                 + block.inputFrameOffset
+            place(at: target)
+        } else if anchorIsProvisional, originFromBlock, let start = encoderStartFrame, let origin = originFrame {
+            // The first timestamp since a provisional anchor: from here the block plays where it says.
+            anchorIsProvisional = false
+            let end = start + encoderFramesIn + Int64(pendingFrames + heldBack)
+            let target = origin + block.inputFrameOffset
+            EngineLog.emit(
+                "[SpatialAudioBridge] provisional anchor corrected by \(target - end) frames on the first timestamp",
+                category: .session)
             place(at: target)
         } else if let expected = nextExpectedInputOffset, block.inputFrameOffset > expected,
                   let start = encoderStartFrame {
@@ -581,6 +614,28 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         pendingFrames += n
     }
 #endif
+
+    /// Caller holds `opLock`. A block that carries a source timestamp states where input frame 0 sits:
+    /// the first one since a reset sets `originFrame`; a later one that disagrees with it by more
+    /// than the half millisecond a Matroska timestamp is rounded to is counted and logged, since the
+    /// source and the decoder's count of what it was given no longer agree.
+    private func noteBlockTimestamp(_ block: ObjectAudioDecodedBlock) {
+        guard let pts = block.sourcePts else { return }
+        let blockOrigin = av_rescale_q(pts, srcTimeBase, encoderTimeBase) - block.sourcePtsInputFrame
+        guard originFromBlock, let origin = originFrame else {
+            originFrame = blockOrigin
+            originFromBlock = true
+            return
+        }
+        let mismatch = blockOrigin - origin
+        guard abs(mismatch) > Int64(Self.sampleRate / 2000) else { return }
+        stats.timestampMismatches += 1
+        if stats.timestampMismatches == 1 || stats.timestampMismatches % 1000 == 0 {
+            EngineLog.emit(
+                "[SpatialAudioBridge] a block's source timestamp is \(mismatch) frames off the decoder's count "
+                + "(\(stats.timestampMismatches) so far)", category: .session)
+        }
+    }
 
     /// Continue the encoder's input at `target` (a source position in 48 kHz frames): a short gap
     /// ahead is filled with silence, anything longer or behind restarts the encoder there, so every
