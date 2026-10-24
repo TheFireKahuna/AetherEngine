@@ -3,6 +3,7 @@ import Metal
 import CoreVideo
 import os
 import AetherLibavutil
+import LibDeinterlace
 
 /// The one pass between a software decoder and the display: a decoded picture, already in GPU-visible memory
 /// (``DecodeFrameAllocator``), written by the GPU into a bi-planar display buffer (NV12 / P010 / NV16 / P210 /
@@ -81,12 +82,8 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     }
 
     /// Byte offsets and linesizes of a picture's planes inside one buffer (a decoder's slab, or the deinterlacer's
-    /// scratch).
-    struct Planes {
-        var buffer: MTLBuffer
-        var offsets: [UInt32]
-        var linesizes: [UInt32]
-    }
+    /// scratch): LibDeinterlace's type, so pictures cross into the deinterlacer as they are.
+    typealias Planes = PlaneSet
 
     /// Whether the reader can describe `format` at all (checked once, when the decoder opens).
     static func reads(_ format: AVPixelFormat) -> Bool {
@@ -273,7 +270,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     }
 
     let device: MTLDevice
-    private let queue: MTLCommandQueue
+    let queue: MTLCommandQueue
     private let textureCache: CVMetalTextureCache
     /// Constant luminance: the counter and coordinates of the pixels the fast path flagged, and the indirect dispatch
     /// arguments for their recompute. Grown to the picture size, kept between frames.
@@ -282,8 +279,12 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     /// The last plan's luma table, uploaded once.
     private var lumaTable: (values: [Float], buffer: MTLBuffer)?
 
+    /// LibDeinterlace's kernels, on this finisher's device.
+    let kernels: DeinterlaceKernels
+
     init(device: MTLDevice) throws {
         self.device = device
+        kernels = try DeinterlaceKernels(device: device)
         guard let queue = device.makeCommandQueue() else { throw FinisherError.unavailable("no command queue") }
         self.queue = queue
         guard let arguments = device.makeBuffer(length: 16, options: .storageModePrivate) else {
@@ -337,21 +338,13 @@ final class PlanarFrameFinisher: @unchecked Sendable {
 
     // MARK: - Deinterlacing
 
-    /// One output field of the deinterlacer: bwdif over three decoded pictures (FFmpeg's previous, current and next),
-    /// written at the source's depth into a planar scratch picture the job's plan then reads. ``BwdifWindow`` says
-    /// which pictures and parities each field takes.
+    /// One output field of the deinterlacer (LibDeinterlace's bwdif): three decoded pictures and vf_bwdif's parities,
+    /// written at the source's depth into a planar scratch picture the job's plan then reads. LibDeinterlace's
+    /// `BwdifWindow` says which pictures and parities each field takes.
     struct Field {
-        var prev: Planes
-        var cur: Planes
-        var next: Planes
-        /// Rows with `(y ^ parity) & 1` are interpolated; the others are the current field's.
-        var parity: UInt32
-        /// vf_bwdif's `parity ^ tff`: which neighbours stand in for the missing field.
-        var fieldParity: UInt32
-        /// The stream's first or last field: interpolated from the current field alone.
-        var intra: Bool
-        /// The decoded pictures' layout (``readerPlan(source:)``).
-        var reader: Plan
+        var bwdif: DeinterlaceKernels.BwdifField
+        /// The decoded pictures' layout.
+        var layout: PictureLayout
     }
 
     /// A picture, or a field of three, written into a display buffer with `plan`. A field's plan is the one for its
@@ -365,34 +358,11 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         var buffer: CVPixelBuffer
     }
 
-    /// The layout of the decoded pictures, for the deinterlacer's reads: the same function constants the finisher's
-    /// reader takes. Nil for a format the deinterlacer does not take (RGB, palette, bitstream).
-    static func readerPlan(source: AVPixelFormat) -> Plan? {
-        guard reads(source), let desc = av_pix_fmt_desc_get(source)?.pointee,
-              desc.flags & (UInt64(AV_PIX_FMT_FLAG_RGB) | UInt64(AV_PIX_FMT_FLAG_PAL) | UInt64(AV_PIX_FMT_FLAG_BITSTREAM)) == 0
-        else { return nil }
-        let comps = components(desc)
-        let gray = desc.nb_components < 3
-        var alignment = [1, 1, 1, 1]
-        for c in comps.prefix(gray ? 1 : 3) {
-            let bits = Int(c.shift + c.depth)
-            alignment[Int(c.plane)] = max(alignment[Int(c.plane)], bits <= 8 ? 1 : (bits <= 16 ? 2 : 4))
-        }
-        let log2 = [UInt32(desc.log2_chroma_w), UInt32(desc.log2_chroma_h)]
-        return Plan(mode: gray ? .gray : .pack, outputLog2: log2, sourceLog2: log2,
-                    components: comps.prefix(3).map { [UInt32($0.plane), UInt32($0.step), UInt32($0.offset), UInt32($0.shift), UInt32($0.depth)] },
-                    bigEndian: desc.flags & UInt64(AV_PIX_FMT_FLAG_BE) != 0, bitstream: false, palette: false, fullRange: false,
-                    targetBits: 16, fractionBits: 0, containerShift: 0, chromaLocation: 0, wideOutput: true,
-                    matrix: 0, bitDepthRGB: 0, transfer: 0, lumaTable: [], rows: [Float](repeating: 0, count: 48),
-                    cl: [Float](repeating: 0, count: 16), tp: [Float](repeating: 0, count: 16), tieBound: 0,
-                    planeAlignment: alignment)
-    }
-
     /// The planar little-endian format holding `source`'s components at their depths and subsampling, which is what
     /// the deinterlacer writes (bwdif is defined on planes). Nil when FFmpeg names no such format (4:1:1 above 8 bits)
-    /// or the deinterlacer does not take the source.
+    /// or the deinterlacer does not read the source.
     static func planarEquivalent(of source: AVPixelFormat) -> AVPixelFormat? {
-        guard readerPlan(source: source) != nil, let want = av_pix_fmt_desc_get(source)?.pointee else { return nil }
+        guard PictureLayout(format: source) != nil, let want = av_pix_fmt_desc_get(source)?.pointee else { return nil }
         let wantComps = components(want)
         let count = want.nb_components < 3 ? 1 : 3
         let refused = UInt64(AV_PIX_FMT_FLAG_BE) | UInt64(AV_PIX_FMT_FLAG_RGB) | UInt64(AV_PIX_FMT_FLAG_PAL)
@@ -417,26 +387,20 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         return nil
     }
 
-    /// The scratch picture for a `width` x `height` field of `reader`'s layout: planes 0...2 (0 alone for grey),
-    /// one byte a sample up to 8 bits and two above, every plane and row 64-byte aligned.
-    static func scratchLayout(reader: Plan, width: Int, height: Int) -> (offsets: [UInt32], linesizes: [UInt32], length: Int) {
+    /// The scratch picture for a `width` x `height` field of `layout`: planes 0...2 (0 alone for grey), one byte a
+    /// sample up to 8 bits and two above, every plane and row 64-byte aligned.
+    static func scratchLayout(layout: PictureLayout, width: Int, height: Int) -> (offsets: [UInt32], linesizes: [UInt32], length: Int) {
         var offsets = [UInt32](repeating: 0, count: 4), linesizes = [UInt32](repeating: 0, count: 4)
         var length = 0
-        for c in 0..<(reader.mode == .gray ? 1 : 3) {
-            let (w, h) = componentSize(reader: reader, component: c, width: width, height: height)
-            let bytes = reader.components[c][4] > 8 ? 2 : 1
+        for (c, component) in layout.components.enumerated() {
+            let (w, h) = layout.size(component: c, width: width, height: height)
+            let bytes = component.depth > 8 ? 2 : 1
             let linesize = (w * bytes + 63) & ~63
             offsets[c] = UInt32(length)
             linesizes[c] = UInt32(linesize)
             length += (linesize * h + 63) & ~63
         }
         return (offsets, linesizes, max(length, 64))
-    }
-
-    private static func componentSize(reader: Plan, component c: Int, width: Int, height: Int) -> (Int, Int) {
-        guard c > 0 else { return (width, height) }
-        let sw = Int(reader.sourceLog2[0]), sh = Int(reader.sourceLog2[1])
-        return ((width + (1 << sw) - 1) >> sw, (height + (1 << sh) - 1) >> sh)
     }
 
     /// Scratch pictures, one per field of a submission, grown to the largest field seen and kept.
@@ -454,51 +418,15 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         return scratch[index]
     }
 
-    /// The deinterlaced planes of `field` alone, at the source's depth, as the scratch holds them: the test hook that
-    /// compares this stage with libavfilter's bwdif.
-    func deinterlace(_ field: Field, width: Int, height: Int) -> (planes: Planes, bytes: UnsafeRawBufferPointer)? {
-        guard let commands = queue.makeCommandBuffer(), let encoder = commands.makeComputeCommandEncoder(),
-              let planes = encodeField(field, width: width, height: height, scratchIndex: 0, encoder: encoder)
-        else { return nil }
-        encoder.endEncoding()
-        commands.commit()
-        commands.waitUntilCompleted()
-        guard commands.status == .completed else { return nil }
-        return (planes, UnsafeRawBufferPointer(start: planes.buffer.contents(), count: planes.buffer.length))
-    }
-
-    /// Encodes `field`'s bwdif dispatches, one per component, and returns the scratch picture they write.
+    /// Encodes `field`'s bwdif (LibDeinterlace) into the scratch picture `scratchIndex`, which it returns.
     private func encodeField(_ field: Field, width: Int, height: Int, scratchIndex: Int,
                              encoder: MTLComputeCommandEncoder) -> Planes? {
-        for picture in [field.prev, field.cur, field.next] {
-            for p in 0..<4 where field.reader.planeAlignment[p] > 1 {
-                guard picture.offsets[p] % UInt32(field.reader.planeAlignment[p]) == 0,
-                      picture.linesizes[p] % UInt32(field.reader.planeAlignment[p]) == 0 else { return nil }
-            }
-        }
-        let layout = Self.scratchLayout(reader: field.reader, width: width, height: height)
-        guard let out = scratchBuffer(scratchIndex, length: layout.length),
-              let pipeline = try? pipeline(for: field.reader, function: "pf_bwdif") else { return nil }
-        encoder.setComputePipelineState(pipeline)
-        encoder.setBuffer(field.prev.buffer, offset: 0, index: 0)
-        encoder.setBuffer(field.cur.buffer, offset: 0, index: 5)
-        encoder.setBuffer(field.next.buffer, offset: 0, index: 6)
-        encoder.setBuffer(out, offset: 0, index: 7)
-        let w = pipeline.threadExecutionWidth
-        let group = MTLSize(width: w, height: max(1, pipeline.maxTotalThreadsPerThreadgroup / w), depth: 1)
-        for c in 0..<(field.reader.mode == .gray ? 1 : 3) {
-            let (cw, ch) = Self.componentSize(reader: field.reader, component: c, width: width, height: height)
-            let depth = field.reader.components[c][4]
-            // PFBwdif: three PFPictures (offsets, linesizes), then the component's values.
-            var words: [UInt32] = []
-            for picture in [field.prev, field.cur, field.next] { words += picture.offsets + picture.linesizes }
-            words += [UInt32(cw), UInt32(ch), UInt32(c), field.parity, field.fieldParity, field.intra ? 1 : 0,
-                      (1 << depth) - 1, layout.offsets[c], layout.linesizes[c], depth > 8 ? 1 : 0]
-            words.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }
-            // One thread per four columns of a row pair.
-            encoder.dispatchThreads(MTLSize(width: (cw + 3) / 4, height: (ch + 1) / 2, depth: 1), threadsPerThreadgroup: group)
-        }
-        return Planes(buffer: out, offsets: layout.offsets, linesizes: layout.linesizes)
+        let layout = Self.scratchLayout(layout: field.layout, width: width, height: height)
+        guard let buffer = scratchBuffer(scratchIndex, length: layout.length) else { return nil }
+        let out = Planes(buffer: buffer, offsets: layout.offsets, linesizes: layout.linesizes)
+        guard kernels.encodeBwdif(field.bwdif, layout: field.layout, width: width, height: height, into: out, encoder: encoder)
+        else { return nil }
+        return out
     }
 
     // MARK: - Submission

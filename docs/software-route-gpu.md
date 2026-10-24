@@ -143,8 +143,8 @@ two-picture streams.
 
 **Structure.** Two dispatches in one GPU submission:
 
-1. `pf_bwdif` (`BwdifShaderSource.swift`) reads the previous, current and next decoded pictures in their slabs through
-   the finisher's descriptor reader and writes the deinterlaced components at the source's depth into a planar scratch
+1. `pf_bwdif` ([LibDeinterlace](https://github.com/TheFireKahuna/LibDeinterlace)) reads the previous, current and
+   next decoded pictures in their slabs through a descriptor reader and writes the deinterlaced components at the source's depth into a planar scratch
    picture (the source's planar equivalent: NV12 becomes yuv420p, P010 yuv420p10).
 2. `pf_finish` reads the scratch as an ordinary progressive picture: every conversion and rounding guarantee of Part 2
    applies unchanged.
@@ -153,7 +153,7 @@ Splitting the stages keeps exactness checkable per stage (the scratch against li
 own reference) and costs one GPU-internal write and read of the source planes; a single kernel would run bwdif again
 for every resampling tap.
 
-**Throughput.** `BwdifWindow` (`Decoder/BwdifWindow.swift`) holds references to the decoded frames, no copies. All the
+**Throughput.** `BwdifWindow` (LibDeinterlace) holds references to the decoded frames, no copies. All the
 outputs one decoded frame releases (the previous picture's second field, this one's first) go in one command buffer:
 one commit, one wait. The encoder is concurrent: every bwdif dispatch of every field and plane runs together, then
 one barrier, then every finishing dispatch (a constant-luminance job, whose later dispatches read its first's list,
@@ -179,7 +179,13 @@ the finisher. AV1 specifies the synthesis exactly (section 7.18.3, its pseudo-ra
 builds the per-frame grain templates, the kernel applies them per 32x32 block, and the result must match dav1d's
 own grain bit for bit on test streams.
 
-## Part 6. Film in interlaced carriage: soft telecine, field matching, decimation (open)
+## Part 6. Film in interlaced carriage: soft telecine, field matching, decimation (built; device test open)
+
+**Licensing.** bwdif, fieldmatch and decimate are transcriptions of FFmpeg's C (LGPL-2.1-or-later), so they cannot sit
+under the engine's App Store exception. They live in their own dynamic library,
+[LibDeinterlace](https://github.com/TheFireKahuna/LibDeinterlace) (LGPL-2.1-or-later, replaceable like FFmpegBuild's
+frameworks), with the bit-exact reference suites; the engine keeps the finisher, the decoder, `FilmCadence` (written
+from the codec standards) and the engagement policy.
 
 Film (24 or 23.976 frames a second) reaches the software route inside 29.97i / 25i carriage three ways. Each has
 one correct presentation: the film frames, each shown once, at the film rate, with the panel at that rate.
@@ -201,16 +207,27 @@ FFmpeg's decoders map them onto `AVFrame.repeat_pict`, extra half-frame duration
 The pictures are progressive and pass the deinterlacer untouched (yadif_common.c's `deint=interlaced`). What is
 missing is the timing:
 
-- **Cadence.** A run of progressive pictures whose field durations repeat 2, 3, 2, 3 (or frame durations 2, 3 in a
-  progressive sequence) is film at 4/5 of the carriage rate. Detected from the flags of the decoded pictures, in the
-  load probe's sample (for the panel rate) and continuously at playback (for the timestamps).
-- **Timestamps.** The container's timestamps follow the field timeline (33.4 ms, 50.0 ms, ...). On a 23.976 Hz panel
-  two of them can land on one refresh, depending on the refresh phase, and a picture is lost. A film run is therefore
-  re-timed onto a uniform grid of one film period, anchored at the run's first picture. The grid and the field
-  timeline agree at every cycle boundary (4 frames = 10 fields) and differ by at most half a field inside a cycle;
-  a picture further than that from its grid slot ends the run and re-anchors (an edit, a cadence break, a seek).
-- **Panel rate.** 4/5 of the carriage frame rate (24000/1001 from 30000/1001, 24 from 30) when the probe's sample is
-  a film run, instead of the doubled field rate.
+- **Cadence.** A run of progressive pictures whose durations alternate 2, 3 fields (or 2, 3 frames in a progressive
+  sequence) is film at 4/5 of the carriage rate. `FilmCadence` (`Decoder/FilmCadence.swift`) recognises it from four
+  pictures' flags.
+- **Timestamps.** Shown on their field timeline (33.4 ms, 50.0 ms, ...) on a 23.976 Hz panel, two pictures can land on
+  one refresh, depending on the refresh phase, and one is lost. A run is therefore re-timed onto a uniform grid of one
+  film period (5x/8 carriage frames for durations x, 3x/2), anchored at the run's first picture and computed per index.
+  The grid and the field timeline agree at every cycle (4 pictures = 10 fields) and lie at most half a field apart inside
+  it. Container timestamps are less exact than the flags: x264's `--pulldown 32` places a cycle's pictures at 0, 4, 6
+  and 8 fields. So a run ends on an interlaced picture, a duration that breaks the alternation, or a timestamp more
+  than one carriage frame from its slot (an edit, a splice), and detection starts over. Applied to every decoded
+  picture in `SoftwareVideoDecoder`, reset on seek and at end of stream.
+- **Panel rate.** For MPEG-2 and VC-1 at a 29.97 / 30 / 59.94 / 60 carriage (VOD, seekable), the load decodes a sample
+  (`InterlaceProbe.filmRate`, the #232 sampler) and, when it is a film run, asks for 4/5 of the carriage rate
+  (24000/1001 from 30000/1001) instead of the container's rate.
+- **H.264** soft telecine is progressive-flagged, so #232 routes it to AVPlayer; its timing on the native route
+  (AVPlayer presents the container's timestamps) is not covered here.
+
+Test streams: `Probes/DolbyVisionPulse/Scripts/mpeg2_pulldown.py` applies 3:2 soft telecine to an MPEG-2 elementary
+stream in place (frame_rate_code, progressive_sequence, top_field_first, repeat_first_field), as DVD pulldown tools
+do; x264's own `--pulldown 32 --fake-interlaced` makes the H.264 equivalent (FFmpeg's libx264 wrapper does not pass
+pulldown through).
 
 ### 6.2 Hard telecine and progressive-segmented film: field matching
 
@@ -257,9 +274,10 @@ mode does; the stages themselves cope with breaks (re-anchoring, combed pictures
 
 - 6.1 against the standards' arithmetic: field durations from each codec's flags on encoded test streams (MPEG-2
   with RFF in both sequence types, H.264 with `pic_struct`), the uniform grid and its half-field invariant.
-- 6.2 and 6.3 against libavfilter on the same frames, as `BwdifReferenceTests` does for bwdif: the chain
-  `fieldmatch,bwdif=mode=send_frame:deint=interlaced,decimate`, every output picture and timestamp equal, on
-  generated 3:2 and 2:2 material with edits, a video-originated segment, scene changes and both field orders.
+- 6.2 and 6.3 against FFmpeg on the same frames (LibDeinterlace's `InverseTelecineReferenceTests`, the `ffmpeg`
+  command-line tool, whose sources of all five filters are byte for byte n8.1.3's): the chain
+  `fieldmatch,bwdif=mode=send_frame:deint=interlaced,decimate`, every output picture and timestamp equal, on 3:2 in
+  both field orders, 4:2:2, a scene cut, an edit, a mid-cycle end, and 2:2. All equal.
 - The engagement table on the probe, and a `SEQ` arm on the TV for each row.
 
 ## Banked

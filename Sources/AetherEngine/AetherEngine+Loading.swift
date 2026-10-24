@@ -2051,7 +2051,7 @@ extension AetherEngine {
                                                   closedCadence: ingest?.closedLiveCadenceSeconds)
             }
         }
-        host.deinterlaceConfig = DeinterlaceConfig(fieldRate: loadedOptions.deinterlaceFieldRate)
+        host.deinterlaceConfig = DeinterlaceConfig(fieldRate: loadedOptions.deinterlaceFieldRate, film: loadFilmCarriage)
         host.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
         }

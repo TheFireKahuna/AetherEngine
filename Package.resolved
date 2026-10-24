@@ -1,5 +1,5 @@
 {
-  "originHash" : "afef8eb071b4a850623c8c34b43376165c20f07b07b9593e33b21a8a3619abc6",
+  "originHash" : "a8f5cc1c315b3d7fde898964ffeb02c331f73240be0517fae9deb85bca66fe55",
   "pins" : [
     {
       "identity" : "ffmpegbuild",
@@ -8,6 +8,15 @@
       "state" : {
         "revision" : "8923abf32f0787d3d91a18b1b9fbee67031221f9",
         "version" : "3.10.1"
+      }
+    },
+    {
+      "identity" : "libdeinterlace",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/TheFireKahuna/LibDeinterlace",
+      "state" : {
+        "revision" : "dc5f8bc289799b7dd17b74a16ada9cc87f9840fc",
+        "version" : "1.0.0"
       }
     },
     {

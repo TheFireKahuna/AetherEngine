@@ -6,6 +6,7 @@ import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
 import Metal
+import LibDeinterlace
 
 /// libavcodec software video decoder for codecs without VideoToolbox support (e.g. AV1/dav1d on Apple TV).
 /// The decoder writes its pictures into GPU-visible memory (`DecodeFrameAllocator`) and one GPU pass
@@ -101,10 +102,20 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var window: BwdifWindow?
     /// The source format's reader for the deinterlacer and the planar format it writes, per decoded format; nil
     /// where the deinterlacer does not take the format (logged once). Guarded by `lock`.
-    private var deinterlaceFormats: [Int32: (reader: PlanarFrameFinisher.Plan, planar: AVPixelFormat)?] = [:]
+    private var deinterlaceFormats: [Int32: (layout: PictureLayout, planar: AVPixelFormat)?] = [:]
 
     /// Deinterlacer cadence from LoadOptions. Set by the host BEFORE `open`.
     var deinterlaceConfig = DeinterlaceConfig()
+
+    /// Soft telecine: film runs re-timed onto the film rate's own grid (``FilmCadence``). Made at `open`. Guarded by
+    /// `lock`.
+    private var filmCadence: FilmCadence?
+
+    /// Film in interlaced carriage (`deinterlaceConfig.film`): every picture through ``InverseTelecine`` instead of the
+    /// deinterlacer. Made on the first picture, when its format and size are ones inverse telecine takes. Guarded by
+    /// `lock`.
+    private var inverseTelecine: InverseTelecine?
+    private var loggedTelecineRefusal = false
 
     /// False puts every picture out as decoded, interlaced or not. Set before `open`; the format probe is
     /// the only caller, it counts the decoder's own pictures.
@@ -337,13 +348,14 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         allocator = frameAllocator
         let made = try PlanarFrameFinisher(device: device)
         finisher = made
+        filmCadence = FilmCadence(timeBase: timeBase)
         if deinterlaces {
             window = BwdifWindow(timeBase: timeBase, fieldRate: deinterlaceConfig.fieldRate == .field)
             // A stream that declares interlacing compiles the deinterlacer's pipeline now, off this thread, so its first
             // field does not wait for the compiler.
             if VideoRoutingPolicy.interlacedFieldOrders.contains(codecpar.pointee.field_order),
-               let reader = PlanarFrameFinisher.readerPlan(source: sourceFormat) {
-                DispatchQueue.global(qos: .userInitiated).async { _ = try? made.pipeline(for: reader, function: "pf_bwdif") }
+               let layout = PictureLayout(format: sourceFormat) {
+                DispatchQueue.global(qos: .userInitiated).async { _ = try? made.kernels.pipeline(for: layout, function: "pf_bwdif") }
             }
         }
 
@@ -514,6 +526,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 }
             }
 
+            // Soft telecine: a film run's pictures on the film rate's grid, before anything reads the timestamp.
+            if let filmCadence {
+                f.pointee.pts = filmCadence.retime(pts: f.pointee.pts, interlaced: f.pointee.flags & AV_FRAME_FLAG_INTERLACED != 0,
+                                                   repeatPict: f.pointee.repeat_pict, carriage: ctx.pointee.framerate)
+            }
+
             // #131: A53 captions surface as decoded-frame side data on the FFmpeg path (MPEG-2
             // picture user data and friends). Presentation order by construction of decoder output.
             if let onA53 = onA53Captions,
@@ -527,6 +545,11 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 }
             }
 
+            if let ivtc = inverseTelecine(for: f), let picture = hold(f) {
+                render(ivtc.push(picture).map { .picture($0.picture, pts: $0.pts) }, timeBase: ivtc.outputTimeBase)
+                lock.unlock()
+                continue
+            }
             let isInterlaced = (f.pointee.flags & AV_FRAME_FLAG_INTERLACED) != 0
             if let window, isInterlaced || window.isActive, let picture = hold(f) {
                 render(window.push(picture), timeBase: window.outputTimeBase)
@@ -539,6 +562,34 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
 
         av_frame_free(&frame)
+    }
+
+    /// The inverse-telecine chain for `f`'s stream when the load found film in it: made on the first picture, nil (and one
+    /// log line) when its format or size is not one inverse telecine takes. Caller holds `lock`.
+    private func inverseTelecine(for f: UnsafePointer<AVFrame>) -> InverseTelecine? {
+        if let inverseTelecine { return inverseTelecine }
+        guard let film = deinterlaceConfig.film, !loggedTelecineRefusal, let finisher, let allocator,
+              let ctx = codecContext else { return nil }
+        let format = AVPixelFormat(rawValue: f.pointee.format)
+        guard let made = InverseTelecine(kernels: finisher.kernels, makePicture: Self.slabMaker(allocator), format: format,
+                                         width: Int(f.pointee.width), height: Int(f.pointee.height), timeBase: timeBase,
+                                         frameRate: ctx.pointee.framerate, decimates: film == .pulldown32) else {
+            loggedTelecineRefusal = true
+            EngineLog.emit("[SWDecoder] inverse telecine does not take \(av_get_pix_fmt_name(format).map { String(cString: $0) } ?? "?") "
+                           + "\(f.pointee.width)x\(f.pointee.height); the deinterlacer runs instead", category: .swPlayback)
+            return nil
+        }
+        EngineLog.emit("[SWDecoder] inverse telecine engaged (\(film.rawValue))", category: .swPlayback)
+        inverseTelecine = made
+        return made
+    }
+
+    /// Empty pictures for inverse telecine's weaves and deinterlaced frames, in slabs of `allocator`.
+    static func slabMaker(_ allocator: DecodeFrameAllocator) -> InverseTelecine.PictureMaker {
+        { [weak allocator] format, width, height in
+            guard let allocator, let made = allocator.picture(format: format, width: Int32(width), height: Int32(height)) else { return nil }
+            return (made.planes, { [weak allocator] in allocator?.release(made.slab) })
+        }
     }
 
     /// `f` held for the deinterlacer: a reference to the frame and where its planes are (the decoder's own slab, or a
@@ -561,16 +612,16 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
 
     /// The deinterlacer's reader and planar format for `f`'s format, or nil (logged once per format).
-    private func deinterlaceFormat(_ f: UnsafePointer<AVFrame>) -> (reader: PlanarFrameFinisher.Plan, planar: AVPixelFormat)? {
+    private func deinterlaceFormat(_ f: UnsafePointer<AVFrame>) -> (layout: PictureLayout, planar: AVPixelFormat)? {
         let format = f.pointee.format
         if let known = deinterlaceFormats[format] { return known }
         let source = AVPixelFormat(rawValue: format)
-        var found: (reader: PlanarFrameFinisher.Plan, planar: AVPixelFormat)?
-        if let reader = PlanarFrameFinisher.readerPlan(source: source), let planar = PlanarFrameFinisher.planarEquivalent(of: source),
+        var found: (layout: PictureLayout, planar: AVPixelFormat)?
+        if let layout = PictureLayout(format: source), let planar = PlanarFrameFinisher.planarEquivalent(of: source),
            BwdifWindow.referenceFormats.contains(planar.rawValue), let desc = av_pix_fmt_desc_get(source)?.pointee {
             let chromaW = (Int(f.pointee.width) + (1 << Int(desc.log2_chroma_w)) - 1) >> Int(desc.log2_chroma_w)
             let chromaH = (Int(f.pointee.height) + (1 << Int(desc.log2_chroma_h)) - 1) >> Int(desc.log2_chroma_h)
-            if chromaW >= 3, chromaH >= 4 { found = (reader, planar) }
+            if chromaW >= 3, chromaH >= 4 { found = (layout, planar) }
         }
         if found == nil {
             EngineLog.emit("[SWDecoder] the deinterlacer does not take \(av_get_pix_fmt_name(source).map { String(cString: $0) } ?? "?") "
@@ -616,8 +667,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             case .field(let prev, let cur, let next, let parity, let fieldParity, let intra, _):
                 guard let formats = deinterlaceFormat(cur.frame) else { continue }
                 prepared = prepare(cur.frame, planFormat: formats.planar, interlaced: false)
-                source = .field(.init(prev: prev.storage.planes, cur: cur.storage.planes, next: next.storage.planes,
-                                      parity: parity, fieldParity: fieldParity, intra: intra, reader: formats.reader))
+                source = .field(.init(bwdif: .init(prev: prev.storage.planes, cur: cur.storage.planes, next: next.storage.planes,
+                                                   parity: parity, fieldParity: fieldParity, intra: intra),
+                                      layout: formats.layout))
             }
             guard let prepared else { continue }
             jobs.append(.init(source: source, plan: prepared.plan, width: Int(picture.frame.pointee.width),
@@ -669,7 +721,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         if epoch == _feedEpoch, let window, window.isActive {
             render(window.finish(), timeBase: window.outputTimeBase)
         }
+        if epoch == _feedEpoch, let ivtc = inverseTelecine {
+            render(ivtc.push(nil).map { .picture($0.picture, pts: $0.pts) }, timeBase: ivtc.outputTimeBase)
+        }
         window?.reset()
+        inverseTelecine?.reset()
+        filmCadence?.reset()
         avcodec_flush_buffers(ctx)
     }
 
@@ -739,7 +796,11 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // so a feed that has not reached `avcodec_send_packet` yet is refused from here on.
         _feedEpoch &+= 1
         // Deinterlacer temporal references are stale across seeks; drop the graph (lazily rebuilt on next interlaced frame).
-        if resetFilterGraph { window?.reset() }
+        if resetFilterGraph {
+            window?.reset()
+            inverseTelecine?.reset()
+        }
+        filmCadence?.reset()
         guard let ctx = codecContext else { return }
         avcodec_flush_buffers(ctx)
     }
@@ -776,6 +837,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     func close() {
         lock.lock()
         window?.reset()
+        inverseTelecine = nil
         if codecContext != nil {
             avcodec_free_context(&codecContext)
         }
