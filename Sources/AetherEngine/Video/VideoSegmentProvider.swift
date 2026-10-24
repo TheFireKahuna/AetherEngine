@@ -3076,9 +3076,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     static let subtitleFeedAliveSeconds = 5.0
 
     /// The longest a subtitle segment request is held for a feeder to reach its window. AVPlayer gives
-    /// up on a subtitle segment after about 1.75 s ('No response for media file in 1.752s', device log
-    /// 2026-10-24), logs an error that the engine reads as a stall, and asks again; a hold past that
-    /// costs more than the empty answer it was meant to avoid.
+    /// up on a subtitle segment after about 1.75 s ('No response for media file in 1.752s'), logs an
+    /// error that the engine reads as a stall, and asks again; a hold past that costs more than the empty
+    /// answer it is meant to avoid.
     static let subtitleRequestWaitSeconds = 1.0
 
     // MARK: - Native subtitle renditions (#15)
@@ -3146,12 +3146,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // scrubbing wedged while a rendition was selected). Wait only while the reader is plausibly about to
         // cover THIS window (read head within the horizon, or still warming up), and only briefly.
         // Measured on how far the track has been READ, not on its last cue: a sparse (forced) track's last
-        // cue can trail its reading by minutes, and waiting on the cue made every one of its windows wait.
-        // And only while a feeder's reading is moving toward it: AVPlayer waits for a selected
-        // rendition's first segments before it starts the item, so a request held for a feeder that has
-        // only started, or for one that hands its result over all at once, held the start past the
-        // readiness gate and cost a master reload (FORCED=YES renditions tvOS picked at load,
-        // 2026-10-24).
+        // cue can trail its reading by minutes. And only while a feeder's reading is moving toward the
+        // window: AVPlayer waits for a selected rendition's first segments before it starts the item, so
+        // holding a request for a feeder that has only started, or for one that hands its result over all
+        // at once, delays the start and gains nothing.
         store.noteRequested(through: end)
         let horizonSeconds = 30.0
         let deadline = Date().addingTimeInterval(Self.subtitleRequestWaitSeconds)

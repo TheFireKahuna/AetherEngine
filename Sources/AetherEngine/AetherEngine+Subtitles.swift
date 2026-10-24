@@ -2328,8 +2328,8 @@ extension AetherEngine {
                 // with no text in it for the rest of the session.
                 //
                 // Waited on how far the track has been READ, not on its last cue's end: a forced
-                // track's cues can sit minutes behind its reading, and its pre-fill used to time out
-                // on a track that had been read to the target and simply had nothing to say there.
+                // track's cues can sit minutes behind its reading, so the cues cannot tell a track
+                // read to the target with nothing to say there from one not read yet.
                 let began = Date()
                 var exit = "target"
                 while store.readThrough(at: from) < target, !store.isFinished, Date() < deadline {

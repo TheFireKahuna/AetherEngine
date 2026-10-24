@@ -3882,7 +3882,7 @@ public final class AetherEngine: ObservableObject {
 
     /// A feeder's read-ahead: `base`, or further when the player has asked for windows ending at
     /// `requested` (source axis). AVKit reads a subtitle rendition about four minutes ahead of the video
-    /// it fetches (device log 2026-10-24), beyond every fixed lead the feeders had.
+    /// it fetches, further than a fixed lead reaches.
     nonisolated static func subtitleReadAhead(base: Double, playhead: Double, requested: Double?) -> Double {
         guard let requested, requested.isFinite else { return base }
         return max(base, requested - playhead + subtitleDemandMarginSeconds)
