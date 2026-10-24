@@ -39,8 +39,8 @@ final class DoviFelComposer: @unchecked Sendable {
     private var poolHeight: Int = 0
     private var poolPixelFormat: OSType = 0
     private var poolAttributesGeneration = -1
-    /// This composer's renderer recommendation in place of the process-wide one. For tests, which run in
-    /// parallel and must not change it under each other.
+    /// This composer's renderer recommendation in place of the process-wide one: the FEL overlay's composer
+    /// follows its own renderer, and tests, which run in parallel, must not change it under each other.
     var rendererRecommendedAttributesOverride: [String: Any]?
     /// This composer's output mode in place of the process-wide ``outputMode``. For tests, which run in
     /// parallel and must not change the mode under each other.

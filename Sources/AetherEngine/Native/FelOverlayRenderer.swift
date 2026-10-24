@@ -4,6 +4,8 @@ import AVFoundation
 import CoreMedia
 import CoreVideo
 import QuartzCore
+import IOSurface
+import os
 
 /// Draws a Profile 7 FEL picture over an `AVPlayer` that plays the source's base layer.
 ///
@@ -53,8 +55,9 @@ public final class FelOverlayRenderer: @unchecked Sendable {
     #if os(tvOS) || os(iOS)
     private var refreshProbe: FelOverlayRefreshProbe?
     #endif
-    /// Attachment carrying a composed frame's presentation time, for reading back what is on screen.
-    private static let presentationTimeKey = "AetherFelOverlayPresentationTime"
+    /// Presentation time of the frame each output surface last carried, for reading back what is on screen.
+    /// Pool surfaces are reused, so this stays as small as the pool.
+    private let surfaceTimes = OSAllocatedUnfairLock(initialState: [IOSurfaceID: Double]())
     private let lifecycle = NSLock()
     private var started = false
     private var stopped = false
@@ -141,18 +144,23 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         #if os(tvOS) || os(iOS)
         let probe = FelOverlayRefreshProbe { [weak self] link in
             guard let self, let timebase = self.layer.controlTimebase else { return }
-            let shown = self.layer.sampleBufferRenderer.displayedPixelBuffer().flatMap {
-                (CVBufferCopyAttachment($0, Self.presentationTimeKey as CFString, nil) as? NSNumber)?.doubleValue
-            }
+            let shown = self.layer.sampleBufferRenderer.displayedPixelBuffer()
+                .flatMap { CVPixelBufferGetIOSurface($0)?.takeUnretainedValue() }
+                .flatMap { self.surfaceTimes.withLock { [id = IOSurfaceGetID($0)] in $0[id] } }
             self.timing.refresh(at: link.timestamp, shown: shown, playing: CMTimebaseGetRate(timebase) != 0)
         }
         probe.start()
         refreshProbe = probe
         #endif
+        // The output pool is built the way the renderer asks frames to be made (CoreAnimation-compatible
+        // surfaces, its cache mode), as the software route's is: a frame the compositor can take as it is.
         if #available(macOS 26, iOS 26, tvOS 26, *) {
-            EngineLog.emit("[FelOverlayRenderer] renderer recommends \(layer.sampleBufferRenderer.recommendedPixelBufferAttributes); "
+            let recommended = layer.sampleBufferRenderer.__recommendedPixelBufferAttributes
+            composer.rendererRecommendedAttributesOverride = recommended
+            EngineLog.emit("[FelOverlayRenderer] output pool follows the renderer's recommendation \(recommended.keys.sorted()); "
                            + "the composer delivers \(Self.fourCC(DoviFelComposer.outputMode.pixelFormat))", category: .swPlayback)
         }
+        logDecoderFormat(item: item)
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), repeating: .milliseconds(4), leeway: .milliseconds(1))
         timer.setEventHandler { [weak self] in self?.tick() }
@@ -275,7 +283,10 @@ public final class FelOverlayRenderer: @unchecked Sendable {
                 return
             }
             DoviDisplayMetadata.attach(rpuNAL: rpu, to: composed)
-            CVBufferSetAttachment(composed, Self.presentationTimeKey as CFString, NSNumber(value: shownTime.seconds), .shouldNotPropagate)
+            if let surface = CVPixelBufferGetIOSurface(composed)?.takeUnretainedValue() {
+                let id = IOSurfaceGetID(surface)
+                self.surfaceTimes.withLock { $0[id] = shownTime.seconds }
+            }
             self.queue.async {
                 guard generation == self.generation else { return }
                 self.enqueue(composed, at: shownTime)
@@ -321,6 +332,25 @@ public final class FelOverlayRenderer: @unchecked Sendable {
                              kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary, &buffer)
         blankEnhancement = buffer
         return buffer
+    }
+
+    /// Logs, once, the format AVPlayer's decoder produces on its own (an output asking for nothing), beside the
+    /// `x420` this renderer asks for: when they differ, AVPlayer converts every frame to hand it over.
+    private func logDecoderFormat(item: AVPlayerItem) {
+        let probe = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
+        item.add(probe)
+        queue.asyncAfter(deadline: .now() + 2) { [weak item] in
+            defer { item?.remove(probe) }
+            let now = probe.itemTime(forHostTime: CACurrentMediaTime())
+            guard let buffer = probe.copyPixelBuffer(forItemTime: now, itemTimeForDisplay: nil) else {
+                EngineLog.emit("[FelOverlayRenderer] decoder format: no frame to read", category: .swPlayback)
+                return
+            }
+            let surface = CVPixelBufferGetIOSurface(buffer) != nil
+            EngineLog.emit("[FelOverlayRenderer] decoder format \(Self.fourCC(CVPixelBufferGetPixelFormatType(buffer))) "
+                           + "\(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer)) iosurface=\(surface); "
+                           + "the overlay asks for x420", category: .swPlayback)
+        }
     }
 
     private static func fourCC(_ code: OSType) -> String {
