@@ -491,11 +491,12 @@ extension SubtitleForwardPrefetcher {
         }
     }
 
-    /// Codecs whose Matroska block is the packet libavformat would hand over, byte for byte, so a
-    /// packet read off the index is the packet the walk would have stored. WebVTT is not among them:
-    /// its cue settings travel in BlockAdditions, which libavformat turns into side data (#233), and
-    /// a bare block would lose the cue's placement.
-    static let indexableCodecs: Set<String> = ["subrip", "ass", "hdmv_pgs_subtitle"]
+    /// Codecs whose Matroska block becomes the packet libavformat would hand over, so a packet read off
+    /// the index is the packet the walk would have stored: the frame itself for SubRip, ASS and PGS,
+    /// and for WebVTT the cue text split out of it with its settings beside it, as
+    /// `matroska_parse_webvtt` splits it (`MatroskaCueIndex.webVTTCue`, #233). Compressed frames are
+    /// inflated by `readFrame`, as libavformat inflates them, so the encoding never matters here.
+    static let indexableCodecs: Set<String> = ["subrip", "ass", "hdmv_pgs_subtitle", "webvtt"]
 
     /// The container's index: every subtitle block read where the index says it is, in one time
     /// order across the streams, and nothing else of the file. The walk reads the whole interleave
@@ -507,6 +508,8 @@ extension SubtitleForwardPrefetcher {
             let streamIndex: Int32
             let track: UInt64
             let blocks: [MatroskaCueIndex.Block]
+            /// A WebVTT stream's blocks are split into text and settings (`MatroskaCueIndex.webVTTCue`).
+            var isWebVTT = false
         }
 
         /// Consecutive unreadable blocks that end the session as a read failure (a dropped
@@ -549,7 +552,8 @@ extension SubtitleForwardPrefetcher {
                     refused.append("\(streamIndex): incomplete")
                     continue
                 }
-                plan.append(Stream(streamIndex: streamIndex, track: track, blocks: index.blocksByTrack[track] ?? []))
+                plan.append(Stream(streamIndex: streamIndex, track: track, blocks: index.blocksByTrack[track] ?? [],
+                                   isWebVTT: entry.stream.codecName == "webvtt"))
             }
             if plan.count != streams.count, refused.isEmpty { refused.append("streams not listed") }
             return (plan, refused)
@@ -571,14 +575,23 @@ extension SubtitleForwardPrefetcher {
                 return .skipped
             }
             failures = 0
+            var payload = frame.payload
+            var settings: String?
+            if stream.isWebVTT {
+                // A block libavformat would refuse is dropped, as the walk would never have seen it.
+                guard let cue = MatroskaCueIndex.webVTTCue(frame.payload) else { return .skipped }
+                payload = cue.text
+                settings = cue.settings.isEmpty ? nil : cue.settings
+            }
             store.harvestChunk(
                 streamIndex: stream.streamIndex,
                 ptsSeconds: index.seconds(ticks: frame.ticks),
                 durationSeconds: frame.durationTicks.map { index.seconds(ticks: $0) } ?? 0,
                 flags: AV_PKT_FLAG_KEY,
-                payload: Data(frame.payload),
+                payload: Data(payload),
                 assembleSplitDisplaySets: assemblyIndices.contains(stream.streamIndex),
-                writer: .prefetch)
+                writer: .prefetch,
+                webvttSettings: settings)
             return .harvested(at: next.seconds)
         }
 

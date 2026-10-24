@@ -465,7 +465,7 @@ final class EmbeddedSubtitleDecoder {
         // 1. zlib-wrapped (RFC 1950), `78 01/5E/9C/DA` magic.
         if data[0] == 0x78,
            data[1] == 0x01 || data[1] == 0x5E || data[1] == 0x9C || data[1] == 0xDA {
-            if let decompressed = inflateZlibBlock(data, size: Int(pkt.pointee.size)) {
+            if let decompressed = ZlibBlock.inflate(data, size: Int(pkt.pointee.size)) {
                 capturedPayload = decompressed
                 return decodeWithReplacedPayload(
                     ctx: ctx, pkt: pkt, payload: decompressed,
@@ -525,45 +525,7 @@ final class EmbeddedSubtitleDecoder {
         }
         let trailerSize = 8
         guard off < size - trailerSize else { return nil }
-        return inflateDeflateStream(
-            src.advanced(by: off),
-            size: size - off - trailerSize,
-            originalSize: size
-        )
-    }
-
-    private func inflateZlibBlock(_ src: UnsafePointer<UInt8>, size: Int) -> [UInt8]? {
-        guard size > 6 else { return nil }
-        return inflateDeflateStream(
-            src.advanced(by: 2),
-            size: size - 2 - 4,
-            originalSize: size
-        )
-    }
-
-    private func inflateDeflateStream(
-        _ src: UnsafePointer<UInt8>,
-        size: Int,
-        originalSize: Int
-    ) -> [UInt8]? {
-        guard size > 0 else { return nil }
-        var dstCapacity = max(originalSize * 8, 4096)
-        let maxCapacity = 8 * 1024 * 1024
-        while dstCapacity <= maxCapacity {
-            let dst = UnsafeMutablePointer<UInt8>.allocate(capacity: dstCapacity)
-            defer { dst.deallocate() }
-            let written = compression_decode_buffer(
-                dst, dstCapacity,
-                src, size,
-                nil, COMPRESSION_ZLIB
-            )
-            if written > 0 && written < dstCapacity {
-                return Array(UnsafeBufferPointer(start: dst, count: written))
-            }
-            if written == 0 { return nil }
-            dstCapacity *= 2
-        }
-        return nil
+        return ZlibBlock.inflateDeflate(src.advanced(by: off), size: size - off - trailerSize, sizeHint: size)
     }
 
     private func decodeWithReplacedPayload(

@@ -123,4 +123,26 @@ struct SubtitleIndexPrefetchTests {
         #expect(store.entries(streamIndex: 10, from: 0, through: 10).count == 2)
         #expect(store.hasReadSpan(from: 0.5, through: 5.0))
     }
+
+    /// WebVTT is no longer a reason to walk: its blocks are split the way libavformat splits them, so
+    /// the store holds the cue text with its settings beside it, exactly what the walk stores (#233).
+    @Test("a WebVTT stream is read from the index, its text stored with its settings")
+    func webVTTFromTheIndex() throws {
+        let fixture = MatroskaCueIndexTests.fixture(webVTT: true)
+        let index = try MatroskaCueIndex.read(
+            from: IOReaderByteSource(DataIOReader(data: Data(fixture.bytes))), token: .forParserTests)
+        var listed = Self.listed()
+        listed[0] = .init(stream: .init(streamIndex: 10, codecName: "webvtt"), frames: 2, timeBase: listed[0].timeBase)
+        let plan = SubtitleForwardPrefetcher.IndexSource.plan(index: index, listed: listed, streams: [10, 11, 12])
+        #expect(plan.refused.isEmpty, "\(plan.refused)")
+        let source = SubtitleForwardPrefetcher.IndexSource(
+            index: index, bytes: IOReaderByteSource(DataIOReader(data: Data(fixture.bytes))),
+            streams: plan.streams, assemblyIndices: [], from: 0)
+        let store = SubtitlePacketStore()
+        while case .harvested = try source.step(into: store) {}
+        let cues = store.entries(streamIndex: 10, from: 0, through: 10)
+        #expect(cues.map(\.payload) == [Data("Hello".utf8), Data("World".utf8)])
+        #expect(cues.map(\.webvttSettings) == ["line:90% align:start", nil])
+        #expect(cues.map(\.ptsSeconds) == [0.010, 5.100])
+    }
 }
