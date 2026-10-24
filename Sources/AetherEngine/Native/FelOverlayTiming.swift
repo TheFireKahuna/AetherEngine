@@ -20,6 +20,14 @@ final class FelOverlayTiming: @unchecked Sendable {
     private var lastShownRefreshes = 0
     private var lastRefresh: CFTimeInterval?
     private var frameDuration: Double?
+    /// First and last (host, audio, item) reading while playing, and the refresh count between them.
+    private var clockFirst: (host: Double, audio: Double?, item: Double)?
+    private var clockLast: (host: Double, audio: Double?, item: Double)?
+    private var refreshTimes: (first: Double, last: Double, count: Int)?
+    /// The refresh interval the system states for the current display mode (`CADisplayLink.duration`).
+    private var statedRefresh: Double?
+    private var maxDriftMs = 0.0
+    private var refollows = 0
 
     func composed(ms: Double, leadMs lead: Double, frameDuration: Double?) {
         lock.withLock {
@@ -31,10 +39,16 @@ final class FelOverlayTiming: @unchecked Sendable {
 
     /// One display refresh: `shown` is the presentation time of the frame on screen, nil when none is.
     /// While the clock stands still (paused, scrubbing) nothing is counted.
-    func refresh(at timestamp: CFTimeInterval, shown: Double?, playing: Bool) {
+    func refresh(at timestamp: CFTimeInterval, stated: CFTimeInterval, shown: Double?, playing: Bool) {
         lock.withLock {
+            if stated > 0 { statedRefresh = stated }
             if let lastRefresh { refreshMs.append((timestamp - lastRefresh) * 1000) }
             lastRefresh = timestamp
+            if let times = refreshTimes {
+                refreshTimes = (times.first, timestamp, times.count + 1)
+            } else {
+                refreshTimes = (timestamp, timestamp, 1)
+            }
             guard playing, let shown else {
                 lastShown = nil
                 lastShownRefreshes = 0
@@ -53,6 +67,68 @@ final class FelOverlayTiming: @unchecked Sendable {
             }
             lastShown = shown
             lastShownRefreshes = 1
+        }
+    }
+
+    /// One reading of the three clocks, at a display refresh.
+    func clocks(host: Double, audio: Double?, item: Double, playing: Bool) {
+        lock.withLock {
+            guard playing else { clockFirst = nil; clockLast = nil; return }
+            if clockFirst == nil { clockFirst = (host, audio, item) }
+            clockLast = (host, audio, item)
+        }
+    }
+
+    func drift(ms: Double, refollowed: Bool) {
+        lock.withLock {
+            if abs(ms) > abs(maxDriftMs) { maxDriftMs = ms }
+            if refollowed { refollows += 1 }
+        }
+    }
+
+    /// The clocks over the window: each one's rate against the host clock in parts per million, the display's
+    /// measured refresh against the interval the system states for its mode and against the content's frame
+    /// duration, and audio against display as how often a frame has to slip.
+    func drainClocks() -> String {
+        lock.withLock {
+            defer {
+                clockFirst = clockLast
+                refreshTimes = nil
+                maxDriftMs = 0
+                refollows = 0
+            }
+            var parts: [String] = []
+            var audioPPM: Double?
+            if let first = clockFirst, let last = clockLast, last.host - first.host > 1 {
+                let span = last.host - first.host
+                if let a0 = first.audio, let a1 = last.audio {
+                    audioPPM = ((a1 - a0) / span - 1) * 1e6
+                    parts.append(String(format: "audio %+.1f ppm vs host", audioPPM!))
+                }
+                parts.append(String(format: "item %+.1f ppm vs host", ((last.item - first.item) / span - 1) * 1e6))
+            }
+            var displayPPM: Double?
+            var period: Double?
+            if let refreshes = refreshTimes, refreshes.count > 10 {
+                let measured = (refreshes.last - refreshes.first) / Double(refreshes.count - 1)
+                period = measured
+                var text = String(format: "display %.4f ms measured", measured * 1000)
+                if let stated = statedRefresh {
+                    displayPPM = (stated / measured - 1) * 1e6
+                    text += String(format: ", %.4f ms stated (%+.1f ppm on the host clock)", stated * 1000, displayPPM!)
+                }
+                if let frameDuration {
+                    text += String(format: ", content frame %.4f ms (%.3f refreshes per frame)", frameDuration * 1000, frameDuration / measured)
+                }
+                parts.append(text)
+            }
+            if let audioPPM, let displayPPM, let period {
+                let relative = audioPPM - displayPPM
+                let minutes = abs(relative) > 0.01 ? period / (abs(relative) * 1e-6) / 60 : .infinity
+                parts.append(String(format: "audio vs display %+.1f ppm (a frame slips every %.0f min)", relative, minutes))
+            }
+            parts.append(String(format: "synchronizer drift max %+.1f ms, follows %d", maxDriftMs, refollows))
+            return "clocks: " + parts.joined(separator: "; ")
         }
     }
 
