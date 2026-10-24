@@ -7,5 +7,5 @@ out/
 *.bin
 *.log
 recordings/
-.dd/
+.dd*/
 __pycache__/
