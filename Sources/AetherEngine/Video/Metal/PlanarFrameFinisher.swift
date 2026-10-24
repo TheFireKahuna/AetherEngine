@@ -20,14 +20,19 @@ import AetherLibavutil
 /// - RGB and palette: R'G'B' codes decoded at their range (H.273 (27)-(29), (33)-(35)) and encoded as
 ///   non-constant-luminance Y'CbCr with the matrix the buffer is tagged with, 4:4:4.
 /// - Convert (`ColourRepresentation`): Y'CbCr in a matrix CoreVideo cannot tag (FCC, chromaticity-derived,
-///   YCgCo, YCgCo-R, GBR on Y'CbCr-labelled planes), chroma resampled to every pixel and re-encoded 4:4:4.
+///   YCgCo, YCgCo-R, GBR on Y'CbCr-labelled planes, constant luminance), chroma resampled to every pixel and
+///   re-encoded 4:4:4 at the source's own depth, then taken to the output like any code of that depth.
+///
+/// Real-valued stages run in float32 with each value's error bound carried alongside; a code whose value lies that
+/// close to a rounding tie is recomputed in double-float (inline for the affine paths, through a second dispatch for
+/// constant luminance), so every code is the correctly rounded H.273 value.
 /// - A source deeper than the 10 bits the output keeps: the value formed with six fraction bits and ordered
 ///   down with the 8x8 Bayer threshold.
 ///
 /// Each source format gets its own specialised pipeline (function constants), compiled once per process.
 final class PlanarFrameFinisher: @unchecked Sendable {
 
-    enum Mode: UInt32 { case pack = 0, resample = 1, gray = 2, rgb = 3, convert = 4 }
+    enum Mode: UInt32 { case pack = 0, resample = 1, gray = 2, rgb = 3, convert = 4, constantLuminance = 5 }
 
     /// What one source format means for the kernel. Everything but `rows` is a function constant.
     struct Plan: Hashable {
@@ -48,19 +53,30 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         /// Convert: 1 non-constant luminance, 2 YCgCo, 3 YCgCo-R (0 otherwise), and BitDepthRGB for 2 and 3.
         var matrix: UInt32
         var bitDepthRGB: UInt32
-        /// RGB and convert: the affine map to output words (with the fraction bits), as double-float rows.
+        /// Constant luminance: the stream's TransferCharacteristics (0 otherwise), and the luma table's entries (per luma
+        /// code: E'Y and its inverse transfer value, double-float, four floats each).
+        var transfer: UInt32
+        var lumaTable: [Float]
+        /// The kernel's affine rows (two maps, double-float: 48 floats), constant-luminance constants (16) and the
+        /// transfer function's constants (16), and the near-tie bound of the constant-luminance fast path.
         var rows: [Float]
+        var cl: [Float]
+        var tp: [Float]
+        var tieBound: Float
         /// Bytes a component load reads, per plane: plane offsets and linesizes must be multiples of it.
         var planeAlignment: [Int]
 
-        static func == (a: Plan, b: Plan) -> Bool { a.specialisation == b.specialisation && a.rows == b.rows }
+        static func == (a: Plan, b: Plan) -> Bool {
+            a.specialisation == b.specialisation && a.rows == b.rows && a.cl == b.cl && a.tp == b.tp && a.tieBound == b.tieBound
+                && a.lumaTable == b.lumaTable
+        }
         func hash(into hasher: inout Hasher) { hasher.combine(specialisation); hasher.combine(rows) }
 
         /// The function constants, in index order.
         var specialisation: [UInt32] {
             [mode.rawValue] + outputLog2 + sourceLog2 + components.flatMap { $0 }
                 + [bigEndian ? 1 : 0, bitstream ? 1 : 0, palette ? 1 : 0, fullRange ? 1 : 0,
-                   targetBits, fractionBits, containerShift, chromaLocation, matrix, bitDepthRGB]
+                   targetBits, fractionBits, containerShift, chromaLocation, matrix, bitDepthRGB, transfer]
         }
     }
 
@@ -123,13 +139,13 @@ final class PlanarFrameFinisher: @unchecked Sendable {
             mode = .gray
         } else if representation.converts {
             guard outLog2 == [0, 0], !interlaced || srcLog2[1] == 0 else { return nil }
-            mode = .convert
+            if case .constantLuminance = representation { mode = .constantLuminance } else { mode = .convert }
         } else {
             guard outLog2[0] <= srcLog2[0], outLog2[1] <= srcLog2[1], !interlaced || outLog2[1] == srcLog2[1] else { return nil }
             mode = outLog2 == srcLog2 ? .pack : .resample
         }
         // A code is only ever widened: the output's significant bits plus its fraction bits hold every source bit.
-        if mode != .rgb && mode != .convert {
+        if ![.rgb, .convert, .constantLuminance].contains(mode) {
             let used = mode == .gray ? 1 : 3
             guard comps.prefix(used).allSatisfy({ UInt32($0.depth) <= targetBits + fractionBits }) else { return nil }
         }
@@ -139,7 +155,18 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         let encode = ColourAffine.encodeCodes(targetBits: Int(targetBits), fractionBits: Int(fractionBits),
                                               fullRange: output.fullRange)
             .after(ColourAffine.encodeNCL(kr: target.kr, kb: target.kb))
-        var matrixMode: UInt32 = 0, bitDepthRGB: UInt32 = 0
+        // A converted picture is encoded at its own depth, as d-bit codes the kernel's depth stage then takes to the
+        // output like any code of that depth: the output gains no precision the source lacked, and float32 can round
+        // up to 12-bit codes.
+        let sourceDepth = Int(comps[0].depth)
+        let encodeAtSource = ColourAffine.encodeCodes(targetBits: sourceDepth, fractionBits: 0, fullRange: sourceFullRange)
+            .after(ColourAffine.encodeNCL(kr: target.kr, kb: target.kb))
+        var matrixMode: UInt32 = 0, bitDepthRGB: UInt32 = 0, transferCode: UInt32 = 0
+        var second: ColourAffine?, cl = [Float](repeating: 0, count: 16), tp = [Float](repeating: 0, count: 16)
+        var lumaTable: [Float] = []
+        func split(_ values: [Double]) -> [Float] {
+            values.flatMap { v -> [Float] in let hi = Float(v); return [hi, Float(v - Double(hi))] }
+        }
         let rows: ColourAffine?
         switch (mode, representation) {
         case (.rgb, _):
@@ -147,17 +174,31 @@ final class PlanarFrameFinisher: @unchecked Sendable {
                                                        fullRange: isPalette || sourceFullRange))
         case (.convert, .nonConstantLuminance(let kr, let kb)):
             matrixMode = 1
-            rows = encode.after(ColourAffine.decodeNCL(kr: kr, kb: kb))
+            rows = encodeAtSource.after(ColourAffine.decodeNCL(kr: kr, kb: kb))
                 .after(ColourAffine.decodeYCbCr(depths: comps.prefix(3).map { Int($0.depth) }, fullRange: sourceFullRange))
         case (.convert, .ycgco):
             matrixMode = 2
             bitDepthRGB = UInt32(comps[0].depth)
-            rows = encode.after(ColourAffine.decodeRGB(depths: Array(repeating: Int(bitDepthRGB), count: 3), fullRange: sourceFullRange))
+            rows = encodeAtSource.after(ColourAffine.decodeRGB(depths: Array(repeating: Int(bitDepthRGB), count: 3), fullRange: sourceFullRange))
         case (.convert, .ycgcoR(let depth)):
             matrixMode = 3
             bitDepthRGB = UInt32(depth)
-            rows = encode.after(ColourAffine.decodeRGB(depths: Array(repeating: depth, count: 3), fullRange: sourceFullRange))
-        case (.convert, _):
+            rows = encodeAtSource.after(ColourAffine.decodeRGB(depths: Array(repeating: depth, count: 3), fullRange: sourceFullRange))
+        case (.constantLuminance, .constantLuminance(let kr, let kb, let transfer)):
+            // Rows 0-2: codes to E'Y, E'PB, E'PR. Rows 3-5: E'R, E'G, E'B to words.
+            transferCode = transfer.code
+            rows = ColourAffine.decodeYCbCr(depths: comps.prefix(3).map { Int($0.depth) }, fullRange: sourceFullRange)
+            second = encodeAtSource
+            cl = split([kr, kb, 1 / (1 - kr - kb), transfer.forward(1 - kb), 1 - transfer.forward(kb),
+                        transfer.forward(1 - kr), 1 - transfer.forward(kr), 0])
+            tp = split(transfer.constants + Array(repeating: 0, count: 8 - transfer.constants.count))
+            // E'Y depends on the luma code alone, so it and its inverse transfer value are one table entry per code.
+            let decode = rows!
+            lumaTable = (0..<(1 << sourceDepth)).flatMap { code -> [Float] in
+                let ey = decode.m[0][0] * Double(code) + decode.b[0]
+                return split([ey, transfer.inverse(ey)])
+            }
+        case (.convert, _), (.constantLuminance, _):
             return nil
         default:
             rows = nil
@@ -170,16 +211,24 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         if isPalette { alignment[1] = 4 }
 
         return Plan(
-            mode: mode, outputLog2: outLog2, sourceLog2: [.pack, .resample, .convert].contains(mode) ? srcLog2 : outLog2,
+            mode: mode, outputLog2: outLog2, sourceLog2: [.pack, .resample, .convert, .constantLuminance].contains(mode) ? srcLog2 : outLog2,
             components: comps.prefix(3).map { [UInt32($0.plane), UInt32($0.step), UInt32($0.offset), UInt32($0.shift), UInt32($0.depth)] },
             bigEndian: desc.flags & UInt64(AV_PIX_FMT_FLAG_BE) != 0,
             bitstream: desc.flags & UInt64(AV_PIX_FMT_FLAG_BITSTREAM) != 0,
             palette: isPalette, fullRange: mode == .rgb ? (isPalette || sourceFullRange) : sourceFullRange,
             targetBits: targetBits, fractionBits: fractionBits, containerShift: containerShift,
             chromaLocation: UInt32(chromaLocation.rawValue), wideOutput: output.depth != .eight,
-            matrix: matrixMode, bitDepthRGB: bitDepthRGB,
-            rows: rows?.doubleFloatRows ?? [Float](repeating: 0, count: 24), planeAlignment: alignment)
+            matrix: matrixMode, bitDepthRGB: bitDepthRGB, transfer: transferCode, lumaTable: lumaTable,
+            rows: (rows?.doubleFloatRows ?? [Float](repeating: 0, count: 24)) + (second?.doubleFloatRows ?? [Float](repeating: 0, count: 24)),
+            cl: cl, tp: tp,
+            // The fast path bounds each pixel's error itself, from this relative error per float32 transfer evaluation.
+            tieBound: mode == .constantLuminance ? Self.transferEvaluationError : 0,
+            planeAlignment: alignment)
     }
+
+    /// The relative error of one float32 exp2 / log2 in the constant-luminance fast path: 4 ulp, the maximum the Metal
+    /// Shading Language specification guarantees for both with fast math disabled (Table 8.1), on every Apple GPU.
+    static let transferEvaluationError: Float = 4 * Float.ulpOfOne
 
     private static func components(_ desc: AVPixFmtDescriptor) -> [AVComponentDescriptor] {
         withUnsafeBytes(of: desc.comp) { Array($0.bindMemory(to: AVComponentDescriptor.self)) }
@@ -218,37 +267,49 @@ final class PlanarFrameFinisher: @unchecked Sendable {
 
     private struct PipelineKey: Hashable {
         let device: ObjectIdentifier
+        let function: String
         let constants: [UInt32]
     }
 
     let device: MTLDevice
     private let queue: MTLCommandQueue
     private let textureCache: CVMetalTextureCache
+    /// Constant luminance: the counter and coordinates of the pixels the fast path flagged, and the indirect dispatch
+    /// arguments for their recompute. Grown to the picture size, kept between frames.
+    private var flagged: MTLBuffer?
+    private let dispatchArguments: MTLBuffer
+    /// The last plan's luma table, uploaded once.
+    private var lumaTable: (values: [Float], buffer: MTLBuffer)?
 
     init(device: MTLDevice) throws {
         self.device = device
         guard let queue = device.makeCommandQueue() else { throw FinisherError.unavailable("no command queue") }
         self.queue = queue
+        guard let arguments = device.makeBuffer(length: 16, options: .storageModePrivate) else {
+            throw FinisherError.unavailable("no buffer")
+        }
+        dispatchArguments = arguments
         var cache: CVMetalTextureCache?
         guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess, let cache
         else { throw FinisherError.unavailable("no texture cache") }
         textureCache = cache
     }
 
+    private static func library(for device: MTLDevice) throws -> MTLLibrary {
+        if let cached = Self.library.withLock({ $0[ObjectIdentifier(device)] }) { return cached }
+        let options = MTLCompileOptions()
+        // IEEE rounding throughout: the rounding steps are H.273's Round.
+        if #available(macOS 15, iOS 18, tvOS 18, visionOS 2, *) { options.mathMode = .safe } else { options.fastMathEnabled = false }
+        let made = try device.makeLibrary(source: PlanarFrameShaderSource.source, options: options)
+        Self.library.withLock { $0[ObjectIdentifier(device)] = made }
+        return made
+    }
+
     /// The pipeline specialised for `plan`, compiled on first use and shared by every finisher in the process.
-    func pipeline(for plan: Plan) throws -> MTLComputePipelineState {
-        let key = PipelineKey(device: ObjectIdentifier(device), constants: plan.specialisation)
+    func pipeline(for plan: Plan, function name: String = "pf_finish") throws -> MTLComputePipelineState {
+        let key = PipelineKey(device: ObjectIdentifier(device), function: name, constants: plan.specialisation)
         if let ready = Self.pipelines.withLock({ $0[key] }) { return ready }
-        let lib: MTLLibrary
-        if let cached = Self.library.withLock({ $0[ObjectIdentifier(device)] }) {
-            lib = cached
-        } else {
-            let options = MTLCompileOptions()
-            // IEEE rounding throughout: the rounding steps are H.273's Round.
-            if #available(macOS 15, iOS 18, tvOS 18, visionOS 2, *) { options.mathMode = .safe } else { options.fastMathEnabled = false }
-            lib = try device.makeLibrary(source: PlanarFrameShaderSource.source, options: options)
-            Self.library.withLock { $0[ObjectIdentifier(device)] = lib }
-        }
+        let lib = try Self.library(for: device)
         let values = MTLFunctionConstantValues()
         var boolIndices: Set<Int> = [20, 21, 22, 23]
         for (index, value) in plan.specialisation.enumerated() {
@@ -260,7 +321,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
                 values.setConstantValue(&word, type: .uint, index: index)
             }
         }
-        let function = try lib.makeFunction(name: "pf_finish", constantValues: values)
+        let function = try lib.makeFunction(name: name, constantValues: values)
         let made = try device.makeComputePipelineState(function: function)
         Self.pipelines.withLock { $0[key] = made }
         return made
@@ -282,19 +343,63 @@ final class PlanarFrameFinisher: @unchecked Sendable {
               let commands = queue.makeCommandBuffer(), let encoder = commands.makeComputeCommandEncoder()
         else { return false }
 
-        // PFFrame: twelve 32-bit words, then the double-float rows (float2, 8-byte aligned at offset 48).
+        // Codes above 12 bits go straight to the exact path in the kernel (PF_EXACT_ONLY): no list, no second pass.
+        let constantLuminance = plan.mode == .constantLuminance && plan.components[0][4] <= 12
+        let capacity = width * height
+        if constantLuminance, (flagged?.length ?? 0) < 4 * (capacity + 1) {
+            flagged = device.makeBuffer(length: 4 * (capacity + 1), options: .storageModeShared)
+        }
+        guard let list = constantLuminance ? flagged : (flagged ?? dispatchArguments) else { return false }
+        if constantLuminance { list.contents().storeBytes(of: UInt32(0), as: UInt32.self) }
+
+        // PFFrame: twelve 32-bit words, then the double-float rows, constant-luminance and transfer constants (float2,
+        // 8-byte aligned from offset 48), the near-tie bound and the list capacity.
         var frame = Data()
         for word in [UInt32(width), UInt32(height), UInt32(chromaTexture.width), UInt32(chromaTexture.height)]
             + planes.offsets + planes.linesizes { withUnsafeBytes(of: word) { frame.append(contentsOf: $0) } }
-        for value in plan.rows { withUnsafeBytes(of: value) { frame.append(contentsOf: $0) } }
+        for value in plan.rows + plan.cl + plan.tp + [plan.tieBound] { withUnsafeBytes(of: value) { frame.append(contentsOf: $0) } }
+        withUnsafeBytes(of: UInt32(constantLuminance ? capacity : 0)) { frame.append(contentsOf: $0) }
+
         encoder.setComputePipelineState(pipeline)
         encoder.setBuffer(planes.slab.buffer, offset: 0, index: 0)
         frame.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }
+        encoder.setBuffer(list, offset: 0, index: 2)
+        if !plan.lumaTable.isEmpty {
+            if lumaTable?.values != plan.lumaTable {
+                guard let made = device.makeBuffer(bytes: plan.lumaTable, length: 4 * plan.lumaTable.count, options: .storageModeShared)
+                else { encoder.endEncoding(); return false }
+                lumaTable = (plan.lumaTable, made)
+            }
+            encoder.setBuffer(lumaTable!.buffer, offset: 0, index: 4)
+        } else {
+            encoder.setBuffer(list, offset: 0, index: 4)
+        }
         encoder.setTexture(lumaTexture, index: 0)
         encoder.setTexture(chromaTexture, index: 1)
         let w = pipeline.threadExecutionWidth
-        encoder.dispatchThreads(MTLSize(width: chromaTexture.width, height: chromaTexture.height, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: w, height: max(1, pipeline.maxTotalThreadsPerThreadgroup / w), depth: 1))
+        // Convert and constant luminance run one thread per source chroma sample (its block of pixels).
+        let blocks = plan.mode == .convert || plan.mode == .constantLuminance
+        let grid = blocks
+            ? MTLSize(width: (width + (1 << Int(plan.sourceLog2[0])) - 1) >> Int(plan.sourceLog2[0]),
+                      height: (height + (1 << Int(plan.sourceLog2[1])) - 1) >> Int(plan.sourceLog2[1]), depth: 1)
+            : MTLSize(width: chromaTexture.width, height: chromaTexture.height, depth: 1)
+        encoder.dispatchThreads(grid, threadsPerThreadgroup: MTLSize(width: w, height: max(1, pipeline.maxTotalThreadsPerThreadgroup / w), depth: 1))
+        if constantLuminance {
+            // The flagged pixels, sized on the GPU: one thread turns the count into indirect arguments, then each
+            // flagged pixel is recomputed in double-float. Dispatches in one encoder run in order.
+            guard let prepare = try? self.pipeline(for: plan, function: "pf_cl_prepare"),
+                  let correct = try? self.pipeline(for: plan, function: "pf_cl_correct") else {
+                encoder.endEncoding()
+                return false
+            }
+            encoder.setComputePipelineState(prepare)
+            encoder.setBuffer(dispatchArguments, offset: 0, index: 3)
+            encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            encoder.setComputePipelineState(correct)
+            encoder.setBuffer(lumaTable!.buffer, offset: 0, index: 4)
+            encoder.dispatchThreadgroups(indirectBuffer: dispatchArguments, indirectBufferOffset: 0,
+                                         threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        }
         encoder.endEncoding()
         commands.commit()
         commands.waitUntilCompleted()

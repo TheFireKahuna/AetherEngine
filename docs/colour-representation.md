@@ -179,15 +179,19 @@ luminance stream with any other TC (2, 3, 9–12, 17, reserved) is refused: no i
 | 14 (ICtCp) | `ITU_R_2100_ICtCp` (CoreVideo's own; not in the public headers) | samples kept; tagged |
 | 0 (GBR) | none | decode R′G′B′ codes; encode Y′CbCr |
 | 4, 12 | none | decode NCL with the source K_R, K_B; encode |
-| 10, 13 | none (10 used to be tagged as 9, wrongly) | decode constant luminance; encode (not built yet: refused until then) |
+| 10, 13 | none (10 used to be tagged as 9, wrongly) | decode constant luminance; encode |
 | 8, 16, 17 | none | YCgCo / YCgCo-R inverse; encode |
 | 2 (unspecified) | inferred (`ColorAttachments.presented`) | samples kept; tagged |
 | 11 (Y′D′ZD′X), primaries 10 (XYZ) | none | refused: XYZ has no CoreVideo primaries; showing it is a gamut conversion, not a representation change |
 | 15 (IPT-C2) | `IPT_C2` | refused here: Dolby Vision profile 5, decoded only with its RPU |
 | 3, 18–255 | | refused (reserved) |
 
-**Encoding:** non-constant luminance (45–47), then (30–32) or (36–38) at the output depth and the source's
-range (video range for RGB sources and for 16-bit outputs, which CoreVideo defines video range only). K_R, K_B
+**Encoding:** non-constant luminance (45–47), then (30–32) or (36–38). A converted Y′CbCr picture is encoded at
+**its own bit depth d** with the source's range, and the d-bit codes are then taken to the output container
+exactly as any d-bit code is (section 1: a shift at video range, the (2^n − 1) scaling at full range, the dither
+to 10 bits). The representation keeps the source's depth: the container gains no precision the source lacked,
+which is also what lets float32 decide the rounding up to 12-bit codes. RGB sources are encoded at the output depth
+at video range (16-bit outputs are video range only in CoreVideo). K_R, K_B
 of the output matrix follow the primaries: BT.2020 → MC 9; BT.709 and P3 (11, 12) → MC 1; BT.601 625 / 525,
 SMPTE 240 (5, 6, 7) → MC 6 (the BT.601 tag); anything else → MC 1. CoreVideo's P3 matrix tags are deprecated
 "no longer supported" (CVImageBuffer.h); any non-constant-luminance matrix carries R′G′B′ exactly, so the
@@ -199,20 +203,27 @@ siting) and the result is not subsampled again.
 
 ## 5. Precision
 
-- **Integer paths** (pack, grey, full-range scaling, the dither) are exact: video range is a shift, and full
-  range is evaluated in 64-bit integers. Its quotients have odd denominators, so they never tie, but float32
-  cannot place them against the tie at 16-bit words.
-- **RGB and the matrix conversions** are one affine map from codes to output words (composed in double on the
-  host), evaluated in double-float: each value is an unevaluated sum of two floats, about 48 significant bits,
-  with `fma` for the products. The inputs are exact (codes, and chroma numerators over 2^20), so the error is
-  around 2^-44 of a code. YCgCo and YCgCo-R reach their R, G, B codes exactly, in integers.
-- **Chroma resampling** is exact. Every phase the sitings produce is a multiple of 1/8 (sites are half samples
-  apart and ratios at most 4), so the Catmull-Rom weights are integers over 1024 per axis, and the result is a
-  64-bit numerator over 2^20, rounded once.
+Every output code is the correctly rounded value of these equations.
+
+- **Integer paths** (pack, grey, full-range scaling, the dither, chroma resampling, YCgCo / YCgCo-R to R, G, B) are
+  exact. Video range is a shift, full range is evaluated in 64-bit integers, and the resampler works in integers:
+  every phase the sitings produce is a multiple of 1/8 (sites are half samples apart, ratios at most 4), so the
+  Catmull-Rom weights are integers over 1024 per axis, and the result is a 64-bit numerator over 2^20, rounded once.
+- **Real-valued paths** (RGB, the matrix conversions, constant luminance) are evaluated in float32, each value
+  carrying a first-order bound on its absolute error: affine stages add 2^-21 of their terms' magnitudes, a
+  transfer function its own error plus its input's error times its slope, E_G's cancelling sum the rounding of its
+  terms. Metal guarantees `exp2` and `log2` to 4 ulp with fast math off (Metal Shading Language specification,
+  Table 8.1), the bound the transfer functions use. A code whose value lies within twice its bound of a rounding
+  tie is recomputed in double-float (an unevaluated sum of two floats, about 48 bits, with table-driven `exp2` /
+  `log2`): inline for the affine paths, and through a second dispatch over the flagged pixels for constant
+  luminance. Above 12-bit codes constant luminance is evaluated in double-float throughout.
+- For constant luminance, E′Y and its inverse transfer value depend on the luma code alone, so they come from a
+  per-code table computed in double on the host.
 
 `PlanarFrameFinisherTests` checks every output code against a float64 reference of this page, reading the
-source through FFmpeg's `av_read_image_line2`. Every code must match. The integer paths get no allowance, and
-the double-float paths an allowance only where the reference lies within 1e-6 of a rounding tie.
+source through FFmpeg's `av_read_image_line2`, including constant luminance on large random pictures (mostly
+out-of-gamut, saturated colours, where E_G cancels and the curves are steep). Every code must match. The integer
+paths get no allowance, and the real-valued paths one only where the reference lies within 1e-6 of a tie.
 
 ## 6. Chroma siting
 

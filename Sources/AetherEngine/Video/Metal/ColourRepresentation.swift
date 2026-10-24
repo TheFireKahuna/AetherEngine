@@ -15,17 +15,20 @@ enum ColourRepresentation: Hashable {
     case ycgco
     /// MC 8 with unequal depths, 16, 17: (62)-(65) at BitDepthRGB.
     case ycgcoR(bitDepthRGB: Int)
+    /// MC 10 or 13: constant luminance (66)-(75) through the stream's transfer characteristics.
+    case constantLuminance(kr: Double, kb: Double, transfer: TransferCharacteristics)
     case refused(String)
 
     var converts: Bool {
         switch self {
-        case .nonConstantLuminance, .ycgco, .ycgcoR, .identity: true
+        case .nonConstantLuminance, .ycgco, .ycgcoR, .identity, .constantLuminance: true
         case .tagged, .refused: false
         }
     }
 
     /// The representation of a picture in `format` declaring `matrix` and `primaries`.
-    static func resolve(format: AVPixelFormat, matrix: AVColorSpace, primaries: AVColorPrimaries) -> ColourRepresentation {
+    static func resolve(format: AVPixelFormat, matrix: AVColorSpace, primaries: AVColorPrimaries,
+                        transfer: AVColorTransferCharacteristic = AVCOL_TRC_UNSPECIFIED) -> ColourRepresentation {
         guard let desc = av_pix_fmt_desc_get(format)?.pointee else { return .refused("unknown pixel format") }
         let isRGBFormat = desc.flags & UInt64(AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL) != 0
         if primaries == AVCOL_PRI_SMPTE428 {
@@ -56,7 +59,15 @@ enum ColourRepresentation: Hashable {
         case AVCOL_SPC_YCGCO_RO:
             return depths[0] >= 9 ? .ycgcoR(bitDepthRGB: depths[0] - 1) : .refused("YCgCo-Ro below 9-bit luma")
         case AVCOL_SPC_BT2020_CL, AVCOL_SPC_CHROMA_DERIVED_CL:
-            return .refused("constant-luminance matrix")
+            guard desc.nb_components >= 3 else { return .refused("constant luminance without chroma") }
+            guard let tf = TransferCharacteristics(transfer) else {
+                return .refused("constant luminance with TransferCharacteristics \(transfer.rawValue), which has no inverse here")
+            }
+            if matrix == AVCOL_SPC_BT2020_CL { return .constantLuminance(kr: 0.2627, kb: 0.0593, transfer: tf) }
+            guard let k = coefficients(primaries: primaries) else {
+                return .refused("chromaticity-derived matrix without known colour primaries")
+            }
+            return .constantLuminance(kr: k.kr, kb: k.kb, transfer: tf)
         case AVCOL_SPC_SMPTE2085:
             return .refused("Y'D'zD'x (SMPTE ST 2085): XYZ colour")
         case AVCOL_SPC_IPT_C2:
@@ -171,5 +182,86 @@ struct ColourAffine: Equatable {
     var doubleFloatRows: [Float] {
         func split(_ v: Double) -> [Float] { let hi = Float(v); return [hi, Float(v - Double(hi))] }
         return (0..<3).flatMap { i in m[i].flatMap(split) + split(b[i]) }
+    }
+}
+
+/// The transfer characteristics constant luminance runs through (H.273 Table 3), with their constants. alpha and
+/// beta are the values H.273 defines them as, the constants that join the segments with continuous value and slope
+/// (docs/colour-representation.md section 3).
+struct TransferCharacteristics: Hashable {
+    let code: UInt32
+    /// The kernel's f.tp, in double (see PlanarFrameShaderSource).
+    let constants: [Double]
+
+    init?(_ transfer: AVColorTransferCharacteristic) {
+        code = UInt32(transfer.rawValue)
+        switch transfer {
+        case AVCOL_TRC_BT709, AVCOL_TRC_SMPTE170M, AVCOL_TRC_BT2020_10, AVCOL_TRC_BT2020_12:
+            constants = Self.segmented(alpha: 1.09929682680944294, beta: 0.01805396851080781, slope: 4.5, exponent: 0.45)
+        case AVCOL_TRC_SMPTE240M:
+            constants = Self.segmented(alpha: 1.11157219592173122, beta: 0.02282158552944502, slope: 4.0, exponent: 0.45)
+        case AVCOL_TRC_GAMMA22:
+            constants = [0, 0, 0, 1 / 2.2, 2.2]
+        case AVCOL_TRC_GAMMA28:
+            constants = [0, 0, 0, 1 / 2.8, 2.8]
+        case AVCOL_TRC_IEC61966_2_1:
+            constants = Self.segmented(alpha: 1.05501071894758660, beta: 0.00304128256012752, slope: 12.92, exponent: 1 / 2.4)
+        case AVCOL_TRC_SMPTE2084:
+            let c1 = 107.0 / 128, c2 = 2413.0 / 128, c3 = 2392.0 / 128, m = 2523.0 / 32, n = 1305.0 / 8192
+            constants = [c1, c2, c3, m, n, 1 / m, 1 / n, c2 - c1 * c3]
+        case AVCOL_TRC_ARIB_STD_B67:
+            let a = 0.17883277
+            constants = [a, 0.28466892, 0.55991073, 1 / a]
+        case AVCOL_TRC_LINEAR:
+            constants = []
+        default:
+            return nil
+        }
+    }
+
+    /// alpha, beta, slope, exponent, 1 / exponent, 1 / alpha, 1 / slope, alpha - 1.
+    private static func segmented(alpha: Double, beta: Double, slope: Double, exponent: Double) -> [Double] {
+        [alpha, beta, slope, exponent, 1 / exponent, 1 / alpha, 1 / slope, alpha - 1]
+    }
+
+    /// L from V in double, for the finisher's luma table: the kernel's inverse, values outside the domain clamped to it
+    /// ([0, 1]; TC 13 odd-symmetric).
+    func inverse(_ v: Double) -> Double {
+        let c = constants
+        switch code {
+        case 1, 6, 14, 15, 7:
+            let a = min(max(v, 0), 1)
+            return a < c[2] * c[1] ? a / c[2] : pow((a + c[0] - 1) / c[0], c[4])
+        case 4, 5: return pow(min(max(v, 0), 1), c[4])
+        case 13:
+            let a = abs(v)
+            let l = a < c[2] * c[1] ? a / c[2] : pow((a + c[0] - 1) / c[0], c[4])
+            return v < 0 ? -l : l
+        case 16:
+            let p = pow(min(max(v, 0), 1), c[5])
+            return pow(max(p - c[0], 0) / (c[1] - c[2] * p), c[6])
+        case 18:
+            let a = min(max(v, 0), 1)
+            return a <= 0.5 ? a * a / 3 : (exp((a - c[2]) / c[0]) + c[1]) / 12
+        default: return min(max(v, 0), 1)
+        }
+    }
+
+    /// V = ( L )' in double, for N_B, P_B, N_R, P_R (72)-(75).
+    func forward(_ l: Double) -> Double {
+        let c = constants
+        switch code {
+        case 1, 6, 14, 15, 7: return l < c[1] ? c[2] * l : c[0] * pow(l, c[3]) - (c[0] - 1)
+        case 4, 5: return pow(l, c[3])
+        case 13:
+            let a = abs(l)
+            let v = a < c[1] ? c[2] * a : c[0] * pow(a, c[3]) - (c[0] - 1)
+            return l < 0 ? -v : v
+        case 16:
+            let ln = pow(l, c[4])
+            return pow((c[0] + c[1] * ln) / (1 + c[2] * ln), c[3])
+        case 18: return l <= 1.0 / 12 ? (3 * l).squareRoot() : c[0] * log(12 * l - c[1]) + c[2]
+        default: return l
+        }
     }
 }

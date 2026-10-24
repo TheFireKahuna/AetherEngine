@@ -22,9 +22,10 @@ struct PlanarFrameFinisherTests {
         var matrix: CFString = kCVImageBufferYCbCrMatrix_ITU_R_709_2
         var colorspace: AVColorSpace = AVCOL_SPC_UNSPECIFIED
         var primaries: AVColorPrimaries = AVCOL_PRI_UNSPECIFIED
+        var transfer: AVColorTransferCharacteristic = AVCOL_TRC_UNSPECIFIED
         var description: String {
             "\(String(cString: av_get_pix_fmt_name(format))) range=\(range.rawValue)\(tenBitStream ? " 10-bit stream" : "")"
-                + "\(sv22 ? " sv22" : "") loc=\(location.rawValue) \(matrix) mc=\(colorspace.rawValue) cp=\(primaries.rawValue)"
+                + "\(sv22 ? " sv22" : "") loc=\(location.rawValue) \(matrix) mc=\(colorspace.rawValue) cp=\(primaries.rawValue) tc=\(transfer.rawValue)"
         }
     }
 
@@ -76,6 +77,20 @@ struct PlanarFrameFinisherTests {
         Case(format: AV_PIX_FMT_YUV420P10LE, colorspace: AVCOL_SPC_YCGCO_RO, primaries: AVCOL_PRI_BT709),
         Case(format: AV_PIX_FMT_YUV444P, range: AVCOL_RANGE_JPEG, colorspace: AVCOL_SPC_RGB, primaries: AVCOL_PRI_BT709),
         Case(format: AV_PIX_FMT_YUV444P10LE, colorspace: AVCOL_SPC_RGB, primaries: AVCOL_PRI_BT2020),
+    ] + clCases
+
+    /// Constant luminance, through each kind of transfer function.
+    static let clCases: [Case] = [
+        Case(format: AV_PIX_FMT_YUV444P10LE, colorspace: AVCOL_SPC_BT2020_CL, primaries: AVCOL_PRI_BT2020, transfer: AVCOL_TRC_BT2020_10),
+        Case(format: AV_PIX_FMT_YUV420P10LE, colorspace: AVCOL_SPC_BT2020_CL, primaries: AVCOL_PRI_BT2020, transfer: AVCOL_TRC_BT2020_10),
+        Case(format: AV_PIX_FMT_YUV444P12LE, colorspace: AVCOL_SPC_BT2020_CL, primaries: AVCOL_PRI_BT2020, transfer: AVCOL_TRC_BT2020_12),
+        Case(format: AV_PIX_FMT_YUV444P12LE, range: AVCOL_RANGE_JPEG, colorspace: AVCOL_SPC_BT2020_CL, primaries: AVCOL_PRI_BT2020, transfer: AVCOL_TRC_SMPTE2084),
+        Case(format: AV_PIX_FMT_YUV444P10LE, colorspace: AVCOL_SPC_BT2020_CL, primaries: AVCOL_PRI_BT2020, transfer: AVCOL_TRC_ARIB_STD_B67),
+        Case(format: AV_PIX_FMT_YUV444P10LE, colorspace: AVCOL_SPC_BT2020_CL, primaries: AVCOL_PRI_BT2020, transfer: AVCOL_TRC_GAMMA22),
+        Case(format: AV_PIX_FMT_YUV444P, colorspace: AVCOL_SPC_CHROMA_DERIVED_CL, primaries: AVCOL_PRI_BT709, transfer: AVCOL_TRC_BT709),
+        Case(format: AV_PIX_FMT_YUV444P10LE, colorspace: AVCOL_SPC_CHROMA_DERIVED_CL, primaries: AVCOL_PRI_SMPTE432, transfer: AVCOL_TRC_IEC61966_2_1),
+        Case(format: AV_PIX_FMT_YUV422P10LE, colorspace: AVCOL_SPC_CHROMA_DERIVED_CL, primaries: AVCOL_PRI_SMPTE240M, transfer: AVCOL_TRC_SMPTE240M),
+        Case(format: AV_PIX_FMT_YUV444P10LE, colorspace: AVCOL_SPC_BT2020_CL, primaries: AVCOL_PRI_BT2020, transfer: AVCOL_TRC_LINEAR),
     ]
 
     @Test("GPU output equals the H.273 reference", arguments: cases.indices, [(35, 9), (66, 34)])
@@ -108,6 +123,11 @@ struct PlanarFrameFinisherTests {
         #expect(refused(AV_PIX_FMT_GBRP, AVCOL_SPC_RGB, AVCOL_PRI_SMPTE428), "XYZ primaries")
         #expect(refused(AV_PIX_FMT_YUV420P, AVColorSpace(rawValue: 3)), "reserved")
         #expect(!refused(AV_PIX_FMT_YUV420P10LE, AVCOL_SPC_ICTCP), "ICtCp is tagged")
+        #expect(refused(AV_PIX_FMT_YUV420P10LE, AVCOL_SPC_BT2020_CL), "constant luminance needs a transfer function to invert")
+        if case .refused = ColourRepresentation.resolve(format: AV_PIX_FMT_YUV420P10LE, matrix: AVCOL_SPC_BT2020_CL,
+                                                        primaries: AVCOL_PRI_BT2020, transfer: AVCOL_TRC_LOG) {} else {
+            Issue.record("a logarithmic transfer has no inverse over its range")
+        }
         #expect(ColorAttachments.matrix(AVCOL_SPC_ICTCP) as String? == "ITU_R_2100_ICtCp")
         #expect(PlanarFrameFinisher.reads(AV_PIX_FMT_RGB4), "RGB at any depth decodes through its range")
         // An interlaced picture is never resampled vertically.
@@ -179,7 +199,8 @@ struct PlanarFrameFinisherTests {
         return out
     }
 
-    private func run(_ c: Case, width: Int, height: Int) throws {
+    /// Runs `c`. `recompute` false leaves the constant-luminance fast path's words as they are.
+    private func run(_ c: Case, width: Int, height: Int, recompute: Bool = true) throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let allocator = try #require(DecodeFrameAllocator(device: device))
         let finisher = try PlanarFrameFinisher(device: device)
@@ -198,7 +219,8 @@ struct PlanarFrameFinisherTests {
             }
         }
 
-        let representation = ColourRepresentation.resolve(format: c.format, matrix: c.colorspace, primaries: c.primaries)
+        let representation = ColourRepresentation.resolve(format: c.format, matrix: c.colorspace, primaries: c.primaries,
+                                                          transfer: c.transfer)
         let output = SoftwareVideoDecoder.outputFormat(pixelFormat: c.format.rawValue, colorRange: c.range,
                                                        streamIs10Bit: c.tenBitStream, twelveBit420: c.sv22 ? .sv22 : .p010Dithered,
                                                        representation: representation)
@@ -207,9 +229,10 @@ struct PlanarFrameFinisherTests {
         let sourceFullRange = isRGB ? c.range != AVCOL_RANGE_MPEG
             : (c.range == AVCOL_RANGE_JPEG || SoftwareVideoDecoder.isJPEGFormat(c.format))
         let matrix = representation.converts ? ColourRepresentation.targetMatrix(primaries: c.primaries) : c.matrix
-        let plan = try #require(PlanarFrameFinisher.plan(source: c.format, output: output, sourceFullRange: sourceFullRange,
+        var plan = try #require(PlanarFrameFinisher.plan(source: c.format, output: output, sourceFullRange: sourceFullRange,
                                                          chromaLocation: c.location, matrix: matrix,
                                                          representation: representation), "\(c)")
+        if !recompute { plan.tieBound = 0 }
         let planes = try #require(allocator.copy(f))
         defer { allocator.release(planes.slab) }
         let pb = try makeBuffer(output, width: width, height: height)
@@ -231,7 +254,62 @@ struct PlanarFrameFinisherTests {
         }
     }
 
+    /// Random codes are the hard case: mostly out-of-gamut, saturated colours where E_G cancels and the forward curve is
+    /// steep, so every pixel's own error bound is exercised.
+    @Test("constant luminance is exact on large random pictures", arguments: clCases)
+    func constantLuminanceExact(_ c: Case) throws {
+        try run(c, width: 512, height: 256)
+    }
+
     // MARK: - Reference
+
+    /// H.273 Table 3 in Double, written apart from the engine's: alpha / beta as docs/colour-representation.md gives
+    /// them; values outside [0, 1] clamped (TC 13 odd-symmetric), as the doc says the finisher does.
+    struct Transfer {
+        let code: UInt32
+        func forward(_ x: Double) -> Double {
+            switch code {
+            case 1, 6, 14, 15, 7:
+                let (a, b, s) = code == 7 ? (1.111572195921731, 0.022821585529445, 4.0) : (1.099296826809442, 0.018053968510807, 4.5)
+                let l = min(max(x, 0), 1)
+                return l < b ? s * l : a * pow(l, 0.45) - (a - 1)
+            case 4: return pow(min(max(x, 0), 1), 1 / 2.2)
+            case 5: return pow(min(max(x, 0), 1), 1 / 2.8)
+            case 13:
+                let (a, b) = (1.055010718947587, 0.003041282560128), m = abs(x)
+                let v = m < b ? 12.92 * m : a * pow(m, 1 / 2.4) - (a - 1)
+                return x < 0 ? -v : v
+            case 16:
+                let ln = pow(min(max(x, 0), 1), 1305.0 / 8192)
+                return pow((107.0 / 128 + 2413.0 / 128 * ln) / (1 + 2392.0 / 128 * ln), 2523.0 / 32)
+            case 18:
+                let l = min(max(x, 0), 1)
+                return l <= 1.0 / 12 ? (3 * l).squareRoot() : 0.17883277 * log(12 * l - 0.28466892) + 0.55991073
+            default: return min(max(x, 0), 1)
+            }
+        }
+        func inverse(_ x: Double) -> Double {
+            switch code {
+            case 1, 6, 14, 15, 7:
+                let (a, b, s) = code == 7 ? (1.111572195921731, 0.022821585529445, 4.0) : (1.099296826809442, 0.018053968510807, 4.5)
+                let v = min(max(x, 0), 1)
+                return v < s * b ? v / s : pow((v + a - 1) / a, 1 / 0.45)
+            case 4: return pow(min(max(x, 0), 1), 2.2)
+            case 5: return pow(min(max(x, 0), 1), 2.8)
+            case 13:
+                let (a, b) = (1.055010718947587, 0.003041282560128), m = abs(x)
+                let l = m < 12.92 * b ? m / 12.92 : pow((m + a - 1) / a, 2.4)
+                return x < 0 ? -l : l
+            case 16:
+                let p = pow(min(max(x, 0), 1), 32.0 / 2523)
+                return pow(max(p - 107.0 / 128, 0) / (2413.0 / 128 - 2392.0 / 128 * p), 8192.0 / 1305)
+            case 18:
+                let v = min(max(x, 0), 1)
+                return v <= 0.5 ? v * v / 3 : (exp((v - 0.55991073) / 0.17883277) + 0.28466892) / 12
+            default: return min(max(x, 0), 1)
+            }
+        }
+    }
 
     /// docs/colour-representation.md, in Double, reading through av_read_image_line2.
     struct Reference {
@@ -371,7 +449,7 @@ struct PlanarFrameFinisherTests {
                 return (e(codes.0), e(codes.1), e(codes.2))
             }
             switch representation {
-            case .nonConstantLuminance(let kr, let kb):
+            case .nonConstantLuminance, .constantLuminance:
                 let ey: Double, pb: Double, pr: Double
                 if sourceFullRange {
                     ey = yc / (pow(2, Double(dy)) - 1)
@@ -382,6 +460,15 @@ struct PlanarFrameFinisherTests {
                     pb = (cb / pow(2, Double(dc - 8)) - 128) / 224
                     pr = (cr / pow(2, Double(dc - 8)) - 128) / 224
                 }
+                if case .constantLuminance(let kr, let kb, let tf) = representation {
+                    // (66)-(75) inverted: the branch by the sign of E'PB / E'PR, then G from linear light.
+                    let t = Transfer(code: tf.code)
+                    let nb = t.forward(1 - kb), pB = 1 - t.forward(kb), nr = t.forward(1 - kr), pR = 1 - t.forward(kr)
+                    let b = ey + 2 * (pb <= 0 ? nb : pB) * pb, r = ey + 2 * (pr <= 0 ? nr : pR) * pr
+                    let lg = (t.inverse(ey) - kr * t.inverse(r) - kb * t.inverse(b)) / (1 - kr - kb)
+                    return (r, t.forward(lg), b)
+                }
+                guard case .nonConstantLuminance(let kr, let kb) = representation else { fatalError() }
                 let r = ey + 2 * (1 - kr) * pr, b = ey + 2 * (1 - kb) * pb
                 return (r, (ey - kr * r - kb * b) / (1 - kr - kb), b)
             case .ycgco:
@@ -404,9 +491,22 @@ struct PlanarFrameFinisherTests {
 
         func rgbWords(_ x: Int, _ y: Int) -> (Word, Word, Word) {
             let (kr, kb) = PlanarFrameFinisher.coefficients(matrix)
-            let (r, g, b) = representation.converts && representation != .identity ? converted(x, y) : rgb(x, y)
+            let converting = representation.converts && representation != .identity
+            let (r, g, b) = converting ? converted(x, y) : rgb(x, y)
             let ey = kr * r + (1 - kr - kb) * g + kb * b
             let pb = 0.5 * (b - ey) / (1 - kb), pr = 0.5 * (r - ey) / (1 - kr)
+            if converting {
+                // Encoded at the source's own depth d with Round, then taken to the output as a d-bit code.
+                let d = depth(0), k = pow(2, Double(d - 8)), span = pow(2, Double(d)) - 1, mid = pow(2, Double(d - 1))
+                let reals = sourceFullRange ? [span * ey, span * pb + mid, span * pr + mid]
+                                            : [k * (219 * ey + 16), k * (224 * pb + 128), k * (224 * pr + 128)]
+                let words = reals.enumerated().map { i, x -> Word in
+                    let code = Int(min(max((x + 0.5).rounded(.down), 0), span))
+                    let frac = x - x.rounded(.down)
+                    return Word(word: exact(code, depth: d, chroma: i > 0), real: x, nearTie: abs(frac - 0.5) < 1e-6, step: 1 << 16)
+                }
+                return (words[0], words[1], words[2])
+            }
             let n = Double(targetBits), scale = Double(1 << fractionBits)
             if output.fullRange {
                 return (rounded((pow(2, n) - 1) * ey * scale), rounded(((pow(2, n) - 1) * pb + pow(2, n - 1)) * scale),
@@ -423,7 +523,7 @@ struct PlanarFrameFinisherTests {
                     for x in 0..<width {
                         var w = isRGB || isPalette || representation.converts ? rgbWords(x, y).0 : Word(word: exact(read(0, x, y), depth: depth(0), chroma: false), real: 0, nearTie: false, step: 0)
                         w.word = container(w.word, wordX: x, y: y)
-                        w.step = 1 << (fractionBits > 0 ? 6 : containerShift)
+                        if w.step != 1 << 16 { w.step = 1 << (fractionBits > 0 ? 6 : containerShift) }
                         out.append(w)
                     }
                 }
@@ -446,7 +546,7 @@ struct PlanarFrameFinisherTests {
                     }
                     cb.word = container(cb.word, wordX: 2 * x, y: y)
                     cr.word = container(cr.word, wordX: 2 * x + 1, y: y)
-                    cb.step = 1 << (fractionBits > 0 ? 6 : containerShift); cr.step = cb.step
+                    if cb.step != 1 << 16 { cb.step = 1 << (fractionBits > 0 ? 6 : containerShift); cr.step = cb.step }
                     out.append(cb); out.append(cr)
                 }
             }
