@@ -22,7 +22,7 @@ struct LegacyFormatChainTests {
         ("ra_288", AV_CODEC_ID_RA_288, .realAudio),
         ("amr_nb", AV_CODEC_ID_AMR_NB, .amr),
         ("amr_wb", AV_CODEC_ID_AMR_WB, .amr),
-        ("pcm_dvd", AV_CODEC_ID_PCM_DVD, .pcm),
+        ("pcm_dvd", AV_CODEC_ID_PCM_DVD, .otherPCM),
     ]
 
     /// None of these is on the native allowlist, so all of them reach `SoftwareVideoDecoder`.

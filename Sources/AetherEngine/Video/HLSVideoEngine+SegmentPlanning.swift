@@ -937,13 +937,41 @@ extension HLSVideoEngine {
     /// LOAS/LATM AAC (DVB, its IPTV restreams) as the AAC it carries: the codec id, the stream's own
     /// AudioSpecificConfig (libavcodec's LATM decoder left it in `extradata` while probing, in the bytes
     /// it started in; `LATM.configuration` cuts it at its end), and no TS codec_tag. Returns the
-    /// configuration the stream's elements must keep (`HLSSegmentProducer.AACTransport.latm`), nil
+    /// configuration the stream's elements must keep (`HLSSegmentProducer.AudioFraming.latm`), nil
     /// when probing read none or it lies outside what `LATM` reads, which leaves the stream to the
     /// bridge.
     static func latmConfiguration(_ codecpar: UnsafePointer<AVCodecParameters>) -> [UInt8]? {
         guard codecpar.pointee.codec_id == AV_CODEC_ID_AAC_LATM, let extradata = codecpar.pointee.extradata,
               codecpar.pointee.extradata_size > 0 else { return nil }
         return LATM.configuration(extradata: UnsafeRawBufferPointer(start: extradata, count: Int(codecpar.pointee.extradata_size)))
+    }
+
+    /// The speakers a linear PCM track is copied with. The muxer has to name every channel's speaker
+    /// (`chnl`), and Matroska, like a WAV without a channel mask, states only how many there are; such a
+    /// file is written in the WAVE order, which is the count's default layout and how the bridge reads
+    /// it too. Nil where the count has no default layout, which leaves the track to the bridge.
+    static func pcmChannelLayout(_ codecpar: UnsafePointer<AVCodecParameters>) -> AVChannelLayout? {
+        var layout = AVChannelLayout()
+        if codecpar.pointee.ch_layout.order != AV_CHANNEL_ORDER_UNSPEC {
+            var source = codecpar.pointee.ch_layout
+            guard av_channel_layout_copy(&layout, &source) >= 0 else { return nil }
+            return layout
+        }
+        av_channel_layout_default(&layout, codecpar.pointee.ch_layout.nb_channels)
+        guard layout.order != AV_CHANNEL_ORDER_UNSPEC else { return nil }
+        return layout
+    }
+
+    /// Name the speakers of a linear PCM track the muxer copies. The muxer has to give every channel
+    /// a speaker (`chnl`), and Matroska, like a WAV without a channel mask, states only how many
+    /// there are: such a file is written in the WAVE order, which is the count's default layout, and
+    /// the bridge reads it the same way. A count without a default layout (9, 11, ...) carries no
+    /// speakers anywhere, and the muxer refuses it.
+    static func namePCMSpeakers(_ codecpar: UnsafeMutablePointer<AVCodecParameters>) {
+        guard codecpar.pointee.ch_layout.order == AV_CHANNEL_ORDER_UNSPEC else { return }
+        let channels = codecpar.pointee.ch_layout.nb_channels
+        av_channel_layout_uninit(&codecpar.pointee.ch_layout)
+        av_channel_layout_default(&codecpar.pointee.ch_layout, channels)
     }
 
     static func prepareLATMForFMP4(_ codecpar: UnsafeMutablePointer<AVCodecParameters>, config: [UInt8]) -> Bool {

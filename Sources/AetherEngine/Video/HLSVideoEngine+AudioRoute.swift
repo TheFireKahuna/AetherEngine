@@ -9,8 +9,20 @@ extension HLSVideoEngine {
     enum AudioCodecCompat {
         case aac, ac3, eac3, flac, alac, mp3, opus
         case truehd, dts
-        case vorbis, pcm, mp2
-        /// LATM/LOAS-framed AAC (DVB-T2/IPTV, typically HE-AAC); no ADTS headers, no ASC in extradata, always bridges via aac_latm decoder.
+        case vorbis, mp2
+        /// Linear PCM, integer or float, which the mp4 muxer writes as ISO/IEC 23003-5 `ipcm` / `fpcm`
+        /// with its speaker positions in `chnl`, and AVPlayer plays from HLS fMP4 (measured on macOS 27:
+        /// 16-, 24- and 32-bit float, stereo, 5.1 and 7.1, CODECS `ipcm` / `fpcm`; `lpcm` it refuses,
+        /// -11848). Copied as it is.
+        case pcm
+        /// PCM with no `ipcm` form: unsigned 8-bit, G.711 A-law / mu-law (libavcodec spells them
+        /// pcm_alaw / pcm_mulaw, and they decode to the same S16 the raw shapes do), and DVD LPCM, whose
+        /// packets carry headers. These go through the bridge.
+        case otherPCM
+        /// Blu-ray LPCM: big-endian PCM behind a header per packet (`BluRayLPCM`). Copied as `ipcm`
+        /// with the header taken off and the speakers declared in the disc's own order.
+        case bluRayLPCM
+        /// LATM/LOAS-framed AAC (DVB-T2/IPTV, typically HE-AAC): the AAC inside it copies (`LATM`).
         case aacLatm
         /// Every Windows Media audio flavour (Standard, Pro, Lossless, Voice), which arrives with the
         /// native .wmv / .asf support of FFmpegBuild 3.1.0. None is fMP4-legal, so all bridge. One case
@@ -66,19 +78,18 @@ extension HLSVideoEngine {
                  AV_CODEC_ID_RA_288:
                 return .realAudio
             case AV_CODEC_ID_AMR_NB, AV_CODEC_ID_AMR_WB: return .amr
-            // G.711 A-law / mu-law sit here rather than in a case of their own: libavcodec spells
-            // them pcm_alaw / pcm_mulaw, they decode to the same S16 the raw shapes do, and nothing
-            // downstream of the bridge tells them apart. FLV is where they turn up.
             case AV_CODEC_ID_PCM_S16LE,
                  AV_CODEC_ID_PCM_S24LE,
                  AV_CODEC_ID_PCM_F32LE,
                  AV_CODEC_ID_PCM_S16BE,
-                 AV_CODEC_ID_PCM_S32LE,
-                 AV_CODEC_ID_PCM_U8,
+                 AV_CODEC_ID_PCM_S32LE:
+                return .pcm
+            case AV_CODEC_ID_PCM_U8,
                  AV_CODEC_ID_PCM_ALAW,
                  AV_CODEC_ID_PCM_MULAW,
                  AV_CODEC_ID_PCM_DVD:
-                return .pcm
+                return .otherPCM
+            case AV_CODEC_ID_PCM_BLURAY: return .bluRayLPCM
             default: return .unsupported
             }
         }
@@ -87,11 +98,12 @@ extension HLSVideoEngine {
         var hlsCodecsString: String {
             switch self {
             case .aac, .aacLatm: return "mp4a.40.2"
+            case .pcm, .bluRayLPCM: return "ipcm"
             case .ac3:    return "ac-3"
             case .eac3:   return "ec-3"
             case .flac:   return "fLaC"
             case .alac:   return "alac"
-            case .mp3, .opus, .truehd, .dts, .vorbis, .pcm, .mp2, .wma,
+            case .mp3, .opus, .truehd, .dts, .vorbis, .otherPCM, .mp2, .wma,
                  .nellymoser, .adpcmSwf, .speex, .realAudio, .amr, .unsupported:
                 // mp3: theoretically mp4a.40.34, but AVPlayer treats any mp4a as AAC and fails; bridge to FLAC.
                 return ""
@@ -101,7 +113,7 @@ extension HLSVideoEngine {
         /// Codecs that must go through AudioBridge. Opus is fMP4-spec-legal but AVPlayer rejects it in HLS-fMP4 in practice (only CAF/WebM paths work). MP3 writes `mp4a.40.34` but AVPlayer treats any mp4a as AAC, failing with -11829/-12848.
         var requiresBridge: Bool {
             switch self {
-            case .opus, .mp3, .truehd, .dts, .vorbis, .pcm, .mp2, .wma,
+            case .opus, .mp3, .truehd, .dts, .vorbis, .otherPCM, .mp2, .wma,
                  .nellymoser, .adpcmSwf, .speex, .realAudio, .amr: return true
             default: return false
             }

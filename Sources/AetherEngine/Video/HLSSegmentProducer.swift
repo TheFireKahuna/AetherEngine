@@ -82,16 +82,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
     }
 
-    /// How a stream-copied AAC track's frames are framed in the source, and so what comes off them
-    /// before they are muxed.
-    enum AACTransport: Equatable {
-        /// Raw access units, as MP4 and Matroska carry them.
+    /// How a stream-copied audio track's packets are framed in the source, and so what comes off
+    /// them before they are muxed.
+    enum AudioFraming: Equatable {
+        /// As the muxer takes them (MP4 and Matroska access units, linear PCM).
         case raw
-        /// ADTS (MPEG-TS, a raw .aac): a 7 or 9 byte header per frame.
+        /// ADTS AAC (MPEG-TS, a raw .aac): a 7 or 9 byte header per frame.
         case adts
-        /// LOAS/LATM (`LATM`): the frame inside each AudioMuxElement. `config` is the
+        /// LOAS/LATM AAC (`LATM`): the frame inside each AudioMuxElement. `config` is the
         /// AudioSpecificConfig the init segment declares, which the stream's elements must keep.
         case latm(config: [UInt8])
+        /// Blu-ray LPCM (`BluRayLPCM`): the samples behind each packet's header, which must keep
+        /// declaring this format.
+        case bluRayLPCM(BluRayLPCM)
     }
 
     /// Audio wiring for stream-copy (e.g. EAC3-JOC Atmos) or FLAC bridge (TrueHD/DTS/PCM).
@@ -106,8 +109,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
         let sourceTimeBase: AVRational
         /// Non-nil routes each packet through bridge.feed and muxes the returned FLAC packets.
         let bridge: (any AudioTranscodingBridge)?
-        /// The framing a stream-copied AAC track's frames arrive in.
-        let aacTransport: AACTransport
+        /// The framing a stream-copied track's packets arrive in.
+        let framing: AudioFraming
         /// AE#458: the source track's language as ISO 639-2/T, carried into every muxer this config builds
         /// (a producer restart rebuilds one, so it has to live on the config, not on the first muxer).
         let language: String?
@@ -121,7 +124,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
              inputTimeBase: AVRational,
              sourceTimeBase: AVRational,
              bridge: (any AudioTranscodingBridge)?,
-             aacTransport: AACTransport = .raw,
+             framing: AudioFraming = .raw,
              language: String? = nil,
              sourceStart: Int64? = nil) {
             self.codecpar = codecpar
@@ -130,7 +133,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.inputTimeBase = inputTimeBase
             self.sourceTimeBase = sourceTimeBase
             self.bridge = bridge
-            self.aacTransport = aacTransport
+            self.framing = framing
             self.language = language
             self.sourceStart = sourceStart
         }
@@ -528,10 +531,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// One-packet look-behind; next packet's dts fills pending.duration when per-block duration is missing.
     private var pendingVideoPkt: UnsafeMutablePointer<AVPacket>?
-    /// The LATM elements of a stream-copied AAC track are read with (`AACTransport.latm`), and how
-    /// many were dropped.
+    /// What the LATM elements of a stream-copied AAC track are read with (`AudioFraming.latm`).
     private var latmReader = LATM.Reader()
-    private var latmDroppedElements = 0
+    /// Packets of a stream-copied track dropped because their framing could not be taken off.
+    private var unframeableAudioPackets = 0
     private var pendingAudioPkt: UnsafeMutablePointer<AVPacket>?
 
     /// Live segment index captured when pending packet was examined; the live cutter advances at keyframes.
@@ -4751,11 +4754,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         }
                         continue
                     }
-                    switch audio.aacTransport {
+                    switch audio.framing {
                     case .raw: break
                     case .adts: Self.stripADTSHeader(packet)
                     case .latm(let config):
                         guard unwrapLATM(packet, declared: config) else { continue }
+                    case .bluRayLPCM(let format):
+                        guard unwrapBluRayLPCM(packet, declared: format) else { continue }
                     }
                     let thisAudioSeg: Int = isLive
                         ? liveCurrentSegmentIndex
@@ -5107,24 +5112,49 @@ final class HLSSegmentProducer: @unchecked Sendable {
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return false }
         let frame = latmReader.payload(UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)))
         guard let frame, latmReader.config == declared else {
-            latmDroppedElements += 1
-            if latmDroppedElements == 1 || latmDroppedElements % 500 == 0 {
-                EngineLog.emit(
-                    "[HLSSegmentProducer] LATM: dropped \(latmDroppedElements) element(s), the last "
-                    + (frame == nil ? "unreadable" : "carrying AudioSpecificConfig "
-                        + (latmReader.config ?? []).map { String(format: "%02x", $0) }.joined()
-                        + " where the init declares " + declared.map { String(format: "%02x", $0) }.joined()),
-                    category: .session)
-            }
+            noteUnframeable(frame == nil ? "an unreadable LATM element"
+                : "a LATM element carrying AudioSpecificConfig " + Self.hex(latmReader.config ?? [])
+                    + " where the init declares " + Self.hex(declared))
             return false
         }
-        guard let buffer = av_buffer_alloc(frame.count + Int(AV_INPUT_BUFFER_PADDING_SIZE)) else { return false }
-        frame.withUnsafeBufferPointer { buffer.pointee.data.update(from: $0.baseAddress!, count: frame.count) }
-        memset(buffer.pointee.data + frame.count, 0, Int(AV_INPUT_BUFFER_PADDING_SIZE))
+        return Self.replacePayload(of: packet, with: frame)
+    }
+
+    /// Take a Blu-ray LPCM packet's header off (`BluRayLPCM`), in place, and on a layout stored with
+    /// an unused channel copy the frames without it. False drops the packet: one whose header declares
+    /// another format than the init segment does, or that is not whole frames.
+    private func unwrapBluRayLPCM(_ packet: UnsafeMutablePointer<AVPacket>, declared: BluRayLPCM) -> Bool {
+        guard let data = packet.pointee.data, packet.pointee.size > 0,
+              let samples = declared.samples(UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size))) else {
+            noteUnframeable("a Blu-ray LPCM packet of another format, or not whole frames")
+            return false
+        }
+        guard !declared.isPadded else { return Self.replacePayload(of: packet, with: declared.droppingPadding(samples)) }
+        packet.pointee.data = data.advanced(by: 4)
+        packet.pointee.size -= 4
+        return true
+    }
+
+    private func noteUnframeable(_ what: String) {
+        unframeableAudioPackets += 1
+        if unframeableAudioPackets == 1 || unframeableAudioPackets % 500 == 0 {
+            EngineLog.emit(
+                "[HLSSegmentProducer] audio: dropped \(unframeableAudioPackets) packet(s), the last \(what)",
+                category: .session)
+        }
+    }
+
+    private static func hex(_ bytes: [UInt8]) -> String { bytes.map { String(format: "%02x", $0) }.joined() }
+
+    /// `packet` with `bytes` as its whole payload, in a buffer of its own.
+    private static func replacePayload(of packet: UnsafeMutablePointer<AVPacket>, with bytes: [UInt8]) -> Bool {
+        guard let buffer = av_buffer_alloc(bytes.count + Int(AV_INPUT_BUFFER_PADDING_SIZE)) else { return false }
+        bytes.withUnsafeBufferPointer { buffer.pointee.data.update(from: $0.baseAddress!, count: bytes.count) }
+        memset(buffer.pointee.data + bytes.count, 0, Int(AV_INPUT_BUFFER_PADDING_SIZE))
         av_buffer_unref(&packet.pointee.buf)
         packet.pointee.buf = buffer
         packet.pointee.data = buffer.pointee.data
-        packet.pointee.size = Int32(frame.count)
+        packet.pointee.size = Int32(bytes.count)
         return true
     }
 

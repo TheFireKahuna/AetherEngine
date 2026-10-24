@@ -15,16 +15,17 @@ import AetherLibavformat
 @Suite("FLV format chain")
 struct FLVFormatChainTests {
 
-    /// Flash audio, all of it. `pcm_alaw` / `pcm_mulaw` route as `.pcm` (libavcodec's own spelling,
-    /// same S16 output), the other three carry a case of their own so the routing log names them.
+    /// Flash audio, all of it. Big-endian 16-bit PCM is linear PCM the fMP4 carries as `ipcm`; unsigned
+    /// 8-bit and G.711 A-law / mu-law route as `.otherPCM` (libavcodec's own spelling, same S16
+    /// output); the other three carry a case of their own so the routing log names them.
     private static let audio: [(String, AVCodecID, HLSVideoEngine.AudioCodecCompat)] = [
         ("nellymoser", AV_CODEC_ID_NELLYMOSER, .nellymoser),
         ("adpcm_swf", AV_CODEC_ID_ADPCM_SWF, .adpcmSwf),
         ("speex", AV_CODEC_ID_SPEEX, .speex),
         ("pcm_s16be", AV_CODEC_ID_PCM_S16BE, .pcm),
-        ("pcm_u8", AV_CODEC_ID_PCM_U8, .pcm),
-        ("pcm_alaw", AV_CODEC_ID_PCM_ALAW, .pcm),
-        ("pcm_mulaw", AV_CODEC_ID_PCM_MULAW, .pcm),
+        ("pcm_u8", AV_CODEC_ID_PCM_U8, .otherPCM),
+        ("pcm_alaw", AV_CODEC_ID_PCM_ALAW, .otherPCM),
+        ("pcm_mulaw", AV_CODEC_ID_PCM_MULAW, .otherPCM),
     ]
 
     /// The video half. FLV1 is Sorenson Spark and registers under the family name `flv`, so a
@@ -37,11 +38,15 @@ struct FLVFormatChainTests {
         ("vp6f", AV_CODEC_ID_VP6F),
     ]
 
-    @Test("every Flash audio codec bridges instead of dropping to video-only")
-    func everyAudioCodecBridges() {
+    @Test("every Flash audio codec plays: linear PCM copies, the rest bridge instead of dropping to video-only")
+    func everyAudioCodecPlays() {
         for (name, id, expected) in Self.audio {
             let compat = HLSVideoEngine.AudioCodecCompat.from(id)
             #expect(compat == expected, "\(name) routes as \(compat), not \(expected)")
+            if compat == .pcm {
+                #expect(!compat.requiresBridge && compat.hlsCodecsString == "ipcm", "\(name) copies as ipcm")
+                continue
+            }
             #expect(compat.requiresBridge, "\(name) would try to stream-copy into fMP4")
             #expect(compat.hlsCodecsString.isEmpty,
                     "\(name) is bridged, so the master playlist takes its CODECS from the encoder")
