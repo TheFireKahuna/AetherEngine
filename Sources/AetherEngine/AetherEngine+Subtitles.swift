@@ -2296,6 +2296,33 @@ extension AetherEngine {
         }
     }
 
+    /// The subtitle track (the id `selectSubtitleTrack(index:)` takes) behind a legible option of the current
+    /// item, for a host that lets AVKit's own subtitle menu pick (`setNativeSubtitleRendering(true)`), told of
+    /// the pick by `playerViewController(_:didSelect:in:)`. Nil for an option no served rendition backs.
+    /// Inverse of the match `setNativeSubtitleSelected` makes: the n-th option in a language is the n-th
+    /// rendition in that language; a language-less option is matched by position.
+    public func subtitleTrackID(forNativeOption option: AVMediaSelectionOption, in group: AVMediaSelectionGroup) -> Int? {
+        guard let index = group.options.firstIndex(of: option),
+              let ordinal = Self.nativeOrdinal(forOptionAt: index,
+                                               optionLanguageTags: group.options.map { $0.extendedLanguageTag },
+                                               trackLanguages: nativeSubtitleTracks.map { $0.language }),
+              ordinal < nativeSubtitleTrackTable.count else { return nil }
+        let entry = nativeSubtitleTrackTable[ordinal]
+        return entry.sourceStreamIndex ?? entry.externalID
+    }
+
+    /// The rendition ordinal behind option `index`; see `subtitleTrackID(forNativeOption:in:)`.
+    nonisolated static func nativeOrdinal(forOptionAt index: Int, optionLanguageTags: [String?],
+                                          trackLanguages: [String?]) -> Int? {
+        guard index >= 0, index < optionLanguageTags.count else { return nil }
+        guard let tag = optionLanguageTags[index] else {
+            return index < trackLanguages.count ? index : nil
+        }
+        let rank = optionLanguageTags[0..<index].filter { languageMatches($0, tag) }.count
+        let matching = trackLanguages.indices.filter { trackLanguages[$0].map { languageMatches(tag, $0) } ?? false }
+        return rank < matching.count ? matching[rank] : nil
+    }
+
     /// #88: ordinal of the table entry backing an active track id: embedded ids match
     /// sourceStreamIndex, external ids match externalID.
     nonisolated static func nativeSubtitleOrdinal(forActiveTrack id: Int, in table: [NativeSubtitleTrackEntry]) -> Int? {
@@ -2545,7 +2572,10 @@ extension AetherEngine {
     /// foreign selection, bounded only against a selection fight it cannot win.
     func forceNativeLegibleDeselectedUntilHostSelects() {
         cancelNativeLegibleDeselectPin()
-        guard nativeSubtitleReapplyOrdinal == nil, let item = currentAVPlayer?.currentItem else { return }
+        // A standing native-rendering request means the rendition IS the display (AVKit's own subtitle
+        // menu, PiP, AirPlay): the host and AVKit own selection, and a pin would undo the viewer's pick.
+        guard nativeSubtitleReapplyOrdinal == nil, !nativeSubtitleRenderingRequested,
+              let item = currentAVPlayer?.currentItem else { return }
         currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
         nativeLegibleDeselectPinTask = Task { @MainActor [weak self] in
             guard let self,
@@ -2553,7 +2583,7 @@ extension AetherEngine {
                   !group.options.isEmpty else { return }
             var attempts = 0
             while attempts < 25,
-                  self.nativeSubtitleReapplyOrdinal == nil,
+                  self.nativeSubtitleReapplyOrdinal == nil, !self.nativeSubtitleRenderingRequested,
                   self.currentAVPlayer?.currentItem === item {
                 if attempts == 0 || item.currentMediaSelection.selectedMediaOption(in: group) != nil {
                     item.select(nil, in: group)
@@ -2588,7 +2618,7 @@ extension AetherEngine {
                       pinned === self.currentAVPlayer?.currentItem else { return }
                 // The host owns selection from the moment it asks for a native track (PiP, AirPlay,
                 // external display); its own select fires this notification too.
-                guard self.nativeSubtitleReapplyOrdinal == nil else {
+                guard self.nativeSubtitleReapplyOrdinal == nil, !self.nativeSubtitleRenderingRequested else {
                     self.cancelNativeLegibleDeselectPin()
                     return
                 }
