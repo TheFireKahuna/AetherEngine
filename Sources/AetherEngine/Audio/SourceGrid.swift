@@ -30,6 +30,12 @@ struct SourceGrid {
     private var step: Int64
     /// How far a container timestamp may be from the frame it marks: `AudioContinuity.tolerance`.
     let tolerance: Int64
+    /// How far it may be from that frame's lattice point: its own rounding and the rounding of the
+    /// start the lattice is laid from (`origin`), which the container rounded the same way. Read
+    /// against a timestamp's rounding alone, `DTSX Emulator.mkv` (start 53 ms, timestamps up to a
+    /// tick either side of their frames) left the lattice about 700 times a minute and was placed
+    /// anew each time. On a run placed on every frame the origin cancels out.
+    private var latticeTolerance: Int64 { step > 1 ? 2 * tolerance - 1 : tolerance }
 
     /// The run's relative position of its first frame, and the grid offsets (in steps, from the
     /// point `origin` puts that frame on) still consistent with every timestamp the run has seen.
@@ -80,6 +86,7 @@ struct SourceGrid {
             let offset = relative - first
             if offset % step == 0 {
                 // origin + (k + offset / step) * step must lie within tolerance of the estimate.
+                let tolerance = latticeTolerance
                 let low = Self.ceilDiv(estimate - tolerance - origin, step) - offset / step
                 let high = Self.floorDiv(estimate + tolerance - origin, step) - offset / step
                 if low > high {
@@ -87,7 +94,7 @@ struct SourceGrid {
                     restarted = true
                     step = 1
                     self.first = relative
-                    self.steps = (estimate - tolerance - origin)...(estimate + tolerance - origin)
+                    self.steps = (estimate - self.tolerance - origin)...(estimate + self.tolerance - origin)
                 } else if let steps = self.steps {
                     let lo = max(steps.lowerBound, low), hi = min(steps.upperBound, high)
                     if lo <= hi {
