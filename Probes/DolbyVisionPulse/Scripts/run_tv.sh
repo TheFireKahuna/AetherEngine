@@ -221,7 +221,20 @@ case "$SEQ" in
     for f in film_soft.ts film_hard.ts film_psf.ts; do
       [[ -e "$OUT/$f" ]] || { echo "missing $OUT/$f (Scripts/build_film.sh makes it)"; exit 1; }
     done ;;
-  *) echo "unknown SEQ=$SEQ (main|el|vt|count|cm4|cm4q|l8ladder|fmt|bits|card|cardov|placeholder|soak|deint|film)"; exit 1 ;;
+  subs)
+    # AVKit's own subtitle selection and suppressesPlayerRendering (Scripts/build_subs.sh), by eye, about 2.5 min.
+    # SUBS_ARMS (e.g. SP,SF) plays a subset.
+    S="$B/subs/master.m3u8"
+    ARMS="SA|subs|$S|case=auto,SS|subs|$S|case=sup,ST|subs|$S|case=trap,SF|subs|$S|case=fix"
+    ARMS+=",SP|subs|$S|case=pip,SD|subs|$S|case=sdh"
+    LABELS=SA,SS,ST,SF,SP,SD
+    if [[ -n "${SUBS_ARMS:-}" ]]; then
+      ARMS=$(print -r -- "$ARMS" | tr ',' '\n' | awk -v keep=",$SUBS_ARMS," -F'|' \
+        'NF > 1 { k = index(keep, "," $1 ",") > 0 } k' | paste -sd, -)
+      LABELS=$SUBS_ARMS
+    fi
+    [[ -e "$OUT/subs/master.m3u8" ]] || { echo "missing $OUT/subs (Scripts/build_subs.sh makes it)"; exit 1; } ;;
+  *) echo "unknown SEQ=$SEQ (main|el|vt|count|cm4|cm4q|l8ladder|fmt|bits|card|cardov|placeholder|soak|deint|film|subs)"; exit 1 ;;
 esac
 
 if [[ "${1:-}" != "--no-build" ]]; then
