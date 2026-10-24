@@ -567,11 +567,18 @@ enum AudioDecoderError: Error, CustomStringConvertible, LocalizedError {
 
 /// Opens an audio decoder at the programme's reference dynamics. FFmpeg's AC-3 and E-AC-3 decoders
 /// apply the stream's dynamic range compression in full by default (`drc_scale` 1); a receiver
-/// decoding the same bitstream plays it uncompressed unless asked, so the engine does too. Decoders
-/// without the option ignore it.
+/// decoding the same bitstream plays it uncompressed unless asked, so the engine does too.
+///
+/// They also fill the coefficients the encoder gave no bits with noise (A/52's dither), from a
+/// generator that by default runs on from the decoder's open, so a frame decodes differently with
+/// every frame before it and a decode started anywhere never meets a continuous one (measured over 60
+/// starts in four files: never once). `cons_noisegen` seeds it from each frame's own bytes: the same
+/// noise level and spectrum, A/52 leaves the generator to the decoder, and a frame decodes the same
+/// every time. Decoders without these options ignore them.
 func openAudioDecoder(_ ctx: UnsafeMutablePointer<AVCodecContext>, _ codec: UnsafePointer<AVCodec>) -> Int32 {
     var options: OpaquePointer?
     av_dict_set(&options, "drc_scale", "0", 0)
+    av_dict_set(&options, "cons_noisegen", "1", 0)
     defer { av_dict_free(&options) }
     return avcodec_open2(ctx, codec, &options)
 }
