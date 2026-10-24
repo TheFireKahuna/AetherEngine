@@ -89,7 +89,7 @@ struct LiveSourceReplayTests {
                           sourceStreamIndex: demuxer.audioStreamIndex,
                           inputTimeBase: stream.pointee.time_base,
                           sourceTimeBase: stream.pointee.time_base,
-                          bridge: nil, aacTransport: .adts)
+                          bridge: nil, framing: .adts)
         }
         let cache = retainedCache ?? SegmentCache(forwardWindow: 32, backwardWindow: 32)
         let baseIndex = predecessor == nil ? 0 : cache.count

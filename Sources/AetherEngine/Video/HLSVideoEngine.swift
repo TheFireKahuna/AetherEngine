@@ -2093,6 +2093,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             let compat = AudioCodecCompat.from(codecID)
             let sourceAudio = audioStream.pointee.codecpar.pointee
             let latmConfig = Self.latmConfiguration(audioStream.pointee.codecpar)
+            let bluRayLPCM = BluRayLPCM(codecpar: audioStream.pointee.codecpar)
+            var pcmLayout = compat == .pcm ? Self.pcmChannelLayout(audioStream.pointee.codecpar) : nil
+            defer { if pcmLayout != nil { av_channel_layout_uninit(&pcmLayout!) } }
             // AE#764: CoreMedia refuses a FLAC min_blocksize under 192 and hangs on frames smaller than the
             // field claims, so a stream with small blocks cannot be copied, only decoded.
             let flacBlocksTooSmall = compat == .flac
@@ -2106,11 +2109,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     + "\(FLACStreamInfo.coreMediaMinimumBlockSize), bridging instead of stream-copy",
                     category: .session
                 )
-            } else if compat.requiresBridge || (compat == .aacLatm && latmConfig == nil) {
+            } else if compat.requiresBridge || (compat == .aacLatm && latmConfig == nil)
+                        || (compat == .bluRayLPCM && bluRayLPCM == nil) || (compat == .pcm && pcmLayout == nil) {
                 bridgePreferred = true
                 EngineLog.emit(
                     "[HLSVideoEngine] audio: codec=\(compat) "
-                        + (compat == .aacLatm ? "(no AudioSpecificConfig read out of it while probing)" : "(bridge required)")
+                        + (compat == .aacLatm ? "(no AudioSpecificConfig read out of it while probing)"
+                            : compat == .bluRayLPCM ? "(no format read out of it while probing)"
+                            : compat == .pcm ? "(\(sourceAudio.ch_layout.nb_channels) channels in no layout to name their speakers by)"
+                            : "(bridge required)")
                         + ", decoding + "
                           + (Self.spatialRenderingLayout(
                                 rendering: objectAudioRendering, codecID: sourceAudio.codec_id,
@@ -2158,6 +2165,27 @@ public final class HLSVideoEngine: @unchecked Sendable {
                         category: .session
                     )
                 }
+                // Linear PCM: the muxer names every channel's speaker.
+                if pcmLayout != nil {
+                    av_channel_layout_uninit(&ownedAudioParams.ptr.pointee.ch_layout)
+                    guard av_channel_layout_copy(&ownedAudioParams.ptr.pointee.ch_layout, &pcmLayout!) >= 0 else {
+                        throw HLSVideoEngineError.openFailed(reason: "audio channel layout allocation failed")
+                    }
+                }
+                if compat == .pcm { Self.namePCMSpeakers(ownedAudioParams.ptr) }
+                // Blu-ray LPCM: the muxer is given the samples behind its headers, as big-endian PCM.
+                if let bluRayLPCM {
+                    guard bluRayLPCM.describe(ownedAudioParams.ptr) else {
+                        throw HLSVideoEngineError.openFailed(reason: "audio channel layout allocation failed")
+                    }
+                    EngineLog.emit(
+                        "[HLSVideoEngine] audio: Blu-ray LPCM, \(bluRayLPCM.speakers.count) channels "
+                        + "\(bluRayLPCM.bitsPerSample)-bit \(bluRayLPCM.sampleRate) Hz"
+                        + (bluRayLPCM.isPadded ? ", its unused channel dropped," : "")
+                        + " + taking the headers off for fMP4 stream-copy as ipcm",
+                        category: .session
+                    )
+                }
                 streamCopyAudio = HLSSegmentProducer.AudioConfig(
                     codecpar: UnsafePointer(ownedAudioParams.ptr),
                     timeBase: audioStream.pointee.time_base,
@@ -2165,7 +2193,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     inputTimeBase: audioStream.pointee.time_base,
                     sourceTimeBase: audioStream.pointee.time_base,
                     bridge: nil,
-                    aacTransport: latmConfig.map { .latm(config: $0) } ?? (stripAdts ? .adts : .raw),
+                    framing: latmConfig.map { .latm(config: $0) }
+                        ?? bluRayLPCM.map { .bluRayLPCM($0) } ?? (stripAdts ? .adts : .raw),
                     language: audioLanguage
                 )
                 // Audio fallback duration from codec-fixed frame sizes (AC3/EAC3=1536, AAC=1024).
@@ -2198,10 +2227,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 // `probeWriteHeader` in buildProducerWithAudioCascade catches and bridges that.
                 let isJOC = compat == .eac3 && acp.profile == 30
                 audioIsAtmosStreamCopy = isJOC
-                // RFC 6381: mp4a.40 and the object type, so HE-AAC is 40.5 and HE-AACv2 40.29.
+                // RFC 6381: AAC is mp4a.40 and the object type, so HE-AAC is 40.5 and HE-AACv2
+                // 40.29; PCM is its sample entry, `fpcm` for float and `ipcm` for integer.
                 audioHLSCodecs = compat == .aac || compat == .aacLatm
                     ? "mp4a.40.\(Self.aacObjectType(profile: acp.profile, frameSize: acp.frame_size))"
-                    : compat.hlsCodecsString
+                    : compat == .pcm && acp.codec_id == AV_CODEC_ID_PCM_F32LE ? "fpcm" : compat.hlsCodecsString
                 EngineLog.emit(
                     "[HLSVideoEngine] audio: codec=\(compat) → stream-copy as `\(audioHLSCodecs ?? "?")` "
                     + "\(isJOC ? "[JOC=Atmos] " : "")"
