@@ -22,7 +22,7 @@ extension PrewarmSuites {
         private func freshCache() -> SourceByteCache {
             SourceByteCache(directory: FileManager.default.temporaryDirectory
                 .appending(path: "prewarm-551-\(UUID().uuidString)", directoryHint: .isDirectory),
-                            byteBudget: 64 << 20)
+                            budget: .fixed(64 << 20))
         }
 
         private func key(_ url: URL) -> SourceCacheKey { SourceCacheKey(url: url, headers: [:]) }

@@ -80,7 +80,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                       sourceCache: SourceByteCache? = nil,
                       label: String = "disc") {
         let session = Self.makeSession(sessionConfiguration)
-        guard case .size(let size) = Self.resolveSize(
+        guard case .size(let size, let version) = Self.resolveSize(
             url: url, extraHeaders: extraHeaders, session: session, requestTimeout: requestTimeout,
             maxRetries: maxRetries,
             knownSize: knownSize ?? sourceCache?.knownSize(SourceCacheKey(url: url, headers: extraHeaders))) else {
@@ -89,7 +89,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         }
         self.init(url: url, extraHeaders: extraHeaders, baseChunkSize: baseChunkSize,
                   maxChunkSize: maxChunkSize, maxRetries: maxRetries, requestTimeout: requestTimeout,
-                  session: session, totalSize: size, sourceCache: sourceCache, label: label)
+                  session: session, totalSize: size, version: version, sourceCache: sourceCache, label: label)
     }
 
     /// `init?` for a caller that has to say why a disc image cannot be read: an origin that answers the
@@ -108,11 +108,11 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         switch resolveSize(url: url, extraHeaders: extraHeaders, session: session,
                            requestTimeout: requestTimeout, maxRetries: maxRetries,
                            knownSize: sourceCache?.knownSize(SourceCacheKey(url: url, headers: extraHeaders))) {
-        case .size(let size):
+        case .size(let size, let version):
             return HTTPDiscIOReader(
                 url: url, extraHeaders: extraHeaders, baseChunkSize: baseChunkSize,
                 maxChunkSize: maxChunkSize, maxRetries: maxRetries, requestTimeout: requestTimeout,
-                session: session, totalSize: size, sourceCache: sourceCache, label: "disc")
+                session: session, totalSize: size, version: version, sourceCache: sourceCache, label: "disc")
         case .ignoresRange:
             if session !== EngineHTTP.session { session.invalidateAndCancel() }
             throw AVIOReaderError.originIgnoresRange
@@ -130,6 +130,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                  requestTimeout: TimeInterval,
                  session: URLSession,
                  totalSize: Int64,
+                 version: SourceVersion,
                  sourceCache: SourceByteCache?,
                  label: String) {
         self.sourceCache = sourceCache
@@ -148,7 +149,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         self.totalSize = totalSize
         SourceByteLedger.shared.readerOpened(url)
         sourceCache?.readerOpened(cacheKey)
-        sourceCache?.noteTotalSize(totalSize, for: cacheKey)
+        sourceCache?.noteVersion(version, for: cacheKey)
     }
 
     private static func makeSession(_ sessionConfiguration: URLSessionConfiguration?) -> URLSession {
@@ -164,7 +165,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     private static func resolveSize(url: URL, extraHeaders: [String: String], session: URLSession,
                                     requestTimeout: TimeInterval, maxRetries: Int,
                                     knownSize: Int64?) -> SizeProbe {
-        if let knownSize, knownSize > 0 { return .size(knownSize) }
+        if let knownSize, knownSize > 0 { return .size(knownSize, SourceVersion(size: knownSize)) }
         return probeSize(url: url, extraHeaders: extraHeaders, session: session,
                          timeout: requestTimeout, maxRetries: max(0, maxRetries))
     }
@@ -271,7 +272,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                          baseChunkSize: baseChunkSize, maxChunkSize: maxChunkSize,
                          maxRetries: maxRetries, requestTimeout: requestTimeout,
                          session: Self.makeSession(nil),
-                         totalSize: totalSize,
+                         totalSize: totalSize, version: SourceVersion(size: totalSize),
                          sourceCache: sourceCache, label: label)
     }
 
@@ -289,6 +290,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         while true {
             cancelLock.lock(); let stop = cancelled; cancelLock.unlock()
             if stop { return nil }
+            sourceCache?.waitForWriteRoom(for: cacheKey)
             let response = Self.rangeGet(url: url, extraHeaders: extraHeaders, session: session,
                                          requests: ownsSession ? nil : requests,
                                          timeout: requestTimeout, offset: offset, length: length)
@@ -300,7 +302,8 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                Self.parseContentRangeStart(contentRange) == offset {
                 let kept = r.body.count > length ? r.body.prefix(length) : r.body
                 SourceByteLedger.shared.record(url, reader: label, offset: offset, count: kept.count)
-                sourceCache?.store(kept, at: offset, for: cacheKey)
+                sourceCache?.noteVersion(r.version, for: cacheKey)
+                sourceCache?.store(kept, at: offset, version: r.version, for: cacheKey)
                 SourceByteLedger.shared.discard(url, reader: label, count: r.body.count - kept.count)
                 return kept
             }
@@ -314,7 +317,9 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     }
 
     private enum SizeProbe {
-        case size(Int64)
+        /// The total, and the body the probe's response stated (the total alone for a size known
+        /// without asking).
+        case size(Int64, SourceVersion)
         /// The origin answered the range probe with a 200 that is not the byte asked for.
         case ignoresRange
         case unreachable
@@ -328,7 +333,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                              timeout: timeout, offset: 0, length: 1)
             if let r = r, r.status == 206, let cr = r.contentRange,
                let total = parseContentRangeTotal(cr) {
-                return .size(total)
+                return .size(total, r.version)
             }
             if let r = r, r.status == 200 {
                 EngineLog.emit(
@@ -355,6 +360,8 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         let contentRange: String?
         let body: Data
         let answer: AVIOReader.RangeAnswer
+        /// The body the response stated (`SourceVersion`), which its bytes are kept as.
+        let version: SourceVersion
     }
 
     /// Takes one range of the source. Only a 206 that starts where asked is taken at all, and what is
@@ -401,7 +408,8 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
             Self.recordFetched(bytes: body.count)
             return RangeResponse(status: http.statusCode,
                                  contentRange: http.value(forHTTPHeaderField: "Content-Range"),
-                                 body: body, answer: delegate.answer)
+                                 body: body, answer: delegate.answer,
+                                 version: SourceVersion(http, requestedOffset: offset))
         }
     }
 

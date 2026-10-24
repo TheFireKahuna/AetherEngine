@@ -166,6 +166,8 @@ enum RangeFetch {
         /// The URL that actually answered, redirects followed. A warm that resolved a 302 knows the
         /// target the session would otherwise resolve again (#551 round 2).
         let respondedURL: URL?
+        /// The body the response stated: `total` and the origin's validators.
+        let version: SourceVersion
     }
 
     static func run(url: URL,
@@ -204,8 +206,8 @@ enum RangeFetch {
                     case .body(let result):
                         SourceByteLedger.shared.record(url, reader: label, offset: result.range.start,
                                                        count: result.body.count)
-                        cache.noteTotalSize(result.total, for: cacheKey)
-                        cache.store(result.body, at: result.range.start, for: cacheKey)
+                        cache.noteVersion(result.version, for: cacheKey)
+                        cache.store(result.body, at: result.range.start, version: result.version, for: cacheKey)
                         continuation.resume(returning: result)
                     case .rejected(let reason): continuation.resume(throwing: PrewarmDecline(reason: reason))
                     }
@@ -231,6 +233,7 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
     private var contentRange: (start: Int64, end: Int64, total: Int64)?
     private var rejection: String?
     private var respondedURL: URL?
+    private var validators: (etag: String?, lastModified: String?) = (nil, nil)
 
     /// Guards the handoff between the caller's thread, which installs the handler, and the
     /// session's delegate queue, which produces the outcome. Either can be first.
@@ -338,6 +341,7 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         // `http.url` is the URL that answered, redirects followed, which is the one a later load
         // should start at instead of resolving the chain again (#551 round 2).
         respondedURL = http.url
+        validators = (http.value(forHTTPHeaderField: "ETag"), http.value(forHTTPHeaderField: "Last-Modified"))
         completionHandler(.allow)
     }
 
@@ -368,7 +372,9 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         return .body(RangeFetch.Result(body: buffer,
                                        range: (start: range.start, end: range.end),
                                        total: range.total,
-                                       respondedURL: respondedURL))
+                                       respondedURL: respondedURL,
+                                       version: SourceVersion(size: range.total, etag: validators.etag,
+                                                              lastModified: validators.lastModified)))
     }
 
     /// `bytes <start>-<end>/<total>`. A `*` total is a range the origin will not size, which is

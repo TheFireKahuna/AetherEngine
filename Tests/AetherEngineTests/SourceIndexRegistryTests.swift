@@ -11,6 +11,24 @@ struct SourceIndexRegistryTests {
               size: size)
     }
 
+    private static func cache(grace: TimeInterval = 300) -> SourceByteCache {
+        SourceByteCache(directory: FileManager.default.temporaryDirectory
+            .appending(path: "index-registry-\(UUID().uuidString)", directoryHint: .isDirectory),
+                        budget: .fixed(64 << 20), releaseGrace: grace, removesDirectory: true)
+    }
+
+    /// A registry over a cache in which each of `keys` is open, as a consumer's reader opens its
+    /// source before it asks for the index.
+    private static func registry(holding keys: [SourceIndexRegistry.Key], grace: TimeInterval = 300)
+        -> (SourceIndexRegistry, SourceByteCache) {
+        let cache = Self.cache(grace: grace)
+        for key in keys {
+            cache.readerOpened(key.source)
+            cache.noteVersion(SourceVersion(size: key.size), for: key.source)
+        }
+        return (SourceIndexRegistry(cache: cache), cache)
+    }
+
     /// Counts how often the registry ran a read of the bytes, which is how often it parsed.
     private final class Opener: @unchecked Sendable {
         private let lock = NSLock()
@@ -32,9 +50,9 @@ struct SourceIndexRegistryTests {
 
     @Test("Consumers racing for one source share one parse, and a consumer after them parses nothing")
     func racingConsumersShareOneParse() async throws {
-        let registry = SourceIndexRegistry()
-        let opener = Opener(MatroskaCueIndexTests.fixture().bytes)
         let key = Self.key("race")
+        let (registry, _) = Self.registry(holding: [key])
+        let opener = Opener(MatroskaCueIndexTests.fixture().bytes)
         let tracks = await withTaskGroup(of: [UInt64].self) { group in
             for _ in 0..<12 {
                 group.addTask {
@@ -58,7 +76,7 @@ struct SourceIndexRegistryTests {
 
     @Test("Another source, or the same request at another size, is another index")
     func sourceAndSizeNameTheIndex() async {
-        let registry = SourceIndexRegistry()
+        let (registry, _) = Self.registry(holding: [Self.key("a"), Self.key("b")])
         let opener = Opener(MatroskaCueIndexTests.fixture().bytes)
         _ = await registry.index(for: Self.key("a"), read: opener.read)
         _ = await registry.index(for: Self.key("b"), read: opener.read)
@@ -69,7 +87,7 @@ struct SourceIndexRegistryTests {
 
     @Test("A source no reader covers is a kept answer, not a parse per consumer")
     func permanentRefusalIsKept() async {
-        let registry = SourceIndexRegistry()
+        let (registry, _) = Self.registry(holding: [Self.key("plain")])
         let opener = Opener([UInt8](repeating: 7, count: 70_000))
         let first = await registry.index(for: Self.key("plain"), read: opener.read)
         let second = await registry.index(for: Self.key("plain"), read: opener.read)
@@ -84,7 +102,7 @@ struct SourceIndexRegistryTests {
     /// next consumer is allowed to try again.
     @Test("A read that broke off is not remembered: the next consumer tries again")
     func brokenReadIsRetried() async {
-        let registry = SourceIndexRegistry()
+        let (registry, _) = Self.registry(holding: [Self.key("flaky")])
         let counter = Opener(nil)
         let first = await registry.index(for: Self.key("flaky"), read: counter.read)
         guard case .unavailable(.malformed) = first else {
@@ -98,17 +116,60 @@ struct SourceIndexRegistryTests {
         #expect(good.count == 1)
     }
 
-    @Test("Past capacity the least recently asked for index goes, and is parsed again if asked for")
-    func capacityEvictsTheOldest() async {
-        let registry = SourceIndexRegistry()
+    @Test("An index goes when the cache lets its source go, and the next consumer reads it again",
+          .timeLimit(.minutes(1)))
+    func indexGoesWithItsSource() async throws {
+        let key = Self.key("lifetime")
+        let (registry, cache) = Self.registry(holding: [key], grace: 0.2)
         let opener = Opener(MatroskaCueIndexTests.fixture().bytes)
-        for n in 0...SourceIndexRegistry.capacity {
-            _ = await registry.index(for: Self.key("cap\(n)"), read: opener.read)
-        }
-        #expect(registry.parseCount == SourceIndexRegistry.capacity + 1)
-        _ = await registry.index(for: Self.key("cap\(SourceIndexRegistry.capacity)"), read: opener.read)
-        #expect(registry.parseCount == SourceIndexRegistry.capacity + 1)
-        _ = await registry.index(for: Self.key("cap0"), read: opener.read)
-        #expect(registry.parseCount == SourceIndexRegistry.capacity + 2)
+        _ = await registry.index(for: key, read: opener.read)
+        _ = await registry.index(for: key, read: opener.read)
+        #expect(registry.parseCount == 1, "held while a reader has the source open")
+        cache.readerClosed(key.source)
+        try await waitFor { registry.heldCount == 0 }
+        _ = await registry.index(for: key, read: opener.read)
+        #expect(registry.parseCount == 2)
+    }
+
+    @Test("A source replaced by another body takes its index with it")
+    func anotherBodyDropsTheIndex() async {
+        let key = Self.key("replaced")
+        let (registry, cache) = Self.registry(holding: [key])
+        cache.noteVersion(SourceVersion(size: key.size, etag: "\"v1\""), for: key.source)
+        let opener = Opener(MatroskaCueIndexTests.fixture().bytes)
+        _ = await registry.index(for: key, read: opener.read)
+        cache.noteVersion(SourceVersion(size: key.size, etag: "\"v1\""), for: key.source)
+        #expect(registry.heldCount == 1, "the same body says nothing new")
+        cache.noteVersion(SourceVersion(size: key.size, etag: "\"v2\""), for: key.source)
+        #expect(registry.heldCount == 0)
+        _ = await registry.index(for: key, read: opener.read)
+        #expect(registry.parseCount == 2)
+    }
+
+    @Test("A source the cache does not hold keeps its index only while it is read")
+    func unheldSourceKeepsNothing() async {
+        let (registry, cache) = Self.registry(holding: [])
+        let opener = Opener(MatroskaCueIndexTests.fixture().bytes)
+        _ = await registry.index(for: Self.key("local"), read: opener.read)
+        #expect(registry.heldCount == 0)
+        _ = await registry.index(for: Self.key("local"), read: opener.read)
+        #expect(registry.parseCount == 2)
+        // Held under another size is not held at this one.
+        cache.readerOpened(Self.key("local").source)
+        cache.noteVersion(SourceVersion(size: 2_000), for: Self.key("local").source)
+        _ = await registry.index(for: Self.key("local"), read: opener.read)
+        #expect(registry.heldCount == 0)
+    }
+
+    @Test("Letting idle sources go lets their indexes go")
+    func idleReleaseDropsTheIndex() async {
+        let key = Self.key("idle")
+        let (registry, cache) = Self.registry(holding: [key])
+        _ = await registry.index(for: key, read: Opener(MatroskaCueIndexTests.fixture().bytes).read)
+        cache.releaseIdleSources()
+        #expect(registry.heldCount == 1, "a reader still has it open")
+        cache.readerClosed(key.source)
+        cache.releaseIdleSources()
+        #expect(registry.heldCount == 0)
     }
 }

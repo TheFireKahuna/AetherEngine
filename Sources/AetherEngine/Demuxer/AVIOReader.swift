@@ -444,20 +444,38 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     }
 
     /// `offset` is where the delivery sits in the source: the duplicate-traffic ledger counts the
-    /// span, and the source cache keeps the bytes for whichever reader asks for them next. Live has
-    /// no stable byte addresses, so its bytes are counted and not kept.
-    private func addBytesFetched(_ data: Data, at offset: Int64) {
+    /// span, and the source cache keeps the bytes for whichever reader asks for them next, as the
+    /// body `version` (the response the bytes came on) says they are. Live has no stable byte
+    /// addresses, so its bytes are counted and not kept.
+    private func addBytesFetched(_ data: Data, at offset: Int64, version: SourceVersion) {
         let n = data.count
         counterLock.lock()
         _cumulativeBytesFetched &+= Int64(n)
         counterLock.unlock()
         SourceByteLedger.shared.record(url, reader: label, offset: offset, count: n)
-        if !isLive { sourceCache.store(data, at: offset, for: cacheKey) }
+        if !isLive { sourceCache.store(data, at: offset, version: version, for: cacheKey) }
         // #392: every network delivery this reader makes passes through here (pump, chunk, tail
         // prefetch, detour fetch, streaming), which is why the idle clock is stamped here and not
         // in one of them. A serve out of memory does not reach this call, and must not: memory is
         // exactly what an idle reader lives on while its pin ages.
         noteNetworkDelivery()
+    }
+
+    /// What `http`, the answer to a request from `requestedOffset`, says the source's body is, told
+    /// to the source cache: another body than the one it holds drops what it held. Every response
+    /// whose bytes are kept comes through here before its bytes do.
+    private func noteResponseVersion(_ http: HTTPURLResponse, requestedOffset: Int64) -> SourceVersion {
+        // A refusal's page is not the source's body, whatever validators it carries.
+        guard (200...299).contains(http.statusCode) else { return SourceVersion() }
+        let version = SourceVersion(http, requestedOffset: requestedOffset)
+        if !isLive { sourceCache.noteVersion(version, for: cacheKey) }
+        return version
+    }
+
+    /// Holds the next request while the source cache's writes are behind (`waitForWriteRoom`). On
+    /// the thread that sends it, never in a delivery callback. Live keeps nothing, so never waits.
+    private func waitForCacheWriteRoom() {
+        if !isLive { sourceCache.waitForWriteRoom(for: cacheKey) }
     }
 
     private var isStreaming: Bool { fileSize <= 0 }
@@ -531,6 +549,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// consumer treats EOF as "played to the end" and deliberately never retries it. Guarded by
     /// `streamLock`.
     private var streamExpectedBytes: Int64 = -1
+    /// The body the streaming GET's response stated, which its deliveries are kept as. Guarded by
+    /// `streamLock`.
+    private var streamVersion = SourceVersion()
     /// Audit DMX-6: the streaming GET ended in a transport error, or was ended at
     /// `streamHardCap`. Either way the bytes that did not arrive are lost, not absent, so the read
     /// that runs out reports EIO instead of end-of-media. Guarded by `streamLock`.
@@ -1002,12 +1023,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var tailPrefetchInFlight = false
     private var tailPrefetchStartedAt = DispatchTime.now()
 
-    /// #551: the size this open took from the source cache rather than from a response header. A
-    /// size that came from a DIFFERENT response than the one now serving the session is the one
-    /// adopted fact that could be wrong and could never be corrected, because the write-once rule
-    /// below treats any positive `fileSize` as settled. Remembered so the first network connection's
-    /// own `Content-Range` can be checked against it, once.
-    private var adoptedCachedSize: Int64?
+    /// #551: the body this open took from the source cache rather than from a response header (its
+    /// size, and the validators it was recorded with). A size that came from a DIFFERENT response
+    /// than the one now serving the session is the one adopted fact that could be wrong and could
+    /// never be corrected, because the write-once rule below treats any positive `fileSize` as
+    /// settled. Remembered so the first network connection's own response can be checked against it.
+    private var adoptedCachedVersion: SourceVersion?
+    /// The body the current connection's response stated, which its deliveries are kept as.
+    /// winCond-guarded.
+    private var connVersion = SourceVersion()
     /// One line per open for the first read the source cache served instead of the network: the
     /// round trip that did not happen, named. winCond-guarded.
     private var cacheServeLogged = false
@@ -2937,7 +2961,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     return .failed
                 }
             }
-            addBytesFetched(data, at: offset)
+            let version = (response as? HTTPURLResponse)
+                .map { noteResponseVersion($0, requestedOffset: offset) } ?? SourceVersion()
+            addBytesFetched(data, at: offset, version: version)
             return .ok(data)
         } catch {
             return .failed
@@ -2966,9 +2992,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     /// The source cache's answer to the open: when another reader of this source has fetched its head,
     /// the size it learned is adopted (#551), so the first connection is planned against it and
-    /// replays the head from disk instead of asking the origin. `adoptedCachedSize` is
-    /// what makes that safe: a later response stating a different size drops the adopted size and
-    /// the cache drops what it held under the old one. A head the cache cannot serve leaves the open
+    /// replays the head from disk instead of asking the origin. `adoptedCachedVersion` is
+    /// what makes that safe: a later response stating another body (a different size, `ETag` or
+    /// `Last-Modified`) drops the adopted size, and the cache drops what it held for the old one. A head the cache cannot serve leaves the open
     /// as it was, with its first response as the size probe (#70).
     private func adoptCachedSourceSize() {
         guard !isLive else { return }
@@ -2977,7 +3003,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // since run out is handled by the expiry ladder, as any pin is.
         recordResolvedURL(sourceCache.resolvedURL(for: cacheKey))
         guard prefetchEnabled,
-              let known = sourceCache.knownSize(cacheKey), known > 0,
+              let version = sourceCache.knownVersion(cacheKey), let known = version.size,
               (sourceCache.heldLength(cacheKey, at: 0, expectedSize: known) ?? 0)
                 >= min(SourceByteCache.minimumServeBytes, known)
         else { return }
@@ -2985,7 +3011,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let adopted = fileSize <= 0
         if adopted {
             fileSize = known
-            adoptedCachedSize = known
+            adoptedCachedVersion = version
         }
         winCond.unlock()
         guard adopted else { return }
@@ -3081,14 +3107,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                                    - self.tailPrefetchStartedAt.uptimeNanoseconds) / 1_000_000
             // Kept before the waiting read is woken: the read the fetch was in flight for serves
             // from the source cache, so the bytes have to be there when it looks.
-            if case .span(let start, let data) = outcome, !self.isFullyClosed {
-                self.addBytesFetched(data, at: start)
+            if case .span(let start, let data, let http) = outcome, !self.isFullyClosed {
+                self.addBytesFetched(data, at: start,
+                                     version: self.noteResponseVersion(http, requestedOffset: start))
             }
             self.winCond.lock()
             self.tailPrefetchInFlight = false
             self.winCond.broadcast()
             self.winCond.unlock()
-            if case .span(let start, let data) = outcome {
+            if case .span(let start, let data, _) = outcome {
                 SuffixRangeSupport.shared.noteServed(url)
                 EngineLog.emit(
                     "[AVIOReader] \(self.label) tail prefetch kept \(data.count)B at \(start) "
@@ -3221,6 +3248,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// request construction below). Bumps generation so late callbacks from the old
     /// connection are ignored.
     private func startPersistentConnection(at offset: Int64, boundedTo: Int64? = nil, openEnded: Bool = false) {
+        waitForCacheWriteRoom()
         winCond.lock()
         connGeneration &+= 1
         let generation = connGeneration
@@ -3664,7 +3692,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if fromCache {
             SourceByteLedger.shared.servedFromCache(url, reader: label, count: count)
         } else {
-            addBytesFetched(data, at: winStart + Int64(base))
+            addBytesFetched(data, at: winStart + Int64(base), version: connVersion)
         }
         // #220: the requested range has been delivered in full. That ends the connection on
         // purpose; the read loop re-requests at the frontier once the consumer has drawn down.
@@ -3804,25 +3832,30 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // (fileSize <= 0), current-gen only, and never for live (whose length is
         // non-authoritative). The response precedes any body and no read() reads fileSize
         // until open() returns, so this write is ordered behind winCond just like the data.
-        // #551: the adopted size meets the connection that is actually serving this session. They
+        // #551: the adopted body meets the connection that is actually serving this session. They
         // disagree only when the cached bytes belong to a different response, and then they are
         // the wrong ones: these bytes are the ones being played. Drop the adopted size and the
-        // spans read under it, and let the write-once rule below take the real size; recording that
-        // size in the source cache drops what it held under the old one.
-        if generation == connGeneration, !isLive, let adopted = adoptedCachedSize,
-           let total = Self.sizeFromResponse(http, requestedOffset: requestedOffset), total != adopted {
+        // spans read under it, and let the write-once rule below take the real size; noting this
+        // response in the source cache drops what it held for the old body.
+        let answered = (status == 206 || (status == 200 && requestedOffset == 0)) && !rangeIgnoredAtOpen
+        let version = SourceVersion(http, requestedOffset: requestedOffset)
+        if generation == connGeneration, !isLive, answered, let adopted = adoptedCachedVersion,
+           adopted.contradicts(version) {
             EngineLog.emit(
-                "[AVIOReader] \(label) the source cache said \(adopted)B, this connection says \(total)B; "
-                + "dropping what was read under it (#551)", category: .demux)
+                "[AVIOReader] \(label) the source cache said \(adopted.description), this connection says "
+                + "\(version.description); dropping what was read under it (#551)", category: .demux)
             fileSize = 0
-            adoptedCachedSize = nil
+            adoptedCachedVersion = nil
+        }
+        if generation == connGeneration, !isLive, answered {
+            // #112: the resolved length is shared, so a later side demuxer on the same origin can skip a
+            // probe that might be starved under this connection's load and would otherwise collapse it
+            // to forward-only; and the validators with it, so the cache keeps one body.
+            connVersion = noteResponseVersion(http, requestedOffset: requestedOffset)
         }
         if generation == connGeneration, !isLive, fileSize <= 0, !rangeIgnoredAtOpen,
            let total = Self.sizeFromResponse(http, requestedOffset: requestedOffset) {
             fileSize = total
-            // #112: share this resolved length so a later side demuxer on the same origin can skip a probe that
-            // might be starved under this connection's load and would otherwise collapse it to forward-only.
-            sourceCache.noteTotalSize(total, for: cacheKey)
             #if DEBUG
             EngineLog.emit("[AVIOReader] File size: \(total) bytes (data connection)", category: .demux)
             #endif
@@ -3972,10 +4005,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // Advisory length for the EOF/EIO distinction; -1 (chunked / unknown) leaves the
                 // clean-end path as the only EOF source.
                 guard let self else { return }
+                let version = (response as? HTTPURLResponse)
+                    .map { self.noteResponseVersion($0, requestedOffset: 0) } ?? SourceVersion()
                 let expected = response.expectedContentLength
-                guard expected > 0 else { return }
                 self.streamLock.lock()
-                self.streamExpectedBytes = expected
+                self.streamVersion = version
+                if expected > 0 { self.streamExpectedBytes = expected }
                 self.streamLock.unlock()
             },
             onRefused: { [weak self] status, respondedBy in
@@ -4006,6 +4041,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // references the transport's dispatch_data would pin its buffer for that long.
             self.streamBuffer.append(data.withUnsafeBytes { Data($0) })
             let deliveredAt = self.streamBytesReceived
+            let version = self.streamVersion
             self.streamBytesReceived += Int64(data.count)
             self.streamPeakBytes = max(self.streamPeakBytes, self.streamBuffer.count)
             var toCancel: URLSessionDataTask?
@@ -4035,7 +4071,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             } else {
                 toSuspend?.suspend()
             }
-            self.addBytesFetched(data, at: deliveredAt)
+            self.addBytesFetched(data, at: deliveredAt, version: version)
             self.streamDataReady.signal()
         } onComplete: { [weak self] error in
             lease.release()
@@ -4279,14 +4315,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// demuxer already resolved for the same origin. A fresh probe here can be 429'd or answered without a length
     /// while the video producer is hammering the origin, which would drop this reader to forward-only streaming so
     /// every `avformat_seek_file` returns -1 and PGS reconstruction reads nothing. The producer's persistent open
-    /// records the real length in the source cache (`noteTotalSize` at the data-connection response), so a starved
+    /// records the real length in the source cache (`noteVersion` at the data-connection response), so a starved
     /// probe reuses it and stays byte-seekable. A successful probe also records it for whoever opens next.
     private func resolveInitialFileSize() -> Int64 {
         let probed = probeFileSize()
-        if probed > 0 {
-            sourceCache.noteTotalSize(probed, for: cacheKey)
-            return probed
-        }
+        if probed > 0 { return probed }
         if let cached = sourceCache.knownSize(cacheKey), cached > 0 {
             EngineLog.emit("[AVIOReader] size probe empty; reusing cached \(cached) bytes to keep seekability (#112)", category: .demux)
             return cached
@@ -4395,6 +4428,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let completion = DispatchSemaphore(value: 0)
         delegate.onCompletion = { [weak self] response in
             self?.noteRateLimitedResponse(response)
+            if let response { _ = self?.noteResponseVersion(response, requestedOffset: 0) }
             lease.release()
             completion.signal()
         }
@@ -4460,6 +4494,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let semaphore = DispatchSemaphore(value: 0)
         delegate.onCompletion = { [weak self] response in
             self?.noteRateLimitedResponse(response)
+            if let response { _ = self?.noteResponseVersion(response, requestedOffset: 0) }
             lease.release()
             semaphore.signal()
         }
@@ -4506,6 +4541,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 return -1
             }
             let length = http.expectedContentLength
+            _ = noteResponseVersion(http, requestedOffset: 0)
             #if DEBUG
             EngineLog.emit("[AVIOReader] File size: \(length) bytes (HEAD fallback)", category: .demux)
             #endif
@@ -4571,7 +4607,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         return nil
                     }
                 }
-                addBytesFetched(data, at: offset)
+                let version = (response as? HTTPURLResponse)
+                    .map { noteResponseVersion($0, requestedOffset: offset) } ?? SourceVersion()
+                addBytesFetched(data, at: offset, version: version)
                 return data
             } catch {
                 // Superseded / closed / past the read deadline: this read is disposable,
@@ -4728,6 +4766,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // through here, so this is the one place that has to take an origin slot for all of them.
         // Refusals are charged before the completion callback returns the slot. Early exit
         // releases the same lease idempotently.
+        waitForCacheWriteRoom()
         let slotURL = request.url ?? url
         let ticket = try requestTicket(
             for: slotURL, label: "\(label) \(slotLabel)", timeout: slotWait)
@@ -5472,7 +5511,8 @@ final class SuffixRangeSupport: @unchecked Sendable {
 /// collected length is capped besides, so a lying `Content-Range` cannot grow this either.
 private final class TailPrefetchDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     enum Outcome {
-        case span(Int64, Data)
+        /// Where the suffix starts, its bytes, and the response they came on.
+        case span(Int64, Data, HTTPURLResponse)
         /// Named so the log says WHICH way an origin declined, since "no suffix ranges", "a 200 with
         /// the whole file" and "a short body" are three different origins to talk to a reporter about.
         ///
@@ -5494,6 +5534,7 @@ private final class TailPrefetchDelegate: NSObject, URLSessionDataDelegate, @unc
     private let extraHeaders: [String: String]
     private var buffer = Data()
     private var spanStart: Int64?
+    private var response: HTTPURLResponse?
     private var rejection: (String, Verdict)?
 
     /// Called exactly once, on completion, whatever happened. A caller waits on this fetch, so a
@@ -5545,6 +5586,7 @@ private final class TailPrefetchDelegate: NSObject, URLSessionDataDelegate, @unc
             return
         }
         spanStart = start
+        self.response = http
         completionHandler(.allow)
     }
 
@@ -5565,7 +5607,7 @@ private final class TailPrefetchDelegate: NSObject, URLSessionDataDelegate, @unc
     private func outcome(error: Error?) -> Outcome {
         if let (reason, verdict) = rejection { return .rejected(reason, verdict: verdict) }
         if let error { return .rejected("transport: \(error.localizedDescription)", verdict: .transportFailure) }
-        guard let start = spanStart else {
+        guard let start = spanStart, let response else {
             return .rejected("no usable response header", verdict: .declinedByOrigin)
         }
         // A short body would put later offsets in the span at the wrong place, so a partial
@@ -5574,7 +5616,7 @@ private final class TailPrefetchDelegate: NSObject, URLSessionDataDelegate, @unc
         guard buffer.count == expectedLength else {
             return .rejected("short body: \(buffer.count)B of \(expectedLength)B", verdict: .declinedByOrigin)
         }
-        return .span(start, buffer)
+        return .span(start, buffer, response)
     }
 }
 

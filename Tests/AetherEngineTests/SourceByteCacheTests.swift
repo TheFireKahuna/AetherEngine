@@ -9,7 +9,7 @@ struct SourceByteCacheTests {
     private static func freshCache(budget: Int64 = 64 << 20, grace: TimeInterval = 300) -> SourceByteCache {
         let dir = FileManager.default.temporaryDirectory
             .appending(path: "source-cache-tests-\(UUID().uuidString)", directoryHint: .isDirectory)
-        return SourceByteCache(directory: dir, byteBudget: budget, releaseGrace: grace)
+        return SourceByteCache(directory: dir, budget: .fixed(budget), releaseGrace: grace)
     }
 
     private static func pattern(_ count: Int, seed: Int = 0) -> Data {
@@ -63,8 +63,8 @@ struct SourceByteCacheTests {
     func storedBytesComeBack() throws {
         let cache = Self.freshCache()
         let data = Self.pattern(300_000)
-        cache.noteTotalSize(10_000_000, for: Self.source)
-        cache.store(data, at: 1_000_000, for: Self.source)
+        cache.noteVersion(SourceVersion(size: 10_000_000), for: Self.source)
+        cache.store(data, at: 1_000_000, version: SourceVersion(), for: Self.source)
         cache.drainWritesForTesting()
         let sameRequest = SourceCacheKey(url: Self.sourceURL, headers: ["User-Agent": "Sodalite"])
         let back = try #require(cache.read(sameRequest, at: 1_000_000, maxLength: 1 << 20, expectedSize: 10_000_000))
@@ -80,8 +80,8 @@ struct SourceByteCacheTests {
     @Test("Another token or header set is another entry: nothing crosses between them")
     func credentialsAndHeadersSeparateEntries() {
         let cache = Self.freshCache()
-        cache.noteTotalSize(10_000_000, for: Self.source)
-        cache.store(Self.pattern(1000), at: 0, for: Self.source)
+        cache.noteVersion(SourceVersion(size: 10_000_000), for: Self.source)
+        cache.store(Self.pattern(1000), at: 0, version: SourceVersion(), for: Self.source)
         cache.drainWritesForTesting()
         let otherToken = SourceCacheKey(
             url: URL(string: "https://media.example.com/Videos/abc/stream.mkv?static=true&api_key=BBBB")!,
@@ -100,10 +100,10 @@ struct SourceByteCacheTests {
         let cache = Self.freshCache()
         let first = Self.pattern(100_000, seed: 3)
         let second = Self.pattern(50_000, seed: 4)
-        cache.noteTotalSize(10_000_000, for: Self.source)
-        cache.store(first, at: 0, for: Self.source)
+        cache.noteVersion(SourceVersion(size: 10_000_000), for: Self.source)
+        cache.store(first, at: 0, version: SourceVersion(), for: Self.source)
         cache.drainWritesForTesting()
-        cache.store(second, at: 100_000, for: Self.source)
+        cache.store(second, at: 100_000, version: SourceVersion(), for: Self.source)
         // No drain: `second` may still be pending.
         #expect(cache.heldLength(Self.source, at: 0, expectedSize: 10_000_000) == 150_000)
         let whole = try #require(cache.read(Self.source, at: 50_000, maxLength: 100_000, expectedSize: 10_000_000))
@@ -115,8 +115,8 @@ struct SourceByteCacheTests {
     @Test("A reader that knows the source under another size is served nothing")
     func sizeMismatchIsNotServed() {
         let cache = Self.freshCache()
-        cache.noteTotalSize(10_000_000, for: Self.source)
-        cache.store(Self.pattern(1000), at: 0, for: Self.source)
+        cache.noteVersion(SourceVersion(size: 10_000_000), for: Self.source)
+        cache.store(Self.pattern(1000), at: 0, version: SourceVersion(), for: Self.source)
         cache.drainWritesForTesting()
         #expect(cache.read(Self.source, at: 0, maxLength: 1000, expectedSize: 9_999_999) == nil)
         #expect(cache.heldLength(Self.source, at: 0, expectedSize: 9_999_999) == 0)
@@ -125,25 +125,158 @@ struct SourceByteCacheTests {
     @Test("A source whose size changes loses everything held for it")
     func sizeChangeDropsHeldBytes() {
         let cache = Self.freshCache()
-        cache.noteTotalSize(10_000_000, for: Self.source)
-        cache.store(Self.pattern(1000), at: 0, for: Self.source)
+        cache.noteVersion(SourceVersion(size: 10_000_000), for: Self.source)
+        cache.store(Self.pattern(1000), at: 0, version: SourceVersion(), for: Self.source)
         cache.drainWritesForTesting()
-        cache.noteTotalSize(12_000_000, for: Self.source)
+        cache.noteVersion(SourceVersion(size: 12_000_000), for: Self.source)
         #expect(cache.read(Self.source, at: 0, maxLength: 1000, expectedSize: 12_000_000) == nil)
         #expect(cache.heldBytesForTesting(Self.source) == 0)
+    }
+
+    // MARK: Which body
+
+    @Test("Versions compare only what both sides state, and a response states its size and validators")
+    func versionsCompareWhatBothState() throws {
+        let v1 = SourceVersion(size: 100, etag: "\"v1\"")
+        #expect(!v1.contradicts(SourceVersion(size: 100)))
+        #expect(!v1.contradicts(SourceVersion(lastModified: "Tue, 01 Oct 2024 10:00:00 GMT")))
+        #expect(v1.contradicts(SourceVersion(size: 100, etag: "\"v2\"")))
+        #expect(v1.contradicts(SourceVersion(size: 101)))
+        #expect(SourceVersion(lastModified: "a").contradicts(SourceVersion(etag: "x", lastModified: "b")))
+        #expect(SourceVersion(size: 0, etag: "") == SourceVersion(), "no size and no validators say nothing")
+        let http = try #require(HTTPURLResponse(
+            url: URL(string: "https://media.example.com/a.mkv")!, statusCode: 206, httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Range": "bytes 100-199/5000", "ETag": "W/\"abc\"",
+                           "Last-Modified": "Tue, 01 Oct 2024 10:00:00 GMT"]))
+        #expect(SourceVersion(http, requestedOffset: 100)
+                == SourceVersion(size: 5000, etag: "W/\"abc\"", lastModified: "Tue, 01 Oct 2024 10:00:00 GMT"))
+    }
+
+    @Test("A response stating another ETag or Last-Modified drops what was held; the same body keeps it")
+    func anotherBodyDropsHeldBytes() {
+        let cache = Self.freshCache()
+        let v1 = SourceVersion(size: 10_000_000, etag: "\"v1\"")
+        cache.noteVersion(v1, for: Self.source)
+        cache.store(Self.pattern(1000), at: 0, version: v1, for: Self.source)
+        cache.drainWritesForTesting()
+        // The same body, said again, or with a validator it had not stated before: nothing goes.
+        cache.noteVersion(SourceVersion(size: 10_000_000), for: Self.source)
+        cache.noteVersion(SourceVersion(size: 10_000_000, etag: "\"v1\"", lastModified: "Mon, 30 Sep 2024 08:00:00 GMT"),
+                          for: Self.source)
+        #expect(cache.heldBytesForTesting(Self.source) == 1000)
+        #expect(cache.knownVersion(Self.source)?.lastModified == "Mon, 30 Sep 2024 08:00:00 GMT")
+        // Last-Modified alone says it is another body.
+        cache.noteVersion(SourceVersion(size: 10_000_000, lastModified: "Tue, 01 Oct 2024 10:00:00 GMT"), for: Self.source)
+        #expect(cache.heldBytesForTesting(Self.source) == 0)
+        #expect(cache.read(Self.source, at: 0, maxLength: 1000, expectedSize: 10_000_000) == nil)
+        let v2 = SourceVersion(size: 10_000_000, etag: "\"v2\"")
+        cache.store(Self.pattern(1000), at: 0, version: v2, for: Self.source)
+        cache.drainWritesForTesting()
+        cache.noteVersion(SourceVersion(size: 10_000_000, etag: "\"v3\""), for: Self.source)
+        #expect(cache.heldBytesForTesting(Self.source) == 0)
+    }
+
+    /// A connection answered before the file was replaced goes on delivering the old body after a
+    /// newer response has said the new one.
+    @Test("A delivery from another body than the recorded one is not kept")
+    func staleDeliveryIsNotKept() {
+        let cache = Self.freshCache()
+        let v2 = SourceVersion(size: 10_000_000, etag: "\"v2\"")
+        cache.noteVersion(v2, for: Self.source)
+        cache.store(Self.pattern(1000), at: 0, version: SourceVersion(size: 10_000_000, etag: "\"v1\""),
+                    for: Self.source)
+        cache.drainWritesForTesting()
+        #expect(cache.heldLength(Self.source, at: 0, expectedSize: 10_000_000) == 0)
+        cache.store(Self.pattern(1000), at: 0, version: v2, for: Self.source)
+        cache.store(Self.pattern(1000), at: 1000, version: SourceVersion(size: 10_000_000), for: Self.source)
+        cache.drainWritesForTesting()
+        #expect(cache.heldBytesForTesting(Self.source) == 2000)
+    }
+
+    // MARK: The write queue
+
+    @Test("Writes past the pending bound are all kept, and a request waits until the disk has caught up",
+          .timeLimit(.minutes(1)))
+    func writesPastTheBoundAreKept() {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "source-cache-bound-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let cache = SourceByteCache(directory: dir, budget: .fixed(256 << 20), pendingWriteBound: 1 << 20,
+                                    removesDirectory: true)
+        cache.readerOpened(Self.source)
+        cache.noteVersion(SourceVersion(size: 64 << 20), for: Self.source)
+        // Faster than any disk: 32 MB stored back to back, as deliveries outrunning the writes.
+        let piece = Self.pattern(64 << 10)
+        for n in 0..<512 {
+            cache.store(piece, at: Int64(n) * Int64(piece.count), version: SourceVersion(), for: Self.source)
+        }
+        #expect(cache.pendingWriteBytesForTesting > 1 << 20)
+        cache.waitForWriteRoom(for: Self.source)
+        #expect(cache.pendingWriteBytesForTesting <= 1 << 20)
+        #expect(cache.writeWaitNanosForTesting(Self.source) > 0)
+        cache.drainWritesForTesting()
+        #expect(cache.heldBytesForTesting(Self.source) == 32 << 20)
+        // Within the bound, a request goes out at once.
+        cache.waitForWriteRoom(for: Self.source)
+    }
+
+    // MARK: The budget
+
+    private final class FreeSpace: @unchecked Sendable {
+        private let lock = NSLock()
+        private var bytes: Int64
+        init(_ bytes: Int64) { self.bytes = bytes }
+        var value: Int64 { get { lock.withLock { bytes } } set { lock.withLock { bytes = newValue } } }
+    }
+
+    @Test("The budget is sized again as the cache writes, and a fuller disk evicts down to it")
+    func budgetFollowsTheFreeSpace() {
+        let block = SourceByteCache.blockBytes
+        let free = FreeSpace(32 * block)
+        let ledger = RetentionClaims()
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "source-cache-budget-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let cache = SourceByteCache(
+            directory: dir,
+            budget: .claimed(.init(claims: ledger, freeSpace: { free.value }, sizing: { Int(($0 ?? 0) / 4) },
+                                   reviewEvery: 4 * block)),
+            removesDirectory: true)
+        #expect(cache.byteBudgetForTesting == 8 * block)
+        cache.readerOpened(Self.source)
+        cache.noteVersion(SourceVersion(size: 64 * block), for: Self.source)
+        for n in 0..<3 {
+            cache.store(Self.pattern(Int(block), seed: n), at: Int64(n) * block, version: SourceVersion(), for: Self.source)
+        }
+        cache.drainWritesForTesting()
+        #expect(cache.heldBytesForTesting(Self.source) == 3 * block)
+
+        // The disk filled under the session: 5 blocks free besides the 3 this cache wrote.
+        free.value = 5 * block
+        cache.reviewBudget()
+        #expect(cache.byteBudgetForTesting == 2 * block)
+        #expect(cache.heldBytesForTesting(Self.source) == 2 * block)
+
+        // Room again: the next writes size the claim up without being asked. The first of them lands
+        // under the old budget (and evicts one block) and is the one that reviews it.
+        free.value = 400 * block
+        for n in 3..<7 {
+            cache.store(Self.pattern(Int(block), seed: n), at: Int64(n) * block, version: SourceVersion(), for: Self.source)
+        }
+        cache.drainWritesForTesting()
+        #expect(cache.byteBudgetForTesting >= 100 * block)
+        #expect(cache.heldBytesForTesting(Self.source) == 5 * block)
     }
 
     @Test("Past the budget the least recently used block goes, and its range reads as not held")
     func evictionDropsLeastRecentBlock() throws {
         let block = Int(SourceByteCache.blockBytes)
         let cache = Self.freshCache(budget: Int64(2 * block))
-        cache.noteTotalSize(Int64(8 * block), for: Self.source)
-        cache.store(Self.pattern(block, seed: 1), at: 0, for: Self.source)
-        cache.store(Self.pattern(block, seed: 2), at: Int64(block), for: Self.source)
+        cache.noteVersion(SourceVersion(size: Int64(8 * block)), for: Self.source)
+        cache.store(Self.pattern(block, seed: 1), at: 0, version: SourceVersion(), for: Self.source)
+        cache.store(Self.pattern(block, seed: 2), at: Int64(block), version: SourceVersion(), for: Self.source)
         cache.drainWritesForTesting()
         // Block 0 is read, so block 1 is now the least recently used one.
         _ = cache.read(Self.source, at: 0, maxLength: 16, expectedSize: Int64(8 * block))
-        cache.store(Self.pattern(block, seed: 3), at: Int64(2 * block), for: Self.source)
+        cache.store(Self.pattern(block, seed: 3), at: Int64(2 * block), version: SourceVersion(), for: Self.source)
         cache.drainWritesForTesting()
         #expect(cache.heldBytesForTesting(Self.source) == Int64(2 * block))
         #expect(cache.heldLength(Self.source, at: Int64(block), expectedSize: Int64(8 * block)) == 0)
@@ -158,7 +291,7 @@ struct SourceByteCacheTests {
         let gone = Self.key("https://media.example.com/gone")
         for url in [kept, gone] {
             cache.readerOpened(url)
-            cache.store(Self.pattern(100), at: 0, for: url)
+            cache.store(Self.pattern(100), at: 0, version: SourceVersion(), for: url)
         }
         cache.drainWritesForTesting()
         cache.readerClosed(kept)
@@ -176,9 +309,9 @@ struct SourceByteCacheTests {
         let cache = Self.freshCache()
         let warmed = Self.key("https://media.example.com/warmed")
         let playing = Self.key("https://media.example.com/playing")
-        cache.store(Self.pattern(100), at: 0, for: warmed)
+        cache.store(Self.pattern(100), at: 0, version: SourceVersion(), for: warmed)
         cache.readerOpened(playing)
-        cache.store(Self.pattern(100), at: 0, for: playing)
+        cache.store(Self.pattern(100), at: 0, version: SourceVersion(), for: playing)
         cache.noteResolvedURL(URL(string: "https://edge.example.com/warmed"), for: warmed)
         cache.drainWritesForTesting()
         cache.releaseIdleSources()
@@ -253,8 +386,8 @@ struct SourceByteCacheTests {
 
         let held = 2 * 1024 * 1024 ..< 3 * 1024 * 1024
         let key = SourceCacheKey(url: url, headers: [:])
-        SourceByteCache.shared.noteTotalSize(Int64(size), for: key)
-        SourceByteCache.shared.store(body.subdata(in: held), at: Int64(held.lowerBound), for: key)
+        SourceByteCache.shared.noteVersion(SourceVersion(size: Int64(size)), for: key)
+        SourceByteCache.shared.store(body.subdata(in: held), at: Int64(held.lowerBound), version: SourceVersion(), for: key)
         SourceByteCache.shared.drainWritesForTesting()
 
         #expect(try Self.readAll(url, label: "pump", size: size, prefetch: true) == body)
@@ -263,6 +396,30 @@ struct SourceByteCacheTests {
         #expect(pump.fromCache >= Int64(held.count))
         #expect(pump.duplicate == 0)
         #expect(pump.fetched <= Int64(size - held.count))
+    }
+
+    /// A file replaced behind the same URL at the same size: the held span the pump would replay
+    /// from disk is the old body, and the first response's `ETag` says so before it is read.
+    @Test("The pump does not replay a held span of a replaced file", .timeLimit(.minutes(1)))
+    func pumpDoesNotReplayAReplacedFile() throws {
+        let size = 6 * 1024 * 1024
+        let old = Self.pattern(size, seed: 31)
+        let new = Self.pattern(size, seed: 32)
+        let origin = try #require(KeepAliveRangeOrigin(data: new, etag: "\"v2\""))
+        defer { origin.stop() }
+        let url = URL(string: "http://127.0.0.1:\(origin.port)/replaced-\(UUID().uuidString).bin")!
+        let hold = AVIOReader(url: url, label: "hold", prefetchEnabled: false, sourceCache: .shared)
+        defer { hold.close() }
+
+        let held = 2 * 1024 * 1024 ..< 3 * 1024 * 1024
+        let key = SourceCacheKey(url: url, headers: [:])
+        let before = SourceVersion(size: Int64(size), etag: "\"v1\"")
+        SourceByteCache.shared.noteVersion(before, for: key)
+        SourceByteCache.shared.store(old.subdata(in: held), at: Int64(held.lowerBound), version: before, for: key)
+        SourceByteCache.shared.drainWritesForTesting()
+
+        #expect(try Self.readAll(url, label: "pump", size: size, prefetch: true) == new)
+        #expect(SourceByteCache.shared.knownVersion(key)?.etag == "\"v2\"")
     }
 
     // MARK: Exact ranges
@@ -303,5 +460,29 @@ struct SourceByteCacheTests {
             let at = 100_000 + lane * 10_000
             #expect(results[lane] == [UInt8](body.subdata(in: at..<(at + 700))))
         }
+    }
+
+    /// A reader that opens on the size the cache knows asks the origin nothing, so it reads what the
+    /// cache holds until its first response; from that response on, the old body is gone.
+    @Test("A range reader's first response after a replacement drops the old body", .timeLimit(.minutes(1)))
+    func rangeReaderDropsAReplacedFile() throws {
+        let size = 2 * 1024 * 1024
+        let old = Self.pattern(size, seed: 41)
+        let new = Self.pattern(size, seed: 42)
+        let origin = try #require(KeepAliveRangeOrigin(data: old, etag: "\"v1\""))
+        defer { origin.stop() }
+        let url = URL(string: "http://127.0.0.1:\(origin.port)/replaced-\(UUID().uuidString).mkv")!
+        let cache = Self.freshCache()
+        let first = try #require(HTTPDiscIOReader(url: url, sourceCache: cache, label: "first"))
+        #expect(first.readRange(at: 1000, count: 4096) == old.subdata(in: 1000..<5096))
+        cache.drainWritesForTesting()
+        #expect(cache.knownVersion(SourceCacheKey(url: url, headers: [:]))?.etag == "\"v1\"")
+
+        origin.replace(with: new, etag: "\"v2\"")
+        let second = try #require(HTTPDiscIOReader(url: url, sourceCache: cache, label: "second"))
+        defer { second.close() }
+        first.close()
+        #expect(second.readRange(at: 100_000, count: 4096) == new.subdata(in: 100_000..<104_096))
+        #expect(second.readRange(at: 1000, count: 4096) == new.subdata(in: 1000..<5096))
     }
 }
