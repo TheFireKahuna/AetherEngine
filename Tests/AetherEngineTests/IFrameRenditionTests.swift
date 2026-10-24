@@ -37,7 +37,7 @@ struct IFrameRenditionTests {
         }
         let rendition = IFrameRendition(
             entries: entries,
-            cache: IFramePayloadCache(directory: dir, byteLimit: 1 << 20),
+            cache: IFramePayloadCache(byteLimit: 1 << 20),
             readPayload: rec.read,
             buildFragment: { payload, index, entry in
                 // The fragment names the payload it was built from and the time it was stamped with.

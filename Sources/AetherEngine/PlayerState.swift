@@ -368,6 +368,20 @@ public enum DeinterlaceFieldRate: String, Sendable, Equatable {
     case frame
 }
 
+/// The SDR companion an HDR session's I-frame rendition lists beside its own keyframes
+/// (`LoadOptions.iFrameHDRStills`, AE#682). The keyframes themselves are always listed with their real range
+/// (the Dolby Vision tier on a DV session), so trick play can scan in HDR; AVKit's scrub thumbnail player
+/// takes the lowest video range on offer, which makes the companion the source of the thumbnails.
+public enum IFrameHDRStills: String, Sendable, Equatable, CaseIterable {
+    /// One tone-mapped SDR Motion JPEG still per keyframe, the shape of Apple's own trick-play tier.
+    case toneMappedJPEG
+    /// No companion: the HDR keyframes alone.
+    case keyframesOnly
+    /// The same keyframes again, their colour tags untouched, declared `VIDEO-RANGE=SDR` without
+    /// `SUPPLEMENTAL-CODECS`. A label the content contradicts, kept to learn how AVKit treats it.
+    case keyframesLabeledSDR
+}
+
 /// Live-join latency profile for loopback live sessions (`LoadOptions.liveJoinProfile`, AetherEngine#195).
 public enum LiveJoinProfile: Sendable, Equatable {
     /// Historical behavior: ~4s segment cut target, served TARGETDURATION >= 6, live-edge holdback
@@ -776,8 +790,12 @@ public struct LoadOptions: Sendable, Equatable {
     /// Start the native WebVTT subtitle readers eagerly at load (instead of lazily on `setNativeSubtitleSelected`), so the `/subs_N_M.vtt` segments are already populated when AVKit fetches them under a host-independent selection (e.g. an `EXT-X-MEDIA ... DEFAULT=YES` rendition that AVKit auto-selects). Equivalent to a fully-populated static VOD subtitle file. Only meaningful with `prepareNativeSubtitles`. Default `false` (Sodalite#32 probe).
     public var eagerNativeSubtitleReaders: Bool = false
 
-    /// Serve an I-frame rendition (`EXT-X-I-FRAME-STREAM-INF`) next to the master, so a stock `AVPlayerViewController` shows its own scrub thumbnails and can scan on I-frames, with no host code (AE#682). One still per served segment: the source's own keyframe at full resolution for SDR, and for HDR10, HLG and Dolby Vision a tone-mapped SDR Motion JPEG 640 pixels wide, since AVKit shows no scrub thumbnail from a PQ or Dolby Vision keyframe. Costs a second reader on the source for the whole session, opened shortly after load because AVKit asks for the first keyframe before anyone scrubs. Silently absent, with one log line naming the reason, when the session cannot answer every listed keyframe: live, a source without a trustworthy keyframe index (MPEG-TS), `sequentialOrigin`, `heldSourceConnection`, an origin limited to one request, a disc source, a custom reader that cannot clone, or media-playlist routing. A host with its own transport bar wants `scrubThumbnail` instead. A tuning field: correctable through `reloadAtCurrentPosition(applying:)`. Default `false`.
+    /// Serve an I-frame rendition (`EXT-X-I-FRAME-STREAM-INF`) next to the master, so a stock `AVPlayerViewController` shows its own scrub thumbnails and can scan on I-frames, with no host code (AE#682). One still per served segment: the source's own keyframe at full resolution, declared with the variant's own codec and range (the Dolby Vision tier on a DV session, which trick play scans on), and for HDR10, HLG and Dolby Vision an SDR companion beside it (`iFrameHDRStills`, by default a tone-mapped Motion JPEG 640 pixels wide), since AVKit's scrub thumbnail player takes the lowest range on offer and shows nothing from a PQ or Dolby Vision keyframe. Costs a second reader on the source for the whole session, opened shortly after load because AVKit asks for the first keyframe before anyone scrubs. Silently absent, with one log line naming the reason, when the session cannot answer every listed keyframe: live, a source without a trustworthy keyframe index (MPEG-TS), `sequentialOrigin`, `heldSourceConnection`, an origin limited to one request, a disc source, a custom reader that cannot clone, or media-playlist routing. A host with its own transport bar wants `scrubThumbnail` instead. A tuning field: correctable through `reloadAtCurrentPosition(applying:)`. Default `false`.
     public var serveIFramePlaylist: Bool = false
+
+    /// The SDR companion an HDR10, HLG or Dolby Vision session lists beside its keyframes
+    /// (`serveIFramePlaylist`). A tuning field. Default `.toneMappedJPEG`.
+    public var iFrameHDRStills: IFrameHDRStills = .toneMappedJPEG
 
     /// Confirm E-AC-3 JOC (Dolby Atmos) on this session's audio tracks, so `audioTracks` carries an honest
     /// `TrackInfo.isAtmos` for a badge instead of the pre-decode guess. No container reliably declares JOC, so

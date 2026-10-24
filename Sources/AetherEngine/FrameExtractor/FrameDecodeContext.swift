@@ -35,6 +35,8 @@ final class FrameDecodeContext: @unchecked Sendable {
     private var boundedReader: IOReader?
 
     private var demuxer: Demuxer?
+    /// Packet-fed contexts only: the stream's own parameters, owned, in place of a demuxer.
+    private var streamParameters: UnsafeMutablePointer<AVCodecParameters>?
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
     private var hardwareDeviceContext: UnsafeMutablePointer<AVBufferRef>?
     private var hardwareDecodeDisabled = false
@@ -159,9 +161,39 @@ final class FrameDecodeContext: @unchecked Sendable {
         self.allowsHardwareDecode = allowsHardwareDecode || reader is DataIOReader
     }
 
+    /// Packet-fed: one decoder, opened once from a stream's own parameters, that turns keyframes handed to
+    /// `decodeStill(keyframe:targetWidth:)` into stills with no container around them and nothing written
+    /// to disk (AE#682's SDR scrub thumbnails). VideoToolbox, as for every still decoded beside native
+    /// playback. `extradata` replaces the parameters' own, for a stream whose samples the session rewrote.
+    init(streamParameters: UnsafePointer<AVCodecParameters>, timeBase: AVRational, extradata: [UInt8]? = nil) {
+        self.url = URL(string: "aether-packets://frame-decode")!
+        self.openedHTTPHeaders = [:]
+        self.requestHeaderStore = nil
+        self.reader = nil
+        self.formatHint = nil
+        self.selectTitleID = nil
+        self.allowsHardwareDecode = true
+        self.timeBase = timeBase
+        var copy = avcodec_parameters_alloc()
+        if let params = copy, avcodec_parameters_copy(params, streamParameters) >= 0 {
+            if let extradata, !extradata.isEmpty,
+               let buffer = av_mallocz(extradata.count + Int(AV_INPUT_BUFFER_PADDING_SIZE))?
+                   .assumingMemoryBound(to: UInt8.self) {
+                extradata.withUnsafeBufferPointer { buffer.update(from: $0.baseAddress!, count: extradata.count) }
+                av_freep(&params.pointee.extradata)
+                params.pointee.extradata = buffer
+                params.pointee.extradata_size = Int32(extradata.count)
+            }
+            self.streamParameters = params
+        } else {
+            avcodec_parameters_free(&copy)
+        }
+    }
+
     deinit {
         close()
         reader?.close()
+        if streamParameters != nil { avcodec_parameters_free(&streamParameters) }
     }
 
     /// Open demuxer + decoder if not already open. Throws on failure, leaving the
@@ -202,6 +234,14 @@ final class FrameDecodeContext: @unchecked Sendable {
     }
 
     private func openInternal(control: ProbeControl?) throws {
+        if let params = streamParameters {
+            // Packet-fed: the stream's parameters stand in for the container, nothing is opened to read.
+            let declared = SoftwareVideoDecoder.declaredStreamSAR(
+                bitstream: params.pointee.sample_aspect_ratio, container: params.pointee.sample_aspect_ratio)
+            if declared.num > 0, declared.den > 0 { streamSAR = declared }
+            try openDecoder(codecpar: params)
+            return
+        }
         let demuxer = Demuxer()
         demuxer.probeControl = control
         if let control {
@@ -267,6 +307,10 @@ final class FrameDecodeContext: @unchecked Sendable {
         if declared.num > 0, declared.den > 0 {
             streamSAR = declared
         }
+        try openDecoder(codecpar: codecpar)
+    }
+
+    private func openDecoder(codecpar: UnsafeMutablePointer<AVCodecParameters>) throws {
         containerColor = ColorDescription(codecpar: codecpar)
         isHDR = Self.isHDRTransfer(codecpar.pointee.color_trc)
         isDolbyVisionNoBaseLayer = Self.isDVNoBaseLayer(codecpar: codecpar)
@@ -366,6 +410,11 @@ final class FrameDecodeContext: @unchecked Sendable {
         return ctx
     }
 
+    /// The parameters the decoder was opened from: the packet-fed copy, or the demuxed stream's.
+    private var activeCodecParameters: UnsafeMutablePointer<AVCodecParameters>? {
+        streamParameters ?? demuxer?.stream(at: videoStreamIndex)?.pointee.codecpar
+    }
+
     private func disableHardwareDecode(_ reason: String) {
         hardwareDecodeDisabled = true
         if !loggedHardwareFallback {
@@ -402,8 +451,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         hardwareDeviceContext = nil
         hardwareDecoderName = nil
 
-        guard let stream = demuxer?.stream(at: videoStreamIndex),
-              let codecpar = stream.pointee.codecpar,
+        guard let codecpar = activeCodecParameters,
               let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
             isOpen = false
             return false
@@ -498,67 +546,6 @@ final class FrameDecodeContext: @unchecked Sendable {
         defer { av_frame_free(&frame) }
 
         var hardwareTransferFailure: Int32?
-        func makeImage(_ decodedFrame: UnsafeMutablePointer<AVFrame>) -> CGImage? {
-            var transferredFrame: UnsafeMutablePointer<AVFrame>?
-            let f: UnsafeMutablePointer<AVFrame>
-            if decodedFrame.pointee.format == AV_PIX_FMT_VIDEOTOOLBOX.rawValue {
-                transferredFrame = av_frame_alloc()
-                guard let transferTarget = transferredFrame else { return nil }
-                let transferResult = av_hwframe_transfer_data(transferTarget, decodedFrame, 0)
-                guard transferResult >= 0 else {
-                    hardwareTransferFailure = transferResult
-                    av_frame_free(&transferredFrame)
-                    return nil
-                }
-                let propertyResult = av_frame_copy_props(transferTarget, decodedFrame)
-                guard propertyResult >= 0 else {
-                    hardwareTransferFailure = propertyResult
-                    av_frame_free(&transferredFrame)
-                    return nil
-                }
-                f = transferTarget
-                if hardwareDecoderName == nil,
-                   let stream = demuxer.stream(at: videoStreamIndex),
-                   let codecpar = stream.pointee.codecpar,
-                   let codec = avcodec_find_decoder(codecpar.pointee.codec_id) {
-                    logOpened(codecpar: codecpar, codec: codec, hardware: "videotoolbox")
-                }
-            } else {
-                f = decodedFrame
-                if hardwareDecoderName == nil,
-                   let stream = demuxer.stream(at: videoStreamIndex),
-                   let codecpar = stream.pointee.codecpar,
-                   let codec = avcodec_find_decoder(codecpar.pointee.codec_id) {
-                    logOpened(codecpar: codecpar, codec: codec, hardware: "none")
-                }
-            }
-            defer {
-                if transferredFrame != nil {
-                    av_frame_free(&transferredFrame)
-                }
-            }
-            let width = mode == .thumbnail
-                ? targetWidth
-                : Self.clampedWidth(frame: f, maxSize: maxSize)
-            #if DolbyVisionStillReshaping
-            if isDolbyVisionNoBaseLayer {
-                let sar = resolvedSAR(frame: f)
-                if let img = DolbyVisionStillConverter.makeImage(frame: f, targetWidth: width, sar: sar) {
-                    return img
-                }
-                // No DV metadata on this frame / unsupported layout: fall through to the standard path.
-            }
-            #endif
-            if isHDR {
-                var toned = HDRToneMapper.toneMap(frame: f, targetWidth: width, timeBase: timeBase)
-                if toned != nil {
-                    defer { av_frame_free(&toned) }
-                    if let img = Self.cgImageFromRGBAFrame(toned!) { return img }
-                }
-                // tone-map failed: fall through to sws path (degraded but non-nil)
-            }
-            return convertToCGImage(frame: f, targetWidth: width)
-        }
 
         // Once the demuxer hits EOF, flush the decoder (NULL packet) and keep draining: the
         // context is frame-threaded, so the last GOP's frames only emit after the flush. Without
@@ -624,7 +611,8 @@ final class FrameDecodeContext: @unchecked Sendable {
                 }
 
                 if isCancelled() { return nil }
-                let image = makeImage(f)
+                let image = makeImage(f, mode: mode, targetWidth: targetWidth, maxSize: maxSize,
+                                      hardwareTransferFailure: &hardwareTransferFailure)
                 if let hardwareTransferFailure {
                     guard replaceHardwareDecoderWithSoftware(
                         reason: "frame transfer failed ret=\(hardwareTransferFailure)") else {
@@ -655,6 +643,109 @@ final class FrameDecodeContext: @unchecked Sendable {
                 return image
             }
         }
+    }
+
+    /// The decoded frame as a still: the hardware frame brought to memory, then the Dolby Vision, tone-map
+    /// or plain conversion. A failed hardware transfer is reported in `hardwareTransferFailure`.
+    private func makeImage(_ decodedFrame: UnsafeMutablePointer<AVFrame>, mode: FrameMode, targetWidth: Int,
+                           maxSize: CGSize?, hardwareTransferFailure: inout Int32?) -> CGImage? {
+
+        var transferredFrame: UnsafeMutablePointer<AVFrame>?
+        let f: UnsafeMutablePointer<AVFrame>
+        if decodedFrame.pointee.format == AV_PIX_FMT_VIDEOTOOLBOX.rawValue {
+            transferredFrame = av_frame_alloc()
+            guard let transferTarget = transferredFrame else { return nil }
+            let transferResult = av_hwframe_transfer_data(transferTarget, decodedFrame, 0)
+            guard transferResult >= 0 else {
+                hardwareTransferFailure = transferResult
+                av_frame_free(&transferredFrame)
+                return nil
+            }
+            let propertyResult = av_frame_copy_props(transferTarget, decodedFrame)
+            guard propertyResult >= 0 else {
+                hardwareTransferFailure = propertyResult
+                av_frame_free(&transferredFrame)
+                return nil
+            }
+            f = transferTarget
+            if hardwareDecoderName == nil,
+               let codecpar = activeCodecParameters,
+               let codec = avcodec_find_decoder(codecpar.pointee.codec_id) {
+                logOpened(codecpar: codecpar, codec: codec, hardware: "videotoolbox")
+            }
+        } else {
+            f = decodedFrame
+            if hardwareDecoderName == nil,
+               let codecpar = activeCodecParameters,
+               let codec = avcodec_find_decoder(codecpar.pointee.codec_id) {
+                logOpened(codecpar: codecpar, codec: codec, hardware: "none")
+            }
+        }
+        defer {
+            if transferredFrame != nil {
+                av_frame_free(&transferredFrame)
+            }
+        }
+        let width = mode == .thumbnail
+            ? targetWidth
+            : Self.clampedWidth(frame: f, maxSize: maxSize)
+        #if DolbyVisionStillReshaping
+        if isDolbyVisionNoBaseLayer {
+            let sar = resolvedSAR(frame: f)
+            if let img = DolbyVisionStillConverter.makeImage(frame: f, targetWidth: width, sar: sar) {
+                return img
+            }
+            // No DV metadata on this frame / unsupported layout: fall through to the standard path.
+        }
+        #endif
+        if isHDR {
+            var toned = HDRToneMapper.toneMap(frame: f, targetWidth: width, timeBase: timeBase)
+            if toned != nil {
+                defer { av_frame_free(&toned) }
+                if let img = Self.cgImageFromRGBAFrame(toned!) { return img }
+            }
+            // tone-map failed: fall through to sws path (degraded but non-nil)
+        }
+        return convertToCGImage(frame: f, targetWidth: width)
+    
+    }
+
+    /// Decodes one keyframe handed over whole (packet-fed contexts): the decoder stays open between stills,
+    /// so each costs one decode and its conversion. nil on a decode failure.
+    func decodeStill(keyframe payload: Data, targetWidth: Int) -> CGImage? {
+        guard isOpen, let ctx = codecContext, streamParameters != nil, !payload.isEmpty,
+              payload.count <= Int(Int32.max) else { return nil }
+        guard Self.yieldsStill(dolbyVisionNoBaseLayer: isDolbyVisionNoBaseLayer) else { return nil }
+        avcodec_flush_buffers(ctx)
+        ctx.pointee.skip_frame = AVDISCARD_DEFAULT
+        var packet = av_packet_alloc()
+        defer { av_packet_free(&packet) }
+        guard let packet, av_new_packet(packet, Int32(payload.count)) == 0,
+              let dst = packet.pointee.data else { return nil }
+        payload.copyBytes(to: dst, count: payload.count)
+        packet.pointee.flags = AV_PKT_FLAG_KEY
+        packet.pointee.pts = 0
+        packet.pointee.dts = 0
+        guard avcodec_send_packet(ctx, packet) >= 0 else { return nil }
+        // The context is frame-threaded: a lone keyframe only comes out once the decoder is drained.
+        avcodec_send_packet(ctx, nil)
+        var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+        defer { av_frame_free(&frame) }
+        guard let frame, avcodec_receive_frame(ctx, frame) >= 0 else {
+            avcodec_flush_buffers(ctx)
+            return nil
+        }
+        ColorDescription.backfill(frame: frame, container: containerColor)
+        var hardwareTransferFailure: Int32?
+        let image = makeImage(frame, mode: .thumbnail, targetWidth: targetWidth, maxSize: nil,
+                              hardwareTransferFailure: &hardwareTransferFailure)
+        avcodec_flush_buffers(ctx)
+        if let hardwareTransferFailure {
+            guard replaceHardwareDecoderWithSoftware(
+                reason: "frame transfer failed ret=\(hardwareTransferFailure)") else { return nil }
+            return decodeStill(keyframe: payload, targetWidth: targetWidth)
+        }
+        return image
     }
 
     /// Output pixel displayDimensions for a target display width, applying source SAR

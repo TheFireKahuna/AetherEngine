@@ -2985,6 +2985,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     var iFrameRenditionFormat: IFrameRenditionFormat? { iFrameSource?.format }
     func iFrameInitSegment() -> Data? { iFrameSource?.initSegment() }
     func iFrameSegment(at index: Int) -> Data? { iFrameSource?.fragment(at: index) }
+    var iFrameCompanionFormat: IFrameRenditionFormat? { iFrameSource?.companionFormat }
+    func iFrameCompanionInitSegment() -> Data? { iFrameSource?.companionInitSegment() }
+    func iFrameCompanionSegment(at index: Int) -> Data? { iFrameSource?.companionFragment(at: index) }
 
     var masterCodecs: String? { codecsString }
     var masterSupplementalCodecs: String? { supplementalCodecsString }
