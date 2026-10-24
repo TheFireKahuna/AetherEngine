@@ -52,6 +52,17 @@ public final class FelOverlayRenderer: @unchecked Sendable {
     private var boundsObservation: NSKeyValueObservation?
     private var gravityObservation: NSKeyValueObservation?
     private let timing = FelOverlayTiming()
+    /// The documented model for presenting your own frames against a clock: the renderer joins a synchronizer
+    /// (through the tvOS 27 receiver, `VideoRendererIO`), and the synchronizer follows AVPlayer's item clock.
+    private let synchronizer = AVSampleBufferRenderSynchronizer()
+    private let io: VideoRendererIO
+    private var itemTimebase: CMTimebase?
+    private var rateObserver: NSObjectProtocol?
+    /// The item's ultimate source clock (the audio device's), for the clock readings in the log.
+    private var audioClock: CMClock?
+    private var lastFollowCheck = CACurrentMediaTime()
+    /// The synchronizer runs on the host clock, the item on the audio clock: past this, it follows again.
+    static let followTolerance = 0.015
     #if os(tvOS) || os(iOS)
     private var refreshProbe: FelOverlayRefreshProbe?
     #endif
@@ -88,6 +99,7 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         self.composer = composer
         self.item = item
         self.tap = tap
+        io = VideoRendererIO(renderer: layer.sampleBufferRenderer)
         output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
             kCVPixelBufferMetalCompatibilityKey as String: true,
@@ -125,29 +137,36 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         readyObservation?.invalidate()
         readyObservation = nil
         item.add(output)
-        var timebase: CMTimebase?
-        CMTimebaseCreateWithSourceTimebase(allocator: kCFAllocatorDefault, sourceTimebase: itemTimebase, timebaseOut: &timebase)
-        if let timebase {
-            // A child timebase starts at rate 0 relative to its source; run it 1:1 with the item's clock.
-            let now = CMTimebaseGetTime(itemTimebase)
-            CMTimebaseSetRateAndAnchorTime(timebase, rate: 1, anchorTime: now, immediateSourceTime: now)
-            layer.controlTimebase = timebase
-        }
+        self.itemTimebase = itemTimebase
+        audioClock = CMTimebaseCopyUltimateSourceClock(itemTimebase)
+        io.join(synchronizer, throughReceiver: true)
+        followItemClock()
         tap.advance(to: CMTimebaseGetTime(itemTimebase).seconds)
+        // Play, pause and rate changes reach the synchronizer as they reach the item.
+        rateObserver = NotificationCenter.default.addObserver(forName: CMTimebase.effectiveRateChanged, object: itemTimebase, queue: nil) { [weak self] _ in
+            self?.queue.async { self?.followItemClock() }
+        }
         // A seek moves the item's clock before its first frame decodes: point the tap's decoder there at once,
         // and drop what the layer queued for the old position.
         jumpObserver = NotificationCenter.default.addObserver(forName: CMTimebase.timeJumped, object: itemTimebase, queue: nil) { [weak self] _ in
             guard let self else { return }
             self.tap.advance(to: CMTimebaseGetTime(itemTimebase).seconds)
-            self.queue.async { self.restartPresentation() }
+            self.queue.async {
+                self.followItemClock()
+                self.restartPresentation()
+            }
         }
         #if os(tvOS) || os(iOS)
         let probe = FelOverlayRefreshProbe { [weak self] link in
-            guard let self, let timebase = self.layer.controlTimebase else { return }
+            guard let self, let itemTimebase = self.itemTimebase else { return }
             let shown = self.layer.sampleBufferRenderer.displayedPixelBuffer()
                 .flatMap { CVPixelBufferGetIOSurface($0)?.takeUnretainedValue() }
                 .flatMap { self.surfaceTimes.withLock { [id = IOSurfaceGetID($0)] in $0[id] } }
-            self.timing.refresh(at: link.timestamp, shown: shown, playing: CMTimebaseGetRate(timebase) != 0)
+            let playing = self.synchronizer.rate != 0
+            self.timing.refresh(at: link.timestamp, stated: link.duration, shown: shown, playing: playing)
+            self.timing.clocks(host: CMClockGetTime(CMClockGetHostTimeClock()).seconds,
+                               audio: self.audioClock.map { CMClockGetTime($0).seconds },
+                               item: CMTimebaseGetTime(itemTimebase).seconds, playing: playing)
         }
         probe.start()
         refreshProbe = probe
@@ -186,6 +205,9 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         #endif
         if let jumpObserver { NotificationCenter.default.removeObserver(jumpObserver) }
         jumpObserver = nil
+        if let rateObserver { NotificationCenter.default.removeObserver(rateObserver) }
+        rateObserver = nil
+        if started { io.leave(synchronizer) }
         if let item, item.outputs.contains(output) { item.remove(output) }
     }
 
@@ -231,6 +253,7 @@ public final class FelOverlayRenderer: @unchecked Sendable {
     // MARK: - Render queue
 
     private func tick() {
+        checkFollow()
         let tickTime = CACurrentMediaTime()
         let gap = (tickTime - lastTick) * 1000
         lastTick = tickTime
@@ -295,8 +318,33 @@ public final class FelOverlayRenderer: @unchecked Sendable {
     }
 
     /// Render queue: what the layer holds belongs to the position the clock just left.
+    /// Render queue: sets the synchronizer to the item's rate and time at one host instant, the item's clock
+    /// read at that same instant.
+    private func followItemClock() {
+        guard let itemTimebase else { return }
+        let hostClock = CMClockGetHostTimeClock()
+        let host = CMClockGetTime(hostClock)
+        let time = CMSyncConvertTime(host, from: hostClock, to: itemTimebase)
+        synchronizer.setRate(Float(CMTimebaseGetRate(itemTimebase)), time: time, atHostTime: host)
+    }
+
+    /// Render queue, about once a second: how far the synchronizer (host clock) has drifted from the item
+    /// (audio clock), and a follow when it is past `followTolerance`.
+    private func checkFollow() {
+        let now = CACurrentMediaTime()
+        guard now - lastFollowCheck >= 1, let itemTimebase else { return }
+        lastFollowCheck = now
+        let hostClock = CMClockGetHostTimeClock()
+        let host = CMClockGetTime(hostClock)
+        let drift = (CMSyncConvertTime(host, from: hostClock, to: synchronizer.timebase)
+                     - CMSyncConvertTime(host, from: hostClock, to: itemTimebase)).seconds
+        let refollow = synchronizer.rate != 0 && abs(drift) > Self.followTolerance
+        timing.drift(ms: drift * 1000, refollowed: refollow)
+        if refollow { followItemClock() }
+    }
+
     private func restartPresentation() {
-        layer.sampleBufferRenderer.flush()
+        io.flush(removingDisplayedImage: false)
         layer.sampleBufferRenderer.presentationTimeExpectation = .monotonicallyIncreasing
         lastPulled = .invalid
         generation += 1
@@ -312,12 +360,12 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: buffer, formatDescription: format,
                                                  sampleTiming: &timing, sampleBufferOut: &sample)
         guard let sample else { return }
-        if let timebase = layer.controlTimebase {
-            let lead = (time - CMTimebaseGetTime(timebase)).seconds
+        do {
+            let lead = (time - synchronizer.currentTime()).seconds
             if lead < 0 { countersLock.withLock { _counters.late += 1 } }
             self.timing.composed(ms: lastComposeMs, leadMs: lead * 1000, frameDuration: frameDuration)
         }
-        layer.sampleBufferRenderer.enqueue(sample)
+        _ = io.enqueue(sample)
         countersLock.withLock { _counters.composed += 1 }
         onComposed?(time, buffer)
     }
@@ -374,6 +422,7 @@ public final class FelOverlayRenderer: @unchecked Sendable {
                        + "held \(held.accessUnits) units / \(held.decoded) decoded",
                        category: .swPlayback)
         EngineLog.emit("[FelOverlayRenderer] \(timing.drain())", category: .swPlayback)
+        EngineLog.emit("[FelOverlayRenderer] \(timing.drainClocks())", category: .swPlayback)
         layer.sampleBufferRenderer.loadVideoPerformanceMetrics { metrics in
             guard let metrics else { return }
             EngineLog.emit("[FelOverlayRenderer] renderer metrics: frames \(metrics.totalNumberOfFrames), dropped \(metrics.numberOfDroppedFrames), "
