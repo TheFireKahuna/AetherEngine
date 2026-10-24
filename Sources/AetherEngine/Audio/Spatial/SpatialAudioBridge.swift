@@ -652,6 +652,8 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         let position = start + encoderFramesIn
 #if APACObjectOutput
         if objectOutput {
+            // No bed to measure, but the objects and the LFE input still get their line.
+            logLevels(levelMeter.addUnmeasured(frameCount: frames, startSeconds: Double(position) / Double(Self.sampleRate)))
             output = pipeline.submit(output, frames: frames, position: position)
             // The free buffer handed back still holds the chunk it last carried.
             output.objectRoles = objectRoles
@@ -661,7 +663,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             return
         }
 #endif
-        limiter.process(output.planes, frameCount: frames)
+        limiter.process(output.planes, frameCount: frames, lfe: layout.lfeIndex)
         // Where this chunk plays, for the level line: the anchor is a source PTS in 48 kHz frames.
         logLevels(levelMeter.add(output.planes.map { UnsafePointer($0) }, frameCount: frames,
                                  startSeconds: Double(position) / Double(Self.sampleRate)))

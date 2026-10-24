@@ -78,6 +78,36 @@ final class AudioBridge: @unchecked Sendable {
         encoder == AV_CODEC_ID_EAC3 ? 6 : 8
     }
 
+    /// The 4- and 5-channel LFE layouts E-AC-3 carries as they are (FFmpeg's encoder takes them, and
+    /// the stream's own channel configuration names them), so no channel is added.
+    static let exactEAC3Layouts = ["3.1", "4.1", "FL+FR+LFE+BC"]
+
+    /// The layout the bridge encodes `channels` (already capped) of a source with `hasLFE` into;
+    /// `sourceIs` says whether the source is exactly the named layout. FFmpeg's default for the
+    /// count, except where that loses or misplaces a channel:
+    /// - a source with an LFE in 4 or 5 channels: the defaults for those counts (4.0, 5.0) have no
+    ///   LFE, and swr drops it. E-AC-3 encodes 3.1, 4.1 and FL+FR+LFE+BC as they are; the rest (FLAC
+    ///   always, and 2/2 + LFE, which FFmpeg's E-AC-3 encoder does not take) go to 5.1. So does 2.1
+    ///   on FLAC, which cannot carry it (below); E-AC-3 carries 2.1 as it is.
+    /// - FLAC has one fixed order per count, and the mp4 sample entry no channel mask, so the
+    ///   player reads 3 channels as L R C and 4 as L R Ls Rs whatever was encoded (measured: 2.1
+    ///   reads back as 3.0, the LFE on the centre; 4.0 as quad, the centre on the back left). A
+    ///   3-channel source without an LFE is encoded as 3.0, and a 4-channel one as 5.0 (its centre
+    ///   kept, a back centre split to the back pair) unless it is quad already.
+    static func encoderLayoutName(channels: Int32, hasLFE: Bool, sourceIs: (String) -> Bool,
+                                  encoder: AVCodecID) -> String? {
+        if hasLFE, (4...5).contains(channels) || (channels == 3 && encoder == AV_CODEC_ID_FLAC) {
+            if encoder == AV_CODEC_ID_EAC3, let exact = exactEAC3Layouts.first(where: sourceIs) { return exact }
+            return "5.1"
+        }
+        guard encoder == AV_CODEC_ID_FLAC else { return nil }
+        switch channels {
+        case 3: return "3.0"
+        case 4: return sourceIs("quad") ? "quad" : "5.0"
+        default: return nil
+        }
+    }
+
     /// EAC3 scales at 128 kbps per resolved channel (Dolby's transparent reference profile): 256
     /// kbps stereo, 768 kbps 5.1, and 1024 kbps if the cap above ever reaches 8. FLAC is VBR, so
     /// its rate is 0 (unlimited) rather than a number.
@@ -336,7 +366,7 @@ final class AudioBridge: @unchecked Sendable {
         // probe -> garbled audio. The full path is correct; the only genuine failures are XLL frames that
         // residual-code channels without a usable core ("Residual encoded channels are present without core",
         // EINVAL -22), which feed() skips per-packet instead of failing the whole feed (#64).
-        let openRet = avcodec_open2(dec, srcCodec, nil)
+        let openRet = openAudioDecoder(dec, srcCodec)
         guard openRet >= 0 else {
             cleanup()
             throw AudioBridgeError.decoderOpenFailed(code: openRet)
@@ -409,7 +439,27 @@ final class AudioBridge: @unchecked Sendable {
 
         // Cap to encoder max (EAC3 5.1, FLAC 7.1). Above-cap downmix happens automatically inside swr_convert
         // when source layout exceeds the encoder's; the resampler picks Apple-compatible ordering.
-        let nChannels: Int32 = min(resolvedChannels, Self.maxEncodedChannels(for: encoderCodecID))
+        let cappedChannels: Int32 = min(resolvedChannels, Self.maxEncodedChannels(for: encoderCodecID))
+        // The layout comes from wherever the count did; an order-less one (count only) says nothing.
+        let sourceLayout = containerChannels > 0 && containerChannels <= 8
+            ? srcCodecpar.pointee.ch_layout : dec.pointee.ch_layout
+        let sourceHasLFE = withUnsafePointer(to: sourceLayout) { channelLayoutHasLFE($0) }
+        let sourceIs = { (name: String) -> Bool in
+            var candidate = AVChannelLayout()
+            defer { av_channel_layout_uninit(&candidate) }
+            return av_channel_layout_from_string(&candidate, name) >= 0
+                && withUnsafePointer(to: sourceLayout) { av_channel_layout_compare($0, &candidate) == 0 }
+        }
+        var encLayout = AVChannelLayout()
+        let encoderLayoutName = Self.encoderLayoutName(channels: cappedChannels, hasLFE: sourceHasLFE,
+                                                       sourceIs: sourceIs, encoder: encoderCodecID)
+        if let encoderLayoutName, av_channel_layout_from_string(&encLayout, encoderLayoutName) >= 0 {
+            EngineLog.emit("[AudioBridge] encoding \(cappedChannels) source channels as \(encoderLayoutName), so every "
+                           + "channel keeps its place (the LFE, or FLAC's fixed order)", category: .session)
+        } else {
+            av_channel_layout_default(&encLayout, cappedChannels)
+        }
+        let nChannels = encLayout.nb_channels
         let encoderName = avcodec_get_name(encoderCodecID).map { String(cString: $0) } ?? "?"
         let logBitRate: String = encoderCodecID == AV_CODEC_ID_EAC3
             ? "\(Int64(nChannels) * 128) kbps"
@@ -433,8 +483,6 @@ final class AudioBridge: @unchecked Sendable {
         let resolvedBitRate = Self.encoderBitRate(for: encoderCodecID, channels: nChannels)
         enc.pointee.bit_rate = resolvedBitRate
         enc.pointee.time_base = AVRational(num: 1, den: sampleRate)
-        var encLayout = AVChannelLayout()
-        av_channel_layout_default(&encLayout, nChannels)
         let layoutCopyRet = av_channel_layout_copy(&enc.pointee.ch_layout, &encLayout)
         if layoutCopyRet < 0 {
             cleanup()
@@ -471,7 +519,7 @@ final class AudioBridge: @unchecked Sendable {
         if dec.pointee.ch_layout.nb_channels > 0 {
             av_channel_layout_copy(&inLayout, &dec.pointee.ch_layout)
         } else {
-            av_channel_layout_default(&inLayout, nChannels)
+            av_channel_layout_default(&inLayout, cappedChannels)
         }
         // copy() allocates a channel map for custom-order layouts; uninit the stack struct or that map leaks per session.
         defer { av_channel_layout_uninit(&inLayout) }
