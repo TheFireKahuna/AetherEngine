@@ -835,7 +835,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let format = AVPixelFormat(rawValue: frame.pointee.format)
         let interlaced = (frame.pointee.flags & (1 << 3)) != 0  // AV_FRAME_FLAG_INTERLACED
         let colour = ColorDescription(frame: frame)
-        let representation = ColourRepresentation.resolve(format: format, matrix: colour.matrix, primaries: colour.primaries)
+        let representation = ColourRepresentation.resolve(format: format, matrix: colour.matrix, primaries: colour.primaries,
+                                                          transfer: colour.transfer)
         if case .refused(let reason) = representation {
             if refusedRepresentations.insert(reason).inserted {
                 EngineLog.emit("[SWDecoder] cannot represent this picture: \(reason); frames dropped", category: .swPlayback)
