@@ -175,19 +175,29 @@ Branch on this where host behaviour differs per pipeline: who draws subtitles (A
 
 ## Byte-reader callback scheduling
 
-The AVIO reader, held HTTP transport and prewarm fetcher use independent serial
-user-initiated URLSession delegate queues. These callbacks deliver playback bytes
-and release origin-request tickets needed by foreground demux threads. A semaphore
-wait cannot donate priority to an implicit utility callback queue. Held transport
-work also runs at user-initiated QoS.
+Every engine fetch runs on one URLSession (`EngineHTTP.session`), so one HTTP/3
+connection per origin, with one serial user-initiated delegate queue. These
+callbacks deliver playback bytes and release origin-request tickets needed by
+foreground demux threads. A semaphore wait cannot donate priority to an implicit
+utility callback queue. Held transport work runs on the same queue. The idle
+timeout rides each request and the resource ceiling is a per-task deadline, so
+nothing a fetch needs is configured per session.
+
+Bytes any reader fetched are kept per source in `SourceByteCache` (a sparse file
+in tmp, LRU by 4 MB block, budgeted beside the segment caches), and every fetch
+path asks it first: the pump replays held spans as ranges of their own, side
+readers and the indexed subtitle reads are served from it, and a warm (#551) is
+simply the cache filled ahead of the load. A source's container index is parsed
+once and shared (`SourceIndexRegistry`).
 
 Finite AVIO requests release their ticket in the completion callback, before the
 synchronous caller resumes to process its result. A lock-guarded lease makes that
 release idempotent against cancellation, early return and deallocation. Refusal
 responses are charged to the origin before handing its slot to another reader. Persistent
 and prewarm callbacks already return their tickets at completion. Per-origin caps,
-FIFO ordering, pacing, cancellation drains and timeout/overcommit policy remain
-unchanged; each session retains its own serial callback ordering.
+FIFO ordering, pacing, cancellation drains and timeout/overcommit policy are the
+request budget's (`OriginRequestBudget`); callbacks keep their per-task order on the
+one serial queue.
 
 QoS is not an execution deadline. A VOD segment already in the cache may still
 cross the slow-serve threshold while its serving thread is delayed. Its early

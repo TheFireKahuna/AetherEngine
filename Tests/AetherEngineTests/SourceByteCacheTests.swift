@@ -150,6 +150,37 @@ struct SourceByteCacheTests {
         #expect(cache.heldBytesForTesting(gone) == 0)
     }
 
+    /// `AetherEngine.discardPrewarmedSources`: a host leaving the context its warms were made for
+    /// lets them go now, while a source a session is reading stays.
+    @Test("Releasing idle sources drops what no reader has open and keeps what one does")
+    func releaseIdleKeepsOpenSources() {
+        let cache = Self.freshCache()
+        let warmed = Self.key("https://media.example.com/warmed")
+        let playing = Self.key("https://media.example.com/playing")
+        cache.store(Self.pattern(100), at: 0, for: warmed)
+        cache.readerOpened(playing)
+        cache.store(Self.pattern(100), at: 0, for: playing)
+        cache.noteResolvedURL(URL(string: "https://edge.example.com/warmed"), for: warmed)
+        cache.drainWritesForTesting()
+        cache.releaseIdleSources()
+        #expect(cache.heldBytesForTesting(warmed) == 0)
+        #expect(cache.resolvedURL(for: warmed) == nil)
+        #expect(cache.heldBytesForTesting(playing) == 100)
+    }
+
+    @Test("A redirect target is kept per source and forgotten only while it is still the recorded one")
+    func resolvedTargetIsForgottenOnlyIfCurrent() throws {
+        let cache = Self.freshCache()
+        let edgeA = try #require(URL(string: "https://edge-a.example.com/x"))
+        let edgeB = try #require(URL(string: "https://edge-b.example.com/x"))
+        cache.noteResolvedURL(edgeA, for: Self.source)
+        cache.noteResolvedURL(edgeB, for: Self.source)
+        cache.forgetResolvedURL(edgeA, for: Self.source)
+        #expect(cache.resolvedURL(for: Self.source) == edgeB)
+        cache.forgetResolvedURL(edgeB, for: Self.source)
+        #expect(cache.resolvedURL(for: Self.source) == nil)
+    }
+
     // MARK: Through the reader
 
     /// Reads all of `url` through a real AVIOReader and returns the bytes.

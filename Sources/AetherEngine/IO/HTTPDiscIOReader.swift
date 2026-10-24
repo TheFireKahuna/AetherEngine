@@ -41,8 +41,6 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     private let maxChunkSize: Int
     private let maxRetries: Int
     private let totalSize: Int64
-    /// Warmed bytes (#647), read before the network. Immutable, so a fork shares them without a copy.
-    private let residentSpans: [ResidentSpan]
 
     private let lock = NSLock()
     private var position: Int64 = 0
@@ -69,8 +67,8 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         return transferredBytes
     }
 
-    /// Probes total size and range support with one (retried) `bytes=0-0` request, unless
-    /// `prewarmed` has already stated both. Returns nil if the source is unreachable or answers `200`
+    /// Probes total size and range support with one (retried) `bytes=0-0` request, unless the size
+    /// is already known (`knownSize`, or the source cache's, which a warm or another reader stated). Returns nil if the source is unreachable or answers `200`
     /// (full body, no range support); logs which. `open` tells the two apart.
     convenience init?(url: URL,
                       extraHeaders: [String: String] = [:],
@@ -79,22 +77,20 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                       maxRetries: Int = 3,
                       requestTimeout: TimeInterval = 30,
                       sessionConfiguration: URLSessionConfiguration? = nil,
-                      prewarmed: PrewarmedSource? = nil,
                       knownSize: Int64? = nil,
                       sourceCache: SourceByteCache? = nil,
                       label: String = "disc") {
         let session = Self.makeSession(sessionConfiguration)
         guard case .size(let size) = Self.resolveSize(
             url: url, extraHeaders: extraHeaders, session: session, requestTimeout: requestTimeout,
-            maxRetries: maxRetries, knownSize: knownSize ?? prewarmed?.contentLength) else {
+            maxRetries: maxRetries,
+            knownSize: knownSize ?? sourceCache?.knownSize(SourceCacheKey(url: url, headers: extraHeaders))) else {
             if session !== EngineHTTP.session { session.invalidateAndCancel() }
             return nil
         }
         self.init(url: url, extraHeaders: extraHeaders, baseChunkSize: baseChunkSize,
                   maxChunkSize: maxChunkSize, maxRetries: maxRetries, requestTimeout: requestTimeout,
-                  session: session, totalSize: size,
-                  residentSpans: prewarmed.map { [$0.head] + ($0.tail.map { [$0] } ?? []) } ?? [],
-                  sourceCache: sourceCache, label: label)
+                  session: session, totalSize: size, sourceCache: sourceCache, label: label)
     }
 
     /// `init?` for a caller that has to say why a disc image cannot be read: an origin that answers the
@@ -108,19 +104,16 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                      maxRetries: Int = 3,
                      requestTimeout: TimeInterval = 30,
                      sessionConfiguration: URLSessionConfiguration? = nil,
-                     prewarmed: PrewarmedSource? = nil,
                      sourceCache: SourceByteCache? = nil) throws -> HTTPDiscIOReader? {
         let session = makeSession(sessionConfiguration)
         switch resolveSize(url: url, extraHeaders: extraHeaders, session: session,
                            requestTimeout: requestTimeout, maxRetries: maxRetries,
-                           knownSize: prewarmed?.contentLength) {
+                           knownSize: sourceCache?.knownSize(SourceCacheKey(url: url, headers: extraHeaders))) {
         case .size(let size):
             return HTTPDiscIOReader(
                 url: url, extraHeaders: extraHeaders, baseChunkSize: baseChunkSize,
                 maxChunkSize: maxChunkSize, maxRetries: maxRetries, requestTimeout: requestTimeout,
-                session: session, totalSize: size,
-                residentSpans: prewarmed.map { [$0.head] + ($0.tail.map { [$0] } ?? []) } ?? [],
-                sourceCache: sourceCache, label: "disc")
+                session: session, totalSize: size, sourceCache: sourceCache, label: "disc")
         case .ignoresRange:
             if session !== EngineHTTP.session { session.invalidateAndCancel() }
             throw AVIOReaderError.originIgnoresRange
@@ -138,7 +131,6 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                  requestTimeout: TimeInterval,
                  session: URLSession,
                  totalSize: Int64,
-                 residentSpans: [ResidentSpan],
                  sourceCache: SourceByteCache?,
                  label: String) {
         self.sourceCache = sourceCache
@@ -153,7 +145,6 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         self.requestTimeout = requestTimeout
         self.session = session
         self.ownsSession = session !== EngineHTTP.session
-        self.residentSpans = residentSpans.filter { !$0.isEmpty }
         self.totalSize = totalSize
         SourceByteLedger.shared.readerOpened(url)
         sourceCache?.readerOpened(cacheKey)
@@ -176,28 +167,6 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         if let knownSize, knownSize > 0 { return .size(knownSize) }
         return probeSize(url: url, extraHeaders: extraHeaders, session: session,
                          timeout: requestTimeout, maxRetries: max(0, maxRetries))
-    }
-
-    /// #647: take what a host warmed for this URL, under the rule `AVIOReader` adopts by (#551).
-    ///
-    /// A take, like every adoption: the reader holds the bytes from here on. A caller whose source
-    /// turns out not to be a disc puts them back (`SourcePrewarmStore.store`) so the streaming
-    /// reader it falls back to adopts them instead.
-    static func takePrewarm(for url: URL, extraHeaders: [String: String],
-                            store: SourcePrewarmStore = .shared) -> PrewarmedSource? {
-        guard let warm = store.take(for: url) else { return nil }
-        guard warm.head.start == 0, !warm.head.isEmpty, warm.contentLength > 0 else { return nil }
-        guard warm.requestHeaders == extraHeaders else {
-            EngineLog.emit(
-                "[HTTPDiscIOReader] \(url.lastPathComponent): a warm exists for this URL but was "
-                + "fetched with different headers; opening cold (#647)", category: .demux)
-            return nil
-        }
-        EngineLog.emit(
-            "[HTTPDiscIOReader] \(url.lastPathComponent): adopted a prewarmed source: "
-            + "head=\(warm.head.data.count)B tail=\(warm.tail?.data.count ?? 0)B of "
-            + "\(warm.contentLength)B (#647)", category: .demux)
-        return warm
     }
 
     // MARK: - Pure helpers
@@ -239,28 +208,14 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         lock.lock(); defer { lock.unlock() }
         if position >= totalSize { return 0 }
 
-        if let span = residentSpans.first(where: { $0.covers(position) }) {
-            let spanOffset = Int(position - span.start)
-            let toCopy = min(Int(n), span.data.count - spanOffset, Int(totalSize - position))
-            span.data.withUnsafeBytes { src in
-                out.update(from: src.baseAddress!.assumingMemoryBound(to: UInt8.self)
-                    .advanced(by: spanOffset), count: toCopy)
-            }
-            position += Int64(toCopy)
-            // Reading on past the span is the sequential continuation, so the window grows there.
-            lastFetchEnd = position
-            return Int32(toCopy)
-        }
-
         if position < bufferStart || position >= bufferStart + Int64(buffer.count) {
             currentChunkSize = Self.nextChunkSize(
                 position: position, lastFetchEnd: lastFetchEnd,
                 current: currentChunkSize, base: baseChunkSize, maxChunk: maxChunkSize)
-            // Stop at the next warmed span: its bytes are already here. The same goes for a span the
-            // source cache holds, which another reader of this source (or a clone of this one) fetched.
-            let warmedLimit = residentSpans.lazy.map(\.start).filter { $0 > self.position }.min() ?? totalSize
+            // Stop where a span the source cache holds begins: another reader of this source, a clone
+            // of this one or a host's warm (#647) fetched it already.
             let limit = sourceCache?.nextHeldStart(
-                cacheKey, after: position, before: warmedLimit, expectedSize: totalSize) ?? warmedLimit
+                cacheKey, after: position, before: totalSize, expectedSize: totalSize) ?? totalSize
             let want = Int(min(Int64(currentChunkSize), limit - position))
             let held = sourceCache?.read(cacheKey, at: position, maxLength: currentChunkSize,
                                          expectedSize: totalSize)
@@ -326,7 +281,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                          baseChunkSize: baseChunkSize, maxChunkSize: maxChunkSize,
                          maxRetries: maxRetries, requestTimeout: requestTimeout,
                          session: Self.makeSession(nil),
-                         totalSize: totalSize, residentSpans: residentSpans,
+                         totalSize: totalSize,
                          sourceCache: sourceCache, label: label)
     }
 
@@ -558,7 +513,7 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
 }
 
 extension HTTPDiscIOReader: RangeReadableIOReader {
-    /// Exactly the range, stitched from what is already here (a warmed span, the source cache) and
+    /// Exactly the range, stitched from what the source cache already holds and
     /// ranged GETs for exactly the gaps between. No read-ahead window and no cursor, so lanes share
     /// one reader, one session and one connection. Each gap is fetched up to the next held byte, not
     /// the next held span worth a request boundary: these ranges are small, and a byte already here
@@ -570,13 +525,6 @@ extension HTTPDiscIOReader: RangeReadableIOReader {
         out.reserveCapacity(Int(end - offset))
         var cursor = offset
         while cursor < end {
-            if let span = residentSpans.first(where: { $0.covers(cursor) }) {
-                let from = Int(cursor - span.start)
-                let take = min(span.data.count - from, Int(end - cursor))
-                out.append(span.data.subdata(in: from..<(from + take)))
-                cursor += Int64(take)
-                continue
-            }
             if let held = sourceCache?.read(cacheKey, at: cursor, maxLength: Int(end - cursor),
                                             expectedSize: totalSize) {
                 SourceByteLedger.shared.servedFromCache(url, reader: label, count: held.count)
@@ -584,9 +532,8 @@ extension HTTPDiscIOReader: RangeReadableIOReader {
                 cursor += Int64(held.count)
                 continue
             }
-            let nextWarmed = residentSpans.lazy.map(\.start).filter { $0 > cursor && $0 < end }.min() ?? end
-            let limit = sourceCache?.nextHeldStart(cacheKey, after: cursor, before: nextWarmed,
-                                                   minLength: 1, expectedSize: totalSize) ?? nextWarmed
+            let limit = sourceCache?.nextHeldStart(cacheKey, after: cursor, before: end,
+                                                   minLength: 1, expectedSize: totalSize) ?? end
             guard let data = fetchWithRetry(offset: cursor, length: Int(limit - cursor)), !data.isEmpty else {
                 return nil
             }

@@ -760,8 +760,8 @@ public final class Demuxer: @unchecked Sendable {
         // Gated on the disc-image extension so normal media URLs skip the range-probe entirely; if
         // the source is not a recognizable disc, fall through to the streaming reader.
         if !isLive, Self.isDiscImageURL(url) {
-            let warm = HTTPDiscIOReader.takePrewarm(for: url, extraHeaders: extraHeaders)
-            if let discReader = try HTTPDiscIOReader.open(url: url, extraHeaders: extraHeaders, prewarmed: warm,
+            // A host's warm (#647) is in the source cache, which the disc reader reads first.
+            if let discReader = try HTTPDiscIOReader.open(url: url, extraHeaders: extraHeaders,
                                                           sourceCache: .shared) {
                 adoptOwnedSourceReader(discReader)
                 if isCloseRequested {
@@ -773,7 +773,6 @@ public final class Demuxer: @unchecked Sendable {
                     discInfo = try DiscReader.wrap(discReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString)
                 } catch {
                     releaseOwnedSourceReader()
-                    if let warm { SourcePrewarmStore.shared.store(warm, for: url) }
                     throw error
                 }
                 if let discInfo {
@@ -791,8 +790,6 @@ public final class Demuxer: @unchecked Sendable {
                 }
                 releaseOwnedSourceReader()
             }
-            // Not a disc: hand the warm back so the streaming reader below adopts it (#647).
-            if let warm { SourcePrewarmStore.shared.store(warm, for: url) }
         }
         let reader = AVIOReader(
             url: url,
