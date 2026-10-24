@@ -45,7 +45,9 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     private let lock = NSLock()
     private var position: Int64 = 0
     private var bufferStart: Int64 = -1
-    private var buffer: [UInt8] = []
+    /// The fetched chunk as it arrived: the response body or the source cache's buffer, held
+    /// rather than copied, with reads copied out of it.
+    private var buffer = Data()
     /// End offset of the last buffer refill; a read starting here continues sequentially.
     private var readAhead: ReadAhead
     /// Current adaptive read-ahead window; grows on sequential refills, resets on a seek.
@@ -216,7 +218,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                 return -1
             }
             bufferStart = position
-            buffer = [UInt8](data)
+            buffer = data
             readAhead.fetched(at: position, count: buffer.count)
         }
 
@@ -224,9 +226,8 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         let available = buffer.count - bufOffset
         let toCopy = min(Int(n), available, Int(totalSize - position))
         guard toCopy > 0 else { return 0 }
-        buffer.withUnsafeBufferPointer { src in
-            out.update(from: src.baseAddress!.advanced(by: bufOffset), count: toCopy)
-        }
+        let lower = buffer.startIndex + bufOffset
+        buffer.copyBytes(to: UnsafeMutableBufferPointer(start: out, count: toCopy), from: lower..<(lower + toCopy))
         position += Int64(toCopy)
         return Int32(toCopy)
     }

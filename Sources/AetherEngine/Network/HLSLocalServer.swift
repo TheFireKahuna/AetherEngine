@@ -22,7 +22,7 @@ protocol HLSSegmentProvider: AnyObject {
     /// wraps `mediaSegment(at:onSlow:)`.
     func mediaSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource?
 
-    /// Optional file URL for disk-backed segments (cache adopt path). Server streams file -> socket bypassing Foundation Data; sendfile(2) was tried but SIGSYS'd on tvOS sandbox.
+    /// Optional file URL for disk-backed segments (cache adopt path). The server maps the file and sends from the mapping (`streamFileToSocket`).
     /// Must name a file that exists: the server stats and opens it afterwards, and a URL whose file
     /// has gone is answered with an error response rather than the bytes the bookkeeping promised.
     func mediaSegmentURL(at index: Int) -> URL?
@@ -1708,68 +1708,59 @@ final class HLSLocalServer: @unchecked Sendable {
         return true
     }
 
-    /// Chunked file -> socket stream (256 KB buffer). sendfile(2) tried first but is SIGSYS'd by tvOS sandbox; reverted to read+send. expectedLength must match Content-Length exactly: a file that grew or shrank between stat and read would shift HTTP framing on the keep-alive connection. Short file fails the response (closes connection) rather than leaving the client waiting.
+    /// File -> socket straight out of the page cache: the file is mapped and `send` copies from the
+    /// mapping, so the bytes are copied into the socket once and never through a user buffer
+    /// (sendfile(2) would skip even that copy, but the tvOS sandbox SIGSYS's it). expectedLength must
+    /// match Content-Length exactly: a file that changed size between stat and open would shift HTTP
+    /// framing on the keep-alive connection, so a shorter file fails the response (closes the
+    /// connection) and a longer one sends only expectedLength. Mapping is safe against the cache's own
+    /// lifecycle: a served segment is adopted whole and only ever unlinked, never truncated, and a
+    /// mapping outlives the unlink.
     private func streamFileToSocket(fileURL: URL, socketFd: Int32, path: String,
                              expectedLength: Int) -> Bool {
-        let handle: FileHandle
-        do {
-            handle = try FileHandle(forReadingFrom: fileURL)
-        } catch {
-            EngineLog.emit("[HLSLocalServer] file open failed \(path): \(error)",
+        let fileFd = Darwin.open(fileURL.path, O_RDONLY | O_CLOEXEC)
+        guard fileFd >= 0 else {
+            EngineLog.emit("[HLSLocalServer] file open failed \(path): errno=\(errno)",
                            category: .hlsServer)
             return false
         }
-        let fileFd = handle.fileDescriptor
-        defer { try? handle.close() }
+        defer { Darwin.close(fileFd) }
+        var st = stat()
+        guard fstat(fileFd, &st) == 0, st.st_size >= expectedLength, expectedLength > 0 else {
+            EngineLog.emit(
+                "[HLSLocalServer] short file \(path): size=\(st.st_size) expected=\(expectedLength)",
+                category: .hlsServer
+            )
+            return false
+        }
+        guard let mapping = mmap(nil, expectedLength, PROT_READ, MAP_PRIVATE, fileFd, 0),
+              mapping != MAP_FAILED else {
+            EngineLog.emit("[HLSLocalServer] file map failed \(path): errno=\(errno)",
+                           category: .hlsServer)
+            return false
+        }
+        defer { munmap(mapping, expectedLength) }
 
-        let chunkSize = 256 * 1024
-        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
-        defer { buffer.deallocate() }
-
-        var totalSent: Int = 0
-        while true {
-            if totalSent >= expectedLength {
-                // File grew after stat; do not send excess bytes.
-                bumpBytesSent(totalSent)
-                bumpSendfileBytes(totalSent)
-                return true
-            }
-            let want = min(chunkSize, expectedLength - totalSent)
-            let nRead = read(fileFd, buffer, want)
-            if nRead == 0 {
-                // File shrank after stat; fail to avoid framing desync.
-                EngineLog.emit(
-                    "[HLSLocalServer] short file \(path): sent=\(totalSent) expected=\(expectedLength)",
-                    category: .hlsServer
-                )
-                return false
-            }
-            if nRead < 0 {
+        var totalSent = 0
+        while totalSent < expectedLength {
+            let n = send(socketFd, mapping.advanced(by: totalSent), expectedLength - totalSent, 0)
+            if n < 0 {
                 let err = errno
                 if err == EINTR { continue }
-                EngineLog.emit("[HLSLocalServer] file read failed \(path): errno=\(err) sent=\(totalSent)",
+                EngineLog.emit("[HLSLocalServer] send failed \(path): errno=\(err) sent=\(totalSent)",
                                category: .hlsServer)
                 return false
             }
-            var written = 0
-            while written < nRead {
-                let n = send(socketFd, buffer.advanced(by: written), nRead - written, 0)
-                if n < 0 {
-                    let err = errno
-                    if err == EINTR { continue }
-                    EngineLog.emit("[HLSLocalServer] send failed \(path): errno=\(err) sent=\(totalSent + written)",
-                                   category: .hlsServer)
-                    return false
-                }
-                if n == 0 {
-                    EngineLog.emit("[HLSLocalServer] send returned 0 \(path) sent=\(totalSent + written)",
-                                   category: .hlsServer)
-                    return false
-                }
-                written += n
+            if n == 0 {
+                EngineLog.emit("[HLSLocalServer] send returned 0 \(path) sent=\(totalSent)",
+                               category: .hlsServer)
+                return false
             }
-            totalSent += nRead
+            totalSent += n
         }
+        bumpBytesSent(totalSent)
+        bumpSendfileBytes(totalSent)
+        return true
     }
 
     // MARK: - Playlist construction
