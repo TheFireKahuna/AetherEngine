@@ -19,10 +19,12 @@ import VideoToolbox
 ///   devices. HEVC is also several times smaller than JPEG at the same quality, and decodes on the hardware.
 /// - 10-bit, like Apple's own SDR HEVC I-frame tiers (Main10, VIDEO-RANGE=SDR): less banding after the tone map.
 ///
-/// The keyframe goes straight into one long-lived decoder, VideoToolbox scales it and maps PQ or HLG to BT.709
-/// in one pass (`VTPixelTransferSession`, Apple's own curve), and one hardware encode makes the still; nothing
-/// touches the disk. A Dolby Vision profile 5 picture is IPT, which only `DolbyVisionStillConverter` reads, so
-/// it takes that converter and then the same encoder. The CODECS the master declares come from a warm-up encode,
+/// The keyframe goes straight into one long-lived decoder and becomes the display buffer playback would show
+/// (VideoToolbox's, or the GPU finisher's for a software decode); `StillRenderer` scales it and maps PQ or HLG to
+/// BT.709 in one pass (`VTPixelTransferSession`, Apple's own curve), and one hardware encode makes the still; no
+/// CPU pass over the pixels and nothing on disk (docs/software-route-gpu.md Part 7). A Dolby Vision profile 5
+/// picture is IPT, which only `DolbyVisionStillConverter` reads, so it takes that converter and then the same
+/// encoder. The CODECS the master declares come from a warm-up encode,
 /// so they match the `hvcC` in every init.
 final class IFrameStillBuilder: @unchecked Sendable {
     static let defaultWidth = 800
@@ -35,11 +37,7 @@ final class IFrameStillBuilder: @unchecked Sendable {
     /// scrub back over ground already covered should cost nothing.
     static let cachedFragments = 1536
     private static let timescale: UInt32 = 90_000
-    private static var sdr: ColorAttachments.Tags {
-        ColorAttachments.Tags(primaries: kCVImageBufferColorPrimaries_ITU_R_709_2,
-                              transfer: kCVImageBufferTransferFunction_ITU_R_709_2,
-                              matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2)
-    }
+    private static var sdr: ColorAttachments.Tags { StillRenderer.sdr }
 
     struct Output {
         let initSegment: Data
@@ -136,8 +134,9 @@ final class IFrameStillBuilder: @unchecked Sendable {
             return Output(initSegment: initSegment, fragment: hit)
         }
         do { try decoder.ensureOpen() } catch { return nil }
-        guard let picture = decoder.decodeScaledStill(keyframe: payload, width: width, height: height,
-                                                      destination: Self.sdr) ?? converted(payload),
+        let picture = decoder.isDolbyVisionNoBaseLayer ? converted(payload)
+            : decoder.decodeScaledStill(keyframe: payload, width: width, height: height, destination: Self.sdr)
+        guard let picture,
               let pts = Optional(lock.withLock { () -> Int64 in defer { nextPTS += 1 }; return nextPTS }),
               let encoded = Self.encode(picture, session: session, pts: pts) else {
             if !loggedFailure {
@@ -155,8 +154,7 @@ final class IFrameStillBuilder: @unchecked Sendable {
         return Output(initSegment: initSegment, fragment: fragment)
     }
 
-    /// The CPU path's picture (Dolby Vision profile 5's converter, or a software decode) drawn into a buffer
-    /// the encoder takes.
+    /// Dolby Vision profile 5's converter image drawn into a buffer the encoder takes.
     private func converted(_ payload: Data) -> CVPixelBuffer? {
         guard let image = decoder.decodeStill(keyframe: payload, targetWidth: width) else { return nil }
         var buffer: CVPixelBuffer?

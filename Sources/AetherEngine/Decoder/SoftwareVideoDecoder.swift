@@ -14,14 +14,9 @@ import LibDeinterlace
 final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
-    /// Where the decoder writes its pictures, and the GPU pass that reads them. Made at `open`.
-    private var allocator: DecodeFrameAllocator?
-    private var finisher: PlanarFrameFinisher?
-    /// The finisher's plan per frame description, and the descriptions it refused (logged once each). Guarded by
-    /// `lock`, like everything `emit` touches.
-    private var plans: [PlanKey: PlanarFrameFinisher.Plan] = [:]
-    private var refusedPlans: Set<PlanKey> = []
-    private var refusedRepresentations: Set<String> = []
+    /// Where the decoder writes its pictures and the GPU pass that turns them into display buffers. Made at `open`;
+    /// guarded by `lock`, like everything `emit` touches.
+    private var writer: DisplayBufferWriter?
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
     var onFrame: DecodedFrameHandler?
 
@@ -44,9 +39,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         var pixelBufferType: OSType = 0
     }
 
-    /// True when the source is >8-bit (HDR10, AV1 HDR).
-    private var use10Bit = false
-
     /// Container-declared SAR fallback for anamorphic DVD/SD content (NTSC 720x480, PAL 720x576, widescreen DVDs).
     /// Native VideoToolbox gets this from the container automatically; the software path must attach it explicitly.
     private var streamSAR = AVRational(num: 1, den: 1)
@@ -59,14 +51,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// #290: one line per stream when a declared SAR is dropped for the aspect it produces, so a
     /// smeared picture names its own cause instead of looking like a renderer bug.
     private var loggedSARReject = false
-
-    private var pixelBufferPool: CVPixelBufferPool?
-    private var poolWidth = 0
-    private var poolHeight = 0
-    private var poolFormat = OutputFormat(tenBit: false, fullRange: false)
-    /// The format the last converted frame asked for, so a change is logged once (release-visible) rather
-    /// than per frame. Guarded by `lock`, like the pool.
-    private var loggedOutputFormat: OutputFormat?
 
     /// Skip pre-seek frames; decoded for reference but not converted.
     /// Guarded by `skipLock` not `lock`: emit() runs with `lock` held, so a same-lock accessor would deadlock.
@@ -120,14 +104,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// False puts every picture out as decoded, interlaced or not. Set before `open`; the format probe is
     /// the only caller, it counts the decoder's own pictures.
     var deinterlaces = true
-
-    /// The attributes of every display buffer the finisher writes. Format and size are the pool's own.
-    static var displayBufferAttributes: CFDictionary {
-        [
-            kCVPixelBufferMetalCompatibilityKey: true,
-            kCVPixelBufferIOSurfacePropertiesKey: NSDictionary(),
-        ] as NSDictionary
-    }
 
     /// #544: decode on the calling thread with no frame-level threading. Set before `open`; the
     /// still extractor is the only caller, everything on a playback path wants the parallel default.
@@ -231,9 +207,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         set { twelveBit420Switch.withLock { $0 = newValue } }
     }
 
-    /// This session's `twelveBit420Output`, read once at `open`.
-    private var twelveBit420 = TwelveBit420Output.p010Dithered
-
     /// `streamIs10Bit` is the open-time verdict (declared depth or an HDR transfer) and only ever widens
     /// the answer. The range is kept: a full-range frame goes out full range, its codes taken to the output
     /// depth as H.273 scales full range. A yuvj source is full range by its pixel format whatever
@@ -281,20 +254,11 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     /// AE#499: what the container declared about colour, captured at `open` before a single frame
     /// exists. A decoded frame carries the VUI alone, and a remux whose VUI is empty would otherwise
-    /// reach `attachColorSpace` as an untagged picture, so an HDR10 file decoded in software lost its
+    /// reach the display buffer as an untagged picture, so an HDR10 file decoded in software lost its
     /// PQ / BT.2020 attachments while the same file through the hardware decoder (which reads
     /// `codecpar`) kept them. Written once in `open`, before the host can feed a packet, and read on
-    /// the decode thread afterwards, the same discipline `use10Bit` and the other open-time fields keep.
+    /// the decode thread afterwards, the same discipline as the other open-time fields.
     private var containerColor = ColorDescription.unspecified
-
-    /// HDR10 static metadata the container declared, the fallback for a frame that carries none, and
-    /// the value last attached, kept so every frame of a stream gets the same `NSData` object (and the
-    /// renderer's format-description key equal bytes). Same open-time discipline as `containerColor`;
-    /// `attachedHDRStatic` is guarded by `lock`, like everything `emit` touches.
-    private var containerHDRStatic = HDRStaticMetadata.none
-    private var attachedHDRStatic = HDRStaticMetadata.none
-    /// A declared colour value CoreVideo has no constant for is named once per decoder. Guarded by `lock`.
-    private var loggedUnmappedColor = false
 
     /// Deinterlaced frames dropped for carrying no PTS (see the drop site in decode()). Guarded by `lock`.
     private var droppedUntimestampedFields = 0
@@ -342,12 +306,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         if sourceFormat != AV_PIX_FMT_NONE, !PlanarFrameFinisher.reads(sourceFormat) {
             throw VideoDecoderError.unsupportedPixelFormat(name: av_get_pix_fmt_name(sourceFormat).map { String(cString: $0) } ?? "\(sourceFormat.rawValue)")
         }
-        guard let device = MTLCreateSystemDefaultDevice(), let frameAllocator = DecodeFrameAllocator(device: device) else {
-            throw VideoDecoderError.metalUnavailable
-        }
-        allocator = frameAllocator
-        let made = try PlanarFrameFinisher(device: device)
-        finisher = made
+        guard let device = MTLCreateSystemDefaultDevice() else { throw VideoDecoderError.metalUnavailable }
+        // >8-bit when the stream declares it or carries an HDR transfer (HDR10, AV1 HDR).
+        let streamIs10Bit = codecpar.pointee.bits_per_raw_sample > 8 || ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
+        let made = try DisplayBufferWriter(device: device, streamIs10Bit: streamIs10Bit, twelveBit420: Self.twelveBit420Output,
+                                           containerHDRStatic: HDRStaticMetadata(codecpar: codecpar), logTag: "SWDecoder")
+        writer = made
         filmCadence = AetherEngine.filmDetection ? FilmCadence(timeBase: timeBase) : nil
         if deinterlaces {
             window = BwdifWindow(timeBase: timeBase, fieldRate: deinterlaceConfig.fieldRate == .field)
@@ -355,7 +319,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             // field does not wait for the compiler.
             if VideoRoutingPolicy.interlacedFieldOrders.contains(codecpar.pointee.field_order),
                let layout = PictureLayout(format: sourceFormat) {
-                DispatchQueue.global(qos: .userInitiated).async { _ = try? made.kernels.pipeline(for: layout, function: "pf_bwdif") }
+                DispatchQueue.global(qos: .userInitiated).async { _ = try? made.finisher.kernels.pipeline(for: layout, function: "pf_bwdif") }
             }
         }
 
@@ -363,12 +327,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             throw VideoDecoderError.sessionCreationFailed(status: -1)
         }
         codecContext = ctx
-        // Pictures go straight into the slabs the finisher reads (every decoder the route opens through
-        // libavcodec has DR1; one without it keeps libavcodec's buffers and its pictures are copied).
-        if codec.pointee.capabilities & AV_CODEC_CAP_DR1 != 0 { frameAllocator.install(on: ctx) }
-        // The conformance window exactly: libavcodec otherwise rounds a left crop down to keep the planes
-        // 32-byte aligned for CPU code, showing columns the stream crops. The GPU reads any offset.
-        ctx.pointee.flags |= AV_CODEC_FLAG_UNALIGNED
+        made.install(on: ctx, codec: codec)
 
         guard avcodec_parameters_to_context(ctx, codecpar) >= 0 else {
             throw VideoDecoderError.noCodecParameters
@@ -408,14 +367,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         av_dict_free(&opts)
 
         containerColor = ColorDescription(codecpar: codecpar)
-        containerHDRStatic = HDRStaticMetadata(codecpar: codecpar)
-        twelveBit420 = Self.twelveBit420Output
-        let bitsPerSample = codecpar.pointee.bits_per_raw_sample
-        let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
-        use10Bit = bitsPerSample > 8 || isHDRTransfer
 
         // Release-visible log (no #if DEBUG): needed for TestFlight users and DrHurt #4 black-screen reports.
-        EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), threads=\(ctx.pointee.thread_count), \(use10Bit ? "10-bit" : "8-bit")", category: .swPlayback)
+        EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), threads=\(ctx.pointee.thread_count), \(streamIs10Bit ? "10-bit" : "8-bit")", category: .swPlayback)
     }
 
     /// #407: the timestamp to put on a decoded frame that carries none, or nil when the frame is
@@ -568,10 +522,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// log line) when its format or size is not one inverse telecine takes. Caller holds `lock`.
     private func inverseTelecine(for f: UnsafePointer<AVFrame>) -> InverseTelecine? {
         if let inverseTelecine { return inverseTelecine }
-        guard let film = deinterlaceConfig.film, !loggedTelecineRefusal, let finisher, let allocator,
-              let ctx = codecContext else { return nil }
+        guard let film = deinterlaceConfig.film, !loggedTelecineRefusal, let writer, let ctx = codecContext else { return nil }
         let format = AVPixelFormat(rawValue: f.pointee.format)
-        guard let made = InverseTelecine(kernels: finisher.kernels, makePicture: Self.slabMaker(allocator), format: format,
+        guard let made = InverseTelecine(kernels: writer.finisher.kernels, makePicture: Self.slabMaker(writer.allocator), format: format,
                                          width: Int(f.pointee.width), height: Int(f.pointee.height), timeBase: timeBase,
                                          frameRate: ctx.pointee.framerate, decimates: film == .pulldown32) else {
             loggedTelecineRefusal = true
@@ -597,7 +550,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// format or the picture (planes under 3 columns or 4 lines, as FFmpeg's bwdif), which then goes out as decoded.
     /// Caller holds `lock`.
     private func hold(_ f: UnsafeMutablePointer<AVFrame>) -> BwdifWindow.Picture? {
-        guard let allocator, deinterlaceFormat(f) != nil, let held = av_frame_clone(f) else { return nil }
+        guard let allocator = writer?.allocator, deinterlaceFormat(f) != nil, let held = av_frame_clone(f) else { return nil }
         if let slab = allocator.slab(of: held), let planes = PlanarFrameFinisher.planes(of: held, in: slab) {
             return BwdifWindow.Picture(storage: .init(frame: held, planes: planes, release: nil), pts: held.pointee.pts)
         }
@@ -635,7 +588,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// target and pictures without a timestamp (yadif's second field is `cur + next`, missing when either is) are not
     /// written. Caller holds `lock`, as for `emit`.
     private func render(_ outputs: [BwdifWindow.Output], timeBase tb: AVRational) {
-        guard !outputs.isEmpty, let finisher else { return }
+        guard !outputs.isEmpty, let finisher = writer?.finisher else { return }
         var jobs: [PlanarFrameFinisher.Job] = []
         var emits: [(frame: UnsafeMutablePointer<AVFrame>, pts: Int64, buffer: CVPixelBuffer)] = []
         var held: [BwdifWindow.Picture] = []
@@ -842,13 +795,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             avcodec_free_context(&codecContext)
         }
         codecContext = nil
-        plans = [:]
-        refusedPlans = []
-        refusedRepresentations = []
-        pixelBufferPool = nil
-        poolWidth = 0
-        poolHeight = 0
-        loggedOutputFormat = nil
+        writer = nil
         // Nil onFrame inside the lock: emit() reads it under the same lock; unsynchronized write is a data race.
         onFrame = nil
         lock.unlock()
@@ -856,26 +803,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     deinit {
         close()
-    }
-
-    // MARK: - Decoder-owned pixel buffer pool
-
-    /// Create (or reuse) the pool the finisher writes display buffers into, for the given geometry, with
-    /// `displayBufferAttributes`.
-    private func ensurePixelBufferPool(width: Int, height: Int, format: OutputFormat) -> CVPixelBufferPool? {
-        if pixelBufferPool == nil || poolWidth != width || poolHeight != height || poolFormat != format {
-            pixelBufferPool = nil
-            let poolAttrs: NSDictionary = [kCVPixelBufferPoolMinimumBufferCountKey: 6]
-            let pbAttrs = NSMutableDictionary(dictionary: Self.displayBufferAttributes as NSDictionary)
-            pbAttrs[kCVPixelBufferPixelFormatTypeKey] = format.pixelFormatType
-            pbAttrs[kCVPixelBufferWidthKey] = width
-            pbAttrs[kCVPixelBufferHeightKey] = height
-            CVPixelBufferPoolCreate(kCFAllocatorDefault, poolAttrs, pbAttrs, &pixelBufferPool)
-            poolWidth = width
-            poolHeight = height
-            poolFormat = format
-        }
-        return pixelBufferPool
     }
 
     private func reportDecodedFormat(pixelBuffer: CVPixelBuffer) {
@@ -895,112 +822,20 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - AVFrame → CVPixelBuffer (GPU finisher)
 
-    /// What a plan is decided by: the frame's format and range, the output, the siting and matrix it is written
-    /// with, and whether the picture is interlaced (no vertical chroma resampling then).
-    struct PlanKey: Hashable {
-        var pixelFormat: Int32
-        var output: OutputFormat
-        var sourceFullRange: Bool
-        var chromaLocation: UInt32
-        var matrix: String
-        var interlaced: Bool
-        var representation: ColourRepresentation
-    }
-
-    /// The display buffer for one decoded picture, written by the GPU from the picture's own memory. Nil (and
-    /// one log line per kind) when the finisher cannot write this frame's format into the output.
+    /// The display buffer for one decoded picture (``DisplayBufferWriter/finish(_:)``), with the stream's sample aspect.
     private func finishFrame(_ frame: UnsafeMutablePointer<AVFrame>) -> CVPixelBuffer? {
-        guard let allocator, let finisher else { return nil }
-        let width = Int(frame.pointee.width), height = Int(frame.pointee.height)
-        let interlaced = (frame.pointee.flags & AV_FRAME_FLAG_INTERLACED) != 0
-        guard let (plan, pb) = prepare(frame, planFormat: AVPixelFormat(rawValue: frame.pointee.format), interlaced: interlaced)
-        else { return nil }
-
-        // The decoder's own slab, or (rawvideo, libavcodec's paletted buffers) a copy of the picture in one.
-        let planes: PlanarFrameFinisher.Planes
-        var copied: DecodeFrameAllocator.Slab?
-        if let slab = allocator.slab(of: frame), let own = PlanarFrameFinisher.planes(of: frame, in: slab) {
-            planes = own
-        } else if let copy = allocator.copy(frame) {
-            planes = copy.planes
-            copied = copy.slab
-        } else {
-            return nil
-        }
-        defer { if let copied { allocator.release(copied) } }
-        guard finisher.finish(planes, plan: plan, width: width, height: height, into: pb) else {
-            if !loggedFinishFailure {
-                loggedFinishFailure = true
-                EngineLog.emit("[SWDecoder] GPU finish failed (logged once)", category: .swPlayback)
-            }
-            return nil
-        }
+        guard let pb = writer?.finish(frame) else { return nil }
+        attachPixelAspectRatio(from: frame, to: pb)
         return pb
     }
 
-    /// The finisher's plan for `frame` and the display buffer it writes, tagged with the frame's colour and aspect.
-    /// `planFormat` is the layout the finisher reads: the frame's own, or for a deinterlaced picture its planar
-    /// equivalent (``PlanarFrameFinisher/planarEquivalent(of:)``), with `interlaced` false. Range, siting and colour
-    /// come from the frame and its own format either way.
+    /// The finisher's plan and display buffer for `frame` (``DisplayBufferWriter/prepare(_:planFormat:interlaced:)``),
+    /// with the stream's sample aspect.
     private func prepare(_ frame: UnsafeMutablePointer<AVFrame>, planFormat: AVPixelFormat,
                          interlaced: Bool) -> (plan: PlanarFrameFinisher.Plan, buffer: CVPixelBuffer)? {
-        let width = Int(frame.pointee.width), height = Int(frame.pointee.height)
-        guard width > 0, height > 0 else { return nil }
-        let format = AVPixelFormat(rawValue: frame.pointee.format)
-        let colour = ColorDescription(frame: frame)
-        let representation = ColourRepresentation.resolve(format: format, matrix: colour.matrix, primaries: colour.primaries,
-                                                          transfer: colour.transfer)
-        if case .refused(let reason) = representation {
-            if refusedRepresentations.insert(reason).inserted {
-                EngineLog.emit("[SWDecoder] cannot represent this picture: \(reason); frames dropped", category: .swPlayback)
-            }
-            return nil
-        }
-        let outputFormat = Self.outputFormat(
-            pixelFormat: frame.pointee.format, colorRange: frame.pointee.color_range, streamIs10Bit: use10Bit,
-            twelveBit420: twelveBit420, interlaced: interlaced, representation: representation)
-        logOutputFormat(outputFormat, source: av_get_pix_fmt_name(format).map { String(cString: $0) } ?? "?",
-                        colorRange: frame.pointee.color_range)
-
-        let isRGB = (av_pix_fmt_desc_get(format)?.pointee.flags ?? 0) & UInt64(AV_PIX_FMT_FLAG_RGB) != 0
-        // H.273: VideoFullRangeFlag applies to R'G'B' codes too. An RGB frame is full range unless it says
-        // video range; a Y'CbCr frame (YCgCo's R'G'B' codes included) is video range unless it, or its yuvj
-        // format, says full.
-        let sourceFullRange = isRGB ? frame.pointee.color_range != AVCOL_RANGE_MPEG
-            : (frame.pointee.color_range == AVCOL_RANGE_JPEG || Self.isJPEGFormat(format))
-        // A converted picture is encoded with, and tagged as, the matrix its primaries call for.
-        let convertedMatrix = representation.converts ? ColourRepresentation.targetMatrix(primaries: colour.primaries) : nil
-        let matrix = convertedMatrix ?? ColorAttachments.presented(colour, frameSize: (frame.pointee.width, frame.pointee.height)).matrix
-        let location = Self.resolvedChromaLocation(frame.pointee.chroma_location, isJPEG: Self.isJPEGFormat(format))
-        let key = PlanKey(pixelFormat: planFormat.rawValue, output: outputFormat, sourceFullRange: sourceFullRange,
-                          chromaLocation: UInt32(location.rawValue), matrix: matrix as String, interlaced: interlaced,
-                          representation: representation)
-        let plan: PlanarFrameFinisher.Plan
-        if let known = plans[key] {
-            plan = known
-        } else if let made = PlanarFrameFinisher.plan(source: planFormat, output: outputFormat, sourceFullRange: sourceFullRange,
-                                                      chromaLocation: location, matrix: matrix, interlaced: interlaced,
-                                                      representation: representation) {
-            plans[key] = made
-            plan = made
-        } else {
-            if refusedPlans.insert(key).inserted {
-                EngineLog.emit("[SWDecoder] cannot write \(av_get_pix_fmt_name(format).map { String(cString: $0) } ?? "?")"
-                               + "\(interlaced ? " (interlaced)" : "") as \(outputFormat.logDescription); frames dropped",
-                               category: .swPlayback)
-            }
-            return nil
-        }
-
-        var pixelBuffer: CVPixelBuffer?
-        guard let pool = ensurePixelBufferPool(width: width, height: height, format: outputFormat),
-              CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer) == kCVReturnSuccess,
-              let pb = pixelBuffer else { return nil }
-        attachColorSpace(from: frame, to: pb)
-        if let convertedMatrix { CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, convertedMatrix, .shouldPropagate) }
-        attachPixelAspectRatio(from: frame, to: pb)
-
-        return (plan, pb)
+        guard let prepared = writer?.prepare(frame, planFormat: planFormat, interlaced: interlaced) else { return nil }
+        attachPixelAspectRatio(from: frame, to: prepared.buffer)
+        return prepared
     }
 
     nonisolated static func isJPEGFormat(_ format: AVPixelFormat) -> Bool {
@@ -1012,57 +847,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
     }
 
-    /// One release-visible line whenever the buffer format changes, naming what it was chosen from.
-    private func logOutputFormat(_ format: OutputFormat, source: String, colorRange: AVColorRange?) {
-        guard format != loggedOutputFormat else { return }
-        loggedOutputFormat = format
-        EngineLog.emit(
-            "[SWDecoder] output \(format.logDescription) (frame \(source)"
-            + (colorRange.map { ", color_range=\($0.rawValue))" } ?? ")"),
-            category: .swPlayback
-        )
-    }
-
-    // MARK: - Color Space Metadata
-
-    /// Map FFmpeg color metadata to CVPixelBuffer attachments for correct HDR10 rendering (BT.2020 + PQ).
-    /// Every field is written, a gap included (AE#654): VideoToolbox never hands the display layer an
-    /// untagged buffer, and neither may this decoder.
-    private func attachColorSpace(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer) {
-        let description = ColorDescription(frame: frame)
-        let tags = ColorAttachments.presented(description, frameSize: (frame.pointee.width, frame.pointee.height))
-        CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, tags.primaries, .shouldPropagate)
-        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, tags.transfer, .shouldPropagate)
-        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, tags.matrix, .shouldPropagate)
-        if let gamma = tags.gammaLevel {
-            CVBufferSetAttachment(pb, kCVImageBufferGammaLevelKey, gamma as NSNumber, .shouldPropagate)
-        } else {
-            CVBufferRemoveAttachment(pb, kCVImageBufferGammaLevelKey)
-        }
-        if !loggedUnmappedColor, let gaps = ColorAttachments.unmapped(description) {
-            loggedUnmappedColor = true
-            EngineLog.emit("[SWDecoder] no CoreVideo tag for \(gaps); presented as primaries=\(tags.primaries) "
-                           + "matrix=\(tags.matrix) (logged once)", category: .swPlayback)
-        }
-        attachHDRStaticMetadata(from: frame, to: pb)
-        attachChromaLocation(from: frame, to: pb)
-    }
-
-    /// Where the subsampled chroma samples sit, which the display layer's upsampler needs to put the
-    /// colour back on the right pixels; nothing told it before. Same value for both fields: what
-    /// leaves this decoder is progressive.
-    private func attachChromaLocation(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer) {
-        let chroma = OutputFormat(pixelFormatType: CVPixelBufferGetPixelFormatType(pb))?.chroma ?? .yuv420
-        guard let location = Self.chromaLocation(
-            frame.pointee.chroma_location, output: chroma,
-            isJPEG: Self.isJPEGFormat(AVPixelFormat(rawValue: frame.pointee.format))) else {
-            CVBufferRemoveAttachment(pb, kCVImageBufferChromaLocationTopFieldKey)
-            CVBufferRemoveAttachment(pb, kCVImageBufferChromaLocationBottomFieldKey)
-            return
-        }
-        CVBufferSetAttachment(pb, kCVImageBufferChromaLocationTopFieldKey, location, .shouldPropagate)
-        CVBufferSetAttachment(pb, kCVImageBufferChromaLocationBottomFieldKey, location, .shouldPropagate)
-    }
+    // MARK: - Chroma siting
 
     /// The CoreVideo chroma location for the frame's `chroma_location` on a buffer with `output`
     /// subsampling. nil for 4:4:4, which has nothing to site.
@@ -1072,7 +857,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// route almost always is, except a JPEG-family picture, which is centred. Left rather than no
     /// attachment, because a buffer without one leaves the choice to whatever the display layer
     /// assumes, and nothing documents that. On a 4:2:2 buffer only the horizontal half of the siting
-    /// exists, so the vertical variants fold onto Left / Center (a 4:2:0 picture swscale widened into
+    /// exists, so the vertical variants fold onto Left / Center (a 4:2:0 picture the finisher widens into
     /// `sv22` keeps its horizontal siting).
     /// The frame's chroma siting with UNSPECIFIED filled: centred for JPEG (yuvj) formats, LEFT otherwise (the
     /// H.264 / HEVC inference when the VUI carries no chroma_loc_info, and MPEG-2's 4:2:0).
@@ -1103,15 +888,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             default: return kCVImageBufferChromaLocation_Left
             }
         }
-    }
-
-    /// The mastering display and content light level travel with the colour tags: the frame's own
-    /// (bitstream SEI / AV1 metadata OBU) first, the container's declaration for what it lacks. A
-    /// comparison per frame; the attached objects only change when the stream's metadata does.
-    private func attachHDRStaticMetadata(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer) {
-        let current = HDRStaticMetadata(frame: frame).filled(from: containerHDRStatic)
-        if current != attachedHDRStatic { attachedHDRStatic = current }
-        attachedHDRStatic.attach(to: pb)
     }
 
     // MARK: - Pixel Aspect Ratio (anamorphic SD)
@@ -1260,7 +1036,7 @@ extension AetherEngine {
     public enum SoftwareTwelveBit420Output: String, CaseIterable, Sendable {
         /// 10-bit `x420`, ordered-dithered from the 12-bit picture. The default.
         case p010Dithered = "p010-dither"
-        /// 16-bit 4:2:2 `sv22`: all 12 bits of luma kept, chroma upsampled vertically by swscale.
+        /// 16-bit 4:2:2 `sv22`: all 12 bits of luma kept, chroma upsampled vertically by the finisher.
         case sv22 = "sv22"
     }
 

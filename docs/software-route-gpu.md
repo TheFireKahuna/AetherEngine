@@ -1,7 +1,7 @@
 # The software route: one GPU pass, inside the native player
 
 Status: plan, written 2026-10-24 on `research/12bit-fel`. Parts 2 (the GPU finisher and H.273 colour) and 3 (AV1 into
-the slabs) are built and committed; parts 4 (bwdif on the GPU) and 6 (film in interlaced carriage) are built and verified on device; parts 1 and 5 are open. The colour equations are in [colour-representation.md](colour-representation.md).
+the slabs) are built and committed; parts 4 (bwdif on the GPU) and 6 (film in interlaced carriage) are built and verified on device; parts 1, 5 and 7 are open. The colour equations are in [colour-representation.md](colour-representation.md).
 
 ## Why
 
@@ -284,6 +284,44 @@ mode does; the stages themselves cope with breaks (re-anchoring, combed pictures
   hard telecine 24 pictures a second on 23.98 Hz (off: 60 deinterlaced a second on 59.94 Hz); 2:2 25 a second on
   50 Hz (off: 50 deinterlaced). The only drops fell in the first second, across the panel's mode switch. By eye the
   difference did not show on the G5, which likely smooths 3:2 at 59.94 Hz itself.
+
+## Part 7. Stills on the playback path (open)
+
+Every still (the SDR I-frame tier AVKit's scrub thumbnails play, `FrameExtractor`'s thumbnails and snapshots, the
+software host's packet-run stills) is a picture the player would show, so it is made the way playback makes it,
+plus one scale and colour step.
+
+What there was: a VideoToolbox decode went to memory (`av_hwframe_transfer_data`), a software decode stayed in
+libavcodec's buffers, and both then went through swscale into RGBA on the CPU (`convertToCGImage`, with its own
+matrix choice re-derived from `ColorAttachments`), or for HDR through a zscale + tonemap graph (`HDRToneMapper`,
+FFmpeg's curve, not Apple's), and the I-frame tier then drew that image into a buffer with Core Graphics. Only a
+VideoToolbox keyframe in the I-frame tier stayed on the GPU (`decodeScaledStill`).
+
+The path:
+
+1. **Decode as playback decodes.** VideoToolbox where the still decoder already takes it (its frames are display
+   buffers); otherwise libavcodec into the slabs (`DecodeFrameAllocator`), and the finisher writes the display
+   buffer. The picture-to-display-buffer step is one type, `DisplayBufferWriter`, taken out of
+   `SoftwareVideoDecoder`: the slabs, the finisher, the plan cache, the buffer pool, colour / chroma siting / HDR
+   static attachments. The decoder and the still decoder both use it; nothing else makes a display buffer.
+2. **One GPU step to the still.** `StillRenderer`: `VTPixelTransferSession` scales the display buffer to the still's
+   size and maps it to the destination in the same pass. An HDR picture (PQ, HLG) maps to BT.709 SDR, Apple's own
+   curve, the one `AVAssetImageGenerator`'s force-SDR policy gives; an SDR picture keeps its primaries and transfer.
+   The I-frame tier takes 10-bit 4:2:0 for the encoder; a `CGImage` is a BGRA buffer of its own, wrapped without a
+   copy (a pooled buffer would be repainted under an image the host still shows).
+3. **Removed:** swscale (the engine's last use), `HDRToneMapper` and its filter graph, the hardware-frame transfer and
+   the software re-open it fell back to, the RGBA copies, the Core Graphics redraws.
+
+Dolby Vision profile 5 / AV1 10.0 is not on this path. Playback leaves its reconstruction to the system (the native
+route serves it as `dvh1.05`; the software route refuses it, AE#461), and the default build's scrub preview does the
+same (`AetherScrubPreviewView`, the system compositor). The `DolbyVisionStillReshaping` trait's CPU converter keeps
+reading the decoded frame as before; whether it stays is open.
+
+Part 5's grain then reaches stills with no work of their own: they go through the finisher.
+
+Conformance: a still of a known picture through the software and the VideoToolbox decode, against the display
+buffer playback shows (BT.709 bars at the code values, an untagged SD picture with playback's BT.601 guess, full
+range, an anamorphic picture at its display aspect); HDR10 and HLG sources give BT.709 SDR stills.
 
 ## Banked
 

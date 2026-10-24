@@ -35,6 +35,7 @@ final class SoftwareStillExtractor: @unchecked Sendable {
     }
 
     private let decoder = SoftwareVideoDecoder()
+    private let renderer = StillRenderer()
     private let videoStreamIndex: Int32
     private let timeBaseSeconds: Double
     private let limits: Limits
@@ -148,7 +149,7 @@ final class SoftwareStillExtractor: @unchecked Sendable {
         guard !isCancelled(), reportTime == nil || ContinuousClock.now < deadline,
               let best = selected else { return nil }
         reportTime?(best.seconds, didRefine)
-        return Self.image(from: best.pixelBuffer, maxWidth: maxWidth)
+        return image(from: best.pixelBuffer, maxWidth: maxWidth)
     }
 
     // MARK: - Feeding
@@ -242,31 +243,14 @@ final class SoftwareStillExtractor: @unchecked Sendable {
 
     /// The decoder attaches the resolved sample aspect to the buffer (`#177`), so the still reads
     /// its answer rather than resolving one of its own, and a 704x480 4:3 broadcast frame draws 4:3.
-    static func image(from pixelBuffer: CVPixelBuffer, maxWidth: Int) -> CGImage? {
-        var cgImage: CGImage?
-        guard VTCreateCGImageFromCVPixelBuffer(pixelBuffer, options: nil, imageOut: &cgImage) == noErr,
-              let source = cgImage else { return nil }
-
-        let srcW = source.width
-        let srcH = source.height
+    /// Scaled and mapped on the GPU (``StillRenderer``) into an image of its own: the buffer goes back
+    /// to the decoder's pool the moment this run lets go of it.
+    private func image(from pixelBuffer: CVPixelBuffer, maxWidth: Int) -> CGImage? {
+        let srcW = CVPixelBufferGetWidth(pixelBuffer), srcH = CVPixelBufferGetHeight(pixelBuffer)
         guard srcW > 0, srcH > 0 else { return nil }
-
         let (dstW, dstH) = FrameDecodeContext.displayDimensions(
-            srcW: srcW, srcH: srcH, sar: sampleAspect(of: pixelBuffer), targetWidth: maxWidth)
-
-        // Always drawn into an owned bitmap, even at 1:1. VideoToolbox documents the CGImage as
-        // backed by the CVPixelBuffer it was made from, and that buffer goes back to the decoder's
-        // pool the moment this run lets go of it, so handing the source out would let the next run
-        // repaint a picture the host is still showing.
-        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
-              let ctx = CGContext(data: nil, width: dstW, height: dstH,
-                                  bitsPerComponent: 8, bytesPerRow: 0, space: space,
-                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
-            return source
-        }
-        ctx.interpolationQuality = .high
-        ctx.draw(source, in: CGRect(x: 0, y: 0, width: dstW, height: dstH))
-        return ctx.makeImage() ?? source
+            srcW: srcW, srcH: srcH, sar: Self.sampleAspect(of: pixelBuffer), targetWidth: maxWidth)
+        return renderer.image(pixelBuffer, width: dstW, height: dstH)
     }
 
     static func sampleAspect(of pixelBuffer: CVPixelBuffer) -> AVRational {
