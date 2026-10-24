@@ -167,8 +167,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// First EOF on either merge source ends the stream; draining the survivor produces silent/frozen tail.
     private var mergeMainEOF = false
     private var mergeSideEOF = false
-    // var (not let): SSAI ad creative arrives on a new video PID mid-pump; re-pointed at the new stream.
-    private var videoStreamIndex: Int32
+    /// The video stream chosen at open. An SSAI ad on a new PID arrives under it too (`Demuxer` follows
+    /// the program, `noteProgramChange`).
+    private let videoStreamIndex: Int32
     private let cache: SegmentCache
     /// Segment index offset; 0 for initial-start, non-zero for restart sessions.
     private let baseIndex: Int
@@ -340,6 +341,21 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// Ad creative's video config from in-band SPS/PPS (mid-stream demuxer codecpar has width/height == 0).
     private var pendingAdVideoConfig: (width: Int32, height: Int32, extradata: [UInt8])?
+
+    /// The pending rotation goes back to the stream chosen at open: its init is built from the open's own
+    /// configuration, not from in-band parameter sets (`pendingAdVideoConfig` is nil then).
+    private var pendingReinitUsesOpenedConfig = false
+
+    /// A program change moved the video role (`Demuxer.programChange(on:)`, which hands the new PID over
+    /// under the index chosen at open). Until the keyframe the switch can open on, the new stream's
+    /// packets are held out of the running init: an ad creative opens on in-band SPS/PPS (#133's shape),
+    /// the stream chosen at open on any keyframe, its configuration being the open's.
+    private var awaitingProgramSwitch: ProgramSuccession.Change?
+
+    /// The audio role is on a stream whose codec differs from the open's (live only; VOD rebuilds on the
+    /// software path instead): its packets cannot go into this init, so they are left out until the role
+    /// is back on a codec the init describes.
+    private var audioRoleUnmuxable = false
 
     /// #133 follow-up: Annex-B SPS+PPS backing the CURRENT muxer's avcC box. The fMP4 avcC is frozen at
     /// avformat_write_header, so an in-band parameter-set change on the SAME video PID (encoder restart / regional
@@ -1836,6 +1852,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
         pendingVideoProgramSwitch = false
         let isAdCreative = pendingReinitIsAdCreative
         pendingReinitIsAdCreative = false
+        if pendingReinitUsesOpenedConfig {
+            pendingReinitUsesOpenedConfig = false
+            EngineLog.emit(
+                "[HLSSegmentProducer] muxer rotation (programme back): seg-\(finishedIdx) finalized on the ad's init, "
+                + "the open's init again for seg-\(newIdx)",
+                category: .session
+            )
+            return allocateMuxer(initialSegmentIndex: newIdx, reconstructedVideoConfig: nil, versionedInit: true,
+                                 isAdCreative: false)
+        }
         guard let adConfig = pendingAdVideoConfig else {
             EngineLog.emit(
                 "[HLSSegmentProducer] program switch: no parsed ad video config; "
@@ -1858,6 +1884,59 @@ final class HLSSegmentProducer: @unchecked Sendable {
                              reconstructedVideoConfig: adConfig,
                              versionedInit: true,
                              isAdCreative: isAdCreative)
+    }
+
+    /// What a program change does to this pump (`Demuxer.programChange(on:)`): the stream the PMT moved a
+    /// role to is handed over under the role's own index, so the pump only decides whether its init still
+    /// describes it. Compared with what the pump was opened with, not with the stream before: an ad's
+    /// codec matters against the programme's. Returns an exit reason when the session has to be rebuilt.
+    private func noteProgramChange(_ change: ProgramSuccession.Change, origin: PacketOrigin) -> PumpExitReason? {
+        let source = origin == .side ? sideAudioDemuxer : demuxer
+        let codec = source?.stream(at: change.to)?.pointee.codecpar.pointee.codec_id
+        if origin == .main, change.logical == videoStreamIndex {
+            let codecDiffers = codec != videoConfig.codecpar.pointee.codec_id
+            EngineLog.emit(
+                "[HLSSegmentProducer] program change: video now on stream \(change.to) (was \(change.from))"
+                + (codecDiffers ? ", another codec" : ""), category: .session)
+            if isLive {
+                awaitingProgramSwitch = change
+                return nil
+            }
+            // VOD: one init for the whole playlist. The same codec goes on (new H.264 parameter sets are
+            // caught by `vodH264Configuration`); another codec cannot, and the session is rebuilt on the
+            // software path, which decodes what it is handed.
+            return codecDiffers ? .videoConfigurationChanged(
+                summary: "the video changed codec at a program change (stream \(change.from) → \(change.to))") : nil
+        }
+        guard let audio = audioConfig, change.logical == audio.sourceStreamIndex,
+              origin == (sideAudioDemuxer != nil ? .side : .main) else { return nil }
+        // A bridged track decodes what it was opened with, so it can follow no codec but its own either.
+        let codecDiffers = codec != audio.codecpar.pointee.codec_id
+        EngineLog.emit(
+            "[HLSSegmentProducer] program change: audio now on stream \(change.to) (was \(change.from))"
+            + (codecDiffers ? ", another codec" : ""), category: .session)
+        if !isLive, codecDiffers {
+            return .videoConfigurationChanged(
+                summary: "the audio changed codec at a program change (stream \(change.from) → \(change.to))")
+        }
+        audioRoleUnmuxable = codecDiffers
+        return nil
+    }
+
+    /// The keyframe a program switch opens on, with its in-band SPS/PPS where it has them.
+    private struct ProgramSwitchOpening {
+        var config: (width: Int32, height: Int32, extradata: [UInt8])?
+    }
+
+    /// The keyframe a program switch can open on, or nil to hold the packet out: on the stream chosen at
+    /// open any keyframe (its configuration is the open's; an H.264 one still yields its in-band sets as
+    /// the #133 baseline), on an ad creative a keyframe with in-band SPS/PPS.
+    private func programSwitchOpening(_ change: ProgramSuccession.Change,
+                                      _ packet: UnsafeMutablePointer<AVPacket>) -> ProgramSwitchOpening? {
+        guard packet.pointee.flags & AV_PKT_FLAG_KEY != 0 else { return nil }
+        let inBand = extractAdVideoConfig(packet)
+        if change.to == change.logical { return ProgramSwitchOpening(config: inBand) }
+        return inBand.map { ProgramSwitchOpening(config: $0) }
     }
 
     /// Extract H.264 ad video config from in-band Annex-B SPS/PPS. nil on mid-GOP join (no parameter sets).
@@ -3500,6 +3579,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 var pktPtr: UnsafeMutablePointer<AVPacket>? = packet
                 defer { trackedPacketFree(&pktPtr) }
 
+                if let change = (origin == .side ? sideAudioDemuxer : demuxer)?.programChange(on: packet),
+                   let stop = noteProgramChange(change, origin: origin) {
+                    exitReason = stop
+                    break readLoop
+                }
+
                 // Drop matroska BlockAddition side data (HDR10+/DV RPU ~6 KB/entry; metadata lives in bitstream for HEVC).
                 // Exception: check AV_PKT_DATA_NEW_EXTRADATA first (live only: program boundary SPS/PPS change detection).
                 if isLive, origin == .main, packet.pointee.stream_index == videoStreamIndex {
@@ -3552,29 +3637,35 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
                 let pktStreamIdx = packet.pointee.stream_index
 
-                // SSAI program switch: ad creative uses a different video PID; re-point videoStreamIndex.
-                if isLive, origin == .main, sideAudioDemuxer == nil,
-                   pktStreamIdx != videoStreamIndex,
-                   pktStreamIdx != (audioConfig?.sourceStreamIndex ?? -1),
-                   demuxer.isVideoStream(pktStreamIdx),
-                   // Mid-stream demuxer codecpar is unparsed (width 0); only switch on a keyframe with in-band SPS/PPS.
-                   let adConfig = extractAdVideoConfig(packet) {
+                // SSAI program switch: the video role moved to a new PID (or back to the open's), and this is
+                // the first keyframe it can open on. Until then its packets stay out of the running init.
+                if let change = awaitingProgramSwitch, origin == .main, pktStreamIdx == videoStreamIndex {
+                    guard let opened = programSwitchOpening(change, packet) else { continue }  // held out
+                    awaitingProgramSwitch = nil
+                    let returning = change.to == change.logical
                     EngineLog.emit(
-                        "[HLSSegmentProducer] SSAI video program switch: "
-                        + "videoStreamIndex \(videoStreamIndex) → \(pktStreamIdx) "
-                        + "(ad/program \(adConfig.width)x\(adConfig.height) on a new video PID)",
+                        "[HLSSegmentProducer] SSAI video program switch: stream \(change.from) → \(change.to) "
+                        + (returning ? "(back to the programme, its own configuration)"
+                            : "(ad/program \(opened.config?.width ?? 0)x\(opened.config?.height ?? 0) on a new video PID)"),
                         category: .session
                     )
-                    videoStreamIndex = pktStreamIdx
                     // Do NOT nil lastVideoSourceDts: timeline rebase (below) needs it to fire on the big backward jump.
                     lastSeenVideoExtradata = nil
                     pendingVideoProgramSwitch = true
-                    pendingReinitIsAdCreative = true  // new PID carries its own DV/color signaling; drop program overrides
-                    pendingAdVideoConfig = adConfig
-                    activeMuxerVideoExtradata = adConfig.extradata  // #133 follow-up: rebaseline for same-PID PS-change detection
-                    convertP7Active = false  // ad creatives are H.264
+                    // An ad creative carries its own DV/color signaling, so the program's overrides are dropped;
+                    // the programme coming back keeps them.
+                    pendingReinitIsAdCreative = !returning
+                    pendingReinitUsesOpenedConfig = returning
+                    pendingAdVideoConfig = returning ? nil : opened.config
+                    // #133 follow-up: rebaseline for same-PID PS-change detection.
+                    activeMuxerVideoExtradata = opened.config?.extradata
+                    convertP7Active = returning ? videoConfig.convertP7ToProfile81 : false  // ad creatives are H.264
                     if lastLiveSegmentFinalizeAt != nil { stampLiveSegmentFinalize() }
                     // pendingDiscontinuityFlag / pendingForceCutFlag set by the rebase below.
+                }
+                if audioRoleUnmuxable, origin == (sideAudioDemuxer != nil ? .side : .main),
+                   pktStreamIdx == (audioConfig?.sourceStreamIndex ?? -1) {
+                    continue
                 }
 
                 // NOPTS dts repair: matroska reconstructs dts from ReferenceBlock relations; fails on some B-frames.

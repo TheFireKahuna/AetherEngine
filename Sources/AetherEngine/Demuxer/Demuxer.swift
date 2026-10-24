@@ -360,6 +360,22 @@ public final class Demuxer: @unchecked Sendable {
     /// reposition and by `close()`. Guarded by `accessLock`.
     private var peekedPackets: [UnsafeMutablePointer<AVPacket>] = []
 
+    /// A transport stream's program changes, followed under the stream indices readers chose: a new
+    /// PID that takes a role (`ProgramSuccession`) is read as that role's stream, and its first packet
+    /// says so (`programChange(on:)`). Built at the open (`probeStreams`); a new stream is judged on its
+    /// first packet (`routeProgramSuccessionLocked`). Guarded by `accessLock`.
+    private var succession: ProgramSuccession?
+    /// Per logical stream, the stream its packets come from since the open or the last seek, and the
+    /// position its first one was read at; a packet from another one carries the change. A reader
+    /// configures from the streams chosen at open, so a seek starts it there again.
+    private var deliveredByLogical: [Int32: (stream: Int32, since: Int64)] = [:]
+    /// Every change handed over, in order; a packet's `opaque` is its position plus one.
+    private var programChanges: [ProgramSuccession.Change] = []
+    /// Set by `discardAllStreamsExcept`: a stream a PMT change adds without a role is discarded too.
+    private var discardsUnkeptStreams = false
+    /// New streams already judged (`ProgramSuccession.adopt`), successor or not.
+    private var judgedStreams: Set<Int32> = []
+
     /// Whether this source's video keyframes go into libavformat's index as they are read
     /// (`recordKeyframeLocked`), decided on the first packet after an open. Guarded by `accessLock`.
     private var recordsKeyframes: Bool?
@@ -1060,6 +1076,8 @@ public final class Demuxer: @unchecked Sendable {
     }
 
     private func probeStreams(_ ctx: UnsafeMutablePointer<AVFormatContext>) throws {
+        // The roles are the first PMT's, read before `find_stream_info` can read past a change.
+        succession = Self.makeSuccession(ctx)
         unresolvableAudioStreams = []
         // #87: the subtitle side demuxer opts out of find_stream_info. avformat_open_input already
         // carries codec_id / codec_type for every subtitle track (container header / PMT), and
@@ -1412,16 +1430,7 @@ public final class Demuxer: @unchecked Sendable {
     /// Clamped: av_find_best_stream returns AVERROR_STREAM_NOT_FOUND (-1381258232)
     /// on failure, not -1; normalize to -1 to avoid garbage in logs.
     var videoStreamIndex: Int32 {
-        answeredFromStreams(\.videoStreamIndex) { Self.bestStreamIndex($0, AVMEDIA_TYPE_VIDEO) }
-    }
-
-    /// True if `index` names a video stream. Live producer uses this to detect
-    /// an SSAI program change that introduces a new video PID mid-stream.
-    func isVideoStream(_ index: Int32) -> Bool {
-        accessLock.lock(); defer { accessLock.unlock() }
-        guard let ctx = formatContext, index >= 0, index < ctx.pointee.nb_streams,
-              let stream = ctx.pointee.streams[Int(index)] else { return false }
-        return stream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO
+        answeredFromStreams(\.videoStreamIndex) { logicalStream(Self.bestStreamIndex($0, AVMEDIA_TYPE_VIDEO)) }
     }
 
 
@@ -1429,14 +1438,14 @@ public final class Demuxer: @unchecked Sendable {
     /// GOTCHA: av_find_best_stream skips streams with no channels/sample_rate (live MPEG-TS
     /// probe may leave them that way). Use `firstAudioStreamIndexByType` as fallback.
     var audioStreamIndex: Int32 {
-        answeredFromStreams(\.audioStreamIndex) { Self.bestStreamIndex($0, AVMEDIA_TYPE_AUDIO) }
+        answeredFromStreams(\.audioStreamIndex) { logicalStream(Self.bestStreamIndex($0, AVMEDIA_TYPE_AUDIO)) }
     }
 
     /// First audio stream by codec_type regardless of codecpar completeness.
     /// Fallback for live MPEG-TS where av_find_best_stream skips empty-codecpar
     /// streams; the engine's live AAC codecpar repair fills them downstream.
     var firstAudioStreamIndexByType: Int32 {
-        answeredFromStreams(\.firstAudioStreamIndexByType) { Self.firstAudioStreamIndexByType($0) }
+        answeredFromStreams(\.firstAudioStreamIndexByType) { logicalStream(Self.firstAudioStreamIndexByType($0)) }
     }
 
     func audioTrackInfos() -> [TrackInfo] {
@@ -1486,7 +1495,8 @@ public final class Demuxer: @unchecked Sendable {
     private func trackInfos(in ctx: UnsafeMutablePointer<AVFormatContext>,
                             ofType type: AVMediaType) -> [TrackInfo] {
         var tracks: [TrackInfo] = []
-        for i in 0..<Int(ctx.pointee.nb_streams) {
+        let successors = succession?.successors ?? []
+        for i in 0..<Int(ctx.pointee.nb_streams) where !successors.contains(Int32(i)) {
             guard let stream = ctx.pointee.streams[i],
                   let codecpar = stream.pointee.codecpar,
                   codecpar.pointee.codec_type == type else { continue }
@@ -1526,14 +1536,21 @@ public final class Demuxer: @unchecked Sendable {
     /// Caller holds `accessLock`.
     private func buildTrackSnapshotLocked() -> TrackSnapshot {
         guard let ctx = formatContext else { return TrackSnapshot() }
+        let successors = succession?.successors ?? []
         return TrackSnapshot(
-            videoStreamIndex: Self.bestStreamIndex(ctx, AVMEDIA_TYPE_VIDEO),
-            audioStreamIndex: Self.bestStreamIndex(ctx, AVMEDIA_TYPE_AUDIO),
-            firstAudioStreamIndexByType: Self.firstAudioStreamIndexByType(ctx),
+            videoStreamIndex: logicalStream(Self.bestStreamIndex(ctx, AVMEDIA_TYPE_VIDEO)),
+            audioStreamIndex: logicalStream(Self.bestStreamIndex(ctx, AVMEDIA_TYPE_AUDIO)),
+            firstAudioStreamIndexByType: logicalStream(Self.firstAudioStreamIndexByType(ctx)),
             audioTracks: trackInfos(in: ctx, ofType: AVMEDIA_TYPE_AUDIO),
             subtitleTracks: trackInfos(in: ctx, ofType: AVMEDIA_TYPE_SUBTITLE),
-            subtitleStreamIndices: Self.subtitleStreamIndices(in: ctx),
-            splitDisplaySetSubtitleStreamIndices: Self.splitDisplaySetSubtitleStreamIndices(in: ctx))
+            subtitleStreamIndices: Self.subtitleStreamIndices(in: ctx).subtracting(successors),
+            splitDisplaySetSubtitleStreamIndices: Self.splitDisplaySetSubtitleStreamIndices(in: ctx).subtracting(successors))
+    }
+
+    /// A stream index as readers know it: a program change's successor is its role's stream.
+    /// Caller holds `accessLock`.
+    private func logicalStream(_ index: Int32) -> Int32 {
+        index < 0 ? index : succession?.logical(for: index) ?? index
     }
 
     /// #112: PGS subtitle streams whose display sets arrive split across PES packets and need
@@ -1543,7 +1560,9 @@ public final class Demuxer: @unchecked Sendable {
     /// the trailing END, which the decoder's synthetic-END flush rescues per packet).
     /// #151: every AVMEDIA_TYPE_SUBTITLE stream index; the forward prefetcher's route + keep set.
     func subtitleStreamIndices() -> Set<Int32> {
-        answeredFromStreams(\.subtitleStreamIndices) { Self.subtitleStreamIndices(in: $0) }
+        answeredFromStreams(\.subtitleStreamIndices) {
+            Self.subtitleStreamIndices(in: $0).subtracting(succession?.successors ?? [])
+        }
     }
 
     /// #230: the stream whose packets pace the subtitle side reader's forward park, or -1.
@@ -1595,7 +1614,7 @@ public final class Demuxer: @unchecked Sendable {
 
     func splitDisplaySetSubtitleStreamIndices() -> Set<Int32> {
         answeredFromStreams(\.splitDisplaySetSubtitleStreamIndices) {
-            Self.splitDisplaySetSubtitleStreamIndices(in: $0)
+            Self.splitDisplaySetSubtitleStreamIndices(in: $0).subtracting(succession?.successors ?? [])
         }
     }
 
@@ -1991,6 +2010,9 @@ public final class Demuxer: @unchecked Sendable {
         guard let ctx = formatContext else { return }
         for i in 0..<Int32(ctx.pointee.nb_streams) {
             guard let stream = ctx.pointee.streams[Int(i)] else { continue }
+            // A stream a PMT change added is judged on its first packet (`routeProgramSuccessionLocked`),
+            // which then discards it as its role, or as an unkept stream; until then it must deliver one.
+            if let succession, succession.isNew(i), !judgedStreams.contains(i) { continue }
             // AVDISCARD_DEFAULT = 0 (= passthrough), AVDISCARD_NONKEY = 32, AVDISCARD_ALL = 48.
             if keep.contains(i) {
                 stream.pointee.discard = AVDISCARD_DEFAULT
@@ -2006,6 +2028,12 @@ public final class Demuxer: @unchecked Sendable {
             } else {
                 stream.pointee.discard = AVDISCARD_ALL
             }
+        }
+        // A successor is read as its role's stream, so it is discarded exactly as that one is.
+        discardsUnkeptStreams = true
+        for (successor, logical) in succession?.logicalBySuccessor ?? [:] {
+            guard let s = ctx.pointee.streams[Int(successor)], let l = ctx.pointee.streams[Int(logical)] else { continue }
+            s.pointee.discard = l.pointee.discard
         }
     }
 
@@ -2069,6 +2097,96 @@ public final class Demuxer: @unchecked Sendable {
                       flags: $0.pointee.flags)
             }
         }
+    }
+
+    /// The program change `packet` carries: set on the first packet a role's new stream delivered
+    /// (`ProgramSuccession`), under the role's own stream index. Nil for every other packet.
+    func programChange(on packet: UnsafeMutablePointer<AVPacket>) -> ProgramSuccession.Change? {
+        guard let marker = packet.pointee.opaque else { return nil }
+        let position = Int(bitPattern: marker) - 1
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        return programChanges.indices.contains(position) ? programChanges[position] : nil
+    }
+
+    /// The composition the roles are read off: a transport stream's programs at the open. Nil for any
+    /// other container, whose streams are what its header said.
+    private static func makeSuccession(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> ProgramSuccession? {
+        guard isTransportStream(ctx) else { return nil }
+        return ProgramSuccession(programs: programs(ctx), streamCount: Int32(ctx.pointee.nb_streams),
+                                 mediaType: { mediaType(ctx, $0) })
+    }
+
+    private static func isTransportStream(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> Bool {
+        guard let format = ctx.pointee.iformat else { return false }
+        return String(cString: format.pointee.name).split(separator: ",").contains("mpegts")
+    }
+
+    private static func programs(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> [ProgramSuccession.Program] {
+        guard isTransportStream(ctx) else { return [] }
+        return (0..<Int(ctx.pointee.nb_programs)).compactMap { i in
+            guard let program = ctx.pointee.programs[i] else { return nil }
+            let streams = (0..<Int(program.pointee.nb_stream_indexes)).map { Int32(program.pointee.stream_index[$0]) }
+            return .init(id: program.pointee.id, streams: streams)
+        }
+    }
+
+    private static func mediaType(_ ctx: UnsafeMutablePointer<AVFormatContext>, _ index: Int32) -> Int32? {
+        guard index >= 0, index < Int32(ctx.pointee.nb_streams), let stream = ctx.pointee.streams[Int(index)] else { return nil }
+        return stream.pointee.codecpar.pointee.codec_type.rawValue
+    }
+
+    /// Hands a successor's packet over under its role's stream index, and marks the first packet of
+    /// each change of stream with the change. False when the packet is not for the reader.
+    ///
+    /// A new stream is judged on its first packet once a program names it (libavformat can meet a new
+    /// PID before the PMT that lists it, and guesses a stream of its own for it): a successor is
+    /// discarded as its role is, a new stream without a role as the reader's other unkept streams are.
+    /// A packet from another of the role's streams, read from before where the role's current stream
+    /// began, is a leftover: the old PID's last frames, which libavformat's parser lets go only at the
+    /// next frame on that PID (the programme coming back after an ad) or at the end of the stream. By
+    /// position, because an ad's timestamps can sit anywhere against the programme's.
+    /// Caller holds `accessLock`.
+    private func routeProgramSuccessionLocked(_ packet: UnsafeMutablePointer<AVPacket>,
+                                              _ ctx: UnsafeMutablePointer<AVFormatContext>) -> Bool {
+        guard var succession else { return true }
+        let physical = packet.pointee.stream_index
+        if succession.isNew(physical), !judgedStreams.contains(physical),
+           let stream = ctx.pointee.streams[Int(physical)] {
+            let programs = Self.programs(ctx)
+            guard programs.contains(where: { $0.streams.contains(physical) }) else { return true }
+            judgedStreams.insert(physical)
+            let adopted = succession.adopt(physical, programs: programs, mediaType: { Self.mediaType(ctx, $0) })
+            self.succession = succession
+            if let adopted, let role = ctx.pointee.streams[Int(adopted)] {
+                stream.pointee.discard = role.pointee.discard
+                EngineLog.emit("[Demuxer] program change: stream \(physical) (PID 0x\(String(stream.pointee.id, radix: 16))) "
+                               + "takes the role of stream \(adopted) (PID 0x\(String(role.pointee.id, radix: 16)))",
+                               category: .demux)
+            } else if discardsUnkeptStreams {
+                stream.pointee.discard = AVDISCARD_ALL
+            }
+        }
+        // Discarded from here on, but packets libavformat queued before (`find_stream_info` buffers
+        // what it read) still come out: a new stream's are not the reader's.
+        if succession.isNew(physical), ctx.pointee.streams[Int(physical)]?.pointee.discard == AVDISCARD_ALL {
+            return false
+        }
+        let logical = succession.logical(for: physical)
+        packet.pointee.stream_index = logical
+        let delivered = deliveredByLogical[logical]
+        let previous = delivered?.stream ?? logical
+        guard previous != physical else { return true }
+        if let delivered, packet.pointee.pos >= 0, packet.pointee.pos < delivered.since { return false }
+        deliveredByLogical[logical] = (physical, packet.pointee.pos)
+        let codec = { (index: Int32) in ctx.pointee.streams[Int(index)]?.pointee.codecpar.pointee.codec_id }
+        let change = ProgramSuccession.Change(logical: logical, from: previous, to: physical,
+                                              codecChanged: codec(previous) != codec(physical))
+        programChanges.append(change)
+        packet.pointee.opaque = UnsafeMutableRawPointer(bitPattern: programChanges.count)
+        EngineLog.emit("[Demuxer] program change reaches the reader: stream \(logical) now reads stream \(physical) "
+                       + "(was \(previous))\(change.codecChanged ? ", a different codec" : "")", category: .demux)
+        return true
     }
 
     /// A transport or program stream has no index: libavformat seeks it by a timestamp search, which
@@ -2170,14 +2288,18 @@ public final class Demuxer: @unchecked Sendable {
         decideCompositionRepairLocked()
     }
 
-    /// #409: a seek moves the read position, so the repair drops its picture-order anchor and
-    /// re-anchors on the landing keyframe. A seek that comes before the first read (the software
-    /// host's resume, #699) settles the verdict at the head first: sampled at the landing, the
-    /// stream would start on an open-GOP keyframe whose picture order is not 0, and the classifier
-    /// refuses that, so the whole session played in decode order. Caller holds `accessLock`.
-    private func noteCompositionRepairSeekLocked() {
+    /// Every seek moves the read position, and what follows the read position starts over here.
+    ///
+    /// #409: the repair drops its picture-order anchor and re-anchors on the landing keyframe. A seek
+    /// that comes before the first read (the software host's resume, #699) settles the verdict at the
+    /// head first: sampled at the landing, the stream would start on an open-GOP keyframe whose picture
+    /// order is not 0, and the classifier refuses that, so the whole session played in decode order.
+    /// Program succession: a reader restarts on the streams it chose at open, so a landing past (or
+    /// before) a program change is announced on its first packet again. Caller holds `accessLock`.
+    private func noteSeekLocked() {
         if !compositionRepairEvaluated { decideCompositionRepairLocked() }
         compositionRepair?.noteSeek()
+        deliveredByLogical.removeAll()
     }
 
     /// #409: reads far enough into the source for the verdict, holding every
@@ -2365,6 +2487,11 @@ public final class Demuxer: @unchecked Sendable {
             guard let code = Self.readFailureCode(ret, closeRequested: isCloseRequested) else { return nil }
             throw DemuxerError.readFailed(code: code)
         }
+        if let pkt = packet, !routeProgramSuccessionLocked(pkt, ctx) {
+            // A new stream the reader does not keep: discarded from here on, this one dropped.
+            trackedPacketFree(&packet)
+            return try readDemuxedPacketLocked()
+        }
         if let pkt = packet { recordKeyframeLocked(pkt, ctx) }
         if let pkt = packet { boundTimestampsLocked(pkt) }
         // #407: before anything reads a timestamp off this packet. The PTS on these streams was
@@ -2449,7 +2576,7 @@ public final class Demuxer: @unchecked Sendable {
               let timestamp = Self.ticks(forSeconds: seconds, timeBase: Self.avTimeBase) else { return false }
         // #409: the read position moves, so the repair drops its picture-order anchor and
         // re-anchors on the next keyframe (a seek always lands on one).
-        noteCompositionRepairSeekLocked()
+        noteSeekLocked()
         if let reader = timeSeekableReader {
             dropPeekedPacketsLocked()
             guard repositionTimeSeekable(reader, toSourceSeconds: seconds, streamIndex: -1) else { return false }
@@ -2485,7 +2612,7 @@ public final class Demuxer: @unchecked Sendable {
               streamIndex < Int32(ctx.pointee.nb_streams) else { return false }
         // #409: the read position moves, so the repair drops its picture-order anchor and
         // re-anchors on the next keyframe (a seek always lands on one).
-        noteCompositionRepairSeekLocked()
+        noteSeekLocked()
         if let reader = timeSeekableReader,
            let stream = ctx.pointee.streams[Int(streamIndex)] {
             let timeBase = stream.pointee.time_base
@@ -2630,7 +2757,7 @@ public final class Demuxer: @unchecked Sendable {
         guard let timestamp = Self.ticks(forSeconds: seconds, timeBase: timeBase) else { return false }
         // #409: the read position moves, so the repair drops its picture-order anchor and
         // re-anchors on the next keyframe (a seek always lands on one).
-        noteCompositionRepairSeekLocked()
+        noteSeekLocked()
         // #268: a time-seekable source repositions itself instead of paying libavformat's byte-space
         // binary search, which on an index-less MPEG-TS is either wedged or broken (round 10 below) and
         // over HTTP would additionally be a request storm. No read deadline is armed: the reader's
@@ -2939,7 +3066,7 @@ public final class Demuxer: @unchecked Sendable {
         accessLock.lock()
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return false }
-        noteCompositionRepairSeekLocked()  // #409: re-anchor on the next keyframe
+        noteSeekLocked()  // #409: re-anchor on the next keyframe
         guard isSourceSeekable else { return false }  // audit HLS-103, see `seek(to:)`
         dropPeekedPacketsLocked()
         let ret = avformat_seek_file(ctx, -1, Int64.min, byteTarget, Int64.max, AVSEEK_FLAG_BYTE)
@@ -3081,6 +3208,11 @@ public final class Demuxer: @unchecked Sendable {
         dropPeekedPacketsLocked()
         dropHeldDolbyVisionBaseLocked()
         recordsKeyframes = nil
+        succession = nil
+        judgedStreams.removeAll()
+        deliveredByLogical.removeAll()
+        programChanges.removeAll()
+        discardsUnkeptStreams = false
         doviLayers = nil
         foldsBluRayDolbyVisionLayers = false
         if formatContext != nil {

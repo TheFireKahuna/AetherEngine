@@ -11,7 +11,8 @@ import Foundation
 ///         -x264-params aud=1:repeat-headers=1:b-pyramid=0 -f h264
 ///
 /// and `matroska` is the same stream remuxed (`-c copy`) into Matroska. The composition offsets are
-/// the ones ffmpeg's own mpegts muxer gave those frames.
+/// the ones ffmpeg's own mpegts muxer gave those frames. `ac3` is 22 AC-3 frames of 256 bytes
+/// (`ffmpeg -f lavfi -i sine=frequency=440:sample_rate=48000:duration=0.7 -c:a ac3 -b:a 64k -f ac3`).
 enum TransportStreamFixture {
 
     static let h264 = Data(base64Encoded: """
@@ -98,6 +99,84 @@ enum TransportStreamFixture {
         6vCCBoq7kbOCBLC3i/eBAfGCAerwgghOu5GzggZAt4v3gQHxggHq8IIKEg==
         """, options: .ignoreUnknownCharacters)!
 
+    static let ac3 = Data(base64Encoded: """
+        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
+        +GrqC6VW+FKJC7XYdkovLiENneDtdg==
+        """, options: .ignoreUnknownCharacters)!
+
+    /// `ac3` split into its frames.
+    static let audioFrames: [[UInt8]] = {
+        let bytes = [UInt8](ac3)
+        return stride(from: 0, to: bytes.count, by: 256).map { Array(bytes[$0..<min($0 + 256, bytes.count)]) }
+    }()
+
     struct AccessUnit {
         var bytes: [UInt8]
         /// PTS minus DTS, in 90 kHz ticks.
@@ -134,6 +213,9 @@ enum TransportStreamFixture {
         /// The PMT's stream_type for the video: 0x1B H.264, 0x24 HEVC.
         var videoStreamType: UInt8 = 0x1B
         var pmtVersion: UInt8 = 0
+        /// An AC-3 track on this PID, one frame beside each video frame; nil for none.
+        var audioPID: Int? = nil
+        var audioStreamType: UInt8 = 0x81
         /// The PMT's stream_identifier_descriptor tag for the video, which libavformat matches a
         /// changed PMT's streams by when it merges versions.
         var componentTag: UInt8?
@@ -168,19 +250,13 @@ enum TransportStreamFixture {
                 let pts = dts + unit.compositionOffset
                 var payload = unit.bytes
                 if padding > 0 { payload += [0, 0, 0, 1, 0x0C] + [UInt8](repeating: 0xFF, count: padding) + [0x80] }
+                if let audioPID = program.audioPID {
+                    w.pes(pid: audioPID, Writer.audioPES(pts: dts, payload: audioFrames[frame % audioFrames.count]))
+                }
                 if unit.isKey { keyframes.append((Int64(w.bytes.count), dts)) }
                 frames.append((dts, pts))
-                let pes = Writer.pes(streamID: 0xE0, pts: pts, dts: dts, payload: payload)
-                var at = 0
-                var first = true
-                while at < pes.count {
-                    let adaptation = first ? Writer.pcrAdaptation(dts - 3000, randomAccess: unit.isKey) : nil
-                    let room = 184 - (adaptation.map { $0.count + 1 } ?? 0)
-                    let n = min(room, pes.count - at)
-                    w.cell(pid: program.videoPID, start: first, adaptation: adaptation, payload: pes[at..<at + n])
-                    at += n
-                    first = false
-                }
+                w.pes(pid: program.videoPID, Writer.pes(streamID: 0xE0, pts: pts, dts: dts, payload: payload),
+                      firstAdaptation: Writer.pcrAdaptation(dts - 3000, randomAccess: unit.isKey))
                 frame += 1
             }
         }
@@ -189,10 +265,16 @@ enum TransportStreamFixture {
 
     private static func pmt(_ program: Program) -> [UInt8] {
         let descriptors: [UInt8] = program.componentTag.map { [0x52, 1, $0] } ?? []
+        // The HDMV registration is what makes 0x81 AC-3 (Blu-ray's stream types).
+        let programInfo: [UInt8] = [0x05, 4] + Array("HDMV".utf8)
+        var streams: [UInt8] = [program.videoStreamType, 0xE0 | UInt8(program.videoPID >> 8), UInt8(program.videoPID & 0xFF),
+                                0xF0, UInt8(descriptors.count)] + descriptors
+        if let audioPID = program.audioPID {
+            streams += [program.audioStreamType, 0xE0 | UInt8(audioPID >> 8), UInt8(audioPID & 0xFF), 0xF0, 0x00]
+        }
         let body: [UInt8] = [0x00, 0x01, 0xC1 | (program.pmtVersion & 0x1F) << 1, 0x00, 0x00,
-                             0xE0 | UInt8(program.videoPID >> 8), UInt8(program.videoPID & 0xFF), 0xF0, 0x00,
-                             program.videoStreamType, 0xE0 | UInt8(program.videoPID >> 8), UInt8(program.videoPID & 0xFF),
-                             0xF0, UInt8(descriptors.count)] + descriptors
+                             0xE0 | UInt8(program.videoPID >> 8), UInt8(program.videoPID & 0xFF),
+                             0xF0, UInt8(programInfo.count)] + programInfo + streams
         return [0x02, 0xB0 | UInt8(((body.count + 4) >> 8) & 0x0F), UInt8((body.count + 4) & 0xFF)] + body
     }
 
@@ -217,6 +299,20 @@ enum TransportStreamFixture {
             }
             out += payload
             bytes += out
+        }
+
+        /// One PES over as many cells as it takes; `firstAdaptation` rides the first.
+        mutating func pes(pid: Int, _ pes: [UInt8], firstAdaptation: [UInt8]? = nil) {
+            var at = 0
+            var first = true
+            while at < pes.count {
+                let adaptation = first ? firstAdaptation : nil
+                let room = 184 - (adaptation.map { $0.count + 1 } ?? 0)
+                let n = min(room, pes.count - at)
+                cell(pid: pid, start: first, adaptation: adaptation, payload: pes[at..<at + n])
+                at += n
+                first = false
+            }
         }
 
         mutating func section(pid: Int, _ section: [UInt8]) {
@@ -244,6 +340,13 @@ enum TransportStreamFixture {
         static func pes(streamID: UInt8, pts: Int64, dts: Int64, payload: [UInt8]) -> [UInt8] {
             let header: [UInt8] = [0x84, 0xC0, 10] + timestamp(3, pts) + timestamp(1, dts)
             return [0, 0, 1, streamID, 0, 0] + header + payload
+        }
+
+        /// An audio PES in one cell: bounded, PTS only.
+        static func audioPES(pts: Int64, payload: [UInt8]) -> [UInt8] {
+            let header: [UInt8] = [0x84, 0x80, 5] + timestamp(2, pts)
+            let length = header.count + payload.count
+            return [0, 0, 1, 0xBD, UInt8(length >> 8), UInt8(length & 0xFF)] + header + payload
         }
 
         static func pcrAdaptation(_ base: Int64, randomAccess: Bool) -> [UInt8] {
