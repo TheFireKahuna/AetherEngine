@@ -8,7 +8,7 @@ import Foundation
 /// branches and address arithmetic folded away. One thread per output chroma sample writes that sample and the
 /// luma block it covers (2x2 for 4:2:0, 2x1 for 4:2:2, 1x1 for 4:4:4).
 enum PlanarFrameShaderSource {
-    static let source: String = template.replacingOccurrences(of: "/*PF_TABLES*/", with: tables) + bwdif
+    static let source: String = template.replacingOccurrences(of: "/*PF_TABLES*/", with: tables)
 
     /// The double-float constants and the exp2 / log2 tables, computed in double and written as hex float pairs, so
     /// the kernel's values are exactly the host's.

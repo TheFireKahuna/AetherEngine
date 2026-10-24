@@ -674,6 +674,10 @@ public final class AetherEngine: ObservableObject {
     /// Enhancement layer type for Profile 7 streams ("FEL" or "MEL") extracted from the first RPU.
     var sourceElType: String? = nil
 
+    /// Film in interlaced carriage, found by the load's sample (docs/software-route-gpu.md 6.4); the software host's
+    /// decoder takes it in `DeinterlaceConfig.film`.
+    var loadFilmCarriage: FilmCarriage? = nil
+
     /// `LoadOptions.felOverlay` was decided for this load: a FEL on the native route, its enhancement
     /// layer composed over AVPlayer's picture by `felOverlay`.
     var felOverlayWanted = false
@@ -4974,9 +4978,58 @@ public final class AetherEngine: ObservableObject {
         ) ?? (probeOpened ? nil : audioSourceStreamIndex)
         let resolvedInitialAudio = selectedAudio ?? probedDefaultAudioIndex
         activeAudioTrackIndex = resolvedInitialAudio >= 0 ? Int(resolvedInitialAudio) : nil
+        // Soft telecine (docs/software-route-gpu.md 6.1): an MPEG-2 or VC-1 stream at a 29.97 / 30 / 59.94 / 60 carriage
+        // that is film coded with repeat-field flags plays on the film rate's grid (FilmCadence), so the panel goes to the
+        // film rate. Decided from a decoded sample, as #232 does: the flags live in the pictures, not the container. VOD
+        // and seekable only, the sample moves the read position of the demuxer the session reuses.
+        var filmRate: Double?
+        loadFilmCarriage = nil
+        if probeOpened, !options.isLive, probe.isSourceSeekable, probe.videoStreamIndex >= 0,
+           Self.carriesSoftTelecine(codecID: detectedCodecID, contentRate: detectedRate) {
+            let videoIdx = probe.videoStreamIndex
+            let rate = await BlockingWork.detached(priority: .userInitiated) { [probe] () -> AVRational? in
+                let rate = InterlaceProbe.filmRate(demuxer: probe, streamIndex: videoIdx)
+                guard probe.seekBounded(to: 0, timeout: Self.probeRewindSeekTimeout) else { return nil }
+                return rate
+            }.value
+            if loadGeneration != gen {
+                probe.markClosed()
+                BlockingWork.detached { [probe] in probe.close() }
+                try checkLoadCurrent(gen)
+            }
+            if let rate {
+                filmRate = Double(rate.num) / Double(rate.den)
+                EngineLog.emit("[AetherEngine] soft telecine: film at \(rate.num)/\(rate.den) in "
+                               + String(format: "%.3f", detectedRate ?? 0) + " fps carriage; the panel goes to the film rate",
+                               category: .engine)
+            }
+        }
+        // Hard telecine and progressive-segmented film (6.2 - 6.4): film whose cadence is in the pixels. The same kind of
+        // sample, measured as fieldmatch and decimate measure it; 3:2 plays at 4/5 of the carriage rate, 2:2 at it.
+        if filmRate == nil, probeOpened, !options.isLive, probe.isSourceSeekable, probe.videoStreamIndex >= 0,
+           Self.mayCarryFilm(codecID: detectedCodecID, fieldOrder: detectedFieldOrder, contentRate: detectedRate) {
+            let videoIdx = probe.videoStreamIndex
+            let film = await BlockingWork.detached(priority: .userInitiated) { [probe] () -> FilmCarriage? in
+                let film = InterlaceProbe.filmCarriage(demuxer: probe, streamIndex: videoIdx)
+                guard probe.seekBounded(to: 0, timeout: Self.probeRewindSeekTimeout) else { return nil }
+                return film
+            }.value
+            if loadGeneration != gen {
+                probe.markClosed()
+                BlockingWork.detached { [probe] in probe.close() }
+                try checkLoadCurrent(gen)
+            }
+            if let film, let detectedRate {
+                loadFilmCarriage = film
+                filmRate = film == .pulldown32 ? detectedRate * 4 / 5 : detectedRate
+                EngineLog.emit("[AetherEngine] film in interlaced carriage (\(film.rawValue)) at "
+                               + String(format: "%.3f", detectedRate) + " fps; inverse telecine, panel "
+                               + String(format: "%.3f", filmRate ?? 0), category: .engine)
+            }
+        }
         // #7: the field rate when the software deinterlacer will output one; `detectedRate` stays the
         // content rate for everything else that reads it.
-        let displayRate = Self.displayFrameRate(
+        let displayRate = filmRate ?? Self.displayFrameRate(
             contentRate: detectedRate, codecID: detectedCodecID, fieldOrder: detectedFieldOrder,
             deinterlaceFieldRate: options.deinterlaceFieldRate)
         if let displayRate, let detectedRate, displayRate != detectedRate {

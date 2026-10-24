@@ -211,7 +211,28 @@ final class DecodeFrameAllocator: @unchecked Sendable {
         return (PlanarFrameFinisher.Planes(buffer: slab.buffer, offsets: offsets, linesizes: sizes), slab)
     }
 
-    /// Returns a slab from ``copy(_:)``.
+    /// An empty picture of `format` in a slab, planes 64-byte aligned (the inverse-telecine stages' outputs). The slab
+    /// goes back through ``release(_:)``.
+    func picture(format: AVPixelFormat, width: Int32, height: Int32) -> (planes: PlanarFrameFinisher.Planes, slab: Slab)? {
+        let size = av_image_get_buffer_size(format, width, height, Int32(Self.planeAlignment))
+        guard size > 0, let slab = takeSlab(length: Int(size) + Self.planeAlignment) else { return nil }
+        var data = [UnsafeMutablePointer<UInt8>?](repeating: nil, count: 4)
+        var linesize = [Int32](repeating: 0, count: 4)
+        guard av_image_fill_arrays(&data, &linesize, slab.contents.assumingMemoryBound(to: UInt8.self), format,
+                                   width, height, Int32(Self.planeAlignment)) >= 0 else {
+            release(slab)
+            return nil
+        }
+        var offsets = [UInt32](repeating: 0, count: 4), sizes = [UInt32](repeating: 0, count: 4)
+        for i in 0..<4 {
+            guard let pointer = data[i], let offset = slab.offset(of: pointer) else { continue }
+            offsets[i] = UInt32(offset)
+            sizes[i] = UInt32(linesize[i])
+        }
+        return (PlanarFrameFinisher.Planes(buffer: slab.buffer, offsets: offsets, linesizes: sizes), slab)
+    }
+
+    /// Returns a slab from ``copy(_:)`` or ``picture(format:width:height:)``.
     func release(_ slab: Slab) { giveBack(slab) }
 
     fileprivate func giveBack(_ slab: Slab) {

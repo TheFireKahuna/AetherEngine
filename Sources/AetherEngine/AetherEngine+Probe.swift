@@ -1177,6 +1177,24 @@ extension AetherEngine {
     /// MKV) and 480i29.97 (MPEG-PS, MP4) all report their FRAME rate in both `avg_frame_rate` and
     /// `r_frame_rate`. When #232's frame sample later refutes the declaration and routes native, the
     /// panel is at twice a progressive rate, which shows every picture for exactly two refreshes.
+    /// Soft telecine (docs/software-route-gpu.md 6.1) is worth sampling for: a codec the software route always takes that
+    /// signals field repeats (MPEG-2 `repeat_first_field`, VC-1 `RFF` / `RPTFRM`), at a carriage film is telecined into
+    /// (29.97 / 30 frames, or 59.94 / 60 for a progressive sequence). H.264 signals it too (`pic_struct`), but a
+    /// soft-telecined H.264 stream is progressive-flagged and plays native (#232).
+    nonisolated static func carriesSoftTelecine(codecID: AVCodecID, contentRate: Double?) -> Bool {
+        guard codecID == AV_CODEC_ID_MPEG2VIDEO || codecID == AV_CODEC_ID_VC1, let contentRate else { return false }
+        return [30000.0 / 1001, 30, 60000.0 / 1001, 60].contains { abs($0 - contentRate) < 0.01 }
+    }
+
+    /// Film can sit in this interlaced carriage with its cadence in the pixels (docs/software-route-gpu.md 6.2 - 6.4):
+    /// a codec the software route takes interlaced (MPEG-2, VC-1 always; H.264 declared interlaced, #107) at 25, 29.97
+    /// or 30 frames a second.
+    nonisolated static func mayCarryFilm(codecID: AVCodecID, fieldOrder: AVFieldOrder, contentRate: Double?) -> Bool {
+        guard let contentRate, [25.0, 30000.0 / 1001, 30].contains(where: { abs($0 - contentRate) < 0.01 }) else { return false }
+        if codecID == AV_CODEC_ID_MPEG2VIDEO || codecID == AV_CODEC_ID_VC1 { return true }
+        return codecID == AV_CODEC_ID_H264 && VideoRoutingPolicy.interlacedFieldOrders.contains(fieldOrder)
+    }
+
     nonisolated static func displayFrameRate(
         contentRate: Double?,
         codecID: AVCodecID,
