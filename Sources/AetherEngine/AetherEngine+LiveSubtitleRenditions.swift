@@ -208,20 +208,12 @@ extension AetherEngine {
         cues.count > maxLiveSubtitleCues ? Array(cues.suffix(maxLiveSubtitleCues)) : cues
     }
 
-    /// Audit FEA-107: this session was `.default`, a 7-day resource timeout and a disk cache, so one
-    /// endless body grew until jetsam. Ephemeral and finite, like the ingest readers' own.
-    ///
-    /// The fetches now run on the engine's one pool (`EngineHTTP`), carrying these two limits per
-    /// request and per task; the configuration states them for a caller that builds a session of its own.
+    /// Audit FEA-107: these fetches once ran on a `.default` session, a 7-day resource timeout and a
+    /// disk cache, so one endless body grew until jetsam. Finite, like the ingest readers' own: the
+    /// fetches run on the engine's one pool (`EngineHTTP`) and carry both limits, the idle one on the
+    /// request and the ceiling on the task.
     nonisolated static let liveSubtitleRenditionIdleSeconds: TimeInterval = 10
     nonisolated static let liveSubtitleRenditionResourceSeconds: TimeInterval = 30
-
-    nonisolated static func liveSubtitleRenditionSessionConfiguration() -> URLSessionConfiguration {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = liveSubtitleRenditionIdleSeconds
-        configuration.timeoutIntervalForResource = liveSubtitleRenditionResourceSeconds
-        return configuration
-    }
 
     /// `URLSession.shared` cannot carry a delegate, so this was the one engine fetch a host's trust
     /// decision could never reach. Owned and process-wide for the same reason the carriage probe's

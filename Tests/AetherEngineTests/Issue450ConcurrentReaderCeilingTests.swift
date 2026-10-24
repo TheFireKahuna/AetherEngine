@@ -97,10 +97,10 @@ struct Issue450ConcurrentReaderCeilingTests {
         let server = try #require(Self.makeOrigin())
         defer { server.stop() }
 
-        // The shipped configuration, not a copy of it: a test that rebuilds the config it means to
-        // check can keep passing after the shipped one changes underneath it.
-        let session = URLSession(configuration: AVIOReader.makeSessionConfig(longLived: true))
-        defer { session.invalidateAndCancel() }
+        // The shipped pool, not a copy of its configuration: a test that rebuilds the config it means
+        // to check can keep passing after the shipped one changes underneath it. Shared, so it is not
+        // invalidated here; the requests end with the origin.
+        let session = EngineHTTP.session
 
         Self.fireOpenEnded(session, port: server.port, count: 3)
         try await waitFor { Self.pathsSeen(server).count >= 3 }

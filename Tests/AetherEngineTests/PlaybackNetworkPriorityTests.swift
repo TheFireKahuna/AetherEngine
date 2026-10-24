@@ -10,10 +10,8 @@ struct PlaybackNetworkPriorityTests {
     func utilityRequestCompletion() async throws {
         let origin = try #require(ThrottledOriginServer(totalSize: 64))
         defer { origin.stop() }
-        let queue = AVIOReader.makePlaybackDelegateQueue()
-        let session = URLSession(configuration: AVIOReader.makeSessionConfig(),
-                                 delegate: EngineTLS.sessionDelegate, delegateQueue: queue)
-        defer { session.invalidateAndCancel() }
+        // The shipped pool and its callback queue.
+        let session = EngineHTTP.session
         let result = ProbeTestBox<(qos_class_t, Int, Bool)?>(nil)
         let url = try #require(URL(string: "http://127.0.0.1:\(origin.port)/sample.bin"))
         let task = session.dataTask(with: url) { data, _, error in
@@ -32,7 +30,7 @@ struct PlaybackNetworkPriorityTests {
     @Test("serial callbacks execute at the foreground demux priority",
           .timeLimit(.minutes(1)))
     func foregroundCallbacks() async throws {
-        let queue = AVIOReader.makePlaybackDelegateQueue()
+        let queue = EngineHTTP.delegateQueue
         #expect(queue.qualityOfService == .userInitiated)
         #expect(queue.maxConcurrentOperationCount == 1)
         let observed = ProbeTestBox<qos_class_t?>(nil)

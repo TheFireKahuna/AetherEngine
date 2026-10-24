@@ -15,7 +15,8 @@ extension AetherEngine {
         -> HTTPDiscIOReader?
     {
         HTTPDiscIOReader(url: url, extraHeaders: headers, baseChunkSize: 4096, maxChunkSize: 4 * 1024 * 1024,
-                         knownSize: SourceContentLengthCache.lookup(url), sourceCache: .shared, label: label)
+                         knownSize: SourceByteCache.shared.knownSize(SourceCacheKey(url: url, headers: headers)),
+                         sourceCache: .shared, label: label)
     }
 
     /// A subtitle stream as libavformat lists it, with what an index consumer needs beside it.
