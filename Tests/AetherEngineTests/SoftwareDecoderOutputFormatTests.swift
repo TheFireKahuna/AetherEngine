@@ -4,7 +4,6 @@ import CoreMedia
 import Testing
 import AetherLibavcodec
 import AetherLibavutil
-import AetherLibswscale
 @testable import AetherEngine
 
 /// Audit DEC-107: `SoftwareVideoDecoder` hard-wired its output to 8-bit or 10-bit VIDEO range from the
@@ -16,7 +15,7 @@ struct SoftwareDecoderOutputFormatTests {
 
     // MARK: - The decision
 
-    @Test("full range is carried as a label on 8-bit and on 10-bit output")
+    @Test("a full-range frame goes out full range on 8-bit and on 10-bit output")
     func fullRangeIsALabel() {
         let eight = SoftwareVideoDecoder.outputFormat(
             pixelFormat: AV_PIX_FMT_YUV420P.rawValue, colorRange: AVCOL_RANGE_JPEG, streamIs10Bit: false)
@@ -44,7 +43,7 @@ struct SoftwareDecoderOutputFormatTests {
         let format = SoftwareVideoDecoder.outputFormat(
             pixelFormat: AV_PIX_FMT_YUV420P10LE.rawValue, colorRange: AVCOL_RANGE_MPEG, streamIs10Bit: false)
         #expect(format == .init(tenBit: true, fullRange: false))
-        #expect(format.swscaleFormat == AV_PIX_FMT_P010LE)
+        #expect(format.pixelFormatType == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
     }
 
     @Test("the stream's own 10-bit verdict is never narrowed by an 8-bit frame")
@@ -54,8 +53,6 @@ struct SoftwareDecoderOutputFormatTests {
         #expect(format.tenBit)
     }
 
-    /// #8: this pinned the old behaviour, a yuvj picture squeezed to video range by swscale. swscale is
-    /// now told full range on both sides, so the levels are copied and the buffer is tagged full range.
     @Test("a yuvj source stays full range, even when color_range does not say so")
     func yuvjStaysFullRange() {
         for range in [AVCOL_RANGE_JPEG, AVCOL_RANGE_UNSPECIFIED] {
@@ -70,21 +67,6 @@ struct SoftwareDecoderOutputFormatTests {
         let format = SoftwareVideoDecoder.outputFormat(
             pixelFormat: AV_PIX_FMT_GBRP.rawValue, colorRange: AVCOL_RANGE_JPEG, streamIs10Bit: false)
         #expect(!format.fullRange)
-    }
-
-    @Test("swscale gets bicubic and full chroma only where chroma is resampled; luma is never scaled")
-    func swscaleFlags() {
-        func setup(_ src: AVPixelFormat, _ dst: AVPixelFormat) -> SoftwareVideoDecoder.SwscaleSetup {
-            .init(width: 64, height: 64, source: src, destination: dst, sourceFullRange: false,
-                  destinationFullRange: false, colorspace: SWS_CS_ITU709)
-        }
-        let same = setup(AV_PIX_FMT_YUV420P, AV_PIX_FMT_NV12)
-        #expect(!same.resamplesChroma)
-        #expect(same.flags == Int32(SWS_BILINEAR.rawValue | SWS_ACCURATE_RND.rawValue))
-        #expect(!setup(AV_PIX_FMT_YUV422P10LE, AV_PIX_FMT_P210LE).resamplesChroma)
-        #expect(setup(AV_PIX_FMT_YUV420P12LE, AV_PIX_FMT_P216LE).resamplesChroma)
-        #expect(setup(AV_PIX_FMT_GBRP, AV_PIX_FMT_NV24).resamplesChroma)
-        #expect(setup(AV_PIX_FMT_YUV411P, AV_PIX_FMT_NV16).flags & Int32(SWS_BICUBIC.rawValue) != 0)
     }
 
     // MARK: - Native subsampling and depth (#8)
@@ -105,21 +87,17 @@ struct SoftwareDecoderOutputFormatTests {
         #expect(format(AV_PIX_FMT_YUV422P10LE, AVCOL_RANGE_JPEG).pixelFormatType == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange)
         #expect(format(AV_PIX_FMT_YUV444P10LE).pixelFormatType == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange)
         #expect(format(AV_PIX_FMT_YUV444P10LE, AVCOL_RANGE_JPEG).pixelFormatType == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange)
-        #expect(format(AV_PIX_FMT_YUV422P10LE).swscaleFormat == AV_PIX_FMT_P210LE)
-        #expect(format(AV_PIX_FMT_YUV444P).swscaleFormat == AV_PIX_FMT_NV24)
     }
 
     @Test("#8: 12-bit 4:2:2 / 4:4:4 keep all their bits in sv22 / sv44, video range only")
     func twelveBitKeptInSixteen() {
         #expect(format(AV_PIX_FMT_YUV422P12LE).pixelFormatType == kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange)
         #expect(format(AV_PIX_FMT_YUV444P12LE).pixelFormatType == kCVPixelFormatType_444YpCbCr16BiPlanarVideoRange)
-        #expect(format(AV_PIX_FMT_YUV422P12LE).swscaleFormat == AV_PIX_FMT_P216LE)
         #expect(!format(AV_PIX_FMT_YUV422P12LE).dithers)
         // sv22 / sv44 have no full-range variant: the 10-bit full-range format, dithered.
         let full422 = format(AV_PIX_FMT_YUV422P12LE, AVCOL_RANGE_JPEG)
         #expect(full422.pixelFormatType == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange)
         #expect(full422.dithers)
-        #expect(full422.swscaleFormat == AV_PIX_FMT_P216LE, "swscale writes 16 bits; the dither cuts them to 10")
         #expect(format(AV_PIX_FMT_YUV444P12LE, AVCOL_RANGE_JPEG).pixelFormatType == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange)
     }
 
@@ -128,7 +106,6 @@ struct SoftwareDecoderOutputFormatTests {
         let dithered = format(AV_PIX_FMT_YUV420P12LE)
         #expect(dithered.pixelFormatType == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
         #expect(dithered.dithers)
-        #expect(dithered.swscaleFormat == AV_PIX_FMT_P016LE)
         #expect(format(AV_PIX_FMT_YUV420P12LE, twelveBit420: .sv22).pixelFormatType
                 == kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange)
         let fullSV22 = format(AV_PIX_FMT_YUV420P12LE, AVCOL_RANGE_JPEG, twelveBit420: .sv22)
@@ -144,6 +121,17 @@ struct SoftwareDecoderOutputFormatTests {
         #expect(format(AV_PIX_FMT_GBRP).chroma == .yuv444)
         #expect(format(AV_PIX_FMT_GRAY8).chroma == .yuv420)
         #expect(format(AV_PIX_FMT_GBRP10LE).pixelFormatType == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange)
+        #expect(format(AV_PIX_FMT_PAL8).chroma == .yuv444, "a palette is RGB")
+        #expect(!format(AV_PIX_FMT_PAL8, AVCOL_RANGE_JPEG).fullRange)
+    }
+
+    @Test("an interlaced 12-bit 4:2:0 picture stays 4:2:0 (dithered) even when sv22 is asked for")
+    func interlacedKeepsItsChromaRows() {
+        let interlaced = SoftwareVideoDecoder.outputFormat(
+            pixelFormat: AV_PIX_FMT_YUV420P12LE.rawValue, colorRange: AVCOL_RANGE_MPEG, streamIs10Bit: true,
+            twelveBit420: .sv22, interlaced: true)
+        #expect(interlaced.chroma == .yuv420)
+        #expect(interlaced.dithers)
     }
 
     @Test("#8: every output format reads back from its own pixel format type")
@@ -157,22 +145,6 @@ struct SoftwareDecoderOutputFormatTests {
             }
         }
         #expect(SoftwareVideoDecoder.OutputFormat(pixelFormatType: kCVPixelFormatType_32BGRA) == nil)
-    }
-
-    /// 12-bit 2049 is 10-bit 512.25: a quarter of the 8x8 cells must round up, so the block averages
-    /// back to the 12-bit value, and every word is a clean 10-bit code (low six bits clear).
-    @Test("#8: the ordered dither keeps a 12-bit level's mean in 10-bit codes, saturating at the top")
-    func ditherKeepsTheMean() {
-        var words = [UInt16](repeating: 2049 << 4, count: 8 * 8)
-        words[63] = 0xFFFF
-        words.withUnsafeMutableBytes { raw in
-            SoftwareVideoDecoder.ditherTo10Bit(plane: raw.baseAddress!, bytesPerRow: 16, width: 8, height: 8)
-        }
-        #expect(words.allSatisfy { $0 & 0x3F == 0 })
-        #expect(words[63] == 0xFFC0)
-        let codes = words[0..<63].map { Int($0 >> 6) }
-        #expect(Set(codes) == [512, 513])
-        #expect(codes.filter { $0 == 513 }.count == 16, "the 16 Bayer cells at 48 or above; the saturated corner is not one of them")
     }
 
     // MARK: - Real decodes
@@ -214,7 +186,7 @@ struct SoftwareDecoderOutputFormatTests {
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         let luma = try #require(CVPixelBufferGetBaseAddressOfPlane(buffer, 0)).assumingMemoryBound(to: UInt8.self)
-        #expect(luma[0] == 255, "no range conversion: the decoder's bytes are copied across and only labelled")
+        #expect(luma[0] == 255, "8-bit full range to 8-bit full range keeps every code")
     }
 
     @Test("a 10-bit SDR AV1 picture stays 10-bit instead of being dithered to 8")
@@ -242,41 +214,6 @@ struct SoftwareDecoderOutputFormatTests {
         for y in 0..<64 { for x in 0..<64 { codes.insert(luma[y * stride + x]) } }
         #expect(codes.allSatisfy { $0 & 0x3F == 0 }, "nothing left in P010's padding bits")
         #expect(codes.count <= 2, "a flat 12-bit level is at most two adjacent 10-bit codes")
-    }
-
-    /// The linked FFmpeg has no JPEG decoder, so the yuvj picture is built here and run through the
-    /// decoder's own conversion context.
-    @Test("a yuvj picture is copied into the full-range buffer level for level, not squeezed to 16...235")
-    func yuvjCopiedAtFullRange() throws {
-        let setup = SoftwareVideoDecoder.SwscaleSetup(
-            width: 64, height: 64, source: AV_PIX_FMT_YUVJ420P, destination: AV_PIX_FMT_NV12,
-            sourceFullRange: true, destinationFullRange: true, colorspace: SWS_CS_ITU601)
-        let ctx = try #require(setup.makeContext())
-        defer { sws_freeContext(ctx) }
-        var src: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
-        var dst: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
-        defer { av_frame_free(&src); av_frame_free(&dst) }
-        let s = try #require(src), d = try #require(dst)
-        s.pointee.width = 64; s.pointee.height = 64; s.pointee.format = AV_PIX_FMT_YUVJ420P.rawValue
-        d.pointee.width = 64; d.pointee.height = 64; d.pointee.format = AV_PIX_FMT_NV12.rawValue
-        #expect(av_frame_get_buffer(s, 0) >= 0 && av_frame_get_buffer(d, 0) >= 0)
-        memset(s.pointee.data.0, 255, Int(s.pointee.linesize.0) * 64)
-        memset(s.pointee.data.1, 128, Int(s.pointee.linesize.1) * 32)
-        memset(s.pointee.data.2, 128, Int(s.pointee.linesize.2) * 32)
-        withUnsafePointer(to: &s.pointee.data) { sp in
-            withUnsafePointer(to: &s.pointee.linesize) { sl in
-                withUnsafePointer(to: &d.pointee.data) { dp in
-                    withUnsafePointer(to: &d.pointee.linesize) { dl in
-                        _ = sws_scale(ctx,
-                                      UnsafeRawPointer(sp).assumingMemoryBound(to: UnsafePointer<UInt8>?.self),
-                                      UnsafeRawPointer(sl).assumingMemoryBound(to: Int32.self), 0, 64,
-                                      UnsafeRawPointer(dp).assumingMemoryBound(to: UnsafeMutablePointer<UInt8>?.self),
-                                      UnsafeRawPointer(dl).assumingMemoryBound(to: Int32.self))
-                    }
-                }
-            }
-        }
-        #expect(d.pointee.data.0![32 * Int(d.pointee.linesize.0) + 32] == 255)
     }
 
     /// Red through BT.709 is luma 63 in video range; through swscale's default BT.601 it is 82, which

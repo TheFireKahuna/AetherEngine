@@ -55,6 +55,11 @@ enum VideoDecoderError: Error, LocalizedError {
     case unsupportedCodec(id: UInt32)
     case noExtradata
     case formatDescriptionFailed(status: OSStatus)
+    /// The software decoder's pictures are in a pixel format its GPU finisher cannot read (hardware, Bayer, float
+    /// or XYZ samples, or Y'CbCr below 8 bits).
+    case unsupportedPixelFormat(name: String)
+    /// No Metal device: the software decoder's display path is a GPU pass.
+    case metalUnavailable
     case sessionCreationFailed(status: OSStatus)
     /// `DualLayerVideoDecoder` is single use (dolby-vision-fel.md §5.8): `open` after `close` refuses
     /// with this instead of inheriting the previous stream's state. Thrown rather than a
@@ -76,6 +81,8 @@ enum VideoDecoderError: Error, LocalizedError {
         case .unsupportedCodec(let id): "Unsupported video codec (id: \(id))"
         case .noExtradata: "Missing codec extradata"
         case .formatDescriptionFailed(let s): "Format description failed (\(s))"
+        case .unsupportedPixelFormat(let name): "Decoded pixel format \(name) cannot be displayed"
+        case .metalUnavailable: "No Metal device for the software decoder's display path"
         case .sessionCreationFailed(let s): "Decoder session failed (\(s))"
         case .decoderClosed: "Decoder is closed (single use)"
         case .composerUnavailable: "Dolby Vision FEL composer unavailable (no Metal device or shader compilation failed)"
