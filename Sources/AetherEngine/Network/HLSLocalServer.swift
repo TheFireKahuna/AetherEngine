@@ -125,6 +125,10 @@ protocol HLSSegmentProvider: AnyObject {
     var iFrameRenditionFormat: IFrameRenditionFormat? { get }
     func iFrameInitSegment() -> Data?
     func iFrameSegment(at index: Int) -> Data?
+    /// The SDR companion an HDR session lists beside its keyframes (`iframe_sdr.m3u8`), nil when none.
+    var iFrameCompanionFormat: IFrameRenditionFormat? { get }
+    func iFrameCompanionInitSegment() -> Data?
+    func iFrameCompanionSegment(at index: Int) -> Data?
 
     /// Atomic snapshot at the top of each playlist build. discontinuitySequence = EXT-X-DISCONTINUITY-tagged segments that slid out of the window (RFC 8216 §6.2.2 requires incrementing it; omission slips AVPlayer's discontinuity tracking one window per boundary). firstVisible in the same snapshot: a separate lock acquisition let a concurrent slide produce MEDIA-SEQUENCE newer than the count.
     func notePlaylistBuild() -> (visibleCount: Int, firstVisible: Int, refreshCounter: Int, endlistAdded: Bool, discontinuitySequence: Int)
@@ -206,6 +210,9 @@ extension HLSSegmentProvider {
     var iFrameRenditionFormat: IFrameRenditionFormat? { nil }
     func iFrameInitSegment() -> Data? { nil }
     func iFrameSegment(at index: Int) -> Data? { nil }
+    var iFrameCompanionFormat: IFrameRenditionFormat? { nil }
+    func iFrameCompanionInitSegment() -> Data? { nil }
+    func iFrameCompanionSegment(at index: Int) -> Data? { nil }
     var liveTargetSegmentDuration: Double? { nil }
     var liveRejoinStart: (segmentIndex: Int, secondsIntoSegment: Double)? { nil }
     func noteServedLiveRejoinPlacement(timeOffset: Double, firstVisible: Int) {}
@@ -1244,19 +1251,41 @@ final class HLSLocalServer: @unchecked Sendable {
             guard let prov = provider, prov.iFrameRenditionServed else {
                 return send404(fd: fd, path: normalizedPath, reason: "no I-frame rendition")
             }
-            if case .jpeg = prov.iFrameRenditionFormat, !waitForMainVariant() {
+            let body = Self.buildIFramePlaylistText(provider: prov, subResourceBaseURL: subResourceBaseURL)
+            return send200(fd: fd, path: normalizedPath, data: Data(body.utf8),
+                           contentType: "application/vnd.apple.mpegurl")
+
+        case "/iframe_sdr.m3u8":
+            guard let prov = provider, prov.iFrameRenditionServed, prov.iFrameCompanionFormat != nil else {
+                return send404(fd: fd, path: normalizedPath, reason: "no SDR I-frame companion")
+            }
+            if !waitForMainVariant() {
                 EngineLog.emit("[HLSLocalServer] i-frame rendition withheld: no media segment requested within "
                                + "\(Self.iFrameMainVariantWaitSeconds)s, so the HDR variant was refused",
                                category: .hlsServer)
                 return send404(fd: fd, path: normalizedPath, reason: "main variant not playing")
             }
-            let body = Self.buildIFramePlaylistText(provider: prov, subResourceBaseURL: subResourceBaseURL)
+            let body = Self.buildIFramePlaylistText(provider: prov, subResourceBaseURL: subResourceBaseURL,
+                                                    resourceName: "iframe_sdr")
             return send200(fd: fd, path: normalizedPath, data: Data(body.utf8),
                            contentType: "application/vnd.apple.mpegurl")
 
         case "/iframe_init.mp4":
             guard let data = provider?.iFrameInitSegment(), !data.isEmpty else {
                 return send404(fd: fd, path: normalizedPath, reason: "I-frame init unavailable")
+            }
+            return send200(fd: fd, path: normalizedPath, data: data, contentType: "video/mp4")
+
+        case "/iframe_sdr_init.mp4":
+            guard let data = provider?.iFrameCompanionInitSegment(), !data.isEmpty else {
+                return send404(fd: fd, path: normalizedPath, reason: "SDR I-frame init unavailable")
+            }
+            return send200(fd: fd, path: normalizedPath, data: data, contentType: "video/mp4")
+
+        case let p where p.hasPrefix("/iframe_sdr") && p.hasSuffix(".mp4"):
+            guard let index = Self.parseIFramePath(p, resourceName: "iframe_sdr"),
+                  let data = provider?.iFrameCompanionSegment(at: index), !data.isEmpty else {
+                return send404(fd: fd, path: normalizedPath, reason: "no SDR I-frame for \(normalizedPath)")
             }
             return send200(fd: fd, path: normalizedPath, data: data, contentType: "video/mp4")
 
@@ -1872,14 +1901,7 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         lines.append("#EXT-X-STREAM-INF:\(streamInfAttrs.joined(separator: ","))")
         lines.append("media.m3u8")
-        if provider.iFrameRenditionServed,
-           case .jpeg(let width, let height, let jpegBandwidth) = provider.iFrameRenditionFormat {
-            // AE#682: AVKit shows no scrub thumbnail from a PQ or Dolby Vision keyframe, so an HDR
-            // session lists SDR stills, the shape of Apple's own motion JPEG trick-play tier.
-            let iFrameAttrs = ["BANDWIDTH=\(jpegBandwidth)", "CODECS=\"mjpg\"", "RESOLUTION=\(width)x\(height)",
-                               "VIDEO-RANGE=SDR", "URI=\"iframe.m3u8\""]
-            lines.append("#EXT-X-I-FRAME-STREAM-INF:\(iFrameAttrs.joined(separator: ","))")
-        } else if provider.iFrameRenditionServed {
+        if provider.iFrameRenditionServed {
             // AE#682: BANDWIDTH is the variant's, an honest ceiling (one keyframe cannot outweigh the
             // segment it opens). A value below the real peak logs -12318 on every fetch.
             var iFrameAttrs = ["BANDWIDTH=\(bandwidth)", "CODECS=\"\(videoCodecs(of: codecs))\""]
@@ -1894,6 +1916,23 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             iFrameAttrs.append("URI=\"iframe.m3u8\"")
             lines.append("#EXT-X-I-FRAME-STREAM-INF:\(iFrameAttrs.joined(separator: ","))")
+            // An HDR session's SDR companion, Apple's own layout: AVKit's scrub thumbnail player takes the
+            // lowest video range on offer, the main player scans on the keyframes above.
+            switch provider.iFrameCompanionFormat {
+            case .jpeg(let width, let height, let jpegBandwidth):
+                let attrs = ["BANDWIDTH=\(jpegBandwidth)", "CODECS=\"mjpg\"", "RESOLUTION=\(width)x\(height)",
+                             "VIDEO-RANGE=SDR", "URI=\"iframe_sdr.m3u8\""]
+                lines.append("#EXT-X-I-FRAME-STREAM-INF:\(attrs.joined(separator: ","))")
+            case .keyframesLabeledSDR:
+                var attrs = ["BANDWIDTH=\(bandwidth)", "CODECS=\"\(videoCodecs(of: codecs))\""]
+                if let resolution = provider.masterResolution {
+                    attrs.append("RESOLUTION=\(resolution.width)x\(resolution.height)")
+                }
+                attrs += ["VIDEO-RANGE=SDR", "URI=\"iframe_sdr.m3u8\""]
+                lines.append("#EXT-X-I-FRAME-STREAM-INF:\(attrs.joined(separator: ","))")
+            case .keyframes, nil:
+                break
+            }
         }
         return lines.joined(separator: "\n") + "\n"
     }
@@ -1910,9 +1949,9 @@ final class HLSLocalServer: @unchecked Sendable {
 
     /// "/iframe{N}.mp4" -> N. nil for the init, for a negative or non-numeric index, and for any
     /// other path.
-    static func parseIFramePath(_ path: String) -> Int? {
-        guard path.hasPrefix("/iframe"), path.hasSuffix(".mp4") else { return nil }
-        let digits = path.dropFirst("/iframe".count).dropLast(".mp4".count)
+    static func parseIFramePath(_ path: String, resourceName: String = "iframe") -> Int? {
+        guard path.hasPrefix("/\(resourceName)"), path.hasSuffix(".mp4") else { return nil }
+        let digits = path.dropFirst(resourceName.count + 1).dropLast(".mp4".count)
         guard !digits.isEmpty, digits.allSatisfy(\.isNumber) else { return nil }
         return Int(digits)
     }
@@ -1921,7 +1960,8 @@ final class HLSLocalServer: @unchecked Sendable {
     /// EXTINF and TARGETDURATION as the VOD media playlist, so both renditions describe one timeline.
     /// VOD only; the caller never lists this rendition for a live or event session.
     static func buildIFramePlaylistText(provider: HLSSegmentProvider,
-                                        subResourceBaseURL: URL? = nil) -> String {
+                                        subResourceBaseURL: URL? = nil,
+                                        resourceName: String = "iframe") -> String {
         let count = provider.segmentCount
         var maxDuration: Double = 0
         for i in 0..<count { maxDuration = max(maxDuration, provider.segmentDuration(at: i)) }
@@ -1936,10 +1976,10 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         var lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-I-FRAMES-ONLY",
                      "#EXT-X-TARGETDURATION:\(targetDuration)", "#EXT-X-MEDIA-SEQUENCE:0",
-                     "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-MAP:URI=\"\(prefix)iframe_init.mp4\""]
+                     "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-MAP:URI=\"\(prefix)\(resourceName)_init.mp4\""]
         for i in 0..<count {
             lines.append("#EXTINF:\(String(format: "%.3f", provider.segmentDuration(at: i))),")
-            lines.append("\(prefix)iframe\(i).mp4")
+            lines.append("\(prefix)\(resourceName)\(i).mp4")
         }
         lines.append("#EXT-X-ENDLIST")
         return lines.joined(separator: "\n") + "\n"

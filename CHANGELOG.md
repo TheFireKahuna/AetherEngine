@@ -12,6 +12,19 @@ the public-API contract.
 
 ### Added
 
+- **An HDR session's I-frame rendition keeps its own keyframes and adds an SDR companion** (#682). With
+  `serveIFramePlaylist`, an HDR10, HLG or Dolby Vision session used to list tone-mapped Motion JPEG stills
+  instead of its keyframes. It now lists the keyframes with the variant's own codec and range (on a Dolby Vision
+  session `hvc1` with `SUPPLEMENTAL-CODECS="dvh1.08.06/db1p"` and `VIDEO-RANGE=PQ`, a profile 7 FEL source
+  converted to 8.1 like the playing samples), so trick play scans in HDR, and beside it the SDR tier
+  `LoadOptions.iFrameHDRStills` names (`iframe_sdr.m3u8`): `.toneMappedJPEG` (default), `.keyframesOnly`, or the
+  experimental `.keyframesLabeledSDR`. The layout is Apple's own: decoding tvOS 27.2's AVKit and MediaToolbox
+  shows the scrub thumbnail comes from a second AVPlayer with the Scanning role, which the resource arbiter leaves
+  without a preferred range, so its variant filter takes the lowest video range on offer. Measured on an Apple TV
+  4K (tvOS 27) with a Dolby Vision profile 7 title: thumbnails with the JPEG companion; with the keyframes alone,
+  only the frame at the playhead; with SDR-labelled keyframes, none. The companion is built from the same keyframe
+  reads, so it costs no second reader, and the three-second refused-variant guard now applies to it alone.
+
 - **Dolby Vision FEL titles keep their TrueHD Atmos.** The dual-layer route plays on the software host, which
   decoded TrueHD to its 7.1 presentation. With `objectAudioRendering` on (and the `TrueHDObjectAudio` trait), a
   TrueHD Atmos track there is now rendered to APAC as on the HLS route and played through the host's
@@ -248,6 +261,16 @@ the public-API contract.
   asked for again. That request is now skipped too; a partial warm keeps its tail prefetch.
 
 ### Changed
+
+- **SDR scrub stills decode on one VideoToolbox session and touch no disk** (#682). Each still used to wrap its
+  keyframe in an MP4 fragment written through a staging file, then open a demuxer, a decoder and a VideoToolbox
+  session over it and discard them. `FrameDecodeContext` gains a packet-fed mode, opened once from the stream's
+  parameters, into which `IFrameJPEGBuilder` hands the keyframe directly; the tone map, Dolby Vision reshaping
+  and colour handling are the ones every still uses. The keyframe tier's fragments are muxed in memory
+  (`MP4SegmentMuxer` `inMemory`, `takeFragmentInMemory()`), the keyframe payload cache is in memory with a
+  128 MB cap, and about 1,500 built stills stay in memory instead of 128. Before the change AVKit, which asks for
+  one still at a time, received one every 110 to 250 ms during a scrub. Every 20 stills the session log
+  now says where the time went: `[IFrameRendition] sdr stills: … build … ms; … source reads avg … ms, … KB`.
 
 - **LibTrueHD 4.0.0** (API 3; `TrueHDObjectAudio`). Each object metadata update carries the trims and warp
   mode in force for it, so the shipping bed split reads warp per update, timed with it, instead of the
