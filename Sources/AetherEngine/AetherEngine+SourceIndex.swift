@@ -21,7 +21,7 @@ extension AetherEngine {
 
     /// A subtitle stream as libavformat lists it, with what an index consumer needs beside it.
     struct IndexedSubtitleStream: Sendable {
-        let stream: MatroskaSubtitleIndex.SubtitleStream
+        let stream: MatroskaCueIndex.SubtitleStream
         let frames: Int?
         let timeBase: AVRational
     }
@@ -36,7 +36,7 @@ extension AetherEngine {
                 av_dict_get(st.pointee.metadata, key, nil, AV_DICT_IGNORE_SUFFIX).map { String(cString: $0.pointee.value) }
             }
             let frames = tag("NUMBER_OF_FRAMES").flatMap { Int($0) }
-            let subtitle = MatroskaSubtitleIndex.SubtitleStream(
+            let subtitle = MatroskaCueIndex.SubtitleStream(
                 streamIndex: index, trackID: st.pointee.id,
                 codecName: String(cString: avcodec_get_name(st.pointee.codecpar.pointee.codec_id)),
                 language: av_dict_get(st.pointee.metadata, "language", nil, 0).map { String(cString: $0.pointee.value) },

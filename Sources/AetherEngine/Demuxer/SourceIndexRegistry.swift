@@ -8,7 +8,7 @@ import Foundation
 /// exactly the bytes it needs. Read once per consumer, it is the same tens of megabytes of Cues
 /// parsed again for each, and the consumers disagree the moment one of them reads a different
 /// version. So there is one index per source, and the parser is reachable only from here:
-/// `MatroskaSubtitleIndex.read` takes a `ParseToken`, which nothing outside this file can make.
+/// `MatroskaCueIndex.read` takes a `ParseToken`, which nothing outside this file can make.
 ///
 /// An index is per source and per size, the source cache's identity (`SourceCacheKey`) plus the
 /// total, so a body that changes under the same request is a new entry rather than a stale one. The
@@ -43,10 +43,10 @@ final class SourceIndexRegistry: @unchecked Sendable {
     }
 
     enum Outcome: Sendable {
-        case matroska(MatroskaSubtitleIndex)
-        case unavailable(MatroskaSubtitleIndex.ReadError)
+        case matroska(MatroskaCueIndex)
+        case unavailable(MatroskaCueIndex.ReadError)
 
-        var index: MatroskaSubtitleIndex? {
+        var index: MatroskaCueIndex? {
             if case .matroska(let index) = self { return index }
             return nil
         }
@@ -92,8 +92,8 @@ final class SourceIndexRegistry: @unchecked Sendable {
             guard let source = open() else { return .unavailable(.malformed("source not range-readable")) }
             noteParse()
             do {
-                return .matroska(try MatroskaSubtitleIndex.read(from: source, token: ParseToken()))
-            } catch let error as MatroskaSubtitleIndex.ReadError {
+                return .matroska(try MatroskaCueIndex.read(from: source, token: ParseToken()))
+            } catch let error as MatroskaCueIndex.ReadError {
                 return .unavailable(error)
             } catch {
                 return .unavailable(.malformed("\(error)"))

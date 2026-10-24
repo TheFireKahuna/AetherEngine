@@ -8,9 +8,9 @@ import AetherLibavutil
 /// Diagnostic against a real remote MKV: `AE_MKV_INDEX_URL` (with `AE_MKV_INDEX_AUTH`, an Authorization
 /// header value) names the file. Reads its subtitle index, scans its first PGS track for forced display
 /// sets and reads a few text frames, timing each step. Runs only when the variable is set.
-@Suite("Matroska subtitle index, live file")
-struct MatroskaSubtitleIndexLiveTests {
-    private enum FrameEncodingNone { static let value: MatroskaSubtitleIndex.FrameEncoding? = MatroskaSubtitleIndex.FrameEncoding.none }
+@Suite("Matroska cue index, live file")
+struct MatroskaCueIndexLiveTests {
+    private enum FrameEncodingNone { static let value: MatroskaCueIndex.FrameEncoding? = MatroskaCueIndex.FrameEncoding.none }
 
     @Test("the index reads, and a PGS track's forced display sets are found from their headers")
     func liveIndex() throws {
@@ -25,7 +25,7 @@ struct MatroskaSubtitleIndexLiveTests {
         let source = IOReaderByteSource(reader)
         defer { source.close() }
         var started = Date()
-        let index = try MatroskaSubtitleIndex.read(from: source, token: .forParserTests)
+        let index = try MatroskaCueIndex.read(from: source, token: .forParserTests)
         print("[MKVIndex] index read in \(String(format: "%.2f", Date().timeIntervalSince(started))) s: "
               + "tracks \(index.blocksByTrack.keys.sorted()), scale \(index.timestampScale), "
               + "cluster size field \(index.clusterSizeFieldLength.map(String.init) ?? "varies")")
@@ -51,9 +51,9 @@ struct MatroskaSubtitleIndexLiveTests {
             try demuxer.open(url: url, extraHeaders: headers,
                              profile: DemuxerOpenProfile.subtitleSideDemuxer(callerProbesize: nil, callerMaxAnalyzeDuration: nil))
             defer { demuxer.close() }
-            var streams: [MatroskaSubtitleIndex.SubtitleStream] = []
+            var streams: [MatroskaCueIndex.SubtitleStream] = []
             var i: Int32 = 0
-            while let entry = demuxer.withStream(at: i, { st -> MatroskaSubtitleIndex.SubtitleStream? in
+            while let entry = demuxer.withStream(at: i, { st -> MatroskaCueIndex.SubtitleStream? in
                 guard st.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else { return nil }
                 let language = av_dict_get(st.pointee.metadata, "language", nil, 0).map { String(cString: $0.pointee.value) }
                 return .init(streamIndex: i, trackID: st.pointee.id,

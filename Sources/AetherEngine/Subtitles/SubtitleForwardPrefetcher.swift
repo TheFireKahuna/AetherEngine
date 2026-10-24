@@ -506,21 +506,21 @@ extension SubtitleForwardPrefetcher {
         struct Stream: Sendable {
             let streamIndex: Int32
             let track: UInt64
-            let blocks: [MatroskaSubtitleIndex.Block]
+            let blocks: [MatroskaCueIndex.Block]
         }
 
         /// Consecutive unreadable blocks that end the session as a read failure (a dropped
         /// connection); a single block the index misplaced is skipped.
         static let readFailureLimit = 8
 
-        private let index: MatroskaSubtitleIndex
+        private let index: MatroskaCueIndex
         private let bytes: RandomAccessByteSource
         private let streams: [Stream]
         private let assemblyIndices: Set<Int32>
         private var cursor: [Int]
         private var failures = 0
 
-        init(index: MatroskaSubtitleIndex, bytes: RandomAccessByteSource, streams: [Stream],
+        init(index: MatroskaCueIndex, bytes: RandomAccessByteSource, streams: [Stream],
              assemblyIndices: Set<Int32>, from seconds: Double) {
             self.index = index
             self.bytes = bytes
@@ -533,7 +533,7 @@ extension SubtitleForwardPrefetcher {
         /// The streams of `index` the walk would harvest, or nil when any of them is one the index
         /// cannot stand in for (no track, a codec whose block is not its packet, an incomplete list).
         /// All or nothing, so a stream the index cannot vouch for is never the one left out.
-        static func plan(index: MatroskaSubtitleIndex, listed: [AetherEngine.IndexedSubtitleStream],
+        static func plan(index: MatroskaCueIndex, listed: [AetherEngine.IndexedSubtitleStream],
                          streams: Set<Int32>) -> (streams: [Stream], refused: [String]) {
             let tracks = index.trackNumbers(for: listed.map(\.stream))
             var plan: [Stream] = []

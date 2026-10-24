@@ -135,7 +135,7 @@ releases what no session is reading.
 | Piece | File | What it does |
 |---|---|---|
 | `SourceIndexRegistry` | `Demuxer/SourceIndexRegistry.swift` | One index per source and size. Racing callers share the one parse; later callers get the result. Not-Matroska and no-Cues are kept answers; a read that broke off is not, so the next consumer retries. The key is derived from the request and the reader's own size (`matroskaIndex(of:headers:through:)`), so two consumers cannot name a source differently. |
-| `ParseToken` | same | `MatroskaSubtitleIndex.read` requires one and only the registry can make it, so a second parse cannot be added by accident. The parser's unit tests use a debug-only token; a release build pins that no production code does. |
+| `ParseToken` | same | `MatroskaCueIndex.read` requires one and only the registry can make it, so a second parse cannot be added by accident. The parser's unit tests use a debug-only token; a release build pins that no production code does. |
 | Index consumers | `AetherEngine+SourceIndex.swift` | One exact reader factory (`indexedSourceReader`), one subtitle stream listing (`matroskaSubtitleStreams`), the prefetch source builder. |
 
 Consumers today: the indexed subtitle fill (`AetherEngine+IndexedSubtitles.swift`) and the forward
@@ -159,7 +159,7 @@ every stream completely (`SubtitleForwardPrefetcher.IndexSource`, one loop over 
    - For MPEG-TS and any source without one, have the pump record an index as it reads (keyframe and
      subtitle packet positions), registered under the same key, so later reads and seeks are served
      from the map instead of a walk.
-2. **The index is named for subtitles and exposes only them.** `MatroskaSubtitleIndex` already parses
+2. **The index is named for subtitles and exposes only them.** `MatroskaCueIndex` already parses
    every track's cues, video included.
    - Rename it to what it is (the source's cue index) and expose keyframe positions per video track,
      for the I-frame playlist and for seeking.

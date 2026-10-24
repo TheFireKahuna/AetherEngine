@@ -10,7 +10,10 @@ import Foundation
 /// `NUMBER_OF_FRAMES` statistic (mkvmerge's statistics tags), all of them with a relative position, and
 /// whose frames are either uncompressed, zlib-compressed (the subtitle decoder inflates those itself) or
 /// header-stripped. Anything else is left to the readers that walk the stream.
-struct MatroskaSubtitleIndex: Sendable {
+/// A Matroska source's own index, its Cues, read once per source (`SourceIndexRegistry`): where every
+/// subtitle block and every video keyframe lies, by time. The subtitle consumers read blocks exactly
+/// where it says; the video keyframes are what an I-frame rendition and a seek are built on.
+struct MatroskaCueIndex: Sendable {
 
     /// One indexed block: its timestamp in segment ticks and where it lives.
     struct Block: Sendable, Equatable {
@@ -52,6 +55,35 @@ struct MatroskaSubtitleIndex: Sendable {
         var language: String?
     }
 
+    /// A video TrackEntry, in file order.
+    struct VideoTrack: Sendable, Equatable {
+        var number: UInt64
+        var codecID: String
+    }
+
+    /// A cue point of a video track: a keyframe, by its timestamp and where it lies. The Cues name the
+    /// cluster always and the block within it only when the muxer wrote `CueRelativePosition`; a
+    /// keyframe without it is still the cluster's first frame of that track, which is where muxers put
+    /// it, so it is kept rather than dropped as the subtitle blocks are.
+    struct Keyframe: Sendable, Equatable {
+        var ticks: Int64
+        /// Cluster position relative to the segment's data, as the Cues state it.
+        var clusterPosition: Int64
+        /// Position of the block relative to the cluster's data, when the Cues state it.
+        var relativePosition: Int64?
+    }
+
+    /// The video TrackEntries.
+    var videoTracks: [VideoTrack] = []
+    /// Every video track's keyframes, in time order.
+    var keyframesByTrack: [UInt64: [Keyframe]] = [:]
+
+    /// `track`'s keyframes in time order; empty for a track the Cues do not list.
+    func keyframes(track: UInt64) -> [Keyframe] { keyframesByTrack[track] ?? [] }
+
+    /// Where `keyframe`'s cluster begins in the file: the byte a read of that keyframe starts at.
+    func byteOffset(of keyframe: Keyframe) -> Int64 { segmentDataStart + keyframe.clusterPosition }
+
     struct TrackStatistics: Sendable, Equatable {
         var frames: Int?
         var bytes: Int64?
@@ -85,7 +117,7 @@ struct MatroskaSubtitleIndex: Sendable {
     /// Parses the index. Only `SourceIndexRegistry` can call this (it alone makes a `ParseToken`):
     /// a source's index is parsed once and shared, never read again by the next consumer.
     static func read(from source: RandomAccessByteSource,
-                     token: SourceIndexRegistry.ParseToken) throws -> MatroskaSubtitleIndex {
+                     token: SourceIndexRegistry.ParseToken) throws -> MatroskaCueIndex {
         guard let head = source.read(at: 0, count: headProbeBytes), head.count > 16 else {
             throw ReadError.notMatroska
         }
@@ -143,6 +175,7 @@ struct MatroskaSubtitleIndex: Sendable {
 
         var encodings: [UInt64: FrameEncoding] = [:]
         var subtitleTracks: [SubtitleTrack] = []
+        var videoTracks: [VideoTrack] = []
         var numberByUID: [UInt64: UInt64] = [:]
         if let (bytes, tracks) = try load(0x1654AE6B, limit: 16 << 20) {
             for entry in EBML.children(bytes, of: tracks) where entry.id == 0xAE {
@@ -171,6 +204,7 @@ struct MatroskaSubtitleIndex: Sendable {
                 if type == 0x11, let first = codec.first, first == "S" || first == "D" {
                     subtitleTracks.append(SubtitleTrack(number: number, codecID: codec, language: bcp47 ?? language))
                 }
+                if type == 0x01 { videoTracks.append(VideoTrack(number: number, codecID: codec)) }
             }
         }
 
@@ -202,10 +236,12 @@ struct MatroskaSubtitleIndex: Sendable {
 
         guard let (bytes, cues) = try load(0x1C53BB6B, limit: cuesSizeLimit) else { throw ReadError.noCues }
         var blocks: [UInt64: [Block]] = [:]
+        var keyframes: [UInt64: [Keyframe]] = [:]
+        let videoNumbers = Set(videoTracks.map(\.number))
         var missingRelative: Set<UInt64> = []
         for point in EBML.children(bytes, of: cues) where point.id == 0xBB {
             var ticks: Int64?
-            var positionsAtTime: [(track: UInt64, block: Block?)] = []
+            var positionsAtTime: [(track: UInt64, cluster: Int64, relative: Int64?, block: Block?)] = []
             for field in EBML.children(bytes, of: point) {
                 if field.id == 0xB3 { ticks = Int64(EBML.uint(bytes, field)) }
                 guard field.id == 0xB7 else { continue }
@@ -223,22 +259,29 @@ struct MatroskaSubtitleIndex: Sendable {
                     }
                 }
                 guard let track, let cluster else { continue }
-                positionsAtTime.append((track, relative.map {
+                positionsAtTime.append((track, cluster, relative, relative.map {
                     Block(ticks: 0, clusterPosition: cluster, relativePosition: $0, durationTicks: duration)
                 }))
             }
             guard let ticks else { continue }
-            for (track, block) in positionsAtTime {
+            for (track, cluster, relative, block) in positionsAtTime {
+                if videoNumbers.contains(track) {
+                    keyframes[track, default: []].append(
+                        Keyframe(ticks: ticks, clusterPosition: cluster, relativePosition: relative))
+                }
                 guard var block else { missingRelative.insert(track); continue }
                 block.ticks = ticks
                 blocks[track, default: []].append(block)
             }
         }
         for track in blocks.keys { blocks[track]?.sort { $0.ticks < $1.ticks } }
-        var index = MatroskaSubtitleIndex(segmentDataStart: segmentDataStart, timestampScale: timestampScale,
+        for track in keyframes.keys { keyframes[track]?.sort { $0.ticks < $1.ticks } }
+        var index = MatroskaCueIndex(segmentDataStart: segmentDataStart, timestampScale: timestampScale,
                                           blocksByTrack: blocks, tracksMissingRelativePosition: missingRelative,
                                           encodingByTrack: encodings)
         index.subtitleTracks = subtitleTracks
+        index.videoTracks = videoTracks
+        index.keyframesByTrack = keyframes
         index.statistics = statistics
         index.clusterSizeFieldLength = sampledClusterSizeFieldLength(index, from: source)
         return index
@@ -246,7 +289,7 @@ struct MatroskaSubtitleIndex: Sendable {
 
     /// Reads the headers of a few clusters spread over the file: one size-field length for all of them
     /// is the muxer's, and every block read can then start exactly where its block does.
-    private static func sampledClusterSizeFieldLength(_ index: MatroskaSubtitleIndex,
+    private static func sampledClusterSizeFieldLength(_ index: MatroskaCueIndex,
                                                       from source: RandomAccessByteSource) -> Int? {
         let clusters = Set(index.blocksByTrack.values.flatMap { $0.map(\.clusterPosition) }).sorted()
         guard !clusters.isEmpty else { return nil }

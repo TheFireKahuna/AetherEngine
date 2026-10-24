@@ -27,7 +27,7 @@ struct SourceIndexRegistryTests {
     @Test("Consumers racing for one source share one parse, and a consumer after them parses nothing")
     func racingConsumersShareOneParse() async throws {
         let registry = SourceIndexRegistry()
-        let opener = Opener(MatroskaSubtitleIndexTests.fixture().bytes)
+        let opener = Opener(MatroskaCueIndexTests.fixture().bytes)
         let key = Self.key("race")
         let tracks = await withTaskGroup(of: [UInt64].self) { group in
             for _ in 0..<12 {
@@ -53,7 +53,7 @@ struct SourceIndexRegistryTests {
     @Test("Another source, or the same request at another size, is another index")
     func sourceAndSizeNameTheIndex() async {
         let registry = SourceIndexRegistry()
-        let opener = Opener(MatroskaSubtitleIndexTests.fixture().bytes)
+        let opener = Opener(MatroskaCueIndexTests.fixture().bytes)
         _ = await registry.matroskaIndex(for: Self.key("a"), open: { opener.open() })
         _ = await registry.matroskaIndex(for: Self.key("b"), open: { opener.open() })
         _ = await registry.matroskaIndex(for: Self.key("a", size: 2_000), open: { opener.open() })
@@ -86,7 +86,7 @@ struct SourceIndexRegistryTests {
             Issue.record("expected malformed, got \(first)")
             return
         }
-        let good = Opener(MatroskaSubtitleIndexTests.fixture().bytes)
+        let good = Opener(MatroskaCueIndexTests.fixture().bytes)
         let second = await registry.matroskaIndex(for: Self.key("flaky"), open: { good.open() })
         #expect(second.index != nil)
         #expect(counter.count == 1)
@@ -96,7 +96,7 @@ struct SourceIndexRegistryTests {
     @Test("Past capacity the least recently asked for index goes, and is parsed again if asked for")
     func capacityEvictsTheOldest() async {
         let registry = SourceIndexRegistry()
-        let opener = Opener(MatroskaSubtitleIndexTests.fixture().bytes)
+        let opener = Opener(MatroskaCueIndexTests.fixture().bytes)
         for n in 0...SourceIndexRegistry.capacity {
             _ = await registry.matroskaIndex(for: Self.key("cap\(n)"), open: { opener.open() })
         }
