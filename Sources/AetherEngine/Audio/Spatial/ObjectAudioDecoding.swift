@@ -24,13 +24,21 @@ struct ObjectAudioDecodedBlock {
     /// The stream's channel-based presentation of the same frames (Dolby's own 7.1 or 5.1 rendering
     /// of the mix), when the decoder carries one: see `BedSplitter`.
     var bed: ObjectAudioBed?
-    /// The source timestamp the decoder attributes to this block, as `push(_:pts:)` was given it, and
-    /// the input frame (on `inputFrameOffset`'s axis and rate) that timestamp marks. nil when the push
-    /// that carried this block's first byte had none (most packets of a laced Matroska block) or the
-    /// decoder does not track them. `sourcePts - sourcePtsInputFrame` is where input frame 0 sits, so
-    /// a block anchors the timeline exactly whichever packet carried the timestamp.
-    var sourcePts: Int64? = nil
-    var sourcePtsInputFrame: Int64 = 0
+    /// The latest source timestamp the decoder was given (`push(_:pts:)`) at or before this block's
+    /// first frame since its reset, and the input frame (on `inputFrameOffset`'s axis and rate) that
+    /// timestamp marks; nil before any. Most packets of a laced Matroska block carry none, and after a
+    /// seek the stamped one's frames can be skipped while the decoder waits for a sync, so only the
+    /// decoder, which counts those frames, can say where each block sits relative to it.
+    var sourcePts: Int64?
+    var sourcePtsInputFrame: Int64
+    /// The stream's own presentation clock at this block's first frame, in its frames, where the
+    /// bitstream carries one (TrueHD's output_timing): exact, and continuous across a resync that
+    /// `inputFrameOffset` can only estimate. Counted on from the previous block's, so it only ever
+    /// grows; nil without a clock.
+    var clockFrame: Int64?
+    /// Frames per coded frame of the stream (a TrueHD access unit, a DTS frame): the step of the
+    /// grid its frames sit on (`SourceGrid`).
+    var gridFrames: Int
 }
 
 /// A channel bed decoded alongside an object presentation, sample-aligned with it.
@@ -45,10 +53,8 @@ struct ObjectAudioBed {
 /// metadata that positions them. Kept separate from the bridge so the bridge's timeline, renderer
 /// and encoder handling can be exercised with a synthetic decoder.
 protocol ObjectAudioDecoding: AnyObject {
-    /// Queue demuxed bytes. Any chunking.
-    func push(_ bytes: UnsafeRawBufferPointer) throws
-    /// Queue demuxed bytes with the packet's timestamp (`Int64.min` for none), which the decoder hands
-    /// back on the blocks those bytes start (`ObjectAudioDecodedBlock.sourcePts`).
+    /// Queue demuxed bytes, any chunking, with the packet's timestamp (`Int64.min` for none), which
+    /// the decoder hands back on the blocks those bytes start (`ObjectAudioDecodedBlock.sourcePts`).
     func push(_ bytes: UnsafeRawBufferPointer, pts: Int64) throws
     /// The next complete block, or nil when more input is needed.
     func nextBlock() throws -> ObjectAudioDecodedBlock?
@@ -67,8 +73,6 @@ protocol ObjectAudioDecoding: AnyObject {
 }
 
 extension ObjectAudioDecoding {
-    /// A decoder that tracks no timestamps takes the bytes alone.
-    func push(_ bytes: UnsafeRawBufferPointer, pts: Int64) throws { try push(bytes) }
     var selfResetCount: Int { 0 }
     var playsBedOnly: Bool { false }
     func releaseHeldBlocks() {}

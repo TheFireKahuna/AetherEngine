@@ -62,6 +62,8 @@ extension SoftwarePlaybackHost {
                 : try TrueHDObjectAudioDecoder(splitsBed: !TrueHDReferenceRender.isOn, dialogueGain: dialogueGain)
             let bridge = try SpatialAudioBridge(
                 srcTimeBase: stream.pointee.time_base, layout: layout, decoder: decoder, objectOutput: objects)
+            // This route feeds the stream's own timestamps, so its first frame sits at its start.
+            bridge.setSourceStart(stream.pointee.start_time == Int64.min ? nil : stream.pointee.start_time)
             let apac = try APACSampleBufferDecoder(bridge: bridge)
             let rendering = objects
                 ? "elements sent as APAC objects (\(APACObjectOutputSwitch.variable), personal build)"

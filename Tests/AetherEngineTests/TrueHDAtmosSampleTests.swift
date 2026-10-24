@@ -33,7 +33,7 @@ struct TrueHDAtmosSampleTests {
             var offset = 0
             while offset < raw.count {
                 let n = min(4096, raw.count - offset)
-                try decoder.push(UnsafeRawBufferPointer(rebasing: raw[offset..<offset + n]))
+                try decoder.push(UnsafeRawBufferPointer(rebasing: raw[offset..<offset + n]), pts: Int64.min)
                 offset += n
                 while let block = try decoder.nextBlock() {
                     if renderer == nil { renderer = ObjectAudioRenderer(layout: layout, roles: block.roles); roles = block.roles }
@@ -127,7 +127,7 @@ struct TrueHDAtmosSampleTests {
             var offset = 0
             while offset < raw.count {
                 let n = min(4096, raw.count - offset)
-                try decoder.push(UnsafeRawBufferPointer(rebasing: raw[offset..<offset + n]))
+                try decoder.push(UnsafeRawBufferPointer(rebasing: raw[offset..<offset + n]), pts: Int64.min)
                 try exact.push(UnsafeRawBufferPointer(rebasing: raw[offset..<offset + n]))
                 offset += n
                 while let block = try exact.nextBlock() {
@@ -195,6 +195,7 @@ struct TrueHDAtmosSampleTests {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 48_000), layout: .l916, decoder: TrueHDObjectAudioDecoder())
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         var pts: [Int64] = []
         var bytes = 0

@@ -32,6 +32,7 @@ struct APACSampleBufferDecoderTests {
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
             decoder: SpatialAudioBridgeTests.SyntheticDecoder(skipAfterReset: 5))
+        bridge.setSourceStart(0)
         return try APACSampleBufferDecoder(bridge: bridge)
     }
 

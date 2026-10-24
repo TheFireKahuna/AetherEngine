@@ -21,7 +21,7 @@ import Foundation
 ///   residue in quiet elements; bounded by the bed, it can no longer pull a quiet channel's content
 ///   up or sideways.
 /// - Per output and band, the result is steered towards the energy the elements would give that
-///   output in a direct render (smoothed over about 200 ms), which restores the spread a per-bin
+///   output in a direct render (smoothed over about 200 ms, `balanceWindowHops`), which restores the spread a per-bin
 ///   split loses where several elements share a bin. Raised fully (at most `balanceLimit`), lowered
 ///   only by a third of the gap in dB (`balanceLowering`): the elements' energies add up to less than
 ///   a mix of them wherever they carry the same signal, so a target below the split is mostly the
@@ -32,6 +32,12 @@ import Foundation
 ///
 /// Streaming: output frame i is input frame i. The first `latency` frames after a reset produce no
 /// output, and `drain` returns the ones still inside.
+///
+/// Every output is a function of the timeline alone, so a run that starts anywhere comes out as
+/// continuous playback does once it has run `memoryFrames`: the hops sit on the timeline's 512-frame
+/// grid (`reset(phase:)`), since an FFT's frames placed elsewhere give a slightly different result,
+/// and the balance is smoothed over a fixed window of hops rather than by a filter whose state
+/// never forgets where it began.
 final class BedSplitter {
     static let fftSize = 2048
     static let hop = 512
@@ -39,6 +45,18 @@ final class BedSplitter {
     static let boundMargin: Float = 2
     static let boundMinShare: Float = 0.05
     static let balanceSmoothing: Float = 0.95
+    /// Hops the balance is smoothed over: `balanceSmoothing`'s exponential weights, cut after this
+    /// many (they then hold 3.7 % of the total) and renormalized.
+    static let balanceWindowHops = 64
+    /// Newest first.
+    static let balanceWeights: [Float] = {
+        let w = (0..<balanceWindowHops).map { (1 - balanceSmoothing) * powf(balanceSmoothing, Float($0)) }
+        let sum = w.reduce(0, +)
+        return w.map { $0 / sum }
+    }()
+    /// Input frames after which the output no longer depends on anything before them: the frame
+    /// and the balance window.
+    static let memoryFrames = fftSize + balanceWindowHops * hop
     static let balanceLimit: Float = 4
     /// A lowering is applied at this fraction of its size in dB.
     static let balanceLowering: Float = 1.0 / 3
@@ -84,6 +102,9 @@ final class BedSplitter {
     private var ready: [Float]
     private var consumed: Int64 = 0
     private var written: Int64 = 0
+    /// Silent frames the current run started with to put its hops on the timeline's grid
+    /// (`reset(phase:)`): consumed, never output, and never the caller's.
+    private var prefix: Int64 = 0
 
     /// Per element: the position and gain its ear-level and bed gains were computed for.
     private var cachedPosition: [SIMD3<Float>?] = []
@@ -99,8 +120,10 @@ final class BedSplitter {
     private var ringCount = 0
     private let weightStride: Int
 
-    private var smoothedTarget: [Float]
-    private var smoothedSplit: [Float]
+    /// Per output and band, the last `balanceWindowHops` hops' target and split energies, a ring.
+    private var targetHistory: [Float]
+    private var splitHistory: [Float]
+    private var historyHead = 0
 
     // MARK: Scratch
 
@@ -209,8 +232,8 @@ final class BedSplitter {
         target = [Float](repeating: 0, count: outputs * bins)
         outRe = target; outIm = target; expect = target
         bedBandEnergy = [Float](repeating: 0, count: beds.count * bandEdges.count)
-        smoothedTarget = [Float](repeating: 0, count: outputs * bandEdges.count)
-        smoothedSplit = smoothedTarget
+        targetHistory = [Float](repeating: 0, count: Self.balanceWindowHops * outputs * bandEdges.count)
+        splitHistory = targetHistory
     }
 
     deinit {
@@ -219,21 +242,28 @@ final class BedSplitter {
     }
 
     /// Input frames taken that have not come out yet.
-    var backlog: Int { Int(consumed - written) }
+    var backlog: Int { Int(consumed - prefix - written) }
 
-    /// Forget everything: the next input starts a new stream (a seek, a restart).
-    func reset() {
+    /// Forget everything: the next input starts a new stream (a seek, a restart), its first frame
+    /// `phase` frames past a point of the timeline's hop grid. The frames before it in that hop are
+    /// taken as silence and never output, so every run's hops fall where continuous playback's do.
+    func reset(phase: Int = 0) {
         for i in elementHistory.indices { elementHistory[i] = 0 }
         for i in bedHistory.indices { bedHistory[i] = 0 }
         for i in accumulators.indices { accumulators[i] = 0 }
         for i in lfeDelay.indices { lfeDelay[i] = 0 }
         for i in ready.indices { ready[i] = 0 }
-        for i in smoothedTarget.indices { smoothedTarget[i] = 0; smoothedSplit[i] = 0 }
+        for i in targetHistory.indices { targetHistory[i] = 0; splitHistory[i] = 0 }
+        historyHead = 0
+        for i in elementHop.indices { elementHop[i] = 0 }
+        for i in bedHop.indices { bedHop[i] = 0 }
         cachedPosition = Array(repeating: nil, count: elementCount)
         ringCount = 0
         hasSnapshot = false
-        filled = 0
-        consumed = 0
+        let phase = ((phase % h) + h) % h
+        filled = phase
+        consumed = Int64(phase)
+        prefix = Int64(phase)
         written = 0
     }
 
@@ -269,7 +299,8 @@ final class BedSplitter {
                 else { bedHop.withUnsafeMutableBufferPointer { ($0.baseAddress! + dst).update(repeating: 0, count: take) } }
             }
             // Output for these frames: `ready` holds the hop that came out of the last full frame.
-            let skip = Int(max(0, min(Int64(take), Int64(Self.latency) - consumed)))
+            // Input frame i comes out `latency` frames after it went in; the silent prefix never does.
+            let skip = Int(max(0, min(Int64(take), Int64(Self.latency) + prefix - consumed)))
             if take > skip {
                 for c in 0..<outputs {
                     ready.withUnsafeBufferPointer {
@@ -587,7 +618,9 @@ final class BedSplitter {
         }
 
         // Balance per output and band, towards the energy a direct render would give it.
-        let a = Self.balanceSmoothing
+        let windowHops = Self.balanceWindowHops, weights = Self.balanceWeights
+        let slots = outputs * bandEdges.count
+        historyHead = (historyHead + 1) % windowHops
         for band in 0..<bands {
             let lo = bandEdges[band], hi = min(bandEdges[band + 1], bins)
             guard lo < hi else { continue }
@@ -596,9 +629,14 @@ final class BedSplitter {
                 let row = c * bins
                 for b in lo..<hi { t += target[row + b]; e += expect[row + b] }
                 let slot = c * bands + band
-                smoothedTarget[slot] = a * smoothedTarget[slot] + (1 - a) * t
-                smoothedSplit[slot] = a * smoothedSplit[slot] + (1 - a) * e
-                let st = smoothedTarget[slot], se = smoothedSplit[slot]
+                targetHistory[historyHead * slots + slot] = t
+                splitHistory[historyHead * slots + slot] = e
+                var st: Float = 0, se: Float = 0
+                for k in 0..<windowHops {
+                    let at = ((historyHead - k + windowHops) % windowHops) * slots + slot
+                    st += weights[k] * targetHistory[at]
+                    se += weights[k] * splitHistory[at]
+                }
                 guard st > tiny, se > tiny else { continue }
                 let r = st / se
                 let g = (r >= 1 ? min(r, Self.balanceLimit) : pow(r, Self.balanceLowering)).squareRoot()

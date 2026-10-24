@@ -42,6 +42,10 @@ protocol AudioTranscodingBridge: AnyObject, Sendable {
     /// could only drop whole packets. Taken on the next anchor (the first since construction or
     /// `startSegment`), so the producer sets it before it feeds.
     func setOutputOffset(seconds: Double)
+    /// Where the stream's first frame sits, on the time base and axis the packets fed to this bridge
+    /// are on (the producer's shift applied): the origin of the grid the stream's frames sit on
+    /// (`SourceGrid`). The producer sets it before it feeds a run.
+    func setSourceStart(_ pts: Int64?)
     /// Live splice gap correction, in seconds.
     func noteTimelineJump(deltaSeconds: Double)
     func close()
@@ -79,4 +83,5 @@ extension AudioBridge: AudioTranscodingBridge {
 
 extension AudioTranscodingBridge {
     var objectAudioActivity: ObjectAudioActivity? { nil }
+    func setSourceStart(_ pts: Int64?) {}
 }
