@@ -61,7 +61,29 @@ struct AudioRunPlan {
 /// A run is fed from the last packet at or before where its memory reaches, except MP3's, which
 /// starts at the packet its first needed frame's main data begins in (`MP3MainData`): the format's
 /// worst case is seconds, the stream's own reservoir rarely a frame or two.
+///
+/// The engine holds one, built from the session's template; every producer feeds a session of its
+/// own (`producerBridge()`), which it ends when its pump does (`producerFinished()`). So a producer
+/// a restart abandoned can only ever feed runs no one reads, and a restart needs nothing from the
+/// engine's: the new producer's session starts clean.
 final class AudioSegmentRuns: AudioTranscodingBridge, @unchecked Sendable {
+
+    /// What the engine's and every producer's sessions share.
+    private final class Shared: @unchecked Sendable {
+        /// Unfed: its parameters and sample entry describe every run's output, and the muxer holds them.
+        let template: any AudioTranscodingBridge
+        let makeRun: () throws -> any AudioTranscodingBridge
+        let lock = NSLock()
+        /// Over the whole session: what every retired run counted, and the bytes handed on.
+        var retiredStats = AudioBridge.FeedStats()
+        var bytesOut: Int64 = 0
+        /// The latest producer's session, which the engine's reports for.
+        weak var current: AudioSegmentRuns?
+        init(template: any AudioTranscodingBridge, makeRun: @escaping () throws -> any AudioTranscodingBridge) {
+            self.template = template
+            self.makeRun = makeRun
+        }
+    }
 
     private final class Run {
         let segment: Int
@@ -79,9 +101,10 @@ final class AudioSegmentRuns: AudioTranscodingBridge, @unchecked Sendable {
         }
     }
 
-    /// Unfed: its parameters and sample entry describe every run's output, and the muxer holds them.
-    private let template: any AudioTranscodingBridge
-    private let makeRun: () throws -> any AudioTranscodingBridge
+    private let shared: Shared
+    /// A producer's session, not the engine's.
+    private let isSession: Bool
+    private var template: any AudioTranscodingBridge { shared.template }
     private let sourceTimeBase: AVRational
     private let packetFrames: Int64
     /// Before a run's encoder starts: what the stages ahead of it need fed.
@@ -100,8 +123,6 @@ final class AudioSegmentRuns: AudioTranscodingBridge, @unchecked Sendable {
     private var ring: [UnsafeMutablePointer<AVPacket>] = []
     private var sourceStart: Int64?
     private var outputOffsetSeconds: Double = 0
-    private var retiredStats = AudioBridge.FeedStats()
-    private var bytesOut: Int64 = 0
     private var reportedMissingPlan = false
     private var runsStartedShort = 0
 
@@ -110,8 +131,8 @@ final class AudioSegmentRuns: AudioTranscodingBridge, @unchecked Sendable {
     init?(template: any AudioTranscodingBridge, sourceCodecpar: UnsafePointer<AVCodecParameters>,
           sourceTimeBase: AVRational, makeRun: @escaping () throws -> any AudioTranscodingBridge) {
         guard let span = template.runSpan else { return nil }
-        self.template = template
-        self.makeRun = makeRun
+        shared = Shared(template: template, makeRun: makeRun)
+        isSession = false
         self.sourceTimeBase = sourceTimeBase
         packetFrames = Int64(max(template.runPacketFrames, 1))
         encoderMemory = Int64(template.runEncoderMemory)
@@ -126,6 +147,31 @@ final class AudioSegmentRuns: AudioTranscodingBridge, @unchecked Sendable {
                overlap: (Int64(AudioStageSpan.mp3OverlapFrames) * outputRate + sampleRate - 1) / sampleRate)
             : nil
         ringTicks = preEncoderMemory + outputRate
+    }
+
+    private init(sessionOf engine: AudioSegmentRuns) {
+        shared = engine.shared
+        isSession = true
+        sourceTimeBase = engine.sourceTimeBase
+        packetFrames = engine.packetFrames
+        encoderMemory = engine.encoderMemory
+        preEncoderMemory = engine.preEncoderMemory
+        mp3DecoderMemory = engine.mp3DecoderMemory
+        ringTicks = engine.ringTicks
+    }
+
+    /// A session of its own for a producer to feed; the engine's latest.
+    func producerBridge() -> any AudioTranscodingBridge {
+        let session = AudioSegmentRuns(sessionOf: self)
+        shared.lock.withLock { shared.current = session }
+        return session
+    }
+
+    /// The producer's pump is done: its runs go, whatever it left unread.
+    func producerFinished() {
+        lock.lock()
+        defer { lock.unlock() }
+        closeRuns()
     }
 
     /// How far before a segment's start its run reads the source: the encoder's memory on the packet
@@ -224,41 +270,54 @@ final class AudioSegmentRuns: AudioTranscodingBridge, @unchecked Sendable {
         return out
     }
 
-    /// A seek: the runs go, and so does the session's part of the template (its level window).
+    /// A restart. The new producer feeds a session of its own, so the engine's has only the
+    /// session-wide part of the template to restart (its level window).
     func startSegment() {
-        lock.lock()
-        defer { lock.unlock() }
-        closeRuns()
-        plan = nil
-        nextSegment = nil
-        template.startSegment()
+        if isSession {
+            lock.lock()
+            defer { lock.unlock() }
+            closeRuns()
+            plan = nil
+            nextSegment = nil
+        } else {
+            template.startSegment()
+        }
     }
 
     func noteTimelineJump(deltaSeconds: Double) {}
 
     func close() {
         lock.lock()
-        defer { lock.unlock() }
         closeRuns()
+        lock.unlock()
+        guard !isSession else { return }
+        shared.lock.withLock { shared.current }?.producerFinished()
         template.close()
     }
 
     // MARK: Telemetry
 
+    /// The engine's reports for the latest producer's session; a session for itself.
+    private var reporting: AudioSegmentRuns? { isSession ? self : shared.lock.withLock { shared.current } }
+
+    /// The session's whole: every retired run, and the reporting session's runs still going.
     var feedStats: AudioBridge.FeedStats {
-        lock.lock()
-        defer { lock.unlock() }
-        var total = runs.reduce(retiredStats) { $0.adding($1.bridge.feedStats) }
-        total.packetsFedSinceLastEnqueue = runs.last?.bridge.feedStats.packetsFedSinceLastEnqueue
-            ?? retiredStats.packetsFedSinceLastEnqueue
+        let retired = shared.lock.withLock { shared.retiredStats }
+        guard let session = reporting else { return retired }
+        session.lock.lock()
+        defer { session.lock.unlock() }
+        var total = session.runs.reduce(retired) { $0.adding($1.bridge.feedStats) }
+        total.packetsFedSinceLastEnqueue = session.runs.last?.bridge.feedStats.packetsFedSinceLastEnqueue
+            ?? retired.packetsFedSinceLastEnqueue
         return total
     }
 
     var liveBytes: AudioBridge.LiveBytes {
-        lock.lock()
-        defer { lock.unlock() }
-        return runs.map(\.bridge.liveBytes).reduce(AudioBridge.LiveBytes(fifoSamples: 0, fifoBytes: 0, swrDelaySamples: 0,
-                                                                          swrDelayBytes: 0)) {
+        let zero = AudioBridge.LiveBytes(fifoSamples: 0, fifoBytes: 0, swrDelaySamples: 0, swrDelayBytes: 0)
+        guard let session = reporting else { return zero }
+        session.lock.lock()
+        defer { session.lock.unlock() }
+        return session.runs.map(\.bridge.liveBytes).reduce(zero) {
             AudioBridge.LiveBytes(fifoSamples: $0.fifoSamples + $1.fifoSamples, fifoBytes: $0.fifoBytes + $1.fifoBytes,
                                   swrDelaySamples: $0.swrDelaySamples + $1.swrDelaySamples,
                                   swrDelayBytes: $0.swrDelayBytes + $1.swrDelayBytes)
@@ -266,21 +325,19 @@ final class AudioSegmentRuns: AudioTranscodingBridge, @unchecked Sendable {
     }
 
     var fifoSampleCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return runs.reduce(0) { $0 + $1.bridge.fifoSampleCount }
+        guard let session = reporting else { return 0 }
+        session.lock.lock()
+        defer { session.lock.unlock() }
+        return session.runs.reduce(0) { $0 + $1.bridge.fifoSampleCount }
     }
 
-    var outputBytesLifetime: Int64 {
-        lock.lock()
-        defer { lock.unlock() }
-        return bytesOut
-    }
+    var outputBytesLifetime: Int64 { shared.lock.withLock { shared.bytesOut } }
 
     var objectAudioActivity: ObjectAudioActivity? {
-        lock.lock()
-        defer { lock.unlock() }
-        return runs.last?.bridge.objectAudioActivity
+        guard let session = reporting else { return nil }
+        session.lock.lock()
+        defer { session.lock.unlock() }
+        return session.runs.last?.bridge.objectAudioActivity
     }
 
     // MARK: Private (callers hold `lock`)
@@ -309,7 +366,7 @@ final class AudioSegmentRuns: AudioTranscodingBridge, @unchecked Sendable {
     private func openRun(_ index: Int, at gridStart: Int64, plan: AudioRunPlan) {
         let bridge: any AudioTranscodingBridge
         do {
-            bridge = try makeRun()
+            bridge = try shared.makeRun()
         } catch {
             EngineLog.emit("[AudioSegmentRuns] ERROR: segment \(index)'s run did not open (\(error)); its audio is missing",
                            category: .session)
@@ -393,11 +450,11 @@ final class AudioSegmentRuns: AudioTranscodingBridge, @unchecked Sendable {
         var out: [UnsafeMutablePointer<AVPacket>] = []
         while let run = runs.first {
             out += run.held
-            bytesOut += run.held.reduce(0) { $0 + Int64($1.pointee.size) }
+            let bytes = run.held.reduce(0) { $0 + Int64($1.pointee.size) }
+            shared.lock.withLock { shared.bytesOut += bytes }
             run.held.removeAll()
             guard run.finished else { break }
-            retiredStats = retiredStats.adding(run.bridge.feedStats)
-            run.bridge.close()
+            retire(run)
             runs.removeFirst()
         }
         return out
@@ -427,10 +484,15 @@ final class AudioSegmentRuns: AudioTranscodingBridge, @unchecked Sendable {
                 var p: UnsafeMutablePointer<AVPacket>? = packet
                 trackedPacketFree(&p)
             }
-            retiredStats = retiredStats.adding(run.bridge.feedStats)
-            run.bridge.close()
+            retire(run)
         }
         runs.removeAll()
         freeRing()
+    }
+
+    private func retire(_ run: Run) {
+        let stats = run.bridge.feedStats
+        shared.lock.withLock { shared.retiredStats = shared.retiredStats.adding(stats) }
+        run.bridge.close()
     }
 }

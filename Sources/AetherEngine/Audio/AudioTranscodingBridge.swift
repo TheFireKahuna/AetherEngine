@@ -52,6 +52,10 @@ protocol AudioTranscodingBridge: AnyObject, Sendable {
     /// (`AudioSegmentRuns`); every other bridge ignores it. Set when the audio gate opens, before the
     /// first feed.
     func setRunPlan(_ plan: AudioRunPlan)
+    /// What a producer feeds: this bridge, or one of its own made from it (`AudioSegmentRuns`),
+    /// which the producer ends when its pump does (`producerFinished`).
+    func producerBridge() -> any AudioTranscodingBridge
+    func producerFinished()
     /// How far before a segment's start the bridge reads the source to make it: a restart seeks that
     /// much earlier, and the producer feeds from there. Zero for a bridge that makes the session in
     /// one run.
@@ -111,5 +115,7 @@ extension AudioBridge: AudioTranscodingBridge {
 extension AudioTranscodingBridge {
     var objectAudioActivity: ObjectAudioActivity? { nil }
     func setRunPlan(_ plan: AudioRunPlan) {}
+    func producerBridge() -> any AudioTranscodingBridge { self }
+    func producerFinished() {}
     var preRollSeconds: Double { 0 }
 }
