@@ -26,6 +26,11 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     /// Highest cue end appended (source axis). `cues.last` stopped being the read head once two feeders
     /// with different positions share the store.
     private var maxCueEndSeconds: Double = 0
+    /// The stretch of the source a feeder has READ for this track (source axis), contiguous from where it
+    /// began. `maxCueEndSeconds` says how far the cues reach, which on a sparse track (a forced one, whose
+    /// lines cover foreign dialogue only) can sit minutes behind the reading: there "no cue yet" and "no
+    /// line here" read the same off the cues, and only this tells them apart.
+    private var readSpan: (from: Double, through: Double)?
 
     init() {}
 
@@ -45,6 +50,7 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
         cues.removeAll(keepingCapacity: true)
         seenKeys.removeAll(keepingCapacity: true)
         maxCueEndSeconds = 0
+        readSpan = nil
         appendLocked(newCues)
     }
 
@@ -67,8 +73,39 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
         cues.removeAll(keepingCapacity: false)
         seenKeys.removeAll(keepingCapacity: false)
         maxCueEndSeconds = 0
+        readSpan = nil
         finished = false
         lock.unlock()
+    }
+
+    /// A feeder has read the source from `from` through `through` (source axis) and every cue in it has
+    /// been appended. A span that continues the one held extends it; one that does not (a reader that
+    /// re-anchored after a seek) replaces it, because what was read before is no longer contiguous with
+    /// what is read now.
+    func noteRead(from: Double, through: Double) {
+        guard from.isFinite, through.isFinite, through >= from else { return }
+        lock.lock(); defer { lock.unlock() }
+        if let span = readSpan, from >= span.from, from <= span.through + Self.readSeamSeconds {
+            readSpan = (span.from, max(span.through, through))
+        } else {
+            readSpan = (from, through)
+        }
+    }
+
+    /// Two notes that meet within this are one reading: a reader's next packet never lines up to the sample
+    /// with the last one it reported.
+    static let readSeamSeconds: Double = 0.25
+
+    /// How far this track is known to have been read past `position` (AVPlayer axis): the reading span's
+    /// end when the span holds `position`, and never less than the furthest cue end. A track whose readers
+    /// do not report reads exactly as `readMaxCueEnd()`.
+    func readThrough(at position: Double) -> Double {
+        lock.lock(); defer { lock.unlock() }
+        let cueEnd = cues.isEmpty ? 0 : maxCueEndSeconds - shiftSeconds
+        guard let span = readSpan else { return cueEnd }
+        let from = span.from - shiftSeconds, through = span.through - shiftSeconds
+        guard position >= from - Self.readSeamSeconds, position <= through else { return cueEnd }
+        return max(cueEnd, through)
     }
 
     var cueCount: Int { lock.lock(); defer { lock.unlock() }; return cues.count }

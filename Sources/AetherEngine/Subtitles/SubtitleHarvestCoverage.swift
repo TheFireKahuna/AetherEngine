@@ -122,6 +122,19 @@ struct SubtitleHarvestCoverage: Sendable, Equatable {
         return cursor >= through
     }
 
+    /// How far the reading runs on unbroken from `from`: the end of the covered stretch that holds it, nil
+    /// when `from` itself was never read. The walk is `covers(from:through:)`'s, kept going to the end.
+    func reach(from: Double) -> Double? {
+        guard from.isFinite else { return nil }
+        var cursor: Double?
+        for span in sortedSpans() {
+            let at = cursor ?? from
+            guard span.from <= at + Self.seamSeconds else { break }
+            if span.through >= from { cursor = max(at, span.through) }
+        }
+        return cursor
+    }
+
     /// Every span this ledger holds, open runs included, sorted by start. Small by construction
     /// (`maxSpans` plus one run per writer), so the sort is cheaper than keeping a second index.
     func sortedSpans() -> [Span] {

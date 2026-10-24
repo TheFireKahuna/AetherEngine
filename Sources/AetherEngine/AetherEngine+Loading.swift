@@ -1251,8 +1251,15 @@ extension AetherEngine {
         // text and CC entries so existing ordinals stay byte-stable. Unique NAMEs are computed
         // over text+bitmap together: a same-language pair must get the numbered suffix, or
         // AVFoundation collapses the legible options.
-        let bitmapEntries = Self.bitmapOCRSubtitleEntries(from: subtitleTracks, isLive: loadedOptions.isLive)
-        let combinedInfos = Self.nativeSubtitleRenditionInfos(for: nativeSubtitleTrackTable + bitmapEntries)
+        var bitmapEntries = Self.bitmapOCRSubtitleEntries(from: subtitleTracks, isLive: loadedOptions.isLive)
+        // The forced-only renditions come after every bitmap one, so the full tracks' ordinals are the same
+        // with the option as without it.
+        if loadedOptions.forcedSubtitleRenditions {
+            bitmapEntries += Self.forcedCueSubtitleEntries(for: bitmapEntries)
+        }
+        let combinedInfos = Self.nativeSubtitleRenditionInfos(
+            for: nativeSubtitleTrackTable + bitmapEntries,
+            declaresForced: loadedOptions.forcedSubtitleRenditions)
         let renditionInfos = Array(combinedInfos.prefix(nativeSubtitleTrackTable.count))
         let bitmapInfos = Array(combinedInfos.suffix(bitmapEntries.count))
         nativeSubtitleTracks = renditionInfos.enumerated().map { ordinal, info in
@@ -1920,6 +1927,12 @@ extension AetherEngine {
         // their host's load the session is ready before the return and this checkpoint would arrive
         // behind one it must precede. The generation guard is what keeps a superseded loader from
         // writing into its successor's sequence.
+        // LoadOptions.forcedSubtitleRenditions: the host selects the forced rendition, once it is filled.
+        // Left on, automatic selection would pick a FORCED=YES rendition at readyToPlay itself, before
+        // anything has been read into it, and AVKit keeps the empty segments it fetched then.
+        if loadedOptions.forcedSubtitleRenditions, loadedOptions.prepareNativeSubtitles {
+            host.avPlayer.appliesMediaSelectionCriteriaAutomatically = false
+        }
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }
         host.load(url: playbackURL,
                   startPosition: startPosition,

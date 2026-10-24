@@ -1845,14 +1845,21 @@ final class HLSLocalServer: @unchecked Sendable {
         for r in subRenditions {
             var mediaAttrs = ["TYPE=SUBTITLES", "GROUP-ID=\"subs\"", "NAME=\"\(r.name)\""]
             if let lang = r.language { mediaAttrs.append("LANGUAGE=\"\(lang)\"") }
-            mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=NO"])
-            // Deliberately NO FORCED=YES, even for a source-forced track: AVKit force-displays a FORCED
-            // rendition whose language matches the selected audio regardless of DEFAULT/AUTOSELECT and the
-            // user's CC-off preference, which self-engages a rendition and contradicts the invariant above
-            // (the on-frame overlay owns fullscreen subtitles; the host selects a rendition only on PiP).
-            // A source-forced German track on German audio then rendered with subtitles off (Sodalite#38
-            // follow-on, DV-master path). Same-language forced/full pairs are disambiguated by NAME, not
-            // FORCED. `r.isForced` still rides the published track list so the host can label/pick it.
+            // `r.isForced` is set only under `LoadOptions.forcedSubtitleRenditions`, for a host whose subtitles
+            // are AVKit's own. Without it a source-forced track is deliberately NOT declared FORCED=YES: AVKit
+            // force-displays a FORCED rendition whose language matches the selected audio regardless of
+            // DEFAULT/AUTOSELECT and the user's CC-off preference, which self-engages a rendition and
+            // contradicts the invariant above (the on-frame overlay owns fullscreen subtitles; the host selects
+            // a rendition only on PiP). A source-forced German track on German audio then rendered with
+            // subtitles off (Sodalite#38 follow-on, DV-master path). Same-language forced/full pairs are
+            // disambiguated by NAME. With it, that display IS the point: a forced rendition is declared the
+            // way the HLS Authoring Specification asks (5.11: AUTOSELECT=YES; DEFAULT=NO, since the forced
+            // lines are not the default subtitle), and AVKit keeps it out of its subtitle menu.
+            if r.isForced {
+                mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=YES", "FORCED=YES"])
+            } else {
+                mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=NO"])
+            }
             mediaAttrs.append("URI=\"subs_\(r.ordinal).m3u8\"")
             lines.append("#EXT-X-MEDIA:\(mediaAttrs.joined(separator: ","))")
         }
