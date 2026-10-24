@@ -5113,13 +5113,13 @@ public final class AetherEngine: ObservableObject {
         // AE#348: the pre-flight gate of a VOD load, running beside the load instead of in front of it.
         var preflightGate: Task<Void, Never>?
         defer { preflightGate?.cancel() }
-        // A TrueHD Atmos track rendered to APAC plays with the Atmos activator on either route; started
-        // before the panel switch, so the TV's format banner after it already sees Atmos.
+        // A track that will play as APAC (TrueHD Atmos, or DTS-HD MA the probe labels DTS:X) plays with the
+        // Atmos activator on either route; started before the panel switch, so the TV's format banner after
+        // it already sees Atmos.
         if probeOpened, resolvedInitialAudio >= 0, let par = probe.stream(at: resolvedInitialAudio)?.pointee.codecpar,
-           HLSVideoEngine.objectAudioSource(codecID: par.pointee.codec_id, profile: par.pointee.profile) == .trueHDAtmos,
-           HLSVideoEngine.spatialRenderingLayout(
+           HLSVideoEngine.probeAnticipatesAPAC(
                rendering: options.objectAudioRendering, codecID: par.pointee.codec_id,
-               profile: par.pointee.profile, sampleRate: par.pointee.sample_rate) != nil {
+               profile: par.pointee.profile, sampleRate: par.pointee.sample_rate) {
             anticipateAtmosOutput()
         }
         switch Self.loadDisplayCriteriaAction(engineWritesCriteria: options.engineWritesDisplayCriteria, audioOnlyPath: false) {
