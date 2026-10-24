@@ -142,6 +142,8 @@ enum ColorAttachments {
         case AVCOL_SPC_BT2020_NCL, AVCOL_SPC_BT2020_CL: kCVImageBufferYCbCrMatrix_ITU_R_2020
         case AVCOL_SPC_SMPTE170M, AVCOL_SPC_BT470BG: kCVImageBufferYCbCrMatrix_ITU_R_601_4
         case AVCOL_SPC_SMPTE240M:                   kCVImageBufferYCbCrMatrix_SMPTE_240M_1995
+        // CoreVideo maps code point 14 to its own `ITU_R_2100_ICtCp`, which no public header names.
+        case AVCOL_SPC_ICTCP:                       CVYCbCrMatrixGetStringForIntegerCodePoint(14)?.takeUnretainedValue()
         default:                                    nil
         }
     }

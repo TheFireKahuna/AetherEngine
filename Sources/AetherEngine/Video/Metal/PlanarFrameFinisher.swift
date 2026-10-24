@@ -15,19 +15,21 @@ import AetherLibavutil
 /// - Y'CbCr with the output's chroma subsampling: each code taken to the output depth (a shift at video range,
 ///   H.273's (2^n - 1) scaling at full range).
 /// - Y'CbCr with less chroma than the output keeps (4:2:0 into `sv22`, 4:1:1, 4:1:0, 4:4:0): chroma resampled
-///   with Catmull-Rom at the stream's chroma siting, in source units, then taken to the output depth.
+///   with Catmull-Rom at the stream's chroma siting, in exact integers, then taken to the output depth.
 /// - Grey: luma taken to the output depth, chroma neutral (`1 << (n - 1)`).
 /// - RGB and palette: R'G'B' codes decoded at their range (H.273 (27)-(29), (33)-(35)) and encoded as
 ///   non-constant-luminance Y'CbCr with the matrix the buffer is tagged with, 4:4:4.
+/// - Convert (`ColourRepresentation`): Y'CbCr in a matrix CoreVideo cannot tag (FCC, chromaticity-derived,
+///   YCgCo, YCgCo-R, GBR on Y'CbCr-labelled planes), chroma resampled to every pixel and re-encoded 4:4:4.
 /// - A source deeper than the 10 bits the output keeps: the value formed with six fraction bits and ordered
 ///   down with the 8x8 Bayer threshold.
 ///
 /// Each source format gets its own specialised pipeline (function constants), compiled once per process.
 final class PlanarFrameFinisher: @unchecked Sendable {
 
-    enum Mode: UInt32 { case pack = 0, resample = 1, gray = 2, rgb = 3 }
+    enum Mode: UInt32 { case pack = 0, resample = 1, gray = 2, rgb = 3, convert = 4 }
 
-    /// What one source format means for the kernel. Everything but `rgbRows` is a function constant.
+    /// What one source format means for the kernel. Everything but `rows` is a function constant.
     struct Plan: Hashable {
         var mode: Mode
         var outputLog2: [UInt32]
@@ -43,19 +45,22 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         var containerShift: UInt32
         var chromaLocation: UInt32
         var wideOutput: Bool
-        /// RGB: output code (with the fraction bits) per R, G, B code, then the offset, in 2^-30 fixed point; 12 values.
-        var rgbRows: [Int64]
+        /// Convert: 1 non-constant luminance, 2 YCgCo, 3 YCgCo-R (0 otherwise), and BitDepthRGB for 2 and 3.
+        var matrix: UInt32
+        var bitDepthRGB: UInt32
+        /// RGB and convert: the affine map to output words (with the fraction bits), as double-float rows.
+        var rows: [Float]
         /// Bytes a component load reads, per plane: plane offsets and linesizes must be multiples of it.
         var planeAlignment: [Int]
 
-        static func == (a: Plan, b: Plan) -> Bool { a.specialisation == b.specialisation && a.rgbRows == b.rgbRows }
-        func hash(into hasher: inout Hasher) { hasher.combine(specialisation); hasher.combine(rgbRows) }
+        static func == (a: Plan, b: Plan) -> Bool { a.specialisation == b.specialisation && a.rows == b.rows }
+        func hash(into hasher: inout Hasher) { hasher.combine(specialisation); hasher.combine(rows) }
 
         /// The function constants, in index order.
         var specialisation: [UInt32] {
             [mode.rawValue] + outputLog2 + sourceLog2 + components.flatMap { $0 }
                 + [bigEndian ? 1 : 0, bitstream ? 1 : 0, palette ? 1 : 0, fullRange ? 1 : 0,
-                   targetBits, fractionBits, containerShift, chromaLocation]
+                   targetBits, fractionBits, containerShift, chromaLocation, matrix, bitDepthRGB]
         }
     }
 
@@ -83,14 +88,19 @@ final class PlanarFrameFinisher: @unchecked Sendable {
 
     /// The plan for `source` written as `output`, or nil when the reader cannot describe the format or the output
     /// cannot hold it. `chromaLocation` is the frame's, UNSPECIFIED already resolved; `sourceFullRange` the
-    /// frame's range (for RGB: whether its codes are full range); `matrix` the buffer's tagged Y'CbCr matrix.
-    /// An interlaced picture is never resampled vertically: its chroma rows alternate between the two fields.
+    /// frame's range (for RGB: whether its codes are full range); `matrix` the Y'CbCr matrix the buffer is tagged
+    /// with (and an RGB or converted picture encoded with); `representation` what the source's MatrixCoefficients
+    /// call for. An interlaced picture is never resampled vertically: its chroma rows alternate between the fields.
     static func plan(source: AVPixelFormat, output: SoftwareVideoDecoder.OutputFormat, sourceFullRange: Bool,
-                     chromaLocation: AVChromaLocation, matrix: CFString, interlaced: Bool = false) -> Plan? {
+                     chromaLocation: AVChromaLocation, matrix: CFString, interlaced: Bool = false,
+                     representation: ColourRepresentation = .tagged) -> Plan? {
         guard reads(source), let desc = av_pix_fmt_desc_get(source)?.pointee else { return nil }
-        let comps = components(desc)
+        if case .refused = representation { return nil }
+        var comps = components(desc)
+        // Identity: the Y'CbCr-labelled planes hold G, B, R; read them as R, G, B.
+        if representation == .identity { comps = [comps[2], comps[0], comps[1]] + comps.dropFirst(3) }
         let isPalette = desc.flags & UInt64(AV_PIX_FMT_FLAG_PAL) != 0
-        let isRGB = !isPalette && desc.flags & UInt64(AV_PIX_FMT_FLAG_RGB) != 0
+        let isRGB = representation == .identity || (!isPalette && desc.flags & UInt64(AV_PIX_FMT_FLAG_RGB) != 0)
         let isGray = !isPalette && !isRGB && desc.nb_components < 3
 
         let (targetBits, fractionBits, containerShift): (UInt32, UInt32, UInt32) = switch output.depth {
@@ -111,21 +121,47 @@ final class PlanarFrameFinisher: @unchecked Sendable {
             mode = .rgb
         } else if isGray {
             mode = .gray
+        } else if representation.converts {
+            guard outLog2 == [0, 0], !interlaced || srcLog2[1] == 0 else { return nil }
+            mode = .convert
         } else {
             guard outLog2[0] <= srcLog2[0], outLog2[1] <= srcLog2[1], !interlaced || outLog2[1] == srcLog2[1] else { return nil }
             mode = outLog2 == srcLog2 ? .pack : .resample
         }
         // A code is only ever widened: the output's significant bits plus its fraction bits hold every source bit.
-        if mode != .rgb {
+        if mode != .rgb && mode != .convert {
             let used = mode == .gray ? 1 : 3
             guard comps.prefix(used).allSatisfy({ UInt32($0.depth) <= targetBits + fractionBits }) else { return nil }
         }
 
-        let rows: [Int64] = mode == .rgb
-            ? rgbRows(matrix: matrix, sourceDepths: isPalette ? [8, 8, 8] : comps.prefix(3).map { Int($0.depth) },
-                      sourceFullRange: isPalette || sourceFullRange, targetBits: Int(targetBits),
-                      fractionBits: Int(fractionBits), outputFullRange: output.fullRange)
-            : [Int64](repeating: 0, count: 12)
+        // Output words from E'Y, E'PB, E'PR in the tagged matrix: (45)-(47), then (30)-(32) / (36)-(38).
+        let target = coefficients(matrix)
+        let encode = ColourAffine.encodeCodes(targetBits: Int(targetBits), fractionBits: Int(fractionBits),
+                                              fullRange: output.fullRange)
+            .after(ColourAffine.encodeNCL(kr: target.kr, kb: target.kb))
+        var matrixMode: UInt32 = 0, bitDepthRGB: UInt32 = 0
+        let rows: ColourAffine?
+        switch (mode, representation) {
+        case (.rgb, _):
+            rows = encode.after(ColourAffine.decodeRGB(depths: isPalette ? [8, 8, 8] : comps.prefix(3).map { Int($0.depth) },
+                                                       fullRange: isPalette || sourceFullRange))
+        case (.convert, .nonConstantLuminance(let kr, let kb)):
+            matrixMode = 1
+            rows = encode.after(ColourAffine.decodeNCL(kr: kr, kb: kb))
+                .after(ColourAffine.decodeYCbCr(depths: comps.prefix(3).map { Int($0.depth) }, fullRange: sourceFullRange))
+        case (.convert, .ycgco):
+            matrixMode = 2
+            bitDepthRGB = UInt32(comps[0].depth)
+            rows = encode.after(ColourAffine.decodeRGB(depths: Array(repeating: Int(bitDepthRGB), count: 3), fullRange: sourceFullRange))
+        case (.convert, .ycgcoR(let depth)):
+            matrixMode = 3
+            bitDepthRGB = UInt32(depth)
+            rows = encode.after(ColourAffine.decodeRGB(depths: Array(repeating: depth, count: 3), fullRange: sourceFullRange))
+        case (.convert, _):
+            return nil
+        default:
+            rows = nil
+        }
         var alignment = [1, 1, 1, 1]
         for c in comps.prefix(isPalette ? 1 : 3) where desc.flags & UInt64(AV_PIX_FMT_FLAG_BITSTREAM) == 0 {
             let bits = Int(c.shift + c.depth)
@@ -134,14 +170,15 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         if isPalette { alignment[1] = 4 }
 
         return Plan(
-            mode: mode, outputLog2: outLog2, sourceLog2: mode == .resample || mode == .pack ? srcLog2 : outLog2,
+            mode: mode, outputLog2: outLog2, sourceLog2: [.pack, .resample, .convert].contains(mode) ? srcLog2 : outLog2,
             components: comps.prefix(3).map { [UInt32($0.plane), UInt32($0.step), UInt32($0.offset), UInt32($0.shift), UInt32($0.depth)] },
             bigEndian: desc.flags & UInt64(AV_PIX_FMT_FLAG_BE) != 0,
             bitstream: desc.flags & UInt64(AV_PIX_FMT_FLAG_BITSTREAM) != 0,
             palette: isPalette, fullRange: mode == .rgb ? (isPalette || sourceFullRange) : sourceFullRange,
             targetBits: targetBits, fractionBits: fractionBits, containerShift: containerShift,
             chromaLocation: UInt32(chromaLocation.rawValue), wideOutput: output.depth != .eight,
-            rgbRows: rows, planeAlignment: alignment)
+            matrix: matrixMode, bitDepthRGB: bitDepthRGB,
+            rows: rows?.doubleFloatRows ?? [Float](repeating: 0, count: 24), planeAlignment: alignment)
     }
 
     private static func components(_ desc: AVPixFmtDescriptor) -> [AVComponentDescriptor] {
@@ -156,33 +193,6 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         case kCVImageBufferYCbCrMatrix_SMPTE_240M_1995: (0.212, 0.087)
         default: (0.2126, 0.0722)
         }
-    }
-
-    /// R'G'B' codes to Y'CbCr output words, as affine rows (computed in double, handed to the GPU in 2^-30 fixed point):
-    /// the codes decode to E'R, E'G, E'B at their range ((27)-(29) or (33)-(35)), then (45)-(47), then (30)-(32)
-    /// or (36)-(38) at T bits, times 2^F. Round and Clip are the kernel's.
-    static func rgbRows(matrix: CFString, sourceDepths: [Int], sourceFullRange: Bool, targetBits: Int,
-                        fractionBits: Int, outputFullRange: Bool) -> [Int64] {
-        let (kr, kb) = coefficients(matrix)
-        let kg = 1 - kr - kb
-        // E' = a * code + b per component.
-        let decode: [(a: Double, b: Double)] = sourceDepths.map { d in
-            sourceFullRange ? (1 / Double((1 << d) - 1), 0) : (1 / (219 * pow(2, Double(d - 8))), -16.0 / 219)
-        }
-        let n = Double(targetBits), scale = pow(2, Double(fractionBits))
-        let (ySpan, yOff, cSpan, cOff): (Double, Double, Double, Double) = outputFullRange
-            ? (pow(2, n) - 1, 0, pow(2, n) - 1, pow(2, n - 1))
-            : (219 * pow(2, n - 8), 16 * pow(2, n - 8), 224 * pow(2, n - 8), 128 * pow(2, n - 8))
-        // Rows over (E'R, E'G, E'B).
-        let y = [kr, kg, kb]
-        let cb = [-0.5 * kr / (1 - kb), -0.5 * kg / (1 - kb), 0.5]
-        let cr = [0.5, -0.5 * kg / (1 - kr), -0.5 * kb / (1 - kr)]
-        func row(_ m: [Double], span: Double, offset: Double) -> [Int64] {
-            let coeffs = (0..<3).map { m[$0] * decode[$0].a * span * scale }
-            let constant = ((0..<3).reduce(0) { $0 + m[$1] * decode[$1].b } * span + offset) * scale
-            return (coeffs + [constant]).map { Int64(($0 * 1_073_741_824).rounded()) }
-        }
-        return row(y, span: ySpan, offset: yOff) + row(cb, span: cSpan, offset: cOff) + row(cr, span: cSpan, offset: cOff)
     }
 
     /// The planes of `frame` inside `slab` (one the allocator made, so every plane is in it).
@@ -272,11 +282,11 @@ final class PlanarFrameFinisher: @unchecked Sendable {
               let commands = queue.makeCommandBuffer(), let encoder = commands.makeComputeCommandEncoder()
         else { return false }
 
-        // PFFrame: twelve 32-bit words, then the 64-bit rows (8-byte aligned at offset 48).
+        // PFFrame: twelve 32-bit words, then the double-float rows (float2, 8-byte aligned at offset 48).
         var frame = Data()
         for word in [UInt32(width), UInt32(height), UInt32(chromaTexture.width), UInt32(chromaTexture.height)]
             + planes.offsets + planes.linesizes { withUnsafeBytes(of: word) { frame.append(contentsOf: $0) } }
-        for row in plan.rgbRows { withUnsafeBytes(of: row) { frame.append(contentsOf: $0) } }
+        for value in plan.rows { withUnsafeBytes(of: value) { frame.append(contentsOf: $0) } }
         encoder.setComputePipelineState(pipeline)
         encoder.setBuffer(planes.slab.buffer, offset: 0, index: 0)
         frame.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }

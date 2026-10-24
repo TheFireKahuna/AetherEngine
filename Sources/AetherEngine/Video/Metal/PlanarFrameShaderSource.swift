@@ -13,7 +13,8 @@ using namespace metal;
 // MARK: - Specialisation
 
 // 0 pack (Y'CbCr, output keeps the source's chroma subsampling), 1 resample (Y'CbCr, output keeps more chroma),
-// 2 grey (neutral chroma), 3 RGB (R'G'B' codes or a palette, to Y'CbCr through the affine rows).
+// 2 grey (neutral chroma), 3 RGB (R'G'B' codes or a palette, to Y'CbCr through the affine rows), 4 convert
+// (Y'CbCr in a matrix CoreVideo cannot tag, re-encoded at 4:4:4; FC_MATRIX says which).
 constant uint FC_MODE        [[function_constant(0)]];
 constant uint FC_OUT_LOG2_W  [[function_constant(1)]];
 constant uint FC_OUT_LOG2_H  [[function_constant(2)]];
@@ -41,6 +42,10 @@ constant uint FC_FRACTION_BITS   [[function_constant(25)]];
 constant uint FC_CONTAINER_SHIFT [[function_constant(26)]];
 // AVChromaLocation, UNSPECIFIED already resolved.
 constant uint FC_CHROMA_LOCATION [[function_constant(27)]];
+// Convert: 1 non-constant luminance (one affine map of Y, Cb, Cr), 2 YCgCo (54)-(57), 3 YCgCo-R (62)-(65); the
+// last two then encode their R, G, B codes through the affine rows. BitDepthRGB for 2 and 3 (23)-(25).
+constant uint FC_MATRIX        [[function_constant(28)]];
+constant uint FC_BITDEPTH_RGB  [[function_constant(29)]];
 
 constant bool PF_DITHER = FC_FRACTION_BITS > 0u;
 constant uint PF_BLOCK_W = 1u << FC_OUT_LOG2_W;
@@ -55,11 +60,61 @@ struct PFFrame {
     uint chroma_height;
     uint plane_offset[4];
     uint linesize[4];
-    // RGB: output code (with F fraction bits) = ( row[0] R + row[1] G + row[2] B + row[3] ) / 2^30, before Round.
-    // Fixed point: at 16-bit outputs float32 cannot place a value against its rounding tie, 64-bit integers
-    // with 30 fraction bits err by under 2^-14 of a code.
-    long rgb_rows[12];
+    // RGB and convert: output word (with F fraction bits) = rows[4i] x0 + rows[4i+1] x1 + rows[4i+2] x2 + rows[4i+3],
+    // before Round, each coefficient a double-float (hi, lo) computed in double on the host.
+    float2 rows[12];
 };
+
+// MARK: - Double-float
+
+// A value as the unevaluated sum hi + lo of two floats (about 48 significant bits). The library is compiled with
+// MTLMathMode.safe, so nothing reassociates these sums; fma is a single rounding.
+struct pf_df { float hi; float lo; };
+
+static inline pf_df pf_quick_two_sum(float a, float b) { float s = a + b; return pf_df{s, b - (s - a)}; }
+
+static inline pf_df pf_two_sum(float a, float b) {
+    float s = a + b, bb = s - a;
+    return pf_df{s, (a - (s - bb)) + (b - bb)};
+}
+
+static inline pf_df pf_add(pf_df a, pf_df b) {
+    pf_df s = pf_two_sum(a.hi, b.hi), t = pf_two_sum(a.lo, b.lo);
+    s = pf_quick_two_sum(s.hi, s.lo + t.hi);
+    return pf_quick_two_sum(s.hi, s.lo + t.lo);
+}
+
+static inline pf_df pf_mul(pf_df a, pf_df b) {
+    float p = a.hi * b.hi;
+    float e = fma(a.hi, b.hi, -p);
+    e = fma(a.hi, b.lo, fma(a.lo, b.hi, e));
+    return pf_quick_two_sum(p, e);
+}
+
+// An integer (|v| < 2^47) as a double-float, exactly; `scale` a power of two applied exactly.
+static inline pf_df pf_df_long(long v, float scale) {
+    float hi = float(v);
+    float lo = float(v - long(hi));
+    return pf_df{hi * scale, lo * scale};
+}
+
+// Round( x ) = Floor( x + 0.5 ) (8) of a double-float, clipped to a word. Words stay below 2^23, so a hi that is not
+// whole is further from the next integer than lo can reach.
+static inline uint pf_round_df(pf_df x, uint word_max) {
+    pf_df t = pf_add(x, pf_df{0.5f, 0.0f});
+    float f = floor(t.hi);
+    if (t.hi == f && t.lo < 0.0f) { f -= 1.0f; }
+    return uint(clamp(f, 0.0f, float(word_max)));
+}
+
+// Output word i of the affine rows applied to (x0, x1, x2).
+static inline uint pf_affine(constant PFFrame& f, uint i, pf_df x0, pf_df x1, pf_df x2, uint word_max) {
+    pf_df acc = pf_df{f.rows[4u * i + 3u].x, f.rows[4u * i + 3u].y};
+    acc = pf_add(acc, pf_mul(pf_df{f.rows[4u * i].x, f.rows[4u * i].y}, x0));
+    acc = pf_add(acc, pf_mul(pf_df{f.rows[4u * i + 1u].x, f.rows[4u * i + 1u].y}, x1));
+    acc = pf_add(acc, pf_mul(pf_df{f.rows[4u * i + 2u].x, f.rows[4u * i + 2u].y}, x2));
+    return pf_round_df(acc, word_max);
+}
 
 // MARK: - Reading (av_read_image_line2)
 
@@ -137,13 +192,6 @@ static inline uint pf_chroma_word(uint v, uint d) {
              + den * (long(1u << (FC_TARGET_BITS - 1u + FC_FRACTION_BITS + 1u)) + 1l);
     if (num <= 0l) { return 0u; }
     return min(uint(num / (2l * den)), PF_WORD_MAX);
-}
-
-// An RGB row applied to codes: Round( x ) = Floor( x + 0.5 ) (8) in 2^-30 fixed point, clipped.
-static inline uint pf_rgb_word(constant PFFrame& f, uint row, int3 rgb) {
-    long acc = f.rgb_rows[row * 4u] * long(rgb.x) + f.rgb_rows[row * 4u + 1u] * long(rgb.y)
-             + f.rgb_rows[row * 4u + 2u] * long(rgb.z) + f.rgb_rows[row * 4u + 3u] + (1l << 29);
-    return acc <= 0l ? 0u : min(uint(min(acc >> 30, long(PF_WORD_MAX))), PF_WORD_MAX);
 }
 
 // Integer Bayer 8x8 thresholds (0...63), by row then word.
@@ -247,10 +295,48 @@ kernel void pf_finish(device const uchar*            src     [[buffer(0)]],
     uint cb, cr;
     if (FC_MODE == 3u) {
         // RGB goes out 4:4:4: one pixel, all three outputs from one read.
-        int3 rgb = pf_rgb_codes(src, f, gid.x, gid.y);
-        out_y.write(uint4(pf_container(pf_rgb_word(f, 0u, rgb), gid.x, gid.y)), gid);
-        cb = pf_rgb_word(f, 1u, rgb);
-        cr = pf_rgb_word(f, 2u, rgb);
+        int3 c = pf_rgb_codes(src, f, gid.x, gid.y);
+        pf_df r = pf_df{float(c.x), 0.0f}, g = pf_df{float(c.y), 0.0f}, b = pf_df{float(c.z), 0.0f};
+        out_y.write(uint4(pf_container(pf_affine(f, 0u, r, g, b, PF_WORD_MAX), gid.x, gid.y)), gid);
+        cb = pf_affine(f, 1u, r, g, b, PF_WORD_MAX);
+        cr = pf_affine(f, 2u, r, g, b, PF_WORD_MAX);
+    } else if (FC_MODE == 4u) {
+        // Convert goes out 4:4:4: chroma resampled to this pixel exactly, then re-encoded.
+        long y = long(pf_c0(src, f, gid.x, gid.y));
+        long2 c = pf_resample(src, f, gid);
+        uint3 out;
+        if (FC_MATRIX == 1u) {
+            pf_df x0 = pf_df{float(y), 0.0f}, x1 = pf_df_long(c.x, 0x1p-20f), x2 = pf_df_long(c.y, 0x1p-20f);
+            out = uint3(pf_affine(f, 0u, x0, x1, x2, PF_WORD_MAX), pf_affine(f, 1u, x0, x1, x2, PF_WORD_MAX),
+                        pf_affine(f, 2u, x0, x1, x2, PF_WORD_MAX));
+        } else {
+            long h = long(1u << (FC_C1_DEPTH - 1u));
+            long rgb_max = long((1u << FC_BITDEPTH_RGB) - 1u);
+            long3 rgb;  // numerators over 2^20
+            if (FC_MATRIX == 2u) {
+                // (54)-(57) on real values: chroma resampled to this pixel is a numerator over 2^20.
+                long luma_max = long((1u << FC_C0_DEPTH) - 1u) << 20;
+                long cg = c.x - (h << 20), co = c.y - (h << 20);
+                long t = (y << 20) - cg;
+                rgb = long3(clamp(t + co, 0l, luma_max), clamp((y << 20) + cg, 0l, luma_max), clamp(t - co, 0l, luma_max));
+            } else {
+                // (62)-(65) are integer lifting: chroma resampled to this pixel is rounded to a code first.
+                long cg = ((clamp(c.x, 0l, long((1u << FC_C1_DEPTH) - 1u) << 20) + (1l << 19)) >> 20) - h;
+                long co = ((clamp(c.y, 0l, long((1u << FC_C2_DEPTH) - 1u) << 20) + (1l << 19)) >> 20) - h;
+                // >> of a negative value is floor division here, as H.273's arithmetic shift: (v - (v & 1)) / 2.
+                long t = y - (cg - (cg & 1l)) / 2l;
+                long g = clamp(t + cg, 0l, rgb_max);
+                long b = clamp(t - (co - (co & 1l)) / 2l, 0l, rgb_max);
+                long r = clamp(b + co, 0l, rgb_max);
+                rgb = long3(r, g, b) << 20;
+            }
+            pf_df r = pf_df_long(rgb.x, 0x1p-20f), g = pf_df_long(rgb.y, 0x1p-20f), b = pf_df_long(rgb.z, 0x1p-20f);
+            out = uint3(pf_affine(f, 0u, r, g, b, PF_WORD_MAX), pf_affine(f, 1u, r, g, b, PF_WORD_MAX),
+                        pf_affine(f, 2u, r, g, b, PF_WORD_MAX));
+        }
+        out_y.write(uint4(pf_container(out.x, gid.x, gid.y)), gid);
+        cb = out.y;
+        cr = out.z;
     } else {
         uint2 base = gid * uint2(PF_BLOCK_W, PF_BLOCK_H);
         for (uint j = 0u; j < PF_BLOCK_H; ++j) {

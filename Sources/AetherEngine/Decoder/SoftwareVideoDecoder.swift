@@ -21,6 +21,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// `lock`, like everything `emit` touches.
     private var plans: [PlanKey: PlanarFrameFinisher.Plan] = [:]
     private var refusedPlans: Set<PlanKey> = []
+    private var refusedRepresentations: Set<String> = []
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
     var onFrame: DecodedFrameHandler?
 
@@ -220,16 +221,20 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     nonisolated static func outputFormat(pixelFormat: Int32, colorRange: AVColorRange,
                                          streamIs10Bit: Bool,
                                          twelveBit420: TwelveBit420Output = .p010Dithered,
-                                         interlaced: Bool = false) -> OutputFormat {
+                                         interlaced: Bool = false,
+                                         representation: ColourRepresentation = .tagged) -> OutputFormat {
         let format = AVPixelFormat(rawValue: pixelFormat)
         let desc = av_pix_fmt_desc_get(format)?.pointee
         let depth = desc?.comp.0.depth ?? 8
         let isRGB = ((desc?.flags ?? 0) & UInt64(AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL)) != 0
+            || representation == .identity
         // RGB has no Y'CbCr range of its own to keep: it is encoded at video range like every other source.
         let fullRange = !isRGB && (colorRange == AVCOL_RANGE_JPEG || isJPEGFormat(format))
 
+        // A picture whose matrix is re-encoded goes out 4:4:4: the conversion is per pixel, after chroma is resampled
+        // to every luma site, and nothing is subsampled again.
         let chroma: OutputFormat.Chroma
-        if isRGB {
+        if isRGB || representation.converts {
             chroma = .yuv444
         } else if let desc, desc.nb_components >= 3 {
             chroma = desc.log2_chroma_w == 0 ? .yuv444 : (desc.log2_chroma_h > 0 ? .yuv420 : .yuv422)
@@ -721,6 +726,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         codecContext = nil
         plans = [:]
         refusedPlans = []
+        refusedRepresentations = []
         pixelBufferPool = nil
         poolWidth = 0
         poolHeight = 0
@@ -817,6 +823,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         var chromaLocation: UInt32
         var matrix: String
         var interlaced: Bool
+        var representation: ColourRepresentation
     }
 
     /// The display buffer for one decoded picture, written by the GPU from the picture's own memory. Nil (and
@@ -827,26 +834,39 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         guard width > 0, height > 0 else { return nil }
         let format = AVPixelFormat(rawValue: frame.pointee.format)
         let interlaced = (frame.pointee.flags & (1 << 3)) != 0  // AV_FRAME_FLAG_INTERLACED
+        let colour = ColorDescription(frame: frame)
+        let representation = ColourRepresentation.resolve(format: format, matrix: colour.matrix, primaries: colour.primaries)
+        if case .refused(let reason) = representation {
+            if refusedRepresentations.insert(reason).inserted {
+                EngineLog.emit("[SWDecoder] cannot represent this picture: \(reason); frames dropped", category: .swPlayback)
+            }
+            return nil
+        }
         let outputFormat = Self.outputFormat(
             pixelFormat: frame.pointee.format, colorRange: frame.pointee.color_range, streamIs10Bit: use10Bit,
-            twelveBit420: twelveBit420, interlaced: interlaced)
+            twelveBit420: twelveBit420, interlaced: interlaced, representation: representation)
         logOutputFormat(outputFormat, source: av_get_pix_fmt_name(format).map { String(cString: $0) } ?? "?",
                         colorRange: frame.pointee.color_range)
 
         let isRGB = (av_pix_fmt_desc_get(format)?.pointee.flags ?? 0) & UInt64(AV_PIX_FMT_FLAG_RGB) != 0
         // H.273: VideoFullRangeFlag applies to R'G'B' codes too. An RGB frame is full range unless it says
-        // video range; a Y'CbCr frame is video range unless it (or its yuvj format) says full.
-        let sourceFullRange = isRGB ? frame.pointee.color_range != AVCOL_RANGE_MPEG : outputFormat.fullRange
-        let matrix = ColorAttachments.presented(ColorDescription(frame: frame),
-                                                frameSize: (frame.pointee.width, frame.pointee.height)).matrix
+        // video range; a Y'CbCr frame (YCgCo's R'G'B' codes included) is video range unless it, or its yuvj
+        // format, says full.
+        let sourceFullRange = isRGB ? frame.pointee.color_range != AVCOL_RANGE_MPEG
+            : (frame.pointee.color_range == AVCOL_RANGE_JPEG || Self.isJPEGFormat(format))
+        // A converted picture is encoded with, and tagged as, the matrix its primaries call for.
+        let convertedMatrix = representation.converts ? ColourRepresentation.targetMatrix(primaries: colour.primaries) : nil
+        let matrix = convertedMatrix ?? ColorAttachments.presented(colour, frameSize: (frame.pointee.width, frame.pointee.height)).matrix
         let location = Self.resolvedChromaLocation(frame.pointee.chroma_location, isJPEG: Self.isJPEGFormat(format))
         let key = PlanKey(pixelFormat: frame.pointee.format, output: outputFormat, sourceFullRange: sourceFullRange,
-                          chromaLocation: UInt32(location.rawValue), matrix: matrix as String, interlaced: interlaced)
+                          chromaLocation: UInt32(location.rawValue), matrix: matrix as String, interlaced: interlaced,
+                          representation: representation)
         let plan: PlanarFrameFinisher.Plan
         if let known = plans[key] {
             plan = known
         } else if let made = PlanarFrameFinisher.plan(source: format, output: outputFormat, sourceFullRange: sourceFullRange,
-                                                      chromaLocation: location, matrix: matrix, interlaced: interlaced) {
+                                                      chromaLocation: location, matrix: matrix, interlaced: interlaced,
+                                                      representation: representation) {
             plans[key] = made
             plan = made
         } else {
@@ -863,6 +883,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
               CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer) == kCVReturnSuccess,
               let pb = pixelBuffer else { return nil }
         attachColorSpace(from: frame, to: pb)
+        if let convertedMatrix { CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, convertedMatrix, .shouldPropagate) }
         attachPixelAspectRatio(from: frame, to: pb)
 
         // The decoder's own slab, or (rawvideo, libavcodec's paletted buffers) a copy of the picture in one.
