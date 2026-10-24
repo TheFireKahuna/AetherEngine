@@ -3741,6 +3741,13 @@ public final class AetherEngine: ObservableObject {
     /// selection change that took the OCR worker away can hand it back. Cleared with the track table.
     var forcedRenditionRequestedOrdinal: Int?
 
+    /// Native subtitle renditions filled from the container's index (`AetherEngine+IndexedSubtitles`):
+    /// the load-time fill, the index once read, and the on-demand fill of a selected bitmap rendition.
+    var indexedSubtitleTask: Task<Void, Never>?
+    var indexedSubtitles: IndexedSubtitleState?
+    var indexedBitmapFillTask: Task<Void, Never>?
+    var indexedBitmapFillOrdinal: Int?
+
     /// AE#464 round 2: the position the load currently in flight was handed, parked across the window
     /// in which `load` has already zeroed the clock but the rebuilt session has not reached it yet.
     /// Written at the two sites that raise `state = .loading` for a load, retired by an accepted seek;
@@ -3868,6 +3875,18 @@ public final class AetherEngine: ObservableObject {
     /// How far behind the packet in hand a side reader claims its reading complete (`noteRead`): a subtitle
     /// block is interleaved by its own time, which can trail the reference packet by a fraction of a second.
     nonisolated static let nativeSubtitleReadMarginSeconds: Double = 1.0
+
+    /// How far past the player's furthest subtitle request a feeder reads: one window's worth beyond what
+    /// it asked for, so the next request finds its window read.
+    nonisolated static let subtitleDemandMarginSeconds: Double = 30
+
+    /// A feeder's read-ahead: `base`, or further when the player has asked for windows ending at
+    /// `requested` (source axis). AVKit reads a subtitle rendition about four minutes ahead of the video
+    /// it fetches (device log 2026-10-24), beyond every fixed lead the feeders had.
+    nonisolated static func subtitleReadAhead(base: Double, playhead: Double, requested: Double?) -> Double {
+        guard let requested, requested.isFinite else { return base }
+        return max(base, requested - playhead + subtitleDemandMarginSeconds)
+    }
 
     /// Source-time flush window for ASS cue batching (#56). Previously each event triggered a MainActor.run hop;
     /// on packet-dense tracks (hundreds of events in a few seconds) those hops serialised the demux loop against
@@ -4481,6 +4500,7 @@ public final class AetherEngine: ObservableObject {
         nativeSubtitleReapplyOrdinal = nil
         forcedSubtitleSelection = false
         forcedRenditionRequestedOrdinal = nil
+        cancelIndexedSubtitleFill()
         nativeSubtitleTracks = []
         nativeSubtitleReaderParams = nil
         metadata = nil
@@ -8154,6 +8174,7 @@ public final class AetherEngine: ObservableObject {
         nativeSubtitleReapplyOrdinal = nil
         forcedSubtitleSelection = false
         forcedRenditionRequestedOrdinal = nil
+        cancelIndexedSubtitleFill()
         nativeSubtitleTracks = []
         nativeSubtitleReaderParams = nil
         cancelNativeSubtitleReaders()
