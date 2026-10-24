@@ -98,10 +98,11 @@ final class APACObjectEncoder: APACChunkEncoding {
     /// a restart needs no rebasing.
     private var clock: Int64 = 0
 
-    /// Per slot; `lfe` is the bed's LFE gain (its position is never used).
+    /// Per slot; `lfe` holds each LFE element's gain (their positions are never used). A
+    /// presentation can carry LFE2 as well as LFE: both play from the bed's LFE, summed.
     private var slots: [APACObjectTrajectory]
-    private var lfe: APACObjectTrajectory
-    /// What each element of the current presentation feeds: a slot, the LFE (-1) or nothing (nil).
+    private var lfe: [APACObjectTrajectory] = []
+    /// What each element of the current presentation feeds: a slot, LFE k (-1 - k) or nothing (nil).
     private var roles: [ObjectAudioRole] = []
     private var route: [Int?] = []
     /// Slots an element feeds, and the bus's; the others get no metadata at all.
@@ -178,7 +179,6 @@ final class APACObjectEncoder: APACChunkEncoding {
         for (k, speaker) in busSpeakers.enumerated() {
             slots[Self.objectSlots + k] = APACObjectTrajectory(.init(position: speaker.position, size: 0, gain: 1))
         }
-        lfe = APACObjectTrajectory(Self.silent)
         bus = ObjectAudioRenderer(layout: output, roles: [])
         busPlanes = (0..<SpatialSpeakerLayout.l714.channelCount).map { _ in
             let plane = UnsafeMutablePointer<Float>.allocate(capacity: 1024)
@@ -361,7 +361,7 @@ final class APACObjectEncoder: APACChunkEncoding {
         ended = false
         gatedFramesLeft = Self.gatedFrames
         for i in slots.indices { slots[i].restart(at: clock) }
-        lfe.restart(at: clock)
+        for i in lfe.indices { lfe[i].restart(at: clock) }
         lastStates = lastStates.map { _ in nil }
         rampFrom = rampFrom.map { _ in nil }
     }
@@ -380,10 +380,12 @@ final class APACObjectEncoder: APACChunkEncoding {
         used = Self.busSlotsOnly
         bus = Self.busRenderer(output, roles: newRoles)
         var nextSlot = 0
+        var lfeCount = 0
         for role in newRoles {
             switch role {
             case .lfe:
-                route.append(-1)
+                lfeCount += 1
+                route.append(-lfeCount)
             case .bed, .fixed, .object:
                 if nextSlot < Self.objectSlots {
                     route.append(nextSlot)
@@ -402,7 +404,7 @@ final class APACObjectEncoder: APACChunkEncoding {
             slots[i] = APACObjectTrajectory(Self.silent)
             slots[i].restart(at: clock)
         }
-        lfe = APACObjectTrajectory(Self.silent)
+        lfe = (0..<lfeCount).map { _ in APACObjectTrajectory(Self.silent) }
         for (element, role) in newRoles.enumerated() {
             guard let target = route[element] else { continue }
             let initial: APACObjectTrajectory.Values
@@ -412,8 +414,8 @@ final class APACObjectEncoder: APACChunkEncoding {
             case .bed, .object: initial = Self.silent
             }
             if target < 0 {
-                lfe = APACObjectTrajectory(initial)
-                lfe.restart(at: clock)
+                lfe[-1 - target] = APACObjectTrajectory(initial)
+                lfe[-1 - target].restart(at: clock)
             } else {
                 slots[target] = APACObjectTrajectory(initial)
                 slots[target].restart(at: clock)
@@ -531,7 +533,7 @@ final class APACObjectEncoder: APACChunkEncoding {
             case .lfe: values = .init(position: SIMD3(0.5, 0, 0), size: 0, gain: state.gain)
             }
             if target < 0 {
-                lfe.apply(values, at: clock, rampFrames: ramp)
+                lfe[-1 - target].apply(values, at: clock, rampFrames: ramp)
             } else {
                 slots[target].apply(values, at: clock, rampFrames: ramp)
             }
@@ -559,7 +561,7 @@ final class APACObjectEncoder: APACChunkEncoding {
         lastStates = lastStates.map { _ in nil }
         rampFrom = rampFrom.map { _ in nil }
         for i in slots.indices { slots[i].markDiscontinuity() }
-        lfe.markDiscontinuity()
+        for i in lfe.indices { lfe[i].markDiscontinuity() }
         bus.markDiscontinuity()
     }
 
@@ -642,6 +644,13 @@ final class APACObjectEncoder: APACChunkEncoding {
     /// (measured 9.96 dB against `APACEncoder`, a 50 Hz tone): the LFE's in-band gain, applied once
     /// more. The channel bed is the level the rest of the engine delivers, so the LFE goes in 10 dB down.
     static let lfeCompensation = Float(pow(10, -10.0 / 20))
+
+    /// Whether the LFE is left out on `output`. On stereo the renderer folds it into L and R, +10 dB
+    /// then −6 dB a side (measured): BS.775's ideal fold, but a full-scale LFE on top of loud mains
+    /// clips there, and a consumer 2.0 downmix leaves the LFE out (BS.775 Attachment 1 §5 and §7,
+    /// Dolby's Lo/Ro, TS 103 448 tables A.2–A.4), as Apple's own decode of a channel bed does.
+    /// TrueHD carries no LFE mix level that would say otherwise.
+    static func dropsLFE(on output: SpatialSpeakerLayout) -> Bool { output == .l20 }
 
     /// On stereo the renderer plays an object at a speaker's position into the other speaker too, in
     /// phase, at 0.041 of its amplitude (−27.7 dB; measured as 99.83/0.17 power on a hard-left object,
@@ -731,15 +740,19 @@ final class APACObjectEncoder: APACChunkEncoding {
             guard let target, element < planes.count else { continue }
             let plane = planes[element] + start
             let channel = target < 0 ? lfeChannel : bedChannels + target
-            for i in 0..<count {
-                let t = clock + Int64(i)
-                let g: Float
-                if target < 0 {
-                    g = lfe.value(at: t).gain * Self.lfeCompensation
-                } else {
-                    let v = slots[target].value(at: t)
-                    g = v.gain * Self.distanceCompensation(v.position)
+            if target < 0 {
+                // Left silent on stereo, where the renderer would fold it into L and R (`dropsLFE`).
+                if Self.dropsLFE(on: output) { continue }
+                // Added, not assigned: LFE and LFE2 share the channel.
+                for i in 0..<count {
+                    let g = lfe[-1 - target].value(at: clock + Int64(i)).gain * Self.lfeCompensation
+                    staging[(staged + i) * inputChannels + channel] += plane[i] * g
                 }
+                continue
+            }
+            for i in 0..<count {
+                let v = slots[target].value(at: clock + Int64(i))
+                let g = v.gain * Self.distanceCompensation(v.position)
                 staging[(staged + i) * inputChannels + channel] = plane[i] * g
             }
         }
@@ -794,7 +807,7 @@ final class APACObjectEncoder: APACChunkEncoding {
         packetTrace.blocks = blockCounts
         packetTrace.halvedBudgets = budgets.filter { $0 < APACObjectMetadata.maxBlocks }.count
         for i in slots.indices { slots[i].finishPacket() }
-        lfe.finishPacket()
+        for i in lfe.indices { lfe[i].finishPacket() }
         if let packet {
             let channel = metadataChannel, stride = inputChannels
             APACObjectMetadata.samples(of: packet) { frame, value in staging[frame * stride + channel] = value }
@@ -936,7 +949,6 @@ final class APACObjectEncoder: APACChunkEncoding {
 
     private static func fourCC(_ s: String) -> UInt32 { s.utf8.reduce(0) { $0 << 8 | UInt32($1) } }
 }
-#endif
 
 /// One packet's inputs, for `APACObjectEncoder.reportFailure`.
 private struct PacketTrace {
@@ -998,3 +1010,4 @@ private struct SampleAudit {
         return text
     }
 }
+#endif
