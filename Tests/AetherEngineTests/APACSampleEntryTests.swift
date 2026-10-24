@@ -88,7 +88,7 @@ struct APACSampleEntryTests {
         #expect(APACSampleEntry.replacingSoundSampleEntry(in: initBytes, with: Data(box("apac", []))) == nil)
     }
 
-    @Test("the platform encoder yields sync packets, a dapa cookie and 2048 frames of priming")
+    @Test("the platform encoder yields a sync packet every interval, a dapa cookie and 2048 frames of priming")
     func encoder() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let layout = SpatialSpeakerLayout.l714
@@ -107,7 +107,8 @@ struct APACSampleEntryTests {
         packets += try encoder.flush()
         // 48000 input frames + 2048 priming, in 1024-frame packets, rounded up by the tail.
         #expect(packets.count == (frames + encoder.leadingFrames + 1023) / 1024)
-        #expect(packets.allSatisfy { $0.isSync })
+        #expect(packets.indices.filter { packets[$0].isSync }
+                == Array(stride(from: 0, to: packets.count, by: APACEncoder.syncPacketInterval)))
         #expect(packets.allSatisfy { !$0.data.isEmpty })
 
         // A reset re-primes exactly like a fresh encoder, which the bridge's timestamps assume: the

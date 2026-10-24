@@ -36,6 +36,31 @@ struct APACObjectOutputTests {
         #expect(encoder.leadingFrames == 2048)
     }
 
+    @Test("the object codec makes a sync packet every interval from its start, again after a reset; the stream says the same")
+    func syncPackets() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let encoder = try APACObjectEncoder(bitRate: 17 * 320_000, output: .l714)
+        let buffer = APACEncodePipeline.PlaneBuffer(channels: APACObjectEncoder.elementCapacity, capacity: 2048)
+        buffer.objectRoles = Self.roles
+        for plane in buffer.planes { for i in 0..<2048 { plane[i] = 0.1 * sin(Float(i) * 0.05) } }
+        func run() throws -> [APACEncoder.Packet] {
+            var packets: [APACEncoder.Packet] = []
+            for chunk in 0..<((APACEncoder.syncPacketInterval * 2 + 8) / 2) {
+                buffer.objectUpdates = chunk == 0 ? [.init(frameOffset: 0, rampFrames: 0, states: [nil, nil, nil, nil, nil])] : []
+                packets += try encoder.encode(buffer, frames: 2048)
+            }
+            return packets
+        }
+        for pass in 0..<2 {
+            let packets = try run()
+            #expect(packets.indices.filter { packets[$0].isSync }
+                    == Array(stride(from: 0, to: packets.count, by: APACEncoder.syncPacketInterval)), "pass \(pass)")
+            #expect(packets.allSatisfy { $0.isSync == APACEncoderTests.headerSaysSync($0) }, "pass \(pass): the stream says the same")
+            _ = try encoder.flush()
+            encoder.reset()
+        }
+    }
+
     // MARK: - Placement
 
     struct Case: CustomTestStringConvertible, Sendable {

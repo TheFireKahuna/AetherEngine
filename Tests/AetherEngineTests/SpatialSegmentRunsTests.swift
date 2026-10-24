@@ -61,6 +61,7 @@ struct SpatialSegmentRunsTests {
     private struct Out: Equatable {
         let pts: Int64
         let bytes: [UInt8]
+        let sync: Bool
     }
 
     /// 20 ms packets from `fromMs` to `toMs`, through segment runs whose segments are two seconds
@@ -88,7 +89,8 @@ struct SpatialSegmentRunsTests {
         func take(_ packets: [UnsafeMutablePointer<AVPacket>]) {
             for fp in packets {
                 segments[plan.segment(ofOutputPts: fp.pointee.pts), default: []]
-                    .append(Out(pts: fp.pointee.pts, bytes: Array(UnsafeBufferPointer(start: fp.pointee.data, count: Int(fp.pointee.size)))))
+                    .append(Out(pts: fp.pointee.pts, bytes: Array(UnsafeBufferPointer(start: fp.pointee.data, count: Int(fp.pointee.size))),
+                                sync: fp.pointee.flags & AV_PKT_FLAG_KEY != 0))
                 var q: UnsafeMutablePointer<AVPacket>? = fp
                 trackedPacketFree(&q)
             }
@@ -116,6 +118,8 @@ struct SpatialSegmentRunsTests {
         let all = continuous.segments.keys.sorted().flatMap { continuous.segments[$0]! }
         try #require(all.count > 400)
         for (a, b) in zip(all, all.dropFirst()) { #expect(b.pts - a.pts == 1024, "\(a.pts) then \(b.pts)") }
+        // Every segment starts on a sync packet, so it decodes on its own after a seek.
+        for (segment, packets) in continuous.segments { #expect(packets.first?.sync == true, "segment \(segment)") }
         for k in [2, 4] {
             let fromMs = (Int64(k * 2_000) - Int64((continuous.preRoll * 1000).rounded(.up))) / 20 * 20
             let seek = try produce(withBed: withBed, fromMs: fromMs, toMs: 12_000, base: k)
