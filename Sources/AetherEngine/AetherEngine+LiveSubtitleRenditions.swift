@@ -210,19 +210,23 @@ extension AetherEngine {
 
     /// Audit FEA-107: this session was `.default`, a 7-day resource timeout and a disk cache, so one
     /// endless body grew until jetsam. Ephemeral and finite, like the ingest readers' own.
+    ///
+    /// The fetches now run on the engine's one pool (`EngineHTTP`), carrying these two limits per
+    /// request and per task; the configuration states them for a caller that builds a session of its own.
+    nonisolated static let liveSubtitleRenditionIdleSeconds: TimeInterval = 10
+    nonisolated static let liveSubtitleRenditionResourceSeconds: TimeInterval = 30
+
     nonisolated static func liveSubtitleRenditionSessionConfiguration() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 10
-        configuration.timeoutIntervalForResource = 30
+        configuration.timeoutIntervalForRequest = liveSubtitleRenditionIdleSeconds
+        configuration.timeoutIntervalForResource = liveSubtitleRenditionResourceSeconds
         return configuration
     }
 
     /// `URLSession.shared` cannot carry a delegate, so this was the one engine fetch a host's trust
     /// decision could never reach. Owned and process-wide for the same reason the carriage probe's
     /// is: an uninvalidated session outlives its caller.
-    nonisolated static let renditionSession = URLSession(
-        configuration: liveSubtitleRenditionSessionConfiguration(),
-        delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+    nonisolated static let renditionSession = EngineHTTP.session
 
     /// One poll of a rendition playlist, fetched under a size cap with its status checked and parsed
     /// off the main actor (audit FEA-104, FEA-107). nil when the URL answers with a master playlist.
@@ -230,9 +234,12 @@ extension AetherEngine {
         _ url: URL, headers: [String: String], session: URLSession = renditionSession
     ) async throws -> HLSMediaPlaylist? {
         var request = URLRequest(url: url)
+        let pooled = session === EngineHTTP.session
+        if pooled { request.timeoutInterval = liveSubtitleRenditionIdleSeconds }
         for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
         let (data, response) = try await BoundedPlaylistFetch.data(
-            for: request, session: session, limit: HLSLiveIngestReader.maximumPlaylistBytes)
+            for: request, session: session, limit: HLSLiveIngestReader.maximumPlaylistBytes,
+            resourceTimeout: pooled ? liveSubtitleRenditionResourceSeconds : nil)
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else { throw HLSIngestError.playlistUnreachable(status: status) }
         guard let text = String(data: data, encoding: .utf8) else {
@@ -248,9 +255,12 @@ extension AetherEngine {
         _ url: URL, headers: [String: String], session: URLSession = renditionSession
     ) async -> WebVTTSegment? {
         var request = URLRequest(url: url)
+        let pooled = session === EngineHTTP.session
+        if pooled { request.timeoutInterval = liveSubtitleRenditionIdleSeconds }
         for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
         guard let (data, response) = try? await BoundedFetch.data(
-                for: request, session: session, limit: BoundedFetch.webVTTSegmentLimit),
+                for: request, session: session, limit: BoundedFetch.webVTTSegmentLimit,
+                resourceTimeout: pooled ? liveSubtitleRenditionResourceSeconds : nil),
               let status = (response as? HTTPURLResponse)?.statusCode, (200..<300).contains(status),
               let text = String(data: data, encoding: .utf8)
         else { return nil }

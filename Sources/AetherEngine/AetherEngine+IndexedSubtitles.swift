@@ -49,8 +49,13 @@ extension AetherEngine {
             self.root = root
         }
 
-        /// A reader of its own for one lane of work; closed by the caller.
-        func makeSource() -> IOReaderByteSource? { root.makeIndependentReader().map(IOReaderByteSource.init) }
+        /// A source for one lane of work; closed by the caller. A root that reads exact ranges serves
+        /// every lane itself (one reader, one session, one connection); any other gets a reader of
+        /// its own per lane, since its one cursor would serialise them.
+        func makeSource() -> IOReaderByteSource? {
+            if root is RangeReadableIOReader { return IOReaderByteSource(root, closesReader: false) }
+            return root.makeIndependentReader().map { IOReaderByteSource($0) }
+        }
 
         func processedBlocks(_ ordinal: Int, count: Int) -> [Bool] {
             lock.lock(); defer { lock.unlock() }
@@ -186,7 +191,8 @@ extension AetherEngine {
         headers.merge(sessionRequestHeaders.current) { _, new in new }
         let resolved = headers
         return {
-            HTTPDiscIOReader(url: url, extraHeaders: resolved, baseChunkSize: 4096, maxChunkSize: 4 * 1024 * 1024)
+            HTTPDiscIOReader(url: url, extraHeaders: resolved, baseChunkSize: 4096, maxChunkSize: 4 * 1024 * 1024,
+                             sourceCache: .shared, label: "subindex")
         }
     }
 

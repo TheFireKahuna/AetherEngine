@@ -121,8 +121,7 @@ enum RemoteHLSSubtitleProxy {
                               tracks: [RemoteHLSSubtitleProvider.Track],
                               httpHeaders: [String: String],
                               needsRelay: Bool) async throws -> Prepared {
-        let session = makeSession()
-        defer { session.finishTasksAndInvalidate() }
+        let session = EngineHTTP.session
         // Audit NAT-105: the variant is whatever the master names, on any host or scheme, so the
         // host's credentials go only where the host sent them.
         let credentials = CredentialScope(headers: httpHeaders, anchor: originURL)
@@ -177,15 +176,6 @@ enum RemoteHLSSubtitleProxy {
 
     // MARK: - Playlist reads
 
-    private static func makeSession() -> URLSession {
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = budgetSeconds / 2
-        config.timeoutIntervalForResource = budgetSeconds
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        return URLSession(
-            configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
-    }
-
     /// Matches the sibling HLS fetchers (`HLSCarriageProbe`, `HLSVODIngestReader`). This proxy fetches
     /// an origin master and one variant before AVPlayer ever opens the source, so an origin that
     /// answers with a fast, unbounded stream under the m3u8 URL could otherwise buffer until jetsam
@@ -198,12 +188,15 @@ enum RemoteHLSSubtitleProxy {
                                       session: URLSession,
                                       headers: [String: String]) async throws -> (String, URL) {
         var request = URLRequest(url: url)
+        // The budget this proxy's own session used to carry: half of it idle, all of it in total.
+        request.timeoutInterval = budgetSeconds / 2
         for (field, value) in headers { request.setValue(value, forHTTPHeaderField: field) }
         let data: Data
         let response: URLResponse
         do {
             (data, response) = try await BoundedPlaylistFetch.data(
-                for: request, session: session, limit: maximumPlaylistBytes)
+                for: request, session: session, limit: maximumPlaylistBytes,
+                resourceTimeout: budgetSeconds)
         } catch {
             throw Refusal.fetchFailed("\(error)")
         }

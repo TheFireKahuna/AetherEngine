@@ -851,13 +851,23 @@ enum ReaderTransportLog {
         guard let key = OriginRequestBudget.originKey(for: url),
               let transaction = metrics.transactionMetrics.last,
               let proto = transaction.networkProtocolName else { return }
-        note(protocolName: proto, reusedConnection: transaction.isReusedConnection, originKey: key)
+        note(protocolName: proto, reusedConnection: transaction.isReusedConnection, originKey: key,
+             remoteAddress: transaction.remoteAddress)
+    }
+
+    /// Which address family the connection actually landed on, from the transaction's remote
+    /// address. A dual-stack origin is the case it exists for: whether Happy Eyeballs picked v6 is
+    /// a property of the path, not the URL, and this line is the only place that sees it.
+    static func addressFamily(_ remoteAddress: String?) -> String? {
+        guard let remoteAddress, !remoteAddress.isEmpty else { return nil }
+        return remoteAddress.contains(":") ? "IPv6" : "IPv4"
     }
 
     /// Split out from the metrics callback so the tally is reachable from a test:
     /// `URLSessionTaskMetrics` has no public initializer, so nothing about this could be pinned
     /// through the other entry point.
-    static func note(protocolName proto: String, reusedConnection reused: Bool, originKey key: String) {
+    static func note(protocolName proto: String, reusedConnection reused: Bool, originKey key: String,
+                     remoteAddress: String? = nil) {
         lock.lock()
         let existing = tallies[key]
         var tally = existing ?? Tally(proto: proto, connections: 0, reused: 0, reportedReuse: false)
@@ -872,7 +882,9 @@ enum ReaderTransportLog {
         if announceTransport {
             let multiplexed = proto.hasPrefix("h2") || proto.hasPrefix("h3")
             EngineLog.emit(
-                "[AVIOReader] origin transport: \(proto) at \(key) "
+                "[AVIOReader] origin transport: \(proto)"
+                + (addressFamily(remoteAddress).map { " over \($0)" } ?? "")
+                + " at \(key) "
                 + (multiplexed
                    ? "(multiplexed, so a per-session connection cap bounds nothing)"
                    : "(one request per connection, so a per-session connection cap bounds requests)"),

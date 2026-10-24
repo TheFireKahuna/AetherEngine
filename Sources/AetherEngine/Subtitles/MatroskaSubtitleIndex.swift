@@ -437,14 +437,31 @@ protocol RandomAccessByteSource: AnyObject {
 }
 
 /// `RandomAccessByteSource` over an `IOReader` (an HTTP range reader, a file, a host's own reader).
+///
+/// A `RangeReadableIOReader` is asked for exactly the range, without the cursor or its lock, so any
+/// number of callers can share one source. Any other reader goes through `seek` and `read`, one at a
+/// time.
 final class IOReaderByteSource: RandomAccessByteSource {
     private let reader: IOReader
+    private let closesReader: Bool
     private let lock = NSLock()
 
-    init(_ reader: IOReader) { self.reader = reader }
+    convenience init(_ reader: IOReader) { self.init(reader, closesReader: true) }
+
+    /// `closesReader: false` for a source over a reader somebody else owns and closes.
+    init(_ reader: IOReader, closesReader: Bool) {
+        self.reader = reader
+        self.closesReader = closesReader
+    }
+
+    /// Whether callers can share this source instead of each opening their own.
+    var isConcurrent: Bool { reader is RangeReadableIOReader }
 
     func read(at offset: Int64, count: Int) -> [UInt8]? {
         guard count > 0 else { return [] }
+        if let ranged = reader as? RangeReadableIOReader {
+            return ranged.readRange(at: offset, count: count).map { [UInt8]($0) }
+        }
         lock.lock(); defer { lock.unlock() }
         guard reader.seek(offset: offset, whence: SEEK_SET) == offset else { return nil }
         var bytes = [UInt8](repeating: 0, count: count)
@@ -460,7 +477,7 @@ final class IOReaderByteSource: RandomAccessByteSource {
         return Array(bytes.prefix(filled))
     }
 
-    func close() { reader.close() }
+    func close() { if closesReader { reader.close() } }
 }
 
 /// The few EBML primitives the index needs.

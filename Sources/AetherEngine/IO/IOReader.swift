@@ -28,6 +28,20 @@ public protocol IOReader: AnyObject, Sendable {
     var discImageProbeEnabled: Bool { get }
 }
 
+/// Internal seam for a reader that can hand over an exact byte range, from any thread at once.
+///
+/// A container's own structures are read this way (`IOReaderByteSource`): a Matroska cue index names
+/// each subtitle block's position, and a block is a few hundred bytes. Through the buffered
+/// `read`/`seek` cursor that costs a whole read-ahead window per block (64 KB of interleaved video for
+/// a 568-byte cue on `HTTPDiscIOReader`), and the one cursor serialises every lane behind one lock,
+/// which is why the indexed fill used to clone a reader, a session and a connection per lane. A
+/// range read asks for exactly the bytes, and one reader serves every lane.
+protocol RangeReadableIOReader: IOReader {
+    /// Exactly `count` bytes at `offset`, fewer only at the end of the source; nil on an error.
+    /// Safe to call concurrently with itself; it does not move the `read`/`seek` cursor.
+    func readRange(at offset: Int64, count: Int) -> Data?
+}
+
 /// Internal seam for a custom reader that pulls its bytes over the network and counts them, so a
 /// session reading through it can report `LiveTelemetry.demuxerBytesFetched` like an `AVIOReader`
 /// one does. The engine's own `HTTPDiscIOReader` counts; a host's reader is never asked, and its
