@@ -37,7 +37,7 @@ struct MatroskaCueIndexLiveTests {
         if let text = index.blocksByTrack.keys.sorted().first(where: { index.encodingByTrack[$0] == FrameEncodingNone.value && $0 > 1 }) {
             for block in index.blocksByTrack[text]!.prefix(3) {
                 let frame = index.readFrame(block, track: text, from: source)
-                print("[MKVIndex] track \(text) @\(String(format: "%.2f", index.seconds(ticks: block.ticks))) "
+                print("[MKVIndex] track \(text) @\(String(format: "%.2f", index.seconds(ticks: block.ticks, track: text))) "
                       + "dur \(frame?.durationTicks ?? -1): "
                       + "\(frame.map { String(decoding: $0.payload, as: UTF8.self) } ?? "UNREADABLE")")
                 #expect(frame != nil)
@@ -51,18 +51,7 @@ struct MatroskaCueIndexLiveTests {
             try demuxer.open(url: url, extraHeaders: headers,
                              profile: DemuxerOpenProfile.subtitleSideDemuxer(callerProbesize: nil, callerMaxAnalyzeDuration: nil))
             defer { demuxer.close() }
-            var streams: [MatroskaCueIndex.SubtitleStream] = []
-            var i: Int32 = 0
-            while let entry = demuxer.withStream(at: i, { st -> MatroskaCueIndex.SubtitleStream? in
-                guard st.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else { return nil }
-                let language = av_dict_get(st.pointee.metadata, "language", nil, 0).map { String(cString: $0.pointee.value) }
-                return .init(streamIndex: i, trackID: st.pointee.id,
-                             codecName: String(cString: avcodec_get_name(st.pointee.codecpar.pointee.codec_id)),
-                             language: language)
-            }) {
-                if let entry { streams.append(entry) }
-                i += 1
-            }
+            let streams = AetherEngine.indexedSubtitleStreams(of: demuxer)
             let mapping = index.trackNumbers(for: streams)
             print("[MKVIndex] stream ids: \(streams.map { "\($0.streamIndex)->\($0.trackID)" }.joined(separator: " "))")
             print("[MKVIndex] mapping: \(mapping.count) of \(streams.count) subtitle streams; stream \(streamText) -> track \(mapping[streamText].map(String.init) ?? "none")")
@@ -124,14 +113,14 @@ struct MatroskaCueIndexLiveTests {
             print("[MKVIndex] track \(pgs) header scan: \(blocks.count) blocks in "
                   + "\(String(format: "%.2f", Date().timeIntervalSince(started))) s on \(sources.count) readers, "
                   + "failed \(failedAt.count), states \(states), forced display sets \(forced.count) at "
-                  + "\(forced.prefix(12).map { String(format: "%.1f", index.seconds(ticks: $0)) })")
+                  + "\(forced.prefix(12).map { String(format: "%.1f", index.seconds(ticks: $0, track: pgs)) })")
             for i in failedAt.prefix(4) {
                 let frame = index.readFrame(blocks[i], track: pgs, from: source, prefix: 512)
                 let described = frame.map { f in
                     "read, \(f.payload.count) B, prefix \(f.isPrefix), head "
                         + f.payload.prefix(12).map { String(format: "%02x", $0) }.joined()
                 } ?? "unreadable"
-                print("[MKVIndex]   failed #\(i) @\(String(format: "%.2f", index.seconds(ticks: blocks[i].ticks))): "
+                print("[MKVIndex]   failed #\(i) @\(String(format: "%.2f", index.seconds(ticks: blocks[i].ticks, track: pgs))): "
                       + "frame \(described)")
                 if let frame, let full = index.readFrame(blocks[i], track: pgs, from: source) {
                     print("[MKVIndex]     full \(full.payload.count) B; parse from full: \(String(describing: PGSCompositionHeader.parse(full.payload)))")

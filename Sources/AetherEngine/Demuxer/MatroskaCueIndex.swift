@@ -1,29 +1,19 @@
 import Compression
 import Foundation
+import AetherLibavutil
 
-/// A Matroska file's own index of its subtitle blocks, read off the container instead of out of the
-/// stream: the Cues element lists every block of a subtitle track with its exact position (cluster and
-/// `CueRelativePosition`, which mkvmerge writes by default), so a track's whole content can be fetched
-/// with a few hundred small range reads instead of reading the multi-gigabyte remux around it.
+/// A Matroska source's own index, its Cues, read once per source (`SourceIndexRegistry`): where every
+/// subtitle block and every video keyframe lies, by time. The Cues list every block of a subtitle
+/// track with its exact position (cluster and `CueRelativePosition`, which mkvmerge writes by
+/// default), so a track's whole content is a few hundred small range reads instead of the
+/// multi-gigabyte remux around it; the video keyframes are what an I-frame rendition and a seek are
+/// built on.
 ///
 /// Trusted only where it is provably complete: a track whose cue entries number exactly its
 /// `NUMBER_OF_FRAMES` statistic (mkvmerge's statistics tags), all of them with a relative position, and
-/// whose frames are either uncompressed, zlib-compressed (the subtitle decoder inflates those itself) or
-/// header-stripped. Anything else is left to the readers that walk the stream.
-/// A Matroska source's own index, its Cues, read once per source (`SourceIndexRegistry`): where every
-/// subtitle block and every video keyframe lies, by time. The subtitle consumers read blocks exactly
-/// where it says; the video keyframes are what an I-frame rendition and a seek are built on.
-struct MatroskaCueIndex: Sendable {
-
-    /// One indexed block: its timestamp in segment ticks and where it lives.
-    struct Block: Sendable, Equatable {
-        var ticks: Int64
-        /// Cluster position relative to the segment's data, as the Cues state it.
-        var clusterPosition: Int64
-        /// Position of the BlockGroup or SimpleBlock relative to the cluster's data.
-        var relativePosition: Int64
-        var durationTicks: Int64?
-    }
+/// whose frames this reader can hand over as libavformat does (uncompressed, zlib or header-stripped).
+/// Anything else is left to the readers that walk the stream.
+struct MatroskaCueIndex: SourceIndex {
 
     /// How a track's frames are stored (Matroska ContentEncoding).
     enum FrameEncoding: Sendable, Equatable {
@@ -39,21 +29,16 @@ struct MatroskaCueIndex: Sendable {
     let segmentDataStart: Int64
     /// Nanoseconds per tick (Info TimestampScale, 1 ms when absent).
     let timestampScale: Int64
-    let blocksByTrack: [UInt64: [Block]]
+    /// Every subtitle track's blocks, in time order. A block's offset is the earliest byte it can
+    /// start at: the cluster, its 4-byte ID, the shortest size field, then the relative position.
+    let blocksByTrack: [UInt64: [SourceIndexBlock]]
     /// Tracks with at least one cue entry lacking a relative position: listed, not addressable.
     let tracksMissingRelativePosition: Set<UInt64>
     let encodingByTrack: [UInt64: FrameEncoding]
     /// The subtitle TrackEntries libavformat makes a stream of, in file order (it skips an entry with
-    /// no CodecID or one whose CodecID does not start with S or D, `matroska_parse_tracks`).
-    var subtitleTracks: [SubtitleTrack] = []
-    /// mkvmerge's statistics tags per TrackNumber, read off the file's Tags.
-    var statistics: [UInt64: TrackStatistics] = [:]
-
-    struct SubtitleTrack: Sendable, Equatable {
-        var number: UInt64
-        var codecID: String
-        var language: String?
-    }
+    /// no CodecID or one whose CodecID does not start with S or D, `matroska_parse_tracks`), with
+    /// mkvmerge's statistics tags where the file has them.
+    var subtitleTracks: [SourceIndexTrack] = []
 
     /// A video TrackEntry, in file order.
     struct VideoTrack: Sendable, Equatable {
@@ -84,18 +69,27 @@ struct MatroskaCueIndex: Sendable {
     /// Where `keyframe`'s cluster begins in the file: the byte a read of that keyframe starts at.
     func byteOffset(of keyframe: Keyframe) -> Int64 { segmentDataStart + keyframe.clusterPosition }
 
-    struct TrackStatistics: Sendable, Equatable {
-        var frames: Int?
-        var bytes: Int64?
-    }
     /// The length of the clusters' size field when the clusters sampled at load agree: tried first, and
     /// the other lengths after it, since a muxer can write a few clusters differently.
     var clusterSizeFieldLength: Int?
 
-    func seconds(ticks: Int64) -> Double { Double(ticks) * Double(timestampScale) / 1e9 }
+    // MARK: - SourceIndex
 
-    /// Whether `track` can be read entirely from the index: every one of its `frameCount` frames has an
-    /// addressable entry and its frames can be handed to the decoder.
+    /// Codecs whose Matroska block becomes the packet libavformat hands over: the frame itself for
+    /// SubRip, ASS and PGS, and for WebVTT the cue text split out of it with its settings beside it
+    /// (`webVTTCue`, #233). Compressed frames are inflated by `readFrame`, so the encoding never
+    /// matters here. DVD and DVB bitmaps are left out: their packet parity is unverified.
+    var packetCodecs: Set<String> { ["subrip", "ass", "hdmv_pgs_subtitle", "webvtt"] }
+
+    func blocks(track: UInt64) -> [SourceIndexBlock] { blocksByTrack[track] ?? [] }
+
+    /// Every track counts in segment ticks.
+    func timeBase(track: UInt64) -> AVRational {
+        AVRational(num: Int32(clamping: timestampScale), den: 1_000_000_000)
+    }
+
+    /// Every one of `track`'s `frameCount` frames has an addressable entry and its frames can be
+    /// handed over.
     func isComplete(track: UInt64, frameCount: Int?) -> Bool {
         guard let frameCount, frameCount > 0, let blocks = blocksByTrack[track],
               !tracksMissingRelativePosition.contains(track) else { return false }
@@ -105,12 +99,6 @@ struct MatroskaCueIndex: Sendable {
 
     // MARK: - Reading
 
-    enum ReadError: Error, Equatable {
-        case notMatroska
-        case noCues
-        case malformed(String)
-    }
-
     static let cuesSizeLimit = 64 * 1024 * 1024
     static let headProbeBytes = 64 * 1024
 
@@ -118,14 +106,15 @@ struct MatroskaCueIndex: Sendable {
     /// a source's index is parsed once and shared, never read again by the next consumer.
     static func read(from source: RandomAccessByteSource,
                      token: SourceIndexRegistry.ParseToken) throws -> MatroskaCueIndex {
-        guard let head = source.read(at: 0, count: headProbeBytes), head.count > 16 else {
-            throw ReadError.notMatroska
+        guard let head = source.read(at: 0, count: headProbeBytes) else {
+            throw SourceIndexError.malformed("head unreadable")
         }
+        guard head.count > 16 else { throw SourceIndexError.unsupportedContainer }
         var cursor = 0
-        guard let ebml = EBML.element(head, at: cursor), ebml.id == 0x1A45DFA3 else { throw ReadError.notMatroska }
+        guard let ebml = EBML.element(head, at: cursor), ebml.id == 0x1A45DFA3 else { throw SourceIndexError.unsupportedContainer }
         cursor = ebml.dataStart + Int(ebml.size)
         guard let segment = EBML.element(head, at: cursor), segment.id == 0x18538067 else {
-            throw ReadError.notMatroska
+            throw SourceIndexError.unsupportedContainer
         }
         let segmentDataStart = Int64(segment.dataStart)
 
@@ -155,12 +144,12 @@ struct MatroskaCueIndex: Sendable {
             guard let position = positions[id] else { return nil }
             guard let header = source.read(at: position, count: 16),
                   let element = EBML.element(header, at: 0), element.id == id, !element.unknownSize else {
-                throw ReadError.malformed("element \(String(id, radix: 16)) not where the SeekHead says")
+                throw SourceIndexError.malformed("element \(String(id, radix: 16)) not where the SeekHead says")
             }
             let total = element.dataStart + Int(element.size)
-            guard total <= limit else { throw ReadError.malformed("element \(String(id, radix: 16)) too large") }
+            guard total <= limit else { throw SourceIndexError.malformed("element \(String(id, radix: 16)) too large") }
             guard let bytes = source.read(at: position, count: total), bytes.count == total else {
-                throw ReadError.malformed("element \(String(id, radix: 16)) short read")
+                throw SourceIndexError.malformed("element \(String(id, radix: 16)) short read")
             }
             return (bytes, element)
         }
@@ -174,7 +163,7 @@ struct MatroskaCueIndex: Sendable {
         }
 
         var encodings: [UInt64: FrameEncoding] = [:]
-        var subtitleTracks: [SubtitleTrack] = []
+        var subtitleTracks: [SourceIndexTrack] = []
         var videoTracks: [VideoTrack] = []
         var numberByUID: [UInt64: UInt64] = [:]
         if let (bytes, tracks) = try load(0x1654AE6B, limit: 16 << 20) {
@@ -202,17 +191,18 @@ struct MatroskaCueIndex: Sendable {
                 encodings[number] = encoding
                 if let uid { numberByUID[uid] = number }
                 if type == 0x11, let first = codec.first, first == "S" || first == "D" {
-                    subtitleTracks.append(SubtitleTrack(number: number, codecID: codec, language: bcp47 ?? language))
+                    subtitleTracks.append(SourceIndexTrack(number: number, codecName: codecFamily[codec],
+                                                           language: bcp47 ?? language))
                 }
                 if type == 0x01 { videoTracks.append(VideoTrack(number: number, codecID: codec)) }
             }
         }
 
-        var statistics: [UInt64: TrackStatistics] = [:]
         if let (bytes, tags) = try? load(0x1254C367, limit: 16 << 20) {
             for tag in EBML.children(bytes, of: tags) where tag.id == 0x7373 {
                 var uids: [UInt64] = []
-                var stats = TrackStatistics()
+                var frames: Int?
+                var byteCount: Int64?
                 for field in EBML.children(bytes, of: tag) {
                     if field.id == 0x63C0 {
                         for target in EBML.children(bytes, of: field) where target.id == 0x63C5 {
@@ -226,22 +216,27 @@ struct MatroskaCueIndex: Sendable {
                         if part.id == 0x45A3 { name = EBML.string(bytes, part) }
                         if part.id == 0x4487 { value = EBML.string(bytes, part) }
                     }
-                    if name == "NUMBER_OF_FRAMES" { stats.frames = Int(value) }
-                    if name == "NUMBER_OF_BYTES" { stats.bytes = Int64(value) }
+                    if name == "NUMBER_OF_FRAMES" { frames = Int(value) }
+                    if name == "NUMBER_OF_BYTES" { byteCount = Int64(value) }
                 }
-                guard stats.frames != nil || stats.bytes != nil else { continue }
-                for uid in uids { if let number = numberByUID[uid] { statistics[number] = stats } }
+                guard frames != nil || byteCount != nil else { continue }
+                for uid in uids {
+                    guard let number = numberByUID[uid],
+                          let k = subtitleTracks.firstIndex(where: { $0.number == number }) else { continue }
+                    subtitleTracks[k].frames = frames
+                    subtitleTracks[k].bytes = byteCount
+                }
             }
         }
 
-        guard let (bytes, cues) = try load(0x1C53BB6B, limit: cuesSizeLimit) else { throw ReadError.noCues }
-        var blocks: [UInt64: [Block]] = [:]
+        guard let (bytes, cues) = try load(0x1C53BB6B, limit: cuesSizeLimit) else { throw SourceIndexError.noIndex }
+        var blocks: [UInt64: [(ticks: Int64, cluster: Int64, relative: Int64, duration: Int64?)]] = [:]
         var keyframes: [UInt64: [Keyframe]] = [:]
         let videoNumbers = Set(videoTracks.map(\.number))
         var missingRelative: Set<UInt64> = []
         for point in EBML.children(bytes, of: cues) where point.id == 0xBB {
             var ticks: Int64?
-            var positionsAtTime: [(track: UInt64, cluster: Int64, relative: Int64?, block: Block?)] = []
+            var positionsAtTime: [(track: UInt64, cluster: Int64, relative: Int64?, duration: Int64?)] = []
             for field in EBML.children(bytes, of: point) {
                 if field.id == 0xB3 { ticks = Int64(EBML.uint(bytes, field)) }
                 guard field.id == 0xB7 else { continue }
@@ -259,44 +254,47 @@ struct MatroskaCueIndex: Sendable {
                     }
                 }
                 guard let track, let cluster else { continue }
-                positionsAtTime.append((track, cluster, relative, relative.map {
-                    Block(ticks: 0, clusterPosition: cluster, relativePosition: $0, durationTicks: duration)
-                }))
+                positionsAtTime.append((track, cluster, relative, duration))
             }
             guard let ticks else { continue }
-            for (track, cluster, relative, block) in positionsAtTime {
+            for (track, cluster, relative, duration) in positionsAtTime {
                 if videoNumbers.contains(track) {
                     keyframes[track, default: []].append(
                         Keyframe(ticks: ticks, clusterPosition: cluster, relativePosition: relative))
                 }
-                guard var block else { missingRelative.insert(track); continue }
-                block.ticks = ticks
-                blocks[track, default: []].append(block)
+                guard let relative else { missingRelative.insert(track); continue }
+                blocks[track, default: []].append((ticks, cluster, relative, duration))
             }
         }
-        for track in blocks.keys { blocks[track]?.sort { $0.ticks < $1.ticks } }
         for track in keyframes.keys { keyframes[track]?.sort { $0.ticks < $1.ticks } }
+        var addressed: [UInt64: [SourceIndexBlock]] = [:]
+        for (track, list) in blocks {
+            addressed[track] = list.sorted { $0.ticks < $1.ticks }.map {
+                SourceIndexBlock(ticks: $0.ticks, durationTicks: $0.duration,
+                                 offset: segmentDataStart + $0.cluster + 4 + 1 + $0.relative, size: nil)
+            }
+        }
         var index = MatroskaCueIndex(segmentDataStart: segmentDataStart, timestampScale: timestampScale,
-                                          blocksByTrack: blocks, tracksMissingRelativePosition: missingRelative,
+                                          blocksByTrack: addressed, tracksMissingRelativePosition: missingRelative,
                                           encodingByTrack: encodings)
         index.subtitleTracks = subtitleTracks
         index.videoTracks = videoTracks
         index.keyframesByTrack = keyframes
-        index.statistics = statistics
-        index.clusterSizeFieldLength = sampledClusterSizeFieldLength(index, from: source)
+        index.clusterSizeFieldLength = sampledClusterSizeFieldLength(
+            clusters: Set(blocks.values.flatMap { $0.map(\.cluster) }).sorted(),
+            segmentDataStart: segmentDataStart, from: source)
         return index
     }
 
     /// Reads the headers of a few clusters spread over the file: one size-field length for all of them
     /// is the muxer's, and every block read can then start exactly where its block does.
-    private static func sampledClusterSizeFieldLength(_ index: MatroskaCueIndex,
+    private static func sampledClusterSizeFieldLength(clusters: [Int64], segmentDataStart: Int64,
                                                       from source: RandomAccessByteSource) -> Int? {
-        let clusters = Set(index.blocksByTrack.values.flatMap { $0.map(\.clusterPosition) }).sorted()
         guard !clusters.isEmpty else { return nil }
         let picks = Set([0, clusters.count / 3, 2 * clusters.count / 3, clusters.count - 1]).map { clusters[$0] }
         var lengths: Set<Int> = []
         for position in picks {
-            guard let header = source.read(at: index.segmentDataStart + position, count: 12),
+            guard let header = source.read(at: segmentDataStart + position, count: 12),
                   let element = EBML.element(header, at: 0), element.id == 0x1F43B675 else { return nil }
             lengths.insert(element.dataStart - 4)
         }
@@ -333,51 +331,6 @@ struct MatroskaCueIndex: Sendable {
         return scope & 1 == 0 ? .none : result
     }
 
-    // MARK: - Streams to tracks
-
-    /// A subtitle stream as libavformat lists it.
-    struct SubtitleStream: Sendable {
-        var streamIndex: Int32
-        /// `AVStream.id`: the TrackNumber where libavformat carries it (FFmpegBuild's
-        /// patch_ffmpeg_matroska_track_id), 0 where it does not.
-        var trackID: Int32 = 0
-        var codecName: String
-        var language: String?
-        /// The statistics libavformat copied onto the stream from the track's tags.
-        var frames: Int? = nil
-        var bytes: Int64? = nil
-    }
-
-    /// The track behind each subtitle stream. The stream's own TrackNumber when libavformat carries
-    /// it; otherwise the k-th subtitle stream is the k-th subtitle TrackEntry libavformat makes a
-    /// stream of. Either way every pair has to agree on codec, language and, where the file states
-    /// them, its frame and byte statistics, which tell apart two tracks a stream count or an order
-    /// cannot. A count or any pair that disagrees maps nothing: a wrong track would fill a rendition
-    /// with another track's lines.
-    func trackNumbers(for streams: [SubtitleStream]) -> [Int32: UInt64] {
-        var pairs: [(SubtitleStream, SubtitleTrack)] = []
-        if !streams.isEmpty, streams.allSatisfy({ $0.trackID > 0 }) {
-            for stream in streams {
-                guard let track = subtitleTracks.first(where: { $0.number == UInt64(stream.trackID) }) else { return [:] }
-                pairs.append((stream, track))
-            }
-        } else {
-            guard streams.count == subtitleTracks.count else { return [:] }
-            pairs = Array(zip(streams, subtitleTracks))
-        }
-        var out: [Int32: UInt64] = [:]
-        for (stream, track) in pairs {
-            if let family = Self.codecFamily[track.codecID], family != stream.codecName { return [:] }
-            if let a = stream.language?.lowercased(), let b = track.language?.lowercased(),
-               a != "und", b != "und", !AetherEngine.languageMatches(a, b) { return [:] }
-            let stats = statistics[track.number]
-            if let a = stream.frames, let b = stats?.frames, a != b { return [:] }
-            if let a = stream.bytes, let b = stats?.bytes, a != b { return [:] }
-            out[stream.streamIndex] = track.number
-        }
-        return out
-    }
-
     /// Matroska codec IDs and the decoder libavformat gives their streams.
     static let codecFamily: [String: String] = [
         "S_HDMV/PGS": "hdmv_pgs_subtitle", "S_TEXT/UTF8": "subrip", "S_TEXT/ASCII": "subrip",
@@ -387,19 +340,9 @@ struct MatroskaCueIndex: Sendable {
 
     // MARK: - Blocks
 
-    /// One subtitle frame read off the file.
-    struct Frame: Sendable {
-        var ticks: Int64
-        var durationTicks: Int64?
-        /// The frame as libavformat hands it over: header-stripped bytes restored, zlib inflated.
-        var payload: [UInt8]
-        /// True when only the first bytes were read (`readFrame(..., prefix:)`).
-        var isPrefix: Bool
-    }
-
     /// Whether `track` is a WebVTT subtitle track, whose blocks are split before they are a packet.
-    func isWebVTT(track: UInt64) -> Bool {
-        subtitleTracks.first(where: { $0.number == track }).flatMap { Self.codecFamily[$0.codecID] } == "webvtt"
+    private func isWebVTT(track: UInt64) -> Bool {
+        subtitleTracks.first(where: { $0.number == track })?.codecName == "webvtt"
     }
 
     /// A WebVTT block as libavformat hands it over (`matroska_parse_webvtt`): the payload is an
@@ -436,16 +379,17 @@ struct MatroskaCueIndex: Sendable {
     /// whose length is not known without reading the cluster's own header (1 to 8 bytes).
     static let blockHeaderSlack = 48
 
-    /// Reads `block` of `track`. With `prefix`, at most that many payload bytes (enough for a PGS
-    /// composition header) instead of the whole frame. Nil when the block is not where the index says.
-    func readFrame(_ block: Block, track: UInt64, from source: RandomAccessByteSource,
-                   prefix requestedPrefix: Int? = nil) -> Frame? {
+    /// The block as libavformat hands it over: header-stripped bytes restored, zlib inflated, a WebVTT
+    /// block split into its text and settings (an empty payload for one libavformat drops).
+    func readFrame(_ block: SourceIndexBlock, track: UInt64, from source: RandomAccessByteSource,
+                   prefix requestedPrefix: Int?) -> SourceIndexFrame? {
         // A compressed frame has no readable prefix: it is read whole and inflated, and the prefix is
         // taken from what it inflates to.
         let compressed = encodingByTrack[track] == .zlib
         let prefix = compressed ? nil : requestedPrefix
-        // The block starts at cluster + 4 (the cluster ID) + the size field (1...8) + relative position.
-        let earliest = segmentDataStart + block.clusterPosition + 4 + 1 + block.relativePosition
+        // The block starts at cluster + 4 (the cluster ID) + the size field (1...8) + relative position;
+        // the offset assumes the shortest field.
+        let earliest = block.offset
         let want = (prefix ?? 512) + Self.blockHeaderSlack + 8
         guard let window = source.read(at: earliest, count: want), !window.isEmpty else { return nil }
         // The sampled length first; a muxer can still write a few clusters with another one.
@@ -480,8 +424,14 @@ struct MatroskaCueIndex: Sendable {
                     prefixed = true
                 }
             }
-            return Frame(ticks: block.ticks, durationTicks: located.durationTicks ?? block.durationTicks,
-                         payload: payload, isPrefix: prefixed)
+            var settings: String?
+            if !prefixed, isWebVTT(track: track) {
+                let cue = Self.webVTTCue(payload)
+                payload = cue?.text ?? []
+                settings = cue.flatMap { $0.settings.isEmpty ? nil : $0.settings }
+            }
+            return SourceIndexFrame(ticks: block.ticks, durationTicks: located.durationTicks ?? block.durationTicks,
+                                    payload: payload, webVTTSettings: settings, isPrefix: prefixed)
         }
         return nil
     }

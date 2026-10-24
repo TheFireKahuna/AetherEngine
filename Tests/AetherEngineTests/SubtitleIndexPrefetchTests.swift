@@ -10,12 +10,12 @@ struct SubtitleIndexPrefetchTests {
 
     /// The parser fixture's subtitle tracks as libavformat would list them: SubRip 2, zlib PGS 3,
     /// header-stripped PGS 4, each with the frame count its cues match.
-    private static func listed() -> [AetherEngine.IndexedSubtitleStream] {
+    private static func listed() -> [IndexedSubtitleStream] {
         let tb = AVRational(num: 1, den: 1000)
         return [
-            .init(stream: .init(streamIndex: 10, codecName: "subrip"), frames: 2, timeBase: tb),
-            .init(stream: .init(streamIndex: 11, codecName: "hdmv_pgs_subtitle"), frames: 1, timeBase: tb),
-            .init(stream: .init(streamIndex: 12, codecName: "hdmv_pgs_subtitle"), frames: 1, timeBase: tb),
+            .init(streamIndex: 10, codecName: "subrip", frames: 2, timeBase: tb),
+            .init(streamIndex: 11, codecName: "hdmv_pgs_subtitle", frames: 1, timeBase: tb),
+            .init(streamIndex: 12, codecName: "hdmv_pgs_subtitle", frames: 1, timeBase: tb),
         ]
     }
 
@@ -98,11 +98,11 @@ struct SubtitleIndexPrefetchTests {
     func planIsAllOrNothing() throws {
         let (index, _) = try Self.indexed()
         var webvtt = Self.listed()
-        webvtt[0] = .init(stream: .init(streamIndex: 10, codecName: "webvtt"), frames: 2, timeBase: webvtt[0].timeBase)
+        webvtt[0] = .init(streamIndex: 10, codecName: "webvtt", frames: 2, timeBase: webvtt[0].timeBase)
         #expect(!SubtitleForwardPrefetcher.IndexSource.plan(index: index, listed: webvtt, streams: [10, 11, 12])
             .refused.isEmpty)
         var incomplete = Self.listed()
-        incomplete[0] = .init(stream: .init(streamIndex: 10, codecName: "subrip"), frames: 3, timeBase: incomplete[0].timeBase)
+        incomplete[0] = .init(streamIndex: 10, codecName: "subrip", frames: 3, timeBase: incomplete[0].timeBase)
         #expect(!SubtitleForwardPrefetcher.IndexSource.plan(index: index, listed: incomplete, streams: [10, 11, 12])
             .refused.isEmpty)
         #expect(SubtitleForwardPrefetcher.IndexSource.plan(index: index, listed: Self.listed(), streams: [10, 11, 12])
@@ -132,7 +132,7 @@ struct SubtitleIndexPrefetchTests {
         let index = try MatroskaCueIndex.read(
             from: IOReaderByteSource(DataIOReader(data: Data(fixture.bytes))), token: .forParserTests)
         var listed = Self.listed()
-        listed[0] = .init(stream: .init(streamIndex: 10, codecName: "webvtt"), frames: 2, timeBase: listed[0].timeBase)
+        listed[0] = .init(streamIndex: 10, codecName: "webvtt", frames: 2, timeBase: listed[0].timeBase)
         let plan = SubtitleForwardPrefetcher.IndexSource.plan(index: index, listed: listed, streams: [10, 11, 12])
         #expect(plan.refused.isEmpty, "\(plan.refused)")
         let source = SubtitleForwardPrefetcher.IndexSource(

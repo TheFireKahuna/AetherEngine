@@ -3,21 +3,22 @@ import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
 
-/// Native subtitle renditions filled from the container's own index (`MatroskaCueIndex`) rather
-/// than by reading the stream around them.
+/// Native subtitle renditions filled from the container's own index (`SourceIndex`) rather than by
+/// reading the stream around them.
 ///
 /// AVKit fetches a subtitle rendition minutes ahead of playback (measured: about 4 minutes past the
 /// video it is fetching) and keeps what it gets. A rendition filled by walking the stream can only be
 /// as far ahead as the stream has been read, which on a remux is gigabytes, so its far segments were
-/// either waited on past AVPlayer's patience or served empty for good. A Matroska file's Cues list
-/// every subtitle block with its exact position, so the subtitles can be read on their own:
+/// either waited on past AVPlayer's patience or served empty for good. A Matroska file's Cues and an
+/// MP4's sample tables list every subtitle frame with its exact position, so the subtitles can be
+/// read on their own:
 ///
 /// - text tracks are read whole at load and their renditions are complete before AVKit asks;
 /// - the forced rendition (`LoadOptions.forcedSubtitleTrack`) of a bitmap track is found from the
 ///   display sets' composition headers, and only its own display sets are decoded and recognized;
 /// - a full bitmap track is recognized from the playhead forward, from the index, when it is selected.
 ///
-/// The index is trusted only for a track it provably lists in full (`MatroskaCueIndex.isComplete`).
+/// The index is trusted only for a track it provably lists in full (`SourceIndex.isComplete`).
 /// Everything else keeps the stream-walking path, which follows how far ahead AVKit actually asks.
 extension AetherEngine {
 
@@ -36,14 +37,14 @@ extension AetherEngine {
 
     /// The session's indexed-subtitle state, shared with the fill tasks.
     final class IndexedSubtitleState: @unchecked Sendable {
-        let index: MatroskaCueIndex
+        let index: any SourceIndex
         let plans: [Int: IndexedRenditionPlan]
         private let root: IOReader
         private let lock = NSLock()
         /// Per ordinal, which of its blocks a bitmap fill has recognized.
         private var processed: [Int: [Bool]] = [:]
 
-        init(index: MatroskaCueIndex, plans: [Int: IndexedRenditionPlan], root: IOReader) {
+        init(index: any SourceIndex, plans: [Int: IndexedRenditionPlan], root: IOReader) {
             self.index = index
             self.plans = plans
             self.root = root
@@ -82,14 +83,12 @@ extension AetherEngine {
     /// native subtitle stores exist.
     func startIndexedSubtitleFill(session: HLSVideoEngine, url: URL) {
         cancelIndexedSubtitleFill()
-        guard !loadedOptions.isLive, let demuxer = session.demuxer,
-              demuxer.containerFormatName?.contains("matroska") == true else { return }
+        guard !loadedOptions.isLive, let demuxer = session.demuxer else { return }
         let stores = session.nativeSubtitleCueStoresForSession
         // Every subtitle stream in order, with the facts the renditions need from them.
-        let listed = Self.matroskaSubtitleStreams(of: demuxer)
-        let streams = listed.map(\.stream)
+        let streams = Self.indexedSubtitleStreams(of: demuxer)
         var facts: [Int32: (frames: Int?, timeBase: AVRational)] = [:]
-        for entry in listed { facts[entry.stream.streamIndex] = (entry.frames, entry.timeBase) }
+        for entry in streams { facts[entry.streamIndex] = (entry.frames, entry.timeBase) }
         var pending: [(ordinal: Int, stream: Int32, kind: IndexedRenditionPlan.Kind, language: String?)] = []
         for (ordinal, entry) in nativeSubtitleTrackTable.enumerated() {
             guard ordinal < stores.count, let stream = entry.sourceStreamIndex, entry.externalID == nil,
@@ -112,8 +111,8 @@ extension AetherEngine {
             // The source's one index (`SourceIndexRegistry`): parsed here only if no consumer of this
             // source has parsed it yet, and then over this fill's own reader.
             let began = Date()
-            let outcome = await SourceIndexRegistry.shared.matroskaIndex(
-                of: url, headers: indexHeaders, through: root)
+            let outcome = await SourceIndexRegistry.shared.index(
+                of: url, headers: indexHeaders, demuxer: demuxer, through: root)
             guard let index = outcome.index else {
                 EngineLog.emit("[IndexedSubtitles] no usable index (\(outcome)); the stream-walking fill stays",
                                category: .engine)
@@ -195,8 +194,8 @@ extension AetherEngine {
     /// Every block of a text track, decoded in order into its store, which is then complete.
     nonisolated private func fillIndexedText(_ plan: IndexedRenditionPlan, state: IndexedSubtitleState,
                                              duration: Double, stores: [NativeSubtitleCueStore]) async {
-        guard plan.ordinal < stores.count, let blocks = state.index.blocksByTrack[plan.trackNumber],
-              let decoder = await makeIndexedDecoder(plan) else { return }
+        let blocks = state.index.blocks(track: plan.trackNumber)
+        guard plan.ordinal < stores.count, let decoder = await makeIndexedDecoder(plan) else { return }
         let store = stores[plan.ordinal]
         let began = Date()
         let frames = Self.readFrames(blocks.indices.map { ($0, blocks[$0]) }, track: plan.trackNumber,
@@ -234,7 +233,8 @@ extension AetherEngine {
     /// display set begins.
     nonisolated private func fillIndexedForced(_ plan: IndexedRenditionPlan, state: IndexedSubtitleState,
                                                duration: Double, stores: [NativeSubtitleCueStore]) async {
-        guard plan.ordinal < stores.count, let blocks = state.index.blocksByTrack[plan.trackNumber] else { return }
+        let blocks = state.index.blocks(track: plan.trackNumber)
+        guard plan.ordinal < stores.count else { return }
         let store = stores[plan.ordinal]
         let began = Date()
         let prefixes = Self.readFrames(blocks.indices.map { ($0, blocks[$0]) }, track: plan.trackNumber,
@@ -265,7 +265,7 @@ extension AetherEngine {
                 guard let frame = frames[i],
                       let event = Self.decode(frame, plan: plan, index: state.index, decoder: decoder),
                       headers[i]?.isForced == true else { continue }
-                let next = i + 1 < blocks.count ? state.index.seconds(ticks: blocks[i + 1].ticks) : duration
+                let next = i + 1 < blocks.count ? state.index.seconds(ticks: blocks[i + 1].ticks, track: plan.trackNumber) : duration
                 cues.append(contentsOf: event.cues.filter(\.isForced).map { $0.with(endTime: min($0.endTime, next)) })
             }
         }
@@ -312,14 +312,14 @@ extension AetherEngine {
 
     nonisolated private func runIndexedBitmapFill(_ plan: IndexedRenditionPlan, state: IndexedSubtitleState,
                                                   store: NativeSubtitleCueStore, duration: Double) async {
-        guard let blocks = state.index.blocksByTrack[plan.trackNumber] else { return }
         let index = state.index
+        let blocks = index.blocks(track: plan.trackNumber)
         let batch = 24
         while !Task.isCancelled {
             let done = state.processedBlocks(plan.ordinal, count: blocks.count)
             guard let playhead = await MainActor.run(body: { [weak self] in self?.sourceTime }) else { return }
             // The first block not yet recognized at or after the playhead, else the first one at all.
-            let here = blocks.firstIndex { index.seconds(ticks: $0.ticks) >= playhead - 5 } ?? blocks.count
+            let here = blocks.firstIndex { index.seconds(ticks: $0.ticks, track: plan.trackNumber) >= playhead - 5 } ?? blocks.count
             guard let start = (here..<blocks.count).first(where: { !done[$0] })
                     ?? (0..<blocks.count).first(where: { !done[$0] }) else {
                 store.noteRead(from: 0, through: duration)
@@ -340,7 +340,7 @@ extension AetherEngine {
                 cursor -= 1
                 lookback += 1
             }
-            let runStart = index.seconds(ticks: blocks[cursor].ticks)
+            let runStart = index.seconds(ticks: blocks[cursor].ticks, track: plan.trackNumber)
             // Forward from there in batches, until the run meets recognized ground, ends, or the viewer
             // seeks away from it.
             while !Task.isCancelled, cursor < blocks.count {
@@ -352,7 +352,7 @@ extension AetherEngine {
                 for i in range {
                     guard let frame = frames[i],
                           let event = Self.decode(frame, plan: plan, index: index, decoder: decoder) else { continue }
-                    let next = i + 1 < blocks.count ? index.seconds(ticks: blocks[i + 1].ticks) : duration
+                    let next = i + 1 < blocks.count ? index.seconds(ticks: blocks[i + 1].ticks, track: plan.trackNumber) : duration
                     cues.append(contentsOf: event.cues.map { $0.with(endTime: min($0.endTime, next)) })
                 }
                 if !cues.isEmpty {
@@ -360,7 +360,7 @@ extension AetherEngine {
                 }
                 state.markProcessed(plan.ordinal, range, count: blocks.count)
                 cursor = upper
-                let through = cursor < blocks.count ? index.seconds(ticks: blocks[cursor].ticks) : duration
+                let through = cursor < blocks.count ? index.seconds(ticks: blocks[cursor].ticks, track: plan.trackNumber) : duration
                 if aroundPlayhead { store.noteRead(from: runStart, through: through) }
                 let nowDone = state.processedBlocks(plan.ordinal, count: blocks.count)
                 if cursor < blocks.count, nowDone[cursor] { break }
@@ -400,15 +400,15 @@ extension AetherEngine {
     }
 
     /// `items` read on parallel lanes; the result is indexed like the blocks' positions in the track.
-    nonisolated static func readFrames(_ items: [(Int, MatroskaCueIndex.Block)], track: UInt64,
-                                       state: IndexedSubtitleState, prefix: Int?) -> [Int: MatroskaCueIndex.Frame] {
+    nonisolated static func readFrames(_ items: [(Int, SourceIndexBlock)], track: UInt64,
+                                       state: IndexedSubtitleState, prefix: Int?) -> [Int: SourceIndexFrame] {
         guard !items.isEmpty else { return [:] }
         let laneCount = min(indexedSubtitleReadLanes, items.count)
         let sources = (0..<laneCount).compactMap { _ in state.makeSource() }
         defer { sources.forEach { $0.close() } }
         guard !sources.isEmpty else { return [:] }
         let lock = NSLock()
-        var out: [Int: MatroskaCueIndex.Frame] = [:]
+        var out: [Int: SourceIndexFrame] = [:]
         DispatchQueue.concurrentPerform(iterations: sources.count) { lane in
             var k = lane
             while k < items.count, !Task.isCancelled {
@@ -422,28 +422,19 @@ extension AetherEngine {
         return out
     }
 
-    /// One frame through the decoder, timed on the stream's time base.
-    nonisolated static func decode(_ frame: MatroskaCueIndex.Frame, plan: IndexedRenditionPlan,
-                                   index: MatroskaCueIndex,
+    /// One frame through the decoder as the packet libavformat would hand over (WebVTT settings as
+    /// side data), timed on the stream's time base.
+    nonisolated static func decode(_ frame: SourceIndexFrame, plan: IndexedRenditionPlan,
+                                   index: any SourceIndex,
                                    decoder: EmbeddedSubtitleDecoder) -> EmbeddedSubtitleDecoder.SubtitleEvent? {
-        // A WebVTT block is split the way libavformat splits it (`MatroskaCueIndex.webVTTCue`): the
-        // packet is the cue text, and the settings ride as side data, as the demuxer attaches them.
-        var payload = frame.payload
-        var settings: String?
-        if index.isWebVTT(track: plan.trackNumber) {
-            guard let cue = MatroskaCueIndex.webVTTCue(frame.payload) else { return nil }
-            payload = cue.text
-            settings = cue.settings
-        }
+        let payload = frame.payload
         guard !payload.isEmpty, let packet = trackedPacketAlloc() else { return nil }
         defer { var p: UnsafeMutablePointer<AVPacket>? = packet; trackedPacketFree(&p) }
         guard av_new_packet(packet, Int32(payload.count)) == 0 else { return nil }
         payload.withUnsafeBufferPointer { packet.pointee.data.update(from: $0.baseAddress!, count: $0.count) }
-        if let settings { WebVTTCueSettings.attach(settings: settings, to: packet) }
-        let nanosPerTick = index.timestampScale
-        let toStream = { (ticks: Int64) -> Int64 in
-            av_rescale_q(ticks, AVRational(num: Int32(clamping: nanosPerTick), den: 1_000_000_000), plan.timeBase)
-        }
+        if let settings = frame.webVTTSettings { WebVTTCueSettings.attach(settings: settings, to: packet) }
+        let ticksBase = index.timeBase(track: plan.trackNumber)
+        let toStream = { (ticks: Int64) -> Int64 in av_rescale_q(ticks, ticksBase, plan.timeBase) }
         packet.pointee.pts = toStream(frame.ticks)
         packet.pointee.dts = packet.pointee.pts
         if let duration = frame.durationTicks { packet.pointee.duration = toStream(duration) }

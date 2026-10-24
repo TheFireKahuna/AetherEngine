@@ -1,7 +1,8 @@
 # Source pipeline: every byte once, every index once, every output on demand
 
 Status: in progress, written 2026-10-24 against `research/12bit-fel` at `a7a725e8` and the tvOS 27.2
-SDK (Xcode 27.2). Layers 1 and 2 are built and on device; layer 3 is the remaining work. Each
+SDK (Xcode 27.2). Layers 1 and 2 are built (layer 2 for Matroska and MP4; the MP4 index not yet on
+device); layer 3 is the remaining work. Each
 section says what is done, which tests hold it, and what is not yet ideal, with the steps to get
 there.
 
@@ -127,19 +128,24 @@ releases what no session is reading.
    stay separate (they carry nothing playback depends on, and merging would cost the app's HTTP cache
    and its 304 revalidation, Sodalite#12).
 
-## Layer 2: one index per source (built for Matroska)
+## Layer 2: one index per source (built for Matroska and MP4)
 
 ### What it is
 
 | Piece | File | What it does |
 |---|---|---|
-| `SourceIndexRegistry` | `Demuxer/SourceIndexRegistry.swift` | One index per source and size. Racing callers share the one parse; later callers get the result. Not-Matroska and no-Cues are kept answers; a read that broke off is not, so the next consumer retries. The key is derived from the request and the reader's own size (`matroskaIndex(of:headers:through:)`), so two consumers cannot name a source differently. |
-| `ParseToken` | same | `MatroskaCueIndex.read` requires one and only the registry can make it, so a second parse cannot be added by accident. The parser's unit tests use a debug-only token; a release build pins that no production code does. |
-| Index consumers | `AetherEngine+SourceIndex.swift` | One exact reader factory (`indexedSourceReader`), one subtitle stream listing (`matroskaSubtitleStreams`), the prefetch source builder. |
+| `SourceIndex` | `Demuxer/SourceIndex.swift` | The one shape every consumer reads: subtitle tracks, each track's frames (time, duration, where), `readFrame` returning the packet libavformat would hand over (for Matroska: stripped header restored, zlib inflated, WebVTT split into text and settings), the codecs for which that holds (`packetCodecs`), and the stream-to-track pairing. |
+| `MatroskaCueIndex` | `Demuxer/MatroskaCueIndex.swift` | Matroska's Cues, parsed off the source. Also the video keyframes. |
+| `MP4SampleIndex` | `Demuxer/MP4SampleIndex.swift` | An MP4's sample tables, not parsed again: the entries libavformat built at open (`Demuxer.sampleTable`, edit lists applied), which are what `av_read_frame` reads its packets from. A fragmented file (an `mvex` in the `moov`) has none; a track with an entry the edit list marks to discard is not trusted. mov_text only. |
+| `SourceIndexRegistry` | `Demuxer/SourceIndexRegistry.swift` | One index per source and size, for whichever container the demuxer opened (`index(of:headers:demuxer:through:)`). Racing callers share the one read; later callers get the result. An uncovered container and a file without an index are kept answers; a read that broke off (including an unreadable head) is not, so the next consumer retries. The key is derived from the request and the reader's own size, so two consumers cannot name a source differently. |
+| `ParseToken` | same | Both index readers require one and only the registry can make it, so a second read cannot be added by accident. The parser's unit tests use a debug-only token; a release build pins that no production code does. |
+| Index consumers | `AetherEngine+SourceIndex.swift` | One exact reader factory (`indexedSourceReader`), one subtitle stream listing (`indexedSubtitleStreams`), the prefetch source builder. |
 
-Consumers today: the indexed subtitle fill (`AetherEngine+IndexedSubtitles.swift`) and the forward
-subtitle prefetch, which reads blocks from the index instead of walking the stream when the index lists
-every stream completely (`SubtitleForwardPrefetcher.IndexSource`, one loop over a `Source`).
+Consumers today, all container-agnostic: the indexed subtitle fill (`AetherEngine+IndexedSubtitles.swift`)
+and the forward subtitle prefetch, which reads frames from the index instead of walking the stream when
+the index lists every stream completely (`SubtitleForwardPrefetcher.IndexSource`, one loop over a
+`Source`). On an MP4 the walk it replaces delivered every video keyframe (its pacing stream sits at
+`AVDISCARD_NONKEY`, and `mov_read_packet` reads a keyframe's bytes before handing it over).
 
 ### Guarantees and the tests that hold them
 
@@ -147,17 +153,18 @@ every stream completely (`SubtitleForwardPrefetcher.IndexSource`, one loop over 
 |---|---|
 | Twelve racing consumers, one parse; a later consumer, no parse; source and size name the index | `SourceIndexRegistryTests` |
 | The index prefetch stores the same packets the walk would, in one time order, re-anchors in place, ends a dropped connection as a read failure, is all or nothing | `SubtitleIndexPrefetchTests` |
+| An MP4 sample read from the index is the packet `av_read_frame` hands over (bytes, time, duration), an empty edit included; the prefetch from it stores what its walk stores; an edit-list cut or a fragmented file is refused | `MP4SampleIndexTests` (fixtures made by ffmpeg and MP4Box, embedded) |
 | The walk's contract is unchanged through the one loop | `Issue151SubtitleForwardPrefetchTests`, `Issue230PrefetchReadPositionParkTests`, `Issue231PrefetchRestartTests`, `Issue234SideReaderSeekAnchorTests`, `Issue240SideReaderLinkPriorityTests` |
 
 ### Not yet ideal, and the steps
 
-1. **Matroska only.** An MP4's `moov` has the same information (sample tables, sync samples) and no
-   shared index; MPEG-TS has none at all.
-   - Generalise the registry's outcome to a container index type with a Matroska and an MP4 parser
-     (the `moov` is read once, through the cache).
-   - For MPEG-TS and any source without one, have the pump record an index as it reads (keyframe and
-     subtitle packet positions), registered under the same key, so later reads and seeks are served
-     from the map instead of a walk.
+1. **Matroska and MP4 only.** MP4 is done: `MP4SampleIndex` behind the same `SourceIndex`, every
+   consumer moved onto it. MPEG-TS (and so every Blu-ray remux in `.m2ts`) has no index at all.
+   - Have the pump record an index as it reads (keyframe and subtitle packet positions), registered
+     under the same key, so later reads and seeks are served from the map instead of a walk.
+   - MP4 keyframes are not on `SourceIndex`: the segment plan already reads them from the same
+     libavformat entries (`Demuxer.indexedKeyframeEntries`). Matroska's stay on `MatroskaCueIndex`
+     until the I-frame playlist (layer 3, step 4) names what it needs from both.
 2. **The index is named for subtitles and exposes only them. Done.** It is `MatroskaCueIndex`
    (`Demuxer/MatroskaCueIndex.swift`), and it exposes `videoTracks`, `keyframes(track:)` and
    `byteOffset(of:)` for the I-frame playlist and seeking (`MatroskaCueIndexTests.videoKeyframes`).
@@ -167,8 +174,9 @@ every stream completely (`SubtitleForwardPrefetcher.IndexSource`, one loop over 
    settings beside it (#233; `webVTTSplitMatchesTheDemuxer`, `webVTTFromTheIndex`). zlib-compressed
    frames are inflated by the index reader as libavformat inflates them (`ZlibBlock`), so neither is
    an exception any more. What still sends a session to the walk: a Matroska file with incomplete or
-   no Cues, a bzlib/lzo or encrypted track, a codec outside `indexableCodecs` (DVD and DVB bitmaps,
-   whose packet parity with FFmpeg is unverified), and every non-Matroska source (step 1).
+   no Cues, a bzlib/lzo or encrypted track, a codec outside the index's `packetCodecs` (DVD and DVB
+   bitmaps, whose packet parity with FFmpeg is unverified; in an MP4 anything but mov_text), a
+   fragmented MP4 or an MP4 track its edit list cuts, and every MPEG-TS source (step 1).
 4. **The index outlives its source.** The registry keeps eight indexes, least recently asked for out;
    it is not tied to the source cache's lifetime.
    - Release an index with its source (`SourceByteCache` release), so the two share one lifetime.
@@ -219,6 +227,12 @@ else; the ledger's per-reader lines should show exactly that.
   pass by sending it down an uncached path production no longer runs. It was replaced by testing the
   rule itself: `publishProbedGeometry` checks the generation and writes in one step, unit-tested with a
   stale and a current generation.
+- **An MP4's index is libavformat's, not a second `moov` parser.** The plan said "read the `moov`
+  once, through the cache". The demuxer has already parsed it, with the edit list applied, and its
+  entries are the walk's packets by definition; a parser of our own would have to reproduce
+  `mov_fix_index` to match them. Completeness was first `entries == nb_frames`, which refused every
+  ffmpeg-muxed mov_text track: `nb_frames` counts `stts` samples including the trailing one the edit
+  list trims. The test against `av_read_frame` caught it.
 - **The prefetch index path was first written as a second loop.** `runIndexed` duplicated the walk's
   contract and was replaced, before commit, by one loop over a `Source` with two implementations.
 - **No memory tier of the engine's own.** The three RAM stores existed to avoid network round trips
@@ -236,5 +250,5 @@ else; the ledger's per-reader lines should show exactly that.
 | `[SourceCache] <source> released: stored ..., served ... back to readers` | A source's cache going, after its grace |
 | `[AVIOReader] <reader> conn start ... from the source cache` | A pump range replayed from disk |
 | `[AVIOReader] <reader> source cache served the read at ...; no reconnect for it` | The first out-of-window read served from the cache, once per reader |
-| `#151 forward prefetch started from the index` / `walking the stream` | Which subtitle prefetch source a session got |
+| `#151 forward prefetch started from the index` / `walking the stream` | Which subtitle prefetch source a session got (Matroska or MP4 alike) |
 | `[IndexedSubtitles] index read in ... ms` | The fill's index, parsed or shared |

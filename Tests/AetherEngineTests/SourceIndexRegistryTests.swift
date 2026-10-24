@@ -11,17 +11,23 @@ struct SourceIndexRegistryTests {
               size: size)
     }
 
-    /// Counts how often the registry asked for a byte source, which is how often it parsed.
+    /// Counts how often the registry ran a read of the bytes, which is how often it parsed.
     private final class Opener: @unchecked Sendable {
         private let lock = NSLock()
         private var opens = 0
-        let bytes: [UInt8]
-        init(_ bytes: [UInt8]) { self.bytes = bytes }
+        /// Nil: every read of the source fails, as a dropped connection's do.
+        let bytes: [UInt8]?
+        init(_ bytes: [UInt8]?) { self.bytes = bytes }
         var count: Int { lock.lock(); defer { lock.unlock() }; return opens }
-        func open() -> RandomAccessByteSource? {
+        func read(_ token: SourceIndexRegistry.ParseToken) throws -> any SourceIndex {
             lock.lock(); opens += 1; lock.unlock()
-            return IOReaderByteSource(DataIOReader(data: Data(bytes)))
+            let source: RandomAccessByteSource = bytes.map { IOReaderByteSource(DataIOReader(data: Data($0))) } ?? Unreadable()
+            return try MatroskaCueIndex.read(from: source, token: token)
         }
+    }
+
+    private final class Unreadable: RandomAccessByteSource {
+        func read(at offset: Int64, count: Int) -> [UInt8]? { nil }
     }
 
     @Test("Consumers racing for one source share one parse, and a consumer after them parses nothing")
@@ -32,8 +38,8 @@ struct SourceIndexRegistryTests {
         let tracks = await withTaskGroup(of: [UInt64].self) { group in
             for _ in 0..<12 {
                 group.addTask {
-                    let outcome = await registry.matroskaIndex(for: key, open: { opener.open() })
-                    return outcome.index.map { Array($0.blocksByTrack.keys).sorted() } ?? []
+                    let outcome = await registry.index(for: key, read: opener.read)
+                    return outcome.index.map { $0.subtitleTracks.map(\.number) } ?? []
                 }
             }
             var all: [[UInt64]] = []
@@ -46,7 +52,7 @@ struct SourceIndexRegistryTests {
         #expect(opener.count == 1)
         #expect(registry.parseCount == 1)
 
-        _ = await registry.matroskaIndex(for: key, open: { opener.open() })
+        _ = await registry.index(for: key, read: opener.read)
         #expect(registry.parseCount == 1)
     }
 
@@ -54,21 +60,21 @@ struct SourceIndexRegistryTests {
     func sourceAndSizeNameTheIndex() async {
         let registry = SourceIndexRegistry()
         let opener = Opener(MatroskaCueIndexTests.fixture().bytes)
-        _ = await registry.matroskaIndex(for: Self.key("a"), open: { opener.open() })
-        _ = await registry.matroskaIndex(for: Self.key("b"), open: { opener.open() })
-        _ = await registry.matroskaIndex(for: Self.key("a", size: 2_000), open: { opener.open() })
-        _ = await registry.matroskaIndex(for: Self.key("a"), open: { opener.open() })
+        _ = await registry.index(for: Self.key("a"), read: opener.read)
+        _ = await registry.index(for: Self.key("b"), read: opener.read)
+        _ = await registry.index(for: Self.key("a", size: 2_000), read: opener.read)
+        _ = await registry.index(for: Self.key("a"), read: opener.read)
         #expect(registry.parseCount == 3)
     }
 
-    @Test("A source that is not Matroska is a kept answer, not a parse per consumer")
+    @Test("A source no reader covers is a kept answer, not a parse per consumer")
     func permanentRefusalIsKept() async {
         let registry = SourceIndexRegistry()
         let opener = Opener([UInt8](repeating: 7, count: 70_000))
-        let first = await registry.matroskaIndex(for: Self.key("plain"), open: { opener.open() })
-        let second = await registry.matroskaIndex(for: Self.key("plain"), open: { opener.open() })
-        guard case .unavailable(.notMatroska) = first, case .unavailable(.notMatroska) = second else {
-            Issue.record("expected notMatroska twice, got \(first) and \(second)")
+        let first = await registry.index(for: Self.key("plain"), read: opener.read)
+        let second = await registry.index(for: Self.key("plain"), read: opener.read)
+        guard case .unavailable(.unsupportedContainer) = first, case .unavailable(.unsupportedContainer) = second else {
+            Issue.record("expected unsupportedContainer twice, got \(first) and \(second)")
             return
         }
         #expect(opener.count == 1)
@@ -79,15 +85,14 @@ struct SourceIndexRegistryTests {
     @Test("A read that broke off is not remembered: the next consumer tries again")
     func brokenReadIsRetried() async {
         let registry = SourceIndexRegistry()
-        let counter = Opener([])
-        let unreadable: @Sendable () -> RandomAccessByteSource? = { _ = counter.open(); return nil }
-        let first = await registry.matroskaIndex(for: Self.key("flaky"), open: unreadable)
+        let counter = Opener(nil)
+        let first = await registry.index(for: Self.key("flaky"), read: counter.read)
         guard case .unavailable(.malformed) = first else {
             Issue.record("expected malformed, got \(first)")
             return
         }
         let good = Opener(MatroskaCueIndexTests.fixture().bytes)
-        let second = await registry.matroskaIndex(for: Self.key("flaky"), open: { good.open() })
+        let second = await registry.index(for: Self.key("flaky"), read: good.read)
         #expect(second.index != nil)
         #expect(counter.count == 1)
         #expect(good.count == 1)
@@ -98,12 +103,12 @@ struct SourceIndexRegistryTests {
         let registry = SourceIndexRegistry()
         let opener = Opener(MatroskaCueIndexTests.fixture().bytes)
         for n in 0...SourceIndexRegistry.capacity {
-            _ = await registry.matroskaIndex(for: Self.key("cap\(n)"), open: { opener.open() })
+            _ = await registry.index(for: Self.key("cap\(n)"), read: opener.read)
         }
         #expect(registry.parseCount == SourceIndexRegistry.capacity + 1)
-        _ = await registry.matroskaIndex(for: Self.key("cap\(SourceIndexRegistry.capacity)"), open: { opener.open() })
+        _ = await registry.index(for: Self.key("cap\(SourceIndexRegistry.capacity)"), read: opener.read)
         #expect(registry.parseCount == SourceIndexRegistry.capacity + 1)
-        _ = await registry.matroskaIndex(for: Self.key("cap0"), open: { opener.open() })
+        _ = await registry.index(for: Self.key("cap0"), read: opener.read)
         #expect(registry.parseCount == SourceIndexRegistry.capacity + 2)
     }
 }

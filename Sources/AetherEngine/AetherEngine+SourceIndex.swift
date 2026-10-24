@@ -19,15 +19,8 @@ extension AetherEngine {
                          sourceCache: .shared, label: label)
     }
 
-    /// A subtitle stream as libavformat lists it, with what an index consumer needs beside it.
-    struct IndexedSubtitleStream: Sendable {
-        let stream: MatroskaCueIndex.SubtitleStream
-        let frames: Int?
-        let timeBase: AVRational
-    }
-
-    /// Every subtitle stream of `demuxer` in order (they map onto the TrackEntries by order).
-    nonisolated static func matroskaSubtitleStreams(of demuxer: Demuxer) -> [IndexedSubtitleStream] {
+    /// Every subtitle stream of `demuxer` in order, as an index consumer pairs it with its track.
+    nonisolated static func indexedSubtitleStreams(of demuxer: Demuxer) -> [IndexedSubtitleStream] {
         var out: [IndexedSubtitleStream] = []
         var index: Int32 = 0
         while let stream = demuxer.withStream(at: index, { st -> IndexedSubtitleStream? in
@@ -35,13 +28,12 @@ extension AetherEngine {
             func tag(_ key: String) -> String? {
                 av_dict_get(st.pointee.metadata, key, nil, AV_DICT_IGNORE_SUFFIX).map { String(cString: $0.pointee.value) }
             }
-            let frames = tag("NUMBER_OF_FRAMES").flatMap { Int($0) }
-            let subtitle = MatroskaCueIndex.SubtitleStream(
+            return IndexedSubtitleStream(
                 streamIndex: index, trackID: st.pointee.id,
                 codecName: String(cString: avcodec_get_name(st.pointee.codecpar.pointee.codec_id)),
                 language: av_dict_get(st.pointee.metadata, "language", nil, 0).map { String(cString: $0.pointee.value) },
-                frames: frames, bytes: tag("NUMBER_OF_BYTES").flatMap { Int64($0) })
-            return IndexedSubtitleStream(stream: subtitle, frames: frames, timeBase: st.pointee.time_base)
+                frames: tag("NUMBER_OF_FRAMES").flatMap { Int($0) }, bytes: tag("NUMBER_OF_BYTES").flatMap { Int64($0) },
+                timeBase: st.pointee.time_base)
         }) {
             if let stream { out.append(stream) }
             index += 1
@@ -50,7 +42,7 @@ extension AetherEngine {
     }
 
     /// The forward subtitle prefetch's packets from the container's index (#151), or nil to walk the
-    /// stream: remote Matroska whose index lists every stream the walk would harvest completely
+    /// stream: a remote source whose index lists every stream the walk would harvest completely
     /// (`SubtitleForwardPrefetcher.IndexSource.plan`). A local file has no film to save and a custom
     /// source's reader is the host's. The reader comes back with the source because it is the
     /// session's to cancel and close.
@@ -58,20 +50,19 @@ extension AetherEngine {
         url: URL, headers: [String: String], headerStore: RequestHeaderStore?, demuxer: Demuxer,
         streams: Set<Int32>, assembly: Set<Int32>, startAt: Double
     ) async -> (source: SubtitleForwardPrefetcher.IndexSource, reader: HTTPDiscIOReader)? {
-        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
-              demuxer.containerFormatName?.contains("matroska") == true else { return nil }
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
         var requestHeaders = headers
         requestHeaders.merge(headerStore?.current ?? [:]) { _, new in new }
         guard let reader = Self.indexedSourceReader(url: url, headers: requestHeaders, label: "prefetch")
         else { return nil }
-        guard let index = await SourceIndexRegistry.shared.matroskaIndex(
-            of: url, headers: requestHeaders, through: reader).index
+        guard let index = await SourceIndexRegistry.shared.index(
+            of: url, headers: requestHeaders, demuxer: demuxer, through: reader).index
         else {
             reader.close()
             return nil
         }
         let plan = SubtitleForwardPrefetcher.IndexSource.plan(
-            index: index, listed: Self.matroskaSubtitleStreams(of: demuxer), streams: streams)
+            index: index, listed: Self.indexedSubtitleStreams(of: demuxer), streams: streams)
         guard plan.refused.isEmpty else {
             EngineLog.emit(
                 "[AetherEngine] #151 forward prefetch: the index does not cover every stream "
