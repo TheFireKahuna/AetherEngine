@@ -29,18 +29,26 @@ struct DetourOriginTicketTests {
         let chunk = 256 * 1024
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
         defer { buf.deallocate() }
-        var read = 0
-        while read < 13 * 1024 * 1024 {
-            let n = Int(reader.read(into: buf, size: Int32(chunk)))
-            #expect(n > 0, "forward read failed at \(read)")
-            if n <= 0 { return }
-            read += n
+        func readForward(_ bytes: Int) -> Bool {
+            var read = 0
+            while read < bytes {
+                let n = Int(reader.read(into: buf, size: Int32(chunk)))
+                #expect(n > 0, "forward read failed at \(read)")
+                if n <= 0 { return false }
+                read += n
+            }
+            return true
         }
+        // The head, then far ahead, so the target below is behind the window and was never fetched:
+        // a byte the source cache holds is served without a detour, which would measure nothing.
+        guard readForward(1024 * 1024) else { return }
+        #expect(reader.seek(offset: 40 * 1024 * 1024, whence: Int32(SEEK_SET)) == 40 * 1024 * 1024)
+        guard readForward(5 * 1024 * 1024) else { return }
         #expect(reader.hasLiveConnectionForTesting, "the pump was not on the link, so the detour had no rival")
 
-        // Backward past the retained head and the window (which trimmed to about 8 MB): the read
-        // that opens the detour block holding 4 to 8 MB.
-        let target = Int64(5 * 1024 * 1024)
+        // Backward past the window, into bytes nothing has fetched: the read that opens the detour
+        // block holding 20 to 24 MB.
+        let target = Int64(21 * 1024 * 1024)
         #expect(reader.seek(offset: target, whence: Int32(SEEK_SET)) == target)
         let served = reader.read(into: buf, size: Int32(chunk))
 
@@ -56,10 +64,10 @@ struct DetourOriginTicketTests {
         #expect(books.peakInflight == 2, "peak \(books.peakInflight) on the books against a limit of 2")
         // The detour block is the 4 MB aligned block holding the target, and nothing else asks for
         // exactly that range: the pump's refills are 32 MB and the tail prefetch is a suffix.
-        #expect(server.requestedRanges.contains { $0.start == 4 * 1024 * 1024 && $0.end == 8 * 1024 * 1024 - 1 },
+        #expect(server.requestedRanges.contains { $0.start == 20 * 1024 * 1024 && $0.end == 24 * 1024 * 1024 - 1 },
                 "no detour block went out, so this measured nothing: \(server.requestedRanges)")
 
-        // Arming a seek deadline must still reuse that resident block without network I/O.
+        // Arming a seek deadline must still reuse that held block without network I/O.
         let requestsBeforeHit = server.rangeRequestCount
         reader.beginReadDeadline(secondsFromNow: 8)
         #expect(reader.seek(offset: target, whence: Int32(SEEK_SET)) == target)
@@ -80,17 +88,21 @@ struct DetourOriginTicketTests {
         let chunk = 256 * 1024
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
         defer { buf.deallocate() }
-        func readToThirteenMB(from start: Int) throws {
-            var position = start
-            while position < 13 * 1024 * 1024 {
+        func readForward(_ bytes: Int) throws {
+            var read = 0
+            while read < bytes {
                 let n = Int(reader.read(into: buf, size: Int32(chunk)))
                 try #require(n > 0)
-                position += n
+                read += n
             }
         }
-        try readToThirteenMB(from: 0)
+        // The head, then far ahead, so the targets below are behind the window in bytes nothing has
+        // fetched, which is the only read the detour policy decides.
+        try readForward(1024 * 1024)
+        #expect(reader.seek(offset: 40 * 1024 * 1024, whence: Int32(SEEK_SET)) == 40 * 1024 * 1024)
+        try readForward(5 * 1024 * 1024)
         #expect(reader.hasLiveConnectionForTesting)
-        let target: Int64 = 5 * 1024 * 1024
+        let target: Int64 = 21 * 1024 * 1024
         reader.beginReadDeadline(secondsFromNow: 8)
         #expect(reader.seek(offset: target, whence: Int32(SEEK_SET)) == target)
         let n = Int(reader.read(into: buf, size: Int32(chunk)))
@@ -100,14 +112,16 @@ struct DetourOriginTicketTests {
             buf[$0] == ThrottledOriginServer.patternByte(at: target + Int64($0))
         })
         #expect(server.requestedRanges.contains { $0.start == target })
-        #expect(!server.requestedRanges.contains { $0.start == 4 * 1024 * 1024 && $0.end == 8 * 1024 * 1024 - 1 })
+        #expect(!server.requestedRanges.contains { $0.start == 20 * 1024 * 1024 && $0.end == 24 * 1024 * 1024 - 1 })
         reader.endReadDeadline()
 
-        // The policy is scoped to the bounded operation, not a sticky source-wide downgrade.
-        try readToThirteenMB(from: Int(target) + max(0, n))
-        #expect(reader.seek(offset: target, whence: Int32(SEEK_SET)) == target)
+        // The policy is scoped to the bounded operation, not a sticky source-wide downgrade: the next
+        // backward read into unfetched bytes, with no deadline armed, detours as usual.
+        try readForward(2 * 1024 * 1024)
+        let later: Int64 = 10 * 1024 * 1024
+        #expect(reader.seek(offset: later, whence: Int32(SEEK_SET)) == later)
         #expect(reader.read(into: buf, size: Int32(chunk)) == chunk)
-        #expect(server.requestedRanges.contains { $0.start == 4 * 1024 * 1024 && $0.end == 8 * 1024 * 1024 - 1 })
+        #expect(server.requestedRanges.contains { $0.start == 8 * 1024 * 1024 && $0.end == 12 * 1024 * 1024 - 1 })
     }
 
     #if os(macOS)

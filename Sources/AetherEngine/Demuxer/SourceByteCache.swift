@@ -44,7 +44,14 @@ final class SourceByteCache: @unchecked Sendable {
     private final class Source: @unchecked Sendable {
         let fd: Int32
         let path: String
+        /// What is on disk.
         var spans = ByteSpanSet()
+        /// Stored and not yet written, readable all the same: a reader that fetched a block must be
+        /// able to read it straight back, or the write's latency would be a window in which the next
+        /// reader fetches it again.
+        var pending: [(id: UInt64, offset: Int64, data: Data)] = []
+        /// What a read can be served from: on disk or pending.
+        var visible = ByteSpanSet()
         /// Block index to the tick it was last written or read.
         var blockUse: [Int64: UInt64] = [:]
         var totalSize: Int64?
@@ -74,6 +81,8 @@ final class SourceByteCache: @unchecked Sendable {
     }
 
     private let directory: URL
+    /// A cache made for one reader removes its directory with itself.
+    private let removesDirectory: Bool
     private let byteBudget: Int64
     private let releaseGrace: TimeInterval
     private let claim: RetentionClaims.Claim?
@@ -81,6 +90,7 @@ final class SourceByteCache: @unchecked Sendable {
     private var sources: [SourceCacheKey: Source] = [:]
     private var heldBytes: Int64 = 0
     private var pendingWriteBytes = 0
+    private var nextPendingID: UInt64 = 0
     private var clock: UInt64 = 0
     private var droppedWriteLogged = false
     private var directoryReady = false
@@ -102,12 +112,31 @@ final class SourceByteCache: @unchecked Sendable {
     }
 
     init(directory: URL, byteBudget: Int64, claim: RetentionClaims.Claim? = nil,
-         releaseGrace: TimeInterval = SourceByteCache.releaseGraceSeconds) {
+         releaseGrace: TimeInterval = SourceByteCache.releaseGraceSeconds, removesDirectory: Bool = false) {
         self.directory = directory
+        self.removesDirectory = removesDirectory
         self.byteBudget = max(0, byteBudget)
         self.releaseGrace = releaseGrace
         self.claim = claim
         claim?.track { [weak self] in self.map { Int($0.heldBytesSnapshot) } ?? 0 }
+    }
+
+    /// A cache of one reader's own, for a reader nobody handed the shared one (a reader built
+    /// directly, as tests do): the same read path, so a reader never has a second way of keeping the
+    /// bytes it fetched. Sized for what one reader re-reads (the head its parse returns to, backward
+    /// detours), released as the reader closes, gone with it.
+    static func scoped() -> SourceByteCache {
+        SourceByteCache(
+            directory: FileManager.default.temporaryDirectory
+                .appending(path: "aether-reader-cache", directoryHint: .isDirectory)
+                .appending(path: UUID().uuidString, directoryHint: .isDirectory),
+            byteBudget: scopedBudgetBytes, releaseGrace: 0, removesDirectory: true)
+    }
+
+    static let scopedBudgetBytes: Int64 = 64 << 20
+
+    deinit {
+        if removesDirectory { try? FileManager.default.removeItem(at: directory) }
     }
 
     // MARK: - Lifetime
@@ -189,8 +218,9 @@ final class SourceByteCache: @unchecked Sendable {
 
     // MARK: - Bytes
 
-    /// Keeps `data`, which a reader fetched for `url` at `offset`. Asynchronous: the bytes become
-    /// servable once written, and a write that would grow the queue past its bound is dropped.
+    /// Keeps `data`, which a reader fetched for `url` at `offset`. Servable from the moment it is
+    /// stored (out of memory until its write lands); a write that would grow the queue past its bound
+    /// is dropped instead.
     func store(_ data: Data, at offset: Int64, for key: SourceCacheKey) {
         guard !data.isEmpty, offset >= 0, byteBudget > 0 else { return }
         lock.lock()
@@ -207,6 +237,10 @@ final class SourceByteCache: @unchecked Sendable {
             return
         }
         pendingWriteBytes += data.count
+        nextPendingID &+= 1
+        let id = nextPendingID
+        source.pending.append((id, offset, data))
+        source.visible.insert(start: offset, end: offset + Int64(data.count))
         scheduleReleaseLocked(key, source)
         lock.unlock()
 
@@ -215,7 +249,11 @@ final class SourceByteCache: @unchecked Sendable {
             lock.lock()
             defer { lock.unlock() }
             pendingWriteBytes -= data.count
-            guard written, sources[key] === source else { return }
+            source.pending.removeAll { $0.id == id }
+            guard written, sources[key] === source else {
+                rebuildVisibleLocked(source)
+                return
+            }
             let added = source.spans.insert(start: offset, end: offset + Int64(data.count))
             heldBytes += added
             source.storedBytes += added
@@ -225,26 +263,65 @@ final class SourceByteCache: @unchecked Sendable {
     }
 
     /// The held bytes from `offset` on, up to `maxLength`, or nil when `offset` is not held or the
-    /// cache knows the source under a different size than `expectedSize`.
+    /// cache knows the source under a different size than `expectedSize`. Stitched from what is
+    /// pending (in memory) and what is on disk, so a run that crosses from one to the other is one
+    /// read. Disk pages read back moments after they were written come out of the kernel's page
+    /// cache, which is the memory tier: the cache keeps none of its own.
     func read(_ key: SourceCacheKey, at offset: Int64, maxLength: Int, expectedSize: Int64?) -> Data? {
         guard maxLength > 0, offset >= 0 else { return nil }
+        enum Piece { case memory(Data), file(Int64, Int) }
         lock.lock()
         guard let source = servableLocked(key, expectedSize: expectedSize) else { lock.unlock(); return nil }
-        let length = Int(min(Int64(maxLength), source.spans.contiguousLength(from: offset)))
+        var pieces: [Piece] = []
+        var cursor = offset
+        var remaining = maxLength
+        while remaining > 0 {
+            if let entry = source.pending.last(where: {
+                $0.offset <= cursor && cursor < $0.offset + Int64($0.data.count)
+            }) {
+                let from = Int(cursor - entry.offset)
+                let take = min(remaining, entry.data.count - from)
+                pieces.append(.memory(entry.data.subdata(in: from..<(from + take))))
+                cursor += Int64(take)
+                remaining -= take
+                continue
+            }
+            let onDisk = source.spans.contiguousLength(from: cursor)
+            guard onDisk > 0 else { break }
+            // Up to the next pending start at most: past it the pending bytes are the newer ones.
+            let nextPending = source.pending.lazy.map(\.offset).filter { $0 > cursor }.min() ?? Int64.max
+            let take = Int(min(Int64(remaining), onDisk, nextPending - cursor))
+            pieces.append(.file(cursor, take))
+            cursor += Int64(take)
+            remaining -= take
+        }
+        let length = Int(cursor - offset)
         guard length > 0 else { lock.unlock(); return nil }
         let epoch = source.evictions
-        touchLocked(source, start: offset, end: offset + Int64(length))
+        touchLocked(source, start: offset, end: cursor)
         lock.unlock()
 
-        var data = Data(count: length)
-        let complete = data.withUnsafeMutableBytes { raw -> Bool in
-            guard let base = raw.baseAddress else { return false }
-            var done = 0
-            while done < length {
-                let n = pread(source.fd, base + done, length - done, off_t(offset) + off_t(done))
-                if n > 0 { done += n } else if n < 0, errno == EINTR { continue } else { return false }
+        var data = Data(capacity: length)
+        var complete = true
+        for piece in pieces {
+            switch piece {
+            case .memory(let bytes):
+                data.append(bytes)
+            case .file(let at, let count):
+                var chunk = Data(count: count)
+                let read = chunk.withUnsafeMutableBytes { raw -> Bool in
+                    guard let base = raw.baseAddress else { return false }
+                    var done = 0
+                    while done < count {
+                        let n = pread(source.fd, base + done, count - done, off_t(at) + off_t(done))
+                        if n > 0 { done += n } else if n < 0, errno == EINTR { continue } else { return false }
+                    }
+                    return true
+                }
+                guard read else { complete = false; break }
+                data.append(chunk)
             }
-            return true
+            if !complete { break }
         }
         lock.lock()
         let valid = complete && source.evictions == epoch && sources[key] === source
@@ -256,7 +333,7 @@ final class SourceByteCache: @unchecked Sendable {
     /// How many bytes from `offset` on are held for `url`, under the same size check `read` makes.
     func heldLength(_ key: SourceCacheKey, at offset: Int64, expectedSize: Int64?) -> Int64 {
         lock.lock(); defer { lock.unlock() }
-        return servableLocked(key, expectedSize: expectedSize)?.spans.contiguousLength(from: offset) ?? 0
+        return servableLocked(key, expectedSize: expectedSize)?.visible.contiguousLength(from: offset) ?? 0
     }
 
     /// Where the next held span of at least `minLength` begins after `offset` and before `limit`.
@@ -265,7 +342,7 @@ final class SourceByteCache: @unchecked Sendable {
                        expectedSize: Int64?) -> Int64? {
         lock.lock(); defer { lock.unlock() }
         return servableLocked(key, expectedSize: expectedSize)?
-            .spans.nextSpan(after: offset, before: limit, minLength: minLength)?.start
+            .visible.nextSpan(after: offset, before: limit, minLength: minLength)?.start
     }
 
     /// Returns once every write queued so far has landed, so the bytes are servable: a warm that
@@ -351,6 +428,16 @@ final class SourceByteCache: @unchecked Sendable {
         releaseQueue.asyncAfter(deadline: .now() + releaseGrace, execute: work)
     }
 
+    /// What is servable: on disk, and pending. Rebuilt when either side loses bytes (an eviction, a
+    /// failed write); an insert only ever grows it, so a store extends it directly.
+    private func rebuildVisibleLocked(_ source: Source) {
+        var visible = source.spans
+        for entry in source.pending {
+            visible.insert(start: entry.offset, end: entry.offset + Int64(entry.data.count))
+        }
+        source.visible = visible
+    }
+
     /// Least recently used blocks go, across every source, until the held bytes fit the budget.
     private func evictLocked() {
         while heldBytes > byteBudget {
@@ -367,6 +454,7 @@ final class SourceByteCache: @unchecked Sendable {
             heldBytes -= before - victim.source.spans.totalBytes
             victim.source.blockUse[victim.block] = nil
             victim.source.evictions &+= 1
+            rebuildVisibleLocked(victim.source)
             var hole = fpunchhole_t(fp_flags: 0, reserved: 0,
                                     fp_offset: off_t(start), fp_length: off_t(Self.blockBytes))
             _ = fcntl(victim.source.fd, F_PUNCHHOLE, &hole)

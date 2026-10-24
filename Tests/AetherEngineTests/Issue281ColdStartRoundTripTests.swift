@@ -233,8 +233,6 @@ struct Issue281ColdStartRoundTripTests {
         let farOffset = fileSize / 2
         #expect(reader.seek(offset: farOffset, whence: SEEK_SET) == farOffset)
         _ = read(reader, 64 * 1024)
-
-        reader.markOpenPhaseFinished()
         let requestsAfterParse = server.rangeRequestCount
 
         // Playback's first read: back at the head, with the connection anchored elsewhere.
@@ -243,32 +241,7 @@ struct Issue281ColdStartRoundTripTests {
 
         #expect(got == 32 * 1024, "playback's first read returned \(got)")
         #expect(server.rangeRequestCount == requestsAfterParse,
-                "playback's first read reconnected instead of using the retained head: \(server.requestedRanges)")
-    }
-
-    /// The head is kept for one read, not forever. Once playback has moved past what it holds, it is
-    /// megabytes with nothing left to serve.
-    @Test("after the open phase the head is no longer retained")
-    func parkingStopsAfterTheOpenPhase() async throws {
-        let server = try #require(ThrottledOriginServer(totalSize: fileSize))
-        defer { server.stop() }
-        let reader = makeReader(server)
-        defer { reader.markClosed(); reader.close() }
-        try reader.open()
-        _ = read(reader, 1 * 1024 * 1024)
-
-        reader.markOpenPhaseFinished()
-
-        let farOffset = fileSize / 2
-        #expect(reader.seek(offset: farOffset, whence: SEEK_SET) == farOffset)
-        _ = read(reader, 64 * 1024)
-        let requestsAfterSeek = server.rangeRequestCount
-
-        #expect(reader.seek(offset: 4096, whence: SEEK_SET) == 4096)
-        _ = read(reader, 32 * 1024)
-
-        #expect(server.rangeRequestCount > requestsAfterSeek,
-                "the head was still retained after the open phase ended")
+                "playback's first read reconnected instead of using the held head: \(server.requestedRanges)")
     }
 
     /// Suffix ranges are not universally implemented. An origin that does not do them answers the

@@ -233,7 +233,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // still refusing, instead of a label a host wears for the rest of the process.
         OriginRequestBudget.shared.noteTargetHealthy(resolved)
         // The next reader of this source pins it too, rather than paying the resolver again.
-        if resolved != url { sourceCache?.noteResolvedURL(resolved, for: cacheKey) }
+        if resolved != url { sourceCache.noteResolvedURL(resolved, for: cacheKey) }
         resolvedURLLock.lock()
         defer { resolvedURLLock.unlock() }
         if resolved != url && resolved != _resolvedURL {
@@ -259,7 +259,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             EngineLog.emit("[AVIOReader] Dropped resolved URL cache (\(reason))", category: .demux)
         }
         resolvedURLLock.unlock()
-        if let droppedNow { sourceCache?.forgetResolvedURL(droppedNow, for: cacheKey) }
+        if let droppedNow { sourceCache.forgetResolvedURL(droppedNow, for: cacheKey) }
         // Outside the reader's lock, and outside the reader's lifetime: the ledger belongs to the
         // origin because the next request against it may well come from a demuxer that does not
         // exist yet (#377 round 5).
@@ -452,7 +452,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         _cumulativeBytesFetched &+= Int64(n)
         counterLock.unlock()
         SourceByteLedger.shared.record(url, reader: label, offset: offset, count: n)
-        if !isLive { sourceCache?.store(data, at: offset, for: cacheKey) }
+        if !isLive { sourceCache.store(data, at: offset, for: cacheKey) }
         // #392: every network delivery this reader makes passes through here (pump, chunk, tail
         // prefetch, detour fetch, streaming), which is why the idle clock is stamped here and not
         // in one of them. A serve out of memory does not reach this call, and must not: memory is
@@ -678,12 +678,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     // MARK: - Cold-start round trips (#281)
 
-    /// How much of the file's head to retain for the return trip after a parse excursion. Measured
-    /// landings across six container layouts and a field trace: 48, 1161, 5752 and 265159, all well
-    /// inside this. Sized to hold that return without becoming a second buffer worth worrying about
-    /// next to the live window: this is charged against the same footprint the high-water end bounds.
-    static let headSpanMaxBytes = 4 * 1024 * 1024
-
     /// Speculative suffix fetch issued with `open()`, sized to cover the small trailing objects a
     /// demuxer asks for before it can report a frame rate: `mfra` on fragmented MP4 (~1-2 KB), and
     /// the trailing `moov` of a non-faststart file whose sample tables are small enough to fit.
@@ -692,30 +686,26 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// a feature-length file's runs into megabytes, and fetching that speculatively on every open
     /// would spend real bandwidth on a guess, competing with the first data connection on exactly
     /// the slow links this is meant to help. 64 KB is negligible on any link that plays video at
-    /// all, and when it misses, the retained head still removes the return trip.
+    /// all, and when it misses, the source cache still removes the return trip to the head.
     static let tailPrefetchBytes = 64 * 1024
 
-    // MARK: - Detour Block Cache (random-access parse reads; AetherEngine#69)
+    // MARK: - Detours (random-access parse reads; AetherEngine#69)
 
     // A non-faststart / coarsely-interleaved remote MP4 makes the demuxer ping-pong between
     // distant file regions (header, trailing moov, sample data) during find_stream_info /
     // index parse. Each non-sequential read used to tear down + reopen the persistent
     // connection (seekReconnect), so the parse storm hammered the origin into a 429.
-    // Instead, serve those random-access reads through the pooled keep-alive chunkSession
-    // (the one fetchChunk already uses), caching 4 MB aligned blocks. The streaming
+    // Instead, a read the window cannot serve is served from the source cache, and a miss
+    // fetches its 4 MB aligned block on the side, which the cache then holds. The streaming
     // connection stays ANCHORED; the ping-pong becomes cache hits; the storm collapses to
     // the two legitimate reconnects (open + the one seek to the moov). The sequential
     // playback fast path never enters this code, so it carries zero overhead.
     private static let detourBlockSize = 4 * 1024 * 1024
-    private static let detourMaxBlocks = 8                       // ~32 MB LRU ceiling
-    /// Audit PERF-108: a detour block nobody has read or filled for this long is a scrub's leftover,
-    /// not a parse's working set (a parser revisits its region within seconds).
-    private static let detourBlockIdleSecondsDefault: TimeInterval = 30
     // Once detour reads turn sequential past this much, re-anchor the streaming connection
     // there so sustained playback returns to the cheap window path (e.g. after a backward scrub).
     private static let detourReanchorBytes: Int64 = 8 * 1024 * 1024
-    // Interactive per-fetch budget for a detour block (#93/#96). A backward-scrub read serves via the
-    // detour cache; a miss fetches a 4 MB block over the pooled session. On a per-connection-starved
+    // Interactive per-fetch budget for a detour block (#93/#96). A backward-scrub read serves from the
+    // source cache; a miss fetches a 4 MB block over the pooled session. On a per-connection-starved
     // origin that fetch used to ride the full chunkRequestTimeout (idle 15s / total 35s) before falling
     // through to the rescue reconnect, which opens a fresh connection the origin serves in ~30-190ms
     // (rrgomes' #93/#96 traces: the whole 15-35s sat here, invisibly, in the detour fetch). A 4 MB block
@@ -846,7 +836,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     }
 
     /// Detour blocks currently resident.
-    var detourResidentBlocksForTesting: Int { detourCache.residentCount }
 
     /// One detour block fetch, true when it came back rate limited.
     func detourFetchIsRateLimitedForTesting(from offset: Int64, size: Int) -> Bool {
@@ -982,18 +971,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// When the current rate-limited streak began, for the live budget. Cleared with the streak.
     private var rateLimitStreakStartedAt: DispatchTime?
 
-    /// Detour LRU block cache (its own leaf lock, never held across `fetchChunk`/network or
-    /// `winCond`). Stores only full-size blocks; short bodies are served once but never cached
-    /// (see serveFromDetour), so eviction never shadows a re-fetchable tail. Pure copy/eviction
-    /// math lives on the cache and is unit-tested without any network.
-    private let detourCache = DetourBlockCache(blockSize: AVIOReader.detourBlockSize,
-                                               maxBlocks: AVIOReader.detourMaxBlocks)
-    /// When the detour cache was last swept for idle blocks (audit PERF-108). Demux-thread-only.
-    private var lastDetourIdleSweepNs: UInt64 = 0
-    /// How long a detour block may sit unread before the sweep releases it. An init parameter for
-    /// the same reason `connStallTimeout` is one: a process-wide hook would leak into whatever suite
-    /// runs concurrently.
-    private let detourBlockIdleSeconds: TimeInterval
     // The interactive cap on a detour fetch; tests that assert a block lands raise it, since 4 s is
     // a wall clock a loaded runner can spend before the fetch does.
     private let detourFetchBudget: TimeInterval
@@ -1002,23 +979,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var detourRunNextExpected: Int64 = -1
     private var detourRunBytes: Int64 = 0
 
-    // MARK: - Cold-start spans (#281)
-
-    /// The head of the FILE, retained for the open phase as the data connection delivers it, so the
-    /// return trip after a parse excursion is a copy rather than a connection.
-    ///
-    /// #281 parked the window at seek time instead, cut from `winStart`, on the reasoning that the
-    /// demuxer returns to the window's start. It returns to the FILE's start: measured landings of
-    /// 48, 1161, 5752 across six container layouts and 265159 in a field trace. The two coincide
-    /// only while the parse seeks away before reading anything, and the parked copy served nothing
-    /// on any layout measured, so it is gone. Collected as the bytes arrive rather than copied at
-    /// seek time, because `trimWindowLocked` has dropped the head long before a seek asks for it.
-    /// winCond-guarded.
-    private var headSpan: Data = Data()
-
-    /// Speculative tail bytes fetched alongside `open()`. winCond-guarded: the fetch completes on a
-    /// URLSession queue while the demux thread reads.
-    private var tailSpan: ResidentSpan?
+    // MARK: - The speculative tail (#281)
 
     /// In-flight speculative tail fetch, cancelled by `close()`.
     private var tailPrefetchTask: URLSessionDataTask?
@@ -1031,16 +992,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var tailPrefetchInFlight = false
     private var tailPrefetchStartedAt = DispatchTime.now()
 
-    /// One log line per span per open, not per serve. winCond-guarded (set from the read loop).
     /// #551: the size this open took from the source cache rather than from a response header. A
     /// size that came from a DIFFERENT response than the one now serving the session is the one
     /// adopted fact that could be wrong and could never be corrected, because the write-once rule
     /// below treats any positive `fileSize` as settled. Remembered so the first network connection's
     /// own `Content-Range` can be checked against it, once.
     private var adoptedCachedSize: Int64?
-    private var headSpanServeLogged = false
-    private var headSpanPlaybackServeLogged = false
-    private var tailSpanServeLogged = false
+    /// One line per open for the first read the source cache served instead of the network: the
+    /// round trip that did not happen, named. winCond-guarded.
+    private var cacheServeLogged = false
 
     /// Measured time to first data of the most recent connection: what one round trip against this
     /// origin actually costs, which is the only honest bound on how long waiting for in-flight bytes
@@ -1053,15 +1013,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// `Self.tailPrefetchWaitBudget(firstDataMs:)` is what guards the real bound.
     var tailPrefetchWaitBudgetForTesting: TimeInterval?
 
-    /// True from `open()` until the demuxer reports its header/stream-info pass done. The parse
-    /// seeks this fix targets all happen inside that window; a far seek afterwards is a real scrub,
-    /// where the old window is worthless and parking it would only cost memory.
-    /// winCond-guarded.
-    private var openPhaseActive = false
-
-    /// AE#585: true while the host runs a bounded index pass after the open phase, which is index
-    /// work rather than playback. winCond-guarded.
-    private var indexPassActive = false
 
     /// AE#782: a producer restart repositioned the demuxer. The next backward read that needs the
     /// network re-anchors the streaming connection there at once, instead of serving the new playback
@@ -1151,10 +1102,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// #240: which reader this is, for the connection log. Several readers run against the same
     /// origin at once and the line used to name none of them.
     private let label: String
-    /// Bytes other readers of this source already fetched, and where this reader's own fetches go
-    /// for them. Nil fetches everything, as every reader did before the cache: the engine's
-    /// construction sites pass `SourceByteCache.shared`.
-    private let sourceCache: SourceByteCache?
+    /// Where every byte this reader fetches is kept, and where every read outside its live window is
+    /// served from: the shared cache at the engine's construction sites, so readers of one source
+    /// serve each other, or one of the reader's own (`SourceByteCache.scoped`) otherwise. There is no
+    /// reader without one, and no second way of keeping bytes.
+    private let sourceCache: SourceByteCache
     private let cacheKey: SourceCacheKey
     private let sourceOpenPolicy: SourceOpenPolicy
     private let openDiagnosticID = String(UUID().uuidString.prefix(8))
@@ -1164,8 +1116,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private let probeDrainLock = NSLock()
     private var drainingProbeRequest = false
 
-    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil, backoffScale: Double = 1, pinIdleSeconds: TimeInterval = AVIOReader.pinIdleRepinSecondsDefault, liveRefusalRetryBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget, sourceCache: SourceByteCache? = nil) {
-        self.sourceCache = sourceCache
+    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil, backoffScale: Double = 1, pinIdleSeconds: TimeInterval = AVIOReader.pinIdleRepinSecondsDefault, liveRefusalRetryBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget, sourceCache: SourceByteCache? = nil) {
+        self.sourceCache = sourceCache ?? .scoped()
         self.cacheKey = SourceCacheKey(url: url, headers: extraHeaders)
         self.sourceOpenPolicy = sourceOpenPolicy
         self.probeControl = probeControl
@@ -1189,18 +1141,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.winHighWater = max(1, windowHighWater
             ?? (isLive ? Self.liveWinHighWaterDefault : Self.winHighWaterDefault))
         self.streamHighWater = max(1, streamHighWater ?? Self.streamHighWaterDefault)
-        self.detourBlockIdleSeconds = detourIdleSeconds ?? Self.detourBlockIdleSecondsDefault
         self.detourFetchBudget = detourFetchBudget ?? Self.detourFetchBudgetSeconds
         self.heldConnectionEnabled = heldConnection
         SourceByteLedger.shared.readerOpened(url)
-        sourceCache?.readerOpened(cacheKey)
+        self.sourceCache.readerOpened(cacheKey)
     }
 
     /// A reader released without `close()` still closes its ledger books and its cache hold.
     deinit {
         if !isFullyClosed {
             SourceByteLedger.shared.readerClosed(url, reader: label)
-            sourceCache?.readerClosed(cacheKey)
+            sourceCache.readerClosed(cacheKey)
         }
     }
 
@@ -1278,10 +1229,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             _ = streamDataReady.wait(timeout: .now() + .seconds(15))
             try failIfStreamingRefused(fallbackStatus: 0)
         } else if prefetchEnabled {
-            // #281: the parse seeks that follow this open are what the retained head exists for.
-            winCond.lock()
-            openPhaseActive = true
-            winCond.unlock()
             // #551: what another reader of this source, or a host's warm, already learned: its size
             // and redirect target, so the first connection is planned against the bytes the source
             // cache holds and replays the head from disk instead of asking the origin.
@@ -1871,7 +1818,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let tailTask = tailPrefetchTask
         tailPrefetchTask = nil
         tailPrefetchInFlight = false
-        openPhaseActive = false
         winCond.broadcast()
         winCond.unlock()
         transfer?.cancelTransfer()
@@ -1888,7 +1834,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         isFullyClosed = true
         defer {
             SourceByteLedger.shared.readerClosed(url, reader: label)
-            sourceCache?.readerClosed(cacheKey)
+            sourceCache.readerClosed(cacheKey)
         }
         isClosed = true
         if let ctx = context {
@@ -1905,8 +1851,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         currentBuffer = Data()
         prefetchBuffer = nil
         bufferLock.unlock()
-
-        detourCache.clear()
 
         streamLock.lock()
         streamEnded = true
@@ -1927,11 +1871,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let transfer = activeTransfer
         activeTransfer = nil
         window.removeAll()
-        // #281: both spans hold real bytes (up to headSpanMaxBytes + tailPrefetchBytes), so they
-        // are released with the window rather than living until the reader is deallocated.
-        headSpan = Data()
-        tailSpan = nil
-        openPhaseActive = false
         let tailTask = tailPrefetchTask
         tailPrefetchTask = nil
         tailPrefetchInFlight = false
@@ -2167,7 +2106,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private func readPersistent(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
         let requestSize = Int(size)
         var totalRead = 0
-        sweepIdleDetourBlocks()
 
         // #93 restart latency: accumulate where THIS read spends its time; one summary line fires
         // on completion when the whole call exceeded the threshold (see SlowReadDiagnostics).
@@ -2229,64 +2167,47 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // #281: bytes already in hand beat every network path below, so this is checked before
             // any of them, and before the reconnect decision that a dead connection would force.
             // Only when the live window cannot serve the position: a window hit is the cheap path
-            // and stays first.
+            // and stays first. "In hand" is the source cache: the head the parse returns to, the
+            // trailing index, a detour block, or bytes another reader of this source fetched. Read
+            // outside `winCond`, so a disk read never holds up a delivery being appended; only this
+            // demux thread moves `position`, so nothing it decides on can change meanwhile.
             let spanPos = position
-            let windowCanServe = spanPos >= winStart && spanPos < winStart + Int64(window.count)
-
-            // #281 retest: the head has now done the job it was kept past the parse for. This read
-            // is not at the head, so playback has either moved beyond it or started nowhere near it,
-            // and holding megabytes for a return that is not coming is just footprint.
-            //
-            // AE#585: unless the host is running its index pass, where neither half of that premise
-            // holds. The cue prewarm seeks to the middle for the container's index and the cursor is
-            // reset to zero straight after, so a drop here throws the head away one read before
-            // playback asks for exactly those bytes.
-            if !openPhaseActive, !indexPassActive, !headSpan.isEmpty,
-               spanPos < 0 || spanPos >= Int64(headSpan.count) {
-                headSpan = Data()
-            }
-            if !windowCanServe, !headSpan.isEmpty || tailSpan != nil,
-               let served = serveFromResidentSpansLocked(into: buf.advanced(by: totalRead),
-                                                        maxLen: requestSize - totalRead,
-                                                        at: spanPos) {
-                let n = served.bytes
-                // Once per span per open: the round trip that did not happen, named. Every serve
-                // after the first says nothing new and would only make the log expensive.
-                var spanLine: String? = nil
-                switch served {
-                // Two lines, not one, because they are two different findings: the parse's return to
-                // the head was already true in 6.5.2, playback's first read being served is what the
-                // head living past `markOpenPhaseFinished` added. One line could not tell a reporter
-                // which of the two they were looking at.
-                case .head where !openPhaseActive && !headSpanPlaybackServeLogged:
-                    headSpanPlaybackServeLogged = true
-                    spanLine = "[AVIOReader] \(label) retained file head served playback's first read"
-                        + " at \(spanPos); no reconnect for it"
-                case .head where !headSpanServeLogged:
-                    headSpanServeLogged = true
-                    spanLine = "[AVIOReader] \(label) retained file head served the return to \(spanPos)"
-                        + "; no reconnect for it"
-                case .tail where !tailSpanServeLogged:
-                    tailSpanServeLogged = true
-                    spanLine = "[AVIOReader] \(label) tail prefetch served the read at \(spanPos)"
-                        + "; no reconnect for it"
-                default:
-                    break
-                }
-                position = spanPos + Int64(n)
-                winCond.broadcast()
+            var windowCanServe = spanPos >= winStart && spanPos < winStart + Int64(window.count)
+            if !windowCanServe, !isLive, fileSize > 0 {
+                let sizeNow = fileSize
                 winCond.unlock()
-                if let spanLine { EngineLog.emit(spanLine, category: .demux) }
-                totalRead += n
-                diag.recordDetourServe(ms: 0, fetched: false)
-                // No ladder reset, and no phase either (#410): these spans are bytes fetched earlier
-                // and kept, and the line above says so itself ("no reconnect for it"). Clearing the
-                // streaks here is the #380 window-serve mistake in the branch that runs FIRST, before
-                // every network path, and unlike the detour it is not taken out of service on a metered
-                // origin, so the parse's return to the head could hold a refusing origin at streak=0.
-                // Reporting `.flowing` off the same serve made the host read a delivering source out of
-                // read-ahead the origin paid for before it died.
-                continue
+                if let held = cachedSourceBytes(at: spanPos, maxLength: requestSize - totalRead,
+                                                expectedSize: sizeNow) {
+                    let n = held.count
+                    held.withUnsafeBytes { raw in
+                        if let base = raw.baseAddress {
+                            buf.advanced(by: totalRead).update(from: base.assumingMemoryBound(to: UInt8.self), count: n)
+                        }
+                    }
+                    winCond.lock()
+                    position = spanPos + Int64(n)
+                    let firstServe = !cacheServeLogged
+                    cacheServeLogged = true
+                    winCond.broadcast()
+                    winCond.unlock()
+                    if firstServe {
+                        EngineLog.emit(
+                            "[AVIOReader] \(label) source cache served the read at \(spanPos); no reconnect for it",
+                            category: .demux)
+                    }
+                    totalRead += n
+                    diag.recordDetourServe(ms: 0, fetched: false)
+                    // No ladder reset, and no phase either (#410): these are bytes fetched earlier and
+                    // kept, and the line above says so itself ("no reconnect for it"). Clearing the
+                    // streaks here is the #380 window-serve mistake in the branch that runs FIRST,
+                    // before every network path, so the parse's return to the head could hold a
+                    // refusing origin at streak=0, and reporting `.flowing` off the same serve would
+                    // make the host read a delivering source out of bytes the origin paid for before
+                    // it died.
+                    continue
+                }
+                winCond.lock()
+                windowCanServe = spanPos >= winStart && spanPos < winStart + Int64(window.count)
             }
 
             // #281 retest: this read wants bytes the speculative fetch is on the wire for RIGHT NOW.
@@ -2375,20 +2296,19 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     }
                     winCond.lock(); playbackRepositionPending = false; winCond.unlock()
                     detourResetRun()
-                    sweepIdleDetourBlocks(force: true)
                     timedReconnect(seek: true, at: curPosition)
                     continue
                 }
                 // Backward random-access read (MP4 parse ping-pong, or a large backward scrub).
-                // Serve via the pooled detour cache so the anchored streaming connection is NOT
-                // torn down (the reconnect storm + origin 429, AetherEngine#69).
+                // Serve from the source cache, fetching the block on the side on a miss, so the
+                // anchored streaming connection is NOT torn down (the reconnect storm + origin 429,
+                // AetherEngine#69).
                 if detourEligible {
                     // Re-anchor the streaming connection once detour reads have turned sequential
                     // past the threshold (playback resumed here), so steady playback returns to
                     // the cheap window path instead of fetching 4 MB blocks forever.
                     if curPosition == detourRunNextExpected && detourRunBytes >= Self.detourReanchorBytes {
                         detourResetRun()
-                        sweepIdleDetourBlocks(force: true)
                         timedReconnect(seek: true, at: curPosition)
                         continue
                     }
@@ -2531,9 +2451,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
             if curPosition > frontier + Int64(Self.seekKeepForwardLimit) {
                 winCond.unlock()
-                // Far-forward seek. Serve from the detour cache ONLY if the block is already
-                // resident (e.g. the moov region the parser revisits); a genuine forward scrub
-                // misses and re-anchors the streaming window there, never chunk-serving forever.
+                // Far-forward seek. Serve from the source cache ONLY if the bytes are already held
+                // (e.g. the moov region the parser revisits); a genuine forward scrub misses and
+                // re-anchors the streaming window there, never chunk-serving forever.
                 if detourEligible {
                     switch serveFromDetour(into: buf.advanced(by: totalRead),
                                            maxLen: requestSize - totalRead,
@@ -2878,23 +2798,28 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private enum DetourServe { case served(Int, fetched: Bool); case rateLimited(TimeInterval); case miss }
     private enum DetourFetch { case ok(Data); case rateLimited(TimeInterval); case failed }
 
-    /// Serve `[offset, offset+maxLen)` (clamped to one 4 MB block) from the detour cache,
-    /// fetching the block over the pooled keep-alive chunkSession on a miss when `allowFetch`.
-    /// Demux-thread call; may block on the network via `detourFetchBlock` (no lock held across it).
-    /// Returns `.miss` (never `.served(0)`) so callers fall back to a single reconnect.
+    /// Serve `[offset, offset+maxLen)` (clamped to one 4 MB block) from the source cache, fetching
+    /// the block on the side on a miss when `allowFetch`; the fetch lands in the cache like every
+    /// delivery, so the parse's next return to it is a hit. Demux-thread call; may block on the
+    /// network via `detourFetchBlock` (no lock held across it). Returns `.miss` (never
+    /// `.served(0)`) so callers fall back to a single reconnect.
     private func serveFromDetour(into dst: UnsafeMutablePointer<UInt8>, maxLen: Int,
                                  at offset: Int64, allowFetch: Bool) -> DetourServe {
         guard fileSize > 0, offset < fileSize, maxLen > 0 else { return .miss }
 
-        // Resident-block hit: pure copy, no network.
-        if let n = detourCache.serveCached(into: dst, maxLen: maxLen, at: offset) {
+        // Held already: pure copy, no network.
+        if let held = cachedSourceBytes(at: offset, maxLength: maxLen, expectedSize: fileSize) {
+            let n = held.count
+            held.withUnsafeBytes { raw in
+                if let base = raw.baseAddress { dst.update(from: base.assumingMemoryBound(to: UInt8.self), count: n) }
+            }
             return .served(n, fetched: false)
         }
         // A bounded position search may probe several distant offsets. Waiting for a whole
         // speculative 4 MB block at each offset can spend the seek's entire deadline before
         // the existing streaming reconnect gets a chance to deliver the requested bytes.
-        // Keep resident hits above, but let a bounded miss re-anchor immediately. Ordinary
-        // parse-time ping-pong still fills the detour cache and preserves its connection.
+        // Keep held hits above, but let a bounded miss re-anchor immediately. Ordinary
+        // parse-time ping-pong still fills the source cache and preserves its connection.
         guard allowFetch, readDeadline == .distantFuture else { return .miss }
 
         let blockStart = (offset / Int64(Self.detourBlockSize)) * Int64(Self.detourBlockSize)
@@ -2902,16 +2827,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let block: Data
         switch detourFetchBlock(from: blockStart, size: blockLen) {
         case .ok(let fetched):
-            // Cache only FULL-length blocks. A truncated 206 cached verbatim would shadow the
-            // re-fetch path for its uncovered tail, so the parser ping-ponging into that tail
-            // would cost one reconnect per read, reintroducing a mild storm (#69 review). Serve
-            // the short body once; the next read of this block re-fetches.
-            if fetched.count == blockLen, !isFullyClosed {
-                detourCache.insert(blockStart / Int64(Self.detourBlockSize), fetched)
-                #if DEBUG
-                EngineLog.emit("[AVIOReader] detour fill block=\(blockStart / Int64(Self.detourBlockSize)) offset=\(blockStart) size=\(fetched.count) (resident=\(detourCache.residentCount))", category: .demux)
-                #endif
-            }
+            // In the source cache already (`addBytesFetched`), short bodies included: a truncated
+            // 206 holds what it carried and no more, so its uncovered tail is still a miss that
+            // fetches, never a hole served as bytes.
             block = fetched
         case .rateLimited(let retryAfter):
             return .rateLimited(retryAfter)
@@ -2980,21 +2898,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
     }
 
-    /// Audit PERF-108: release detour blocks nothing has touched for `detourBlockIdleSeconds`, at most
-    /// once a second from the read path and unconditionally when playback re-anchors, which is the
-    /// moment a scrub's blocks stop being anyone's working set. Demux-thread-only.
-    private func sweepIdleDetourBlocks(force: Bool = false) {
-        let now = DispatchTime.now().uptimeNanoseconds
-        guard force || now &- lastDetourIdleSweepNs >= 1_000_000_000 else { return }
-        lastDetourIdleSweepNs = now
-        let evicted = detourCache.evictIdle(olderThan: detourBlockIdleSeconds)
-        if evicted > 0 {
-            EngineLog.emit(
-                "[AVIOReader] \(label) released \(evicted) idle detour block(s) "
-                + "(\(detourCache.residentCount) resident)", category: .demux, level: .verbose)
-        }
-    }
-
     /// Tracks contiguity of detour reads for the re-anchor heuristic. Shared by BOTH the backward
     /// and far-forward branches; the re-anchor check itself lives only in the backward branch on
     /// purpose, so a forward-accumulated run later met by a contiguous backward read is an intended
@@ -3026,10 +2929,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // A redirect target another reader of this source (or a host's warm) resolved is pinned here
         // too, so this open does not pay the resolver's 302 again (#551 round 2). A lease that has
         // since run out is handled by the expiry ladder, as any pin is.
-        recordResolvedURL(sourceCache?.resolvedURL(for: cacheKey))
+        recordResolvedURL(sourceCache.resolvedURL(for: cacheKey))
         guard prefetchEnabled,
-              let known = sourceCache?.knownSize(cacheKey), known > 0,
-              (sourceCache?.heldLength(cacheKey, at: 0, expectedSize: known) ?? 0)
+              let known = sourceCache.knownSize(cacheKey), known > 0,
+              (sourceCache.heldLength(cacheKey, at: 0, expectedSize: known) ?? 0)
                 >= min(SourceByteCache.minimumServeBytes, known)
         else { return }
         winCond.lock()
@@ -3063,22 +2966,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private func startTailPrefetch() {
         guard !isLive, !isClosed else { return }
         // A source another reader (or a host's warm) has fetched already has its trailing object in the
-        // source cache, and its size, so the suffix this request would ask for is a disk read instead.
-        // A source smaller than the suffix is its own suffix.
-        if let total = sourceCache?.knownSize(cacheKey), total > 0 {
+        // source cache, and its size, so the suffix this request would ask for is there to be read
+        // and no request goes out. A source smaller than the suffix is its own suffix.
+        if let total = sourceCache.knownSize(cacheKey), total > 0 {
             let start = max(0, total - Int64(Self.tailPrefetchBytes))
-            let length = Int(total - start)
-            if let held = cachedSourceBytes(at: start, maxLength: length, expectedSize: total),
-               held.count == length {
-                winCond.lock()
-                if tailSpan == nil, !isFullyClosed {
-                    tailSpan = ResidentSpan(start: start, data: held)
-                }
-                winCond.broadcast()
-                winCond.unlock()
+            if sourceCache.heldLength(cacheKey, at: start, expectedSize: total) >= total - start {
                 EngineLog.emit(
-                    "[AVIOReader] \(label) tail prefetch served \(held.count)B from the source cache",
-                    category: .demux)
+                    "[AVIOReader] \(label) tail prefetch: the source cache holds the trailing "
+                    + "\(total - start)B; no request", category: .demux)
                 return
             }
         }
@@ -3138,21 +3033,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             guard let self else { return }
             let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds
                                    - self.tailPrefetchStartedAt.uptimeNanoseconds) / 1_000_000
+            // Kept before the waiting read is woken: the read the fetch was in flight for serves
+            // from the source cache, so the bytes have to be there when it looks.
+            if case .span(let start, let data) = outcome, !self.isFullyClosed {
+                self.addBytesFetched(data, at: start)
+            }
             self.winCond.lock()
             self.tailPrefetchInFlight = false
-            var installed = false
-            if case .span(let start, let data) = outcome, !self.isFullyClosed, self.tailSpan == nil {
-                self.tailSpan = ResidentSpan(start: start, data: data)
-                installed = true
-            }
             self.winCond.broadcast()
             self.winCond.unlock()
             if case .span(let start, let data) = outcome {
                 SuffixRangeSupport.shared.noteServed(url)
-                self.addBytesFetched(data, at: start)
                 EngineLog.emit(
-                    "[AVIOReader] \(self.label) tail prefetch \(installed ? "installed" : "dropped") "
-                    + "\(data.count)B at \(start) after \(Int(elapsedMs))ms",
+                    "[AVIOReader] \(self.label) tail prefetch kept \(data.count)B at \(start) "
+                    + "after \(Int(elapsedMs))ms",
                     category: .demux)
             } else if case .rejected(let reason, let verdict) = outcome {
                 var learned = false
@@ -3246,39 +3140,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return start
     }
 
-    /// The demuxer is done parsing; a far seek from here on is playback. Stops COLLECTING into the
-    /// head, but deliberately does not release it here.
-    ///
-    /// #281 retest: releasing it here was one read too early. The read that follows this call is
-    /// playback's FIRST, and after a trailing-index parse the anchored connection sits at the END of
-    /// the file, so that read is a backward one that lands at the head on every layout measured (48
-    /// here, 5752 in the field trace). Dropping the head on the last parse read handed straight back
-    /// the round trip the head exists to remove, and no `probe`-based measurement could see it,
-    /// because `probe` exits at exactly this line. The head is released instead by the first
-    /// post-open read it cannot answer, which is either playback moving past it or a resume position
-    /// nowhere near it. The tail span stays for the same reason it always did: it is 64 KB, and a
-    /// container that re-reads its trailing index during playback should keep hitting it.
-    func markOpenPhaseFinished() {
-        winCond.lock()
-        openPhaseActive = false
-        winCond.unlock()
-    }
-
-    /// AE#585: the reads that follow are a bounded index pass, not playback.
-    func beginIndexPass() {
-        winCond.lock()
-        indexPassActive = true
-        winCond.unlock()
-    }
-
-    /// AE#585: the index pass is over; the next read that cannot be answered from a resident span
-    /// is playback's, and #281's rule applies to it unchanged.
-    func endIndexPass() {
-        winCond.lock()
-        indexPassActive = false
-        winCond.unlock()
-    }
-
     /// AE#782: see `playbackRepositionPending`.
     func notePlaybackRepositioned() {
         winCond.lock()
@@ -3286,39 +3147,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.unlock()
     }
 
-    /// Which cold-start span answered, so the log can name the round trip that did not happen
-    /// rather than leaving its absence to be inferred.
-    enum SpanServe {
-        case head(Int)
-        case tail(Int)
-
-        var bytes: Int {
-            switch self {
-            case .head(let n), .tail(let n): return n
-            }
-        }
-    }
-
-    /// Serve `offset` from either cold-start span. Caller holds `winCond` (the read loop already
-    /// does, and `winCond` is an NSCondition, so re-acquiring here would deadlock). The copy runs
-    /// under the lock on purpose: it is a memcpy out of a `Data` the delegate threads only ever
-    /// install, never mutate.
-    private func serveFromResidentSpansLocked(into dst: UnsafeMutablePointer<UInt8>, maxLen: Int,
-                                              at offset: Int64) -> SpanServe? {
-        if !headSpan.isEmpty,
-           let n = ResidentSpan(start: 0, data: headSpan).serve(into: dst, maxLen: maxLen, at: offset) {
-            return .head(n)
-        }
-        if let n = tailSpan?.serve(into: dst, maxLen: maxLen, at: offset) { return .tail(n) }
-        return nil
-    }
-
     /// What `SourceByteCache` holds for this source at `offset`, up to `maxLength`, counted in the
     /// ledger as served rather than fetched. VOD with a known size only: the size is what proves the
     /// held bytes belong to the body this reader is reading.
     private func cachedSourceBytes(at offset: Int64, maxLength: Int, expectedSize: Int64) -> Data? {
         guard !isLive, expectedSize > 0, maxLength > 0,
-              let held = sourceCache?.read(cacheKey, at: offset, maxLength: maxLength,
+              let held = sourceCache.read(cacheKey, at: offset, maxLength: maxLength,
                                                      expectedSize: expectedSize)
         else { return nil }
         SourceByteLedger.shared.servedFromCache(url, reader: label, count: held.count)
@@ -3329,7 +3163,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// pays for bytes the cache is about to hand over.
     private func clippedToNextHeldSpan(from offset: Int64, length: Int64, expectedSize: Int64) -> Int64 {
         guard !isLive, expectedSize > 0, length > 0,
-              let next = sourceCache?.nextHeldStart(
+              let next = sourceCache.nextHeldStart(
                 cacheKey, after: offset, before: offset + length, expectedSize: expectedSize)
         else { return length }
         return next - offset
@@ -3381,16 +3215,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var cachedLength: Int64 = 0
         var resolvedBound = askedBound
         let sizeAtPlan = fileSize
-        let planSize = sizeAtPlan > 0 ? sizeAtPlan : (isLive ? 0 : sourceCache?.knownSize(cacheKey) ?? 0)
+        let planSize = sizeAtPlan > 0 ? sizeAtPlan : (isLive ? 0 : sourceCache.knownSize(cacheKey) ?? 0)
         if !isLive, !heldConnectionEnabled, planSize > offset {
             let remaining = planSize - offset
             let held = sizeAtPlan > 0
-                ? (sourceCache?.heldLength(cacheKey, at: offset, expectedSize: sizeAtPlan) ?? 0) : 0
+                ? (sourceCache.heldLength(cacheKey, at: offset, expectedSize: sizeAtPlan) ?? 0) : 0
             if held > 0, held >= min(SourceByteCache.minimumServeBytes, remaining) {
                 cachedLength = min(held, askedBound ?? held)
                 resolvedBound = cachedLength
             } else if let bound = askedBound,
-                      let next = sourceCache?.nextHeldStart(
+                      let next = sourceCache.nextHeldStart(
                 cacheKey, after: offset, before: offset + bound, expectedSize: planSize) {
                 resolvedBound = next - offset
             }
@@ -3549,7 +3383,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// every generation, since a stuck disk read is still a stuck read.
     private func startCachedSpan(at offset: Int64, length: Int64, expectedSize: Int64,
                                  generation: Int, logGate skippedConnStarts: Int?) {
-        guard let sourceCache else { return }
         let transfer = CachedSpanTransfer(reader: self, generation: generation, cache: sourceCache,
                                           key: cacheKey, offset: offset, length: length,
                                           expectedSize: expectedSize)
@@ -3777,15 +3610,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         let base = window.count
         window.append(data)
-        // #281 retest: retain the head of the file for the open phase, as it arrives. It cannot be
-        // copied later out of the window, because `trimWindowLocked` drops it as the parse reads
-        // forward, which is why the seek-time park misses on every layout whose parse reads more
-        // than `winLookback` before its first excursion. Contiguity is checked rather than assumed:
-        // only the connection anchored at zero, and only while it is still the tail of what is held.
-        if openPhaseActive, winStart == 0, base == headSpan.count,
-           headSpan.count < Self.headSpanMaxBytes {
-            headSpan.append(data.prefix(Self.headSpanMaxBytes - headSpan.count))
-        }
         if fromCache {
             SourceByteLedger.shared.servedFromCache(url, reader: label, count: count)
         } else {
@@ -3939,8 +3763,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             EngineLog.emit(
                 "[AVIOReader] \(label) the source cache said \(adopted)B, this connection says \(total)B; "
                 + "dropping what was read under it (#551)", category: .demux)
-            headSpan = Data()
-            tailSpan = nil
             fileSize = 0
             adoptedCachedSize = nil
         }
@@ -3949,7 +3771,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             fileSize = total
             // #112: share this resolved length so a later side demuxer on the same origin can skip a probe that
             // might be starved under this connection's load and would otherwise collapse it to forward-only.
-            sourceCache?.noteTotalSize(total, for: cacheKey)
+            sourceCache.noteTotalSize(total, for: cacheKey)
             #if DEBUG
             EngineLog.emit("[AVIOReader] File size: \(total) bytes (data connection)", category: .demux)
             #endif
@@ -4411,10 +4233,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private func resolveInitialFileSize() -> Int64 {
         let probed = probeFileSize()
         if probed > 0 {
-            sourceCache?.noteTotalSize(probed, for: cacheKey)
+            sourceCache.noteTotalSize(probed, for: cacheKey)
             return probed
         }
-        if let cached = sourceCache?.knownSize(cacheKey), cached > 0 {
+        if let cached = sourceCache.knownSize(cacheKey), cached > 0 {
             EngineLog.emit("[AVIOReader] size probe empty; reusing cached \(cached) bytes to keep seekability (#112)", category: .demux)
             return cached
         }
@@ -4914,109 +4736,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 }
 
 // MARK: - Detour Block Cache
-
-/// Fixed-block LRU cache backing the persistent reader's detour path (AetherEngine#69). Random-access
-/// parse reads on a non-faststart remote MP4 are served from here over the pooled keep-alive session
-/// instead of tearing down the anchored streaming connection. Thread-safe via a single leaf lock
-/// (demux-thread reads + teardown-thread `clear`); never held across the network. Stores only
-/// full-size blocks (the fetch/insert decision is the caller's), so eviction can't shadow a
-/// re-fetchable short-body tail. The copy + eviction math is pure and unit-tested without a network.
-final class DetourBlockCache: @unchecked Sendable {
-    private let lock = NSLock()
-    private var blocks: [Int64: Data] = [:]
-    private var lru: [Int64] = []
-    /// When each resident block was last inserted or served, on `now`'s clock (audit PERF-108).
-    private var lastHit: [Int64: TimeInterval] = [:]
-    private let maxBlocks: Int
-    private let now: @Sendable () -> TimeInterval
-    let blockSize: Int
-
-    /// `now` is injectable so the idle test moves a clock instead of waiting one out.
-    init(blockSize: Int, maxBlocks: Int,
-         now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
-        self.blockSize = blockSize
-        self.maxBlocks = maxBlocks
-        self.now = now
-    }
-
-    /// Returns the resident block for `idx` and bumps its recency, or nil on a miss.
-    func block(_ idx: Int64) -> Data? {
-        lock.lock(); defer { lock.unlock() }
-        guard let data = blocks[idx] else { return nil }
-        if let i = lru.firstIndex(of: idx) {
-            lru.remove(at: i)
-            lru.append(idx)
-        }
-        lastHit[idx] = now()
-        return data
-    }
-
-    /// Inserts a (full-size) block, evicting the least-recently-used tail beyond `maxBlocks`.
-    func insert(_ idx: Int64, _ data: Data) {
-        lock.lock(); defer { lock.unlock() }
-        if blocks[idx] == nil { lru.append(idx) }
-        blocks[idx] = data
-        lastHit[idx] = now()
-        while lru.count > maxBlocks {
-            let evicted = lru.removeFirst()
-            blocks.removeValue(forKey: evicted)
-            lastHit[evicted] = nil
-        }
-    }
-
-    /// Drops every block nothing has read or filled for `seconds`, and returns how many went. The
-    /// cache is otherwise only emptied at close, so the blocks of a backward scrub (up to 32 MB)
-    /// outlived the scrub for the whole session (audit PERF-108). Age rather than a clear at the
-    /// re-anchor, because a parser ping-ponging through a region keeps hitting its blocks.
-    @discardableResult
-    func evictIdle(olderThan seconds: TimeInterval) -> Int {
-        lock.lock(); defer { lock.unlock() }
-        let cutoff = now() - seconds
-        let idle = lru.filter { (lastHit[$0] ?? 0) < cutoff }
-        guard !idle.isEmpty else { return 0 }
-        let gone = Set(idle)
-        lru.removeAll { gone.contains($0) }
-        for idx in idle {
-            blocks.removeValue(forKey: idx)
-            lastHit[idx] = nil
-        }
-        return idle.count
-    }
-
-    func clear() {
-        lock.lock()
-        blocks.removeAll()
-        lru.removeAll()
-        lastHit.removeAll()
-        lock.unlock()
-    }
-
-    var residentCount: Int {
-        lock.lock(); defer { lock.unlock() }
-        return blocks.count
-    }
-
-    /// Copy up to `maxLen` bytes covering `offset` from the resident block into `dst`, returning the
-    /// byte count. Returns nil if the covering block is not resident, or if `offset` lands in the
-    /// uncovered tail of a short block (so the caller re-fetches rather than serving stale bytes).
-    /// One call serves at most to the block boundary; a read spanning blocks is driven by the caller
-    /// re-entering at the advanced offset. Pure given the cache contents; bumps recency on a hit.
-    func serveCached(into dst: UnsafeMutablePointer<UInt8>, maxLen: Int, at offset: Int64) -> Int? {
-        guard maxLen > 0, offset >= 0 else { return nil }
-        let idx = offset / Int64(blockSize)
-        let blockStart = idx * Int64(blockSize)
-        guard let blk = block(idx) else { return nil }
-        let inBlock = Int(offset - blockStart)
-        guard inBlock >= 0, inBlock < blk.count else { return nil }
-        let n = min(maxLen, blk.count - inBlock)
-        blk.withUnsafeBytes { raw in
-            if let base = raw.baseAddress {
-                dst.update(from: base.advanced(by: inBlock).assumingMemoryBound(to: UInt8.self), count: n)
-            }
-        }
-        return n
-    }
-}
 
 /// Preserves Range + extra headers across cross-host redirects. URLSession strips
 /// custom headers on host change; without this, CDN behind AIOStreams proxy gets a

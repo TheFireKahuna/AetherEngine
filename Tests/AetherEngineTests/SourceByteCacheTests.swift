@@ -93,6 +93,25 @@ struct SourceByteCacheTests {
         #expect(otherToken.display == Self.source.display)
     }
 
+    /// Read-your-writes: a reader that fetched a block reads it straight back, before its write has
+    /// landed, and a read across what is on disk and what is still pending comes back as one run.
+    @Test("Stored bytes are servable at once, and a read stitches pending and written bytes")
+    func storedBytesAreServableAtOnce() throws {
+        let cache = Self.freshCache()
+        let first = Self.pattern(100_000, seed: 3)
+        let second = Self.pattern(50_000, seed: 4)
+        cache.noteTotalSize(10_000_000, for: Self.source)
+        cache.store(first, at: 0, for: Self.source)
+        cache.drainWritesForTesting()
+        cache.store(second, at: 100_000, for: Self.source)
+        // No drain: `second` may still be pending.
+        #expect(cache.heldLength(Self.source, at: 0, expectedSize: 10_000_000) == 150_000)
+        let whole = try #require(cache.read(Self.source, at: 50_000, maxLength: 100_000, expectedSize: 10_000_000))
+        #expect(whole == first.subdata(in: 50_000..<100_000) + second)
+        cache.drainWritesForTesting()
+        #expect(try #require(cache.read(Self.source, at: 100_000, maxLength: 50_000, expectedSize: 10_000_000)) == second)
+    }
+
     @Test("A reader that knows the source under another size is served nothing")
     func sizeMismatchIsNotServed() {
         let cache = Self.freshCache()
