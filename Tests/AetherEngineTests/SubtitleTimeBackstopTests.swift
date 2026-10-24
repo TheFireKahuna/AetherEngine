@@ -80,9 +80,9 @@ struct SubtitleTimeBackstopTests {
     @Test("the WebVTT body survives cues at huge and non-finite times")
     func webVTTTimestamps() {
         let vtt = WebVTTBuilder.body(cues: [
-            (start: 1, end: 2, text: "near"),
-            (start: 1e19, end: .infinity, text: "far"),
-            (start: .nan, end: .nan, text: "nan"),
+            .init(start: 1, end: 2, text: "near"),
+            .init(start: 1e19, end: .infinity, text: "far"),
+            .init(start: .nan, end: .nan, text: "nan"),
         ])
         #expect(vtt.contains("00:00:01.000 --> 00:00:02.000\nnear"))
         #expect(vtt.contains("far"))

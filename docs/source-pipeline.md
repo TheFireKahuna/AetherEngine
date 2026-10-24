@@ -3,9 +3,9 @@
 Status: in progress, written 2026-10-24 against `research/12bit-fel` at `a7a725e8` and the tvOS 27.2
 SDK (Xcode 27.2), brought up to `503c69f5`, then the cache's validators, write bound and budget
 review and the index's lifetime, then layer 3 step 4 (I-frame keyframes from the index), then layer 3
-step 1 (one subtitle source per session). Layers 1 and 2 are built (layer 2 for Matroska and MP4);
-MPEG-TS has no index and is handled on its own terms (its section below), including programs that
-change mid-stream; layer 3 is the remaining work, steps 1 and 4 built. Each section says what is done, which tests hold
+step 1 (one subtitle source per session), then layer 3 step 2 (native subtitles). Layers 1 and 2 are
+built (layer 2 for Matroska and MP4); MPEG-TS has no index and is handled on its own terms (its section
+below), including programs that change mid-stream; layer 3 is the remaining work, steps 1, 2 and 4 built. Each section says what is done, which tests hold
 it, what is not yet ideal with the steps to get there, and what still waits for a device run.
 
 Waiting for a device run, in the order worth doing them:
@@ -25,6 +25,13 @@ Waiting for a device run, in the order worth doing them:
    rendition in PiP, and a bitmap track's OCR rendition; then a few seeks. `[SubtitleSource] routes`,
    `reading from ...: indexed [...] walked [...]`, `complete from the index`, and one `subwalk` reader
    (or none) in `[SourceLedger]` where there were `prefetch` and `nativesubs` before.
+6. Native subtitles (layer 3, step 2), both of Sodalite's chromes: a text track drawn by AVKit in the
+   subtitle settings' style; an ASS track drawn by libass and a PGS track by the overlay, AVKit showing
+   nothing under either; with subtitles off on a title with a forced track, tvOS showing its lines by
+   itself (forced PGS in the overlay); the caption setting at Always On picking an SDH track; PiP and
+   AirPlay showing every kind; a subtitle delay set in Settings mid-play moving a text track to the
+   overlay, and PiP then rebuilding to serve it. `[NativeSubtitles] following ...` and
+   `forced ordinal=N from the index`.
 
 ## Why
 
@@ -279,7 +286,7 @@ libavformat's own parsers and PMT handling are what the tests run against.
    can name the old and the new streams together, and after a seek it is corrected only at the next
    PMT cell. A new stream judged to take no role is therefore judged again when the programs change.
 
-## Layer 3: every output on request (steps 1 and 4 built; the rest next)
+## Layer 3: every output on request (steps 1, 2 and 4 built; the rest next)
 
 In order, each step replacing a reader rather than adding one:
 
@@ -305,10 +312,47 @@ In order, each step replacing a reader rather than adding one:
      teletext options), so a line cannot be stored once with ASS markup and once without.
    - **OCR.** One worker for both routes, reading the packet store its demand keeps ahead. The forced
      rendition is recognized the same way, forced lines only, as far ahead as its demand.
-2. **Subtitle renditions served on request.** A WebVTT segment request from AVKit asks the subtitle
-   source for exactly that segment's time range, so AVKit's own look-ahead is the lead. The forced
-   rendition the same way (`FORCED=YES`). The fixed leads (`subtitleDrainLeadSeconds`, the OCR worker's
-   270 s) stop being reasons to read ahead.
+2. **Native subtitles, served as AVKit asks for them. Built.** The engine behaves as a VOD origin whose
+   renditions are complete files, and AVFoundation's legible selection is the one record of what shows.
+   Apple's HLS authoring specification and our device logs set the constraints: subtitles reach AVKit as
+   WebVTT (or text-profile IMSC1) only, so no image subtitles (4.2, 5.2); a served segment is final, an
+   empty one meaning "no subtitles here" (RFC 8216bis 3.1.4) and kept by AVKit; AVKit fetches a rendition
+   about four minutes ahead of the video, and the whole forward window in one burst at selection; it gives
+   up on a segment after about 1.75 s, and a hold that long slips frames. So a rendition has to be ready
+   ahead of AVKit's fetching, and every request is answered at once from what is determined.
+   - **Who draws.** AVKit selects and draws every text track: WebVTT passed through, and SRT, mov_text,
+     teletext and TTML converted with italic, bold, underline and `\an` alignment (cue settings).
+     CEA-608/708 stay in-band captions. The overlay draws what AVKit cannot: ASS with its styling
+     (libass) and bitmap tracks (PGS, DVB, VobSub), forced bitmap lines included; their WebVTT
+     renditions (ASS reduced to emphasis and alignment, bitmaps recognized by OCR) serve PiP, AirPlay
+     and external displays.
+   - **Selection.** The engine follows AVFoundation's legible selection, whether the viewer, the host or
+     tvOS made it (forced subtitles with subtitles off, SDH under Always On, automatic captions), and a
+     host pick is a selection of the matching option. The deselect pin is gone. A text track's
+     rendition is drawn by AVKit unsuppressed; for an overlay-drawn track the engine's legible output
+     suppresses AVKit (`suppressesPlayerRendering`), the line cleared first so none freezes, and the
+     drainer feeds the overlay. While the rendition is the display (`setNativeSubtitleRendering(true)`:
+     PiP, AirPlay, an external display) suppression is lifted. Device-verified 2026-10-25 (`SEQ=subs`).
+   - **Declarations.** SDH tracks carry the accessibility `CHARACTERISTICS` with `AUTOSELECT=YES` (4.5,
+     4.6); every forced track `FORCED=YES` with `AUTOSELECT=YES` (5.11).
+   - **Delay.** The subtitle delay a session starts with is served: every cue time is written with it,
+     from the first fetch, so AVKit draws it natively. A delay changed during the session moves the text
+     track to the overlay, which applies it at once; when the rendition becomes the display with a
+     served delay that differs, the session is rebuilt in place (`reloadAtCurrentPosition`) so the new
+     item serves the current one, and AVKit draws natively again from then on.
+   - **Serving.** AVKit's fetch of a rendition's playlist starts its reading and every segment request
+     moves its frontier: an indexed text rendition is complete at load; an indexed forced bitmap
+     rendition is complete at load (the display sets' composition headers find the forced ones, and
+     only those are recognized); a full bitmap rendition is recognized by the OCR worker ahead of
+     AVKit's frontier (its lead follows AVKit's requests); a walked stream is read ahead of the frontier,
+     and keeps the selection pre-fill and the empty-rendition gate, since a walk cannot answer a burst
+     four minutes ahead within a second. A host pick starts the overlay at once and then selects the
+     option, so the pre-fill's wait shows the overlay's lines rather than none. The loopback's
+     whole-program `.vtt` (dead) is gone; the remote-HLS bypass's injected renditions keep theirs.
+   - **Served text.** Italic, bold and underline from SRT tags, ASS overrides (a styled ASS track's
+     event text, overrides intact) and rich-text runs; `\an` and `\pos` as cue settings
+     (`WebVTTCueSettings.settings(for:)`, the parser's inverse). Colour and font are left to the
+     viewer's caption style and the host's text style rules.
 3. **The PGS overlay pulls.** The drainer asks the subtitle source for its window around the playhead;
    the packet store becomes a cache of what was pulled, not a buffer filled ahead.
 4. **The I-frame playlist from the index. Built.** `IFrameKeyframeReader`
@@ -390,6 +434,14 @@ else; the ledger's per-reader lines should show exactly that.
   public option is still declared.
 - **A demand that is withdrawn and asked again in one turn is not a stop.** The first version stopped
   the reading on the withdrawal, so the OCR worker's re-arm closed and reopened the walk.
+- **A full bitmap rendition is not recognized to the end of the film.** It was planned; the worker
+  reads its packets from the packet store, whose byte cap keeps a bitmap track's window, not its film,
+  so the whole film would need a second recognition path beside the worker. The worker stays ahead of
+  AVKit's frontier instead; the forced rendition, which is the one tvOS shows by itself, is whole.
+- **The deselect pin and `systemCaptionRequest` are gone.** The engine held AVFoundation's selection off
+  (Sodalite#38, #65) so that the overlay alone drew subtitles, and forwarded what the system asked for.
+  With AVKit suppressed only for the tracks the overlay draws, the system's selection is simply
+  followed.
 - **Two ways to read a keyframe, by container.** Index-only was weighed: it would have left AVI, FLV
   and ASF titles without scrub thumbnails, since only libavformat can turn their index positions into
   packets and re-implementing their packet assembly is the duplicate parser this plan refuses
@@ -433,6 +485,10 @@ else; the ledger's per-reader lines should show exactly that.
 | `[SubtitleSource] reading from Ts: indexed [...] walked [...] pacing=N` | A reading session started, and what it reads |
 | `[SubtitleSource] stream N complete from the index: ... frames, ... cues in ... ms` | A text rendition filled whole at load |
 | `[SubtitleSource] stopped reading (reason=...)` | Nobody asks any more, and the last consumer's reason |
+| `[NativeSubtitles] following "<option>": track N ordinal M, drawn by AVKit` / `the overlay` | The selection AVFoundation holds, whoever made it, and who draws it |
+| `[NativeSubtitles] AVKit suppressed (its line cleared first)` / `AVKit draws the rendition` | Suppression switched for an overlay-drawn track, or lifted |
+| `[NativeSubtitles] forced ordinal=N from the index: ... display sets, ... forced, ... lines` | A forced bitmap rendition recognized whole at load |
+| `[NativeSubtitles] the rendition is the display and serves a delay of ...; rebuilding` | A mid-session delay carried to PiP / AirPlay by a rebuild |
 | `[HLSVideoEngine] cue prewarm: skipped, mpegts has no index a seek loads` | The prewarm left out on a container without a lazy index |
 | `segment plan: uniform stride fallback (..., anchorPts=... (first IRAP read), ...)` | The uniform plan's anchor and where it came from |
 | `[Demuxer] program change: stream N (PID 0x...) takes the role of stream M (PID 0x...)` | A PMT change followed: the new PID read as the role's stream |

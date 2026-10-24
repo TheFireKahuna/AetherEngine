@@ -321,6 +321,84 @@ final class SubtitleSource {
         }
     }
 
+    // MARK: - Forced lines of an indexed bitmap stream
+
+    /// What `indexedForcedLines` found: the forced lines, closed, and how much of the stream was read.
+    struct ForcedLines {
+        let cues: [SubtitleCue]
+        let displaySets: Int
+        let forcedDisplaySets: Int
+        /// Display sets whose composition header could not be read: the lines are a head start, not all.
+        let unreadable: Int
+        let milliseconds: Int
+    }
+
+    /// The forced lines of `stream` for the whole film, when the index reads it: every display set's
+    /// composition header is read (a few hundred bytes each), and only the display sets that carry a forced
+    /// object are decoded, each from the last self-contained display set before it. A forced line ends where
+    /// the stream's next display set begins. Nil when the stream is walked.
+    func indexedForcedLines(stream: Int32) async -> ForcedLines? {
+        let resolved = await resolution.value
+        guard let index = resolved.index,
+              let indexed = resolved.indexedStreams.first(where: { $0.streamIndex == stream }),
+              let listed = resolved.listed.first(where: { $0.streamIndex == stream }) else { return nil }
+        let host = host
+        return await BlockingWork.detached(priority: .utility) {
+            await Self.forcedLines(indexed, index: index, timeBase: listed.timeBase, resolved: resolved, host: host)
+        }.value
+    }
+
+    nonisolated private static func forcedLines(
+        _ stream: SubtitleForwardPrefetcher.IndexSource.Stream, index: any SourceIndex, timeBase: AVRational,
+        resolved: Resolution, host: Host
+    ) async -> ForcedLines? {
+        let began = Date()
+        let blocks = stream.blocks
+        let stop = StopFlag()
+        let prefixes = await withTaskCancellationHandler {
+            readFrames(blocks, track: stream.track, index: index, resolved: resolved, prefix: 512, stop: stop)
+        } onCancel: { stop.raise() }
+        guard !Task.isCancelled else { return nil }
+        let headers: [PGSCompositionHeader?] = blocks.indices.map { i in
+            prefixes[i].flatMap { PGSCompositionHeader.parse($0.payload) }
+        }
+        let forced = headers.indices.filter { headers[$0]?.isForced == true }
+        // Each forced display set, decoded from the self-contained one it builds on.
+        var runs: [ClosedRange<Int>] = []
+        for f in forced {
+            var start = f
+            while start > 0, headers[start]?.isSelfContained != true { start -= 1 }
+            if let last = runs.last, start <= last.upperBound + 1 {
+                runs[runs.count - 1] = last.lowerBound...max(last.upperBound, f)
+            } else {
+                runs.append(start...f)
+            }
+        }
+        let duration = await MainActor.run { host.duration() }
+        var cues: [SubtitleCue] = []
+        for run in runs {
+            guard !Task.isCancelled,
+                  let decoder = await MainActor.run(body: { host.makeDecoder(stream.streamIndex).map(DecoderHandoff.init) })?.decoder
+            else { return nil }
+            let runBlocks = run.map { blocks[$0] }
+            let frames = await withTaskCancellationHandler {
+                readFrames(runBlocks, track: stream.track, index: index, resolved: resolved, stop: stop)
+            } onCancel: { stop.raise() }
+            for (offset, i) in run.enumerated() {
+                guard let frame = frames[offset],
+                      let event = decode(frame, index: index, track: stream.track, streamTimeBase: timeBase,
+                                         decoder: decoder),
+                      headers[i]?.isForced == true else { continue }
+                let next = i + 1 < blocks.count
+                    ? index.seconds(ticks: blocks[i + 1].ticks, track: stream.track) : duration
+                cues.append(contentsOf: event.cues.filter(\.isForced).map { $0.with(endTime: min($0.endTime, next)) })
+            }
+        }
+        return ForcedLines(cues: cues, displaySets: blocks.count, forcedDisplaySets: forced.count,
+                           unreadable: headers.filter { $0 == nil }.count,
+                           milliseconds: Int(Date().timeIntervalSince(began) * 1000))
+    }
+
     private struct DecoderHandoff: @unchecked Sendable { let decoder: EmbeddedSubtitleDecoder }
 
     /// Raised by a cancel, read by the lanes, which run on threads of their own outside the task.
@@ -331,9 +409,11 @@ final class SubtitleSource {
         var isRaised: Bool { lock.lock(); defer { lock.unlock() }; return raised }
     }
 
-    /// `blocks` read on parallel lanes, by their position in the array.
+    /// `blocks` read on parallel lanes, by their position in the array. With `prefix`, at most that many
+    /// payload bytes of each (enough for a PGS composition header).
     nonisolated static func readFrames(_ blocks: [SourceIndexBlock], track: UInt64, index: any SourceIndex,
-                                       resolved: Resolution, stop: StopFlag) -> [Int: SourceIndexFrame] {
+                                       resolved: Resolution, prefix: Int? = nil,
+                                       stop: StopFlag) -> [Int: SourceIndexFrame] {
         guard !blocks.isEmpty else { return [:] }
         let sources = (0..<min(readLanes, blocks.count)).compactMap { _ in resolved.laneSource() }
         defer { sources.forEach { $0.close() } }
@@ -346,7 +426,7 @@ final class SubtitleSource {
         DispatchQueue.concurrentPerform(iterations: sources.count) { lane in
             var k = lane
             while k < blocks.count, !stop.isRaised {
-                if let frame = index.readFrame(blocks[k], track: track, from: sources[lane]) {
+                if let frame = index.readFrame(blocks[k], track: track, from: sources[lane], prefix: prefix) {
                     out.lock.lock(); out.byPosition[k] = frame; out.lock.unlock()
                 }
                 k += sources.count

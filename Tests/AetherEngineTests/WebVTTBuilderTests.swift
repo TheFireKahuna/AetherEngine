@@ -5,8 +5,8 @@ struct WebVTTBuilderTests {
     @Test("formats header, timestamps, and sanitized text")
     func formatsCues() {
         let vtt = WebVTTBuilder.body(cues: [
-            (start: 0, end: 1.5, text: "Hello"),
-            (start: 61.25, end: 3661.004, text: "{\\an8}World\\Nline2"),
+            .init(start: 0, end: 1.5, text: "Hello"),
+            .init(start: 61.25, end: 3661.004, text: "{\\an8}World\\Nline2"),
         ])
         #expect(vtt.hasPrefix("WEBVTT\n"))
         #expect(vtt.contains("00:00:00.000 --> 00:00:01.500\nHello"))
@@ -21,13 +21,13 @@ struct WebVTTBuilderTests {
 
     @Test("cue that sanitizes to empty is skipped")
     func skipsEmpty() {
-        let vtt = WebVTTBuilder.body(cues: [(start: 0, end: 1, text: "{\\an8}")])
+        let vtt = WebVTTBuilder.body(cues: [.init(start: 0, end: 1, text: "{\\an8}")])
         #expect(vtt == "WEBVTT\n\n")
     }
 
     /// The text of the single cue `text` produces, or nil when it is skipped.
     private func cueText(_ text: String) -> String? {
-        let vtt = WebVTTBuilder.body(cues: [(start: 0, end: 1, text: text)])
+        let vtt = WebVTTBuilder.body(cues: [.init(start: 0, end: 1, text: text)])
         guard let range = vtt.range(of: "00:00:00.000 --> 00:00:01.000\n") else { return nil }
         let rest = vtt[range.upperBound...]
         #expect(rest.hasSuffix("\n\n"))
@@ -95,7 +95,7 @@ struct WebVTTBuilderTests {
 
     @Test("segment bodies get the same cue text treatment")
     func segmentEscapes() {
-        let vtt = WebVTTBuilder.segment(cues: [(start: 0, end: 1, text: "{\\i1}Tom & Jerry")])
+        let vtt = WebVTTBuilder.segment(cues: [.init(start: 0, end: 1, text: "{\\i1}Tom & Jerry")])
         #expect(vtt.contains("00:00:00.000 --> 00:00:01.000\n<i>Tom &amp; Jerry</i>\n\n"))
     }
 

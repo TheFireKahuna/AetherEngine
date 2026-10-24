@@ -45,7 +45,6 @@ final class PublicAPIDocumentationTests: XCTestCase {
         "Subtitles/ExternalSubtitleTrack.swift",
         "Subtitles/NativeSubtitleCueStore.swift",
         "Disc/DiscMetadata.swift",
-        "Native/NativeLegibleDeselectPin.swift",
         "Native/SoftwarePiPSource.swift",
         "Audio/Tap/AudioTapTypes.swift",
         "Audio/AudioBridge.swift",

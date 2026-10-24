@@ -30,8 +30,11 @@ protocol SourceIndex: Sendable {
     /// states one.
     func isComplete(track: UInt64, frameCount: Int?) -> Bool
 
-    /// Reads `block` of `track`. Nil when the block is not where the index says or could not be read.
-    func readFrame(_ block: SourceIndexBlock, track: UInt64, from source: RandomAccessByteSource) -> SourceIndexFrame?
+    /// Reads `block` of `track`. With `prefix`, at most that many payload bytes (enough for a PGS
+    /// composition header) instead of the whole frame. Nil when the block is not where the index says
+    /// or could not be read.
+    func readFrame(_ block: SourceIndexBlock, track: UInt64, from source: RandomAccessByteSource,
+                   prefix: Int?) -> SourceIndexFrame?
 
     /// Whether the keyframes of video `track` can be read here (`readKeyframe`).
     func coversKeyframes(track: UInt64) -> Bool
@@ -76,6 +79,8 @@ struct SourceIndexFrame: Sendable {
     var payload: [UInt8]
     /// WebVTT cue settings, which libavformat attaches as side data.
     var webVTTSettings: String?
+    /// True when only the first bytes were read (`readFrame(..., prefix:)`).
+    var isPrefix: Bool
 }
 
 /// A subtitle track as the index lists it.
@@ -145,3 +150,9 @@ extension SourceIndex {
     }
 }
 
+extension SourceIndex {
+    /// The whole frame of `block`.
+    func readFrame(_ block: SourceIndexBlock, track: UInt64, from source: RandomAccessByteSource) -> SourceIndexFrame? {
+        readFrame(block, track: track, from: source, prefix: nil)
+    }
+}

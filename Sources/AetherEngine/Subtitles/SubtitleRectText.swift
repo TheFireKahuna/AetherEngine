@@ -68,6 +68,18 @@ enum SubtitleRectText {
         return cleanASSBody(l)
     }
 
+    /// The text field of an ASS event line with its override blocks and escapes intact, for a consumer that
+    /// reads the markup itself (`WebVTTBuilder.cueText`); nil when it is empty.
+    static func eventText(fromASSEventLine line: String) -> String? {
+        var l = capped(line)
+        if l.hasPrefix("Dialogue: ") {
+            l.removeFirst("Dialogue: ".count)
+        }
+        let parts = l.split(separator: ",", maxSplits: 8, omittingEmptySubsequences: false)
+        let body = parts.count == 9 && Int(parts[0]) != nil ? String(parts[8]) : l
+        return body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : body
+    }
+
     /// Raw ASS event line exactly as libavcodec hands it over (`ReadOrder,Layer,Style,...,Text`, tags + escapes intact), for the `preserveASSMarkup` path; nil when the rect carries no ASS payload (bitmap or plain-text-only rects).
     static func rawASSLine(for rect: UnsafeMutablePointer<AVSubtitleRect>) -> String? {
         guard let assPtr = rect.pointee.ass else { return nil }

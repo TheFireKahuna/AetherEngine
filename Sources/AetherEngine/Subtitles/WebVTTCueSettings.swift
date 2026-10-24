@@ -94,6 +94,37 @@ enum WebVTTCueSettings {
         return SubtitleTextPlacement(alignment: r * 3 + c + 1, position: position)
     }
 
+    /// The cue settings that ask for `placement`, the inverse of `placement(fromSettings:)`: what a
+    /// served WebVTT cue carries so AVKit places it where the source did. Nil for the default (bottom
+    /// centre, no anchor point), which needs none. A point becomes a percentage `line` anchored at the
+    /// edge its row names and a percentage `position`; without one, a top row is `line:0`, a middle row
+    /// `line:50%,center`, and the column is the cue's `align`.
+    static func settings(for placement: SubtitleTextPlacement) -> String? {
+        let alignment = min(max(placement.alignment ?? 2, 1), 9)
+        let column = (alignment - 1) % 3
+        let row = (alignment - 1) / 3
+        var fields: [String] = []
+        if let point = placement.position {
+            let lineAlign = ["end", "center", "start"][row]
+            fields.append("line:\(percent(point.y)),\(lineAlign)")
+            fields.append("position:\(percent(point.x))")
+        } else if row == 2 {
+            fields.append("line:0")
+        } else if row == 1 {
+            fields.append("line:50%,center")
+        }
+        if column != 1 || !fields.isEmpty {
+            fields.append("align:\(["start", "center", "end"][column])")
+        }
+        return fields.isEmpty ? nil : fields.joined(separator: " ")
+    }
+
+    /// A fraction as a WebVTT percentage, clamped to the 0 to 100 the grammar allows.
+    private static func percent(_ fraction: CGFloat) -> String {
+        let value = min(max(Double(fraction) * 100, 0), 100)
+        return String(format: "%.2f%%", value)
+    }
+
     /// The settings string the demuxer attached to this packet, if any. Verbatim, exactly as it
     /// followed the timestamp line in the source.
     static func settings(onPacket packet: UnsafePointer<AVPacket>) -> String? {

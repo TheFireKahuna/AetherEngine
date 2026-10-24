@@ -196,8 +196,11 @@ struct ForcedSubtitleRenditionTests {
 }
 
 private final class ForcedMasterProvider: HLSSegmentProvider, @unchecked Sendable {
-    let renditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)]
-    init(renditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)]) { self.renditions = renditions }
+    let renditions: [NativeSubtitleRenditionInfo]
+    /// Each rendition at its ordinal, which is its position.
+    init(renditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)]) {
+        self.renditions = renditions.map { .init(language: $0.language, name: $0.name, isForced: $0.isForced) }
+    }
     func initSegment() -> Data? { Data([0x00]) }
     func mediaSegment(at index: Int) -> Data? { Data([0x00]) }
     var segmentCount: Int { 1 }
@@ -205,5 +208,5 @@ private final class ForcedMasterProvider: HLSSegmentProvider, @unchecked Sendabl
     var playlistType: HLSPlaylistType { .vod }
     var masterCodecs: String? { "hvc1.1.6.L120.90,mp4a.40.2" }
     var masterVideoRange: HLSVideoRange? { .sdr }
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { renditions }
+    var nativeSubtitleRenditions: [NativeSubtitleRenditionInfo] { renditions }
 }

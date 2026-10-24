@@ -1,3 +1,4 @@
+import Compression
 import Foundation
 import AetherLibavutil
 
@@ -96,7 +97,7 @@ struct MatroskaCueIndex: SourceIndex {
         if let relative = keyframe.relativePosition {
             let block = SourceIndexBlock(ticks: keyframe.ticks, durationTicks: nil,
                                          offset: position + 4 + 1 + relative, size: nil)
-            return readFrame(block, track: track, from: source)?.payload
+            return readFrame(block, track: track, from: source, prefix: nil)?.payload
         }
         return block(of: track, at: keyframe.ticks, inClusterAt: position, from: source)
     }
@@ -399,11 +400,16 @@ struct MatroskaCueIndex: SourceIndex {
 
     /// The block as libavformat hands it over: header-stripped bytes restored, zlib inflated, a WebVTT
     /// block split into its text and settings (an empty payload for one libavformat drops).
-    func readFrame(_ block: SourceIndexBlock, track: UInt64, from source: RandomAccessByteSource) -> SourceIndexFrame? {
+    func readFrame(_ block: SourceIndexBlock, track: UInt64, from source: RandomAccessByteSource,
+                   prefix requestedPrefix: Int?) -> SourceIndexFrame? {
+        // A compressed frame has no readable prefix: it is read whole and inflated, and the prefix is
+        // taken from what it inflates to.
+        let compressed = encodingByTrack[track] == .zlib
+        let prefix = compressed ? nil : requestedPrefix
         // The block starts at cluster + 4 (the cluster ID) + the size field (1...8) + relative position;
         // the offset assumes the shortest field.
         let earliest = block.offset
-        let want = 512 + Self.blockHeaderSlack + 8
+        let want = (prefix ?? 512) + Self.blockHeaderSlack + 8
         guard let window = source.read(at: earliest, count: want), !window.isEmpty else { return nil }
         // The sampled length first; a muxer can still write a few clusters with another one.
         let candidates = clusterSizeFieldLength.map { known in [known] + (1...8).filter { $0 != known } } ?? Array(1...8)
@@ -413,23 +419,37 @@ struct MatroskaCueIndex: SourceIndex {
                   let located = Self.locate(window, at: at, track: track) else { continue }
             var payload: [UInt8]
             let payloadEnd = located.payloadStart + located.payloadLength
-            if payloadEnd <= window.count {
+            let isPrefix: Bool
+            if let prefix, located.payloadLength > prefix {
+                let end = min(window.count, located.payloadStart + prefix)
+                payload = Array(window[located.payloadStart..<end])
+                isPrefix = true
+            } else if payloadEnd <= window.count {
                 payload = Array(window[located.payloadStart..<payloadEnd])
+                isPrefix = false
             } else {
                 guard let full = source.read(at: earliest + Int64(located.payloadStart), count: located.payloadLength),
                       full.count == located.payloadLength else { return nil }
                 payload = full
+                isPrefix = false
             }
             guard let frame = restored(payload, track: track) else { return nil }
             payload = frame
+            var prefixed = isPrefix
+            if compressed {
+                if let requestedPrefix, payload.count > requestedPrefix {
+                    payload = Array(payload.prefix(requestedPrefix))
+                    prefixed = true
+                }
+            }
             var settings: String?
-            if isWebVTT(track: track) {
+            if !prefixed, isWebVTT(track: track) {
                 let cue = Self.webVTTCue(payload)
                 payload = cue?.text ?? []
                 settings = cue.flatMap { $0.settings.isEmpty ? nil : $0.settings }
             }
             return SourceIndexFrame(ticks: block.ticks, durationTicks: located.durationTicks ?? block.durationTicks,
-                                    payload: payload, webVTTSettings: settings)
+                                    payload: payload, webVTTSettings: settings, isPrefix: prefixed)
         }
         return nil
     }
@@ -633,5 +653,64 @@ enum EBML {
         let end = min(bytes.count, element.dataStart + Int(min(element.size, 8)))
         for k in element.dataStart..<end { value = (value << 8) | UInt64(bytes[k]) }
         return value
+    }
+}
+
+/// The part of a PGS display set the index needs without decoding it: its Presentation Composition.
+struct PGSCompositionHeader: Equatable {
+    /// 0x00 normal, 0x40 acquisition point, 0x80 epoch start.
+    var state: UInt8
+    var objectCount: Int
+    /// Any composition object carries the forced flag (0x40): the line shows with subtitles off.
+    var isForced: Bool
+
+    /// A display set that does not depend on earlier ones: decoding can start here.
+    var isSelfContained: Bool { state & 0xC0 != 0 }
+
+    /// Parses the composition segment a display set starts with. `payload` may be zlib-wrapped, in
+    /// which case only its first bytes are inflated.
+    static func parse(_ payload: [UInt8]) -> PGSCompositionHeader? {
+        var bytes = payload
+        if bytes.count > 2, bytes[0] == 0x78, [0x01, 0x5E, 0x9C, 0xDA].contains(bytes[1]) {
+            guard let inflated = inflatePrefix(Array(bytes.dropFirst(2)), want: 256) else { return nil }
+            bytes = inflated
+        }
+        if bytes.count > 10, bytes[0] == 0x50, bytes[1] == 0x47 { bytes.removeFirst(10) }   // "PG" stream header
+        guard bytes.count >= 3 + 11, bytes[0] == 0x16 else { return nil }
+        let pcs = 3
+        let state = bytes[pcs + 7]
+        let count = Int(bytes[pcs + 10])
+        var forced = false
+        var object = pcs + 11
+        for _ in 0..<count {
+            guard object + 8 <= bytes.count else { break }
+            let flags = bytes[object + 3]
+            if flags & 0x40 != 0 { forced = true }
+            object += 8 + (flags & 0x80 != 0 ? 8 : 0)
+        }
+        return PGSCompositionHeader(state: state, objectCount: count, isForced: forced)
+    }
+
+    /// The first bytes of a raw deflate stream, from as much of it as is at hand.
+    static func inflatePrefix(_ deflated: [UInt8], want: Int) -> [UInt8]? {
+        guard !deflated.isEmpty else { return nil }
+        let stream = UnsafeMutablePointer<compression_stream>.allocate(capacity: 1)
+        defer { stream.deallocate() }
+        guard compression_stream_init(stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB) == COMPRESSION_STATUS_OK else {
+            return nil
+        }
+        defer { compression_stream_destroy(stream) }
+        var out = [UInt8](repeating: 0, count: want)
+        let produced: Int = deflated.withUnsafeBufferPointer { input in
+            out.withUnsafeMutableBufferPointer { output in
+                stream.pointee.src_ptr = input.baseAddress!
+                stream.pointee.src_size = input.count
+                stream.pointee.dst_ptr = output.baseAddress!
+                stream.pointee.dst_size = want
+                _ = compression_stream_process(stream, 0)
+                return want - stream.pointee.dst_size
+            }
+        }
+        return produced > 0 ? Array(out.prefix(produced)) : nil
     }
 }

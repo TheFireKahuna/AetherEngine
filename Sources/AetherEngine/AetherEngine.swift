@@ -1625,17 +1625,6 @@ public final class AetherEngine: ObservableObject {
     /// else, and nothing on screen said why. No replay; subscribe per session.
     public let liveResumeClamped = PassthroughSubject<LiveResumeClamp, Never>()
 
-    /// Fires when the SYSTEM turned captions on by itself, i.e. selected a legible option in the item that
-    /// neither the host nor the user asked for. On iOS 26 that is Settings > Accessibility > Subtitles &
-    /// Captioning > Automatic Subtitles (show when muted, on skip back, on a language mismatch); those
-    /// toggles have no read API, so acting on the selection is the only way to honour them.
-    ///
-    /// The engine still deselects the option (its renditions exist for PiP, AirPlay and external screens,
-    /// and rendering them in fullscreen draws a caption box over the host's own subtitles). A host that
-    /// wants the behaviour renders the request itself: it knows which of the three triggers plausibly
-    /// fired and which of its own tracks matches. No replay; subscribe per session.
-    public let systemCaptionRequest = PassthroughSubject<SystemCaptionRequest, Never>()
-
     /// Fires when a native session AVPlayer refused on its merits is rebuilt on the software path
     /// (AE#561), carrying the failure the rebuild absorbed. Without it a host sees only `videoRoute`
     /// change, which a host re-planning failing titles itself cannot tell from a routing decision
@@ -2516,6 +2505,8 @@ public final class AetherEngine: ObservableObject {
         /// Container FORCED disposition; declared as FORCED=YES on the WebVTT rendition so
         /// AVFoundation distinguishes same-language forced/full pairs.
         var isForced: Bool = false
+        /// Container HEARING_IMPAIRED disposition: declared as an SDH rendition.
+        var isHearingImpaired: Bool = false
         /// Phase D: bitmap (PGS/DVB/DVD) entry whose store is filled by the OCR worker /
         /// sidecar OCR fill, not by the pump tap or the side readers.
         var needsOCR: Bool = false
@@ -2523,7 +2514,8 @@ public final class AetherEngine: ObservableObject {
         /// holding just the lines the track flags as forced. Same source stream as the full track's
         /// entry, which comes before it in the table.
         var forcedCuesOnly: Bool = false
-        /// The session's one rendition declared FORCED=YES (`LoadOptions.forcedSubtitleTrack`).
+        /// Declared FORCED=YES: `LoadOptions.forcedSubtitleTrack`'s rendition, and under
+        /// `LoadOptions.declaresForcedSubtitles` every track the container flags forced.
         var declaresForced: Bool = false
     }
     var nativeSubtitleTrackTable: [NativeSubtitleTrackEntry] = []
@@ -2593,16 +2585,33 @@ public final class AetherEngine: ObservableObject {
     /// session-scoped; cancelled on load()/stop() alongside the subtitle tasks.
     var audibleReadbackTask: Task<Void, Never>? = nil
 
-    /// Sodalite#38 / #65: the pin that keeps the native legible rendition deselected while the host
-    /// draws subtitles itself. The task is the load-time burst, the observer holds the deselect for
-    /// the rest of the item's life against iOS 26's automatic captions, and the burst budget stops
-    /// the pin from spinning if the system re-selects after every deselect. Session-scoped, all four
-    /// dropped together by `cancelNativeLegibleDeselectPin()`.
-    var nativeLegibleDeselectPinTask: Task<Void, Never>? = nil
-    var nativeLegibleDeselectPinObserver: NSObjectProtocol? = nil
-    var nativeLegibleDeselectPinItem: AVPlayerItem? = nil
-    var nativeLegibleDeselectPinGroup: AVMediaSelectionGroup? = nil
-    var nativeLegibleDeselectPinBurst = NativeLegibleDeselectPin()
+    /// The native route's subtitle selection (`AetherEngine+NativeSubtitleSelection`): the item it is armed
+    /// on, its legible group, the legible output that suppresses AVKit's drawing for a track the overlay
+    /// draws, the observer that follows every selection change and the task that loads the group. Dropped
+    /// together by `disarmNativeSubtitleSelection()`.
+    var nativeSubtitleSelectionItem: AVPlayerItem? = nil
+    var nativeSubtitleSelectionGroup: AVMediaSelectionGroup? = nil
+    var nativeSubtitleLegibleOutput: AVPlayerItemLegibleOutput? = nil
+    var nativeSubtitleSelectionObserver: NSObjectProtocol? = nil
+    var nativeSubtitleSelectionTask: Task<Void, Never>? = nil
+    /// What the selection observer last applied.
+    var nativeSubtitleFollowedKey: NativeSubtitleFollowedKey? = nil
+    /// The anchor a host pick asked for, taken by the selection it causes.
+    var pendingNativeSubtitleStartAt: Double? = nil
+    /// The subtitle delay the viewer has now (`setSubtitleDelay`), and the one the session's renditions
+    /// serve: the load's, or the viewer's at a session-preserving reload.
+    var currentSubtitleDelaySeconds: Double = 0
+    var servedSubtitleDelaySeconds: Double = 0
+    /// The forced bitmap renditions being recognized whole from the index, by ordinal
+    /// (`fillIndexedForcedRenditions`). Cancelled with the session's subtitle source.
+    var indexedForcedFillTasks: [Int: Task<Void, Never>] = [:]
+
+    /// Whether AVKit draws the primary subtitle from its rendition: the selected track is text AVKit draws
+    /// in the viewer's caption style, so a host's overlay draws nothing for the primary track. False
+    /// otherwise, when the overlay draws it from `subtitleCues`: a track AVKit cannot draw as authored
+    /// (styled ASS, a bitmap track, forced lines included), text whose delay its rendition does not serve
+    /// yet, and every track off the native route.
+    @Published public internal(set) var primarySubtitleDrawnByAVKit: Bool = false
 
     /// #316: the loopback origin standing in front of a remote HLS master to carry the host's declared
     /// sidecars as legible renditions. Nil whenever the bypass plays the origin URL directly, which is
@@ -4464,7 +4473,7 @@ public final class AetherEngine: ObservableObject {
         remoteHLSSubtitleDiscoveryTask = nil
         audibleReadbackTask?.cancel()
         audibleReadbackTask = nil
-        cancelNativeLegibleDeselectPin()   // Sodalite#65: the pin belongs to the item being replaced
+        disarmNativeSubtitleSelection()   // the selection belongs to the item being replaced
         remoteHLSSubtitleProxy?.tearDown()   // #316
         remoteHLSSubtitleProxy = nil
         injectedSubtitleRenditionNames = [:]
@@ -4491,6 +4500,8 @@ public final class AetherEngine: ObservableObject {
         forcedRenditionRequestedOrdinal = nil
         subtitleSource?.close()
         subtitleSource = nil
+        indexedForcedFillTasks.values.forEach { $0.cancel() }
+        indexedForcedFillTasks = [:]
         nativeSubtitleTracks = []
         metadata = nil
         fontAttachments = []
@@ -6972,7 +6983,7 @@ public final class AetherEngine: ObservableObject {
         remoteHLSSubtitleDiscoveryTask = nil
         audibleReadbackTask?.cancel()
         audibleReadbackTask = nil
-        cancelNativeLegibleDeselectPin()   // Sodalite#65: the pin belongs to the item being torn down
+        disarmNativeSubtitleSelection()   // the selection belongs to the item being torn down
         // #316: the proxy serves exactly one session's master; a standing socket outliving it would keep a
         // port and a decode task alive for a source nobody plays any more.
         remoteHLSSubtitleProxy?.tearDown()
@@ -8204,6 +8215,8 @@ public final class AetherEngine: ObservableObject {
         forcedRenditionRequestedOrdinal = nil
         subtitleSource?.close()
         subtitleSource = nil
+        indexedForcedFillTasks.values.forEach { $0.cancel() }
+        indexedForcedFillTasks = [:]
         nativeSubtitleTracks = []
         nativeSubtitleRenditionAvailable = false
         cancelSidecarTask(channel: .secondary)
