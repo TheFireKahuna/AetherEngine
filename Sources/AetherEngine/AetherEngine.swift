@@ -2500,6 +2500,10 @@ public final class AetherEngine: ObservableObject {
         /// Phase D: bitmap (PGS/DVB/DVD) entry whose store is filled by the OCR worker /
         /// sidecar OCR fill, not by the pump tap or the side readers.
         var needsOCR: Bool = false
+        /// `LoadOptions.forcedSubtitleRenditions`: the forced-only rendition of an embedded bitmap track,
+        /// holding just the lines the track flags as forced. Same source stream as the full track's
+        /// entry, which comes before it in the table.
+        var forcedCuesOnly: Bool = false
     }
     var nativeSubtitleTrackTable: [NativeSubtitleTrackEntry] = []
 
@@ -2542,6 +2546,9 @@ public final class AetherEngine: ObservableObject {
     var subtitleOCRDecoder: EmbeddedSubtitleDecoder?
     var subtitleOCRCursors: [Int: SubtitleDrainCursor] = [:]
     var subtitleOCRPendingStates: [Int: SubtitleOCRPendingState] = [:]
+    /// Where each ordinal's current run of the worker began reading, the start of the span it reports to
+    /// its store (`NativeSubtitleCueStore.noteRead`). Reset with the cursors.
+    var subtitleOCRReadStarts: [Int: Double] = [:]
 
     /// #214 follow-up: `LoadOptions.confirmAtmos` state. The ledger is the session's authority on which
     /// stream indices carry JOC, because a mid-session audio switch republishes `audioTracks` and would
@@ -3724,6 +3731,10 @@ public final class AetherEngine: ObservableObject {
     /// selection looked like it had been followed.
     var nativeSubtitleRenderingRequested = false
 
+    /// The active subtitle is shown as forced subtitles (`selectForcedSubtitleTrack`), so its native
+    /// rendition is the forced one. Any other selection or a subtitles-off clears it.
+    var forcedSubtitleSelection = false
+
     /// AE#464 round 2: the position the load currently in flight was handed, parked across the window
     /// in which `load` has already zeroed the clock but the rebuilt session has not reached it yet.
     /// Written at the two sites that raise `state = .loading` for a load, retired by an accepted seek;
@@ -3848,6 +3859,9 @@ public final class AetherEngine: ObservableObject {
     /// otherwise far segments are fetched empty and cached empty for the VOD rendition. Larger than the inline
     /// reader's 90s lead; only runs while a native rendition is selected (PiP), so the extra read is bounded.
     nonisolated static let nativeSubtitleReadAheadSeconds: Double = 300
+    /// How far behind the packet in hand a side reader claims its reading complete (`noteRead`): a subtitle
+    /// block is interleaved by its own time, which can trail the reference packet by a fraction of a second.
+    nonisolated static let nativeSubtitleReadMarginSeconds: Double = 1.0
 
     /// Source-time flush window for ASS cue batching (#56). Previously each event triggered a MainActor.run hop;
     /// on packet-dense tracks (hundreds of events in a few seconds) those hops serialised the demux loop against
@@ -4459,6 +4473,7 @@ public final class AetherEngine: ObservableObject {
         setPendingRecoverySeekTarget(nil)
         nativeSubtitleTrackTable = []
         nativeSubtitleReapplyOrdinal = nil
+        forcedSubtitleSelection = false
         nativeSubtitleTracks = []
         nativeSubtitleReaderParams = nil
         metadata = nil
@@ -8130,6 +8145,7 @@ public final class AetherEngine: ObservableObject {
         isLoadingSubtitles = false
         nativeSubtitleTrackTable = []
         nativeSubtitleReapplyOrdinal = nil
+        forcedSubtitleSelection = false
         nativeSubtitleTracks = []
         nativeSubtitleReaderParams = nil
         cancelNativeSubtitleReaders()

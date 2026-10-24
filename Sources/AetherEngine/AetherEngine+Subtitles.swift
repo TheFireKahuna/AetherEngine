@@ -44,6 +44,35 @@ extension AetherEngine {
     /// no xsub decoder, so such a track selects and then decodes to nothing; it is deliberately not
     /// claimed anywhere in the documentation.
     public func selectSubtitleTrack(index: Int) {
+        forcedSubtitleSelection = false
+        selectSubtitleTrackPublicly(index: index)
+    }
+
+    /// Show track `index` as FORCED subtitles: what plays when the viewer has chosen no subtitle, the lines
+    /// a forced track carries, or only the lines a full track flags as forced. Everything else is
+    /// `selectSubtitleTrack(index:)`: the track becomes the active one and feeds `subtitleCues` (a host
+    /// drawing its own forced lines filters them by `SubtitleCue.isForced`). What differs is the native
+    /// rendition while `setNativeSubtitleRendering(true)` holds: it is the track's forced one, declared
+    /// `FORCED=YES` under `LoadOptions.forcedSubtitleRenditions`, which AVKit leaves out of its menu, so
+    /// the menu keeps saying Off. This is the selection the AV Foundation release notes give the app: with
+    /// no subtitle chosen, the forced option that goes with the audio. Like any native pick it is filled
+    /// before it is selected. `hasForcedSubtitleRendition(forTrack:)` says whether the track has one.
+    public func selectForcedSubtitleTrack(index: Int) {
+        forcedSubtitleSelection = true
+        selectSubtitleTrackPublicly(index: index)
+    }
+
+    /// Whether `selectForcedSubtitleTrack(index:)` gives track `index` a forced native rendition: its own,
+    /// declared forced, or one made from its flagged lines. False without
+    /// `LoadOptions.forcedSubtitleRenditions` and for a track the session serves no rendition for.
+    public func hasForcedSubtitleRendition(forTrack index: Int) -> Bool {
+        guard loadedOptions.forcedSubtitleRenditions,
+              let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: index, in: nativeSubtitleTrackTable,
+                                                       forced: true) else { return false }
+        return nativeSubtitleTrackTable[ordinal].isForced
+    }
+
+    private func selectSubtitleTrackPublicly(index: Int) {
         externalSubtitleIntentGeneration &+= 1
         hostExplicitSubtitleAction = true
         selectSubtitleTrack(index: index, startAt: sourceTime)
@@ -58,7 +87,7 @@ extension AetherEngine {
             // the same call as a viewer's own choice, and the two want different answers on a
             // receiver, so the line has to name them apart before anything acts on the difference.
             EngineLog.emit("[AetherEngine] #156 native rendition re-asserted for track \(index) "
-                           + "(hostExplicit=\(hostExplicitSubtitleAction))", category: .engine)
+                           + "(hostExplicit=\(hostExplicitSubtitleAction) forced=\(forcedSubtitleSelection))", category: .engine)
             setNativeSubtitleRendering(true)
         }
     }
@@ -127,7 +156,8 @@ extension AetherEngine {
         subtitleDrainCursors[.primary] = nil
         // Phase D: a bitmap track additionally arms the OCR worker feeding its native rendition.
         // Armed BEFORE the prefetcher start so the raised lead is picked up.
-        if let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: index, in: nativeSubtitleTrackTable),
+        if let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: index, in: nativeSubtitleTrackTable,
+                                                    forced: forcedSubtitleSelection),
            nativeSubtitleTrackTable[ordinal].needsOCR {
             startSubtitleOCRWorker(ordinal: ordinal, streamIndex: Int32(index))
         }
@@ -1691,6 +1721,7 @@ extension AetherEngine {
     public func clearSubtitle() {
         externalSubtitleIntentGeneration &+= 1
         hostExplicitSubtitleAction = true
+        forcedSubtitleSelection = false
         // AE#359: subtitles off ends the rendition poll. The renditions themselves stay listed, only
         // the fetching stops, so re-selecting the track starts fresh from the current window.
         liveSubtitleFetchTask?.cancel()
@@ -2018,6 +2049,9 @@ extension AetherEngine {
         var parkLogged = false
         var timeBaseCache: [Int32: AVRational] = [:]
         var totalCues = 0
+        /// Where this run's reading began (its first packet, wherever the seek actually landed) and how far
+        /// it has got, reported to the stores as it grows (`noteRead`).
+        var readThrough: Double?
 
         readLoop: while !Task.isCancelled {
             // #240: the video path owns the link; this reader is lookahead. Same rule as the #151
@@ -2082,6 +2116,21 @@ extension AetherEngine {
                 trackedPacketFree(&p)
             }
 
+            // The reading has passed `pktSeconds`, so every routed track holds every line before it, a
+            // track with nothing to say there included (a forced one, mostly). A second of margin: a
+            // muxer interleaves a subtitle block by its own time, which can trail the packet in hand.
+            if let pktSeconds {
+                if let from = readThrough {
+                    let through = pktSeconds - Self.nativeSubtitleReadMarginSeconds
+                    if through > from {
+                        for route in routes.values { route.store.noteRead(from: from, through: through) }
+                        readThrough = through
+                    }
+                } else {
+                    readThrough = pktSeconds
+                }
+            }
+
             // #15: keep the native readers ahead of AVPlayer's ~240s subtitle prefetch burst (larger lead than
             // the inline overlay reader), so the served .vtt segments carry cues instead of being fetched empty
             // and cached empty for the VOD rendition. Only runs while a native rendition is selected (PiP).
@@ -2138,7 +2187,7 @@ extension AetherEngine {
                   self.nativeVideoSession != nil else { return }
             let position = self.sourceTime
             let readMax = self.nativeSubtitleReaderParams.flatMap { params in
-                ordinal < params.stores.count ? params.stores[ordinal].readMaxCueEnd() : nil
+                ordinal < params.stores.count ? params.stores[ordinal].readThrough(at: position) : nil
             } ?? 0
             if Self.nativeSubtitleReadersCover(
                 position: position,
@@ -2214,9 +2263,11 @@ extension AetherEngine {
             // early when the reader stops making progress (EOF / read-ahead parked) so we never wait the full
             // deadline for content with little remaining.
             var prefilledCues: Int?
+            var readPastPlayhead = false
             if let stores = nativeSubtitleReaderParams?.stores, ordinal < stores.count {
                 let store = stores[ordinal]
-                let target = currentTime + 240.0
+                let from = currentTime
+                let target = from + 240.0
                 let deadline = Date().addingTimeInterval(15.0)
                 var lastMax = 0.0
                 var stall = 0
@@ -2225,26 +2276,32 @@ extension AetherEngine {
                 // those are three different defects: the select that follows caches whatever the
                 // rendition holds at that instant, forever, so an empty exit here is a caption box
                 // with no text in it for the rest of the session.
+                //
+                // Waited on how far the track has been READ, not on its last cue's end: a forced
+                // track's cues can sit minutes behind its reading, and its pre-fill used to time out
+                // on a track that had been read to the target and simply had nothing to say there.
                 let began = Date()
                 var exit = "target"
-                while store.readMaxCueEnd() < target, Date() < deadline {
-                    let m = store.readMaxCueEnd()
+                while store.readThrough(at: from) < target, !store.isFinished, Date() < deadline {
+                    let m = store.readThrough(at: from)
                     if m > lastMax {
                         lastMax = m
                         stall = 0
                     } else if lastMax > 0 {
-                        // Only treat a flat readMax as "reader done/parked" AFTER it has started producing;
-                        // before the first cue lands (seek + demux latency) readMax is legitimately 0, and an
+                        // Only treat a flat reading as "reader done/parked" AFTER it has started producing;
+                        // before the first note lands (seek + demux latency) it is legitimately 0, and an
                         // early break would skip the pre-fill entirely (Sodalite#32 regression).
                         stall += 1
                     }
-                    if stall >= 6 { exit = "stall"; break }   // ~900ms with no new cues after producing => EOF / read-ahead parked
+                    if stall >= 6 { exit = "stall"; break }   // ~900ms with no progress => EOF / read-ahead parked
                     try? await Task.sleep(nanoseconds: 150_000_000)
                 }
-                if exit == "target", store.readMaxCueEnd() < target { exit = "deadline" }
+                let read = store.readThrough(at: from)
+                if exit == "target", read < target, !store.isFinished { exit = "deadline" }
                 let waited = Int(Date().timeIntervalSince(began) * 1000)
-                EngineLog.emit("[AetherEngine] native subtitle pre-fill done: readMax=\(String(format: "%.1f", store.readMaxCueEnd())) target=\(String(format: "%.1f", target)) cues=\(store.cueCount) exit=\(exit) waited=\(waited)ms readersRunning=\(nativeSubtitleReadersTask != nil)", category: .engine)
+                EngineLog.emit("[AetherEngine] native subtitle pre-fill done: read=\(String(format: "%.1f", read)) readMax=\(String(format: "%.1f", store.readMaxCueEnd())) target=\(String(format: "%.1f", target)) cues=\(store.cueCount) exit=\(exit) waited=\(waited)ms readersRunning=\(nativeSubtitleReadersTask != nil)", category: .engine)
                 prefilledCues = store.cueCount
+                readPastPlayhead = store.isFinished || read > from
             }
             // Sodalite#156: never hand AVKit an EMPTY rendition. The comment above says why the
             // pre-fill exists; this is the half that was missing, and without it the pre-fill is
@@ -2255,17 +2312,18 @@ extension AetherEngine {
             // `selected=Deutsch`, then an empty `subs_0_392.vtt` the receiver kept).
             //
             // Empty is not always a race. The store can be legitimately empty because the track has
-            // nothing to say here: a FORCED subtitle covers foreign dialogue only, and Sodalite
-            // selects one silently when the viewer turns subtitles off. Waiting longer would not have
-            // helped that one, and the deadline had already been paid in full.
+            // nothing to say here: a FORCED subtitle covers foreign dialogue only. That case is told
+            // apart by the reading: a track read past the playhead that holds no line there is
+            // truthfully empty, and selecting it is right (its later lines arrive as the reading
+            // does). Only a track nobody has read yet is refused.
             //
             // Refusing costs nothing that selecting would have bought: nothing is drawn either way,
             // and only the refusal can be retried. `nativeSubtitleReapplyOrdinal` is set before this
             // runs, so the readers' own re-anchor re-selects once coverage reaches the playhead.
-            if prefilledCues == 0 {
+            if prefilledCues == 0, !readPastPlayhead {
                 EngineLog.emit("[AetherEngine] native subtitle select refused: rendition ordinal=\(ordinal) "
-                               + "is empty at the playhead, and AVKit caches what it is handed. "
-                               + "Leaving it deselected; the readers' re-anchor retries once it has cues",
+                               + "is unread at the playhead, and AVKit caches what it is handed. "
+                               + "Leaving it deselected; the readers' re-anchor retries once it is read",
                                category: .engine)
                 return
             }
@@ -2308,6 +2366,8 @@ extension AetherEngine {
                                                trackLanguages: nativeSubtitleTracks.map { $0.language }),
               ordinal < nativeSubtitleTrackTable.count else { return nil }
         let entry = nativeSubtitleTrackTable[ordinal]
+        // A forced-only rendition is not a track the viewer picks; it is what shows when they pick none.
+        guard !entry.forcedCuesOnly else { return nil }
         return entry.sourceStreamIndex ?? entry.externalID
     }
 
@@ -2325,8 +2385,16 @@ extension AetherEngine {
 
     /// #88: ordinal of the table entry backing an active track id: embedded ids match
     /// sourceStreamIndex, external ids match externalID.
-    nonisolated static func nativeSubtitleOrdinal(forActiveTrack id: Int, in table: [NativeSubtitleTrackEntry]) -> Int? {
-        table.firstIndex { $0.sourceStreamIndex == id || $0.externalID == id }
+    /// `forced`: the track is shown as forced subtitles (`selectForcedSubtitleTrack`), so the rendition is
+    /// its forced one: the track's own when the track is forced, else the forced-only rendition made from
+    /// its flagged lines; nil when it has neither.
+    nonisolated static func nativeSubtitleOrdinal(forActiveTrack id: Int, in table: [NativeSubtitleTrackEntry],
+                                                  forced: Bool = false) -> Int? {
+        guard let ordinal = table.firstIndex(where: { $0.sourceStreamIndex == id || $0.externalID == id }) else {
+            return nil
+        }
+        guard forced, !table[ordinal].isForced else { return ordinal }
+        return table.firstIndex { $0.forcedCuesOnly && $0.sourceStreamIndex == id }
     }
 
     /// #266: group the load-declared external tracks into one fill job per container, so a URL
@@ -2383,21 +2451,40 @@ extension AetherEngine {
     /// a group; duplicate names made AVFoundation collapse same-language renditions into ONE
     /// legible option (device: three declared, groupOpts=2, and the second German track ended up
     /// selecting the English option through the old positional fallback). Same-language duplicates
-    /// get a numbered suffix; the forced disposition is carried for FORCED=YES.
+    /// get a numbered suffix. `declaresForced` (`LoadOptions.forcedSubtitleRenditions`) carries the forced
+    /// disposition into the master as FORCED=YES; without it no rendition is declared forced (Sodalite#38).
     nonisolated static func nativeSubtitleRenditionInfos(
-        for entries: [NativeSubtitleTrackEntry]
+        for entries: [NativeSubtitleTrackEntry], declaresForced: Bool = false
     ) -> [NativeSubtitleRenditionInfo] {
         var counts: [String: Int] = [:]
         return entries.enumerated().map { i, entry in
-            let base = entry.language.flatMap { Locale.current.localizedString(forIdentifier: $0) }
+            var base = entry.language.flatMap { Locale.current.localizedString(forIdentifier: $0) }
                 ?? "Subtitle \(i + 1)"
+            if entry.forcedCuesOnly { base += " (Forced)" }
             let n = (counts[base] ?? 0) + 1
             counts[base] = n
             return NativeSubtitleRenditionInfo(
                 language: entry.language,
                 name: n == 1 ? base : "\(base) \(n)",
-                isForced: entry.isForced
+                isForced: declaresForced && entry.isForced
             )
+        }
+    }
+
+    /// `LoadOptions.forcedSubtitleRenditions`: a forced-only rendition for each embedded bitmap track that
+    /// is not itself forced. Such a track carries its forced lines as flagged display sets inside the full
+    /// track, the usual Blu-ray arrangement, and the rendition holds just those (the OCR worker drops the
+    /// rest). A track with no flagged lines yields an empty rendition, which nothing shows. External .sup
+    /// tracks are left out: their store is filled from the overlay's whole-file decode, not by the worker.
+    nonisolated static func forcedCueSubtitleEntries(
+        for bitmapEntries: [NativeSubtitleTrackEntry]
+    ) -> [NativeSubtitleTrackEntry] {
+        bitmapEntries.filter { !$0.isForced && $0.sourceStreamIndex != nil }.map { entry in
+            NativeSubtitleTrackEntry(sourceStreamIndex: entry.sourceStreamIndex,
+                                     language: entry.language,
+                                     isForced: true,
+                                     needsOCR: true,
+                                     forcedCuesOnly: true)
         }
     }
 
@@ -2438,7 +2525,8 @@ extension AetherEngine {
             return
         }
         guard active, let activeIdx = activeSubtitleTrackIndex,
-              let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: activeIdx, in: nativeSubtitleTrackTable)
+              let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: activeIdx, in: nativeSubtitleTrackTable,
+                                                       forced: forcedSubtitleSelection)
         else {
             setNativeSubtitleSelected(track: nil)
             return
@@ -2454,7 +2542,8 @@ extension AetherEngine {
     func currentReapplyOrdinalMatchesActiveTrack() -> Bool {
         guard let ordinal = nativeSubtitleReapplyOrdinal,
               let active = activeSubtitleTrackIndex else { return false }
-        return Self.nativeSubtitleOrdinal(forActiveTrack: active, in: nativeSubtitleTrackTable) == ordinal
+        return Self.nativeSubtitleOrdinal(forActiveTrack: active, in: nativeSubtitleTrackTable,
+                                          forced: forcedSubtitleSelection) == ordinal
     }
 
     /// #170: snapshot the subtitle session state a from-scratch `load()` would wipe. Taken by
@@ -2477,6 +2566,7 @@ extension AetherEngine {
             ? loadedSecondarySidecarURL : nil
         carryover.nativeReapplyOrdinal = nativeSubtitleReapplyOrdinal
         carryover.reapplyOrdinalMatchesActiveTrack = currentReapplyOrdinalMatchesActiveTrack()
+        carryover.forcedSubtitleSelection = forcedSubtitleSelection
         return carryover
     }
 
@@ -2515,6 +2605,8 @@ extension AetherEngine {
             postLoadSubtitleActive: isSubtitleActive
         ) {
         case .reselect(let index):
+            forcedSubtitleSelection = carryover.forcedSubtitleSelection
+                && index == carryover.activeSubtitleTrackIndex
             selectSubtitleTrack(index: index, startAt: startAt)
         case .sidecar(let url):
             startSidecarDecode(url: url, httpHeaders: nil, externalTrackID: nil)
@@ -2536,7 +2628,8 @@ extension AetherEngine {
             matchesActiveTrack: carryover.reapplyOrdinalMatchesActiveTrack,
             previousActiveTrack: carryover.activeSubtitleTrackIndex,
             currentOrdinal: nativeSubtitleReapplyOrdinal,
-            table: nativeSubtitleTrackTable
+            table: nativeSubtitleTrackTable,
+            forced: forcedSubtitleSelection
         ) {
             EngineLog.emit(
                 "[AetherEngine] #170 re-applying native subtitle ordinal=\(ordinal) after session-preserving reload",

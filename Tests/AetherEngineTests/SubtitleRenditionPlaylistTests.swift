@@ -131,17 +131,24 @@ struct SubtitleRenditionPlaylistTests {
         #expect(!m.contains("FORCED"))
     }
 
-    @Test("a source-forced rendition is NOT emitted FORCED=YES (host owns fullscreen subs)")
+    @Test("a source-forced rendition is NOT emitted FORCED=YES without the option (host owns fullscreen subs)")
     func masterForcedAttribute() {
         // AVKit force-displays a FORCED rendition matching the audio language regardless of
         // DEFAULT/AUTOSELECT and the CC-off preference, self-engaging a rendition the overlay owns
         // (Sodalite#38 follow-on: forced German track shown on German audio with subtitles off). The
-        // forced/full pair stays disambiguated by NAME, so neither carries FORCED=YES.
-        let provider = MasterMockProvider(renditions: [(0, "ger", "Deutsch", true),
-                                                       (1, "ger", "Deutsch 2", false)])
+        // forced/full pair stays disambiguated by NAME, so neither carries FORCED=YES. The disposition is
+        // dropped where the rendition infos are built, unless `LoadOptions.forcedSubtitleRenditions` asks
+        // for it (ForcedSubtitleRenditionTests).
+        let infos = AetherEngine.nativeSubtitleRenditionInfos(for: [
+            .init(sourceStreamIndex: 2, language: "ger", isForced: true),
+            .init(sourceStreamIndex: 3, language: "ger", isForced: false),
+        ])
+        let provider = MasterMockProvider(renditions: infos.enumerated().map {
+            ($0.offset, $0.element.language, $0.element.name, $0.element.isForced)
+        })
         let m = HLSLocalServer.buildMasterPlaylistText(provider: provider)
-        #expect(m.contains("NAME=\"Deutsch\",LANGUAGE=\"ger\",DEFAULT=NO,AUTOSELECT=NO,URI=\"subs_0.m3u8\""))
-        #expect(m.contains("NAME=\"Deutsch 2\",LANGUAGE=\"ger\",DEFAULT=NO,AUTOSELECT=NO,URI=\"subs_1.m3u8\""))
+        #expect(m.contains("LANGUAGE=\"ger\",DEFAULT=NO,AUTOSELECT=NO,URI=\"subs_0.m3u8\""))
+        #expect(m.contains("LANGUAGE=\"ger\",DEFAULT=NO,AUTOSELECT=NO,URI=\"subs_1.m3u8\""))
         #expect(!m.contains("FORCED"))
     }
 

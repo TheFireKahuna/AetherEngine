@@ -13,7 +13,10 @@ extension AetherEngine {
         subtitleOCRArmedOrdinal = ordinal
         let language = ordinal < nativeSubtitleTrackTable.count
             ? nativeSubtitleTrackTable[ordinal].language : nil
-        EngineLog.emit("[SubtitleOCR] worker armed: ordinal=\(ordinal) stream=\(streamIndex)", category: .engine)
+        // A forced-only rendition (`LoadOptions.forcedSubtitleRenditions`) keeps just the compositions the
+        // track flags as forced, dropped before recognition so the rest costs no OCR.
+        let forcedOnly = ordinal < nativeSubtitleTrackTable.count && nativeSubtitleTrackTable[ordinal].forcedCuesOnly
+        EngineLog.emit("[SubtitleOCR] worker armed: ordinal=\(ordinal) stream=\(streamIndex) forcedOnly=\(forcedOnly)", category: .engine)
         subtitleOCRWorkerTask = BlockingWork.detached(priority: .utility) { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -24,11 +27,12 @@ extension AetherEngine {
                     return self.subtitleOCRPlanTick(ordinal: ordinal, streamIndex: streamIndex)
                 }
                 let decoded = planned?.decodeHandoff.decode().first ?? []
-                let batch = await MainActor.run { [weak self] in
-                    guard !Task.isCancelled, let self, let planned else { return [SubtitleCue]() }
-                    let batch = self.subtitleOCRFinishTick(planned, events: decoded)
+                let (batch, read) = await MainActor.run { [weak self] () -> ([SubtitleCue], (from: Double, through: Double)?) in
+                    guard !Task.isCancelled, let self, let planned else { return ([], nil) }
+                    var batch = self.subtitleOCRFinishTick(planned, events: decoded)
+                    if forcedOnly { batch = batch.filter(\.isForced) }
                     self.subtitleOCRBatchInFlight = !batch.isEmpty
-                    return batch
+                    return (batch, self.subtitleOCRReadSpan(planned))
                 }
                 if !batch.isEmpty {
                     await SubtitleImageOCR.appendRecognized(cues: batch, language: language, to: store)
@@ -36,6 +40,9 @@ extension AetherEngine {
                         if !Task.isCancelled { self.subtitleOCRBatchInFlight = false }
                     }
                 }
+                // Only once its lines are in the store: the reading is what the pre-fill and the segment
+                // server take as proof that a stretch with no line in it truly has none.
+                if let read, !Task.isCancelled { store.noteRead(from: read.from, through: read.through) }
                 try? await Task.sleep(nanoseconds: AetherEngine.subtitleDrainTickNanoseconds)
             }
         }
@@ -46,6 +53,7 @@ extension AetherEngine {
         if subtitleOCRBatchInFlight, let ordinal = subtitleOCRArmedOrdinal {
             subtitleOCRCursors.removeValue(forKey: ordinal)
             subtitleOCRPendingStates.removeValue(forKey: ordinal)
+            subtitleOCRReadStarts.removeValue(forKey: ordinal)
         }
         subtitleOCRBatchInFlight = false
         subtitleOCRArmedOrdinal = nil
@@ -62,6 +70,7 @@ extension AetherEngine {
         cancelSubtitleOCRWorker()
         subtitleOCRCursors.removeAll()
         subtitleOCRPendingStates.removeAll()
+        subtitleOCRReadStarts.removeAll()
     }
 
     /// MainActor half before the decode: plan the window (drainer pacing, larger lead) and pick the
@@ -110,7 +119,31 @@ extension AetherEngine {
             count: entries.count, cap: Self.subtitleOCRMaxPacketsPerTick,
             ptsAt: { entries[$0].ptsSeconds })
         return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, plan: plan, window: window,
-                                   decoder: decoder, batch: entries[..<batchEnd])
+                                   decoder: decoder, batch: entries[..<batchEnd],
+                                   windowComplete: batchEnd == entries.count)
+    }
+
+    /// The stretch a finished tick has read for its rendition: from where this run of the worker began
+    /// through the end of what it decoded, cut back to where the harvest's own reading stops (a packet
+    /// not yet harvested is a line not yet seen) and to the earliest composition still open (its line
+    /// reaches the store only when its end is known). Nil for a tick that read nothing or was dropped.
+    fileprivate func subtitleOCRReadSpan(_ tick: SubtitleOCRTickPlan) -> (from: Double, through: Double)? {
+        let ordinal = tick.ordinal
+        guard let decoder = tick.decoder, subtitleOCRArmedOrdinal == ordinal, subtitleOCRDecoder === decoder,
+              let packetStore = activeSubtitlePacketStore else { return nil }
+        let isReset: Bool
+        switch tick.plan {
+        case .idle: return nil
+        case .decode: isReset = false
+        case .resetAndDecode: isReset = true
+        }
+        if isReset || subtitleOCRReadStarts[ordinal] == nil { subtitleOCRReadStarts[ordinal] = tick.window.from }
+        guard let start = subtitleOCRReadStarts[ordinal],
+              let reach = packetStore.harvestReach(from: tick.window.from) else { return nil }
+        var through = min(tick.window.through, reach)
+        if !tick.windowComplete, let last = tick.batch.last?.ptsSeconds { through = min(through, last) }
+        if let open = subtitleOCRPendingStates[ordinal]?.earliestPendingStart { through = min(through, open) }
+        return through > start ? (start, through) : nil
     }
 
     /// MainActor half after the decode: resolve composition ends and return the CLOSED cues. A
@@ -172,6 +205,8 @@ fileprivate struct SubtitleOCRTickPlan: @unchecked Sendable {
     let window: (from: Double, through: Double)
     let decoder: EmbeddedSubtitleDecoder?
     let batch: ArraySlice<StoredSubtitlePacket>
+    /// The batch is every stored packet in the window (the per-tick cap did not cut it).
+    var windowComplete = false
 
     var decodeHandoff: SubtitleDrainDecodeHandoff {
         SubtitleDrainDecodeHandoff(jobs: decoder.map { [($0, batch)] } ?? [])

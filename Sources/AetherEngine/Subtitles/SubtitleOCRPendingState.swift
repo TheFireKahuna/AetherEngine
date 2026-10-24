@@ -28,6 +28,9 @@ struct SubtitleOCRPendingState: Sendable {
         return closed
     }
 
+    /// The earliest composition still waiting for its end. Nothing from it on has reached the store yet.
+    var earliestPendingStart: Double? { pending.map(\.startTime).min() }
+
     /// End-of-stream path: emit pending compositions whose own end lies more than the margin
     /// behind the playhead with no successor event having closed them.
     mutating func expired(asOf playhead: Double) -> [SubtitleCue] {

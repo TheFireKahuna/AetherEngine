@@ -172,6 +172,14 @@ final class SubtitlePacketStore: @unchecked Sendable {
         return coverage.isEmpty || coverage.covers(from: from, through: through)
     }
 
+    /// #416: how far the harvest has read on unbroken from `from`; nil when nothing was ever noted or
+    /// `from` was never read. Unlike `hasReadSpan`, ignorance answers nil here: the caller turns the answer
+    /// into a claim that a track holds no line in that stretch, and that claim needs a reading behind it.
+    func harvestReach(from: Double) -> Double? {
+        lock.lock(); defer { lock.unlock() }
+        return coverage.reach(from: from)
+    }
+
     /// Introspection for tests and diagnostics.
     var harvestCoverageSpans: [SubtitleHarvestCoverage.Span] {
         lock.lock(); defer { lock.unlock() }

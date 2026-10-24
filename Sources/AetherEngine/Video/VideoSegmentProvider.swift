@@ -4,8 +4,9 @@ import Foundation
 
 /// Per-rendition master-playlist metadata (#15): NAME must be unique within the subtitle group
 /// (HLS requirement; duplicates make AVFoundation collapse same-language renditions into one
-/// legible option), FORCED carries the container disposition into EXT-X-MEDIA. Built once at load
-/// by `AetherEngine.nativeSubtitleRenditionInfos(for:)`.
+/// legible option). `isForced` is the rendition declared FORCED=YES, which happens only under
+/// `LoadOptions.forcedSubtitleRenditions`. Built once at load by
+/// `AetherEngine.nativeSubtitleRenditionInfos(for:declaresForced:)`.
 struct NativeSubtitleRenditionInfo: Sendable, Equatable {
     let language: String?
     let name: String
@@ -3125,16 +3126,18 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // that never finishes serialized the loopback connection AVPlayer also uses for video (device:
         // scrubbing wedged while a rendition was selected). Wait only while the reader is plausibly about to
         // cover THIS window (read head within the horizon, or still warming up), and only briefly.
+        // Measured on how far the track has been READ, not on its last cue: a sparse (forced) track's last
+        // cue can trail its reading by minutes, and waiting on the cue made every one of its windows wait.
         let horizonSeconds = 30.0
         let deadline = Date().addingTimeInterval(3.0)
         while !store.isFinished,
-              store.readMaxCueEnd() < end,
-              end <= store.readMaxCueEnd() + horizonSeconds || store.readMaxCueEnd() <= 0,
+              store.readThrough(at: start) < end,
+              end <= store.readThrough(at: start) + horizonSeconds || store.readThrough(at: start) <= 0,
               Date() < deadline {
             usleep(100_000)
         }
         let cues = stripMarkupIfNeeded(store.cuesInWindow(start: start, end: end))
-        EngineLog.emit("[HLSVideoEngine] subtitle .vtt ord=\(ordinal) seg=\(segmentIndex) win=[\(String(format: "%.1f", start)),\(String(format: "%.1f", end))) inWin=\(cues.count) readMax=\(String(format: "%.1f", store.readMaxCueEnd()))", category: .hlsServer, level: .verbose)
+        EngineLog.emit("[HLSVideoEngine] subtitle .vtt ord=\(ordinal) seg=\(segmentIndex) win=[\(String(format: "%.1f", start)),\(String(format: "%.1f", end))) inWin=\(cues.count) read=\(String(format: "%.1f", store.readThrough(at: start)))", category: .hlsServer, level: .verbose)
         // Absolute media-timeline cue times + MPEGTS:0 identity map. Flip to segment-relative here (one line:
         // relativeToStart: true) if on-device PiP shows subtitles shifted by the segment start. See WebVTTBuilder.segment.
         return WebVTTBuilder.segment(cues: cues, segmentStart: start)
