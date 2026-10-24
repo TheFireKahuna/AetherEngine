@@ -346,7 +346,7 @@ public struct DisplayCapabilities: Sendable, Equatable {
 
 /// Output cadence of the software-decode path's deinterlacer (interlaced MPEG-2 / VC-1 / MPEG-4, and
 /// interlaced H.264, which routes software because AVPlayer does not deinterlace, #107 /
-/// `VideoRoutingPolicy`): yadif_videotoolbox, a Metal kernel over the display buffers.
+/// `VideoRoutingPolicy`): FFmpeg's bwdif, computed on the GPU ahead of the finisher.
 public enum DeinterlaceFieldRate: String, Sendable, Equatable {
     /// One output frame per FIELD (25i -> 50p, 29.97i -> 59.94p): full temporal resolution,
     /// smoother motion. The default.

@@ -3,7 +3,7 @@ import AetherLibavutil
 
 /// Pure codec-and-field-order routing decision extracted from AetherEngine.load's dispatch so it is
 /// unit-testable. Native carries HEVC, H.264 and HW-decodable AV1; every other video codec is
-/// software. The #107 rule sits on top: interlaced H.264 goes software too, so DeinterlaceFilter
+/// software. The #107 rule sits on top: interlaced H.264 goes software too, so the bwdif deinterlacer
 /// can deinterlace it. tvOS AVPlayer does not deinterlace, so 1080i broadcast otherwise combs.
 enum VideoRoutingPolicy {
 

@@ -4009,7 +4009,6 @@ public final class AetherEngine: ObservableObject {
         FFmpegLogBridge.install()
         // Which FFmpeg answers is decided by the host's link, not by the package graph (AE#396).
         FFmpegRuntimeCheck.logOnce()
-        _ = DeinterlaceHardwareWarmup.shared
 
         // Declare category + multichannel support but do NOT activate the session here.
         //
@@ -5329,7 +5328,7 @@ public final class AetherEngine: ObservableObject {
         //    - MPEG-4 Part 2, MPEG-2, VC-1: not in the HLS Authoring Spec CODECS list; libavcodec handles all.
         //    - qtrle and the rest of the QuickTime long tail: same reason, whatever libavcodec was
         //      built with decodes them.
-        // #107: interlaced H.264 joins MPEG-2/VC-1 on the software path so DeinterlaceFilter
+        // #107: interlaced H.264 joins MPEG-2/VC-1 on the software path so the bwdif deinterlacer
         // can deinterlace it; tvOS AVPlayer does not. Decision is pure and unit-tested in
         // VideoRoutingPolicyTests. deint=interlaced passes progressive frames through untouched, so a
         // mis-signalled progressive stream only pays an unnecessary SW decode, never a wrong deinterlace.

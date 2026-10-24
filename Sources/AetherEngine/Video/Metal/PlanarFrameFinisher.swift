@@ -80,9 +80,10 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         }
     }
 
-    /// Byte offsets and linesizes of a picture's planes inside a slab.
+    /// Byte offsets and linesizes of a picture's planes inside one buffer (a decoder's slab, or the deinterlacer's
+    /// scratch).
     struct Planes {
-        var slab: DecodeFrameAllocator.Slab
+        var buffer: MTLBuffer
         var offsets: [UInt32]
         var linesizes: [UInt32]
     }
@@ -255,7 +256,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
             offsets[i] = UInt32(offset)
             linesizes[i] = UInt32(sizes[i])
         }
-        return Planes(slab: slab, offsets: offsets, linesizes: linesizes)
+        return Planes(buffer: slab.buffer, offsets: offsets, linesizes: linesizes)
     }
 
     // MARK: - Metal
@@ -331,25 +332,248 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     /// format) and waits for the GPU. False when the planes break the plan's alignment, a texture cannot be made
     /// for the buffer, or the GPU reports an error.
     func finish(_ planes: Planes, plan: Plan, width: Int, height: Int, into buffer: CVPixelBuffer) -> Bool {
+        finish([Job(source: .picture(planes), plan: plan, width: width, height: height, buffer: buffer)])
+    }
+
+    // MARK: - Deinterlacing
+
+    /// One output field of the deinterlacer: bwdif over three decoded pictures (FFmpeg's previous, current and next),
+    /// written at the source's depth into a planar scratch picture the job's plan then reads. ``BwdifWindow`` says
+    /// which pictures and parities each field takes.
+    struct Field {
+        var prev: Planes
+        var cur: Planes
+        var next: Planes
+        /// Rows with `(y ^ parity) & 1` are interpolated; the others are the current field's.
+        var parity: UInt32
+        /// vf_bwdif's `parity ^ tff`: which neighbours stand in for the missing field.
+        var fieldParity: UInt32
+        /// The stream's first or last field: interpolated from the current field alone.
+        var intra: Bool
+        /// The decoded pictures' layout (``readerPlan(source:)``).
+        var reader: Plan
+    }
+
+    /// A picture, or a field of three, written into a display buffer with `plan`. A field's plan is the one for its
+    /// scratch picture: the source's planar equivalent (``planarEquivalent(of:)``), progressive.
+    struct Job {
+        enum Source { case picture(Planes), field(Field) }
+        var source: Source
+        var plan: Plan
+        var width: Int
+        var height: Int
+        var buffer: CVPixelBuffer
+    }
+
+    /// The layout of the decoded pictures, for the deinterlacer's reads: the same function constants the finisher's
+    /// reader takes. Nil for a format the deinterlacer does not take (RGB, palette, bitstream).
+    static func readerPlan(source: AVPixelFormat) -> Plan? {
+        guard reads(source), let desc = av_pix_fmt_desc_get(source)?.pointee,
+              desc.flags & (UInt64(AV_PIX_FMT_FLAG_RGB) | UInt64(AV_PIX_FMT_FLAG_PAL) | UInt64(AV_PIX_FMT_FLAG_BITSTREAM)) == 0
+        else { return nil }
+        let comps = components(desc)
+        let gray = desc.nb_components < 3
+        var alignment = [1, 1, 1, 1]
+        for c in comps.prefix(gray ? 1 : 3) {
+            let bits = Int(c.shift + c.depth)
+            alignment[Int(c.plane)] = max(alignment[Int(c.plane)], bits <= 8 ? 1 : (bits <= 16 ? 2 : 4))
+        }
+        let log2 = [UInt32(desc.log2_chroma_w), UInt32(desc.log2_chroma_h)]
+        return Plan(mode: gray ? .gray : .pack, outputLog2: log2, sourceLog2: log2,
+                    components: comps.prefix(3).map { [UInt32($0.plane), UInt32($0.step), UInt32($0.offset), UInt32($0.shift), UInt32($0.depth)] },
+                    bigEndian: desc.flags & UInt64(AV_PIX_FMT_FLAG_BE) != 0, bitstream: false, palette: false, fullRange: false,
+                    targetBits: 16, fractionBits: 0, containerShift: 0, chromaLocation: 0, wideOutput: true,
+                    matrix: 0, bitDepthRGB: 0, transfer: 0, lumaTable: [], rows: [Float](repeating: 0, count: 48),
+                    cl: [Float](repeating: 0, count: 16), tp: [Float](repeating: 0, count: 16), tieBound: 0,
+                    planeAlignment: alignment)
+    }
+
+    /// The planar little-endian format holding `source`'s components at their depths and subsampling, which is what
+    /// the deinterlacer writes (bwdif is defined on planes). Nil when FFmpeg names no such format (4:1:1 above 8 bits)
+    /// or the deinterlacer does not take the source.
+    static func planarEquivalent(of source: AVPixelFormat) -> AVPixelFormat? {
+        guard readerPlan(source: source) != nil, let want = av_pix_fmt_desc_get(source)?.pointee else { return nil }
+        let wantComps = components(want)
+        let count = want.nb_components < 3 ? 1 : 3
+        let refused = UInt64(AV_PIX_FMT_FLAG_BE) | UInt64(AV_PIX_FMT_FLAG_RGB) | UInt64(AV_PIX_FMT_FLAG_PAL)
+            | UInt64(AV_PIX_FMT_FLAG_HWACCEL) | UInt64(AV_PIX_FMT_FLAG_BITSTREAM) | UInt64(AV_PIX_FMT_FLAG_ALPHA)
+            | UInt64(AV_PIX_FMT_FLAG_FLOAT) | UInt64(AV_PIX_FMT_FLAG_BAYER) | UInt64(AV_PIX_FMT_FLAG_XYZ)
+        var cursor: UnsafePointer<AVPixFmtDescriptor>?
+        while let next = av_pix_fmt_desc_next(cursor) {
+            cursor = next
+            let d = next.pointee
+            guard Int(d.nb_components) == count, d.flags & refused == 0,
+                  count == 1 || d.flags & UInt64(AV_PIX_FMT_FLAG_PLANAR) != 0,
+                  d.log2_chroma_w == want.log2_chroma_w, d.log2_chroma_h == want.log2_chroma_h,
+                  // The yuvj formats only restate a range the frame carries anyway.
+                  !String(cString: d.name).hasPrefix("yuvj") else { continue }
+            let comps = components(d)
+            let matches = (0..<count).allSatisfy { i in
+                let c = comps[i], w = wantComps[i]
+                return c.plane == i && c.offset == 0 && c.shift == 0 && c.depth == w.depth && c.step == (w.depth > 8 ? 2 : 1)
+            }
+            if matches { return av_pix_fmt_desc_get_id(next) }
+        }
+        return nil
+    }
+
+    /// The scratch picture for a `width` x `height` field of `reader`'s layout: planes 0...2 (0 alone for grey),
+    /// one byte a sample up to 8 bits and two above, every plane and row 64-byte aligned.
+    static func scratchLayout(reader: Plan, width: Int, height: Int) -> (offsets: [UInt32], linesizes: [UInt32], length: Int) {
+        var offsets = [UInt32](repeating: 0, count: 4), linesizes = [UInt32](repeating: 0, count: 4)
+        var length = 0
+        for c in 0..<(reader.mode == .gray ? 1 : 3) {
+            let (w, h) = componentSize(reader: reader, component: c, width: width, height: height)
+            let bytes = reader.components[c][4] > 8 ? 2 : 1
+            let linesize = (w * bytes + 63) & ~63
+            offsets[c] = UInt32(length)
+            linesizes[c] = UInt32(linesize)
+            length += (linesize * h + 63) & ~63
+        }
+        return (offsets, linesizes, max(length, 64))
+    }
+
+    private static func componentSize(reader: Plan, component c: Int, width: Int, height: Int) -> (Int, Int) {
+        guard c > 0 else { return (width, height) }
+        let sw = Int(reader.sourceLog2[0]), sh = Int(reader.sourceLog2[1])
+        return ((width + (1 << sw) - 1) >> sw, (height + (1 << sh) - 1) >> sh)
+    }
+
+    /// Scratch pictures, one per field of a submission, grown to the largest field seen and kept.
+    private var scratch: [MTLBuffer] = []
+
+    private func scratchBuffer(_ index: Int, length: Int) -> MTLBuffer? {
+        while scratch.count <= index {
+            guard let made = device.makeBuffer(length: length, options: .storageModeShared) else { return nil }
+            scratch.append(made)
+        }
+        if scratch[index].length < length {
+            guard let made = device.makeBuffer(length: length, options: .storageModeShared) else { return nil }
+            scratch[index] = made
+        }
+        return scratch[index]
+    }
+
+    /// The deinterlaced planes of `field` alone, at the source's depth, as the scratch holds them: the test hook that
+    /// compares this stage with libavfilter's bwdif.
+    func deinterlace(_ field: Field, width: Int, height: Int) -> (planes: Planes, bytes: UnsafeRawBufferPointer)? {
+        guard let commands = queue.makeCommandBuffer(), let encoder = commands.makeComputeCommandEncoder(),
+              let planes = encodeField(field, width: width, height: height, scratchIndex: 0, encoder: encoder)
+        else { return nil }
+        encoder.endEncoding()
+        commands.commit()
+        commands.waitUntilCompleted()
+        guard commands.status == .completed else { return nil }
+        return (planes, UnsafeRawBufferPointer(start: planes.buffer.contents(), count: planes.buffer.length))
+    }
+
+    /// Encodes `field`'s bwdif dispatches, one per component, and returns the scratch picture they write.
+    private func encodeField(_ field: Field, width: Int, height: Int, scratchIndex: Int,
+                             encoder: MTLComputeCommandEncoder) -> Planes? {
+        for picture in [field.prev, field.cur, field.next] {
+            for p in 0..<4 where field.reader.planeAlignment[p] > 1 {
+                guard picture.offsets[p] % UInt32(field.reader.planeAlignment[p]) == 0,
+                      picture.linesizes[p] % UInt32(field.reader.planeAlignment[p]) == 0 else { return nil }
+            }
+        }
+        let layout = Self.scratchLayout(reader: field.reader, width: width, height: height)
+        guard let out = scratchBuffer(scratchIndex, length: layout.length),
+              let pipeline = try? pipeline(for: field.reader, function: "pf_bwdif") else { return nil }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(field.prev.buffer, offset: 0, index: 0)
+        encoder.setBuffer(field.cur.buffer, offset: 0, index: 5)
+        encoder.setBuffer(field.next.buffer, offset: 0, index: 6)
+        encoder.setBuffer(out, offset: 0, index: 7)
+        let w = pipeline.threadExecutionWidth
+        let group = MTLSize(width: w, height: max(1, pipeline.maxTotalThreadsPerThreadgroup / w), depth: 1)
+        for c in 0..<(field.reader.mode == .gray ? 1 : 3) {
+            let (cw, ch) = Self.componentSize(reader: field.reader, component: c, width: width, height: height)
+            let depth = field.reader.components[c][4]
+            // PFBwdif: three PFPictures (offsets, linesizes), then the component's values.
+            var words: [UInt32] = []
+            for picture in [field.prev, field.cur, field.next] { words += picture.offsets + picture.linesizes }
+            words += [UInt32(cw), UInt32(ch), UInt32(c), field.parity, field.fieldParity, field.intra ? 1 : 0,
+                      (1 << depth) - 1, layout.offsets[c], layout.linesizes[c], depth > 8 ? 1 : 0]
+            words.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }
+            // One thread per four columns of a row pair.
+            encoder.dispatchThreads(MTLSize(width: (cw + 3) / 4, height: (ch + 1) / 2, depth: 1), threadsPerThreadgroup: group)
+        }
+        return Planes(buffer: out, offsets: layout.offsets, linesizes: layout.linesizes)
+    }
+
+    // MARK: - Submission
+
+    /// Writes every job and waits for the GPU once. The deinterlacer's dispatches of all the fields run together,
+    /// then, after one barrier, the finisher's dispatches of all the jobs: one command buffer, one wait, the GPU
+    /// filled by the work of both fields of a frame. A constant-luminance job, whose second and third dispatches read
+    /// the first's list, gets a command buffer of its own. False when any job fails.
+    func finish(_ jobs: [Job]) -> Bool {
+        var ok = true
+        let together = jobs.filter { !usesList($0.plan) }
+        if !together.isEmpty { ok = run(together, concurrent: true) && ok }
+        for job in jobs where usesList(job.plan) { ok = run([job], concurrent: false) && ok }
+        return ok
+    }
+
+    /// Codes above 12 bits go straight to the exact path in the kernel (PF_EXACT_ONLY): no list, no second pass.
+    private func usesList(_ plan: Plan) -> Bool { plan.mode == .constantLuminance && plan.components[0][4] <= 12 }
+
+    private func run(_ jobs: [Job], concurrent: Bool) -> Bool {
+        guard let commands = queue.makeCommandBuffer(),
+              let encoder = commands.makeComputeCommandEncoder(dispatchType: concurrent ? .concurrent : .serial)
+        else { return false }
+        var sources: [Planes] = []
+        var fields = 0
+        for job in jobs {
+            switch job.source {
+            case .picture(let planes):
+                sources.append(planes)
+            case .field(let field):
+                guard let planes = encodeField(field, width: job.width, height: job.height, scratchIndex: fields, encoder: encoder) else {
+                    encoder.endEncoding()
+                    return false
+                }
+                fields += 1
+                sources.append(planes)
+            }
+        }
+        if fields > 0 { encoder.memoryBarrier(scope: .buffers) }
+        var textures: [CVMetalTexture] = []
+        for (job, planes) in zip(jobs, sources) {
+            guard let made = encodeFinish(planes, plan: job.plan, width: job.width, height: job.height, into: job.buffer,
+                                          encoder: encoder) else {
+                encoder.endEncoding()
+                return false
+            }
+            textures += made
+        }
+        encoder.endEncoding()
+        commands.commit()
+        commands.waitUntilCompleted()
+        withExtendedLifetime((textures, sources.map(\.buffer))) {}
+        return commands.status == .completed
+    }
+
+    /// Encodes one picture's finishing dispatches; returns the buffer's textures, which must outlive the work.
+    private func encodeFinish(_ planes: Planes, plan: Plan, width: Int, height: Int, into buffer: CVPixelBuffer,
+                              encoder: MTLComputeCommandEncoder) -> [CVMetalTexture]? {
         for p in 0..<4 where plan.planeAlignment[p] > 1 {
             guard planes.offsets[p] % UInt32(plan.planeAlignment[p]) == 0,
-                  planes.linesizes[p] % UInt32(plan.planeAlignment[p]) == 0 else { return false }
+                  planes.linesizes[p] % UInt32(plan.planeAlignment[p]) == 0 else { return nil }
         }
         let wide = plan.wideOutput
         guard let pipeline = try? pipeline(for: plan),
               let luma = texture(buffer, plane: 0, format: wide ? .r16Uint : .r8Uint),
               let chroma = texture(buffer, plane: 1, format: wide ? .rg16Uint : .rg8Uint),
-              let lumaTexture = CVMetalTextureGetTexture(luma), let chromaTexture = CVMetalTextureGetTexture(chroma),
-              let commands = queue.makeCommandBuffer(), let encoder = commands.makeComputeCommandEncoder()
-        else { return false }
+              let lumaTexture = CVMetalTextureGetTexture(luma), let chromaTexture = CVMetalTextureGetTexture(chroma)
+        else { return nil }
 
-        // Codes above 12 bits go straight to the exact path in the kernel (PF_EXACT_ONLY): no list, no second pass.
-        let constantLuminance = plan.mode == .constantLuminance && plan.components[0][4] <= 12
+        let constantLuminance = usesList(plan)
         let capacity = width * height
         if constantLuminance, (flagged?.length ?? 0) < 4 * (capacity + 1) {
             flagged = device.makeBuffer(length: 4 * (capacity + 1), options: .storageModeShared)
         }
-        guard let list = constantLuminance ? flagged : (flagged ?? dispatchArguments) else { return false }
+        guard let list = constantLuminance ? flagged : (flagged ?? dispatchArguments) else { return nil }
         if constantLuminance { list.contents().storeBytes(of: UInt32(0), as: UInt32.self) }
 
         // PFFrame: twelve 32-bit words, then the double-float rows, constant-luminance and transfer constants (float2,
@@ -361,13 +585,13 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         withUnsafeBytes(of: UInt32(constantLuminance ? capacity : 0)) { frame.append(contentsOf: $0) }
 
         encoder.setComputePipelineState(pipeline)
-        encoder.setBuffer(planes.slab.buffer, offset: 0, index: 0)
+        encoder.setBuffer(planes.buffer, offset: 0, index: 0)
         frame.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }
         encoder.setBuffer(list, offset: 0, index: 2)
         if !plan.lumaTable.isEmpty {
             if lumaTable?.values != plan.lumaTable {
                 guard let made = device.makeBuffer(bytes: plan.lumaTable, length: 4 * plan.lumaTable.count, options: .storageModeShared)
-                else { encoder.endEncoding(); return false }
+                else { return nil }
                 lumaTable = (plan.lumaTable, made)
             }
             encoder.setBuffer(lumaTable!.buffer, offset: 0, index: 4)
@@ -386,12 +610,9 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         encoder.dispatchThreads(grid, threadsPerThreadgroup: MTLSize(width: w, height: max(1, pipeline.maxTotalThreadsPerThreadgroup / w), depth: 1))
         if constantLuminance {
             // The flagged pixels, sized on the GPU: one thread turns the count into indirect arguments, then each
-            // flagged pixel is recomputed in double-float. Dispatches in one encoder run in order.
+            // flagged pixel is recomputed in double-float. This job's encoder is serial, so the dispatches run in order.
             guard let prepare = try? self.pipeline(for: plan, function: "pf_cl_prepare"),
-                  let correct = try? self.pipeline(for: plan, function: "pf_cl_correct") else {
-                encoder.endEncoding()
-                return false
-            }
+                  let correct = try? self.pipeline(for: plan, function: "pf_cl_correct") else { return nil }
             encoder.setComputePipelineState(prepare)
             encoder.setBuffer(dispatchArguments, offset: 0, index: 3)
             encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
@@ -400,11 +621,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
             encoder.dispatchThreadgroups(indirectBuffer: dispatchArguments, indirectBufferOffset: 0,
                                          threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         }
-        encoder.endEncoding()
-        commands.commit()
-        commands.waitUntilCompleted()
-        withExtendedLifetime((luma, chroma, planes.slab)) {}
-        return commands.status == .completed
+        return [luma, chroma]
     }
 
     private func texture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat) -> CVMetalTexture? {

@@ -10,10 +10,9 @@ struct InterlacedDisplayRateTests {
 
     private func rate(_ content: Double?, _ codec: AVCodecID = AV_CODEC_ID_MPEG2VIDEO,
                       _ order: AVFieldOrder = AV_FIELD_TT,
-                      fieldRate: DeinterlaceFieldRate = .field, linked: Bool = true) -> Double? {
+                      fieldRate: DeinterlaceFieldRate = .field) -> Double? {
         AetherEngine.displayFrameRate(contentRate: content, codecID: codec, fieldOrder: order,
-                                      deinterlaceFieldRate: fieldRate,
-                                      hardwareDeinterlacerLinked: linked)
+                                      deinterlaceFieldRate: fieldRate)
     }
 
     @Test("1080i25 asks for 50 Hz and 480i29.97 for 59.94 Hz, after the snap")
@@ -30,10 +29,9 @@ struct InterlacedDisplayRateTests {
         #expect(rate(60000.0 / 1001) == 60000.0 / 1001)
     }
 
-    @Test("frame-rate output and a build without the Metal deinterlacer keep the content rate")
+    @Test("frame-rate output keeps the content rate")
     func frameRateCadences() {
         #expect(rate(25, fieldRate: .frame) == 25)
-        #expect(rate(25, linked: false) == 25)
     }
 
     @Test("progressive, undeclared and natively played interlaced streams keep the content rate")

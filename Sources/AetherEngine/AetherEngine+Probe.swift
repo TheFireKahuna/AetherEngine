@@ -1171,8 +1171,7 @@ extension AetherEngine {
     /// panel was asked for 25 Hz: every other field dropped by the display, or judder. Doubled before snapping, so the snap sees the field rate.
     ///
     /// Only a declared interlaced field order on a codec the software route takes counts: interlaced
-    /// HEVC plays native and is not deinterlaced, and a build without the Metal deinterlacer shows the
-    /// pictures as decoded, at frame rate. A rate above 30 is already a field rate (a muxer that
+    /// HEVC plays native and is not deinterlaced. A rate above 30 is already a field rate (a muxer that
     /// counted fields) and is left alone; no interlaced format carries more than 30 frames a second.
     /// Measured on generated clips through the linked FFmpeg: MPEG-2 1080i25 (TS), H.264 1080i25 (TS,
     /// MKV) and 480i29.97 (MPEG-PS, MP4) all report their FRAME rate in both `avg_frame_rate` and
@@ -1182,11 +1181,10 @@ extension AetherEngine {
         contentRate: Double?,
         codecID: AVCodecID,
         fieldOrder: AVFieldOrder,
-        deinterlaceFieldRate: DeinterlaceFieldRate,
-        hardwareDeinterlacerLinked: Bool = DeinterlaceFilter.hardwareFilterName() != nil
+        deinterlaceFieldRate: DeinterlaceFieldRate
     ) -> Double? {
         guard let contentRate, contentRate > 0, contentRate <= 30.5,
-              deinterlaceFieldRate == .field, hardwareDeinterlacerLinked,
+              deinterlaceFieldRate == .field,
               VideoRoutingPolicy.interlacedFieldOrders.contains(fieldOrder),
               VideoRoutingPolicy.requiresSoftwarePath(codecID: codecID, fieldOrder: fieldOrder, av1Available: true)
         else { return contentRate }

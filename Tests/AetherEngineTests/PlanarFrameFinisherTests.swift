@@ -163,8 +163,8 @@ struct PlanarFrameFinisherTests {
         let output = SoftwareVideoDecoder.outputFormat(pixelFormat: format.rawValue, colorRange: AVCOL_RANGE_MPEG, streamIs10Bit: true)
         let plan = try #require(PlanarFrameFinisher.plan(source: format, output: output, sourceFullRange: false,
                                                          chromaLocation: AVCHROMA_LOC_LEFT, matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2))
-        let planes = try #require(allocator.copy(f))
-        defer { allocator.release(planes.slab) }
+        let (planes, slab) = try #require(allocator.copy(f))
+        defer { allocator.release(slab) }
         let pb = try makeBuffer(output, width: 64, height: 64)
         #expect(finisher.finish(planes, plan: plan, width: 64, height: 64, into: pb))
         return readPlane(pb, plane: 0).map { UInt16($0) }
@@ -233,8 +233,8 @@ struct PlanarFrameFinisherTests {
                                                          chromaLocation: c.location, matrix: matrix,
                                                          representation: representation), "\(c)")
         if !recompute { plan.tieBound = 0 }
-        let planes = try #require(allocator.copy(f))
-        defer { allocator.release(planes.slab) }
+        let (planes, slab) = try #require(allocator.copy(f))
+        defer { allocator.release(slab) }
         let pb = try makeBuffer(output, width: width, height: height)
         #expect(finisher.finish(planes, plan: plan, width: width, height: height, into: pb), "\(c)")
 

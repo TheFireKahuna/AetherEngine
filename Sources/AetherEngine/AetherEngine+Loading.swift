@@ -2043,20 +2043,6 @@ extension AetherEngine {
         try checkLoadCurrent(generation)
         sessionCacheStatusToken &+= 1
         diagnostics.sessionCacheStatus = .inactive
-        let waitStarted = DispatchTime.now()
-        let outcome = await DeinterlaceHardwareWarmup.shared.wait()
-        try checkLoadCurrent(generation)
-        let elapsed = Double(
-            DispatchTime.now().uptimeNanoseconds - waitStarted.uptimeNanoseconds
-        ) / 1_000_000_000
-        if elapsed >= 0.05 {
-            EngineLog.emit(
-                "[AetherEngine] software load waited "
-                + "\(String(format: "%.3f", elapsed))s for hardware "
-                + "deinterlace warm-up (\(outcome.rawValue))",
-                category: .swPlayback
-            )
-        }
 
         await activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
         try checkLoadCurrent(generation)
