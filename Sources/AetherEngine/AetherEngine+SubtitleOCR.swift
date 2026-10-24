@@ -10,10 +10,11 @@ extension AetherEngine {
     func startSubtitleOCRWorker(ordinal: Int, streamIndex: Int32) {
         cancelSubtitleOCRWorker()
         guard let store = nativeStore(atOrdinal: ordinal) else { return }
+        store.markFeeding()
         subtitleOCRArmedOrdinal = ordinal
         let language = ordinal < nativeSubtitleTrackTable.count
             ? nativeSubtitleTrackTable[ordinal].language : nil
-        // A forced-only rendition (`LoadOptions.forcedSubtitleRenditions`) keeps just the compositions the
+        // A forced-only rendition (`LoadOptions.forcedSubtitleTrack`) keeps just the compositions the
         // track flags as forced, dropped before recognition so the rest costs no OCR.
         let forcedOnly = ordinal < nativeSubtitleTrackTable.count && nativeSubtitleTrackTable[ordinal].forcedCuesOnly
         EngineLog.emit("[SubtitleOCR] worker armed: ordinal=\(ordinal) stream=\(streamIndex) forcedOnly=\(forcedOnly)", category: .engine)

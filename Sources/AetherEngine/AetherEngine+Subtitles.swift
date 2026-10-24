@@ -53,23 +53,57 @@ extension AetherEngine {
     /// `selectSubtitleTrack(index:)`: the track becomes the active one and feeds `subtitleCues` (a host
     /// drawing its own forced lines filters them by `SubtitleCue.isForced`). What differs is the native
     /// rendition while `setNativeSubtitleRendering(true)` holds: it is the track's forced one, declared
-    /// `FORCED=YES` under `LoadOptions.forcedSubtitleRenditions`, which AVKit leaves out of its menu, so
-    /// the menu keeps saying Off. This is the selection the AV Foundation release notes give the app: with
-    /// no subtitle chosen, the forced option that goes with the audio. Like any native pick it is filled
-    /// before it is selected. `hasForcedSubtitleRendition(forTrack:)` says whether the track has one.
+    /// `FORCED=YES` under `LoadOptions.forcedSubtitleTrack`, which AVKit leaves out of its menu, so the menu
+    /// keeps saying Off. tvOS normally selects that rendition by itself; this is for a host that has to
+    /// make the selection. Like any native pick it is filled before it is selected.
+    /// `hasForcedSubtitleRendition(forTrack:)` says whether the track has one.
     public func selectForcedSubtitleTrack(index: Int) {
         forcedSubtitleSelection = true
         selectSubtitleTrackPublicly(index: index)
     }
 
-    /// Whether `selectForcedSubtitleTrack(index:)` gives track `index` a forced native rendition: its own,
-    /// declared forced, or one made from its flagged lines. False without
-    /// `LoadOptions.forcedSubtitleRenditions` and for a track the session serves no rendition for.
+    /// Whether track `index` has the session's forced native rendition (`LoadOptions.forcedSubtitleTrack`):
+    /// its own, declared forced, or one made from its flagged lines. False for every other track.
     public func hasForcedSubtitleRendition(forTrack index: Int) -> Bool {
-        guard loadedOptions.forcedSubtitleRenditions,
-              let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: index, in: nativeSubtitleTrackTable,
+        guard let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: index, in: nativeSubtitleTrackTable,
                                                        forced: true) else { return false }
-        return nativeSubtitleTrackTable[ordinal].isForced
+        return nativeSubtitleTrackTable[ordinal].declaresForced
+    }
+
+    /// Fill the session's forced rendition (`LoadOptions.forcedSubtitleTrack`): the player asked for it,
+    /// which on tvOS it does by itself when the audio's language and the viewer's subtitle settings call
+    /// for forced subtitles. A forced-only rendition is OCR'd from the packet store with the prefetcher
+    /// keeping the store ahead; a forced text track is read by the side readers. A bitmap track the host
+    /// has selected keeps the OCR worker: the forced rendition resumes when it is released
+    /// (`resumeForcedRenditionFill`).
+    func fillForcedRendition(ordinal: Int) {
+        guard ordinal < nativeSubtitleTrackTable.count, nativeSubtitleTrackTable[ordinal].declaresForced,
+              let store = nativeStore(atOrdinal: ordinal) else { return }
+        forcedRenditionRequestedOrdinal = ordinal
+        let entry = nativeSubtitleTrackTable[ordinal]
+        if entry.needsOCR, let stream = entry.sourceStreamIndex {
+            if let armed = subtitleOCRArmedOrdinal {
+                guard armed != ordinal else { return }
+                EngineLog.emit("[AetherEngine] forced rendition ordinal=\(ordinal) requested; the OCR worker "
+                               + "serves the selected ordinal=\(armed) until it is released", category: .engine)
+                return
+            }
+            store.markFeeding()
+            startSubtitleOCRWorker(ordinal: ordinal, streamIndex: Int32(stream))
+            startSubtitleForwardPrefetcher(startAt: sourceTime)
+        } else {
+            store.markFeeding()
+            startLazyNativeSubtitleReadersWhenIdle()
+        }
+        EngineLog.emit("[AetherEngine] forced rendition ordinal=\(ordinal) requested by the player: filling "
+                       + "(\(entry.needsOCR ? "OCR, forced lines only" : "side readers"))", category: .engine)
+    }
+
+    /// After a selection change released the OCR worker, give it back to the forced rendition the player
+    /// asked for, if any.
+    func resumeForcedRenditionFill() {
+        guard let ordinal = forcedRenditionRequestedOrdinal, subtitleOCRArmedOrdinal == nil else { return }
+        fillForcedRendition(ordinal: ordinal)
     }
 
     private func selectSubtitleTrackPublicly(index: Int) {
@@ -90,6 +124,8 @@ extension AetherEngine {
                            + "(hostExplicit=\(hostExplicitSubtitleAction) forced=\(forcedSubtitleSelection))", category: .engine)
             setNativeSubtitleRendering(true)
         }
+        // A pick that left the OCR worker free (a text track) hands it back to the forced rendition.
+        resumeForcedRenditionFill()
     }
 
     /// `selectSubtitleTrack(index:)` with an explicit source-PTS start anchor. The public form passes the live
@@ -763,7 +799,9 @@ extension AetherEngine {
         cancelSubtitleForwardPrefetcher(reason: .prefetchRebuild)
         guard Self.shouldRunSubtitleForwardPrefetch(
             isLive: isLive,
-            hasEmbeddedDrainTargets: !subtitleDrainTargets.isEmpty,
+            // The OCR worker reads the packet store too, with or without an overlay drain (a forced
+            // rendition tvOS selected while no subtitle is).
+            hasEmbeddedDrainTargets: !subtitleDrainTargets.isEmpty || subtitleOCRArmedOrdinal != nil,
             hasSource: loadedURL != nil),
             let store = activeSubtitlePacketStore,
             let url = loadedURL else { return }
@@ -1773,6 +1811,8 @@ extension AetherEngine {
             nativeVideoSession?.nativeSubtitleLanguagesForSession = []
             nativeSubtitleRenditionAvailable = false
         }
+        // Subtitles off is exactly when tvOS shows the forced rendition, so it keeps being filled.
+        resumeForcedRenditionFill()
     }
 
     func cancelSidecarTask(channel: SubtitleChannel = .primary) {
@@ -2015,6 +2055,7 @@ extension AetherEngine {
             routes[pair.streamIndex] = (decoder, pair.store, stream.pointee.time_base)
         }
         guard !routes.isEmpty else { return }
+        for route in routes.values { route.store.markFeeding() }
 
         // #104: discard video/audio (and any non-routed subtitle stream) on this side demuxer. Without it the
         // reader pulls and allocs EVERY video+audio sample byte-for-byte through a second AVIOReader just to
@@ -2451,10 +2492,10 @@ extension AetherEngine {
     /// a group; duplicate names made AVFoundation collapse same-language renditions into ONE
     /// legible option (device: three declared, groupOpts=2, and the second German track ended up
     /// selecting the English option through the old positional fallback). Same-language duplicates
-    /// get a numbered suffix. `declaresForced` (`LoadOptions.forcedSubtitleRenditions`) carries the forced
-    /// disposition into the master as FORCED=YES; without it no rendition is declared forced (Sodalite#38).
+    /// get a numbered suffix. An entry marked `declaresForced` (`LoadOptions.forcedSubtitleTrack`) carries
+    /// FORCED=YES into the master; nothing else is declared forced (Sodalite#38).
     nonisolated static func nativeSubtitleRenditionInfos(
-        for entries: [NativeSubtitleTrackEntry], declaresForced: Bool = false
+        for entries: [NativeSubtitleTrackEntry]
     ) -> [NativeSubtitleRenditionInfo] {
         var counts: [String: Int] = [:]
         return entries.enumerated().map { i, entry in
@@ -2466,26 +2507,52 @@ extension AetherEngine {
             return NativeSubtitleRenditionInfo(
                 language: entry.language,
                 name: n == 1 ? base : "\(base) \(n)",
-                isForced: declaresForced && entry.isForced
+                isForced: entry.declaresForced
             )
         }
     }
 
-    /// `LoadOptions.forcedSubtitleRenditions`: a forced-only rendition for each embedded bitmap track that
-    /// is not itself forced. Such a track carries its forced lines as flagged display sets inside the full
-    /// track, the usual Blu-ray arrangement, and the rendition holds just those (the OCR worker drops the
-    /// rest). A track with no flagged lines yields an empty rendition, which nothing shows. External .sup
-    /// tracks are left out: their store is filled from the overlay's whole-file decode, not by the worker.
-    nonisolated static func forcedCueSubtitleEntries(
-        for bitmapEntries: [NativeSubtitleTrackEntry]
-    ) -> [NativeSubtitleTrackEntry] {
-        bitmapEntries.filter { !$0.isForced && $0.sourceStreamIndex != nil }.map { entry in
-            NativeSubtitleTrackEntry(sourceStreamIndex: entry.sourceStreamIndex,
-                                     language: entry.language,
-                                     isForced: true,
-                                     needsOCR: true,
-                                     forcedCuesOnly: true)
+    /// How `LoadOptions.forcedSubtitleTrack` was declared, for the session log.
+    enum ForcedSubtitleDeclaration: Equatable {
+        /// The named track is a forced track: its own rendition is declared forced.
+        case ownRendition
+        /// The named track is a full embedded bitmap track: a forced-only rendition of its flagged lines
+        /// was appended to `bitmap`.
+        case flaggedLines
+        /// Nothing to declare: no such track, or one whose forced lines cannot be told apart (a full text
+        /// track carries forcedness only per track; an external .sup is filled from the overlay's
+        /// whole-file decode, not by the worker).
+        case none
+    }
+
+    /// Marks the one rendition to declare forced for `source` (`LoadOptions.forcedSubtitleTrack`): the
+    /// track's own when it is a forced track, else, for an embedded bitmap track, a forced-only entry
+    /// appended to `bitmap`, holding just the lines the track flags as forced (the OCR worker drops the
+    /// rest). Appended after every other entry so the other ordinals do not move.
+    nonisolated static func declareForcedSubtitleSource(
+        _ source: Int, text: inout [NativeSubtitleTrackEntry], bitmap: inout [NativeSubtitleTrackEntry]
+    ) -> ForcedSubtitleDeclaration {
+        func isSource(_ entry: NativeSubtitleTrackEntry) -> Bool {
+            entry.sourceStreamIndex == source || entry.externalID == source
         }
+        if let i = text.firstIndex(where: isSource) {
+            guard text[i].isForced else { return .none }
+            text[i].declaresForced = true
+            return .ownRendition
+        }
+        guard let i = bitmap.firstIndex(where: isSource) else { return .none }
+        if bitmap[i].isForced {
+            bitmap[i].declaresForced = true
+            return .ownRendition
+        }
+        guard let stream = bitmap[i].sourceStreamIndex else { return .none }
+        bitmap.append(NativeSubtitleTrackEntry(sourceStreamIndex: stream,
+                                               language: bitmap[i].language,
+                                               isForced: true,
+                                               needsOCR: true,
+                                               forcedCuesOnly: true,
+                                               declaresForced: true))
+        return .flaggedLines
     }
 
     /// Index of the legible option backing (track language, same-language rank). AVFoundation

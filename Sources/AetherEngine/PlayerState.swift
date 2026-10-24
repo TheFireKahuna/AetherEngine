@@ -759,19 +759,19 @@ public struct LoadOptions: Sendable, Equatable {
     /// Declare a mov_text track in the init moov so text subtitles survive PiP / AirPlay / external display via AVMediaSelection. Bitmap codecs (PGS / DVB / DVD) excluded automatically. Default `false` (#55).
     public var prepareNativeSubtitles: Bool = false
 
-    /// Hand forced subtitles to AVFoundation the documented way, for a host whose subtitles are AVKit's own
-    /// (its native controls and subtitle menu). A forced rendition is declared `FORCED=YES,AUTOSELECT=YES`
-    /// (HLS Authoring Specification 5.11), which AVFoundation reports as
-    /// `AVMediaCharacteristic.containsOnlyForcedSubtitles` and AVKit keeps out of its subtitle menu. An
-    /// embedded bitmap track (PGS / DVB / DVD), whose forced lines are flagged inside the full track rather
-    /// than carried in a track of their own, gets a second, forced-only rendition holding just the flagged
-    /// lines. The full track is unchanged and still holds them too (5.8). Selection stays with the host, as
-    /// the AV Foundation release notes put it: with no subtitle chosen, the app selects the forced option
-    /// that goes with the audio, here `selectForcedSubtitleTrack(index:)`, which fills the rendition before
-    /// selecting it. Automatic media selection is switched off for the session so AVKit does not select
-    /// one itself before it is filled. Only meaningful with `prepareNativeSubtitles`. Default `false`: a host
-    /// that draws its own subtitles keeps every rendition `FORCED=NO` (Sodalite#38).
-    public var forcedSubtitleRenditions: Bool = false
+    /// Forced subtitles handed to tvOS natively, for a host whose subtitles are AVKit's own (its native
+    /// controls and subtitle menu): the subtitle track (an id `selectSubtitleTrack(index:)` takes) whose
+    /// forced lines are the ones to show. Exactly one rendition is declared forced,
+    /// `FORCED=YES,AUTOSELECT=YES,DEFAULT=NO` (HLS Authoring Specification 5.11): the track's own when the
+    /// track is a forced one, or, for an embedded bitmap track (PGS / DVB / DVD) that only flags its forced
+    /// lines, a second rendition holding just those (the full track still holds them too, 5.8). AVKit
+    /// keeps a forced rendition out of its subtitle menu, and tvOS selects it by itself when it matches
+    /// the audio's language and the viewer's subtitle settings call for forced subtitles; the engine fills
+    /// it from the moment the player asks for it. The host's choice decides WHICH lines (its language and
+    /// track preferences); tvOS decides WHEN they show. Name the track for the audio the session plays.
+    /// Only meaningful with `prepareNativeSubtitles`. nil (the default) declares no rendition forced: a host
+    /// that draws its own subtitles needs AVKit to show none by itself (Sodalite#38).
+    public var forcedSubtitleTrack: Int? = nil
 
     /// Start the native WebVTT subtitle readers eagerly at load (instead of lazily on `setNativeSubtitleSelected`), so the `/subs_N_M.vtt` segments are already populated when AVKit fetches them under a host-independent selection (e.g. an `EXT-X-MEDIA ... DEFAULT=YES` rendition that AVKit auto-selects). Equivalent to a fully-populated static VOD subtitle file. Only meaningful with `prepareNativeSubtitles`. Default `false` (Sodalite#32 probe).
     public var eagerNativeSubtitleReaders: Bool = false
@@ -1058,7 +1058,7 @@ public struct LoadOptions: Sendable, Equatable {
         nativeRemoteHLSIngestFallback: Bool = true,
         preserveASSMarkup: Bool = false,
         prepareNativeSubtitles: Bool = false,
-        forcedSubtitleRenditions: Bool = false,
+        forcedSubtitleTrack: Int? = nil,
         eagerNativeSubtitleReaders: Bool = false,
         serveIFramePlaylist: Bool = false,
         confirmAtmos: Bool = false,
@@ -1118,7 +1118,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.nativeRemoteHLSIngestFallback = nativeRemoteHLSIngestFallback
         self.preserveASSMarkup = preserveASSMarkup
         self.prepareNativeSubtitles = prepareNativeSubtitles
-        self.forcedSubtitleRenditions = forcedSubtitleRenditions
+        self.forcedSubtitleTrack = forcedSubtitleTrack
         self.eagerNativeSubtitleReaders = eagerNativeSubtitleReaders
         self.serveIFramePlaylist = serveIFramePlaylist
         self.confirmAtmos = confirmAtmos

@@ -115,6 +115,8 @@ protocol HLSSegmentProvider: AnyObject {
     /// playlist one segment per video segment, so the embedded reader (parked ~90s ahead of the playhead)
     /// has the cues for a segment in the store by the time AVPlayer fetches it.
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String?
+    /// The player fetched rendition `ordinal`'s media playlist: it has selected that rendition.
+    func nativeSubtitleRenditionRequested(ordinal: Int)
 
     /// AE#682: true when this session lists an I-frame rendition in its master. The two calls below
     /// answer `iframe_init.mp4` and `iframe{N}.mp4`; both may block on a source read.
@@ -199,6 +201,7 @@ extension HLSSegmentProvider {
     var nativeSubtitleDefaultOrdinal: Int { 0 }
     var nativeSubtitleWholeProgram: Bool { false }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? { nil }
+    func nativeSubtitleRenditionRequested(ordinal: Int) {}
     var iFrameRenditionServed: Bool { false }
     var iFrameRenditionFormat: IFrameRenditionFormat? { nil }
     func iFrameInitSegment() -> Data? { nil }
@@ -1207,6 +1210,7 @@ final class HLSLocalServer: @unchecked Sendable {
                 return send404(fd: fd, path: normalizedPath, reason: "unparseable subtitle playlist path")
             }
             EngineLog.emit("[HLSLocalServer] subtitle rendition selected: subs_\(parsed.ordinal).m3u8 fetched", category: .hlsServer)
+            prov.nativeSubtitleRenditionRequested(ordinal: parsed.ordinal)
             let subBody = Self.buildSubtitleMediaPlaylistText(ordinal: parsed.ordinal, provider: prov, generation: route.generation)
             return send200(fd: fd, path: normalizedPath,
                            data: Data(subBody.utf8),
@@ -1845,7 +1849,7 @@ final class HLSLocalServer: @unchecked Sendable {
         for r in subRenditions {
             var mediaAttrs = ["TYPE=SUBTITLES", "GROUP-ID=\"subs\"", "NAME=\"\(r.name)\""]
             if let lang = r.language { mediaAttrs.append("LANGUAGE=\"\(lang)\"") }
-            // `r.isForced` is set only under `LoadOptions.forcedSubtitleRenditions`, for a host whose subtitles
+            // `r.isForced` is set only for `LoadOptions.forcedSubtitleTrack`'s rendition, for a host whose subtitles
             // are AVKit's own. Without it a source-forced track is deliberately NOT declared FORCED=YES: AVKit
             // force-displays a FORCED rendition whose language matches the selected audio regardless of
             // DEFAULT/AUTOSELECT and the user's CC-off preference, which self-engages a rendition and

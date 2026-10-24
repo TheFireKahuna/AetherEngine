@@ -1252,14 +1252,14 @@ extension AetherEngine {
         // over text+bitmap together: a same-language pair must get the numbered suffix, or
         // AVFoundation collapses the legible options.
         var bitmapEntries = Self.bitmapOCRSubtitleEntries(from: subtitleTracks, isLive: loadedOptions.isLive)
-        // The forced-only renditions come after every bitmap one, so the full tracks' ordinals are the same
-        // with the option as without it.
-        if loadedOptions.forcedSubtitleRenditions {
-            bitmapEntries += Self.forcedCueSubtitleEntries(for: bitmapEntries)
+        // LoadOptions.forcedSubtitleTrack: one rendition declared forced. A forced-only one comes after every
+        // bitmap one, so the full tracks' ordinals are the same with the option as without it.
+        if let source = loadedOptions.forcedSubtitleTrack {
+            let declaration = Self.declareForcedSubtitleSource(
+                source, text: &nativeSubtitleTrackTable, bitmap: &bitmapEntries)
+            EngineLog.emit("[AetherEngine] forced subtitles from track \(source): \(declaration)", category: .engine)
         }
-        let combinedInfos = Self.nativeSubtitleRenditionInfos(
-            for: nativeSubtitleTrackTable + bitmapEntries,
-            declaresForced: loadedOptions.forcedSubtitleRenditions)
+        let combinedInfos = Self.nativeSubtitleRenditionInfos(for: nativeSubtitleTrackTable + bitmapEntries)
         let renditionInfos = Array(combinedInfos.prefix(nativeSubtitleTrackTable.count))
         let bitmapInfos = Array(combinedInfos.suffix(bitmapEntries.count))
         nativeSubtitleTracks = renditionInfos.enumerated().map { ordinal, info in
@@ -1339,6 +1339,16 @@ extension AetherEngine {
                 nativeSubtitleTrackTable.append(entry)
                 nativeSubtitleTracks.append(NativeSubtitleTrack(
                     ordinal: ordinal, language: entry.language, displayName: bitmapInfos[i].name))
+            }
+            // LoadOptions.forcedSubtitleTrack: tvOS selects the forced rendition by itself, at load or whenever
+            // its subtitle settings call for it, so the rendition is filled from the moment the player asks
+            // for it rather than when the host gets round to selecting it.
+            let stores = session.nativeSubtitleCueStoresForSession
+            for (ordinal, entry) in nativeSubtitleTrackTable.enumerated() {
+                guard entry.declaresForced, ordinal < stores.count else { continue }
+                stores[ordinal].onRenditionRequested { [weak self] in
+                    Task { @MainActor in self?.fillForcedRendition(ordinal: ordinal) }
+                }
             }
             // Sodalite#32: with eager readers the whole cue set is available up front, so serve the rendition as
             // one whole-program .vtt (the AVPlayer-reliable shape). VOD only (a live program has no fixed end).
@@ -1927,12 +1937,6 @@ extension AetherEngine {
         // their host's load the session is ready before the return and this checkpoint would arrive
         // behind one it must precede. The generation guard is what keeps a superseded loader from
         // writing into its successor's sequence.
-        // LoadOptions.forcedSubtitleRenditions: the host selects the forced rendition, once it is filled.
-        // Left on, automatic selection would pick a FORCED=YES rendition at readyToPlay itself, before
-        // anything has been read into it, and AVKit keeps the empty segments it fetched then.
-        if loadedOptions.forcedSubtitleRenditions, loadedOptions.prepareNativeSubtitles {
-            host.avPlayer.appliesMediaSelectionCriteriaAutomatically = false
-        }
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }
         host.load(url: playbackURL,
                   startPosition: startPosition,

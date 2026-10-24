@@ -1,9 +1,10 @@
 import Testing
 import Foundation
 import CoreGraphics
+import os
 @testable import AetherEngine
 
-/// `LoadOptions.forcedSubtitleRenditions`: forced subtitles handed to AVFoundation as FORCED=YES renditions,
+/// `LoadOptions.forcedSubtitleTrack`: forced subtitles handed to tvOS as one FORCED=YES rendition,
 /// a forced-only rendition made from a bitmap track's flagged lines, and the reading that lets a sparse
 /// (forced) rendition be selected when it is truthfully empty at the playhead.
 @Suite("Forced subtitle renditions")
@@ -17,35 +18,68 @@ struct ForcedSubtitleRenditionTests {
 
     // MARK: - The table
 
-    @Test("an embedded full bitmap track gets a forced-only entry; a forced or external one does not")
-    func forcedCueEntries() {
-        let bitmap: [Entry] = [
-            Entry(sourceStreamIndex: 4, language: "eng", isForced: false, needsOCR: true),
-            Entry(sourceStreamIndex: 5, language: "eng", isForced: true, needsOCR: true),
-            Entry(sourceStreamIndex: nil, externalID: 9000, language: "ger", isForced: false, needsOCR: true),
+    @Test("a named full bitmap track gets one forced-only entry, declared forced")
+    func namedBitmapSource() {
+        var text: [Entry] = [Entry(sourceStreamIndex: 3, language: "en", isForced: false)]
+        var bitmap: [Entry] = [
+            Entry(sourceStreamIndex: 4, language: "en", isForced: false, needsOCR: true),
+            Entry(sourceStreamIndex: 5, language: "en", isForced: false, needsOCR: true),
         ]
-        let forced = AetherEngine.forcedCueSubtitleEntries(for: bitmap)
-        #expect(forced.count == 1)
-        #expect(forced[0].sourceStreamIndex == 4)
-        #expect(forced[0].forcedCuesOnly)
-        #expect(forced[0].isForced)
-        #expect(forced[0].needsOCR)
+        #expect(AetherEngine.declareForcedSubtitleSource(5, text: &text, bitmap: &bitmap) == .flaggedLines)
+        #expect(bitmap.count == 3)
+        #expect(bitmap[2].sourceStreamIndex == 5 && bitmap[2].forcedCuesOnly && bitmap[2].declaresForced)
+        #expect(bitmap.filter(\.declaresForced).count == 1)
+        #expect(!text[0].declaresForced)
     }
 
-    @Test("FORCED is declared only when the option asks for it, and the forced-only rendition is named apart")
-    func renditionInfosDeclareForcedOnlyWhenAsked() {
+    @Test("a named forced track declares its own rendition; a full text track or an external .sup declares none")
+    func namedOwnOrNone() {
+        var text: [Entry] = [Entry(sourceStreamIndex: 2, language: "en", isForced: true),
+                             Entry(sourceStreamIndex: 3, language: "en", isForced: false)]
+        var bitmap: [Entry] = [Entry(sourceStreamIndex: nil, externalID: 9000, language: "en", isForced: false,
+                                     needsOCR: true)]
+        #expect(AetherEngine.declareForcedSubtitleSource(2, text: &text, bitmap: &bitmap) == .ownRendition)
+        #expect(text[0].declaresForced)
+        var text2 = text.map { var e = $0; e.declaresForced = false; return e }
+        #expect(AetherEngine.declareForcedSubtitleSource(3, text: &text2, bitmap: &bitmap) == .none)
+        #expect(AetherEngine.declareForcedSubtitleSource(9000, text: &text2, bitmap: &bitmap) == .none)
+        #expect(AetherEngine.declareForcedSubtitleSource(77, text: &text2, bitmap: &bitmap) == .none)
+        #expect(bitmap.count == 1)
+    }
+
+    @Test("only the declared entry is FORCED=YES, and the forced-only rendition is named apart")
+    func renditionInfosDeclareOnlyTheNamed() {
         let entries: [Entry] = [
             Entry(sourceStreamIndex: 3, language: "en", isForced: true),
             Entry(sourceStreamIndex: 4, language: "en", isForced: false, needsOCR: true),
-            Entry(sourceStreamIndex: 4, language: "en", isForced: true, needsOCR: true, forcedCuesOnly: true),
+            Entry(sourceStreamIndex: 4, language: "en", isForced: true, needsOCR: true, forcedCuesOnly: true,
+                  declaresForced: true),
         ]
-        let off = AetherEngine.nativeSubtitleRenditionInfos(for: entries)
-        #expect(off.allSatisfy { !$0.isForced })
+        let infos = AetherEngine.nativeSubtitleRenditionInfos(for: entries)
+        #expect(infos.map(\.isForced) == [false, false, true])
+        #expect(Set(infos.map(\.name)).count == 3)
+        #expect(infos[2].name.hasSuffix("(Forced)"))
+    }
 
-        let on = AetherEngine.nativeSubtitleRenditionInfos(for: entries, declaresForced: true)
-        #expect(on.map(\.isForced) == [true, false, true])
-        #expect(Set(on.map(\.name)).count == 3)
-        #expect(on[2].name.hasSuffix("(Forced)"))
+    @Test("a store counts as being filled only while a feeder started on it or read it recently")
+    func feedingActivity() {
+        let store = NativeSubtitleCueStore()
+        #expect(!store.isBeingFed(within: 5))
+        store.markFeeding()
+        #expect(store.isBeingFed(within: 5))
+        let read = NativeSubtitleCueStore()
+        read.noteRead(from: 0, through: 10)
+        #expect(read.isBeingFed(within: 5))
+    }
+
+    @Test("the player asking for a rendition reaches its handler")
+    func renditionRequestHook() {
+        let store = NativeSubtitleCueStore()
+        let count = OSAllocatedUnfairLock(initialState: 0)
+        store.onRenditionRequested { count.withLock { $0 += 1 } }
+        store.noteRenditionRequested()
+        store.noteRenditionRequested()
+        #expect(count.withLock { $0 } == 2)
     }
 
     @Test("a forced selection maps a full track to its forced-only rendition, a forced track to its own")
