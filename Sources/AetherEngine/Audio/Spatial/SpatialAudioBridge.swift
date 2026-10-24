@@ -112,6 +112,12 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     private var anchorIsProvisional = false
     private var encoderStartFrame: Int64?
     private var encoderFramesIn: Int64 = 0
+    /// Rendered frames still to drop before the encoder: audio an output offset puts before the
+    /// timeline's start, cut at the exact frame (`encodePending`).
+    private var pendingTrimFrames: Int64 = 0
+    /// `setOutputOffset`, in seconds, and in frames once a reset's first push has taken it.
+    private var outputOffsetSeconds: Double = 0
+    private var outputOffsetFrames: Int64 = 0
     private var nextExpectedInputOffset: Int64?
     private var drainedAtEOF = false
     /// The decoder reset itself after an internal failure: its offsets count from zero again, so the
@@ -299,7 +305,12 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         // has one) places the timeline; no later packet's can. dts covers an unset pts.
         if firstPushPending {
             firstPushPending = false
-            if originFrame == nil, ts != Self.avNoPTS { originFrame = av_rescale_q(ts, srcTimeBase, encoderTimeBase) }
+            if encoderStartFrame == nil {
+                outputOffsetFrames = Int64((outputOffsetSeconds * Double(Self.sampleRate)).rounded())
+            }
+            if originFrame == nil, ts != Self.avNoPTS {
+                originFrame = av_rescale_q(ts, srcTimeBase, encoderTimeBase) + outputOffsetFrames
+            }
         }
 
         // Packets already stamped stay in the result when a later block of the same packet fails:
@@ -421,11 +432,18 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         anchorIsProvisional = false
         encoderStartFrame = nil
         encoderFramesIn = 0
+        pendingTrimFrames = 0
         nextExpectedInputOffset = nil
         drainedAtEOF = false
         decoderSelfResetsSeen = decoder.selfResetCount
         reanchorPending = false
         consecutiveFeedFailures = 0
+    }
+
+    func setOutputOffset(seconds: Double) {
+        opLock.lock()
+        defer { opLock.unlock() }
+        outputOffsetSeconds = seconds
     }
 
     func noteTimelineJump(deltaSeconds: Double) {
@@ -498,18 +516,18 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
                 stats.blocksDroppedUnplaced += 1
                 return
             }
-            encoderStartFrame = origin + block.inputFrameOffset
+            anchor(at: origin + block.inputFrameOffset)
         } else if reanchorPending, let start = encoderStartFrame {
             // After the decoder's own reset: put this block where the source says it plays.
             reanchorPending = false
             anchorIsProvisional = originFrame == nil
-            let target = (originFrame ?? start + encoderFramesIn + Int64(pendingFrames + heldBack))
+            let target = (originFrame ?? runningEnd(from: start))
                 + block.inputFrameOffset
             place(at: target)
         } else if anchorIsProvisional, originFromBlock, let start = encoderStartFrame, let origin = originFrame {
             // The first timestamp since a provisional anchor: from here the block plays where it says.
             anchorIsProvisional = false
-            let end = start + encoderFramesIn + Int64(pendingFrames + heldBack)
+            let end = runningEnd(from: start)
             let target = origin + block.inputFrameOffset
             EngineLog.emit(
                 "[SpatialAudioBridge] provisional anchor corrected by \(target - end) frames on the first timestamp",
@@ -517,7 +535,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             place(at: target)
         } else if let expected = nextExpectedInputOffset, block.inputFrameOffset > expected,
                   let start = encoderStartFrame {
-            let end = start + encoderFramesIn + Int64(pendingFrames + heldBack)
+            let end = runningEnd(from: start)
             place(at: end + (block.inputFrameOffset - expected))
         }
         nextExpectedInputOffset = block.inputFrameOffset + Int64(block.frameCount)
@@ -621,7 +639,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// source and the decoder's count of what it was given no longer agree.
     private func noteBlockTimestamp(_ block: ObjectAudioDecodedBlock) {
         guard let pts = block.sourcePts else { return }
-        let blockOrigin = av_rescale_q(pts, srcTimeBase, encoderTimeBase) - block.sourcePtsInputFrame
+        let blockOrigin = av_rescale_q(pts, srcTimeBase, encoderTimeBase) + outputOffsetFrames - block.sourcePtsInputFrame
         guard originFromBlock, let origin = originFrame else {
             originFrame = blockOrigin
             originFromBlock = true
@@ -642,7 +660,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// later packet keeps its source position.
     private func place(at target: Int64) {
         guard let start = encoderStartFrame else { return }
-        let end = start + encoderFramesIn + Int64(pendingFrames + heldBack)
+        let end = runningEnd(from: start)
         let gap = target - end
         if gap == 0 { return }
         if gap > 0, gap <= Int64(Self.maxSilenceFillFrames) {
@@ -653,11 +671,24 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         encodePending()
         pipeline.restart()
         limiter.reset()
-        encoderStartFrame = target
-        encoderFramesIn = 0
+        anchor(at: target)
         EngineLog.emit(
             "[SpatialAudioBridge] encoder re-anchored \(String(format: "%+.3f", Double(gap) / Double(Self.sampleRate))) s "
             + "off its running position", category: .session)
+    }
+
+    /// Where the next frame taken from the decoder plays.
+    private func runningEnd(from start: Int64) -> Int64 {
+        start + encoderFramesIn + Int64(pendingFrames + heldBack) - pendingTrimFrames
+    }
+
+    /// Start an encoder run at `position`. Never below zero: `baseMediaDecodeTime` is unsigned
+    /// (AE#561), and an APAC packet cut from the front would take its priming with it, so audio
+    /// before the timeline's start comes off the rendered frames instead.
+    private func anchor(at position: Int64) {
+        encoderStartFrame = max(position, 0)
+        encoderFramesIn = 0
+        pendingTrimFrames = max(-position, 0)
     }
 
     /// The longest gap filled with silence rather than by restarting the encoder.
@@ -701,9 +732,25 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// `collectEncoded` on a later call.
     private func encodePending() {
         guard pendingFrames > 0 else { return }
-        let frames = pendingFrames
+        var frames = pendingFrames
         pendingFrames = 0
         guard let start = encoderStartFrame else { return }
+        if pendingTrimFrames > 0 {
+            let cut = Int(min(pendingTrimFrames, Int64(frames)))
+            pendingTrimFrames -= Int64(cut)
+            frames -= cut
+            for plane in output.planes where frames > 0 {
+                memmove(plane, plane + cut, frames * MemoryLayout<Float>.stride)
+            }
+#if APACObjectOutput
+            // Metadata from the cut frames still holds where the frames kept begin.
+            for i in output.objectUpdates.indices {
+                output.objectUpdates[i].frameOffset = max(output.objectUpdates[i].frameOffset - cut, 0)
+            }
+            output.objectDiscontinuities = output.objectDiscontinuities.map { max($0 - cut, 0) }
+#endif
+            if frames == 0 { return }
+        }
         let position = start + encoderFramesIn
 #if APACObjectOutput
         if objectOutput {

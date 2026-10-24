@@ -265,6 +265,8 @@ final class MP4SegmentMuxer {
     /// The same offset in the muxer's OUTPUT audio time base, latched once the header has rewritten
     /// it. Packets reach `writePacket` already rescaled, so this is the base the shift must be in.
     private var audioDelayTicks: Int64 = 0
+    /// Audio packets not written because they fell before zero (see `writePacket`).
+    private(set) var audioPacketsBeforeZero = 0
 
     /// Mid-segment fragment-flush bound (#64). With movflags +frag_custom a moof+mdat is emitted only at
     /// an explicit segment cut; a degenerate plan (sparse-keyframe TS index) or any very long segment
@@ -691,6 +693,21 @@ final class MP4SegmentMuxer {
         if audioDelayTicks != 0, packet.pointee.stream_index == audioOutputStreamIndex {
             if packet.pointee.pts != Int64.min { packet.pointee.pts &+= audioDelayTicks }
             if packet.pointee.dts != Int64.min { packet.pointee.dts &+= audioDelayTicks }
+        }
+        // `baseMediaDecodeTime` is unsigned: an audio timestamp below zero, whatever put it there (a
+        // negative delay above, a source that starts early), goes out as 2^64 minus it, and AVPlayer
+        // places that fragment 584 thousand years out (AE#561). Audio before the timeline's start has
+        // nowhere to play, so it is not written.
+        if packet.pointee.stream_index == audioOutputStreamIndex,
+           (packet.pointee.dts != Int64.min && packet.pointee.dts < 0)
+            || (packet.pointee.pts != Int64.min && packet.pointee.pts < 0) {
+            audioPacketsBeforeZero += 1
+            if audioPacketsBeforeZero == 1 {
+                EngineLog.emit("[MP4SegmentMuxer] audio before the timeline's start (dts \(packet.pointee.dts), "
+                               + "audio delay \(audioDelaySeconds) s) is not written", category: .session)
+            }
+            av_packet_unref(packet)
+            return (0, .none)
         }
 
         guard let clean = timestampSanitizer.sanitize(

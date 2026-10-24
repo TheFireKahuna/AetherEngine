@@ -838,8 +838,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// 0 disables the park (live, and any host that never opted in stays far below its budget anyway).
     private let prefetchDiskBudgetBytes: Int
 
-    /// AE#464: the host's audio offset this producer's muxers write. Fixed for the producer's life;
-    /// a new value arrives as a new producer (see `MP4SegmentMuxer.audioDelaySeconds`).
+    /// AE#464: the host's audio offset. Fixed for the producer's life; a new value arrives as a new
+    /// producer (see `MP4SegmentMuxer.audioDelaySeconds`). A bridge builds it into what it encodes,
+    /// so a negative one cuts at the exact sample (`setOutputOffset`); stream-copied packets cannot be
+    /// cut, so the muxer moves them and drops the ones it puts before zero.
     private let audioDelaySeconds: Double
     /// A stream-copied audio track's move into Apple's timestamp convention (`AppleAudioDecoderDelay`):
     /// whole source ticks added to every packet as it is read, and the remainder the muxer adds.
@@ -1531,6 +1533,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         self.epoch = epoch
         self.servesSegmentsProgressively = servesSegmentsProgressively
         self.audioDelaySeconds = audioDelaySeconds
+        audio?.bridge?.setOutputOffset(seconds: audioDelaySeconds)
         self.audioMoovPrimeFrame = audioMoovPrimeFrame
         self.audioMoovPrimeKnownUnobtainable = audioMoovPrimeKnownUnobtainable
         self.capturesAudioPrimeFrames =
@@ -2233,7 +2236,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // AE#222 + mid-session rotation: the last frame a muxer accepted, or the host's
                 // construction-time prime while no muxer has accepted one yet.
                 audioMoovPrimeFrame: audioMoovPrimeFrame,
-                audioDelaySeconds: audioDelaySeconds + streamCopyDecoderDelayResidualSeconds,
+                audioDelaySeconds: (audioConfig?.bridge == nil ? audioDelaySeconds : 0)
+                    + streamCopyDecoderDelayResidualSeconds,
                 onStorageExhausted: { [cache] in cache.noteStorageExhausted() },
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
@@ -4805,13 +4809,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     /// The segment a bridged audio packet belongs to. Live and sequential audio follow the video
-    /// cutter; everything else is routed by the packet's own time against the plan. One helper for the
+    /// cutter; everything else is routed by the packet's own time against the plan, without the audio
+    /// delay the bridge stamped in: shifted, a positive delay would open the next segment while the
+    /// video is still cutting this one. One helper for the
     /// per-feed and the end-of-file flush, because the flush missing the sequential rule opened a plan
     /// index the cutter never reached and cost the archive its final segment (audit SEG-103).
     private func bridgedAudioSegmentIndex(_ packet: UnsafeMutablePointer<AVPacket>, audio: AudioConfig) -> Int {
         if isLive { return liveCurrentSegmentIndex }
         if audioFollowsVideoCut { return vodCutter.current }
-        return segmentIndex(forSourcePts: av_rescale_q(packet.pointee.pts, audio.inputTimeBase, sourceVideoTimeBase))
+        let delay = Int64((audioDelaySeconds * Double(audio.inputTimeBase.den) / Double(max(audio.inputTimeBase.num, 1))).rounded())
+        return segmentIndex(forSourcePts: av_rescale_q(packet.pointee.pts - delay, audio.inputTimeBase, sourceVideoTimeBase))
     }
 
     // MARK: - Look-behind finalize helpers

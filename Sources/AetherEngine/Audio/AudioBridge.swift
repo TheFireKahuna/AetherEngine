@@ -311,8 +311,12 @@ final class AudioBridge: @unchecked Sendable {
     /// count cannot see is placed exactly (`AudioContinuity`). Live keeps the free-running counter, since
     /// the producer re-times its splices itself (`noteTimelineJump`).
     private let followsSourceContinuity: Bool
-    /// Output samples still to drop from the start of what the resampler produces (an overlap).
+    /// Output samples still to drop from the start of what the resampler produces (an overlap, or
+    /// audio before the timeline's start).
     private var pendingTrimSamples: Int64 = 0
+    /// `setOutputOffset`, in seconds, and in encoder ticks once the anchor has taken it.
+    private var outputOffsetSeconds: Double = 0
+    private var outputOffsetTicks: Int64 = 0
     /// What last broke the stream inside the bridge, named in the log line of the placement after it.
     private var continuityBreakCause: String?
 
@@ -807,6 +811,12 @@ final class AudioBridge: @unchecked Sendable {
         continuityBreakCause = nil
     }
 
+    func setOutputOffset(seconds: Double) {
+        opLock.lock()
+        defer { opLock.unlock() }
+        outputOffsetSeconds = seconds
+    }
+
     /// Drain everything buffered at source EOF: remaining decoder frames, FIFO leftover (< one encoder frame),
     /// encoder internal delay. Without this the final ~100-200 ms of every VOD title were dropped (feed's FIFO
     /// drain only emits FULL frames and nothing sent the encoder its EOF frame). Returns the tail packets; caller
@@ -1007,7 +1017,12 @@ final class AudioBridge: @unchecked Sendable {
                     // padding in front of the audio. AVFoundation trims exactly that padding on decode
                     // (measured: an E-AC-3 click comes out on the sample; `AppleAudioDecoderDelay`), so the
                     // audio plays on its source position, and the timeline never starts below zero.
-                    let position = av_rescale_q(frameTs, srcTimeBase, encoderTimeBase) &+ Int64(enc.pointee.initial_padding)
+                    if rebaseFromNextSourcePTS {
+                        outputOffsetTicks = Int64((outputOffsetSeconds * Double(encoderTimeBase.den)
+                                                   / Double(max(encoderTimeBase.num, 1))).rounded())
+                    }
+                    let position = av_rescale_q(frameTs, srcTimeBase, encoderTimeBase)
+                        &+ Int64(enc.pointee.initial_padding) &+ outputOffsetTicks
                     if rebaseFromNextSourcePTS {
                         // Never below zero: `baseMediaDecodeTime` is unsigned (AE#561). Audio before the
                         // timeline's start comes off the frame instead of wrapping.
