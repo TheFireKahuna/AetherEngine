@@ -142,13 +142,11 @@ struct MP4SampleIndex: SourceIndex {
         return bytes
     }
 
-    func readFrame(_ block: SourceIndexBlock, track: UInt64, from source: RandomAccessByteSource,
-                   prefix: Int?) -> SourceIndexFrame? {
-        guard let size = block.size else { return nil }
-        let count = prefix.map { min($0, size) } ?? size
-        guard let bytes = source.read(at: block.offset, count: count), bytes.count == count else { return nil }
+    func readFrame(_ block: SourceIndexBlock, track: UInt64, from source: RandomAccessByteSource) -> SourceIndexFrame? {
+        guard let size = block.size,
+              let bytes = source.read(at: block.offset, count: size), bytes.count == size else { return nil }
         return SourceIndexFrame(ticks: block.ticks, durationTicks: block.durationTicks, payload: bytes,
-                                webVTTSettings: nil, isPrefix: count < size)
+                                webVTTSettings: nil)
     }
 }
 

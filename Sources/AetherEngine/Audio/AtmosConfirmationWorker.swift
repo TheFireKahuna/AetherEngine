@@ -114,7 +114,7 @@ extension AetherEngine {
     }
 
     /// Teardown. `markClosed()` on the side demuxer so a parked AVIO read cannot outlive the session,
-    /// the same rule the native subtitle readers follow.
+    /// the same rule the subtitle source's walk follows.
     func cancelAtmosConfirmation() {
         atmosConfirmationTask?.cancel()
         atmosConfirmationTask = nil

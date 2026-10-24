@@ -161,7 +161,7 @@ struct Issue234SideReaderSeekAnchorTests {
                 demuxer: demuxer, store: store,
                 streamIndices: [subtitle], assemblyIndices: [],
                 pacingIndex: pacing,
-                leadSeconds: 60,
+                lead: { _ in 60 },
                 parkPollNanoseconds: 1_000_000,
                 playhead: { Self.seekTarget })
             return store.entries(streamIndex: subtitle, from: 0, through: 1000).map(\.ptsSeconds)

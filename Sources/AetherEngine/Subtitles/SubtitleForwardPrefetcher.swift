@@ -2,19 +2,17 @@ import Foundation
 import AetherLibavcodec
 import AetherLibavutil
 
-/// #151: subtitle-only forward side reader. The producer pump harvests subtitle packets only as
-/// far as its own forward park (#102), so the drainer's 60 s lead window (`subtitleDrainLeadSeconds`)
-/// is empty beyond a few seconds on direct-play sources and a host-applied ADVANCE sync offset
-/// finds no cues, text and bitmap alike. This reader fills the same session SubtitlePacketStore
-/// up to playhead + lead independently of the producer: it reads every embedded subtitle stream
-/// (all other streams discarded, #104), parks on the subtitle PTS axis, and resumes as the
-/// playhead advances. A packet the pump already harvested collapses onto its entry in the store on
-/// a byte-identical payload (#235: not on the PTS, which distinct cues share); split-PES PGS sets
-/// assemble under the `.prefetch` writer key so the pump's in-flight set is never corrupted.
+/// The read loop of the session's `SubtitleSource`: every subtitle packet from the anchor forward into
+/// the session `SubtitlePacketStore`, up to the furthest lead any consumer asks for, independently of the
+/// producer's forward park (#102, #151). Packets come from the container's index where it lists a stream
+/// in full (`IndexSource`) and from one walk of the stream otherwise (`DemuxerSource`); a session with
+/// both reads them through one loop (`CompositeSource`), so there is one park, one anchor and one
+/// coverage frontier whatever mix of streams it has. The walk also decodes each text stream into its
+/// native cue store. A packet the pump already harvested collapses onto its entry in the store on a
+/// byte-identical payload (#235: not on the PTS, which distinct cues share); split-PES PGS sets assemble
+/// under the `.prefetch` writer key so the pump's in-flight set is never corrupted.
 ///
-/// This is the loop half only; positioning (bounded seek + byte-estimate fallback), lifecycle,
-/// and seek re-anchoring live on the engine (`AetherEngine.startSubtitleForwardPrefetcher`),
-/// mirroring the native subtitle readers (memory rule: all side readers share positioning fixes).
+/// This is the loop half only; routes, demand, lifecycle and re-anchoring live on `SubtitleSource`.
 enum SubtitleForwardPrefetcher {
 
     /// How far behind the anchor a side reader starts reading, so the cue covering the anchor is
@@ -220,7 +218,7 @@ enum SubtitleForwardPrefetcher {
         streamIndices: Set<Int32>,
         assemblyIndices: Set<Int32>,
         pacingIndex: Int32,
-        leadSeconds: Double,
+        lead: @escaping @Sendable (_ playhead: Double) -> Double,
         parkPollNanoseconds: UInt64,
         link: SideReaderLinkArbiter? = nil,
         reanchor: SideReaderReanchor? = nil,
@@ -229,7 +227,7 @@ enum SubtitleForwardPrefetcher {
     ) async -> Outcome {
         await run(source: DemuxerSource(demuxer: demuxer, streamIndices: streamIndices,
                                         assemblyIndices: assemblyIndices, pacingIndex: pacingIndex),
-                  store: store, leadSeconds: leadSeconds, parkPollNanoseconds: parkPollNanoseconds,
+                  store: store, lead: lead, parkPollNanoseconds: parkPollNanoseconds,
                   link: link, reanchor: reanchor, fence: fence, playhead: playhead)
     }
 
@@ -239,16 +237,16 @@ enum SubtitleForwardPrefetcher {
     /// caller. One loop whatever the packets come from (`Source`): the stream walk and the
     /// container's index differ in how a packet is read and how a jump moves the reader, and in
     /// nothing this loop decides.
-    /// Harvest-then-park: the packet whose PTS crosses `playhead + leadSeconds` is stored before
+    /// Harvest-then-park: the packet whose PTS crosses `playhead + lead(playhead)` is stored before
     /// the loop parks, so the store may hold one packet past the lead edge (harmless; the drainer
-    /// window decides what decodes). The playhead is snapshot at start and refreshed only inside
-    /// the park loop, matching the native readers: no MainActor hop per packet during a backfill
+    /// window decides what decodes). The lead is asked at every park decision, so a consumer that
+    /// arrives or raises its lead moves the edge without a new session. The playhead is snapshot at
+    /// start and refreshed only inside the park loop: no MainActor hop per packet during a backfill
     /// burst.
-    ///
     static func run(
         source: Source,
         store: SubtitlePacketStore,
-        leadSeconds: Double,
+        lead: @escaping @Sendable (_ playhead: Double) -> Double,
         parkPollNanoseconds: UInt64,
         link: SideReaderLinkArbiter? = nil,
         reanchor: SideReaderReanchor? = nil,
@@ -278,10 +276,11 @@ enum SubtitleForwardPrefetcher {
         readLoop: while !Task.isCancelled {
             // #240: leave the link to the video path while it needs it. Asked before the read
             // because the read is what pulls bytes, and on a Matroska walk it pulls the video and
-            // audio bytes too. The lead is measured from the last read position, which is what the reader
-            // has actually banked; a session that has read nothing yet counts as lead 0 and is let
-            // through by the floor rule, so positioning is never blocked behind a busy pump forever.
-            if let link, valveGrantedUntil.map({ DispatchTime.now() > $0 }) ?? true {
+            // audio bytes too; a read from the index costs a few hundred bytes and is never held. The
+            // lead is measured from the last read position, which is what the reader has actually
+            // banked; a session that has read nothing yet counts as lead 0 and is let through by the
+            // floor rule, so positioning is never blocked behind a busy pump forever.
+            if let link, source.readsTheLink, valveGrantedUntil.map({ DispatchTime.now() > $0 }) ?? true {
                 var yielded: Double = 0
                 while !Task.isCancelled,
                       link.shouldYield(
@@ -307,7 +306,7 @@ enum SubtitleForwardPrefetcher {
                     valveGrantedUntil = DispatchTime.now() + link.valveGrantSeconds
                     SubtitlePrefetchTelemetry.recordLinkValveGrant()
                     EngineLog.emit(
-                        "[AetherEngine] #151 forward prefetch yielded the link for "
+                        "[SubtitleSource] yielded the link for "
                         + "\(Int(yielded))s; taking \(Int(link.valveGrantSeconds))s of it back "
                         + "(the video path is not releasing it)",
                         category: .engine)
@@ -321,7 +320,7 @@ enum SubtitleForwardPrefetcher {
             if let reanchor, let target = reanchor.take() {
                 let landed = source.reposition(to: target.seconds, reanchor: reanchor)
                 EngineLog.emit(
-                    "[AetherEngine] #151 forward prefetch re-anchored in place at "
+                    "[SubtitleSource] re-anchored in place at "
                     + "\(String(format: "%.2f", target.seconds))s (\(landed))",
                     category: .engine)
                 // #250: the banked position is now this seek's, and the pre-seek one is void.
@@ -346,8 +345,7 @@ enum SubtitleForwardPrefetcher {
                 // #231: a transport failure on the side reader, a stall that exhausts the read
                 // deadline, a reconnect that gives up. Distinct from EOF, and restartable.
                 EngineLog.emit(
-                    "[AetherEngine] #151 forward prefetch read failed after \(harvested) packets: "
-                    + "\(error)",
+                    "[SubtitleSource] read failed after \(harvested) packets: \(error)",
                     category: .engine)
                 exit = .readFailed
                 break
@@ -382,7 +380,7 @@ enum SubtitleForwardPrefetcher {
                 lastCoverageNoted = position
             }
             var didPark = false
-            while !Task.isCancelled, position > playheadSnapshot + leadSeconds {
+            while !Task.isCancelled, position > playheadSnapshot + lead(playheadSnapshot) {
                 // #496: a backward seek leaves the read position far past the new playhead, so this
                 // condition stays true for as long as the viewer stays behind it, and the loop never
                 // reaches the point where the move is taken. The pending move is what voids the
@@ -394,7 +392,7 @@ enum SubtitleForwardPrefetcher {
                 }
                 guard let fresh = await playhead() else { break readLoop }
                 playheadSnapshot = fresh
-                if position <= playheadSnapshot + leadSeconds { break }
+                if position <= playheadSnapshot + lead(playheadSnapshot) { break }
                 do { try await Task.sleep(nanoseconds: parkPollNanoseconds) } catch { break readLoop }
             }
             if didPark { SubtitlePrefetchTelemetry.recordPark(false) }
@@ -418,30 +416,48 @@ extension SubtitleForwardPrefetcher {
         case endOfFile
     }
 
-    /// Where `run` gets its packets: the stream itself or the container's own index.
+    /// Where `run` gets its packets: the stream itself, the container's own index, or both.
     protocol Source: AnyObject {
         /// One read. Throws for a transport failure (#231), which the caller restarts.
         func step(into store: SubtitlePacketStore) throws -> Step
         /// Move to `seconds` for an in-place re-anchor (#240); the answer is for the log line.
         func reposition(to seconds: Double, reanchor: SideReaderReanchor) -> String
+        /// Whether the next read pulls the stream's interleave over the link, so it yields to the video
+        /// path (#240).
+        var readsTheLink: Bool { get }
+    }
+
+    /// A text stream the walk decodes into its native rendition's cue store as it reads.
+    struct CueRoute {
+        let decoder: EmbeddedSubtitleDecoder
+        let store: NativeSubtitleCueStore
     }
 
     /// The stream walk: every packet the demuxer delivers, the targets harvested, the pacing stream
-    /// placed (#230).
+    /// placed (#230), and each text stream with a rendition decoded into its cue store.
     final class DemuxerSource: Source {
         private let demuxer: Demuxer
         private let streamIndices: Set<Int32>
         private let assemblyIndices: Set<Int32>
         private let pacingIndex: Int32
+        private let cueRoutes: [Int32: CueRoute]
+        private let cuesArrived: (@Sendable () -> Void)?
         private var timeBaseCache: [Int32: AVRational] = [:]
         private var timeBaseFailures = 0
+        /// How far this run has read for the cue stores (`noteRead`); nil until its first placed packet.
+        private var cueReadThrough: Double?
 
-        init(demuxer: Demuxer, streamIndices: Set<Int32>, assemblyIndices: Set<Int32>, pacingIndex: Int32) {
+        init(demuxer: Demuxer, streamIndices: Set<Int32>, assemblyIndices: Set<Int32>, pacingIndex: Int32,
+             cueRoutes: [Int32: CueRoute] = [:], cuesArrived: (@Sendable () -> Void)? = nil) {
             self.demuxer = demuxer
             self.streamIndices = streamIndices
             self.assemblyIndices = assemblyIndices
             self.pacingIndex = pacingIndex
+            self.cueRoutes = cueRoutes
+            self.cuesArrived = cuesArrived
         }
+
+        var readsTheLink: Bool { true }
 
         func step(into store: SubtitlePacketStore) throws -> Step {
             guard let pkt = try demuxer.readPacket() else { return .endOfFile }
@@ -464,8 +480,7 @@ extension SubtitleForwardPrefetcher {
                 SubtitlePrefetchTelemetry.recordTimeBaseFallback()
                 if timeBaseFailures == 1 {
                     EngineLog.emit(
-                        "[AetherEngine] #151 forward prefetch: no usable time base for stream "
-                        + "\(streamIdx); packet dropped (logged once)",
+                        "[SubtitleSource] no usable time base for stream \(streamIdx); packet dropped (logged once)",
                         category: .engine)
                 }
                 return .skipped
@@ -474,16 +489,36 @@ extension SubtitleForwardPrefetcher {
                 store.harvest(streamIndex: streamIdx, packet: pkt, timeBase: tb,
                               assembleSplitDisplaySets: assemblyIndices.contains(streamIdx),
                               writer: .prefetch)
+                if let route = cueRoutes[streamIdx],
+                   let event = route.decoder.decode(packet: pkt, streamTimeBase: tb), !event.cues.isEmpty {
+                    route.store.appendCues(event.cues)
+                    cuesArrived?()
+                }
             }
             let position = packetSeconds(pts: pkt.pointee.pts, dts: pkt.pointee.dts,
                                          timeBase: tb, preferDecodeOrder: !isTarget)
             var p: UnsafeMutablePointer<AVPacket>? = pkt
             trackedPacketFree(&p)
+            if let position { noteCueReading(through: position) }
             if isTarget { return .harvested(at: position) }
             return position.map { .paced(at: $0) } ?? .skipped
         }
 
+        /// The reading has passed `position`, so every cue store this walk feeds holds every line before
+        /// it, a track with nothing to say there included (a forced one, mostly). Less a margin: a muxer
+        /// interleaves a subtitle block by its own time, which can trail the packet in hand.
+        private func noteCueReading(through position: Double) {
+            guard !cueRoutes.isEmpty else { return }
+            guard let from = cueReadThrough else { cueReadThrough = position; return }
+            let through = position - AetherEngine.nativeSubtitleReadMarginSeconds
+            guard through > from else { return }
+            for route in cueRoutes.values { route.store.noteRead(from: from, through: through) }
+            cueReadThrough = through
+        }
+
         func reposition(to seconds: Double, reanchor: SideReaderReanchor) -> String {
+            // What this run read before the move is not contiguous with what it reads after it.
+            cueReadThrough = nil
             let landed = SubtitleForwardPrefetcher.reposition(
                 demuxer: demuxer, to: seconds, anchorStreamIndex: reanchor.anchorStreamIndex,
                 fallbackDuration: reanchor.fallbackDuration, timeout: reanchor.seekTimeout)
@@ -491,12 +526,12 @@ extension SubtitleForwardPrefetcher {
         }
     }
 
-    /// The container's index (`SourceIndex`): every subtitle frame read where the index says it is, as
-    /// the packet libavformat would hand over, in one time order across the streams, and nothing else
-    /// of the file. The walk reads the interleave to find these packets: on Matroska the video too
-    /// (libavformat reads every block off the wire before honouring a discard), on an MP4 every video
-    /// keyframe of its pacing stream, so a lead cost that much film; here it costs its cues. No pacing
-    /// stream is needed: frames come in time order, so every step is a read position.
+    /// The container's index (`SourceIndex`): every subtitle frame of the streams it lists in full, read
+    /// where the index says it is, as the packet libavformat would hand over, in one time order across the
+    /// streams, and nothing else of the file. The walk reads the interleave to find these packets: on
+    /// Matroska the video too (libavformat reads every block off the wire before honouring a discard), on
+    /// an MP4 every video keyframe of its pacing stream, so a lead cost that much film; here it costs its
+    /// cues. No pacing stream is needed: frames come in time order, so every step is a read position.
     final class IndexSource: Source {
         struct Stream: Sendable {
             let streamIndex: Int32
@@ -525,16 +560,19 @@ extension SubtitleForwardPrefetcher {
             cursor = cursors(at: seconds)
         }
 
-        /// The streams of `index` the walk would harvest, or nil when any of them is one the index
-        /// cannot stand in for (no track, a codec whose frame is not its packet, an incomplete list).
-        /// All or nothing, so a stream the index cannot vouch for is never the one left out.
+        /// Which of `streams` the index can stand in for: a stream it pairs with a track, of a codec
+        /// whose frame is its packet, listed in full. Each refused stream is named with the reason, and
+        /// is the walk's.
         static func plan(index: any SourceIndex, listed: [IndexedSubtitleStream],
                          streams: Set<Int32>) -> (streams: [Stream], refused: [String]) {
             let tracks = index.trackNumbers(for: listed)
             var plan: [Stream] = []
             var refused: [String] = []
-            for entry in listed where streams.contains(entry.streamIndex) {
-                let streamIndex = entry.streamIndex
+            for streamIndex in streams.sorted() {
+                guard let entry = listed.first(where: { $0.streamIndex == streamIndex }) else {
+                    refused.append("\(streamIndex): not listed")
+                    continue
+                }
                 guard let track = tracks[streamIndex] else { refused.append("\(streamIndex): no track"); continue }
                 guard index.packetCodecs.contains(entry.codecName) else {
                     refused.append("\(streamIndex): \(entry.codecName)")
@@ -546,17 +584,16 @@ extension SubtitleForwardPrefetcher {
                 }
                 plan.append(Stream(streamIndex: streamIndex, track: track, blocks: index.blocks(track: track)))
             }
-            if plan.count != streams.count, refused.isEmpty { refused.append("streams not listed") }
             return (plan, refused)
         }
 
+        var readsTheLink: Bool { false }
+
+        /// When the next frame read is, on the source axis; nil once every stream is read.
+        var nextSeconds: Double? { next()?.seconds }
+
         func step(into store: SubtitlePacketStore) throws -> Step {
-            var next: (stream: Int, seconds: Double)?
-            for (position, stream) in streams.enumerated() where cursor[position] < stream.blocks.count {
-                let seconds = index.seconds(ticks: stream.blocks[cursor[position]].ticks, track: stream.track)
-                if next == nil || seconds < next!.seconds { next = (position, seconds) }
-            }
-            guard let next else { return .endOfFile }
+            guard let next = next() else { return .endOfFile }
             let stream = streams[next.stream]
             let block = stream.blocks[cursor[next.stream]]
             cursor[next.stream] += 1
@@ -585,6 +622,16 @@ extension SubtitleForwardPrefetcher {
             return "index"
         }
 
+        /// The stream whose next frame comes first, and that frame's time.
+        private func next() -> (stream: Int, seconds: Double)? {
+            var next: (stream: Int, seconds: Double)?
+            for (position, stream) in streams.enumerated() where cursor[position] < stream.blocks.count {
+                let seconds = index.seconds(ticks: stream.blocks[cursor[position]].ticks, track: stream.track)
+                if next == nil || seconds < next!.seconds { next = (position, seconds) }
+            }
+            return next
+        }
+
         /// Per stream, the first block at or after `seconds` less the walk's own backscan.
         private func cursors(at seconds: Double) -> [Int] {
             let from = seconds - anchorBackscanSeconds
@@ -601,6 +648,63 @@ extension SubtitleForwardPrefetcher {
         struct IndexReadFailure: Error, CustomStringConvertible {
             let consecutive: Int
             var description: String { "\(consecutive) index blocks unreadable in a row" }
+        }
+    }
+
+    /// The index and the walk read as one: each step reads from whichever is behind, so both advance
+    /// together, every position stepped is one both have read to, and the loop parks and re-anchors them
+    /// as one reader.
+    final class CompositeSource: Source {
+        private let index: IndexSource
+        private let walk: DemuxerSource
+        /// The walk's read position: the anchor less the backscan until its first placed packet.
+        private var walkPosition: Double
+        private var indexDone = false
+        private var walkDone = false
+
+        init(index: IndexSource, walk: DemuxerSource, from seconds: Double) {
+            self.index = index
+            self.walk = walk
+            walkPosition = seconds - anchorBackscanSeconds
+        }
+
+        var readsTheLink: Bool { nextIsWalk }
+
+        private var nextIsWalk: Bool {
+            if walkDone { return false }
+            if indexDone { return true }
+            return (index.nextSeconds ?? .infinity) > walkPosition
+        }
+
+        func step(into store: SubtitlePacketStore) throws -> Step {
+            if indexDone, walkDone { return .endOfFile }
+            if nextIsWalk {
+                let step = try walk.step(into: store)
+                switch step {
+                case .endOfFile:
+                    walkDone = true
+                    return indexDone ? .endOfFile : .skipped
+                case .harvested(let at?), .paced(let at):
+                    walkPosition = max(walkPosition, at)
+                default:
+                    break
+                }
+                return step
+            }
+            let step = try index.step(into: store)
+            if step == .endOfFile {
+                indexDone = true
+                return walkDone ? .endOfFile : .skipped
+            }
+            return step
+        }
+
+        func reposition(to seconds: Double, reanchor: SideReaderReanchor) -> String {
+            indexDone = false
+            walkDone = false
+            walkPosition = seconds - anchorBackscanSeconds
+            _ = index.reposition(to: seconds, reanchor: reanchor)
+            return "index, \(walk.reposition(to: seconds, reanchor: reanchor))"
         }
     }
 }

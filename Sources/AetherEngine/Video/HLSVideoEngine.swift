@@ -469,20 +469,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         subtitleTapLock.lock()
         defer { subtitleTapLock.unlock() }
         subtitleTapRoutes.removeAll()
-        guard let dem = demuxer else { return }
-        let w = savedVideoConfig.map { Int32($0.codecpar.pointee.width) } ?? 1920
-        let h = savedVideoConfig.map { Int32($0.codecpar.pointee.height) } ?? 1080
+        guard demuxer != nil else { return }
         for (ordinal, sidx) in nativeSubtitleSourceStreamIndicesForSession.enumerated() {
-            guard let sidx, ordinal < nativeSubtitleCueStoresForSession.count else { continue }
-            // Audit DMX-108: see `makeOverlayDecoder`.
-            let made = dem.withStream(at: sidx) { stream in
-                EmbeddedSubtitleDecoder(stream: stream,
-                                        sourceVideoWidth: w > 0 ? w : 1920,
-                                        sourceVideoHeight: h > 0 ? h : 1080,
-                                        preserveASSMarkup: preserveASSMarkupForSubtitleTap,
-                                        teletextPage: teletextPageForSubtitleTap)
-            }
-            guard let decoder = made ?? nil else { continue }
+            guard let sidx, ordinal < nativeSubtitleCueStoresForSession.count,
+                  let decoder = makeOverlayDecoder(streamIndex: sidx) else { continue }
             subtitleTapRoutes[sidx] = (decoder, nativeSubtitleCueStoresForSession[ordinal])
         }
         if !subtitleTapRoutes.isEmpty {

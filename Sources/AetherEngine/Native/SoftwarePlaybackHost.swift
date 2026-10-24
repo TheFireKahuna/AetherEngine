@@ -1684,6 +1684,10 @@ final class SoftwarePlaybackHost {
 
     /// #112 rework: build an overlay decoder for any embedded subtitle stream, seeded from the
     /// session's video dims like the HLS tap routes. The drainer owns the returned decoder.
+    /// The session's demuxer, which lists the subtitle streams and names the source's index for the
+    /// engine's `SubtitleSource`.
+    var subtitleSourceDemuxer: Demuxer? { demuxer }
+
     func makeOverlayDecoder(streamIndex: Int32) -> EmbeddedSubtitleDecoder? {
         guard let dem = demuxer, let stream = dem.stream(at: streamIndex) else { return nil }
         let vpar = dem.stream(at: videoStreamIndex)?.pointee.codecpar

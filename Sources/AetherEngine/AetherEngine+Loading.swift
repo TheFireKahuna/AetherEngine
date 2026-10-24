@@ -1280,7 +1280,7 @@ extension AetherEngine {
         // packet-store drainer, not by tap-event forwarding.
         session.preserveASSMarkupForSubtitleTap = loadedOptions.preserveASSMarkup
         session.teletextPageForSubtitleTap = loadedOptions.teletextPage
-        EngineLog.emit("[AetherEngine] native subtitles: prepare=\(loadedOptions.prepareNativeSubtitles) eager=\(loadedOptions.eagerNativeSubtitleReaders) textTracks=\(nativeSubtitleTrackTable.count) bitmapOCR=\(bitmapEntries.count) enable=\(session.enableNativeSubtitleTrackForSession)", category: .engine)
+        EngineLog.emit("[AetherEngine] native subtitles: prepare=\(loadedOptions.prepareNativeSubtitles) textTracks=\(nativeSubtitleTrackTable.count) bitmapOCR=\(bitmapEntries.count) enable=\(session.enableNativeSubtitleTrackForSession)", category: .engine)
 
         // #77: arm the in-band CC tap before start() so the first producer keeps the CC stream.
         setupClosedCaptionTapIfNeeded(session: session)
@@ -1438,32 +1438,14 @@ extension AetherEngine {
             if !stores.isEmpty {
                 let shift = session.playlistShiftSeconds
                 stores.forEach { $0.setShiftSeconds(shift) }
-                nativeSubtitleReaderParams = (url: url, stores: stores)
                 // #88: load-declared external tracks fill their stores with one whole-file decode
-                // each (no side demuxer); embedded tracks keep the pump-tap / reader paths below.
+                // each (no side demuxer); embedded tracks are the pump tap's and the subtitle source's.
                 startExternalNativeStoreFill(session: session)
-                // Embedded tracks the container indexes in full are read from the index instead.
-                startIndexedSubtitleFill(session: session, url: url)
-                // Sodalite#32: the producer's pump tap fills these stores for the whole produced region at
-                // zero side-channel bandwidth, so the eager at-load readers (which competed with playback
-                // for the remote link at startup) are only a fallback for sessions whose tap could not arm
-                // (no demuxable stream indices, e.g. all-sidecar). The lazy reader on PiP selection stays:
-                // it covers AVKit's ~240s forward .vtt prefetch burst beyond the produced region.
-                let tapArmed = session.nativeSubtitleSourceStreamIndicesForSession.contains { $0 != nil }
-                if loadedOptions.eagerNativeSubtitleReaders && !tapArmed {
-                    // Anchor at the SESSION START POSITION (resume), not 0, and read straight to EOF (no
-                    // read-ahead parking). A from-0 read behind a resume position spent the whole session
-                    // catching up over a remote link and never covered the playhead (device: readMax 48s vs
-                    // playhead 304s, every .vtt served empty).
-                    let readEOF = !loadedOptions.isLive
-                    startNativeSubtitleReaders(url: url, stores: stores,
-                                               readToEOF: readEOF, startAtSeconds: startPosition ?? 0)
-                    EngineLog.emit("[AetherEngine] native subtitle eager readers started: stores=\(stores.count) readToEOF=\(readEOF) startAt=\(String(format: "%.1f", startPosition ?? 0))", category: .engine)
-                } else if tapArmed {
-                    EngineLog.emit("[AetherEngine] pump tap active; eager readers skipped (lazy reader covers the select burst)", category: .engine)
-                }
             }
         }
+        // The session's one subtitle reader. Built after the stores exist, so the text renditions the
+        // container indexes in full are filled whole now, before AVKit asks for them.
+        startSubtitleSource()
 
         // Reuse the existing host across native->native reloads (issue #15): a fresh AVPlayer breaks AVKit's MediaRemote re-registration ("Code=14 client callback"), blanking the Control Center widget. stopInternal kept the host alive (keepNativeHost).
         let host: NativeAVPlayerHost
@@ -2243,6 +2225,7 @@ extension AetherEngine {
         }
         // A TrueHD Atmos track the host renders to APAC wants the activator, as the HLS route's does.
         followAtmosOutput()
+        startSubtitleSource()
     }
 
     /// Open `AudioPlaybackHost` for an audio-only source. No HLS pipeline, display layer, or display-criteria handshake. Same lifecycle as `loadSoftware`.

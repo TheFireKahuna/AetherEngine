@@ -152,6 +152,12 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
         return max(cueEnd, through)
     }
 
+    /// The reading span on the axis `readThrough(at:)` answers on; nil before any feeder reported one.
+    var readingSpan: (from: Double, through: Double)? {
+        lock.lock(); defer { lock.unlock() }
+        return readSpan.map { ($0.from - shiftSeconds, $0.through - shiftSeconds) }
+    }
+
     var cueCount: Int { lock.lock(); defer { lock.unlock() }; return cues.count }
 
     /// Snapshot of all text cues sorted by start, source axis (the overlay backfill on selection,
