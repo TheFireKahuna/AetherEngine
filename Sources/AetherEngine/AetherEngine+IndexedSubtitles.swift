@@ -85,30 +85,11 @@ extension AetherEngine {
         guard !loadedOptions.isLive, let demuxer = session.demuxer,
               demuxer.containerFormatName?.contains("matroska") == true else { return }
         let stores = session.nativeSubtitleCueStoresForSession
-        // Every subtitle stream in order (they map onto the TrackEntries by order), with the facts the
-        // renditions need from them.
-        var streams: [MatroskaSubtitleIndex.SubtitleStream] = []
+        // Every subtitle stream in order, with the facts the renditions need from them.
+        let listed = Self.matroskaSubtitleStreams(of: demuxer)
+        let streams = listed.map(\.stream)
         var facts: [Int32: (frames: Int?, timeBase: AVRational)] = [:]
-        var index: Int32 = 0
-        while let stream = demuxer.withStream(at: index, { st -> (MatroskaSubtitleIndex.SubtitleStream, Int?, AVRational)? in
-            guard st.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else { return nil }
-            func tag(_ key: String) -> String? {
-                av_dict_get(st.pointee.metadata, key, nil, AV_DICT_IGNORE_SUFFIX).map { String(cString: $0.pointee.value) }
-            }
-            let frames = tag("NUMBER_OF_FRAMES").flatMap { Int($0) }
-            let subtitle = MatroskaSubtitleIndex.SubtitleStream(
-                streamIndex: index, trackID: st.pointee.id,
-                codecName: String(cString: avcodec_get_name(st.pointee.codecpar.pointee.codec_id)),
-                language: av_dict_get(st.pointee.metadata, "language", nil, 0).map { String(cString: $0.pointee.value) },
-                frames: frames, bytes: tag("NUMBER_OF_BYTES").flatMap { Int64($0) })
-            return (subtitle, frames, st.pointee.time_base)
-        }) {
-            if let (subtitle, frames, timeBase) = stream {
-                streams.append(subtitle)
-                facts[index] = (frames, timeBase)
-            }
-            index += 1
-        }
+        for entry in listed { facts[entry.stream.streamIndex] = (entry.frames, entry.timeBase) }
         var pending: [(ordinal: Int, stream: Int32, kind: IndexedRenditionPlan.Kind, language: String?)] = []
         for (ordinal, entry) in nativeSubtitleTrackTable.enumerated() {
             guard ordinal < stores.count, let stream = entry.sourceStreamIndex, entry.externalID == nil,
@@ -120,7 +101,7 @@ extension AetherEngine {
         guard !pending.isEmpty else { return }
 
         let opener = indexedSubtitleReaderOpener(url: url)
-        let indexSource = SourceCacheKey(url: url, headers: indexedSubtitleRequestHeaders())
+        let indexHeaders = indexedSubtitleRequestHeaders()
         let duration = duration
         indexedSubtitleTask = BlockingWork.detached(priority: .utility) { [weak self] in
             guard let root = opener() else {
@@ -130,11 +111,9 @@ extension AetherEngine {
             }
             // The source's one index (`SourceIndexRegistry`): parsed here only if no consumer of this
             // source has parsed it yet, and then over this fill's own reader.
-            let source = IOReaderByteSource(root, closesReader: false)
             let began = Date()
             let outcome = await SourceIndexRegistry.shared.matroskaIndex(
-                for: .init(source: indexSource, size: root.seek(offset: 0, whence: 65536)),
-                open: { source })
+                of: url, headers: indexHeaders, through: root)
             guard let index = outcome.index else {
                 EngineLog.emit("[IndexedSubtitles] no usable index (\(outcome)); the stream-walking fill stays",
                                category: .engine)
@@ -198,10 +177,7 @@ extension AetherEngine {
         }
         if url.isFileURL { return { FileIOReader(url: url) } }
         let resolved = indexedSubtitleRequestHeaders()
-        return {
-            HTTPDiscIOReader(url: url, extraHeaders: resolved, baseChunkSize: 4096, maxChunkSize: 4 * 1024 * 1024,
-                             sourceCache: .shared, label: "subindex")
-        }
+        return { Self.indexedSourceReader(url: url, headers: resolved, label: "subindex") }
     }
 
     func cancelIndexedSubtitleFill() {

@@ -57,6 +57,16 @@ final class SourceIndexRegistry: @unchecked Sendable {
     private var order: [Key] = []
     private var parses = 0
 
+    /// The Matroska index of `url` as asked for with `headers`, parsed (if it has not been) through
+    /// `reader`. The key is derived here, from the request and the reader's own size, so two consumers
+    /// of one source cannot name it differently and parse it twice. `reader` stays the caller's.
+    func matroskaIndex(of url: URL, headers: [String: String], through reader: IOReader) async -> Outcome {
+        let key = Key(source: SourceCacheKey(url: url, headers: headers),
+                      size: reader.seek(offset: 0, whence: 65536))
+        let source = IOReaderByteSource(reader, closesReader: false)
+        return await matroskaIndex(for: key, open: { source })
+    }
+
     /// The Matroska index of the source at `key`. Parsed by the first caller, from the byte source
     /// `open` hands over (nil reads as not readable and is not remembered), and by no caller after it.
     /// The parse runs on its own task, so a caller that is cancelled while waiting leaves it to finish

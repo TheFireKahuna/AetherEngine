@@ -986,41 +986,60 @@ extension AetherEngine {
             return SubtitleForwardPrefetcher.Outcome(exit: .openFailed, harvested: 0)
         }
         let assembly = demuxer.splitDisplaySetSubtitleStreamIndices()
-        // #230: one non-subtitle stream stays deliverable at AVDISCARD_NONKEY so the loop has a
-        // read-position control point between cues. AVDISCARD_ALL is applied inside av_read_frame,
-        // so a fully discarded source hands the loop nothing at all between two subtitle packets
-        // and a single read call walks whatever lies between them.
-        let pacing = demuxer.prefetchPacingStreamIndex()
-        demuxer.discardAllStreamsExcept(streams, pacing: pacing)
-
-        // Prewarm MKV cue index (lives at EOF), then bounded positioning with the verified
-        // byte-estimate fallback, both budgeted (#112 round 10). Skip prewarm for disc (#76).
-        let duration = demuxer.duration
-        if duration > 0, !demuxer.isDiscSource {
-            demuxer.seekBounded(to: duration * 0.5, timeout: Self.sideReaderSeekBudgetSeconds)
-        }
-        // #234: anchor the positioning on the subtitle axis explicitly. A -1 seek lets libavformat
-        // pick the reference stream by score, and `discard != AVDISCARD_ALL` is worth +200 there:
-        // before #230 the subtitle stream was the only stream not fully discarded and won that
-        // vote by accident, after #230 the pacing stream outranks it and the seek lands on a video
-        // keyframe instead. On Matroska that is a different cluster, so a landing cue further back
-        // than one keyframe is behind the read head before the first packet arrives and the seek
-        // destination stays dark. Lowest index matches what the score used to elect.
+        // The container's own index, when it lists every stream completely: then its blocks are read
+        // where it says they are, and none of the walk below is needed (no pacing stream, no cue
+        // index prewarm, no positioning seek, none of the interleave). Otherwise the stream walk.
+        let indexed = reader == nil
+            ? await indexedForwardPrefetchSource(url: url, headers: headers, headerStore: headerStore,
+                                                 demuxer: demuxer, streams: streams, assembly: assembly,
+                                                 startAt: startAt)
+            : nil
+        defer { indexed?.reader.close() }
+        let source: SubtitleForwardPrefetcher.Source
+        let pacing: Int32
         let seekAnchor = streams.min() ?? -1
         let engineDisplayDuration = await MainActor.run { [weak self] in self?.duration ?? 0 }
-        let landed = SubtitleForwardPrefetcher.reposition(
-            demuxer: demuxer, to: startAt, anchorStreamIndex: seekAnchor,
-            fallbackDuration: engineDisplayDuration,
-            timeout: Self.sideReaderSeekBudgetSeconds)
-        // #416: this session reads forwards from here, and nothing below it is this reader's to
-        // claim. Stated even when the positioning fell back or failed: what the loop then reads is
-        // still forwards from wherever it sits, and the anchor is the earliest it can be.
-        store.noteHarvestAnchor(.prefetch, at: startAt)
-        if landed != .seek {
-            EngineLog.emit(
-                "[AetherEngine] #151 forward prefetch seek to \(String(format: "%.2f", startAt))s timed out "
-                + "or failed; byte-estimate fallback \(landed == .byteEstimate ? "applied" : "unavailable")",
-                category: .engine)
+        if let indexed {
+            source = indexed.source
+            pacing = -1
+            store.noteHarvestAnchor(.prefetch, at: startAt)
+        } else {
+            // #230: one non-subtitle stream stays deliverable at AVDISCARD_NONKEY so the loop has a
+            // read-position control point between cues. AVDISCARD_ALL is applied inside av_read_frame,
+            // so a fully discarded source hands the loop nothing at all between two subtitle packets
+            // and a single read call walks whatever lies between them.
+            pacing = demuxer.prefetchPacingStreamIndex()
+            demuxer.discardAllStreamsExcept(streams, pacing: pacing)
+
+            // Prewarm MKV cue index (lives at EOF), then bounded positioning with the verified
+            // byte-estimate fallback, both budgeted (#112 round 10). Skip prewarm for disc (#76).
+            let duration = demuxer.duration
+            if duration > 0, !demuxer.isDiscSource {
+                demuxer.seekBounded(to: duration * 0.5, timeout: Self.sideReaderSeekBudgetSeconds)
+            }
+            // #234: anchor the positioning on the subtitle axis explicitly. A -1 seek lets libavformat
+            // pick the reference stream by score, and `discard != AVDISCARD_ALL` is worth +200 there:
+            // before #230 the subtitle stream was the only stream not fully discarded and won that
+            // vote by accident, after #230 the pacing stream outranks it and the seek lands on a video
+            // keyframe instead. On Matroska that is a different cluster, so a landing cue further back
+            // than one keyframe is behind the read head before the first packet arrives and the seek
+            // destination stays dark. Lowest index matches what the score used to elect.
+            let landed = SubtitleForwardPrefetcher.reposition(
+                demuxer: demuxer, to: startAt, anchorStreamIndex: seekAnchor,
+                fallbackDuration: engineDisplayDuration,
+                timeout: Self.sideReaderSeekBudgetSeconds)
+            // #416: this session reads forwards from here, and nothing below it is this reader's to
+            // claim. Stated even when the positioning fell back or failed: what the loop then reads is
+            // still forwards from wherever it sits, and the anchor is the earliest it can be.
+            store.noteHarvestAnchor(.prefetch, at: startAt)
+            if landed != .seek {
+                EngineLog.emit(
+                    "[AetherEngine] #151 forward prefetch seek to \(String(format: "%.2f", startAt))s timed out "
+                    + "or failed; byte-estimate fallback \(landed == .byteEstimate ? "applied" : "unavailable")",
+                    category: .engine)
+            }
+            source = SubtitleForwardPrefetcher.DemuxerSource(
+                demuxer: demuxer, streamIndices: streams, assemblyIndices: assembly, pacingIndex: pacing)
         }
 
         // #240: hand the running loop its own anchor box, so a playhead jump moves the cursor
@@ -1043,22 +1062,28 @@ extension AetherEngine {
         }
 
         EngineLog.emit(
-            "[AetherEngine] #151 forward prefetch started: streams=\(streams.sorted()) "
-            + "pacing=\(pacing) anchor=\(seekAnchor) "
+            "[AetherEngine] #151 forward prefetch started \(indexed == nil ? "walking the stream" : "from the index"): "
+            + "streams=\(streams.sorted()) pacing=\(pacing) anchor=\(seekAnchor) "
             + "startAt=\(String(format: "%.2f", startAt))s lead=\(leadSeconds)s",
             category: .engine)
-        let outcome = await SubtitleForwardPrefetcher.run(
-            demuxer: demuxer, store: store,
-            streamIndices: streams, assemblyIndices: assembly,
-            pacingIndex: pacing,
-            leadSeconds: leadSeconds,
-            parkPollNanoseconds: Self.subtitleForwardPrefetchParkPollNanoseconds,
-            link: link,
-            reanchor: reanchor,
-            fence: fence,
-            playhead: { [weak self] in
-                await MainActor.run(body: { [weak self] in self?.sourceTime })
-            })
+        let indexReader = indexed?.reader
+        let outcome = await withTaskCancellationHandler {
+            await SubtitleForwardPrefetcher.run(
+                source: source, store: store,
+                leadSeconds: leadSeconds,
+                parkPollNanoseconds: Self.subtitleForwardPrefetchParkPollNanoseconds,
+                // The index reads a few hundred bytes a block; it has no link to yield (#240).
+                link: indexed == nil ? link : nil,
+                reanchor: reanchor,
+                fence: fence,
+                playhead: { [weak self] in
+                    await MainActor.run(body: { [weak self] in self?.sourceTime })
+                })
+        } onCancel: {
+            // A block read in flight is a ranged GET; teardown must not wait out its timeout. The
+            // walk's demuxer is ended by the engine's own teardown (`markClosed`).
+            indexReader?.cancel()
+        }
         EngineLog.emit(
             "[AetherEngine] #151 forward prefetch exited (reason=\(outcome.exit) "
             + "cancelled=\(Task.isCancelled)) harvested=\(outcome.harvested)",
