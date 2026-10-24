@@ -2091,17 +2091,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             resolveUnlabelledTrueHDAtmos(
                 audioStream: audioStream, audioDemuxer: audioDem, streamIndex: audioStreamIndex)
             let compat = AudioCodecCompat.from(codecID)
-            // HE-AAC needs bridging only when there is no ASC (live ADTS/MPEG-TS): synthesized ASC
-            // would declare LC at the SBR output rate, decoded as garbage by AudioToolbox (-11821).
-            // Movie containers already carry a correct ASC so stream-copy works (AetherEngine#33).
-            let acpForHE = audioStream.pointee.codecpar.pointee
-            let hasASC = acpForHE.extradata != nil && acpForHE.extradata_size > 0
-            let isHEAAC = acpForHE.codec_id == AV_CODEC_ID_AAC
-                && Self.aacRequiresBridge(
-                    profile: acpForHE.profile,
-                    frameSize: acpForHE.frame_size,
-                    hasASC: hasASC
-                )
+            let sourceAudio = audioStream.pointee.codecpar.pointee
             // AE#764: CoreMedia refuses a FLAC min_blocksize under 192 and hangs on frames smaller than the
             // field claims, so a stream with small blocks cannot be copied, only decoded.
             let flacBlocksTooSmall = compat == .flac
@@ -2115,23 +2105,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     + "\(FLACStreamInfo.coreMediaMinimumBlockSize), bridging instead of stream-copy",
                     category: .session
                 )
-            } else if compat.requiresBridge || isHEAAC {
+            } else if compat.requiresBridge {
                 bridgePreferred = true
                 EngineLog.emit(
-                    isHEAAC
-                        ? "[HLSVideoEngine] audio: HE-AAC (profile=\(acpForHE.profile) frameSize=\(acpForHE.frame_size)), ADTS stream-copy would mis-signal SBR, bridging instead"
-                        : "[HLSVideoEngine] audio: codec=\(compat) (bridge required), decoding + "
+                    "[HLSVideoEngine] audio: codec=\(compat) (bridge required), decoding + "
                           + (Self.spatialRenderingLayout(
-                                rendering: objectAudioRendering, codecID: acpForHE.codec_id,
-                                profile: acpForHE.profile, sampleRate: acpForHE.sample_rate)
+                                rendering: objectAudioRendering, codecID: sourceAudio.codec_id,
+                                profile: sourceAudio.profile, sampleRate: sourceAudio.sample_rate)
                              .map { layout in
-                                 Self.objectAudioSource(codecID: acpForHE.codec_id, profile: acpForHE.profile) == .trueHDAtmos
+                                 Self.objectAudioSource(codecID: sourceAudio.codec_id, profile: sourceAudio.profile) == .trueHDAtmos
                                      ? "Atmos object render into \(layout.rawValue), APAC"
                                      : "DTS:X render into \(layout.rawValue) if its first frame decodes as DTS:X, APAC"
                              }
                              ?? Self.encoderLabel(AudioBridge.bridgeEncoder(
                                 for: audioBridgeMode,
-                                sourceChannels: acpForHE.ch_layout.nb_channels)).uppercased())
+                                sourceChannels: sourceAudio.ch_layout.nb_channels)).uppercased())
                           + " re-encode",
                     category: .session
                 )
@@ -2141,8 +2129,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 // pump strips per-frame ADTS headers.
                 let stripAdts = Self.prepareAACForFMP4(audioStream.pointee.codecpar)
                 if stripAdts {
+                    let asc = audioStream.pointee.codecpar.pointee
                     EngineLog.emit(
-                        "[HLSVideoEngine] audio: AAC/ADTS from TS, synthesised ASC + stripping ADTS for fMP4 stream-copy (no FLAC bridge)",
+                        "[HLSVideoEngine] audio: AAC/ADTS, AudioSpecificConfig "
+                        + (0..<Int(asc.extradata_size)).map { String(format: "%02x", asc.extradata[$0]) }.joined()
+                        + " (object type \(Self.aacObjectType(profile: asc.profile, frameSize: asc.frame_size))) "
+                        + "+ stripping ADTS for fMP4 stream-copy",
                         category: .session
                     )
                 }
@@ -2191,7 +2183,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 // `probeWriteHeader` in buildProducerWithAudioCascade catches and bridges that.
                 let isJOC = compat == .eac3 && acp.profile == 30
                 audioIsAtmosStreamCopy = isJOC
-                audioHLSCodecs = compat.hlsCodecsString
+                // RFC 6381: mp4a.40 and the object type, so HE-AAC is 40.5 and HE-AACv2 40.29.
+                audioHLSCodecs = compat == .aac
+                    ? "mp4a.40.\(Self.aacObjectType(profile: acp.profile, frameSize: acp.frame_size))"
+                    : compat.hlsCodecsString
                 EngineLog.emit(
                     "[HLSVideoEngine] audio: codec=\(compat) → stream-copy as `\(audioHLSCodecs ?? "?")` "
                     + "\(isJOC ? "[JOC=Atmos] " : "")"
