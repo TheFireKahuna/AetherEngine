@@ -120,6 +120,7 @@ extension AetherEngine {
         guard !pending.isEmpty else { return }
 
         let opener = indexedSubtitleReaderOpener(url: url)
+        let indexSource = SourceCacheKey(url: url, headers: indexedSubtitleRequestHeaders())
         let duration = duration
         indexedSubtitleTask = BlockingWork.detached(priority: .utility) { [weak self] in
             guard let root = opener() else {
@@ -127,13 +128,15 @@ extension AetherEngine {
                                category: .engine)
                 return
             }
-            let source = IOReaderByteSource(root)
+            // The source's one index (`SourceIndexRegistry`): parsed here only if no consumer of this
+            // source has parsed it yet, and then over this fill's own reader.
+            let source = IOReaderByteSource(root, closesReader: false)
             let began = Date()
-            let index: MatroskaSubtitleIndex
-            do {
-                index = try MatroskaSubtitleIndex.read(from: source)
-            } catch {
-                EngineLog.emit("[IndexedSubtitles] no usable index (\(error)); the stream-walking fill stays",
+            let outcome = await SourceIndexRegistry.shared.matroskaIndex(
+                for: .init(source: indexSource, size: root.seek(offset: 0, whence: 65536)),
+                open: { source })
+            guard let index = outcome.index else {
+                EngineLog.emit("[IndexedSubtitles] no usable index (\(outcome)); the stream-walking fill stays",
                                category: .engine)
                 root.close()
                 return
@@ -180,6 +183,13 @@ extension AetherEngine {
         }
     }
 
+    /// The headers the fill's reader asks with, which are also what names its source's index.
+    private func indexedSubtitleRequestHeaders() -> [String: String] {
+        var headers = loadedOptions.httpHeaders
+        headers.merge(sessionRequestHeaders.current) { _, new in new }
+        return headers
+    }
+
     /// A range reader over the session's source, opened off the main actor.
     private func indexedSubtitleReaderOpener(url: URL) -> @Sendable () -> IOReader? {
         if isCustomSource {
@@ -187,9 +197,7 @@ extension AetherEngine {
             return { clone }
         }
         if url.isFileURL { return { FileIOReader(url: url) } }
-        var headers = loadedOptions.httpHeaders
-        headers.merge(sessionRequestHeaders.current) { _, new in new }
-        let resolved = headers
+        let resolved = indexedSubtitleRequestHeaders()
         return {
             HTTPDiscIOReader(url: url, extraHeaders: resolved, baseChunkSize: 4096, maxChunkSize: 4 * 1024 * 1024,
                              sourceCache: .shared, label: "subindex")

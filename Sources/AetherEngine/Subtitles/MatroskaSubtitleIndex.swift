@@ -82,7 +82,10 @@ struct MatroskaSubtitleIndex: Sendable {
     static let cuesSizeLimit = 64 * 1024 * 1024
     static let headProbeBytes = 64 * 1024
 
-    static func read(from source: RandomAccessByteSource) throws -> MatroskaSubtitleIndex {
+    /// Parses the index. Only `SourceIndexRegistry` can call this (it alone makes a `ParseToken`):
+    /// a source's index is parsed once and shared, never read again by the next consumer.
+    static func read(from source: RandomAccessByteSource,
+                     token: SourceIndexRegistry.ParseToken) throws -> MatroskaSubtitleIndex {
         guard let head = source.read(at: 0, count: headProbeBytes), head.count > 16 else {
             throw ReadError.notMatroska
         }
@@ -441,7 +444,10 @@ protocol RandomAccessByteSource: AnyObject {
 /// A `RangeReadableIOReader` is asked for exactly the range, without the cursor or its lock, so any
 /// number of callers can share one source. Any other reader goes through `seek` and `read`, one at a
 /// time.
-final class IOReaderByteSource: RandomAccessByteSource {
+///
+/// `@unchecked Sendable`: a range reader is read without shared state, and anything else only under
+/// the lock, so the source can be handed to the parse that `SourceIndexRegistry` runs.
+final class IOReaderByteSource: RandomAccessByteSource, @unchecked Sendable {
     private let reader: IOReader
     private let closesReader: Bool
     private let lock = NSLock()
