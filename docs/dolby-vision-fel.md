@@ -704,7 +704,8 @@ not a reading of the stream's `chroma_sample_loc_type`, which the 4:2:0 kernel n
   the CPU model.
 - **Composed-frame RPU override (experiment):** `AetherEngine.felComposedRpuOverride` (`@_spi(Diagnostics)`,
   trait only; `aetherctl feltest|play --fel-rpu-override <file>`, the probe app's `rpu=<url>` arm option)
-  replaces the converted RPU on every frame the composer produced, base-layer-only compositions included,
+  replaces the converted RPU on every frame the composer produced, on the software host and on the native
+  route's FEL overlay alike (`DoviComposedRpuOverride`), base-layer-only compositions included,
   with one fixed RPU NAL: an "amplifier" whose luma curve is steep in a narrow window, so sub-10-bit steps
   in the composed picture become visible on the TV if more than 10 bits survive tvOS's output. The bytes
   are what `dovi_write_unspec62_nalu` writes (`0x7C 0x01` header, emulation prevention, no start code);
