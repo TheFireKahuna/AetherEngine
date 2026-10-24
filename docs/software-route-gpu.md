@@ -1,8 +1,7 @@
 # The software route: one GPU pass, inside the native player
 
 Status: plan, written 2026-10-24 on `research/12bit-fel`. Parts 2 (the GPU finisher and H.273 colour) and 3 (AV1 into
-the slabs) are built and committed; part 4 (bwdif on the GPU) is built and awaits its device test; parts 1, 5 and 6 are
-open. The colour equations are in [colour-representation.md](colour-representation.md).
+the slabs) are built and committed; part 4 (bwdif on the GPU) is built and verified on device; parts 1, 5 and 6 are open. The colour equations are in [colour-representation.md](colour-representation.md).
 
 ## Why
 
@@ -124,7 +123,7 @@ decode.
 2. Release FFmpegBuild, bump the engine's pin, and add AV1 to the parity tests (a decode through the slab path equals
    the copied path).
 
-## Part 4. Deinterlacing: FFmpeg's bwdif on the GPU (built; device test open)
+## Part 4. Deinterlacing: FFmpeg's bwdif on the GPU (built, verified on device)
 
 The first attempt ran `yadif_videotoolbox` on the finisher's display buffers and displayed its output directly
 (`efeef135`). On the Apple TV the picture froze while frames kept being enqueued (`SEQ=deint`, 2026-10-25; the
@@ -168,7 +167,9 @@ path (`DeinterlaceHardwareWarmup`), `DeinterlaceMode`. FFmpegBuild's `videotoolb
 no longer used by the engine (dropping it from FFmpegBuild is a separate decision); the CoreVideo-pool patch written
 during the diagnosis was not committed.
 
-**Open:** the device test (`SEQ=deint`), and timings per frame on the M4 and the A15.
+**Device test** (`SEQ=deint`, LG G5, 2026-10-25): the progressive control, field rate with a seek, frame rate and the
+wrong-field-order control all play as the legend says; 50 / 25 pictures a second shown, none dropped. **Open:** timings
+per frame on the M4 and the A15.
 
 ## Part 5. AV1 film grain on the GPU (open)
 

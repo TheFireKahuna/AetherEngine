@@ -24,7 +24,7 @@
 #                                               GD overlay pulses / placeholder constant, GX the reverse, GH HDR10 placeholder,
 #                                               GS seeks on the counter clip; by eye, about 2.5 min
 #   DEVICE=... SEQ=deint ./run_tv.sh            the deinterlace card on the software route (Scripts/build_deint.sh): DF field rate
-#                                               with a seek, DR frame rate, DW the wrong-field-order control; by eye, about 80 s
+#                                               with a seek, DR frame rate, DW the wrong-field-order control; by eye, about 45 s
 #   DEVICE=... SEQ=count ./run_tv.sh            counter clips: T / NE / TL (FEL route, residual, RPU pulse) and PM (8.1 control)
 #   DEVICE=... SEQ=soak SOAK_URL=<http url | file under $PULSE_OUT> [SOAK_MIN=5] [SOAK_SEEKS=60@1800,150@600,240@3000] ./run_tv.sh
 #                                               one FEL soak arm; its summary line is grepped at the end
@@ -183,14 +183,14 @@ case "$SEQ" in
     done ;;
   deint)
     # The deinterlace card (Scripts/build_deint.sh) on the software route, by eye; the legend below says what
-    # each region shows. DF: correct field order at field rate, with a seek at 20 s back to 5 s (the graph is
-    # rebuilt). DR: the same at frame rate. DW: the control, flagged bottom field first, deinterlaced wrong.
+    # each region shows. DF: correct field order at field rate, with a seek at 8 s back to 2 s (the window
+    # starts over). DR: the same at frame rate. DW: the control, flagged bottom field first, deinterlaced wrong.
     # DP first: the card as progressive 50p, the same software route without the deinterlacer, so the screen
     # only ever sees the finisher's own buffers. DEINT_ARMS (e.g. DP,DF) plays a subset.
-    ARMS="DP|soak|$B/deint_prog50.ts|minutes=0.35"
-    ARMS+=",DF|soak|$B/deint_tff.ts|minutes=0.6;seeks=20@5"
-    ARMS+=",DR|soak|$B/deint_tff.ts|minutes=0.35;fieldrate=frame"
-    ARMS+=",DW|soak|$B/deint_bff.ts|minutes=0.35"
+    ARMS="DP|soak|$B/deint_prog50.ts|minutes=0.17"
+    ARMS+=",DF|soak|$B/deint_tff.ts|minutes=0.25;seeks=8@2"
+    ARMS+=",DR|soak|$B/deint_tff.ts|minutes=0.17;fieldrate=frame"
+    ARMS+=",DW|soak|$B/deint_bff.ts|minutes=0.17"
     LABELS=DP,DF,DR,DW
     if [[ -n "${DEINT_ARMS:-}" ]]; then
       ARMS=$(print -r -- "$ARMS" | tr ',' '\n' | awk -v keep=",$DEINT_ARMS," -F'|' \
@@ -244,13 +244,13 @@ if [[ "$SEQ" == deint ]]; then
   cat <<'LEGEND'
 the card, top to bottom: a white bar sweeping right, a band of fine stripes, a 4-digit field number and a
 small box stepping right. Expect the TV at 50 Hz (Match Frame Rate on).
-  DP  control: the card as progressive 50p, no deinterlacer (21 s): everything moves as DF should
-  DF  correct, field rate (36 s, at 20 s it jumps back to 0:05):
+  DP  control: the card as progressive 50p, no deinterlacer (10 s): everything moves as DF should
+  DF  correct, field rate (15 s, at 8 s it jumps back to 0:02):
       bar edges clean, no comb teeth; stripes sharp and still; the number a steady blur of changing digits
       (50 a second, too fast to read) with no backward jumps; the box glides right, never steps back;
       after the jump the same, at once
-  DR  frame rate (21 s): bar and stripes as DF; the box hops two places at a time, motion a little rougher
-  DW  the control, field order flagged wrong (21 s): the box jitters back and forth, the bar shudders;
+  DR  frame rate (10 s): bar and stripes as DF; the box hops two places at a time, motion a little rougher
+  DW  the control, field order flagged wrong (10 s): the box jitters back and forth, the bar shudders;
       if DF looked like this, the field order is being read wrong
   any arm: a frozen picture with the tone still playing is the wedge the old transfer copy guarded against
 LEGEND
