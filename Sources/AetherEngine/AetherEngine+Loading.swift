@@ -931,6 +931,7 @@ extension AetherEngine {
         // a reader that cannot clone leaves the rendition absent.
         if loadedOptions.serveIFramePlaylist {
             session.requestIFramePlaylist()
+            session.iFrameHDRStills = loadedOptions.iFrameHDRStills
             if isCustomSource, let clone = customReader?.makeIndependentReader() {
                 session.customIFrameReader = (reader: clone, formatHint: customFormatHint)
             }

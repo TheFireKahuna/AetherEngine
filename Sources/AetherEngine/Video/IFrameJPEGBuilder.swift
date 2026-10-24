@@ -4,8 +4,8 @@ import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
 
-/// AE#682: turns one keyframe into one Motion JPEG fragment, for sources whose own keyframes AVKit
-/// will not show as scrub thumbnails.
+/// AE#682: turns one keyframe into one Motion JPEG fragment, the SDR companion an HDR session lists beside
+/// its own keyframes, for sources whose keyframes AVKit will not show as scrub thumbnails.
 ///
 /// Measured on an Apple TV 4K (tvOS 27, 2026-10-14): the stock scrubber fetches the init and one
 /// I-frame of a PQ rendition and then gives up, whether the keyframes are Dolby Vision or plain HDR10,
@@ -19,20 +19,23 @@ final class IFrameJPEGBuilder {
     private static let qualities: [CGFloat] = [0.8, 0.6, 0.4, 0.25]
     private static let timescale: UInt32 = 90_000
 
-    /// Built fragments kept in memory (about 50 KB each): AVKit asks for the same still several times,
-    /// and each build is a full decode of the keyframe.
-    static let cachedFragments = 128
+    /// Built fragments kept in memory (about 50 KB each, so roughly 75 MB at the cap): AVKit asks for the
+    /// same still several times, a scrub back over ground already covered should cost nothing, and each
+    /// build is a decode of the keyframe.
+    static let cachedFragments = 1536
 
     let width: Int
     let height: Int
     let initSegment: Data
-    private let keyframe: IFrameFragmentBuilder
+    /// One decoder for every still, opened on the first: the keyframe goes straight in, with no container
+    /// built around it, no demuxer opened over it and nothing staged on disk.
+    private let decoder: FrameDecodeContext
     private let lock = NSLock()
     private var built: [Int: Data] = [:]
     private var builtOrder: [Int] = []
 
-    init(keyframe: IFrameFragmentBuilder, width: Int, height: Int) {
-        self.keyframe = keyframe
+    init(decoder: FrameDecodeContext, width: Int, height: Int) {
+        self.decoder = decoder
         self.width = width
         self.height = height
         self.initSegment = Self.makeInit(width: width, height: height)
@@ -63,9 +66,7 @@ final class IFrameJPEGBuilder {
         if let hit = lock.withLock({ built[index] }) {
             return IFrameFragmentBuilder.Output(initSegment: initSegment, fragment: hit)
         }
-        guard let source = keyframe.build(payload: payload, index: index, startSeconds: startSeconds,
-                                          durationSeconds: durationSeconds),
-              let picture = Self.decode(source),
+        guard let picture = decode(payload),
               let jpeg = Self.encode(picture, width: width, height: height) else { return nil }
         let fragment = Self.makeFragment(jpeg: jpeg, sequence: UInt32(truncatingIfNeeded: index + 1),
                                          startSeconds: startSeconds, durationSeconds: durationSeconds)
@@ -76,13 +77,10 @@ final class IFrameJPEGBuilder {
         return IFrameFragmentBuilder.Output(initSegment: initSegment, fragment: fragment)
     }
 
-    private static func decode(_ source: IFrameFragmentBuilder.Output) -> CGImage? {
-        let context = FrameDecodeContext(reader: DataIOReader(parts: [source.initSegment, source.fragment]),
-                                         formatHint: "mp4")
-        defer { context.close() }
-        do { try context.ensureOpen() } catch { return nil }
-        return context.decodeFrame(at: 0, mode: .thumbnail, targetWidth: defaultWidth,
-                                   maxSize: nil, isCancelled: { false })
+    /// Called on the rendition's serial queue, so the decoder is never used from two threads at once.
+    private func decode(_ payload: Data) -> CGImage? {
+        do { try decoder.ensureOpen() } catch { return nil }
+        return decoder.decodeStill(keyframe: payload, targetWidth: width)
     }
 
     static func encode(_ image: CGImage, width: Int, height: Int) -> Data? {

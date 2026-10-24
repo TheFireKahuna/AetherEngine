@@ -25,14 +25,10 @@ final class IFrameFragmentBuilder {
         guard !payload.isEmpty, payload.count <= Int(Int32.max),
               video.timeBase.num > 0, video.timeBase.den > 0 else { return nil }
         var initBytes = Data()
+        // In memory: a keyframe fragment is built, served and forgotten, so it never touches the disk.
         guard let muxer = try? MP4SegmentMuxer(
             initialSegmentIndex: index, sessionDir: stagingDir, video: video, audio: nil,
-            onInitCaptured: { initBytes = $0 }) else { return nil }
-        var completed: URL?
-        defer {
-            _ = muxer.finalize()
-            if let completed { try? FileManager.default.removeItem(at: completed) }
-        }
+            inMemory: true, onInitCaptured: { initBytes = $0 }) else { return nil }
 
         var packet = av_packet_alloc()
         defer { av_packet_free(&packet) }
@@ -50,11 +46,7 @@ final class IFrameFragmentBuilder {
         av_packet_rescale_ts(packet, video.timeBase, muxer.muxerVideoTimeBase)
 
         guard muxer.writePacket(packet).rc >= 0,
-              case .completed(let path, _) = muxer.cutFragmentForNextSegment(index + 1) else { return nil }
-        completed = path
-        guard let fragment = try? Data(contentsOf: path), !fragment.isEmpty, !initBytes.isEmpty else {
-            return nil
-        }
+              let fragment = muxer.takeFragmentInMemory(), !initBytes.isEmpty else { return nil }
         return Output(initSegment: initBytes, fragment: fragment)
     }
 }

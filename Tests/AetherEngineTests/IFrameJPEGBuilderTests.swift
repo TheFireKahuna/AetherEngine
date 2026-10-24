@@ -79,7 +79,8 @@ struct IFrameJPEGBuilderTests {
         defer { fx.demuxer.close() }
         let dir = try stagingDir()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let builder = IFrameJPEGBuilder(keyframe: IFrameFragmentBuilder(video: fx.config, stagingDir: dir),
+        let builder = IFrameJPEGBuilder(decoder: FrameDecodeContext(streamParameters: fx.config.codecpar,
+                                                                    timeBase: fx.config.timeBase),
                                         width: 640, height: 360)
 
         let out = try #require(builder.build(payload: fx.keyframe, index: 3, startSeconds: 12,
@@ -102,7 +103,8 @@ struct IFrameJPEGBuilderTests {
         defer { fx.demuxer.close() }
         let dir = try stagingDir()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let builder = IFrameJPEGBuilder(keyframe: IFrameFragmentBuilder(video: fx.config, stagingDir: dir),
+        let builder = IFrameJPEGBuilder(decoder: FrameDecodeContext(streamParameters: fx.config.codecpar,
+                                                                    timeBase: fx.config.timeBase),
                                         width: 640, height: 360)
         let first = try #require(builder.build(payload: fx.keyframe, index: 5, startSeconds: 20,
                                                durationSeconds: 4))
@@ -117,7 +119,8 @@ struct IFrameJPEGBuilderTests {
         defer { fx.demuxer.close() }
         let dir = try stagingDir()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let builder = IFrameJPEGBuilder(keyframe: IFrameFragmentBuilder(video: fx.config, stagingDir: dir),
+        let builder = IFrameJPEGBuilder(decoder: FrameDecodeContext(streamParameters: fx.config.codecpar,
+                                                                    timeBase: fx.config.timeBase),
                                         width: 640, height: 360)
         #expect(builder.build(payload: Data([0, 0, 0, 4, 1, 2, 3, 4]), index: 0, startSeconds: 0,
                               durationSeconds: 4) == nil)
