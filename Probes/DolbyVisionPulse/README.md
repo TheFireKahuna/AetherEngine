@@ -298,6 +298,25 @@ t statistic) and the lag in clip frames between the switch and the panel's respo
 
 N and NE are the drift floor. A verdict only means something against them.
 
+### CM v4.0 vs v2.9 (`SEQ=cm4`, analyse with `--color`)
+
+Same pixels in every clip; only the RPU changes. P* arms are AVPlayer (Profile 8.1), T* the engine's FEL route.
+
+| Arm | RPU | Native CM v4.0 end to end | v4.0 stripped, or a v2.9 panel | tvOS rebuilds v4.0 into v2.9 L2 |
+|---|---|---|---|---|
+| P, T | v2.9, L2 pulse | PULSE | PULSE | PULSE |
+| PN | v2.9, nothing switches | steady | steady | steady |
+| P4, T4 | v4.0 safe defaults (L3/L9/L11/L254), no L8, same L2 pulse | **steady** (v4.0 ignores L2) | PULSE | PULSE or steady |
+| P8, T8 | v4.0, L2 neutral, L8 tone pulse at targets 1/48/49/37/38 | PULSE | steady | PULSE |
+| PH, TH | v4.0, L8 six-vector only: red hue rotated, cyan desaturated | **V4-SIGNATURE** | none | none (L2 has no per-hue trim) |
+
+`--color` adds per-patch hue (degrees) and saturation channels. The six-vector verdict is `V4-SIGNATURE` when
+red's hue and cyan's saturation both move (|t| > 5) while no grey changes level and no other colour changes hue;
+`partial` when only some of that holds (a global hue or saturation change, as a re-derived trim would give). Only
+the native column turns on the signature, so PH or TH showing it is the proof that the panel's own CM v4.0 reads
+our L8 blocks. The table's middle column is also the answer for the "safe defaults" upgrade: P4 pulsing means the
+v4.0 blocks never arrive.
+
 ## Proving the analysis first
 
 `sim_recording.py` writes a fake phone recording of `pulse_l2.mp4`: filmed at 30 fps with perspective,
@@ -308,6 +327,10 @@ vignetting and noise, B phases darkened with a three frame latency for a `pulse`
 python3 Scripts/sim_recording.py sim.mp4 pulse,steady        # about two minutes
 python3 Scripts/analyze.py sim.mp4 --arms pulse,steady        # PULSE (28 patches), steady (0 patches)
 ```
+
+The colour channels were checked the same way on the decoded `pulse_hue.mp4` (its pixels never change:
+steady, signature none), on that video with a global hue rotation in the B phases (`partial`) and with only the
+red patch's hue and the cyan patch's saturation changed (`V4-SIGNATURE`).
 
 `cut.py` can be exercised the same way with a hand-written log of `[Pulse] wall=<epoch> t=<s> slate
 <label>`, `arm <label> start mode=<mode> url=<clip>` and `arm <label> end` lines and `--sync`.

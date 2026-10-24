@@ -10,6 +10,16 @@ the analysis reads back from the phone video. Only the RPU changes:
   l8    CM v4.0: L1 constant, L2 trims always neutral; L8 trims at the 100/600/1000/higher presets
         switch neutral <-> extreme. Only a CM v4.0 display manager can see the switch, so a pulse
         means the L8 blocks reached the panel; a v2.9-only path (or one that drops L8) stays flat.
+  l2v4  CM v4.0 without L8 (the safe-default blocks L3/L9/L11/L254 only), L2 switching as in l2. A CM v4.0
+        display manager ignores L2, so it stays flat where v4.0 arrives intact; it pulses like l2 where the
+        v4.0 list is stripped or the panel runs CM v2.9.
+  l8a-h the L8 ladder (L8_LADDER): the l8 tone pulse with one 10-byte block at 100 nits (a), at 1000 nits (b),
+        five 10-byte blocks (c), one 25-byte block at 1000 nits (d); then at 1000 nits a realistic tone trim (e)
+        and a saturation-only trim (f), the extreme trim at 600 nits (g), and a's block at 25 bytes (h).
+  hue   CM v4.0, L2 and the L8 tone trims neutral; only the L8 six-vector trims switch (red hue rotated,
+        cyan desaturated). Red and cyan move, greys and the other colours stay put, only when the panel's own
+        CM v4.0 consumes the L8 blocks: CM v2.9 has no per-hue control (the colour-aware analysis,
+        analyze.py --color, measures it).
 
 Timeline at 24000/1001 fps: 144 frames of phase A (pre-roll, lets the HDMI mode switch settle),
 then 20 phases of 72 frames alternating B, A, B, ... (10 cycles of ~6 s). The phase of any frame is
@@ -454,13 +464,37 @@ NEUTRAL_TRIM = dict(trim_slope=2048, trim_offset=2048, trim_power=2048,
 EXTREME_TRIM = dict(trim_slope=512, trim_offset=1792, trim_power=3584,
                     trim_chroma_weight=2048, trim_saturation_gain=0, ms_weight=2048)
 TRIM_TARGETS = [100, 600, 1000, 4000]
-# L8 addresses targets by preset index, not by nits, and a frame carries at most 5 L8 blocks. These are
-# the presets real masters carry (1: 100-nit BT.709, 27: 600-nit P3, 48: 1000-nit P3, 49: the next one
-# up), mirroring TRIM_TARGETS, so whichever pair the panel's CM v4.0 interpolates between, both switch.
-L8_TARGET_INDICES = [1, 27, 48, 49]
-# L8's neutral is 2048 in every field, including chroma weight and saturation (unlike L2's).
-L8_NEUTRAL_TRIM = dict(NEUTRAL_TRIM, target_mid_contrast=2048, clip_trim=2048)
-L8_EXTREME_TRIM = dict(EXTREME_TRIM, target_mid_contrast=2048, clip_trim=2048)
+# L8 addresses targets by preset index, not by nits, and a frame carries at most 5 L8 blocks. A 1000-2000
+# nit panel (the G5) interpolates between the 1000- and 2000-nit trims, so both primaries variants of each
+# are present (48/49: 1000 nits, 37/38: 2000 nits, per dolby_vision's trim_target_nits), plus the 100-nit
+# BT.709 target (1) every real master carries. 600 nits (27) is left out to stay within five blocks.
+L8_TARGET_INDICES = [1, 48, 49, 37, 38]
+# Length 25 carries the six-vector fields; neutral is 2048 in the 12-bit fields and 128 in the vectors.
+L8_VECTORS_NEUTRAL = {f"{k}_vector_field{i}": 128 for k in ("saturation", "hue") for i in range(6)}
+L8_NEUTRAL_TRIM = dict(NEUTRAL_TRIM, target_mid_contrast=2048, clip_trim=2048, **L8_VECTORS_NEUTRAL)
+L8_EXTREME_TRIM = dict(L8_NEUTRAL_TRIM, **EXTREME_TRIM)
+# CM v4.0-only signature: tone trims neutral, only two secondaries move. Vector order is R, Y, G, C, B, M:
+# the red hue is rotated and cyan is fully desaturated, so a v4.0 display manager moves the red and cyan
+# patches and nothing else. CM v2.9 has no per-hue control, so no L2 trim (derived or not) can produce it.
+L8_HUE_TRIM = dict(L8_NEUTRAL_TRIM, hue_vector_field0=32, saturation_vector_field3=0)
+# The L8 ladder: the l8 tone pulse with fewer or shorter blocks, from what streaming masters carry (one
+# 10-byte block at the 100-nit target) up to l8's five 25-byte blocks, to find where L8 stops working.
+# variant -> (target indices, block length, phase B trim)
+# On the G5 (2026-10-20) a: dims; b, c, d: a black flash at each switch and no trim. e-h then separate
+# "the 1000-nit target" from "an extreme trim at the target nearest the panel's peak".
+L8_MILD_TRIM = dict(L8_NEUTRAL_TRIM, trim_slope=1843, trim_power=2253)       # slope -0.1, power +0.1
+L8_SAT_ONLY_TRIM = dict(L8_NEUTRAL_TRIM, trim_saturation_gain=0)             # tone neutral, saturation -1
+L8_LADDER = {
+    "l8a": ([1], 10, L8_EXTREME_TRIM),                   # one short block, 100 nits
+    "l8b": ([48], 10, L8_EXTREME_TRIM),                  # one short block, 1000 nits
+    "l8c": (L8_TARGET_INDICES, 10, L8_EXTREME_TRIM),     # five short blocks
+    "l8d": ([48], 25, L8_EXTREME_TRIM),                  # one long block, 1000 nits
+    "l8e": ([48], 10, L8_MILD_TRIM),                     # 1000 nits, a realistic tone trim
+    "l8f": ([48], 10, L8_SAT_ONLY_TRIM),                 # 1000 nits, saturation only
+    "l8g": ([27], 10, L8_EXTREME_TRIM),                  # 600 nits, extreme
+    "l8h": ([1], 25, L8_EXTREME_TRIM),                   # 100 nits as a, long block
+}
+V40_VARIANTS = ("l8", "l2v4", "hue") + tuple(L8_LADDER)
 
 
 def shots():
@@ -476,7 +510,7 @@ def rpu_config(variant):
     L = layout()
     mn, mx, avg = l1_stats(L)
     cfg = {
-        "cm_version": "V40" if variant == "l8" else "V29",
+        "cm_version": "V40" if variant in V40_VARIANTS else "V29",
         "profile": "8.1",
         "length": N_FRAMES,
         "level6": {"max_display_mastering_luminance": 10000, "min_display_mastering_luminance": 1,
@@ -490,13 +524,16 @@ def rpu_config(variant):
             blocks.append({"Level1": {"min_pq": mn, "max_pq": peak, "avg_pq": min(avg, peak)}})
         else:
             blocks.append({"Level1": {"min_pq": mn, "max_pq": mx, "avg_pq": avg}})
-            trim = EXTREME_TRIM if (variant == "l2" and ph == "B") else NEUTRAL_TRIM
+            trim = EXTREME_TRIM if (variant in ("l2", "l2v4") and ph == "B") else NEUTRAL_TRIM
             for t in TRIM_TARGETS:
                 blocks.append({"Level2": dict(target_max_pq=pq12(t), **trim)})
-            if variant == "l8":
-                trim8 = L8_EXTREME_TRIM if ph == "B" else L8_NEUTRAL_TRIM
-                for idx in L8_TARGET_INDICES:
-                    blocks.append({"Level8": dict(length=10, target_display_index=idx, **trim8)})
+            if variant in ("l8", "hue") or variant in L8_LADDER:
+                pulse8 = L8_HUE_TRIM if variant == "hue" else L8_EXTREME_TRIM
+                indices, length, pulse8 = L8_LADDER.get(variant, (L8_TARGET_INDICES, 25, pulse8))
+                trim8 = pulse8 if ph == "B" else L8_NEUTRAL_TRIM
+                for idx in indices:
+                    # a short block simply doesn't carry the fields past its length
+                    blocks.append({"Level8": dict(length=length, target_display_index=idx, **trim8)})
         cfg["shots"].append({"start": start, "duration": dur, "metadata_blocks": blocks})
     return cfg
 
@@ -548,7 +585,7 @@ if __name__ == "__main__":
         write_flat_el(sys.stdout.buffer, bullseye_planes()[1], CARD_FRAMES)
     elif cmd == "still-rpu-json" and len(sys.argv) == 3 and sys.argv[2] in ("card", "bullseye"):
         json.dump(still_rpu_config(sys.argv[2]), sys.stdout, indent=1)
-    elif cmd == "rpu-json" and len(sys.argv) == 3 and sys.argv[2] in ("l1", "l2", "null", "l8"):
+    elif cmd == "rpu-json" and len(sys.argv) == 3 and sys.argv[2] in ("l1", "l2", "null") + V40_VARIANTS:
         json.dump(rpu_config(sys.argv[2]), sys.stdout, indent=1)
     else:
         sys.exit(__doc__)

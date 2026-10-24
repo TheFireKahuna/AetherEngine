@@ -30,7 +30,8 @@ import UIKit
 //   buffer, for the 12-bit display-path experiment (`AetherEngine.felOutputMode`); `rpu=<url>` (absolute, or
 //   relative to the clip's): one Dolby Vision RPU NAL, fetched before the arm starts, that every composed frame
 //   carries in place of its own for this arm only (`AetherEngine.felComposedRpuOverride`; a fetch or parse
-//   failure skips the arm); `secs=N`: play N seconds, looping the clip, instead of once through (80 s cap).
+//   failure skips the arm); `secs=N`: play N seconds, looping the clip, instead of once through (80 s cap); on `avplayer`
+//   arms it only shortens the arm (no looping).
 // - `soak`: `engine` for `minutes=` with a `seeks=at@to,...` schedule, sampled once a second, ending in
 //   one `soak summary` line; takes `out=` like `engine` (default sv22, the engine's).
 //
@@ -193,7 +194,7 @@ struct PulseHarnessView: View {
             say("arm \(arm.label) start mode=\(arm.mode) url=\(arm.url.lastPathComponent)")
             switch arm.mode {
             case "avplayer":
-                await host.playAVPlayer(arm.url, log: say)
+                await host.playAVPlayer(arm.url, seconds: arm.params["secs"].flatMap(Double.init), log: say)
             case "vt", "vtcopy", "vtstrip":
                 await host.playVT(arm.url, mode: arm.mode, log: say)
             case "engine":
