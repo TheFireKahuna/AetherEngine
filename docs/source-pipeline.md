@@ -159,9 +159,9 @@ the index lists every stream completely (`SubtitleForwardPrefetcher.IndexSource`
 ### Not yet ideal, and the steps
 
 1. **Matroska and MP4 only.** MP4 is done: `MP4SampleIndex` behind the same `SourceIndex`, every
-   consumer moved onto it. MPEG-TS (and so every Blu-ray remux in `.m2ts`) has no index at all.
-   - Have the pump record an index as it reads (keyframe and subtitle packet positions), registered
-     under the same key, so later reads and seeks are served from the map instead of a walk.
+   consumer moved onto it. MPEG-TS (and so every Blu-ray remux in `.m2ts`) has no index at all, and
+   a recorded one was looked at and not built (see the decisions below): the TS walk is cheap, and
+   what a recording would serve (back-seeks, re-reads) libavformat's own index entries largely cover.
    - MP4 keyframes are not on `SourceIndex`: the segment plan already reads them from the same
      libavformat entries (`Demuxer.indexedKeyframeEntries`). Matroska's stay on `MatroskaCueIndex`
      until the I-frame playlist (layer 3, step 4) names what it needs from both.
@@ -233,6 +233,21 @@ else; the ledger's per-reader lines should show exactly that.
   `mov_fix_index` to match them. Completeness was first `entries == nb_frames`, which refused every
   ffmpeg-muxed mov_text track: `nb_frames` counts `stts` samples including the trailing one the edit
   list trims. The test against `av_read_frame` caught it.
+- **No transport stream subtitle scanner, and no pump-recorded TS index.** A Swift cell scanner was
+  built and proven packet for packet against `mpegts.c` for PGS and teletext (188/192/204-byte cells,
+  split PES headers, a zero-length adaptation field, continuity breaks, a missing PTS, the program
+  clock fix, the 33-bit wrap, a seek, lost sync), with mpeg2ts-reader as a second reference, then
+  removed. The premise was that a TS subtitle walk is a second full demux: `AVDISCARD_NONKEY` is not
+  implemented by mpegts, so the pacing video arrives whole and parsed. True, but measured it runs at
+  about 5 GB/s (SIMD start-code search, memcpy-speed PES copies): a 60 GB remux costs the walk ~12 s
+  of CPU over the film. The scanner did not beat it in a debug build, would not have read fewer
+  bytes (subtitles interleave with video cell by cell), and DVB subtitles would have needed the
+  `dvbsub` parser libavformat runs after the demuxer (`need_parsing` is FULL for every mpegts
+  stream). Kept from it: libavformat's TS seek already records index entries as it searches
+  (`mpegts_get_dts` → `av_add_index_entry`, every probed packet, flagged keyframe whatever it is),
+  and its later seeks on the same demuxer use them as bounds (`ff_seek_frame_binary`); the demuxer's
+  settings are public AVOptions (`ts_packetsize`, `resync_size`, `max_packet_size`,
+  `fix_teletext_pts`, `merge_pmt_versions`).
 - **The prefetch index path was first written as a second loop.** `runIndexed` duplicated the walk's
   contract and was replaced, before commit, by one loop over a `Source` with two implementations.
 - **No memory tier of the engine's own.** The three RAM stores existed to avoid network round trips
