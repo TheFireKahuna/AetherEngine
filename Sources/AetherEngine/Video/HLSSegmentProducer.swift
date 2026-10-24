@@ -346,8 +346,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// configuration, not from in-band parameter sets (`pendingAdVideoConfig` is nil then).
     private var pendingReinitUsesOpenedConfig = false
 
-    /// A program change moved the video role (`Demuxer.programChange(on:)`, which hands the new PID over
-    /// under the index chosen at open). Until the keyframe the switch can open on, the new stream's
+    /// The streams the video and audio this pump muxes come from now: the ones chosen at open until a
+    /// program change hands a role to another PID (`Demuxer.sourceStream(of:)`).
+    private lazy var videoSourceStream: Int32 = videoStreamIndex
+    private lazy var audioSourceStream: Int32 = audioConfig?.sourceStreamIndex ?? -1
+
+    /// A program change moved the video role (`Demuxer` hands the new PID over under the index chosen
+    /// at open). Until the keyframe the switch can open on, the new stream's
     /// packets are held out of the running init: an ad creative opens on in-band SPS/PPS (#133's shape),
     /// the stream chosen at open on any keyframe, its configuration being the open's.
     private var awaitingProgramSwitch: ProgramSuccession.Change?
@@ -1886,7 +1891,25 @@ final class HLSSegmentProducer: @unchecked Sendable {
                              isAdCreative: isAdCreative)
     }
 
-    /// What a program change does to this pump (`Demuxer.programChange(on:)`): the stream the PMT moved a
+    /// The program change `packet` shows this pump: it comes from another stream than the one its role
+    /// is set up for. Each pump compares with its own, so a pump started after a seek past a change
+    /// sees the change on its first packet.
+    private func sourceChange(_ packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin) -> ProgramSuccession.Change? {
+        let index = packet.pointee.stream_index
+        let source = Demuxer.sourceStream(of: packet)
+        if origin == .main, index == videoStreamIndex, source != videoSourceStream {
+            defer { videoSourceStream = source }
+            return ProgramSuccession.Change(logical: index, from: videoSourceStream, to: source)
+        }
+        if let audio = audioConfig, index == audio.sourceStreamIndex,
+           origin == (sideAudioDemuxer != nil ? .side : .main), source != audioSourceStream {
+            defer { audioSourceStream = source }
+            return ProgramSuccession.Change(logical: index, from: audioSourceStream, to: source)
+        }
+        return nil
+    }
+
+    /// What a program change does to this pump: the stream the PMT moved a
     /// role to is handed over under the role's own index, so the pump only decides whether its init still
     /// describes it. Compared with what the pump was opened with, not with the stream before: an ad's
     /// codec matters against the programme's. Returns an exit reason when the session has to be rebuilt.
@@ -3579,7 +3602,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 var pktPtr: UnsafeMutablePointer<AVPacket>? = packet
                 defer { trackedPacketFree(&pktPtr) }
 
-                if let change = (origin == .side ? sideAudioDemuxer : demuxer)?.programChange(on: packet),
+                if let change = sourceChange(packet, origin: origin),
                    let stop = noteProgramChange(change, origin: origin) {
                     exitReason = stop
                     break readLoop

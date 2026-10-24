@@ -2730,6 +2730,12 @@ public final class AetherEngine: ObservableObject {
     /// the next session's.
     var softwarePathEscalationBudget = SoftwarePathEscalation.Budget()
 
+    /// Rebuilds of the software session for a program change to another codec (`SoftwareSourceWatch`).
+    /// Kept across the session-preserving reloads they run, so a rebuild that lands without reaching
+    /// the change cannot ask again without end.
+    var programCodecRebuilds = 0
+    static let programCodecRebuildLimit = 3
+
     /// AE#629: the engine's own rebuild in flight or finished, kept so a `load()` whose startup it
     /// superseded can wait for it instead of throwing. Matched by generation, so a stale one is inert.
     var softwarePathTakeover: SoftwarePathEscalation.Takeover?
@@ -4509,6 +4515,7 @@ public final class AetherEngine: ObservableObject {
         itemDeathReviveGate = ItemDeathReviveGate(maxAttempts: 3)
         stallReloadReviveGate = ItemDeathReviveGate(maxAttempts: 2)
         softwarePathEscalationBudget = SoftwarePathEscalation.Budget()
+        if !sessionPreservingReloadInFlight { programCodecRebuilds = 0 }
         undecodableLiveAudioStreamIndices = Self.undecodableAudioStreamIndicesAcrossLoad(
             undecodableLiveAudioStreamIndices, sessionPreservingReload: sessionPreservingReloadInFlight)
         masterFallbackUsed = false

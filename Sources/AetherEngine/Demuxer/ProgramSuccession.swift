@@ -27,15 +27,12 @@ struct ProgramSuccession: Sendable {
         var streams: [Int32]
     }
 
-    /// A role's stream changed under its logical index: handed to a reader on the first packet the
-    /// new stream delivers (`Demuxer.programChange(on:)`).
+    /// A role's stream changed under its logical index, as a reader sees it: the stream a packet came
+    /// from (`Demuxer.sourceStream(of:)`) is not the one the reader is set up for.
     struct Change: Sendable, Equatable {
         var logical: Int32
         var from: Int32
         var to: Int32
-        /// The codec differs: the stream that now carries the role cannot be read with what the
-        /// role's previous stream was opened with.
-        var codecChanged: Bool
     }
 
     private struct Role: Hashable, Sendable {

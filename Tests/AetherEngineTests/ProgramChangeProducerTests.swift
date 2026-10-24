@@ -19,12 +19,14 @@ struct ProgramChangeProducerTests {
         var reason: HLSSegmentProducer.PumpExitReason? { lock.withLock { exit } }
     }
 
-    /// Runs a producer over `data` to its end and hands back its cache and exit.
-    private static func produce(_ data: Data, live: Bool, withAudio: Bool = false)
+    /// Runs a producer over `data` to its end and hands back its cache and exit; `startingAt` seeks
+    /// the demuxer there first, as a restart after a seek does.
+    private static func produce(_ data: Data, live: Bool, withAudio: Bool = false, startingAt: Double? = nil)
         async throws -> (cache: SegmentCache, reason: HLSSegmentProducer.PumpExitReason?) {
         let demuxer = Demuxer()
         try demuxer.open(reader: DataIOReader(data: data), formatHint: "mpegts")
         defer { demuxer.close() }
+        if let startingAt { #expect(demuxer.seek(to: startingAt)) }
         let index = demuxer.videoStreamIndex
         let stream = try #require(demuxer.stream(at: index))
         var audio: HLSSegmentProducer.AudioConfig?
@@ -112,6 +114,19 @@ struct ProgramChangeProducerTests {
             #expect(reason?.description == "eof", "stream type \(streamType)")
             #expect(cache.count >= 4, "stream type \(streamType)")
             #expect(Self.initVersions(cache).count == 1, "an audio change opens no init of its own")
+        }
+    }
+
+    @Test("a VOD pump started after a seek past a codec change sees it on its first packet", .timeLimit(.minutes(1)))
+    func vodRestartPastTheChange() async throws {
+        let written = TransportStreamFixture.write([
+            .init(frames: 75), .init(frames: 75, videoPID: 0x1021, videoStreamType: 0x24, pmtVersion: 1),
+        ])
+        let (cache, reason) = try await Self.produce(written.data, live: false,
+                                                     startingAt: Double(written.frames[110].dts) / 90_000)
+        defer { cache.close() }
+        guard case .videoConfigurationChanged = reason else {
+            Issue.record("expected the configuration exit, got \(String(describing: reason))"); return
         }
     }
 

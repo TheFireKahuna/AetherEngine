@@ -367,6 +367,15 @@ final class SoftwarePlaybackHost {
     private let demuxCondition = NSCondition()
 
     private var videoStreamIndex: Int32 = -1
+    /// The streams the decoders were opened for: the ones chosen at open, or the ones a program change
+    /// moved the roles to by the start position (`roleSources`).
+    private var videoSourceStream: Int32 = -1
+    private var audioSourceStream: Int32 = -1
+    /// What the loops ask before decoding a packet a program change may have moved (`SoftwareSourceWatch`).
+    private var sourceWatch: SoftwareSourceWatch?
+    /// A program change moved a role to another codec than its decoder's: the session has to be rebuilt
+    /// at the playhead, where the next host opens decoders for it. Main actor.
+    var onProgramCodecChange: ((String) -> Void)?
     /// The audio stream this host actually serves, or -1 when it serves none: the source had no audio
     /// track, or `AudioDecoder.open` refused it and the session went video-only (AE#462). Read by the
     /// engine for the published decoder label, which used to be built from the PROBE and therefore
@@ -1156,6 +1165,20 @@ final class SoftwarePlaybackHost {
 
     // MARK: - Load
 
+    /// The stream each role is read from at the read position: the stream its first packet there came
+    /// from (`Demuxer.sourceStream(of:)`), which a program change can have moved off the one chosen at
+    /// open. Peeked, so the packets are still the loop's to read. -1 stays -1.
+    nonisolated static func roleSources(_ dem: Demuxer, video: Int32, audio: Int32) -> (video: Int32, audio: Int32) {
+        var videoSource: Int32?
+        var audioSource: Int32? = audio < 0 ? audio : nil
+        try? dem.peekPackets(maxPackets: 512) { packet in
+            if videoSource == nil, packet.pointee.stream_index == video { videoSource = Demuxer.sourceStream(of: packet) }
+            if audioSource == nil, packet.pointee.stream_index == audio { audioSource = Demuxer.sourceStream(of: packet) }
+            return videoSource != nil && audioSource != nil
+        }
+        return (videoSource ?? video, audioSource ?? audio)
+    }
+
     func load(
         demuxer dem: Demuxer,
         startPosition: Double?,
@@ -1231,17 +1254,76 @@ final class SoftwarePlaybackHost {
             guard !stopRequested else { return }
         }
 
+        // Positioned before the decoders exist: they are opened for the stream that carries each role at
+        // the start, which after a program change is not the one chosen at open.
+        var startSkip: CMTime?
+        // The session zero a cold load predicts from the source's origin, the way a resume derives it.
+        // Set for every non-live source, not only a resume: a seek or a scrub still before the first play
+        // converts with it, and the demux loop only resolves the real zero when it first arms the clock
+        // (a pre-play seek arms the clock itself, so the loop never would). Reported, so the engine's
+        // chapter axis, harvest anchors and stills all read the same zero.
+        if !isLive {
+            let predictedZero = SWClockAnchorPolicy.resumeSessionZero(sourceOriginSeconds: dem.resolvedSourceStartOrigin)
+            if predictedZero != clockSessionZero {
+                clockSessionZero = predictedZero
+                onClockSessionZero?(predictedZero)
+            }
+        }
+
+        if let start = startPosition, start.isFinite, start > 0 {
+            // AE#724: the anchor is a session-axis position; on an offset-origin source it is carried
+            // over before it reaches the demuxer, the skip threshold and the clock, as a seek's is.
+            let zero = clockSessionZero
+            let sourceStart = SWClockAnchorPolicy.sourceSeconds(forSession: start, sessionZeroSeconds: zero)
+            // #254: same off-main, deadline-bounded reposition the transport seek uses. A resume into a
+            // remote source that has to scan for its landing would otherwise block the main thread here.
+            let outcome = await reposition(dem, sourceStart, Self.seekBudgetSeconds, seekQueue,
+                                           { [weak self] in self?.stopRequested ?? true })
+            // Besides the in-band record completion above, this is load()'s only suspension point, so it
+            // is the other place a stop() can land mid-load. Arming the clock and publishing isReady on a session already torn down would
+            // hand the engine a host it has stopped.
+            guard !stopRequested, !Task.isCancelled, outcome != .superseded else {
+                throw CancellationError()
+            }
+            EngineLog.emit("[SWReposition] flags=\(outcome == .landed ? 0 : 1)", category: .swPlayback)
+            guard outcome == .landed else { throw HostError.repositionFailed }
+            // Mirror seek() skip-PTS + clock alignment so demux drops pre-keyframe frames and synchronizer starts at the resume offset.
+            let startTime = CMTime(seconds: sourceStart, preferredTimescale: 90000)
+            startSkip = startTime
+            renderer.setSkipThreshold(startTime)
+            initialClockTime = startTime
+            currentTime = start
+            sourceClockSeconds = sourceStart
+        } else {
+            initialClockTime = .zero
+        }
+
+        // The stream each role is read from here (`Demuxer.sourceStream(of:)`): the decoders are this
+        // stream's, and the loops ask for a rebuild when a role moves to another codec.
+        let audioRole = resolvedAudioIdx
+        let sources = await BlockingWork.detached(priority: .userInitiated) {
+            Self.roleSources(dem, video: dem.videoStreamIndex, audio: audioRole)
+        }.value
+        guard !stopRequested, !Task.isCancelled else { throw CancellationError() }
+        guard let decodeStream = dem.stream(at: sources.video) else { throw HostError.noVideoStream }
+        videoSourceStream = sources.video
+        audioSourceStream = sources.audio
+        if sources.video != dem.videoStreamIndex || sources.audio != resolvedAudioIdx {
+            EngineLog.emit("[SWHost] program change at the start: video from stream \(sources.video), "
+                           + "audio from stream \(sources.audio)", category: .swPlayback)
+        }
+
         // HEVC -> VTDecompressionSession (HW) when VideoToolbox PROVABLY HW-decodes this exact format;
         // everything else -> libavcodec. Replace wholesale to prevent state bleed. #2: HardwareVideoDecoder
         // requires a HW decoder and has no software fallback, so an HEVC Rext stream on hardware without a
         // HW decoder must go to libavcodec. AE#461: so must every format the probe cannot classify (in-band
         // parameter sets, Annex-B extradata), which the routing gate reads as "keep native" but which
         // HardwareVideoDecoder, building from the hvcC alone, can never open.
-        if let codecpar = vStream.pointee.codecpar,
+        if let codecpar = decodeStream.pointee.codecpar,
            codecpar.pointee.codec_id == AV_CODEC_ID_HEVC,
            VTCapabilityProbe.hardwareDecodeVerdict(codecpar: codecpar).opensHardwareDecoder {
             videoDecoder.close()
-            let dvProfile = configuredDVProfile ?? AetherEngine.dvProfile(stream: vStream)
+            let dvProfile = configuredDVProfile ?? AetherEngine.dvProfile(stream: decodeStream)
             let chosen = selectVideoDecoder(
                 codecID: codecpar.pointee.codec_id,
                 canHardwareDecode: true,
@@ -1282,7 +1364,7 @@ final class SoftwarePlaybackHost {
             videoDecoder = SoftwareVideoDecoder()
             EngineLog.emit(
                 "[SWHost] selected SoftwareVideoDecoder (libavcodec) for codec_id="
-                + "\(vStream.pointee.codecpar?.pointee.codec_id.rawValue ?? 0)",
+                + "\(decodeStream.pointee.codecpar?.pointee.codec_id.rawValue ?? 0)",
                 category: .swPlayback
             )
         }
@@ -1296,14 +1378,14 @@ final class SoftwarePlaybackHost {
             forHardwareDecoder: videoDecoder is HardwareVideoDecoder || decodesDualLayer))
         renderer.setFELLookahead(
             enabled: decodesDualLayer,
-            frameRate: AetherEngine.detectFrameRate(stream: vStream))
+            frameRate: AetherEngine.detectFrameRate(stream: decodeStream))
         // The FEL look-ahead window only holds if none of it waits in the reorder buffer; see
         // `SampleBufferRenderer.arrivalFloor`. Without a frame rate it stays on the reorder buffer.
         renderer.setArrivalOrderHandover(
-            frameRate: decodesDualLayer ? AetherEngine.detectFrameRate(stream: vStream) : nil)
+            frameRate: decodesDualLayer ? AetherEngine.detectFrameRate(stream: decodeStream) : nil)
 
         // Flip display layer into HDR mode before frames arrive; without this preferredDynamicRange stays .standard and PQ/HLG renders desaturated.
-        if let codecpar = vStream.pointee.codecpar {
+        if let codecpar = decodeStream.pointee.codecpar {
             let trc = codecpar.pointee.color_trc
             let sourceIsHDR = trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67
             if sourceIsHDR {
@@ -1318,7 +1400,7 @@ final class SoftwarePlaybackHost {
         // Applied here (not init) so it also covers a decoder replaced above.
         (videoDecoder as? SoftwareVideoDecoder)?.deinterlaceConfig = deinterlaceConfig
 
-        try videoDecoder.open(stream: vStream) { [weak self] pixelBuffer, pts, hdr10PlusData in
+        try videoDecoder.open(stream: decodeStream) { [weak self] pixelBuffer, pts, hdr10PlusData in
             guard let self else { return }
             // AE#491: a frame decoded from a pre-seek packet is not late, it is from somewhere else.
             guard self.decodeGeneration == self.seekGeneration else { return }
@@ -1344,6 +1426,7 @@ final class SoftwarePlaybackHost {
             }
         }
 
+        if let startSkip { videoDecoder.skipUntilPTS = startSkip }
         videoDecoder.onFirstHDR10PlusDetected = { [weak self] in
             self?.onFirstHDR10PlusDetected?()
         }
@@ -1358,7 +1441,7 @@ final class SoftwarePlaybackHost {
             self?.onA53Captions?(triplets, pts)
         }
 
-        if resolvedAudioIdx >= 0, let aStream = dem.stream(at: resolvedAudioIdx),
+        if resolvedAudioIdx >= 0, let aStream = dem.stream(at: sources.audio),
            let acp = aStream.pointee.codecpar {
             // Live AAC the probe never filled (sample_rate=0): assume 48 kHz stereo AAC-LC so channel
             // negotiation and the published track are correct. The AudioDecoder otherwise recovers
@@ -1406,6 +1489,19 @@ final class SoftwarePlaybackHost {
         // AE#462: after the decoder has had its chance, whichever way the block above left it, so a
         // stream present but unusable (no codecpar) classifies as the drop it is rather than as a
         // source without audio.
+        let watchDemuxer = dem
+        sourceWatch = SoftwareSourceWatch(
+            videoIndex: videoStreamIndex, videoSource: videoSourceStream,
+            audioIndex: audioStreamIndex, audioSource: audioSourceStream,
+            codec: { watchDemuxer.stream(at: $0)?.pointee.codecpar.pointee.codec_id },
+            onCodecChange: { [weak self] summary in
+                Task { @MainActor [weak self] in
+                    guard let self, !self.stopRequested else { return }
+                    EngineLog.emit("[SWHost] program change: \(summary); rebuilding at the playhead",
+                                   category: .swPlayback)
+                    self.onProgramCodecChange?(summary)
+                }
+            })
         self.audioDelivery = audioIsAPAC ? .bridged : Self.audioDelivery(resolvedAudioIndex: resolvedAudioIdx,
                                                 decoderOpened: self.audioDecoder != nil,
                                                 sourceCarriesAudio: dem.firstAudioStreamIndexByType >= 0)
@@ -1457,46 +1553,6 @@ final class SoftwarePlaybackHost {
         // Reset the live feeder state for the new session.
         resetFeederState()
 
-        // The session zero a cold load predicts from the source's origin, the way a resume derives it.
-        // Set for every non-live source, not only a resume: a seek or a scrub still before the first play
-        // converts with it, and the demux loop only resolves the real zero when it first arms the clock
-        // (a pre-play seek arms the clock itself, so the loop never would). Reported, so the engine's
-        // chapter axis, harvest anchors and stills all read the same zero.
-        if !isLive {
-            let predictedZero = SWClockAnchorPolicy.resumeSessionZero(sourceOriginSeconds: dem.resolvedSourceStartOrigin)
-            if predictedZero != clockSessionZero {
-                clockSessionZero = predictedZero
-                onClockSessionZero?(predictedZero)
-            }
-        }
-
-        if let start = startPosition, start.isFinite, start > 0 {
-            // AE#724: the anchor is a session-axis position; on an offset-origin source it is carried
-            // over before it reaches the demuxer, the skip threshold and the clock, as a seek's is.
-            let zero = clockSessionZero
-            let sourceStart = SWClockAnchorPolicy.sourceSeconds(forSession: start, sessionZeroSeconds: zero)
-            // #254: same off-main, deadline-bounded reposition the transport seek uses. A resume into a
-            // remote source that has to scan for its landing would otherwise block the main thread here.
-            let outcome = await reposition(dem, sourceStart, Self.seekBudgetSeconds, seekQueue,
-                                           { [weak self] in self?.stopRequested ?? true })
-            // Besides the in-band record completion above, this is load()'s only suspension point, so it
-            // is the other place a stop() can land mid-load. Arming the clock and publishing isReady on a session already torn down would
-            // hand the engine a host it has stopped.
-            guard !stopRequested, !Task.isCancelled, outcome != .superseded else {
-                throw CancellationError()
-            }
-            EngineLog.emit("[SWReposition] flags=\(outcome == .landed ? 0 : 1)", category: .swPlayback)
-            guard outcome == .landed else { throw HostError.repositionFailed }
-            // Mirror seek() skip-PTS + clock alignment so demux drops pre-keyframe frames and synchronizer starts at the resume offset.
-            let startTime = CMTime(seconds: sourceStart, preferredTimescale: 90000)
-            videoDecoder.skipUntilPTS = startTime
-            renderer.setSkipThreshold(startTime)
-            initialClockTime = startTime
-            currentTime = start
-            sourceClockSeconds = sourceStart
-        } else {
-            initialClockTime = .zero
-        }
 
         // A local path is left on the direct loop: the spool exists to avoid a second trip to a
         // SOURCE, and re-reading a file is a page-cache hit. Measured on a file:// session, the
@@ -1512,7 +1568,8 @@ final class SoftwarePlaybackHost {
                           audioTiming: Self.audioPacketTiming($0.pointee.codecpar))
                 } : nil
             let initialSourceClock = initialClockTime.seconds
-            let videoReorderDepth = Self.presentationReorderDepth(codecID: vCodecID)
+            let videoReorderDepth = Self.presentationReorderDepth(
+                codecID: decodeStream.pointee.codecpar?.pointee.codec_id.rawValue ?? vCodecID)
             let cacheResult = await BlockingWork.detached(priority: .utility) { () throws -> (SoftwarePacketReadAhead, RetentionClaims.Claim?)? in
                 let segments = HLSVideoEngine.clampedForwardWindow(forwardBufferSegments)
                 guard let (fifo, bytes, claim) = try Self.makePacketStore(
@@ -2224,10 +2281,16 @@ final class SoftwarePlaybackHost {
         audioTimeBaseSeconds: Double,
         audioTapSink: (@Sendable (CMSampleBuffer) -> Void)?,
         audioEpoch: UInt64,
-        noteDecodeGeneration: @Sendable () -> Void
+        noteDecodeGeneration: @Sendable () -> Void,
+        sourceWatch: SoftwareSourceWatch? = nil
     ) -> Bool {
         let tbSec = pkt.isVideo ? videoTimeBaseSeconds : audioTimeBaseSeconds
         guard tbSec > 0, !pkt.bytes.isEmpty else { return false }
+        if let sourceWatch {
+            let index = pkt.isVideo ? videoStreamIndex : audioStreamIndex
+            guard sourceWatch.verdict(streamIndex: index, source: pkt.source >= 0 ? pkt.source : index) == .decode
+            else { return false }
+        }
 
         guard let p = trackedPacketAlloc() else { return false }
         var avPkt: UnsafeMutablePointer<AVPacket>? = p
@@ -2243,6 +2306,7 @@ final class SoftwarePlaybackHost {
         p.pointee.dts = p.pointee.pts
         p.pointee.flags = pkt.isKeyframe ? AV_PKT_FLAG_KEY : 0
         p.pointee.stream_index = pkt.isVideo ? videoStreamIndex : audioStreamIndex
+        if pkt.source >= 0 { p.pointee.opaque = UnsafeMutableRawPointer(bitPattern: Int(pkt.source) + 1) }
 
         if pkt.isVideo {
             noteDecodeGeneration()
@@ -2448,6 +2512,7 @@ final class SoftwarePlaybackHost {
             self?.onClockSessionZero?(zero)
         }
 
+        let watch = sourceWatch
         if liveSession, let ring {
             let getFeederPlaying: @Sendable () -> Bool = { [weak self] in
                 guard let self else { return false }
@@ -2547,7 +2612,8 @@ final class SoftwarePlaybackHost {
                     markClockArmed: setClockArmed,
                     onEnd: onEnd,
                     audioTapSink: getAudioTapSink,
-                    noteDecodeGeneration: noteDecodeGeneration
+                    noteDecodeGeneration: noteDecodeGeneration,
+                    sourceWatch: watch
                 )
             }
             return
@@ -2594,7 +2660,8 @@ final class SoftwarePlaybackHost {
                 splitDisplaySetSubtitleStreamIndices: subSplitSetIndices,
                 subtitleTapSink: getSubtitleTapSink,
                 recordingTap: recordingTap,
-                playedMedia: playedMediaLedger
+                playedMedia: playedMediaLedger,
+                sourceWatch: watch
             )
         }
     }
@@ -2764,8 +2831,10 @@ final class SoftwarePlaybackHost {
                         let isKey = isVideo && (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
                         // Best-effort: a write failure just shrinks the
                         // rewind window, it must not stall the reader.
+                        let source = Demuxer.sourceStream(of: packet)
                         try? ring.append(pts: ptsSec, isKeyframe: isKey, isVideo: isVideo,
-                                         bytes: UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)))
+                                         bytes: UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)),
+                                         source: source == streamIdx ? -1 : source)
                         condition.lock()
                         condition.broadcast()
                         condition.unlock()
@@ -2824,7 +2893,8 @@ final class SoftwarePlaybackHost {
         markClockArmed: @Sendable () -> Void,
         onEnd: @Sendable () -> Void,
         audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?),
-        noteDecodeGeneration: @Sendable () -> Void
+        noteDecodeGeneration: @Sendable () -> Void,
+        sourceWatch: SoftwareSourceWatch? = nil
     ) {
         // The join's start is placed once, before the first packet is fed; a seek before then is
         // the viewer's own choice of position and retires it.
@@ -2871,7 +2941,8 @@ final class SoftwarePlaybackHost {
                     audioTimeBaseSeconds: audioTimeBaseSeconds,
                     audioTapSink: audioTapSink(),
                     audioEpoch: audioEpoch,
-                    noteDecodeGeneration: noteDecodeGeneration
+                    noteDecodeGeneration: noteDecodeGeneration,
+                    sourceWatch: sourceWatch
                 )
                 if !armed {
                     preArmPacketsFed += 1
@@ -3123,7 +3194,8 @@ final class SoftwarePlaybackHost {
                 audioTimeBaseSeconds: audioTimeBaseSeconds,
                 audioTapSink: audioTapSink(),
                 audioEpoch: audioEpoch,
-                noteDecodeGeneration: noteDecodeGeneration
+                noteDecodeGeneration: noteDecodeGeneration,
+                sourceWatch: sourceWatch
             )
 
             // Arm clock once on first packet PTS (anchoring at .zero caused delay). Audio: first decoded buffers; video-only: first video packet (no clock without audio = frozen frame).
@@ -3212,7 +3284,8 @@ final class SoftwarePlaybackHost {
         splitDisplaySetSubtitleStreamIndices: Set<Int32> = [],
         subtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { nil },
         recordingTap: @escaping @Sendable (UnsafeMutablePointer<AVPacket>) -> Void = { _ in },
-        playedMedia: PlayedMediaLedger? = nil
+        playedMedia: PlayedMediaLedger? = nil,
+        sourceWatch: SoftwareSourceWatch? = nil
     ) {
         // Clock arming: one-shot latch (seekClock is not idempotent -- re-calling snaps clock back to initialClockTime). Shared with host so a seek before first audio isn't overridden by a late re-arm.
 
@@ -3583,6 +3656,13 @@ final class SoftwarePlaybackHost {
             recordingTap(packet)
 
             let streamIdx = packet.pointee.stream_index
+            // A role a program change moved to another codec: held out until the rebuild it asked for.
+            if let sourceWatch,
+               sourceWatch.verdict(streamIndex: streamIdx, source: Demuxer.sourceStream(of: packet)) == .drop {
+                av_packet_unref(packet)
+                av_packet_free_safe(packet)
+                return true
+            }
 
             // Discontinuity runs before any timestamp read; offset applied to both streams.
             if foldTimeline, streamIdx == videoStreamIndex, videoTimeBaseSeconds > 0,
