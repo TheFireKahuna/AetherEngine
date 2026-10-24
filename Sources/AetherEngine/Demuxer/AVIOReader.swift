@@ -48,16 +48,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// a sidecar, a still), which keep the headers they were opened with.
     private let requestHeaderStore: RequestHeaderStore?
     private var extraHeaders: [String: String] { requestHeaderStore?.current ?? openedHeaders }
-    /// #450: connections the BOUNDED pool may hold to one host. A throttle, and it is allowed to be
-    /// one: every request on that pool ends (a 4 MB detour block, a size probe, the tail prefetch),
-    /// so a request that waits here waits for one that is finishing.
-    static let boundedConnectionsPerHost = 2
-
-    /// #450: connections the LONG-LIVED pool may hold to one host. Deliberately above any plausible
-    /// reader count rather than a limit, because the same number that throttles the bounded pool
-    /// deadlocks this one. See `makeSessionConfig`.
-    static let longLivedConnectionsPerHost = 64
-
     struct HopTiming {
         let host: String
         let port: Int
@@ -108,31 +98,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         )
     }
 
-    /// Session config factory. Short-lived probes/chunks get a 60s resource timeout;
-    /// long-lived persistent/streaming connections omit it (fires mid-stream, NSURLError
-    /// -1001; stall detection is handled by `connStallTimeout`). `urlCache = nil` avoids
-    /// the "N URLCaches racing async invalidation" leak (reverted in fef8ef4).
-    ///
-    /// #450: the two pools carry different requests, so they carry different cap policies.
-    ///
-    /// `persistentSession` is a `static let`, so its cap is not a per-reader allowance, it is the
-    /// whole PROCESS's allowance to one origin, shared by every reader in it: the pump, the
-    /// subtitle side reader, the forward prefetcher, and one more pump per playback surface. Its
-    /// requests are open-ended by design, a live pump holding its connection for the whole session,
-    /// so the request that arrives on top of the cap is not slowed, it is parked behind connections
-    /// that are not going to end. URLSession parks it with no callback, no error and no metrics, so
-    /// the wait is not even observable as a wait: `awaitFirstPersistentData` spends its full 15 s
-    /// and the load reports a source that would not open, for a queue the engine built itself
-    /// (measured, reporter of #450: four live tiles on one origin, tiles 3 and 4 zero bytes, while
-    /// three concurrent `curl` pulls of the same endpoints flowed at full rate).
-    ///
-    /// What the engine asks of one origin is bounded by `OriginRequestBudget` (#377) instead. That
-    /// one counts requests rather than connections, which is what an origin meters and the only
-    /// thing that means anything over h2, it waits with a budget, it says that it waited, and it
-    /// lowers itself when the origin answers 429/503/509. A second ceiling underneath it, silent
-    /// and unyielding, made the documented contract of `LoadOptions.maxConcurrentSourceRequests ==
-    /// nil` ("counts but does not cap") false from the third concurrent long-lived read on. A
-    /// declared ceiling is a lie for as long as a lower one is silent.
     /// The ceiling a bounded fetch (a chunk, a detour block, the tail prefetch) gets on the shared
     /// session, the one its own session used to impose (`timeoutIntervalForResource`).
     static let boundedResourceSeconds: TimeInterval = 60
@@ -144,22 +109,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// nothing else: what retains a completion-handler body is the demux thread's autorelease pool,
     /// not the session (#243), and these paths are delegate-based. A probe-controlled reader keeps
     /// the session its probe hands it.
-    ///
-    /// Kept for the sessions this reader no longer makes but a test or a sibling still configures
-    /// the same way.
-    static func makeSessionConfig(longLived: Bool = false) -> URLSessionConfiguration {
-        let config = URLSessionConfiguration.ephemeral
-        if !longLived {
-            config.timeoutIntervalForResource = 60
-        }
-        config.httpMaximumConnectionsPerHost =
-            longLived ? longLivedConnectionsPerHost : boundedConnectionsPerHost
-        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        // No URLCache instance, kills the in-memory cache that the
-        // long-lived-session fix from fef8ef4 was working around.
-        config.urlCache = nil
-        return config
-    }
     private var position: Int64 = 0
     private var fileSize: Int64 = -1
 
@@ -3137,7 +3086,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         fileSize = warm.contentLength
         adoptedWarmSize = warm.contentLength
         winCond.unlock()
-        SourceContentLengthCache.store(warm.contentLength, for: url)
         sourceCache?.noteTotalSize(warm.contentLength, for: cacheKey)
         // The warm followed the redirect chain and knows where it ended. Pinning that target here
         // is what keeps this session from resolving it a second time: a resolver 302 measured
@@ -3755,7 +3703,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             "[AVIOReader] \(label) gen=\(generation) no first byte after "
             + "\(String(format: "%.1f", waited))s at offset \(offset); "
             + (inflight.map { "\($0) request(s) open to this origin" } ?? "origin not in the budget's books")
-            + ", transport pool allows \(Self.longLivedConnectionsPerHost) connections per host",
+            + ", transport pool allows \(EngineHTTP.connectionsPerHost) connections per host",
             category: .demux)
     }
 
@@ -4080,7 +4028,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             fileSize = total
             // #112: share this resolved length so a later side demuxer on the same origin can skip a probe that
             // might be starved under this connection's load and would otherwise collapse it to forward-only.
-            SourceContentLengthCache.store(total, for: url)
             sourceCache?.noteTotalSize(total, for: cacheKey)
             #if DEBUG
             EngineLog.emit("[AVIOReader] File size: \(total) bytes (data connection)", category: .demux)
@@ -4446,17 +4393,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     // MARK: - Network (seekable mode)
 
-    /// These callbacks deliver foreground playback bytes and return origin slots to blocked
-    /// demux threads. URLSession's implicit queue can run at utility QoS and cannot donate
-    /// priority through a semaphore. Each session keeps its own serial callback queue.
-    static func makePlaybackDelegateQueue() -> OperationQueue {
-        let queue = OperationQueue()
-        queue.name = "aether.avio.callbacks"
-        queue.qualityOfService = .userInitiated
-        queue.maxConcurrentOperationCount = 1
-        return queue
-    }
-
     /// Audit DMX-5: where a 206 says its body starts, when that is not where it was asked to.
     /// Every ranged path here places the body at the REQUESTED offset, so a 206 aligned to an
     /// edge's own chunk boundary would shift every later read by the difference. Nil for any other
@@ -4549,16 +4485,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// demuxer already resolved for the same origin. A fresh probe here can be 429'd or answered without a length
     /// while the video producer is hammering the origin, which would drop this reader to forward-only streaming so
     /// every `avformat_seek_file` returns -1 and PGS reconstruction reads nothing. The producer's persistent open
-    /// caches the real length (SourceContentLengthCache.store at the data-connection response), so a starved probe
-    /// reuses it and stays byte-seekable. A successful probe also seeds the cache for whoever opens next.
+    /// records the real length in the source cache (`noteTotalSize` at the data-connection response), so a starved
+    /// probe reuses it and stays byte-seekable. A successful probe also records it for whoever opens next.
     private func resolveInitialFileSize() -> Int64 {
         let probed = probeFileSize()
         if probed > 0 {
-            SourceContentLengthCache.store(probed, for: url)
             sourceCache?.noteTotalSize(probed, for: cacheKey)
             return probed
         }
-        if let cached = SourceContentLengthCache.lookup(url), cached > 0 {
+        if let cached = sourceCache?.knownSize(cacheKey), cached > 0 {
             EngineLog.emit("[AVIOReader] size probe empty; reusing cached \(cached) bytes to keep seekability (#112)", category: .demux)
             return cached
         }

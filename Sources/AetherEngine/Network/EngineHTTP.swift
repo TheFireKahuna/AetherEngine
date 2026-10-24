@@ -22,8 +22,22 @@ import Foundation
 /// `PersistentHTTP1Transport`), whose point is a connection of their own. A session a test injects is
 /// also left as it is.
 enum EngineHTTP {
+    /// Connections the pool may hold to one host. Over HTTP/3 or HTTP/2 there is one whatever this
+    /// says; it binds only an HTTP/1.1 origin, and there it must not bind (#450). The pool carries
+    /// open-ended requests (a live pump holds its connection for the whole session), so a request on
+    /// top of a cap is not slowed but parked behind connections that are not going to end, with no
+    /// callback, no error and no metrics: four live tiles against one origin left tiles 3 and 4 at
+    /// zero bytes while `curl` pulled the same endpoints at full rate. So it sits above any plausible
+    /// reader count, and what the engine asks of an origin is bounded by `OriginRequestBudget`
+    /// (#377) instead, which counts requests (what an origin meters), waits with a budget, says that
+    /// it waited, and lowers itself when the origin answers 429/503/509.
+    static let connectionsPerHost = 64
+
     /// One serial queue for every callback: per-task ordering needs a serial queue, and each callback
-    /// is a copy into a buffer and a signal, never work.
+    /// is a copy into a buffer and a signal, never work. User-initiated, because these callbacks
+    /// deliver foreground playback bytes and return origin slots to blocked demux threads, and
+    /// URLSession's implicit queue can run at utility QoS with no way to donate priority through a
+    /// semaphore.
     static let delegateQueue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "aether.http.callbacks"
@@ -36,9 +50,7 @@ enum EngineHTTP {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         configuration.urlCache = nil
-        // Counts connections, which on HTTP/3 is one per origin whatever this says; on an HTTP/1.1
-        // origin it is the pool the long-lived pump connections already had (#450).
-        configuration.httpMaximumConnectionsPerHost = AVIOReader.longLivedConnectionsPerHost
+        configuration.httpMaximumConnectionsPerHost = connectionsPerHost
         // The ceiling is per task now (`armResourceDeadline`); the session imposes none of its own.
         configuration.timeoutIntervalForResource = .greatestFiniteMagnitude
         return URLSession(configuration: configuration, delegate: EngineTLS.sessionDelegate,

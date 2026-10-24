@@ -241,11 +241,10 @@ struct LiveSubtitleRenditionHardeningTests {
         #expect(failing == nil)
     }
 
-    @Test("the rendition session has a finite resource timeout")
-    func sessionTimeoutsAreFinite() {
-        let configuration = AetherEngine.liveSubtitleRenditionSessionConfiguration()
-        #expect(configuration.timeoutIntervalForResource <= 60)
-        #expect(configuration.timeoutIntervalForRequest <= 30)
+    @Test("the rendition fetches carry a finite resource timeout")
+    func fetchTimeoutsAreFinite() {
+        #expect(AetherEngine.liveSubtitleRenditionResourceSeconds <= 60)
+        #expect(AetherEngine.liveSubtitleRenditionIdleSeconds <= 30)
     }
 
     @Test("the published cue list is capped")
