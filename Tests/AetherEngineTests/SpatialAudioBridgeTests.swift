@@ -961,3 +961,125 @@ extension SpatialAudioBridgeTests {
     }
 }
 #endif
+
+#if TrueHDObjectAudio
+/// The anchor after a reset, when most packets carry no timestamp (laced Matroska: one per 100 ms block).
+extension SpatialAudioBridgeTests {
+
+    /// Reports each push's timestamp back on the block it carried, as LibTrueHD does, and after its
+    /// reset (or at the start) emits nothing until `syncWait` pushes have passed, as TrueHD waits for a
+    /// major sync. Offsets count every push since the reset.
+    final class TimestampingDecoder: ObjectAudioDecoding {
+        let panicAt: Int?, syncWait: Int, reportsTimestamps: Bool
+        private var pushes = 0, sinceReset = 0
+        private var inputFrames: Int64 = 0
+        private var blocks: [(offset: Int64, frames: Int, pts: Int64)] = []
+        private let plane = UnsafeMutablePointer<Float>.allocate(capacity: 1 << 16)
+        private(set) var selfResetCount = 0
+        struct Panic: Error {}
+        init(panicAt: Int?, syncWait: Int, reportsTimestamps: Bool = true) {
+            self.panicAt = panicAt; self.syncWait = syncWait; self.reportsTimestamps = reportsTimestamps
+            plane.initialize(repeating: 0.1, count: 1 << 16)
+        }
+        deinit { plane.deallocate() }
+        func push(_ bytes: UnsafeRawBufferPointer) throws { try push(bytes, pts: Int64.min) }
+        func push(_ bytes: UnsafeRawBufferPointer, pts: Int64) throws {
+            pushes += 1
+            if pushes == panicAt { inputFrames = 0; blocks = []; sinceReset = 0; selfResetCount += 1; throw Panic() }
+            sinceReset += 1
+            let frames = bytes.count * 40
+            if sinceReset > syncWait { blocks.append((inputFrames, frames, pts)) }
+            inputFrames += Int64(frames)
+        }
+        func nextBlock() throws -> ObjectAudioDecodedBlock? {
+            guard !blocks.isEmpty else { return nil }
+            let b = blocks.removeFirst()
+            return ObjectAudioDecodedBlock(
+                sampleRate: 48_000, frameCount: b.frames, inputFrameOffset: b.offset, configurationGeneration: 0,
+                roles: [.bed(.left)], planes: [UnsafePointer(plane)], updates: [],
+                sourcePts: reportsTimestamps && b.pts != Int64.min ? b.pts : nil, sourcePtsInputFrame: b.offset)
+        }
+        func reset() { inputFrames = 0; blocks = []; sinceReset = 0 }
+    }
+
+    /// `count` packets of 20 ms from `startMs`, packet i carrying a timestamp only when i % `every` == 0
+    /// and i >= `firstStamped`. Returns the emitted packets' pts, drained.
+    private func feedLaced(_ bridge: SpatialAudioBridge, startMs: Int64, count: Int, every: Int,
+                           firstStamped: Int = 0) throws -> [Int64] {
+        var out: [Int64] = []
+        var payload = [UInt8](repeating: 0, count: 24)
+        for i in 0..<count {
+            guard let pkt = av_packet_alloc() else { continue }
+            defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
+            payload.withUnsafeMutableBytes { raw in
+                _ = av_new_packet(pkt, 24)
+                pkt.pointee.data.update(from: raw.bindMemory(to: UInt8.self).baseAddress!, count: 24)
+            }
+            pkt.pointee.pts = i % every == 0 && i >= firstStamped ? startMs + Int64(i) * 20 : Int64.min
+            pkt.pointee.dts = pkt.pointee.pts
+            for fp in try bridge.feed(packet: pkt) {
+                out.append(fp.pointee.pts)
+                var p: UnsafeMutablePointer<AVPacket>? = fp
+                trackedPacketFree(&p)
+            }
+        }
+        for fp in try bridge.flush() {
+            out.append(fp.pointee.pts)
+            var p: UnsafeMutablePointer<AVPacket>? = fp
+            trackedPacketFree(&p)
+        }
+        return out
+    }
+
+    @Test("after a self-reset whose next packets carry no timestamp, later audio keeps its source position")
+    func lacedSelfResetKeepsPosition() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        // Panic on push 52; packets 52-54 carry no timestamp, 55 does, and the decoder resumes output
+        // six pushes after its reset. Anchored on packet 55's timestamp as if it were packet 52's, the
+        // rest played three packets (60 ms) late; the lost packet 51 comes back as silence instead.
+        let bridge = try SpatialAudioBridge(srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
+                                            decoder: TimestampingDecoder(panicAt: 52, syncWait: 6))
+        defer { bridge.close() }
+        let packets = try feedLaced(bridge, startMs: 1000, count: 100, every: 5)
+        // The same stream without the panic, through the same decoder (which also waits for a sync at
+        // the start): the timestamps have to come out identical.
+        let unbroken = try SpatialAudioBridge(srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
+                                              decoder: TimestampingDecoder(panicAt: nil, syncWait: 6))
+        defer { unbroken.close() }
+        let reference = try feedLaced(unbroken, startMs: 1000, count: 100, every: 5)
+        #expect(reference.first == Int64(53_760), "1 s plus the six 960-frame packets before the sync")
+        #expect(packets == reference)
+        #expect(bridge.feedStats.timestampMismatches == 0)
+    }
+
+    @Test("a decoder that reports no timestamps never puts audio after a reset late")
+    func lacedSelfResetWithoutBlockTimestamps() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try SpatialAudioBridge(srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
+                                            decoder: TimestampingDecoder(panicAt: 52, syncWait: 6, reportsTimestamps: false))
+        defer { bridge.close() }
+        let packets = try feedLaced(bridge, startMs: 1000, count: 100, every: 5)
+        let unbroken = try SpatialAudioBridge(srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
+                                              decoder: TimestampingDecoder(panicAt: nil, syncWait: 6, reportsTimestamps: false))
+        defer { unbroken.close() }
+        let reference = try feedLaced(unbroken, startMs: 1000, count: 100, every: 5)
+        // Packet 55's timestamp no longer anchors packet 52's frames; with nothing to say where they
+        // go, they follow on from what came before, losing at most the panicked packet's 20 ms.
+        #expect(packets.count <= reference.count && packets.count >= reference.count - 1)
+    }
+
+    @Test("with no timestamp on the first packet, the first block that carries one anchors exactly")
+    func firstTimestampFromBlock() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try SpatialAudioBridge(srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
+                                            decoder: TimestampingDecoder(panicAt: nil, syncWait: 0))
+        defer { bridge.close() }
+        // Packets 0-4 carry no timestamp; packet 5 is stamped 1100 ms. Its block is input frame 4800,
+        // so input frame 0 sits at 1000 ms; blocks before it are dropped, not placed at 0.
+        let packets = try feedLaced(bridge, startMs: 1000, count: 50, every: 5, firstStamped: 5)
+        #expect(packets.first == 52_800)
+        #expect(zip(packets, packets.dropFirst()).allSatisfy { $1 - $0 == 1024 })
+        #expect(bridge.feedStats.blocksDroppedUnplaced == 5)
+    }
+}
+#endif

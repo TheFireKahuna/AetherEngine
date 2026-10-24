@@ -620,6 +620,12 @@ final class AudioBridge: @unchecked Sendable {
         /// `avcodec_receive_packet` answers that were neither a packet nor EAGAIN/EOF.
         var encodeErrors = 0
         var lastEncodeErrorCode: Int32 = 0
+        /// Source timestamps that disagreed with the bridge's own count of the audio it was given by
+        /// more than half a millisecond (a Matroska timestamp's rounding).
+        var timestampMismatches = 0
+        /// Decoded audio dropped because nothing yet said where it plays (no timestamp on the first
+        /// packet since a reset, none on its blocks).
+        var blocksDroppedUnplaced = 0
 
         /// Fed real source, answered with nothing at all.
         var isSilent: Bool { packetsFed > 0 && packetsEmitted == 0 }
