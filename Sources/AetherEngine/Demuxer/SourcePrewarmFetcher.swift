@@ -50,7 +50,10 @@ enum SourcePrewarmFetcher {
     static func warm(url: URL,
                      extraHeaders: [String: String],
                      byteBudget: Int,
-                     into store: SourcePrewarmStore = .shared) async -> SourcePrewarmReport {
+                     into cache: SourceByteCache = .shared) async -> SourcePrewarmReport {
+        // Everything a warm learns is filed under the request a load will make: the source URL and
+        // the load's headers, whatever URL and headers actually served it.
+        let key = SourceCacheKey(url: url, headers: extraHeaders)
         let budget = max(0, byteBudget)
         guard budget > 0 else { return decline(url, "byte budget is zero") }
         // The same early-out the tail prefetch takes: on an origin metered down to one request at a
@@ -65,7 +68,8 @@ enum SourcePrewarmFetcher {
         do {
             head = try await RangeFetch.run(url: url, extraHeaders: extraHeaders,
                                             requestedStart: 0, requestedLength: budget,
-                                            label: "prewarm head", session: session)
+                                            label: "prewarm head", session: session,
+                                            cache: cache, cacheKey: key)
         } catch let error as PrewarmDecline {
             return decline(url, error.reason)
         } catch {
@@ -82,55 +86,53 @@ enum SourcePrewarmFetcher {
         let tailURL = head.respondedURL ?? url
         let tailHeaders = RedirectHeaderPolicy.headersToReplay(
             extraHeaders: extraHeaders, originalURL: url, redirectURL: tailURL)
-        var tail: ResidentSpan?
+        var tail: (start: Int64, bytes: Int)?
         switch SourcePrewarmPlan.trailing(head: head.body, total: head.total) {
         case .none:
             break
         case .suffix where head.total > Int64(head.body.count) + Int64(tailBytes):
             tail = await fetchTail(url: tailURL, extraHeaders: tailHeaders, source: url,
-                                   start: head.total - Int64(tailBytes), length: tailBytes)
+                                   start: head.total - Int64(tailBytes), length: tailBytes,
+                                   cache: cache, cacheKey: key)
         case .suffix:
             break
         case .range(let start):
             let length = Int(clamping: head.total - start)
             if length > 0 {
                 tail = await fetchTail(url: tailURL, extraHeaders: tailHeaders, source: url,
-                                       start: start, length: length)
+                                       start: start, length: length, cache: cache, cacheKey: key)
             }
         }
         if Task.isCancelled { return decline(url, "cancelled") }
 
-        let warmed = PrewarmedSource(head: ResidentSpan(start: 0, data: head.body),
-                                     tail: tail,
-                                     contentLength: head.total,
-                                     requestHeaders: extraHeaders,
-                                     resolvedURL: head.respondedURL)
-        guard store.store(warmed, for: url) else {
-            return decline(url, "\(warmed.byteCount) bytes exceed the prewarm store's cap")
-        }
+        // The resolved target rides with the bytes, so a load pins it instead of paying the 302
+        // again (#551 round 2), and the warm reports done only once its bytes are servable.
+        cache.noteResolvedURL(head.respondedURL, for: key)
+        await cache.flushWrites()
+        let retained = head.body.count + (tail?.bytes ?? 0)
         EngineLog.emit(
             "[SourcePrewarm] warmed \(url.lastPathComponent): head=\(head.body.count)B "
-            + "tail=\(tail?.data.count ?? 0)B at \(tail.map { String($0.start) } ?? "-") "
+            + "tail=\(tail?.bytes ?? 0)B at \(tail.map { String($0.start) } ?? "-") "
             + "of \(head.total)B"
-            + (warmed.resolvedURL.map { ", resolved to host=\($0.host ?? "?")" } ?? "")
+            + (head.respondedURL.map { ", resolved to host=\($0.host ?? "?")" } ?? "")
             + " (#551)",
             category: .demux)
-        return SourcePrewarmReport(retainedBytes: warmed.byteCount,
-                                   contentLength: head.total,
-                                   declined: nil)
+        return SourcePrewarmReport(retainedBytes: retained, contentLength: head.total, declined: nil)
     }
 
     private static func fetchTail(url: URL,
                                   extraHeaders: [String: String],
                                   source: URL,
                                   start: Int64,
-                                  length: Int) async -> ResidentSpan? {
+                                  length: Int,
+                                  cache: SourceByteCache,
+                                  cacheKey: SourceCacheKey) async -> (start: Int64, bytes: Int)? {
         if let fetched = try? await RangeFetch.run(
             url: url, extraHeaders: extraHeaders,
             requestedStart: start, requestedLength: length,
-            label: "prewarm tail", session: session),
+            label: "prewarm tail", session: session, cache: cache, cacheKey: cacheKey),
            fetched.range.start == start {
-            return ResidentSpan(start: start, data: fetched.body)
+            return (start, fetched.body.count)
         }
         EngineLog.emit("[SourcePrewarm] trailing object not retained for \(source.lastPathComponent); "
                        + "the head alone is warm", category: .demux)
@@ -171,7 +173,9 @@ enum RangeFetch {
                     requestedStart: Int64,
                     requestedLength: Int,
                     label: String,
-                    session: URLSession) async throws -> Result {
+                    session: URLSession,
+                    cache: SourceByteCache,
+                    cacheKey: SourceCacheKey) async throws -> Result {
         guard let ticket = OriginRequestBudget.shared.tryAcquire(for: url, label: label) else {
             throw PrewarmDecline(reason: "no origin request slot free (#377)")
         }
@@ -200,9 +204,8 @@ enum RangeFetch {
                     case .body(let result):
                         SourceByteLedger.shared.record(url, reader: label, offset: result.range.start,
                                                        count: result.body.count)
-                        let key = SourceCacheKey(url: url, headers: extraHeaders)
-                        SourceByteCache.shared.noteTotalSize(result.total, for: key)
-                        SourceByteCache.shared.store(result.body, at: result.range.start, for: key)
+                        cache.noteTotalSize(result.total, for: cacheKey)
+                        cache.store(result.body, at: result.range.start, for: cacheKey)
                         continuation.resume(returning: result)
                     case .rejected(let reason): continuation.resume(throwing: PrewarmDecline(reason: reason))
                     }

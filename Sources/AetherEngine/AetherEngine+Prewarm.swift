@@ -80,20 +80,22 @@ public extension AetherEngine {
                                         byteBudget: byteBudget ?? SourcePrewarmFetcher.defaultByteBudget)
     }
 
-    /// Whether a source is warm right now, without consuming it.
+    /// Whether a source's head is warm right now, for the request a load will make (`httpHeaders` as
+    /// that load carries them).
     ///
-    /// For a host that wants to skip re-warming an item it already warmed. The playing session's
-    /// adoption is what empties it, so this answers false again after the load that used it.
-    nonisolated static func isPrewarmed(url: URL) -> Bool {
-        SourcePrewarmStore.shared.isWarm(for: url)
+    /// For a host that wants to skip re-warming an item it already warmed. Warm bytes live in the
+    /// engine's source cache, shared with every reader of the source rather than taken by the first,
+    /// so a source stays warm after the load that used it, until the cache lets it go.
+    nonisolated static func isPrewarmed(url: URL, httpHeaders: [String: String] = [:]) -> Bool {
+        SourceByteCache.shared.heldLength(SourceCacheKey(url: url, headers: httpHeaders), at: 0,
+                                          expectedSize: nil) > 0
     }
 
-    /// Drop every warmed source.
+    /// Drop every warmed source no session is reading.
     ///
     /// For a host leaving the context the warms were made for (a user signing out, a server
-    /// changing). Warmed bytes cost memory until they are adopted or displaced, and a host that
-    /// knows they will never be adopted can say so.
+    /// changing): their bytes are let go now rather than after the cache's grace.
     nonisolated static func discardPrewarmedSources() {
-        SourcePrewarmStore.shared.clear()
+        SourceByteCache.shared.releaseIdleSources()
     }
 }

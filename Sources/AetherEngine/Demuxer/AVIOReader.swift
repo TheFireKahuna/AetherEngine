@@ -232,6 +232,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // from the dropped ledger is what keeps "dropped and minted again" meaning a target that is
         // still refusing, instead of a label a host wears for the rest of the process.
         OriginRequestBudget.shared.noteTargetHealthy(resolved)
+        // The next reader of this source pins it too, rather than paying the resolver again.
+        if resolved != url { sourceCache?.noteResolvedURL(resolved, for: cacheKey) }
         resolvedURLLock.lock()
         defer { resolvedURLLock.unlock() }
         if resolved != url && resolved != _resolvedURL {
@@ -257,6 +259,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             EngineLog.emit("[AVIOReader] Dropped resolved URL cache (\(reason))", category: .demux)
         }
         resolvedURLLock.unlock()
+        if let droppedNow { sourceCache?.forgetResolvedURL(droppedNow, for: cacheKey) }
         // Outside the reader's lock, and outside the reader's lifetime: the ledger belongs to the
         // origin because the next request against it may well come from a demuxer that does not
         // exist yet (#377 round 5).
@@ -1029,12 +1032,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var tailPrefetchStartedAt = DispatchTime.now()
 
     /// One log line per span per open, not per serve. winCond-guarded (set from the read loop).
-    /// #551: the size this open took from a warm rather than from a response header. A size that
-    /// came from a DIFFERENT response than the one now serving the session is the one adopted fact
-    /// that could be wrong and could never be corrected, because the write-once rule below treats
-    /// any positive `fileSize` as settled. Remembered so the frontier connection's own
-    /// `Content-Range` can be checked against it, once.
-    private var adoptedWarmSize: Int64?
+    /// #551: the size this open took from the source cache rather than from a response header. A
+    /// size that came from a DIFFERENT response than the one now serving the session is the one
+    /// adopted fact that could be wrong and could never be corrected, because the write-once rule
+    /// below treats any positive `fileSize` as settled. Remembered so the first network connection's
+    /// own `Content-Range` can be checked against it, once.
+    private var adoptedCachedSize: Int64?
     private var headSpanServeLogged = false
     private var headSpanPlaybackServeLogged = false
     private var tailSpanServeLogged = false
@@ -1279,91 +1282,71 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             winCond.lock()
             openPhaseActive = true
             winCond.unlock()
-            // #551: bytes a host warmed for this source before anything asked to play it. When
-            // they are here, this open owes the origin nothing for the span they cover.
-            let warm = adoptPrewarmedSource()
+            // #551: what another reader of this source, or a host's warm, already learned: its size
+            // and redirect target, so the first connection is planned against the bytes the source
+            // cache holds and replays the head from disk instead of asking the origin.
+            adoptCachedSourceSize()
             // #281: issued BEFORE the data connection so it overlaps the round trip that follows,
             // rather than queueing behind it. It asks for a suffix range, which needs no size and
-            // therefore needs nothing this open has learned yet. A warm that already carries the
-            // trailing object has no use for it.
-            // A fully resident head already contains the suffix too. Do not start an asynchronous
-            // request for bytes this open has adopted in their entirety.
-            let fullyWarmed = warm.map { $0.head.end >= $0.contentLength } ?? false
-            if warm?.tail == nil, !fullyWarmed {
-                startTailPrefetch()
-            }
+            // therefore needs nothing this open has learned yet; a tail the source cache holds is
+            // served from there.
+            startTailPrefetch()
             // Playback path. The persistent connection's `Range: bytes=0-` request is itself
             // the size probe: its 206 Content-Range is folded into fileSize by
             // persistentReceivedResponse (issue #70), so the common case skips the dedicated
             // probeFileSize() round-trip (and its HEAD fallback, the request some origins 429).
-            //
-            // #551: a warm open moves that connection to the warm frontier rather than skipping it.
-            // Playback needs the bytes behind the head either way, and issuing it here is what
-            // overlaps its round trip with the parse that the warm bytes are already serving.
-            let warmFrontier = warm?.head.end ?? 0
             let gotData: Bool
             let openPrefix: [UInt8]
-            if let warm {
-                if warmFrontier < warm.contentLength {
-                    startPersistentConnection(at: warmFrontier, boundedTo: boundedInitialFetch)
-                }
-                // The open has its first bytes in hand, so there is nothing to wait for. Waiting
-                // anyway would spend the round trip this whole feature exists to remove.
-                gotData = true
-                openPrefix = Array(warm.head.data.prefix(16))
-            } else {
-                adoptCachedSourceSize()
+            winCond.lock()
+            rangeVerdictPending = !isLive
+            winCond.unlock()
+            startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
+            var opened = awaitFirstPersistentData()
+            // A live open the origin answered with a status is reported as that answer, the
+            // way the live HLS ingest reports a refused join: the host retries a 509 on its own
+            // cadence with the right words for it, where the read loop's ladder would have spent
+            // the open budget on the same request and handed back an untyped read failure.
+            // A server error is asked once more first, as the read loop did before this was typed:
+            // a 500/502 while a tuner or transcode spins up is the moment's, not the channel's.
+            if !opened, isLive, let refusal = refusalOfLiveOpenConnection(),
+               Self.isResolvedHardServerError(refusal) {
+                EngineLog.emit(
+                    "[AVIOReader] \(label) live open answered status=\(refusal); asking once more",
+                    category: .demux)
+                backoffBeforeReconnect(streak: 1, retryAfter: 0)
+                try probeControl?.check()
+                guard !isClosed else { throw CancellationError() }
+                startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
+                opened = awaitFirstPersistentData()
+            }
+            if !opened, isLive, let refusal = refusalOfLiveOpenConnection() {
+                EngineLog.emit(
+                    "[AVIOReader] \(label) live open refused status=\(refusal); failing the open typed",
+                    category: .demux)
+                markClosed()
+                close()
+                throw AVIOReaderError.httpStatus(refusal)
+            }
+            // AE#693: one refusal is the origin's answer to that request, not yet to the
+            // resource. The #378 path below takes a 401/403/404/410 here as final and settles
+            // the session forward-only, which costs it every seek and the resume position. An
+            // IPTV panel answered a ranged open 403 and the unranged GET right after it 200, and
+            // ranged requests worked again later. Asking the same range once more decides it:
+            // served, the source stays seekable; refused again, the #378 path runs as before.
+            if !opened, !isLive, let refusal = refusalOfOpenConnection() {
+                EngineLog.emit(
+                    "[AVIOReader] \(label) ranged open refused status=\(refusal) at offset 0; "
+                    + "asking once more before settling the source forward-only (AE#693)",
+                    category: .demux)
+                try probeControl?.check()
                 winCond.lock()
-                rangeVerdictPending = !isLive
+                rangeVerdictPending = true
                 winCond.unlock()
                 startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
-                var opened = awaitFirstPersistentData()
-                // A live open the origin answered with a status is reported as that answer, the
-                // way the live HLS ingest reports a refused join: the host retries a 509 on its own
-                // cadence with the right words for it, where the read loop's ladder would have spent
-                // the open budget on the same request and handed back an untyped read failure.
-                // A server error is asked once more first, as the read loop did before this was typed:
-                // a 500/502 while a tuner or transcode spins up is the moment's, not the channel's.
-                if !opened, isLive, let refusal = refusalOfLiveOpenConnection(),
-                   Self.isResolvedHardServerError(refusal) {
-                    EngineLog.emit(
-                        "[AVIOReader] \(label) live open answered status=\(refusal); asking once more",
-                        category: .demux)
-                    backoffBeforeReconnect(streak: 1, retryAfter: 0)
-                    try probeControl?.check()
-                    guard !isClosed else { throw CancellationError() }
-                    startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
-                    opened = awaitFirstPersistentData()
-                }
-                if !opened, isLive, let refusal = refusalOfLiveOpenConnection() {
-                    EngineLog.emit(
-                        "[AVIOReader] \(label) live open refused status=\(refusal); failing the open typed",
-                        category: .demux)
-                    markClosed()
-                    close()
-                    throw AVIOReaderError.httpStatus(refusal)
-                }
-                // AE#693: one refusal is the origin's answer to that request, not yet to the
-                // resource. The #378 path below takes a 401/403/404/410 here as final and settles
-                // the session forward-only, which costs it every seek and the resume position. An
-                // IPTV panel answered a ranged open 403 and the unranged GET right after it 200, and
-                // ranged requests worked again later. Asking the same range once more decides it:
-                // served, the source stays seekable; refused again, the #378 path runs as before.
-                if !opened, !isLive, let refusal = refusalOfOpenConnection() {
-                    EngineLog.emit(
-                        "[AVIOReader] \(label) ranged open refused status=\(refusal) at offset 0; "
-                        + "asking once more before settling the source forward-only (AE#693)",
-                        category: .demux)
-                    try probeControl?.check()
-                    winCond.lock()
-                    rangeVerdictPending = true
-                    winCond.unlock()
-                    startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
-                    opened = awaitFirstPersistentData()
-                }
-                gotData = try recoverUnansweredOpenIfNeeded(gotData: opened)
-                openPrefix = firstWindowPrefix()
+                opened = awaitFirstPersistentData()
             }
+            gotData = try recoverUnansweredOpenIfNeeded(gotData: opened)
+            openPrefix = firstWindowPrefix()
             // AE#140: an HLS playlist URL misrouted onto the raw-byte live path. A live origin serves the
             // finite #EXTM3U body at HTTP 200 and closes the connection; the endless-feed reader then
             // re-fetches that body forever. Those reconnects look PRODUCTIVE (a full body at 200, and every
@@ -1470,29 +1453,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                             EngineLog.emit("[AVIOReader] Persistent open (post-probe): no data within the open budget, proceeding to read-loop reconnect", category: .demux)
                         }
                     }
-                }
-            }
-            // #551: a warm open asserts `gotData` instead of observing it, which is the whole point
-            // (nothing waits on a first byte), and the cost is that the open-time refusal ladder
-            // above never runs for it. A source whose token expired between the warm and the play
-            // would then parse happily out of warm bytes and die several seconds later as an
-            // untyped read failure instead of as the 401 it is.
-            //
-            // Checked, not waited for: if the refusal has already landed by the time the open gets
-            // here, it is thrown typed exactly as the cold path throws it, and if it has not, the
-            // read loop's ladder still ends the session correctly, just later and less precisely.
-            // The alternative, waiting for the answer, is the round trip this feature removes.
-            if warm != nil {
-                winCond.lock()
-                let refusal = (connEnded && Self.isResolvedExpiryStatus(connStatus)) ? connStatus : 0
-                winCond.unlock()
-                if refusal != 0 {
-                    EngineLog.emit(
-                        "[AVIOReader] \(label) the warm open found the source already refused: "
-                        + "HTTP \(refusal); failing the open typed (#551)", category: .demux)
-                    markClosed()
-                    close()
-                    throw AVIOReaderError.httpStatus(refusal)
                 }
             }
             if !tookFallback && !gotData {
@@ -3055,61 +3015,19 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     // MARK: - Cold-start spans (#281)
 
-    /// #551: take whatever a host warmed for this source and install it as this open's resident
-    /// bytes.
-    ///
-    /// Head, tail and size travel together because the open needs all three to stay off the
-    /// network: the spans answer the parse reads, and the size is what keeps `resolveOptimisticOpen`
-    /// from falling back to the probe ladder, which would spend the round trip the warm just saved.
-    ///
-    /// A take, not a copy. The bytes are this reader's from here on, and leaving a second copy in
-    /// the store would hold megabytes for a source that is now playing.
-    private func adoptPrewarmedSource() -> PrewarmedSource? {
-        guard !isLive else { return nil }
-        guard let warm = SourcePrewarmStore.shared.take(for: url) else { return nil }
-        // The head is the one span an open cannot do without, and it is only usable where it says
-        // it starts: at zero, which is where the parse begins.
-        guard warm.head.start == 0, !warm.head.isEmpty, warm.contentLength > 0 else { return nil }
-        // The URL is only half the request. An origin that varies on Referer, User-Agent or
-        // Authorization answers a different body, and a different size, under the same URL, and
-        // nothing about the bytes themselves would show it. A session whose headers differ from the
-        // warm's opens cold instead.
-        guard warm.requestHeaders == extraHeaders else {
-            EngineLog.emit(
-                "[AVIOReader] \(label) a warm exists for this URL but was fetched with different "
-                + "headers; opening cold (#551)", category: .demux)
-            return nil
-        }
-        winCond.lock()
-        headSpan = warm.head.data
-        if let tail = warm.tail { tailSpan = tail }
-        fileSize = warm.contentLength
-        adoptedWarmSize = warm.contentLength
-        winCond.unlock()
-        sourceCache?.noteTotalSize(warm.contentLength, for: cacheKey)
-        // The warm followed the redirect chain and knows where it ended. Pinning that target here
-        // is what keeps this session from resolving it a second time: a resolver 302 measured
-        // 800 ms on the AE#551 round 2 harness and 3.2 s on the reporter's panel, and it was paid
-        // per fresh connection, not once. This is the same pin a redirect records (#12), so the
-        // expiry ladder above handles a lease that has run out in the usual way: drop it and
-        // re-resolve through the source URL. Credential headers do not follow it (`headers(for:)`).
-        recordResolvedURL(warm.resolvedURL)
-        EngineLog.emit(
-            "[AVIOReader] \(label) adopted a prewarmed source: head=\(warm.head.data.count)B "
-            + "tail=\(warm.tail?.data.count ?? 0)B of \(warm.contentLength)B; "
-            + "the data connection starts at \(warm.head.end) (#551)",
-            category: .demux)
-        return warm
-    }
-
     /// The source cache's answer to the open: when another reader of this source has fetched its head,
-    /// the size it learned is adopted the way a warm's is (#551), so the first connection is planned
-    /// against it and replays the head from disk instead of asking the origin. `adoptedWarmSize` is
+    /// the size it learned is adopted (#551), so the first connection is planned against it and
+    /// replays the head from disk instead of asking the origin. `adoptedCachedSize` is
     /// what makes that safe: a later response stating a different size drops the adopted size and
     /// the cache drops what it held under the old one. A head the cache cannot serve leaves the open
     /// as it was, with its first response as the size probe (#70).
     private func adoptCachedSourceSize() {
-        guard !isLive, prefetchEnabled,
+        guard !isLive else { return }
+        // A redirect target another reader of this source (or a host's warm) resolved is pinned here
+        // too, so this open does not pay the resolver's 302 again (#551 round 2). A lease that has
+        // since run out is handled by the expiry ladder, as any pin is.
+        recordResolvedURL(sourceCache?.resolvedURL(for: cacheKey))
+        guard prefetchEnabled,
               let known = sourceCache?.knownSize(cacheKey), known > 0,
               (sourceCache?.heldLength(cacheKey, at: 0, expectedSize: known) ?? 0)
                 >= min(SourceByteCache.minimumServeBytes, known)
@@ -3118,7 +3036,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let adopted = fileSize <= 0
         if adopted {
             fileSize = known
-            adoptedWarmSize = known
+            adoptedCachedSize = known
         }
         winCond.unlock()
         guard adopted else { return }
@@ -3144,22 +3062,25 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// loopback origin, which answers before the race can be lost, made it look like it worked.
     private func startTailPrefetch() {
         guard !isLive, !isClosed else { return }
-        // A source another reader has open already has its trailing object in the source cache, and
-        // its size, so the suffix this request would ask for is a disk read instead.
-        if let total = sourceCache?.knownSize(cacheKey), total > Int64(Self.tailPrefetchBytes),
-           let held = cachedSourceBytes(at: total - Int64(Self.tailPrefetchBytes),
-                                        maxLength: Self.tailPrefetchBytes, expectedSize: total),
-           held.count == Self.tailPrefetchBytes {
-            winCond.lock()
-            if tailSpan == nil, !isFullyClosed {
-                tailSpan = ResidentSpan(start: total - Int64(held.count), data: held)
+        // A source another reader (or a host's warm) has fetched already has its trailing object in the
+        // source cache, and its size, so the suffix this request would ask for is a disk read instead.
+        // A source smaller than the suffix is its own suffix.
+        if let total = sourceCache?.knownSize(cacheKey), total > 0 {
+            let start = max(0, total - Int64(Self.tailPrefetchBytes))
+            let length = Int(total - start)
+            if let held = cachedSourceBytes(at: start, maxLength: length, expectedSize: total),
+               held.count == length {
+                winCond.lock()
+                if tailSpan == nil, !isFullyClosed {
+                    tailSpan = ResidentSpan(start: start, data: held)
+                }
+                winCond.broadcast()
+                winCond.unlock()
+                EngineLog.emit(
+                    "[AVIOReader] \(label) tail prefetch served \(held.count)B from the source cache",
+                    category: .demux)
+                return
             }
-            winCond.broadcast()
-            winCond.unlock()
-            EngineLog.emit(
-                "[AVIOReader] \(label) tail prefetch served \(held.count)B from the source cache",
-                category: .demux)
-            return
         }
         let url = requestURL()
         // #377: a speculative second request is the first thing to drop on an origin that allows
@@ -4008,20 +3929,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // (fileSize <= 0), current-gen only, and never for live (whose length is
         // non-authoritative). The response precedes any body and no read() reads fileSize
         // until open() returns, so this write is ordered behind winCond just like the data.
-        // #551: the warm's size meets the connection that is actually serving this session. They
-        // disagree only when the warm belongs to a different response, and then the warm is the
-        // wrong one: these bytes are the ones being played. Drop the whole warm rather than keep
-        // spans whose offsets belong to another body, and let the write-once rule below take the
-        // real size.
-        if generation == connGeneration, !isLive, let adopted = adoptedWarmSize,
+        // #551: the adopted size meets the connection that is actually serving this session. They
+        // disagree only when the cached bytes belong to a different response, and then they are
+        // the wrong ones: these bytes are the ones being played. Drop the adopted size and the
+        // spans read under it, and let the write-once rule below take the real size; recording that
+        // size in the source cache drops what it held under the old one.
+        if generation == connGeneration, !isLive, let adopted = adoptedCachedSize,
            let total = Self.sizeFromResponse(http, requestedOffset: requestedOffset), total != adopted {
             EngineLog.emit(
-                "[AVIOReader] \(label) the warm said \(adopted)B, this connection says \(total)B; "
-                + "dropping the prewarmed bytes (#551)", category: .demux)
+                "[AVIOReader] \(label) the source cache said \(adopted)B, this connection says \(total)B; "
+                + "dropping what was read under it (#551)", category: .demux)
             headSpan = Data()
             tailSpan = nil
             fileSize = 0
-            adoptedWarmSize = nil
+            adoptedCachedSize = nil
         }
         if generation == connGeneration, !isLive, fileSize <= 0, !rangeIgnoredAtOpen,
            let total = Self.sizeFromResponse(http, requestedOffset: requestedOffset) {

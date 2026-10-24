@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import AetherEngine
 
-extension PrewarmStoreSuites {
+extension PrewarmSuites {
     /// AE#551 round 2: what a warm knows about WHERE the bytes live, and what a request may carry
     /// once it goes there.
     ///
@@ -16,13 +16,19 @@ extension PrewarmStoreSuites {
     /// exactly what `RedirectHeaderPolicy` (#126) exists to prevent on the hop. One policy now runs
     /// where the request is built, so a pin cannot outflank it.
     ///
-    /// `.serialized`: the prewarm store and the origin budget are process-wide.
+    /// `.serialized`: the origin budget is process-wide. Each warm goes into a source cache of its own.
     @Suite("#551 the warm's resolved target, and what travels to it", .serialized)
     struct Issue551RedirectHandoffTests {
 
         private let fileSize: Int64 = 64 * 1024 * 1024
         private let credentials = ["Authorization": "Bearer SOURCE-ONLY",
                                    "X-Emby-Token": "SOURCE-ONLY"]
+
+        private func freshCache() -> SourceByteCache {
+            SourceByteCache(directory: FileManager.default.temporaryDirectory
+                .appending(path: "prewarm-551r2-\(UUID().uuidString)", directoryHint: .isDirectory),
+                            byteBudget: 64 << 20)
+        }
 
         private func read(_ reader: AVIOReader, upTo target: Int) -> Int {
             let sliceCap = 128 * 1024
@@ -42,7 +48,7 @@ extension PrewarmStoreSuites {
         @Test("the load starts at the target the warm resolved instead of resolving it again",
               .timeLimit(.minutes(2)))
         func loadAdoptsTheWarmsResolvedTarget() async throws {
-            SourcePrewarmStore.shared.clear()
+            let cache = freshCache()
             let cdn = try #require(ThrottledOriginServer(totalSize: fileSize))
             defer { cdn.stop() }
             let cdnPort = cdn.port
@@ -54,11 +60,11 @@ extension PrewarmStoreSuites {
             let url = URL(string: "http://127.0.0.1:\(source.port)/movie.bin")!
 
             _ = await SourcePrewarmFetcher.warm(url: url, extraHeaders: [:],
-                                                byteBudget: 256 * 1024, into: .shared)
+                                                byteBudget: 256 * 1024, into: cache)
             let resolvesForTheWarm = source.rangeRequestCount
             #expect(resolvesForTheWarm >= 1, "the warm has to have resolved the chain itself")
 
-            let reader = AVIOReader(url: url)
+            let reader = AVIOReader(url: url, sourceCache: cache)
             defer { reader.markClosed(); reader.close() }
             try reader.open()
             #expect(read(reader, upTo: 384 * 1024) == 384 * 1024)
@@ -71,16 +77,16 @@ extension PrewarmStoreSuites {
 
         @Test("a warm that never saw a redirect pins nothing", .timeLimit(.minutes(2)))
         func aDirectWarmPinsNothing() async throws {
-            SourcePrewarmStore.shared.clear()
+            let cache = freshCache()
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))
             defer { server.stop() }
             let url = URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!
 
             _ = await SourcePrewarmFetcher.warm(url: url, extraHeaders: [:],
-                                                byteBudget: 256 * 1024, into: .shared)
-            let warmed = try #require(SourcePrewarmStore.shared.take(for: url))
-            #expect(warmed.resolvedURL?.absoluteString == url.absoluteString || warmed.resolvedURL == nil,
-                    "a direct origin must not hand back a different target: \(String(describing: warmed.resolvedURL))")
+                                                byteBudget: 256 * 1024, into: cache)
+            let pinned = cache.resolvedURL(for: SourceCacheKey(url: url, headers: [:]))
+            #expect(pinned?.absoluteString == url.absoluteString || pinned == nil,
+                    "a direct origin must not hand back a different target: \(String(describing: pinned))")
         }
 
         // MARK: - What travels to the pinned target

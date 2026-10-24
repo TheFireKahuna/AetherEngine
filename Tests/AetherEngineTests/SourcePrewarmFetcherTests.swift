@@ -2,10 +2,11 @@ import Testing
 import Foundation
 @testable import AetherEngine
 
-extension PrewarmStoreSuites {
-    /// #551: the fetch that fills the store, against an origin whose first byte costs something.
+extension PrewarmSuites {
+    /// #551: the fetch that warms a source into the source cache, against an origin whose first byte
+    /// costs something.
     ///
-    /// `.serialized`: these share the process-wide prewarm store. They never reset the origin
+    /// Each test warms into a cache of its own. `.serialized` all the same: they never reset the origin
     /// budget, which is process-wide too: a global reset from here tore the budget out from under
     /// suites running in parallel (measured, two unrelated failures), so a test that needs a ceiling
     /// sets it for its own origin and clears that one again.
@@ -18,23 +19,29 @@ extension PrewarmStoreSuites {
             URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!
         }
 
+        private func freshCache() -> SourceByteCache {
+            SourceByteCache(directory: FileManager.default.temporaryDirectory
+                .appending(path: "prewarm-551-\(UUID().uuidString)", directoryHint: .isDirectory),
+                            byteBudget: 64 << 20)
+        }
+
+        private func key(_ url: URL) -> SourceCacheKey { SourceCacheKey(url: url, headers: [:]) }
+
         @Test("a warm retains the budget it was given and the size the origin stated")
         func warmRetainsBudget() async throws {
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))
             defer { server.stop() }
-            let store = SourcePrewarmStore(totalByteCap: 8 << 20)
+            let cache = freshCache()
 
             let report = await SourcePrewarmFetcher.warm(
-                url: url(server), extraHeaders: [:], byteBudget: 256 * 1024, into: store)
+                url: url(server), extraHeaders: [:], byteBudget: 256 * 1024, into: cache)
 
             #expect(report.isWarm)
             #expect(report.retainedBytes == 256 * 1024)
             #expect(report.contentLength == fileSize)
             #expect(report.declined == nil)
-            let warmed = try #require(store.take(for: url(server)))
-            #expect(warmed.head.start == 0)
-            #expect(warmed.head.data.count == 256 * 1024)
-            #expect(warmed.contentLength == fileSize)
+            #expect(cache.heldLength(key(url(server)), at: 0, expectedSize: fileSize) == 256 * 1024)
+            #expect(cache.knownSize(key(url(server))) == fileSize)
         }
 
         /// The body this origin serves is not an MP4, so the plan asks for no trailing object and the
@@ -44,10 +51,10 @@ extension PrewarmStoreSuites {
         func oneRequestWhenNoTailIsNeeded() async throws {
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))
             defer { server.stop() }
-            let store = SourcePrewarmStore(totalByteCap: 8 << 20)
+            let cache = freshCache()
 
             _ = await SourcePrewarmFetcher.warm(
-                url: url(server), extraHeaders: [:], byteBudget: 128 * 1024, into: store)
+                url: url(server), extraHeaders: [:], byteBudget: 128 * 1024, into: cache)
 
             #expect(server.rangeRequestCount == 1, "requests: \(server.requestedRanges)")
             let asked = try #require(server.requestedRanges.first)
@@ -64,14 +71,14 @@ extension PrewarmStoreSuites {
                                                  respond: { _, _, _ in .status(200) })
             let server = try #require(refusing)
             defer { server.stop() }
-            let store = SourcePrewarmStore(totalByteCap: 8 << 20)
+            let cache = freshCache()
 
             let report = await SourcePrewarmFetcher.warm(
-                url: url(server), extraHeaders: [:], byteBudget: 128 * 1024, into: store)
+                url: url(server), extraHeaders: [:], byteBudget: 128 * 1024, into: cache)
 
             #expect(!report.isWarm)
             #expect(report.declined?.contains("200") == true)
-            #expect(store.retainedBytes == 0)
+            #expect(cache.heldBytesForTesting(key(url(server))) == 0)
         }
 
         /// The arbitration rule: on an origin metered down to one request at a time, the prewarm is
@@ -80,12 +87,12 @@ extension PrewarmStoreSuites {
         func serialOriginIsNotAsked() async throws {
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))
             defer { server.stop() }
-            let store = SourcePrewarmStore(totalByteCap: 8 << 20)
+            let cache = freshCache()
             OriginRequestBudget.shared.setHostLimit(1, for: url(server))
             defer { OriginRequestBudget.shared.setHostLimit(nil, for: url(server)) }
 
             let report = await SourcePrewarmFetcher.warm(
-                url: url(server), extraHeaders: [:], byteBudget: 128 * 1024, into: store)
+                url: url(server), extraHeaders: [:], byteBudget: 128 * 1024, into: cache)
 
             #expect(!report.isWarm)
             #expect(server.rangeRequestCount == 0, "a serial origin was asked anyway: \(server.requestedRanges)")
@@ -100,12 +107,12 @@ extension PrewarmStoreSuites {
                                                  firstByteDelayUs: { _ in 30_000_000 })
             let server = try #require(stalling)
             defer { server.stop() }
-            let store = SourcePrewarmStore(totalByteCap: 8 << 20)
+            let cache = freshCache()
             let target = url(server)
 
             let task = Task {
                 await SourcePrewarmFetcher.warm(
-                    url: target, extraHeaders: [:], byteBudget: 128 * 1024, into: store)
+                    url: target, extraHeaders: [:], byteBudget: 128 * 1024, into: cache)
             }
             // Cancel once the fetch is on the wire, inside the stalled first byte. A fixed sleep here
             // could outlast the stall on a loaded runner and let the warm complete.
@@ -114,7 +121,7 @@ extension PrewarmStoreSuites {
             let report = await task.value
 
             #expect(!report.isWarm)
-            #expect(store.retainedBytes == 0)
+            #expect(cache.heldBytesForTesting(key(url(server))) == 0)
         }
 
         /// The budget is not a promise either: a source smaller than the budget warms whole, and the
@@ -124,10 +131,10 @@ extension PrewarmStoreSuites {
             let small: Int64 = 40 * 1024
             let server = try #require(ThrottledOriginServer(totalSize: small))
             defer { server.stop() }
-            let store = SourcePrewarmStore(totalByteCap: 8 << 20)
+            let cache = freshCache()
 
             let report = await SourcePrewarmFetcher.warm(
-                url: url(server), extraHeaders: [:], byteBudget: 1 << 20, into: store)
+                url: url(server), extraHeaders: [:], byteBudget: 1 << 20, into: cache)
 
             #expect(report.retainedBytes == Int(small))
             #expect(report.contentLength == small)
@@ -142,14 +149,14 @@ extension PrewarmStoreSuites {
             let wide = ThrottledOriginServer(totalSize: fileSize, ignoreRangeEnd: true)
             let server = try #require(wide)
             defer { server.stop() }
-            let store = SourcePrewarmStore(totalByteCap: 8 << 20)
+            let cache = freshCache()
 
             let report = await SourcePrewarmFetcher.warm(
-                url: url(server), extraHeaders: [:], byteBudget: 128 * 1024, into: store)
+                url: url(server), extraHeaders: [:], byteBudget: 128 * 1024, into: cache)
 
             #expect(!report.isWarm)
             #expect(report.declined?.contains("asked for") == true, "declined: \(report.declined ?? "nil")")
-            #expect(store.retainedBytes == 0)
+            #expect(cache.heldBytesForTesting(key(url(server))) == 0)
         }
 
         /// A warm whose task was cancelled before it ever ran must return, not hang. The cancellation
@@ -160,19 +167,19 @@ extension PrewarmStoreSuites {
         func alreadyCancelledWarmReturns() async throws {
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))
             defer { server.stop() }
-            let store = SourcePrewarmStore(totalByteCap: 8 << 20)
+            let cache = freshCache()
             let target = url(server)
 
             let task = Task {
                 while !Task.isCancelled { await Task.yield() }
                 return await SourcePrewarmFetcher.warm(
-                    url: target, extraHeaders: [:], byteBudget: 128 * 1024, into: store)
+                    url: target, extraHeaders: [:], byteBudget: 128 * 1024, into: cache)
             }
             task.cancel()
             let report = await task.value
 
             #expect(!report.isWarm)
-            #expect(store.retainedBytes == 0)
+            #expect(cache.heldBytesForTesting(key(url(server))) == 0)
         }
     }
 }

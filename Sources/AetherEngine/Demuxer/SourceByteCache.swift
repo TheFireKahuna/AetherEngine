@@ -48,6 +48,9 @@ final class SourceByteCache: @unchecked Sendable {
         /// Block index to the tick it was last written or read.
         var blockUse: [Int64: UInt64] = [:]
         var totalSize: Int64?
+        /// Where the source's bytes were actually served from, redirects followed (#551 round 2):
+        /// a reader that pins it does not pay the resolver's 302 again.
+        var resolvedURL: URL?
         var openReaders = 0
         /// Bumped by every eviction, so a read that raced one is discarded instead of returning a
         /// punched hole's zeros.
@@ -147,6 +150,37 @@ final class SourceByteCache: @unchecked Sendable {
         scheduleReleaseLocked(key, source)
     }
 
+    /// Records where `key`'s bytes were served from, redirects followed; nil leaves what is known.
+    func noteResolvedURL(_ url: URL?, for key: SourceCacheKey) {
+        guard let url else { return }
+        lock.lock(); defer { lock.unlock() }
+        sourceLocked(key, create: true)?.resolvedURL = url
+    }
+
+    /// Forgets `url` as `key`'s redirect target, when it still is the one recorded: a reader whose pin
+    /// expired drops it here too, so the next reader resolves afresh instead of adopting a dead lease.
+    func forgetResolvedURL(_ url: URL, for key: SourceCacheKey) {
+        lock.lock(); defer { lock.unlock() }
+        if sources[key]?.resolvedURL == url { sources[key]?.resolvedURL = nil }
+    }
+
+    /// The redirect target a reader of `key` learned, for the next reader to pin (#12).
+    func resolvedURL(for key: SourceCacheKey) -> URL? {
+        lock.lock(); defer { lock.unlock() }
+        return sources[key]?.resolvedURL
+    }
+
+    /// Lets go of every source no reader has open, now rather than after the grace: a host leaving the
+    /// context its warms were made for (a sign-out, a server change).
+    func releaseIdleSources() {
+        lock.lock(); defer { lock.unlock() }
+        for (key, source) in sources where source.openReaders == 0 {
+            source.release?.cancel()
+            heldBytes -= source.spans.totalBytes
+            sources[key] = nil
+        }
+    }
+
     /// The total size recorded for `url`, whichever reader learned it and under whichever token.
     func knownSize(_ key: SourceCacheKey) -> Int64? {
         lock.lock(); defer { lock.unlock() }
@@ -232,6 +266,14 @@ final class SourceByteCache: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return servableLocked(key, expectedSize: expectedSize)?
             .spans.nextSpan(after: offset, before: limit, minLength: minLength)?.start
+    }
+
+    /// Returns once every write queued so far has landed, so the bytes are servable: a warm that
+    /// reports itself done means a load right after it finds them.
+    func flushWrites() async {
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            writeQueue.async { done.resume() }
+        }
     }
 
     /// Blocks until every write queued so far has landed. Tests only.

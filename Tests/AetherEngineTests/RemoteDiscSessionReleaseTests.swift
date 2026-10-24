@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import AetherEngine
 
-extension PrewarmStoreSuites {
+extension PrewarmSuites {
     /// Audit NET-110 / DMX-110: the Demuxer builds the `HTTPDiscIOReader` for a remote disc image
     /// itself, so it is the only party that can end that reader's `URLSession`. The disc adapter's
     /// `ConcatIOReader.close()` is deliberately a no-op and the bridge does not own its reader, so a
@@ -159,21 +159,20 @@ extension PrewarmStoreSuites {
             try await heldAtMostThePooledConnection(origin)
         }
 
-        @Test("a disc image whose structure cannot be parsed hands the warm back")
-        func throwingWrapReturnsTheWarm() async throws {
+        @Test("a disc image whose structure cannot be parsed leaves the warm in place")
+        func throwingWrapLeavesTheWarm() async throws {
             let origin = try #require(KeepAliveRangeOrigin(data: Self.unparseableImage()))
             defer { origin.stop() }
             let source = url(origin, "corrupt.iso")
             _ = await SourcePrewarmFetcher.warm(url: source, extraHeaders: [:], byteBudget: 1 << 20, into: .shared)
-            #expect(SourcePrewarmStore.shared.isWarm(for: source), "the warm was not taken")
-            defer { _ = SourcePrewarmStore.shared.take(for: source) }
+            #expect(AetherEngine.isPrewarmed(url: source), "the warm was not made")
 
             let demuxer = Demuxer()
             defer { demuxer.close() }
             #expect(throws: (any Error).self) { try demuxer.open(url: source) }
 
-            #expect(SourcePrewarmStore.shared.isWarm(for: source),
-                    "a throwing wrap dropped the warm instead of putting it back")
+            // A warm is the source cache's, read and not taken, so a failed open cannot lose it.
+            #expect(AetherEngine.isPrewarmed(url: source), "a throwing wrap dropped the warm")
         }
     }
 }
