@@ -6,7 +6,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/TheFireKahuna/FFmpegBuild",
       "state" : {
-        "revision" : "8923abf32f0787d3d91a18b1b9fbee67031221f9",
+        "revision" : "fe8ebf0e51eea1f3b2dac378bc95d86553598140",
         "version" : "3.10.1"
       }
     },
@@ -26,6 +26,15 @@
       "state" : {
         "revision" : "30bdb41f69a40bf389e8c864d1e525a047efbc40",
         "version" : "2.2.0-fire.1"
+      }
+    },
+    {
+      "identity" : "libtruehd",
+      "kind" : "localSourceControl",
+      "location" : "https://github.com/TheFireKahuna/LibTrueHD",
+      "state" : {
+        "revision" : "261d7d374917cecb39f889f81fa7d7753f0c0839",
+        "version" : "4.0.0"
       }
     },
     {

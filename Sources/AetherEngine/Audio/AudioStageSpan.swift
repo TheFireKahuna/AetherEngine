@@ -71,14 +71,12 @@ extension AudioStageSpan {
         switch par.codec_id {
         case AV_CODEC_ID_PCM_S16LE, AV_CODEC_ID_PCM_S16BE, AV_CODEC_ID_PCM_S24LE, AV_CODEC_ID_PCM_S32LE,
              AV_CODEC_ID_PCM_F32LE, AV_CODEC_ID_PCM_U8, AV_CODEC_ID_PCM_ALAW, AV_CODEC_ID_PCM_MULAW,
-             AV_CODEC_ID_PCM_BLURAY, AV_CODEC_ID_FLAC, AV_CODEC_ID_ALAC:
-            // Every frame decodes on its own (FLAC and ALAC measured: 0 frames from every start).
+             AV_CODEC_ID_PCM_BLURAY, AV_CODEC_ID_PCM_DVD, AV_CODEC_ID_FLAC, AV_CODEC_ID_ALAC:
+            // Every frame decodes on its own (FLAC and ALAC measured: 0 frames from every start). DVD
+            // LPCM's blocks straddle packets, and a fresh decode starts at the packet's first whole
+            // block, which its first access unit pointer gives (FFmpegBuild's
+            // patch_ffmpeg_dvd_lpcm_alignment).
             return .instant
-        case AV_CODEC_ID_PCM_DVD:
-            // Not known: the decoder carries a sample block that straddles two packets over to the
-            // next, and the demuxer strips the header that says where the first whole block begins, so a
-            // decode from a packet that starts mid-block stays misaligned (3 of 12 starts in a clip).
-            return nil
         case AV_CODEC_ID_TRUEHD, AV_CODEC_ID_MLP:
             return AudioStageSpan(latency: 0, memory: trueHDDecoderMemory(outputRate: outputRate))
         case AV_CODEC_ID_DTS:
@@ -109,13 +107,17 @@ extension AudioStageSpan {
     /// synthesis window reaches back 512. The reservoir spans the most frames at the format's lowest
     /// bitrate (32 kbps in MPEG-1, 8 in MPEG-2/2.5), whose frames have the least main data after the
     /// header, a CRC and the side information. Measured: at most 4512 frames over four fixtures.
+    /// Layer III's memory besides the reservoir: the granule before's IMDCT overlap and the synthesis
+    /// window.
+    static let mp3OverlapFrames = 576 + 512
+
     static func mp3DecoderMemory(sampleRate: Int, channels: Int) -> Int {
         let mpeg1 = sampleRate >= 32_000
         let frameBytes = (mpeg1 ? 144 * 32_000 : 72 * 8_000) / max(sampleRate, 1)
         let sideInfo = mpeg1 ? (channels == 1 ? 17 : 32) : (channels == 1 ? 9 : 17)
         let mainData = max(frameBytes - 4 - 2 - sideInfo, 1)
         let reservoirFrames = ((mpeg1 ? 511 : 255) + mainData - 1) / mainData
-        return reservoirFrames * (mpeg1 ? 1152 : 576) + 576 + 512
+        return reservoirFrames * (mpeg1 ? 1152 : 576) + mp3OverlapFrames
     }
 
     // MARK: - Resampler and encoders

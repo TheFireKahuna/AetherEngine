@@ -70,6 +70,13 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         return .series(stages)
     }
 
+    /// A segment's run (`AudioSegmentRuns`): `span`, then the encoder, whose rate control never
+    /// forgets where a run began, so a run leaves it `APACEncoder.segmentRunLeadFrames` before the
+    /// segment.
+    var runSpan: AudioStageSpan? { span.then(AudioStageSpan(latency: 0, memory: APACEncoder.segmentRunLeadFrames)) }
+    var runEncoderMemory: Int { APACEncoder.segmentRunLeadFrames }
+    var runPacketFrames: Int { APACEncoder.framesPerPacket }
+
     private let srcTimeBase: AVRational
     private let decoder: ObjectAudioDecoding
     private let pipeline: APACEncodePipeline
@@ -80,8 +87,15 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// Where the renderer's run began, until it settles (`ObjectAudioRenderer.isSettled`): how long
     /// that takes on real programmes is what a restart's pre-roll has to cover, so it is logged.
     private var rendererSettlingFrom: Int64?
-    /// What the encoder is fed, per bed channel, for the session log (see `BedLevelMeter`).
-    private var levelMeter: BedLevelMeter
+    /// What the encoder is fed, per bed channel, for the session log (see `BedLevelMeter`): this
+    /// bridge's, or the session's when it makes one segment (`measuring`).
+    let levels: SessionLevelMeter
+    /// A segment's run measures into the session's meter, and only its own segment: frames on the
+    /// output timeline (`startRun`). Nil: everything this bridge makes is its own to measure.
+    private var measuring: Range<Int64>?
+    private let ownsLevels: Bool
+    /// Set-up lines go to the log once a session: a segment's run is made as the session's own was.
+    private let announces: Bool
     /// Keeps the bed under full scale, since the encoder carries anything over it on (see `PeakLimiter`).
     private var limiter: PeakLimiter
 
@@ -138,6 +152,9 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     private var reportedNoSourceStart = false
     private var encoderStartFrame: Int64?
     private var encoderFramesIn: Int64 = 0
+    /// Where a VOD segment's run puts the encoder's first frame (`startRun(atFrame:segment:)`), until the
+    /// run's first placed block anchors it.
+    private var runStartFrame: Int64?
     /// Rendered frames still to drop before the encoder: audio an output offset puts before the
     /// timeline's start, cut at the exact frame (`encodePending`).
     private var pendingTrimFrames: Int64 = 0
@@ -190,12 +207,15 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         layout: SpatialSpeakerLayout,
         decoder: ObjectAudioDecoding,
         bitRate: Int? = nil,
-        objectOutput: Bool = false
+        objectOutput: Bool = false,
+        sessionLevels: SessionLevelMeter? = nil
     ) throws {
         self.srcTimeBase = srcTimeBase
         self.layout = layout
         self.decoder = decoder
-        levelMeter = BedLevelMeter(layout: layout, sampleRate: Self.sampleRate)
+        levels = sessionLevels ?? SessionLevelMeter(layout: layout, sampleRate: Self.sampleRate)
+        ownsLevels = sessionLevels == nil
+        announces = sessionLevels == nil
         limiter = PeakLimiter(sampleRate: Self.sampleRate, channels: layout.channelCount)
         let encoder: any APACChunkEncoding
         let channels: Int
@@ -208,7 +228,9 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             rate = bitRate ?? (APACObjectEncoder.objectSlots + 1) * APACObjectEncoder.objectBitRate
             let objects = try APACObjectEncoder(bitRate: rate, sampleRate: Double(Self.sampleRate))
             objects.followRoute()
-            EngineLog.emit("[SpatialAudioBridge] objects rendered for a \(objects.output.rawValue) output", category: .session)
+            if sessionLevels == nil {
+                EngineLog.emit("[SpatialAudioBridge] objects rendered for a \(objects.output.rawValue) output", category: .session)
+            }
             encoder = objects
             channels = APACObjectEncoder.elementCapacity
             // Advertised as the 7.1.4 channel tier the HDMI route renders it to, not the stream's own
@@ -241,6 +263,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             magicCookie: encoder.magicCookie, sampleRate: Self.sampleRate)
         guard let cp = Self.makeStandInCodecpar() else { throw BridgeError.codecparAllocFailed }
         encoderCodecpar = cp
+        guard announces else { return }
         EngineLog.emit(
             "[SpatialAudioBridge] init: \(objectOutput ? "objects (\(channels - 1) slots + LFE, stream \(APACSampleEntry.codecsString(magicCookie: encoder.magicCookie) ?? "?"))" : "layout=\(layout.rawValue)") "
             + "bitRate=\(rate / 1000) kbps codecs=\(hlsCodecs) priming=\(encoder.leadingFrames) frames",
@@ -406,7 +429,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         drainSplitter()
         encodePending()
         drainLimiter()
-        logLevels(levelMeter.restart())
+        restartLevels()
         let finished = pipeline.finish()
         stamped += finished.packets
         noteEncodeErrors(finished.errors)
@@ -430,7 +453,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
 #endif
         pipeline.reset()
         limiter.reset()
-        logLevels(levelMeter.restart())
+        restartLevels()
         pendingFrames = 0
 #if APACObjectOutput
         output.objectUpdates.removeAll(keepingCapacity: true)
@@ -444,6 +467,13 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         drainedAtEOF = false
         decoderSelfResetsSeen = decoder.selfResetCount
         consecutiveFeedFailures = 0
+    }
+
+    func startRun(atFrame frame: Int64, segment: Range<Int64>) {
+        opLock.lock()
+        defer { opLock.unlock() }
+        runStartFrame = frame
+        measuring = segment
     }
 
     func setOutputOffset(seconds: Double) {
@@ -473,7 +503,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         opLock.lock()
         defer { opLock.unlock() }
         // A viewer who hears no heights stops playback: the window they stopped in is the one to log.
-        logLevels(levelMeter.restart())
+        restartLevels()
         pipeline.close()
         cleanup()
     }
@@ -502,7 +532,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         guard block.frameCount > 0 else { return }
 
         let rebuilt = renderer == nil || block.configurationGeneration != rendererGeneration
-        if rebuilt {
+        if rebuilt, announces || renderer != nil {
             // Whether the presentation has an LFE element at all is the first question a missing-LFE
             // report asks.
             EngineLog.emit(
@@ -510,27 +540,40 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
                     + BedLevelMeter.configurationSummary(block.roles),
                 category: .session
             )
+        }
+        if rebuilt {
             renderer = ObjectAudioRenderer(layout: layout, roles: block.roles)
             rendererGeneration = block.configurationGeneration
             rendererRunPending = true
         } else if block.isDiscontinuity {
             renderer?.markDiscontinuity()
         }
-        levelMeter.observe(roles: block.roles, updates: block.updates, configurationChanged: rebuilt)
-        levelMeter.measureInput(roles: block.roles, planes: block.planes, frameCount: block.frameCount)
-        let activity = levelMeter.activity
-        activityLock.withLock { latestActivity = activity }
         // Every block plays where the grid puts it: the encoder is anchored on the first, and a gap
         // the decoder skipped (corrupt access units) is filled with silence so everything after it
         // stays on its frame. Nothing says where a block plays before the run's first timestamp, so
         // until then it is dropped rather than placed at a guess.
-        guard let position = position(of: block) else {
+        let placed = position(of: block)
+        let offset = Int64((outputOffsetSeconds * Double(Self.sampleRate)).rounded())
+        if measuring.map({ range in placed.map { range.contains($0 + offset) } ?? false }) ?? true {
+            let activity = levels.with { meter in
+                meter.observe(roles: block.roles, updates: block.updates, configurationChanged: rebuilt)
+                meter.measureInput(roles: block.roles, planes: block.planes, frameCount: block.frameCount)
+                return meter.activity
+            }
+            activityLock.withLock { latestActivity = activity }
+        }
+        guard let position = placed else {
             stats.blocksDroppedUnplaced += 1
             return
         }
         if encoderStartFrame == nil {
             outputOffsetFrames = Int64((outputOffsetSeconds * Double(Self.sampleRate)).rounded())
-            anchor(at: position + outputOffsetFrames)
+            if let runStart = runStartFrame {
+                runStartFrame = nil
+                anchorRun(at: runStart, firstBlockAt: position + outputOffsetFrames)
+            } else {
+                anchor(at: position + outputOffsetFrames)
+            }
         } else {
             place(at: position + outputOffsetFrames)
         }
@@ -550,12 +593,14 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             if splitter?.bedRoles != bed.roles {
                 drainSplitter()
                 output.ensureCapacity(pendingFrames + block.frameCount, keeping: pendingFrames)
+                if announces || splitter != nil {
+                    EngineLog.emit(
+                        "[SpatialAudioBridge] every output from the stream's \(bed.roles.count)-channel presentation, "
+                        + "split by the objects' energy (latency \(BedSplitter.latency) frames)",
+                        category: .session)
+                }
                 splitter = BedSplitter(layout: layout, bedRoles: bed.roles)
                 splitterStartsFresh = true
-                EngineLog.emit(
-                    "[SpatialAudioBridge] every output from the stream's \(bed.roles.count)-channel presentation, "
-                    + "split by the objects' energy (latency \(BedSplitter.latency) frames)",
-                    category: .session)
             }
             if splitterStartsFresh, let grid {
                 splitterStartsFresh = false
@@ -723,6 +768,16 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         pendingTrimFrames = max(-position, 0)
     }
 
+    /// Start a segment's run with the encoder at `start` whatever the first block is: audio rendered
+    /// before it only settles the renderer, splitter and limiter and comes off; a stream that begins
+    /// after it is preceded by silence.
+    private func anchorRun(at start: Int64, firstBlockAt position: Int64) {
+        encoderStartFrame = start
+        encoderFramesIn = 0
+        pendingTrimFrames = max(start - position, 0)
+        if position > start { encodeSilence(frames: Int(position - start)) }
+    }
+
     /// The longest gap filled with silence rather than by restarting the encoder.
     private static let maxSilenceFillFrames = sampleRate * 5
 
@@ -788,7 +843,10 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         if objectOutput, let start = encoderStartFrame {
             let position = start + encoderFramesIn
             // No bed to measure, but the objects and the LFE input still get their line.
-            logLevels(levelMeter.addUnmeasured(frameCount: frames, startSeconds: Double(position) / Double(Self.sampleRate)))
+            if let measured = measured(position: position, frames: frames) {
+                logLevels(levels.with { $0.addUnmeasured(frameCount: measured.count,
+                                                         startSeconds: Double(measured.lowerBound) / Double(Self.sampleRate)) })
+            }
             output = pipeline.submit(output, frames: frames, position: position)
             // The free buffer handed back still holds the chunk it last carried.
             output.objectRoles = objectRoles
@@ -814,8 +872,11 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         guard frames > 0, let start = encoderStartFrame else { return }
         let position = start + encoderFramesIn
         // Where this chunk plays, for the level line: the anchor is a source PTS in 48 kHz frames.
-        logLevels(levelMeter.add(output.planes.map { UnsafePointer($0) }, frameCount: frames,
-                                 startSeconds: Double(position) / Double(Self.sampleRate)))
+        if let measured = measured(position: position, frames: frames) {
+            let skip = Int(measured.lowerBound - position)
+            logLevels(levels.with { $0.add(output.planes.map { UnsafePointer($0 + skip) }, frameCount: measured.count,
+                                           startSeconds: Double(measured.lowerBound) / Double(Self.sampleRate)) })
+        }
         output = pipeline.submit(output, frames: frames, position: position)
         encoderFramesIn += Int64(frames)
     }
@@ -833,6 +894,21 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         guard let first = errors.first else { return }
         stats.encodeErrors += errors.count
         if noteFailure { noteFeedFailure(first) }
+    }
+
+    /// The frames of a chunk at `position` this bridge measures: all of them, or those of its segment.
+    private func measured(position: Int64, frames: Int) -> Range<Int64>? {
+        let chunk = position..<(position + Int64(frames))
+        guard let measuring else { return chunk }
+        let kept = chunk.clamped(to: measuring)
+        return kept.isEmpty ? nil : kept
+    }
+
+    /// The session meter's open window, if this bridge owns it: on a seek, the end of input or
+    /// teardown. A segment's run leaves the session's to the session.
+    private func restartLevels() {
+        guard ownsLevels else { return }
+        logLevels(levels.with { $0.restart() })
     }
 
     /// The level line, with the limiter's work over the same window when it had any.
