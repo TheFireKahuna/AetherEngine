@@ -82,6 +82,8 @@ extension AetherEngine {
         forcedRenditionRequestedOrdinal = ordinal
         let entry = nativeSubtitleTrackTable[ordinal]
         if entry.needsOCR, let stream = entry.sourceStreamIndex {
+            // Filled whole from the index at load (`fillIndexedForcedRenditions`), or being filled.
+            guard !store.isFinished, indexedForcedFillTasks[ordinal] == nil else { return }
             if let armed = subtitleOCRArmedOrdinal {
                 guard armed != ordinal else { return }
                 EngineLog.emit("[AetherEngine] forced rendition ordinal=\(ordinal) requested; the OCR worker "
@@ -128,7 +130,15 @@ extension AetherEngine {
     /// `selectSubtitleTrack(index:)` with an explicit source-PTS start anchor. The public form passes the live
     /// `sourceTime`; the preferred-subtitle-language auto-select at load passes the resume position so the side
     /// demuxer seeks to the playhead instead of burst-reading from byte 0 on a resumed mid-file load (#73).
+    /// On the native route a track with a rendition is selected in AVFoundation, and the selection decides who
+    /// draws it (`AetherEngine+NativeSubtitleSelection`).
     func selectSubtitleTrack(index: Int, startAt: Double) {
+        if selectNativeSubtitleOption(forTrack: index, startAt: startAt) { return }
+        applySubtitleTrack(index: index, startAt: startAt)
+    }
+
+    /// The overlay's side of a selection: the track becomes the active one and feeds `subtitleCues`.
+    func applySubtitleTrack(index: Int, startAt: Double) {
         // Phase D: every selection change disarms the OCR worker first; the embedded bitmap
         // branch below re-arms it (cursors persist, so a reselect resumes coverage).
         cancelSubtitleOCRWorker()
@@ -1552,18 +1562,8 @@ extension AetherEngine {
         // don't immediately re-select).
         // #316: an injected external rendition is the same kind of selection, under an external id.
         //
-        // Sodalite#156: and the same is true of the native rendition whenever the host has asked for
-        // it, which is every session where the picture is on a receiver or an external screen.
-        // Cancelling the readers below only stops FILLING a rendition; it does not stop anything from
-        // rendering it, and a receiver went on fetching one nobody fed, which is a caption box with
-        // nothing in it. Deliberately the item-level deselect rather than
-        // `setNativeSubtitleSelected(track: nil)`, whose job this otherwise is: that call also clears
-        // `nativeSubtitleReapplyOrdinal`, and `nativeOrdinalToReplay` is guarded on
-        // `currentOrdinal == nil`, so clearing it here would ARM the #170 carryover replay and
-        // re-select on the next session-preserving reload, the opposite of the point.
         if let active = activeSubtitleTrackIndex,
-           nativeSubtitleRenderingRequested
-            || RemoteHLSMediaSelection.ordinal(forTrackID: active) != nil
+           RemoteHLSMediaSelection.ordinal(forTrackID: active) != nil
             || injectedSubtitleRenditionNames[active] != nil,
            let item = currentAVPlayer?.currentItem {
             Task { @MainActor in
@@ -1594,8 +1594,10 @@ extension AetherEngine {
             nativeVideoSession?.nativeSubtitleLanguagesForSession = []
             nativeSubtitleRenditionAvailable = false
         }
-        // Subtitles off is exactly when tvOS shows the forced rendition, so it keeps being filled.
+        // Subtitles off is exactly when tvOS shows the forced rendition, so it keeps being filled, and on the
+        // native route the selection goes back to AVFoundation's own, which shows it.
         resumeForcedRenditionFill()
+        selectNativeSubtitleAutomatically()
     }
 
     func cancelSidecarTask(channel: SubtitleChannel = .primary) {
@@ -1891,6 +1893,7 @@ extension AetherEngine {
                                      externalID: track.isExternal ? track.id : nil,
                                      language: track.language,
                                      isForced: track.isForced,
+                                     isHearingImpaired: track.isHearingImpaired,
                                      needsOCR: true)
         }
     }
@@ -1914,7 +1917,8 @@ extension AetherEngine {
             return NativeSubtitleRenditionInfo(
                 language: entry.language,
                 name: n == 1 ? base : "\(base) \(n)",
-                isForced: entry.declaresForced
+                isForced: entry.declaresForced,
+                isSDH: entry.isHearingImpaired
             )
         }
     }
@@ -1962,6 +1966,12 @@ extension AetherEngine {
         return .flaggedLines
     }
 
+    /// `LoadOptions.declaresForcedSubtitles`: every track the container flags forced is declared a forced
+    /// rendition, beside whatever `declareForcedSubtitleSource` declared.
+    nonisolated static func declareTrackForcedness(_ entries: inout [NativeSubtitleTrackEntry]) {
+        for i in entries.indices where entries[i].isForced { entries[i].declaresForced = true }
+    }
+
     /// Index of the legible option backing (track language, same-language rank). AVFoundation
     /// normalizes HLS LANGUAGE tags (matroska "ger" reads back as extendedLanguageTag "de", often
     /// with a region subtag), so matching goes through `languageMatches`, which spans the ISO
@@ -1978,34 +1988,28 @@ extension AetherEngine {
         return matching[rank]
     }
 
-    /// #15 / Sodalite#34: select the native track matching the currently-active subtitle so AVKit renders it
-    /// itself whenever the video leaves the host's own view hierarchy (a PiP window, an AirPlay receiver, or a
-    /// wired external display), where the host's on-frame overlay cannot draw; `active == false` deselects when
-    /// the video returns to fullscreen inside the app. Maps the active subtitle's source stream (embedded) or
-    /// synthetic id (load-declared external, #88) to the native ordinal. No-op (no native subtitle) when the
-    /// active subtitle has no native text equivalent: a bitmap (PGS/DVB), CEA-708 (608 now rides a native
-    /// rendition, #98), or a track added after load (dynamic external / one-shot sidecar).
+    /// #15 / Sodalite#34: the rendition is the display while the picture is off the host's own view hierarchy
+    /// (a PiP window, an AirPlay receiver, or a wired external display), where the host's overlay cannot draw.
+    /// `true` lets AVKit draw whatever is selected, the tracks the overlay draws included (their WebVTT
+    /// renditions: OCR'd bitmaps, ASS reduced to emphasis and alignment), and rebuilds the session first when
+    /// its renditions serve another subtitle delay than the viewer's (`setSubtitleDelay(_:)`). `false` (the
+    /// picture is back) suppresses AVKit again for a track the overlay draws. The selection itself is
+    /// AVFoundation's (`AetherEngine+NativeSubtitleSelection`); this moves no option.
     public func setNativeSubtitleRendering(_ active: Bool) {
         // Sodalite#156: the host's request is a STANDING one, not a one-shot. It says where the
         // picture is, and it holds until the picture comes back or the session ends, which is what
         // lets a later track pick or a subtitles-off know that the rendition is the display.
         nativeSubtitleRenderingRequested = active
         // #170: the AirPlay flip triggers both the engine's LAN-swap reload and the host's
-        // documented rendering call; landing mid-reload the active track is transiently nil and
-        // this call would be misread as a deselect. Latch the newest request instead;
-        // restoreSubtitleSelection applies it once the reload has re-established the selection.
+        // documented rendering call; latch the newest request across a reload, which arms the new
+        // item's selection with it.
         if sessionPreservingReloadInFlight {
             pendingNativeRenderingRequest = active
             return
         }
-        guard active, let activeIdx = activeSubtitleTrackIndex,
-              let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: activeIdx, in: nativeSubtitleTrackTable,
-                                                       forced: forcedSubtitleSelection)
-        else {
-            setNativeSubtitleSelected(track: nil)
-            return
-        }
-        setNativeSubtitleSelected(track: ordinal)
+        if active { rebuildIfServedSubtitleDelayIsStale() }
+        let suppress = !active && !primarySubtitleDrawnByAVKit
+        Task { @MainActor [weak self] in await self?.setNativeSubtitleSuppressed(suppress) }
     }
 
     // MARK: - Session-preserving reload carryover (#170)
@@ -2111,118 +2115,6 @@ extension AetherEngine {
             )
             setNativeSubtitleSelected(track: ordinal)
         }
-    }
-
-    /// Sodalite#38: the native WebVTT legible rendition exists only for PiP / AirPlay; fullscreen uses the
-    /// host's on-frame overlay. AVKit AUTO-SELECTS the legible group at readyToPlay when the user has a
-    /// system caption preference (Accessibility "Closed Captions + SDH", or a preferred subtitle language),
-    /// which overrides the rendition's DEFAULT=NO,AUTOSELECT=NO, and the forced system caption WINDOW (the
-    /// grey box) cannot be styled transparent via textStyleRules. So pin the group DESELECTED at load.
-    /// `appliesMediaSelectionCriteriaAutomatically = false` alone does NOT stop it: a system caption pref
-    /// counts as the explicit user request that overrides the flag (device-tested, the reverted 0baa98d);
-    /// only a manual `select(nil)` sticks (device-confirmed: the PiP round-trip workaround, which ends in
-    /// exactly this deselect, cleared the subtitle). So `select(nil)` is asserted UNCONDITIONALLY the moment
-    /// the group loads (a manual deselect registered before AVKit's ready-time pass keeps it from engaging),
-    /// then re-asserted on a tight 40 ms cadence for the first second, where the old 250 ms cadence let
-    /// auto-selected cues flash for up to ~0.5 s at start (iOS device).
-    /// Bails the instant the host requests a native track (`setNativeSubtitleRendering` / PiP, AirPlay, or
-    /// external-display entry sets `nativeSubtitleReapplyOrdinal`), which owns selection from then on. A no-op
-    /// when native subtitles are not prepared (no legible group, e.g. tvOS overlay-only).
-    ///
-    /// Sodalite#65: the load-time burst is not enough, because the system also selects the rendition
-    /// LATER. iOS 26's automatic captions (Settings > Accessibility > Subtitles & Captioning: "show when
-    /// muted", "show when skipping back", "show when languages differ") turn captions on minutes into a
-    /// session, and once the burst had run out nothing held them back: AVKit rendered the rendition the
-    /// host keeps around for PiP and AirPlay only, as an empty grey caption box over the frame (the text
-    /// itself stayed invisible under the host's transparent style rules). So the burst hands over to a
-    /// media-selection observer that stays armed for the item's whole life and deselects again on every
-    /// foreign selection, bounded only against a selection fight it cannot win.
-    func forceNativeLegibleDeselectedUntilHostSelects() {
-        cancelNativeLegibleDeselectPin()
-        // A standing native-rendering request means the rendition IS the display (AVKit's own subtitle
-        // menu, PiP, AirPlay): the host and AVKit own selection, and a pin would undo the viewer's pick.
-        guard nativeSubtitleReapplyOrdinal == nil, !nativeSubtitleRenderingRequested,
-              let item = currentAVPlayer?.currentItem else { return }
-        currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
-        nativeLegibleDeselectPinTask = Task { @MainActor [weak self] in
-            guard let self,
-                  let group = try? await item.asset.loadMediaSelectionGroup(for: .legible),
-                  !group.options.isEmpty else { return }
-            var attempts = 0
-            while attempts < 25,
-                  self.nativeSubtitleReapplyOrdinal == nil, !self.nativeSubtitleRenderingRequested,
-                  self.currentAVPlayer?.currentItem === item {
-                if attempts == 0 || item.currentMediaSelection.selectedMediaOption(in: group) != nil {
-                    item.select(nil, in: group)
-                    EngineLog.emit("[AetherEngine] Sodalite#38 native legible force-deselected (attempt \(attempts))", category: .engine)
-                }
-                attempts += 1
-                try? await Task.sleep(nanoseconds: 40_000_000)
-            }
-            guard self.nativeSubtitleReapplyOrdinal == nil,
-                  self.currentAVPlayer?.currentItem === item else { return }
-            self.armNativeLegibleReselectionObserver(item: item, group: group)
-        }
-    }
-
-    /// Sodalite#65: hold the deselect for the rest of the session. `mediaSelectionDidChangeNotification`
-    /// fires for the system's automatic captions as well as for the engine's own selects, so the handler
-    /// only acts on a selection that is present while the host has not asked for a native track; the
-    /// engine's own `select(nil)` reads back as nil and re-enters nothing.
-    private func armNativeLegibleReselectionObserver(item: AVPlayerItem, group: AVMediaSelectionGroup) {
-        nativeLegibleDeselectPinItem = item
-        nativeLegibleDeselectPinGroup = group
-        nativeLegibleDeselectPinObserver = NotificationCenter.default.addObserver(
-            forName: AVPlayerItem.mediaSelectionDidChangeNotification,
-            object: item,
-            queue: .main
-        ) { [weak self] _ in
-            // Delivered on .main (queue: .main above), so assert MainActor to reach @MainActor state.
-            MainActor.assumeIsolated {
-                guard let self,
-                      let pinned = self.nativeLegibleDeselectPinItem,
-                      let group = self.nativeLegibleDeselectPinGroup,
-                      pinned === self.currentAVPlayer?.currentItem else { return }
-                // The host owns selection from the moment it asks for a native track (PiP, AirPlay,
-                // external display); its own select fires this notification too.
-                guard self.nativeSubtitleReapplyOrdinal == nil, !self.nativeSubtitleRenderingRequested else {
-                    self.cancelNativeLegibleDeselectPin()
-                    return
-                }
-                guard let selected = pinned.currentMediaSelection.selectedMediaOption(in: group) else { return }
-                guard self.nativeLegibleDeselectPinBurst.admit(now: Date().timeIntervalSinceReferenceDate) else {
-                    EngineLog.emit(
-                        "[AetherEngine] Sodalite#65: the system keeps re-selecting legible option "
-                        + "\"\(selected.displayName)\"; standing down, the caption box stays",
-                        category: .engine)
-                    self.cancelNativeLegibleDeselectPin()
-                    return
-                }
-                pinned.select(nil, in: group)
-                EngineLog.emit(
-                    "[AetherEngine] Sodalite#65: legible option \"\(selected.displayName)\" was selected "
-                    + "from outside the engine (iOS automatic captions); deselected again, "
-                    + "publishing the request (lang=\(selected.extendedLanguageTag ?? "none"))",
-                    category: .engine)
-                // The selection is the only trace of the user's automatic-captions settings, which have
-                // no read API. Hand it to the host, which can render it in its own subtitle presentation.
-                self.systemCaptionRequest.send(SystemCaptionRequest(language: selected.extendedLanguageTag))
-            }
-        }
-    }
-
-    /// Drops the pin's task, observer and burst budget. Called by the next `load()`, by `stopInternal`,
-    /// and by the pin itself once the host takes over selection.
-    func cancelNativeLegibleDeselectPin() {
-        nativeLegibleDeselectPinTask?.cancel()
-        nativeLegibleDeselectPinTask = nil
-        if let observer = nativeLegibleDeselectPinObserver {
-            NotificationCenter.default.removeObserver(observer)
-            nativeLegibleDeselectPinObserver = nil
-        }
-        nativeLegibleDeselectPinItem = nil
-        nativeLegibleDeselectPinGroup = nil
-        nativeLegibleDeselectPinBurst.reset()
     }
 
     // MARK: - Remote-HLS bypass legible selection (AE#154)

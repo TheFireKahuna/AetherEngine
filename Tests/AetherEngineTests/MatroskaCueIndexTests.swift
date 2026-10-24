@@ -236,6 +236,20 @@ struct MatroskaCueIndexTests {
         #expect(!dropped.isComplete(track: 3, frameCount: 1))
     }
 
+    @Test("a PGS composition header gives its state and the forced flag, from a zlib-wrapped frame's first bytes")
+    func pgsHeader() throws {
+        let forced = try #require(PGSCompositionHeader.parse(Self.zlibWrapped(Self.pgsDisplaySet(state: 0x80, forced: true))))
+        #expect(forced.isForced && forced.isSelfContained && forced.objectCount == 1)
+        let plain = try #require(PGSCompositionHeader.parse(Self.pgsDisplaySet(state: 0x00, forced: false)))
+        #expect(!plain.isForced && !plain.isSelfContained)
+        let fixture = Self.fixture()
+        let src = source(fixture)
+        let index = try MatroskaCueIndex.read(from: src, token: .forParserTests)
+        let prefix = try #require(index.readFrame(index.blocksByTrack[3]![0], track: 3, from: src, prefix: 64))
+        #expect(prefix.isPrefix)
+        #expect(PGSCompositionHeader.parse(prefix.payload)?.isForced == true)
+    }
+
     @Test("a file that is not Matroska, or has no Cues, is refused")
     func refusals() {
         #expect(throws: SourceIndexError.unsupportedContainer) {

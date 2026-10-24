@@ -10,7 +10,11 @@ import Foundation
 struct NativeSubtitleRenditionInfo: Sendable, Equatable {
     let language: String?
     let name: String
+    /// Declared `FORCED=YES, AUTOSELECT=YES` (HLS Authoring Specification 5.11).
     let isForced: Bool
+    /// Subtitles for the deaf and hard of hearing: declared with the accessibility `CHARACTERISTICS` and
+    /// `AUTOSELECT=YES` (4.5, 4.6), so the viewer's "Closed Captions + SDH" setting can select it.
+    var isSDH: Bool = false
 }
 
 // MARK: - Live window sizing
@@ -804,13 +808,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private let nativeSubRenditionInfos: [NativeSubtitleRenditionInfo]
     /// Ordinal advertised as DEFAULT=YES in the master SUBTITLES group (Sodalite#32).
     let nativeSubtitleDefaultOrdinal: Int
-    /// Serve the SUBTITLES rendition as ONE whole-program .vtt (single VOD segment spanning the full duration)
-    /// instead of one .vtt per video segment. The only AVPlayer-reliable sideload shape (Sodalite#32); requires
-    /// eager readers (all cues available up front) and a bounded program (VOD).
-    let nativeSubtitleWholeProgram: Bool
-    /// Current engine playlist shift (AVPlayer clock = source_pts - shift), read at serve time so whole-program
-    /// cues land on the same AVPlayer axis as the video even when the shift was not known at load (Sodalite#32).
-    private let currentShiftSeconds: @Sendable () -> Double
+    /// One segment per video segment: the loopback never serves a whole-program rendition.
+    var nativeSubtitleWholeProgram: Bool { false }
     /// AE#418: fired with the index AVPlayer just placed into its timeline. What that segment
     /// carries below its advertised start is what moves the axis every consumer folds with.
     private let segmentPlacedHandler: (@Sendable (Int) -> Void)?
@@ -1051,8 +1050,6 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         nativeSubtitleRenditionInfos: [NativeSubtitleRenditionInfo] = [],
         stripASSMarkupInVTT: Bool = false,
         nativeSubtitleDefaultOrdinal: Int = 0,
-        nativeSubtitleWholeProgram: Bool = false,
-        currentShiftSeconds: @escaping @Sendable () -> Double = { 0 },
         segmentPlacedHandler: (@Sendable (Int) -> Void)? = nil,
         segmentServedHandler: (@Sendable (Int, Bool) -> Void)? = nil
     ) {
@@ -1102,8 +1099,6 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.nativeSubRenditionInfos = nativeSubtitleRenditionInfos
         self.stripASSMarkupInVTT = stripASSMarkupInVTT
         self.nativeSubtitleDefaultOrdinal = nativeSubtitleDefaultOrdinal
-        self.nativeSubtitleWholeProgram = nativeSubtitleWholeProgram
-        self.currentShiftSeconds = currentShiftSeconds
         self.segmentPlacedHandler = segmentPlacedHandler
         self.segmentServedHandler = segmentServedHandler
     }
@@ -3084,19 +3079,16 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     // MARK: - Native subtitle renditions (#15)
 
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] {
+    var nativeSubtitleRenditions: [NativeSubtitleRenditionInfo] {
         guard !nativeSubStores.isEmpty else { return [] }
         return nativeSubStores.indices.map { i in
             // Session-built infos carry deduped NAMEs + forced dispositions; the legacy per-ordinal
             // fallback stays for constructions that pass only languages (duplicate names collapse
             // AVFoundation's legible options, so real sessions should always pass infos).
-            if i < nativeSubRenditionInfos.count {
-                let info = nativeSubRenditionInfos[i]
-                return (ordinal: i, language: info.language, name: info.name, isForced: info.isForced)
-            }
+            if i < nativeSubRenditionInfos.count { return nativeSubRenditionInfos[i] }
             let lang = i < nativeSubLanguages.count ? nativeSubLanguages[i] : nil
             let name = lang.flatMap { Locale.current.localizedString(forIdentifier: $0) } ?? "Subtitle \(i + 1)"
-            return (ordinal: i, language: lang, name: name, isForced: false)
+            return NativeSubtitleRenditionInfo(language: lang, name: name, isForced: false)
         }
     }
 
@@ -3112,27 +3104,6 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? {
         guard ordinal >= 0, ordinal < nativeSubStores.count else { return nil }
         let store = nativeSubStores[ordinal]
-        if nativeSubtitleWholeProgram {
-            // Sodalite#32: serve the ENTIRE program's cues as one .vtt (the only AVPlayer-reliable sideload
-            // shape). AVKit fetches this VOD single-segment file ONCE and never re-fetches it, so it MUST be
-            // complete. Wait for the reader's definitive EOF signal (isFinished) rather than a cue-count plateau
-            // heuristic, which fired early during dialogue gaps and served a truncated file (device-confirmed).
-            let deadline = Date().addingTimeInterval(30.0)
-            while !store.isFinished, Date() < deadline {
-                usleep(100_000)
-            }
-            // Sodalite#32: the cues are stored at SOURCE pts; AVPlayer clock = source - shift. Apply the CURRENT
-            // engine shift (read now, not the possibly-zero load-time value) so cues land on the video's axis.
-            let shift = currentShiftSeconds()
-            store.setShiftSeconds(shift)
-            let cues = stripMarkupIfNeeded(store.allCues())
-            EngineLog.emit("[HLSVideoEngine] whole-program subtitle .vtt ord=\(ordinal) cues=\(cues.count) finished=\(store.isFinished) shift=\(String(format: "%.2f", shift)) first=\(cues.first.map { String(format: "%.1f", $0.start) } ?? "-") last=\(cues.last.map { String(format: "%.1f", $0.end) } ?? "-")", category: .hlsServer)
-            // PLAIN WebVTT, NO X-TIMESTAMP-MAP (matches the proven-working whole-file sideload). With the map,
-            // AVKit anchors cues to the fMP4 sample PTS (which diverges from currentTime over our loopback) and
-            // the subtitles render offset by the playback position; without it AVKit uses the cue times as the
-            // AVPlayer timeline directly (= our absolute cue axis). Sodalite#32.
-            return WebVTTBuilder.body(cues: cues)
-        }
         stateLock.lock()
         guard segmentIndex >= 0, segmentIndex < segments.count else {
             stateLock.unlock()
@@ -3168,14 +3139,15 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return WebVTTBuilder.segment(cues: cues, segmentStart: start)
     }
 
-    /// Sodalite#32 Phase 2: see `stripASSMarkupInVTT`.
-    private func stripMarkupIfNeeded(
-        _ cues: [(start: Double, end: Double, text: String)]
-    ) -> [(start: Double, end: Double, text: String)] {
+    /// Sodalite#32 Phase 2: see `stripASSMarkupInVTT`. The event's own text, its overrides intact, is
+    /// what the rendition serves: `WebVTTBuilder.cueText` keeps their italic, bold and underline.
+    private func stripMarkupIfNeeded(_ cues: [WebVTTBuilder.Cue]) -> [WebVTTBuilder.Cue] {
         guard stripASSMarkupInVTT else { return cues }
         return cues.compactMap { c in
-            guard let plain = SubtitleRectText.plainText(fromASSEventLine: c.text) else { return nil }
-            return (c.start, c.end, plain)
+            guard let text = SubtitleRectText.eventText(fromASSEventLine: c.text) else { return nil }
+            var cue = c
+            cue.text = text
+            return cue
         }
     }
 }

@@ -75,14 +75,6 @@ final class LiveChannelHost {
             .sink { [weak self] in self?.handleLiveSourceReset() }
             .store(in: &cancellables)
 
-        // The system turned captions on by itself (muted playback, skip back, a
-        // language mismatch). The engine deselected its own rendition and hands
-        // the ask over; answer it with a track of your own, or ignore it.
-        engine.systemCaptionRequest
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] request in self?.answerCaptionRequest(request) }
-            .store(in: &cancellables)
-
         // A session that dies after the load returned arrives here and nowhere
         // else. Show the message, but classify on `errorInfo`: half of these
         // sentences are the engine's own and half are AVFoundation's
@@ -182,15 +174,6 @@ final class LiveChannelHost {
             await self.load(url)
             self.retuneInFlight = false
         }
-    }
-
-    // MARK: - Captions
-
-    private func answerCaptionRequest(_ request: SystemCaptionRequest) {
-        guard let language = request.language,
-              let track = engine.subtitleTracks.first(where: { $0.language == language })
-        else { return }
-        engine.selectSubtitleTrack(index: track.id)
     }
 
     // MARK: - Audio tap (contract 4), optional

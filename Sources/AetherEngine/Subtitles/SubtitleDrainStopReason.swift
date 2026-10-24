@@ -30,4 +30,6 @@ enum SubtitleDrainStopReason: String, Sendable {
     case subtitlesCleared
     /// The session itself is going away (`stopInternal`), so nothing is expected to survive.
     case sessionStopped
+    /// The selected text track is drawn by AVKit from its rendition, so the overlay has nothing to draw.
+    case nativeRenditionDraws
 }

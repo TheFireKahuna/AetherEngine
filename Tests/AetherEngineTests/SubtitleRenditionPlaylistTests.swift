@@ -3,8 +3,11 @@ import Foundation
 @testable import AetherEngine
 
 private final class MasterMockProvider: HLSSegmentProvider, @unchecked Sendable {
-    let renditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)]
-    init(renditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)]) { self.renditions = renditions }
+    let renditions: [NativeSubtitleRenditionInfo]
+    /// Each rendition at its ordinal, which is its position.
+    init(renditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)]) {
+        self.renditions = renditions.map { .init(language: $0.language, name: $0.name, isForced: $0.isForced) }
+    }
     func initSegment() -> Data? { Data([0x00]) }
     func mediaSegment(at index: Int) -> Data? { Data([0x00]) }
     var segmentCount: Int { 1 }
@@ -12,7 +15,20 @@ private final class MasterMockProvider: HLSSegmentProvider, @unchecked Sendable 
     var playlistType: HLSPlaylistType { .vod }
     var masterCodecs: String? { "hvc1.1.6.L120.90,mp4a.40.2" }
     var masterVideoRange: HLSVideoRange? { .sdr }
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { renditions }
+    var nativeSubtitleRenditions: [NativeSubtitleRenditionInfo] { renditions }
+}
+
+private final class SDHMasterProvider: HLSSegmentProvider, @unchecked Sendable {
+    let renditions: [NativeSubtitleRenditionInfo]
+    init(renditions: [NativeSubtitleRenditionInfo]) { self.renditions = renditions }
+    func initSegment() -> Data? { Data([0x00]) }
+    func mediaSegment(at index: Int) -> Data? { Data([0x00]) }
+    var segmentCount: Int { 1 }
+    func segmentDuration(at index: Int) -> Double { 4.0 }
+    var playlistType: HLSPlaylistType { .vod }
+    var masterCodecs: String? { "hvc1.1.6.L120.90,mp4a.40.2" }
+    var masterVideoRange: HLSVideoRange? { .sdr }
+    var nativeSubtitleRenditions: [NativeSubtitleRenditionInfo] { renditions }
 }
 
 /// VOD provider with a fixed segment count + per-segment cue windows for the windowed subtitle playlist.
@@ -20,9 +36,9 @@ private final class WindowedSubsProvider: HLSSegmentProvider, @unchecked Sendabl
     let segCount: Int
     let segDuration: Double
     /// cues[segmentIndex] -> overlapping cues for that segment.
-    let cues: [Int: [(start: Double, end: Double, text: String)]]
+    let cues: [Int: [WebVTTBuilder.Cue]]
     init(segCount: Int, segDuration: Double = 4.0,
-         cues: [Int: [(start: Double, end: Double, text: String)]] = [:]) {
+         cues: [Int: [WebVTTBuilder.Cue]] = [:]) {
         self.segCount = segCount
         self.segDuration = segDuration
         self.cues = cues
@@ -34,7 +50,7 @@ private final class WindowedSubsProvider: HLSSegmentProvider, @unchecked Sendabl
     var playlistType: HLSPlaylistType { .vod }
     var masterCodecs: String? { "hvc1.1.6.L120.90,mp4a.40.2" }
     var masterVideoRange: HLSVideoRange? { .sdr }
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { [(0, "eng", "English", false)] }
+    var nativeSubtitleRenditions: [NativeSubtitleRenditionInfo] { [.init(language: "eng", name: "English", isForced: false)] }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? {
         guard ordinal == 0, segmentIndex >= 0, segmentIndex < segCount else { return nil }
         let start = Double(segmentIndex) * segDuration
@@ -72,7 +88,7 @@ struct SubtitleRenditionPlaylistTests {
     func segmentVTTBody() {
         // Segment 1 spans [4, 8); two cues land in it.
         let p = WindowedSubsProvider(segCount: 3, cues: [
-            1: [(start: 4.5, end: 5.0, text: "first"), (start: 6.0, end: 7.0, text: "second")]
+            1: [.init(start: 4.5, end: 5.0, text: "first"), .init(start: 6.0, end: 7.0, text: "second")]
         ])
         let vtt = p.nativeSubtitleVTT(ordinal: 0, segmentIndex: 1)
         #expect(vtt != nil)
@@ -115,7 +131,7 @@ struct SubtitleRenditionPlaylistTests {
     @Test("relative cue timing rebases cues to segment start")
     func relativeCueTiming() {
         // segmentStart 4.0; cue at absolute 6.0 -> relative 2.0.
-        let vtt = WebVTTBuilder.segment(cues: [(start: 6.0, end: 7.0, text: "x")],
+        let vtt = WebVTTBuilder.segment(cues: [.init(start: 6.0, end: 7.0, text: "x")],
                                         segmentStart: 4.0, relativeToStart: true)
         #expect(vtt.contains("00:00:02.000 --> 00:00:03.000\nx"))
     }
@@ -131,25 +147,42 @@ struct SubtitleRenditionPlaylistTests {
         #expect(!m.contains("FORCED"))
     }
 
-    @Test("a source-forced rendition is NOT emitted FORCED=YES without the option (host owns fullscreen subs)")
+    @Test("a track the container flags forced is declared FORCED=YES, AUTOSELECT=YES under declaresForcedSubtitles")
     func masterForcedAttribute() {
-        // AVKit force-displays a FORCED rendition matching the audio language regardless of
-        // DEFAULT/AUTOSELECT and the CC-off preference, self-engaging a rendition the overlay owns
-        // (Sodalite#38 follow-on: forced German track shown on German audio with subtitles off). The
-        // forced/full pair stays disambiguated by NAME, so neither carries FORCED=YES. The disposition is
-        // dropped where the rendition infos are built, unless `LoadOptions.forcedSubtitleTrack` names it
-        // for it (ForcedSubtitleRenditionTests).
-        let infos = AetherEngine.nativeSubtitleRenditionInfos(for: [
+        // tvOS shows a FORCED rendition by itself when the viewer has no subtitles on and the audio's
+        // language matches; the engine follows that selection and draws or lets AVKit draw it.
+        var table: [AetherEngine.NativeSubtitleTrackEntry] = [
             .init(sourceStreamIndex: 2, language: "ger", isForced: true),
             .init(sourceStreamIndex: 3, language: "ger", isForced: false),
-        ])
-        let provider = MasterMockProvider(renditions: infos.enumerated().map {
-            ($0.offset, $0.element.language, $0.element.name, $0.element.isForced)
-        })
+        ]
+        AetherEngine.declareTrackForcedness(&table)
+        let provider = MasterMockProvider(renditions: AetherEngine.nativeSubtitleRenditionInfos(for: table)
+            .enumerated().map { ($0.offset, $0.element.language, $0.element.name, $0.element.isForced) })
         let m = HLSLocalServer.buildMasterPlaylistText(provider: provider)
-        #expect(m.contains("LANGUAGE=\"ger\",DEFAULT=NO,AUTOSELECT=NO,URI=\"subs_0.m3u8\""))
+        #expect(m.contains("LANGUAGE=\"ger\",DEFAULT=NO,AUTOSELECT=YES,FORCED=YES,URI=\"subs_0.m3u8\""))
         #expect(m.contains("LANGUAGE=\"ger\",DEFAULT=NO,AUTOSELECT=NO,URI=\"subs_1.m3u8\""))
-        #expect(!m.contains("FORCED"))
+    }
+
+    @Test("without declaresForcedSubtitles a flagged track is an ordinary rendition")
+    func masterForcedAttributeOff() {
+        let infos = AetherEngine.nativeSubtitleRenditionInfos(for: [
+            .init(sourceStreamIndex: 2, language: "ger", isForced: true),
+        ])
+        #expect(infos.map(\.isForced) == [false])
+    }
+
+    @Test("an SDH track carries the accessibility CHARACTERISTICS with AUTOSELECT=YES (spec 4.5, 4.6)")
+    func masterSDHAttributes() {
+        let infos = AetherEngine.nativeSubtitleRenditionInfos(for: [
+            .init(sourceStreamIndex: 2, language: "eng", isHearingImpaired: true),
+            .init(sourceStreamIndex: 3, language: "eng"),
+        ])
+        #expect(infos.map(\.isSDH) == [true, false])
+        let provider = SDHMasterProvider(renditions: infos)
+        let m = HLSLocalServer.buildMasterPlaylistText(provider: provider)
+        #expect(m.contains("DEFAULT=NO,AUTOSELECT=YES,CHARACTERISTICS=\"public.accessibility.transcribes-spoken-dialog,"
+                           + "public.accessibility.describes-music-and-sound\",URI=\"subs_0.m3u8\""))
+        #expect(m.contains("DEFAULT=NO,AUTOSELECT=NO,URI=\"subs_1.m3u8\""))
     }
 
     @Test("master omits SUBTITLES when no native subs")
@@ -171,8 +204,8 @@ private final class ReducedMasterMockProvider: HLSSegmentProvider, @unchecked Se
     var masterCodecs: String? { "hvc1.2.4.L150,ec-3" }
     var masterSupplementalCodecs: String? { "dvh1.08.06/db1p" }
     var masterVideoRange: HLSVideoRange? { .pq }
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] {
-        [(ordinal: 0, language: "en", name: "English", isForced: false)]
+    var nativeSubtitleRenditions: [NativeSubtitleRenditionInfo] {
+        [.init(language: "en", name: "English", isForced: false)]
     }
 }
 

@@ -28,8 +28,8 @@ private final class ScriptedOutageProvider: HLSSegmentProvider, @unchecked Senda
     var liveTargetSegmentDuration: Double? { 4.0 }
     var liveOutageEndlist: Bool { outage }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? { "WEBVTT\n" }
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] {
-        [(0, "en", "English", false)]
+    var nativeSubtitleRenditions: [NativeSubtitleRenditionInfo] {
+        [.init(language: "en", name: "English", isForced: false)]
     }
     func notePlaylistBuild() -> (visibleCount: Int, firstVisible: Int, refreshCounter: Int,
                                  endlistAdded: Bool, discontinuitySequence: Int) {

@@ -286,14 +286,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// provider advertises this ordinal as the group default so a host-selected legible track renders.
     var nativeSubtitleDefaultOrdinal: Int = 0
 
-    /// Serve the SUBTITLES rendition as one whole-program .vtt (Sodalite#32). Set before `start()`.
-    var nativeSubtitleWholeProgram: Bool = false
-
-    /// Source position (seconds) the playback stream started at (resume/seek). Device-confirmed AVKit anchors a
-    /// whole-program VOD .vtt's time 0 to the stream start, so whole-program cues shift by this so cue-for-source-S
-    /// lands at currentTime S (from-start = 0 = no shift). Set before `start()`. Sodalite#32.
-    var subtitleStreamStartSeconds: Double = 0
-
     /// Source position (seconds, playlist axis) the session will start at (resume/seek). Set
     /// before `start()`; anchors the FIRST producer at the matching segment instead of seg0
     /// (#93 residual: the seg0 cold start was torn down unwatched on every resume, and the
@@ -2384,8 +2376,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
             nativeSubtitleRenditionInfos: nativeSubtitleRenditionInfosForSession,
             stripASSMarkupInVTT: preserveASSMarkupForSubtitleTap,
             nativeSubtitleDefaultOrdinal: nativeSubtitleDefaultOrdinal,
-            nativeSubtitleWholeProgram: nativeSubtitleWholeProgram,
-            currentShiftSeconds: { [weak self] in (self?.playlistShiftSeconds ?? 0) + (self?.subtitleStreamStartSeconds ?? 0) },
             segmentPlacedHandler: segmentPlacedHandler,
             segmentServedHandler: segmentServedHandler
         )

@@ -105,7 +105,8 @@ protocol HLSSegmentProvider: AnyObject {
     /// Native subtitle renditions (#15): one per text track, for the master EXT-X-MEDIA:TYPE=SUBTITLES tags
     /// and the /subs_{N} endpoints. Empty unless prepareNativeSubtitles is on and the cue stores are threaded.
     /// NAMEs must be unique within the group (duplicates collapse AVFoundation's legible options).
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { get }
+    /// The SUBTITLES renditions, each at its ordinal (its index), served as `subs_<ordinal>.m3u8`.
+    var nativeSubtitleRenditions: [NativeSubtitleRenditionInfo] { get }
     /// Ordinal advertised as DEFAULT=YES in the master SUBTITLES group (Sodalite#32).
     var nativeSubtitleDefaultOrdinal: Int { get }
     /// Serve the SUBTITLES rendition as one whole-program .vtt (single VOD segment) instead of per-video-segment (Sodalite#32).
@@ -203,7 +204,7 @@ extension HLSSegmentProvider {
     var masterClosedCaptions: String? { nil }
     var masterAudioRendition: (language: String?, name: String)? { nil }
     var masterAudioChannels: String? { nil }
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { [] }
+    var nativeSubtitleRenditions: [NativeSubtitleRenditionInfo] { [] }
     var nativeSubtitleDefaultOrdinal: Int { 0 }
     var nativeSubtitleWholeProgram: Bool { false }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? { nil }
@@ -1865,29 +1866,26 @@ final class HLSLocalServer: @unchecked Sendable {
 
         // #15: native WebVTT subtitle renditions (separate from the A/V variant; in-band timed text is
         // non-conformant for HLS). Orthogonal to the video VIDEO-RANGE/CODECS attributes.
-        // Sodalite#32: DEFAULT=NO,AUTOSELECT=NO so AVKit never auto-selects a subtitle rendition in fullscreen
-        // (the on-frame overlay owns fullscreen subtitles). The host explicitly selects the matching rendition
-        // only on PiP entry and deselects it on PiP exit, so the two never double up.
         let subRenditions = provider.nativeSubtitleRenditions
-        for r in subRenditions {
+        for (ordinal, r) in subRenditions.enumerated() {
             var mediaAttrs = ["TYPE=SUBTITLES", "GROUP-ID=\"subs\"", "NAME=\"\(r.name)\""]
             if let lang = r.language { mediaAttrs.append("LANGUAGE=\"\(lang)\"") }
-            // `r.isForced` is set only for `LoadOptions.forcedSubtitleTrack`'s rendition, for a host whose subtitles
-            // are AVKit's own. Without it a source-forced track is deliberately NOT declared FORCED=YES: AVKit
-            // force-displays a FORCED rendition whose language matches the selected audio regardless of
-            // DEFAULT/AUTOSELECT and the user's CC-off preference, which self-engages a rendition and
-            // contradicts the invariant above (the on-frame overlay owns fullscreen subtitles; the host selects
-            // a rendition only on PiP). A source-forced German track on German audio then rendered with
-            // subtitles off (Sodalite#38 follow-on, DV-master path). Same-language forced/full pairs are
-            // disambiguated by NAME. With it, that display IS the point: a forced rendition is declared the
-            // way the HLS Authoring Specification asks (5.11: AUTOSELECT=YES; DEFAULT=NO, since the forced
-            // lines are not the default subtitle), and AVKit keeps it out of its subtitle menu.
+            // Declared as the HLS Authoring Specification asks, so AVFoundation's own selection works from
+            // the viewer's settings: a forced rendition FORCED=YES with AUTOSELECT=YES (5.11), which tvOS
+            // shows by itself when the viewer has no subtitles on and the audio's language matches; SDH with
+            // the accessibility characteristics and AUTOSELECT=YES (4.5, 4.6), which "Closed Captions + SDH"
+            // selects. DEFAULT stays NO: the engine follows the selection AVFoundation makes, and a track
+            // the overlay draws is kept from AVKit by suppressing its rendering, not by withholding it.
             if r.isForced {
                 mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=YES", "FORCED=YES"])
+            } else if r.isSDH {
+                mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=YES",
+                    "CHARACTERISTICS=\"public.accessibility.transcribes-spoken-dialog,"
+                    + "public.accessibility.describes-music-and-sound\""])
             } else {
                 mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=NO"])
             }
-            mediaAttrs.append("URI=\"subs_\(r.ordinal).m3u8\"")
+            mediaAttrs.append("URI=\"subs_\(ordinal).m3u8\"")
             lines.append("#EXT-X-MEDIA:\(mediaAttrs.joined(separator: ","))")
         }
         if !subRenditions.isEmpty {

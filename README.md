@@ -317,17 +317,14 @@ player.selectSubtitleTrack(index: track.id)
 // with its absolute AVStream index; tracks sharing a URL are decoded in one pass (#266).
 ExternalSubtitleTrack(url: mkvURL, name: "Spanish", language: "es", sourceStreamIndex: 3)
 
-// Native WebVTT subtitle renditions (subtitles in PiP / AirPlay / external display; opt-in
-// via LoadOptions.prepareNativeSubtitles, details in docs/formats.md)
+// Native WebVTT subtitle renditions (opt-in via LoadOptions.prepareNativeSubtitles, details in
+// docs/formats.md): AVFoundation's selection is what shows, whoever made it. AVKit draws text tracks;
+// styled ASS and bitmap tracks are the host overlay's (AVKit suppressed); every track reaches PiP /
+// AirPlay / an external display through its rendition.
 player.$nativeSubtitleTracks                   // [NativeSubtitleTrack]: ordinal, language, displayName
-player.setNativeSubtitleSelected(track: 2)     // engage a rendition (e.g. on PiP entry); nil deselects
-
-// The SYSTEM turned captions on by itself: iOS 26 Settings > Accessibility > Subtitles & Captioning
-// > Automatic Subtitles (show when muted, on skip back, on a language mismatch). Those toggles have
-// no read API, so the selection is the only way to see the ask. The engine deselects the option (a
-// rendition rendered in fullscreen draws a caption box over the host's own subtitles) and forwards
-// the request; a host that wants the behaviour picks its own matching track. Subscribe per session.
-player.systemCaptionRequest                    // PassthroughSubject<SystemCaptionRequest, Never>
+player.$primarySubtitleDrawnByAVKit            // true: AVKit draws the track; false: draw subtitleCues
+player.setNativeSubtitleRendering(true)        // the rendition is the display (PiP / AirPlay / external)
+player.setSubtitleDelay(0.5)                   // a delay changed mid-session (LoadOptions.subtitleDelaySeconds at load)
 
 // Second simultaneous subtitle track (bilingual / language learning)
 player.selectSecondarySubtitleTrack(index: streamID)
