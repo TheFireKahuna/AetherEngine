@@ -152,6 +152,13 @@ final class ObjectAudioRenderer {
     /// update is applied as a jump whatever its ramp says: there is no earlier position to ramp
     /// from, and ramping from silence would fade every object in after each seek.
     private var hasMetadata: [Bool]
+    /// Per element, whether its gains are now what continuous playback has, whatever came before
+    /// the renderer was built or reset (`isSettled`), and the frames until a ramp under way settles
+    /// it (0 when none is). `settlesOnNextUpdate`: a discontinuity makes its next update a jump in
+    /// every run.
+    private var settled: [Bool]
+    private var settleRemaining: [Int]
+    private var settlesOnNextUpdate: [Bool]
 
     /// Each object's latest state, for `snapshot`, and where its position and gain were when the
     /// ramp towards it started (nil when it jumped there).
@@ -171,6 +178,9 @@ final class ObjectAudioRenderer {
         rampRemaining = Array(repeating: 0, count: roles.count)
         rampTotal = rampRemaining
         hasMetadata = Array(repeating: false, count: roles.count)
+        settled = hasMetadata
+        settleRemaining = rampRemaining
+        settlesOnNextUpdate = hasMetadata
         objectStates = Array(repeating: nil, count: roles.count)
         objectFrom = Array(repeating: nil, count: roles.count)
         // Beds and LFE have gains the moment the renderer exists; objects wait for metadata and are
@@ -189,6 +199,9 @@ final class ObjectAudioRenderer {
         for index in roles.indices {
             rampRemaining[index] = 0
             hasMetadata[index] = false
+            settled[index] = false
+            settleRemaining[index] = 0
+            settlesOnNextUpdate[index] = false
             objectStates[index] = nil
             objectFrom[index] = nil
             if roles[index] == .object {
@@ -222,8 +235,25 @@ final class ObjectAudioRenderer {
                 rampRemaining[index] = 0
             }
             hasMetadata[index] = false
+            // The ramps stopped where they had got to, so none of them ends on its target now.
+            settleRemaining[index] = 0
+            settlesOnNextUpdate[index] = true
         }
     }
+
+    /// Whether every element's gains are now a function of the metadata since the renderer was
+    /// built or reset alone, so the output is what continuous playback gives.
+    ///
+    /// Object metadata is applied as TS 103 448 pseudocode 19 defines it: an update ramps every gain
+    /// from where it stands, mid-ramp included, so a ramp cut short by the next update carries part of
+    /// the state before it on, and that state part of the one before. A run started anywhere has no
+    /// such state and applies its first update as a jump. The two agree for an element from the
+    /// moment one of its ramps runs to the end before the next update (both then sit on its
+    /// target), or an update jumps in every run (no ramp, or the first after a discontinuity); after
+    /// that they are equal states taking equal updates. Whether a ramp runs to the end is a property
+    /// of the updates' timing and lengths, which every run sees, so this is exact, and it observes
+    /// only: rendering is the same with or without it.
+    var isSettled: Bool { !settled.contains(false) }
 
     /// Render `frameCount` frames of `inputs` (one plane per role) into `outputs` (one plane per
     /// layout channel, overwritten). `updates` must be sorted by `frameOffset`.
@@ -249,6 +279,7 @@ final class ObjectAudioRenderer {
             // Every update at or before `cursor` has been applied, so the next one is strictly later.
             let end = min(frameCount, pending.first?.frameOffset ?? frameCount)
             mix(inputs: inputs, from: cursor, count: end - cursor, outputs: outputs)
+            age(end - cursor)
             cursor = end
         }
         // Updates stamped at or past the end of the block still take effect, for the next block.
@@ -270,6 +301,7 @@ final class ObjectAudioRenderer {
                 rampRemaining[index] -= min(rampRemaining[index], end - cursor)
                 if rampRemaining[index] == 0 { current[index] = target[index] }
             }
+            age(end - cursor)
             cursor = end
         }
         for update in pending { apply(update) }
@@ -316,6 +348,13 @@ final class ObjectAudioRenderer {
         for index in 0..<count {
             guard let state = update.states[index] else { continue }
             let jump = update.rampFrames <= 0 || !hasMetadata[index]
+            if update.rampFrames <= 0 || settlesOnNextUpdate[index] {
+                settled[index] = true
+            } else if !settled[index] {
+                // Continuous playback ramps here from wherever it was; this run agrees once that ramp ends.
+                settleRemaining[index] = update.rampFrames + 1
+            }
+            settlesOnNextUpdate[index] = false
             if roles[index] == .object {
                 objectFrom[index] = jump ? nil : objectNow(index)
                 objectStates[index] = state
@@ -349,6 +388,15 @@ final class ObjectAudioRenderer {
                 current[index] = gains
                 rampRemaining[index] = 0
             }
+        }
+    }
+
+    /// `frames` frames of the current updates have played: a ramp that runs out before the next one
+    /// settles its element.
+    private func age(_ frames: Int) {
+        for index in roles.indices where settleRemaining[index] > 0 {
+            settleRemaining[index] -= min(settleRemaining[index], frames)
+            if settleRemaining[index] == 0 { settled[index] = true }
         }
     }
 

@@ -21,6 +21,7 @@ struct SpatialAudioBridgeTests {
     /// the first `skipAfterReset` access units after a reset are discarded as a real decoder does
     /// while it looks for a major sync, and `dropAt` discards a run mid-stream like a corrupt span.
     final class SyntheticDecoder: ObjectAudioDecoding {
+        let span = AudioStageSpan.instant
         let framesPerAU = 40
         var skipAfterReset: Int
         var dropAt: (push: Int, count: Int)?
@@ -89,6 +90,7 @@ struct SpatialAudioBridgeTests {
 
     /// Stand-in decoder that refuses every access unit, as a corrupt or foreign stream would.
     final class RejectingDecoder: ObjectAudioDecoding {
+        let span = AudioStageSpan.instant
         struct Refused: Error {}
         func push(_ bytes: UnsafeRawBufferPointer, pts: Int64) throws { throw Refused() }
         func nextBlock() throws -> ObjectAudioDecodedBlock? { nil }
@@ -99,6 +101,7 @@ struct SpatialAudioBridgeTests {
     /// contiguous from the first push, and the left bed channel carries a 3 ms 1 kHz burst
     /// starting at input frame `clickFrame`.
     final class ClickDecoder: ObjectAudioDecoding {
+        let span = AudioStageSpan.instant
         let clickFrame: Int64
         private var inputFrames: Int64 = 0
         private var blocks: [(offset: Int64, frames: Int, stamp: (Int64, Int64)?)] = []
@@ -386,6 +389,7 @@ struct SpatialAudioBridgeTests {
     /// Like `ClickDecoder`, but returns nothing after a reset until the bridge asks for what it
     /// holds, as the TrueHD decoder does while it waits for the first object metadata.
     final class HoldingDecoder: ObjectAudioDecoding {
+        let span = AudioStageSpan.instant
         private let inner = ClickDecoder(clickFrame: 30_000)
         private var holding = true
         private(set) var releases = 0
@@ -926,6 +930,7 @@ extension SpatialAudioBridgeTests {
     /// Contiguous like `ClickDecoder`, but at push `panicAt` it fails the way the real one does on a
     /// caught panic: the push throws, the decoder resets itself, and its offsets start from zero.
     final class SelfResettingDecoder: ObjectAudioDecoding {
+        let span = AudioStageSpan.instant
         let panicAt: Int
         private var pushes = 0
         private var inputFrames: Int64 = 0
@@ -964,6 +969,7 @@ extension SpatialAudioBridgeTests {
 
     /// Decodes fine at a rate the renderer refuses, so every block throws.
     final class WrongRateDecoder: ObjectAudioDecoding {
+        let span = AudioStageSpan.instant
         private var pending = 0
         private let plane = UnsafeMutablePointer<Float>.allocate(capacity: 4096)
         deinit { plane.deallocate() }
@@ -1053,6 +1059,7 @@ extension SpatialAudioBridgeTests {
     /// reset (or at the start) emits nothing until `syncWait` pushes have passed, as TrueHD waits for a
     /// major sync. Offsets count every push since the reset.
     final class TimestampingDecoder: ObjectAudioDecoding {
+        let span = AudioStageSpan.instant
         let panicAt: Int?, syncWait: Int
         private var pushes = 0, sinceReset = 0
         private var inputFrames: Int64 = 0
