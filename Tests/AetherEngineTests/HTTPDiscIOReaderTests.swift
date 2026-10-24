@@ -36,21 +36,24 @@ struct HTTPDiscIOReaderTests {
         #expect(Demuxer.isDiscImageURL(URL(string: "https://h/stream.m3u8")!) == false)
     }
 
-    @Test("Read-ahead window grows on sequential continuation and resets otherwise")
+    @Test("Read-ahead grows on sequential continuation, resets otherwise, and starts at the read's own size")
     func adaptiveWindow() {
-        // Sequential continuation (position == lastFetchEnd) doubles, capped at maxChunk.
-        #expect(HTTPDiscIOReader.nextChunkSize(position: 4096, lastFetchEnd: 4096, current: 4096,
-                                               base: 4096, maxChunk: 32768) == 8192)
-        #expect(HTTPDiscIOReader.nextChunkSize(position: 8192, lastFetchEnd: 8192, current: 8192,
-                                               base: 4096, maxChunk: 32768) == 16384)
-        #expect(HTTPDiscIOReader.nextChunkSize(position: 99999, lastFetchEnd: 99999, current: 32768,
-                                               base: 4096, maxChunk: 32768) == 32768)  // capped
-        // A non-contiguous read (seek) resets to base.
-        #expect(HTTPDiscIOReader.nextChunkSize(position: 200000, lastFetchEnd: 8192, current: 16384,
-                                               base: 4096, maxChunk: 32768) == 4096)
-        // No prior refill yet -> base.
-        #expect(HTTPDiscIOReader.nextChunkSize(position: 0, lastFetchEnd: -1, current: 4096,
-                                               base: 4096, maxChunk: 32768) == 4096)
+        var ahead = ReadAhead(floor: 4096, ceiling: 32768)
+        // No prior fetch: the read's own size, at least the floor.
+        #expect(ahead.size(forReadAt: 0, requested: 100) == 4096)
+        ahead.fetched(at: 0, count: 4096)
+        // Sequential continuation doubles, capped at the ceiling.
+        #expect(ahead.size(forReadAt: 4096, requested: 100) == 8192)
+        ahead.fetched(at: 4096, count: 8192)
+        #expect(ahead.size(forReadAt: 12288, requested: 100) == 16384)
+        ahead.fetched(at: 12288, count: 16384)
+        #expect(ahead.size(forReadAt: 28672, requested: 100) == 32768)
+        ahead.fetched(at: 28672, count: 32768)
+        #expect(ahead.size(forReadAt: 61440, requested: 100) == 32768)   // capped
+        // A non-contiguous read resets to the read's own size.
+        #expect(ahead.size(forReadAt: 200_000, requested: 100) == 4096)
+        // A read larger than the floor fetches what it asks for.
+        #expect(ahead.size(forReadAt: 900_000, requested: 20_000) == 20_000)
     }
 
     // MARK: - Read / seek over a mock range server

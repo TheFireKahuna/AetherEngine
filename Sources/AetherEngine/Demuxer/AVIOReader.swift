@@ -700,7 +700,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // connection stays ANCHORED; the ping-pong becomes cache hits; the storm collapses to
     // the two legitimate reconnects (open + the one seek to the moov). The sequential
     // playback fast path never enters this code, so it carries zero overhead.
+    /// The most one detour fetch holds; it starts at `detourFloorBytes` and grows to this over a
+    /// sequential run (`detourReadAhead`).
     private static let detourBlockSize = 4 * 1024 * 1024
+    /// The least a detour fetches: a request's overhead is paid either way, and a parse's revisit of a
+    /// region seldom stops at the first read.
+    private static let detourFloorBytes = 256 * 1024
     // Once detour reads turn sequential past this much, re-anchor the streaming connection
     // there so sustained playback returns to the cheap window path (e.g. after a backward scrub).
     private static let detourReanchorBytes: Int64 = 8 * 1024 * 1024
@@ -977,6 +982,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // Re-anchor run tracking (demux-thread-only): the file offset the next sequential detour read
     // would continue from, and how many contiguous bytes the current detour run has served.
     private var detourRunNextExpected: Int64 = -1
+    /// A detour's fetch size: what the read asks for, grown over a sequential detour run. Demux-thread-only.
+    private var detourReadAhead = ReadAhead(floor: AVIOReader.detourFloorBytes, ceiling: AVIOReader.detourBlockSize)
+    /// The chunk path's fetch size (seekable mode, no persistent connection): what a read asks for,
+    /// grown while reads stay sequential, up to `chunkSize`. Demux-thread-only.
+    private var chunkReadAhead: ReadAhead
     private var detourRunBytes: Int64 = 0
 
     // MARK: - The speculative tail (#281)
@@ -1001,6 +1011,38 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// One line per open for the first read the source cache served instead of the network: the
     /// round trip that did not happen, named. winCond-guarded.
     private var cacheServeLogged = false
+
+    /// Bytes per second the link delivers into the window, smoothed over the network ranges this reader
+    /// has run, and the running count it is measured from. winCond-guarded.
+    private var linkBytesPerSecond: Double = 0
+    private var connFirstDataAt: DispatchTime?
+    private var connBytesSinceFirstData: Int64 = 0
+
+    /// Folds a network delivery into the link rate, once a range has been delivering long enough to
+    /// say anything (a quarter second). Caller holds `winCond`.
+    private func noteLinkRateLocked(delivered count: Int) {
+        guard let since = connFirstDataAt else { return }
+        connBytesSinceFirstData += Int64(count)
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - since.uptimeNanoseconds) / 1_000_000_000
+        guard elapsed >= 0.25 else { return }
+        let sample = Double(connBytesSinceFirstData) / elapsed
+        linkBytesPerSecond = linkBytesPerSecond == 0 ? sample : 0.7 * linkBytesPerSecond + 0.3 * sample
+    }
+
+    /// The smallest held span worth ending a network range for. A split saves the span's bytes and
+    /// costs a round trip (the range ends at the span, and the one after it starts afresh), so it pays
+    /// once the span holds more than the link moves in one round trip: the measured delivery rate
+    /// times the measured time to first byte. Never under 64 KB, and the cache's default
+    /// (`SourceByteCache.minimumServeBytes`) until both have been measured. Caller holds `winCond`.
+    private var heldSpanWorthASplitLocked: Int64 {
+        Self.heldSpanWorthASplit(bytesPerSecond: linkBytesPerSecond, firstDataMs: lastFirstDataMs)
+    }
+
+    static func heldSpanWorthASplit(bytesPerSecond: Double, firstDataMs: Double) -> Int64 {
+        guard bytesPerSecond > 0, firstDataMs > 0 else { return SourceByteCache.minimumServeBytes }
+        let perRoundTrip = bytesPerSecond * firstDataMs / 1000
+        return Int64(min(Double(persistentRangeBytes), max(64 * 1024, perRoundTrip)))
+    }
 
     /// Measured time to first data of the most recent connection: what one round trip against this
     /// origin actually costs, which is the only honest bound on how long waiting for in-flight bytes
@@ -1127,6 +1169,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.openedHeaders = extraHeaders
         self.requestHeaderStore = requestHeaderStore
         self.chunkSize = chunkSize
+        self.chunkReadAhead = ReadAhead(floor: min(64 * 1024, chunkSize), ceiling: chunkSize)
         self.prefetchEnabled = prefetchEnabled
         self.isLive = isLive
         self.sequentialOnly = sequentialOnly
@@ -1969,12 +2012,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     bufferLock.unlock()
                 }
 
-                let fetchSize: Int
-                if fileSize > 0 {
-                    fetchSize = min(chunkSize, Int(fileSize - position))
-                } else {
-                    fetchSize = chunkSize
-                }
+                // What this read asks for, grown while reads stay sequential (`ReadAhead`), up to
+                // `chunkSize`: a keyframe read fetches the keyframe, not a megabyte around it.
+                var fetchSize = chunkReadAhead.size(forReadAt: position, requested: requestSize - totalRead)
+                if fileSize > 0 { fetchSize = min(fetchSize, Int(fileSize - position)) }
 
                 if fetchSize <= 0 { break }
 
@@ -2001,6 +2042,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 currentOffset = position
                 prefetchBuffer = nil
                 bufferLock.unlock()
+                chunkReadAhead.fetched(at: position, count: data.count)
             }
         }
 
@@ -2822,14 +2864,19 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // parse-time ping-pong still fills the source cache and preserves its connection.
         guard allowFetch, readDeadline == .distantFuture else { return .miss }
 
-        let blockStart = (offset / Int64(Self.detourBlockSize)) * Int64(Self.detourBlockSize)
-        let blockLen = Int(min(Int64(Self.detourBlockSize), fileSize - blockStart))
+        // From the read itself, sized to it and grown while detour reads continue where the last one
+        // ended (`detourReadAhead`), and stopped where held bytes begin: a cue read fetches the cue's
+        // neighbourhood, a backward scrub that turns sequential fetches in growing steps.
+        var length = Int64(detourReadAhead.size(forReadAt: offset, requested: maxLen))
+        length = min(length, fileSize - offset)
+        length = clippedToNextHeldSpan(from: offset, length: length, expectedSize: fileSize)
         let block: Data
-        switch detourFetchBlock(from: blockStart, size: blockLen) {
+        switch detourFetchBlock(from: offset, size: Int(length)) {
         case .ok(let fetched):
             // In the source cache already (`addBytesFetched`), short bodies included: a truncated
             // 206 holds what it carried and no more, so its uncovered tail is still a miss that
             // fetches, never a hole served as bytes.
+            detourReadAhead.fetched(at: offset, count: fetched.count)
             block = fetched
         case .rateLimited(let retryAfter):
             return .rateLimited(retryAfter)
@@ -2837,12 +2884,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             return .miss
         }
 
-        let inBlock = Int(offset - blockStart)
-        guard inBlock >= 0, inBlock < block.count else { return .miss }
-        let n = min(maxLen, block.count - inBlock)
+        guard !block.isEmpty else { return .miss }
+        let n = min(maxLen, block.count)
         block.withUnsafeBytes { raw in
             if let base = raw.baseAddress {
-                dst.update(from: base.advanced(by: inBlock).assumingMemoryBound(to: UInt8.self), count: n)
+                dst.update(from: base.assumingMemoryBound(to: UInt8.self), count: n)
             }
         }
         return .served(n, fetched: true)
@@ -3219,13 +3265,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if !isLive, !heldConnectionEnabled, planSize > offset {
             let remaining = planSize - offset
             let held = sizeAtPlan > 0
-                ? (sourceCache.heldLength(cacheKey, at: offset, expectedSize: sizeAtPlan) ?? 0) : 0
-            if held > 0, held >= min(SourceByteCache.minimumServeBytes, remaining) {
+                ? sourceCache.heldLength(cacheKey, at: offset, expectedSize: sizeAtPlan) : 0
+            let worthASplit = heldSpanWorthASplitLocked
+            if held > 0, held >= min(worthASplit, remaining) {
                 cachedLength = min(held, askedBound ?? held)
                 resolvedBound = cachedLength
             } else if let bound = askedBound,
                       let next = sourceCache.nextHeldStart(
-                cacheKey, after: offset, before: offset + bound, expectedSize: planSize) {
+                        cacheKey, after: offset, before: offset + bound, minLength: worthASplit,
+                        expectedSize: planSize) {
                 resolvedBound = next - offset
             }
         }
@@ -3592,8 +3640,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // a give-up latch — an origin that recovered after the faulted ladder capped out may
             // fault again later and deserves a fresh ladder, not `.distantFuture` forever).
             nextFaultedRefillAt = .distantPast
+            connFirstDataAt = DispatchTime.now()
+            connBytesSinceFirstData = 0
         }
         let count = data.count
+        if !fromCache { noteLinkRateLocked(delivered: count) }
         // #310: delivery that lands with the backpressure end ALREADY recorded, i.e. after our
         // own cancel. A bounded in-flight tail is expected. A figure that keeps climbing is the
         // witness that ending is as advisory as suspending was (#174 blocking, #220 suspend:
