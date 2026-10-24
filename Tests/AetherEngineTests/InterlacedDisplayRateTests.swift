@@ -2,17 +2,17 @@ import Testing
 import AetherLibavcodec
 @testable import AetherEngine
 
-/// #7: the software route's hardware deinterlacer emits one picture per field, so the display has to
+/// #7: the software route's deinterlacer emits one picture per field, so the display has to
 /// be asked for the field rate. Measured through the decoder on generated clips: MPEG-2 1080i25 comes
 /// out at 50.0 fps and MPEG-2 480i29.97 at 59.94, while the container reports 25 and 29.97.
 @Suite("Display rate for field-rate deinterlacing (#7)")
 struct InterlacedDisplayRateTests {
 
     private func rate(_ content: Double?, _ codec: AVCodecID = AV_CODEC_ID_MPEG2VIDEO,
-                      _ order: AVFieldOrder = AV_FIELD_TT, mode: DeinterlaceMode = .auto,
+                      _ order: AVFieldOrder = AV_FIELD_TT,
                       fieldRate: DeinterlaceFieldRate = .field, linked: Bool = true) -> Double? {
         AetherEngine.displayFrameRate(contentRate: content, codecID: codec, fieldOrder: order,
-                                      deinterlaceMode: mode, deinterlaceFieldRate: fieldRate,
+                                      deinterlaceFieldRate: fieldRate,
                                       hardwareDeinterlacerLinked: linked)
     }
 
@@ -30,10 +30,9 @@ struct InterlacedDisplayRateTests {
         #expect(rate(60000.0 / 1001) == 60000.0 / 1001)
     }
 
-    @Test("frame-rate output, the CPU fallback and a build without the Metal deinterlacer keep the content rate")
+    @Test("frame-rate output and a build without the Metal deinterlacer keep the content rate")
     func frameRateCadences() {
         #expect(rate(25, fieldRate: .frame) == 25)
-        #expect(rate(25, mode: .software) == 25)
         #expect(rate(25, linked: false) == 25)
     }
 

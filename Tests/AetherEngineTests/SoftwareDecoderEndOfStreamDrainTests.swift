@@ -26,15 +26,15 @@ struct SoftwareDecoderEndOfStreamDrainTests {
 
     @Test("the drain flushes the deinterlacer's look-ahead at field rate")
     func fieldRateDrainsEveryField() throws {
-        let run = try Self.decode(Self.interlacedBase64, config: DeinterlaceConfig(mode: .auto, fieldRate: .field))
+        let run = try Self.decode(Self.interlacedBase64, config: DeinterlaceConfig(fieldRate: .field))
         #expect(run.packets == 48)
         #expect(run.frames.count == 96)
         #expect(Set(run.frames).count == run.frames.count)
     }
 
-    @Test("the drain flushes the software deinterlacer's look-ahead")
-    func softwareDeinterlacerDrainsEveryFrame() throws {
-        let run = try Self.decode(Self.interlacedBase64, config: DeinterlaceConfig(mode: .software, fieldRate: .frame))
+    @Test("the drain flushes the deinterlacer's look-ahead at frame rate")
+    func frameRateDrainsEveryFrame() throws {
+        let run = try Self.decode(Self.interlacedBase64, config: DeinterlaceConfig(fieldRate: .frame))
         #expect(run.packets == 48)
         #expect(run.frames.count == 48)
         #expect(Set(run.frames).count == run.frames.count)
@@ -47,7 +47,7 @@ struct SoftwareDecoderEndOfStreamDrainTests {
     func decodesAgainAfterDrain(interlaced: Bool) throws {
         let fixture = interlaced ? Self.interlacedBase64 : Self.progressiveBase64
         let decoder = SoftwareVideoDecoder()
-        decoder.deinterlaceConfig = DeinterlaceConfig(mode: .software, fieldRate: .frame)
+        decoder.deinterlaceConfig = DeinterlaceConfig(fieldRate: .frame)
         let collector = PTSCollector()
         let first = try Self.openFixture(fixture)
         defer { first.close() }

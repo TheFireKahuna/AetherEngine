@@ -2043,23 +2043,19 @@ extension AetherEngine {
         try checkLoadCurrent(generation)
         sessionCacheStatusToken &+= 1
         diagnostics.sessionCacheStatus = .inactive
-        let deinterlaceMode = loadedOptions.deinterlaceMode
         let waitStarted = DispatchTime.now()
-        if let outcome = await DeinterlaceHardwareWarmup.shared.waitIfNeeded(
-            for: deinterlaceMode
-        ) {
-            try checkLoadCurrent(generation)
-            let elapsed = Double(
-                DispatchTime.now().uptimeNanoseconds - waitStarted.uptimeNanoseconds
-            ) / 1_000_000_000
-            if elapsed >= 0.05 {
-                EngineLog.emit(
-                    "[AetherEngine] software load waited "
-                    + "\(String(format: "%.3f", elapsed))s for hardware "
-                    + "deinterlace warm-up (\(outcome.rawValue))",
-                    category: .swPlayback
-                )
-            }
+        let outcome = await DeinterlaceHardwareWarmup.shared.wait()
+        try checkLoadCurrent(generation)
+        let elapsed = Double(
+            DispatchTime.now().uptimeNanoseconds - waitStarted.uptimeNanoseconds
+        ) / 1_000_000_000
+        if elapsed >= 0.05 {
+            EngineLog.emit(
+                "[AetherEngine] software load waited "
+                + "\(String(format: "%.3f", elapsed))s for hardware "
+                + "deinterlace warm-up (\(outcome.rawValue))",
+                category: .swPlayback
+            )
         }
 
         await activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
@@ -2087,10 +2083,7 @@ extension AetherEngine {
                                                   closedCadence: ingest?.closedLiveCadenceSeconds)
             }
         }
-        host.deinterlaceConfig = DeinterlaceConfig(
-            mode: loadedOptions.deinterlaceMode,
-            fieldRate: loadedOptions.deinterlaceFieldRate
-        )
+        host.deinterlaceConfig = DeinterlaceConfig(fieldRate: loadedOptions.deinterlaceFieldRate)
         host.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
         }

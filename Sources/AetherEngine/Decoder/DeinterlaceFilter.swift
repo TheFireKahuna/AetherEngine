@@ -1,11 +1,11 @@
+import CoreVideo
 import Foundation
 import AetherLibavfilter
 import AetherLibavutil
 
-/// Deinterlacer selection + cadence for the software-decode path, resolved from `LoadOptions`
-/// at load time and handed to `SoftwareVideoDecoder` before `open`.
+/// Deinterlacer cadence for the software-decode path, resolved from `LoadOptions` at load time and
+/// handed to `SoftwareVideoDecoder` before `open`.
 struct DeinterlaceConfig: Sendable, Equatable {
-    var mode: DeinterlaceMode = .auto
     var fieldRate: DeinterlaceFieldRate = .field
 }
 
@@ -13,19 +13,18 @@ struct DeinterlaceConfig: Sendable, Equatable {
 /// #107 routing rule, interlaced H.264, tvOS AVPlayer does not deinterlace, so 1080i/576i
 /// broadcast routes here; see VideoRoutingPolicy).
 ///
-/// Two engines:
-/// - HARDWARE (`config.mode == .auto`, default): `format=nv12,hwupload,yadif_videotoolbox`, the
-///   yadif kernel as a Metal compute shader over VideoToolbox frames (`bwdif_videotoolbox` instead
-///   when the linked build has it, see `hardwareFilterName`). The sink emits
-///   `AV_PIX_FMT_VIDEOTOOLBOX` frames wrapping IOSurface-backed CVPixelBuffers (`frame.data[3]`)
-///   that go straight to the renderer, skipping the sws_scale copy. Runs at field rate by default
-///   (`config.fieldRate`). Requires yadif_videotoolbox in the linked FFmpeg build (FFmpegBuild
-///   >= 2.1) and a Metal device; any build failure disables hw for the session and falls back.
-/// - SOFTWARE (fallback, or `config.mode == .software`): CPU bwdif (yadif for older linked
-///   frameworks), always `mode=send_frame`, field rate without the GPU is the wrong cost trade.
+/// It runs on the display buffers `PlanarFrameFinisher` writes: `yadif_videotoolbox`
+/// (`bwdif_videotoolbox` when the linked build has it, see `hardwareFilterName`), the kernel as a
+/// Metal compute shader over the buffers' planes. Every format the finisher writes (NV12, P010,
+/// NV16, P210, P216, NV24, P410, P416) is one the kernel textures. The input frames context carries
+/// the display pool's attributes (`SoftwareVideoDecoder.displayBufferAttributes`) and the filter
+/// makes its output buffers with them (FFmpegBuild's `pixel_buffer_attributes` patch), so the sink's
+/// buffers are displayed as they come, carrying the input's attachments (colour, pixel aspect).
+/// Runs at field rate by default (`config.fieldRate`). A graph that cannot be built is logged and
+/// the pictures go out as decoded.
 ///
 /// MUST be persistent: yadif/bwdif are temporal filters that need a continuous frame stream.
-/// `deint=interlaced` passes progressive frames through untouched.
+/// `deint=interlaced` passes progressive frames through untouched (the input buffer itself).
 /// Torn down on seek so stale temporal references never cross a discontinuity; lazily rebuilt on
 /// the next interlaced frame. Not thread-safe; the owning decoder serializes access with its lock.
 ///
@@ -36,288 +35,197 @@ struct DeinterlaceConfig: Sendable, Equatable {
 /// timestamps, every other field dropped). Callers must timestamp with `outputTimeBase`.
 final class DeinterlaceFilter {
 
-    enum Engine: String { case hardware, software }
-
     /// Set by the owning decoder (under its lock) before the first `ensureGraph`.
     var config = DeinterlaceConfig()
-
-    /// Which engine the current graph uses; nil when no graph is built.
-    private(set) var engine: Engine?
 
     /// Time base of the filter output. Valid while `isActive`; see the PTS contract above.
     private(set) var outputTimeBase = AVRational(num: 0, den: 1)
 
+    /// What the graph was built for: a buffer of another size or format needs a new one.
+    private struct Geometry: Equatable {
+        var width: Int
+        var height: Int
+        var pixelFormatType: OSType
+    }
+
     private var graph: UnsafeMutablePointer<AVFilterGraph>?
     private var srcCtx: UnsafeMutablePointer<AVFilterContext>?
     private var sinkCtx: UnsafeMutablePointer<AVFilterContext>?
-    private var width: Int32 = 0
-    private var height: Int32 = 0
-    private var pixFmt: Int32 = -1
+    /// The frames context the pushed buffers are described by; the filter's output context copies
+    /// its attributes and range.
+    private var framesRef: UnsafeMutablePointer<AVBufferRef>?
+    private var geometry: Geometry?
     private var loggedUnavailable = false
 
-    /// Latched on the first hardware graph failure: a missing filter or Metal device will not
-    /// appear mid-session, so don't re-attempt (and re-log) on every geometry change.
-    private var hwDisabled = false
-
-    /// VideoToolbox hw device, created lazily for the hardware graph and kept across seek
-    /// teardowns (device creation is not per-stream state).
+    /// VideoToolbox hw device, created lazily for the graph and kept across seek teardowns (device
+    /// creation is not per-stream state).
     private var hwDeviceRef: UnsafeMutablePointer<AVBufferRef>?
 
     var isActive: Bool { graph != nil }
 
     /// The Metal deinterlacer to use: `bwdif_videotoolbox` when the linked FFmpeg has it (better
-    /// edge reconstruction, the kernel the CPU fallback already prefers), else `yadif_videotoolbox`.
-    /// FFmpeg 8.1 ships only the yadif one; the preference costs nothing until a build adds bwdif.
-    /// Both take the same `mode` / `parity` / `deint` options. nil when neither is linked.
+    /// edge reconstruction), else `yadif_videotoolbox`. FFmpeg 8.1 ships only the yadif one; the
+    /// preference costs nothing until a build adds bwdif. Both take the same `mode` / `parity` /
+    /// `deint` options. nil when neither is linked.
     static func hardwareFilterName(available: (String) -> Bool = { avfilter_get_by_name($0) != nil }) -> String? {
         ["bwdif_videotoolbox", "yadif_videotoolbox"].first(where: available)
     }
 
+    /// Builds and drops one graph over a small NV12 buffer, so the Metal pipeline and the device
+    /// exist before the first interlaced picture needs them. False when no graph can be built.
     static func prewarmHardwarePipeline() -> Bool {
-        guard hardwareFilterName() != nil,
-              let frame = av_frame_alloc() else {
-            return false
-        }
+        var buffer: CVPixelBuffer?
+        guard CVPixelBufferCreate(kCFAllocatorDefault, 64, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                                  SoftwareVideoDecoder.displayBufferAttributes, &buffer) == kCVReturnSuccess,
+              let buffer, let frame = av_frame_alloc() else { return false }
         var ownedFrame: UnsafeMutablePointer<AVFrame>? = frame
-        defer {
-            av_frame_free(&ownedFrame)
-        }
-
-        frame.pointee.width = 64
-        frame.pointee.height = 64
-        frame.pointee.format = AV_PIX_FMT_YUV420P.rawValue
+        defer { av_frame_free(&ownedFrame) }
         frame.pointee.pts = 0
-        frame.pointee.flags |= (1 << 3)
+        frame.pointee.flags |= AV_FRAME_FLAG_INTERLACED
         frame.pointee.sample_aspect_ratio = AVRational(num: 1, den: 1)
-        guard av_frame_get_buffer(frame, 0) >= 0 else {
-            return false
-        }
 
         let filter = DeinterlaceFilter()
-        filter.config = DeinterlaceConfig(mode: .auto, fieldRate: .field)
-        defer {
-            filter.teardown()
-        }
-
-        guard filter.ensureGraph(
-            frame: frame,
-            timeBase: AVRational(num: 1, den: 30)
-        ) else {
-            return false
-        }
-        return filter.engine == .hardware
+        defer { filter.teardown() }
+        return filter.ensureGraph(buffer: buffer, properties: frame, timeBase: AVRational(num: 1, den: 30))
     }
 
-    /// Build (or rebuild after a parameter change) the graph for the given frame's geometry.
-    /// Returns false when no deinterlacer is compiled into the linked FFmpeg build or graph setup
-    /// fails; the caller then renders the frame directly (combing, but playing).
-    func ensureGraph(frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational) -> Bool {
-        if graph != nil,
-           width == frame.pointee.width,
-           height == frame.pointee.height,
-           pixFmt == frame.pointee.format {
-            return true
-        }
+    /// Build (or rebuild after a size or format change) the graph for `buffer`, a display buffer
+    /// the finisher wrote; `properties` is its decoded frame (aspect, colour). Returns false when
+    /// no deinterlacer is in the linked FFmpeg build or the graph cannot be built; the caller then
+    /// shows the picture as decoded.
+    func ensureGraph(buffer: CVPixelBuffer, properties frame: UnsafePointer<AVFrame>, timeBase: AVRational) -> Bool {
+        let wanted = Geometry(width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer),
+                              pixelFormatType: CVPixelBufferGetPixelFormatType(buffer))
+        if graph != nil, geometry == wanted { return true }
         teardown()
-
-        if config.mode == .auto, !hwDisabled {
-            if buildGraph(frame: frame, timeBase: timeBase, engine: .hardware) {
-                return true
-            }
-            // One-shot fallback: whatever failed (filter not in the linked build, no Metal
-            // device, hwframes alloc) will keep failing; don't retry per geometry change.
-            hwDisabled = true
-            EngineLog.emit(
-                "[Deinterlace] hardware graph unavailable; falling back to software",
-                category: .swPlayback
-            )
-        }
-        return buildGraph(frame: frame, timeBase: timeBase, engine: .software)
+        return buildGraph(wanted, properties: frame, timeBase: timeBase)
     }
 
-    private func buildGraph(
-        frame: UnsafeMutablePointer<AVFrame>,
-        timeBase: AVRational,
-        engine wanted: Engine
-    ) -> Bool {
+    private func buildGraph(_ wanted: Geometry, properties frame: UnsafePointer<AVFrame>, timeBase: AVRational) -> Bool {
         // AE#492: the build cost belongs on the line that reports the build. A seek tears the graph
         // down, so this is paid per seek on interlaced sources and never on progressive ones, and
         // without the number the two are not comparable.
         let buildStart = DispatchTime.now()
-        // Engine-specific preconditions.
-        switch wanted {
-        case .hardware:
-            guard Self.hardwareFilterName() != nil else {
-                if !loggedUnavailable {
-                    loggedUnavailable = true
-                    EngineLog.emit(
-                        "[Deinterlace] no bwdif_videotoolbox / yadif_videotoolbox in the linked FFmpeg build (needs FFmpegBuild >= 2.1)",
-                        category: .swPlayback
-                    )
-                }
-                return false
+        guard let deintName = Self.hardwareFilterName() else {
+            if !loggedUnavailable {
+                loggedUnavailable = true
+                EngineLog.emit("[Deinterlace] no bwdif_videotoolbox / yadif_videotoolbox in the linked FFmpeg build; "
+                               + "interlaced pictures go out as decoded", category: .swPlayback)
             }
-            guard ensureHWDevice() else { return false }
-        case .software:
-            guard avfilter_get_by_name("bwdif") != nil || avfilter_get_by_name("yadif") != nil else {
-                if !loggedUnavailable {
-                    loggedUnavailable = true
-                    EngineLog.emit(
-                        "[Deinterlace] no bwdif/yadif in the linked FFmpeg build; rendering interlaced frames as-is",
-                        category: .swPlayback
-                    )
-                }
-                return false
-            }
+            return false
         }
+        guard ensureHWDevice(), let dev = hwDeviceRef else { return false }
+        guard let frames = Self.framesContext(device: dev, geometry: wanted) else {
+            EngineLog.emit("[Deinterlace] frames context for \(wanted) failed", category: .swPlayback)
+            return false
+        }
+        var framesOpt: UnsafeMutablePointer<AVBufferRef>? = frames
+        var built = false
+        defer { if !built { av_buffer_unref(&framesOpt) } }
 
         guard let g = avfilter_graph_alloc(),
               let bufferFilter = avfilter_get_by_name("buffer"),
-              let sinkFilter = avfilter_get_by_name("buffersink") else {
+              let sinkFilter = avfilter_get_by_name("buffersink"),
+              let deintFilter = avfilter_get_by_name(deintName) else {
             return false
         }
-        var built = false
         var gOpt: UnsafeMutablePointer<AVFilterGraph>? = g
         defer { if !built { avfilter_graph_free(&gOpt) } }
 
+        // Allocated, described and only then initialised: a hardware format needs its frames context
+        // before the buffer source initialises.
+        guard let srcC = avfilter_graph_alloc_filter(g, bufferFilter, "in"),
+              let parameters = av_buffersrc_parameters_alloc() else { return false }
         let sar = frame.pointee.sample_aspect_ratio
-        let sarNum = sar.num > 0 ? sar.num : 1
-        let sarDen = sar.den > 0 ? sar.den : 1
-        var args = "video_size=\(frame.pointee.width)x\(frame.pointee.height)" +
-                   ":pix_fmt=\(frame.pointee.format)" +
-                   ":time_base=\(timeBase.num)/\(timeBase.den)" +
-                   ":pixel_aspect=\(sarNum)/\(sarDen)"
-        // Declare colorspace/range when the first frame carries them, so the buffer source's
-        // link matches the incoming frames ("Changing video frame properties on the fly"
-        // warning otherwise) and bt709/tv tagging survives onto the filtered output.
-        if frame.pointee.colorspace != AVCOL_SPC_UNSPECIFIED {
-            args += ":colorspace=\(frame.pointee.colorspace.rawValue)"
-        }
-        if frame.pointee.color_range != AVCOL_RANGE_UNSPECIFIED {
-            args += ":range=\(frame.pointee.color_range.rawValue)"
-        }
-
-        var src: UnsafeMutablePointer<AVFilterContext>?
+        parameters.pointee.format = AV_PIX_FMT_VIDEOTOOLBOX.rawValue
+        parameters.pointee.width = Int32(wanted.width)
+        parameters.pointee.height = Int32(wanted.height)
+        parameters.pointee.time_base = timeBase
+        parameters.pointee.sample_aspect_ratio = sar.num > 0 && sar.den > 0 ? sar : AVRational(num: 1, den: 1)
+        // The first frame's colour description, so the link matches the incoming frames ("Changing
+        // video frame properties on the fly" warning otherwise).
+        parameters.pointee.color_space = frame.pointee.colorspace
+        parameters.pointee.color_range = frame.pointee.color_range
+        parameters.pointee.hw_frames_ctx = frames
+        let paramRet = av_buffersrc_parameters_set(srcC, parameters)
+        av_free(parameters)
+        let srcInit = paramRet >= 0 ? avfilter_init_str(srcC, nil) : paramRet
         var sink: UnsafeMutablePointer<AVFilterContext>?
-        let srcRet = avfilter_graph_create_filter(&src, bufferFilter, "in", args, nil, g)
         let sinkRet = avfilter_graph_create_filter(&sink, sinkFilter, "out", nil, nil, g)
-        guard srcRet >= 0, sinkRet >= 0, let srcC = src, let sinkC = sink else {
-            EngineLog.emit(
-                "[Deinterlace] create_filter failed src=\(srcRet) sink=\(sinkRet) args=\(args)",
-                category: .swPlayback
-            )
+        guard srcInit >= 0, sinkRet >= 0, let sinkC = sink else {
+            EngineLog.emit("[Deinterlace] buffer source / sink failed src=\(srcInit) sink=\(sinkRet)",
+                           category: .swPlayback)
             return false
         }
 
-        let chain: String
-        switch wanted {
-        case .hardware:
-            // FFmpeg 8's hwupload validates its device ref at filter INIT, and
-            // avfilter_graph_parse_ptr inits filters internally, before a device could be
-            // attached post-parse ("A hardware device reference is required to upload frames
-            // to", ret=-22). So the hw chain is built filter-by-filter: alloc, attach the
-            // device, init, link.
-            //
-            // format=<sw>: sws converts the decoder's planar YUV to the bi-planar layout the
-            // renderer wants BEFORE upload, so the sink's CVPixelBuffers are directly
-            // displayable. hwupload: sw frame -> VideoToolbox hwframes ctx (IOSurface + Metal
-            // compatible). deint=interlaced: progressive frames pass through (uploaded but
-            // untouched).
-            let swFmt = Self.uploadFormat(for: frame.pointee.format)
-            let mode = config.fieldRate == .field ? "send_field" : "send_frame"
-            let deintOpts = "mode=\(mode):parity=auto:deint=interlaced"
-            let deintName = Self.hardwareFilterName() ?? "yadif_videotoolbox"
-            chain = "format=\(swFmt),hwupload,\(deintName)=\(deintOpts)"
-
-            guard let formatFilter = avfilter_get_by_name("format"),
-                  let uploadFilter = avfilter_get_by_name("hwupload"),
-                  let deintFilter = avfilter_get_by_name(deintName),
-                  let dev = hwDeviceRef else {
-                return false
-            }
-            var fmtCtx: UnsafeMutablePointer<AVFilterContext>?
-            let fmtRet = avfilter_graph_create_filter(&fmtCtx, formatFilter, "fmt", "pix_fmts=\(swFmt)", nil, g)
-            guard fmtRet >= 0, let fmtC = fmtCtx,
-                  let upC = avfilter_graph_alloc_filter(g, uploadFilter, "up"),
-                  let deintC = avfilter_graph_alloc_filter(g, deintFilter, "deint") else {
-                EngineLog.emit("[Deinterlace] hw filter alloc failed fmt=\(fmtRet)", category: .swPlayback)
-                return false
-            }
-            upC.pointee.hw_device_ctx = av_buffer_ref(dev)
-            deintC.pointee.hw_device_ctx = av_buffer_ref(dev)
-            // The Metal deinterlacer's init creates its pipeline; failure here (no Metal
-            // device, e.g. some CI VMs) is the fallback trigger.
-            let upInit = avfilter_init_str(upC, nil)
-            let deintInit = avfilter_init_str(deintC, deintOpts)
-            guard upInit >= 0, deintInit >= 0 else {
-                EngineLog.emit(
-                    "[Deinterlace] hw filter init failed hwupload=\(upInit) \(deintName)=\(deintInit)",
-                    category: .swPlayback
-                )
-                return false
-            }
-            guard avfilter_link(srcC, 0, fmtC, 0) >= 0,
-                  avfilter_link(fmtC, 0, upC, 0) >= 0,
-                  avfilter_link(upC, 0, deintC, 0) >= 0,
-                  avfilter_link(deintC, 0, sinkC, 0) >= 0 else {
-                EngineLog.emit("[Deinterlace] hw graph link failed", category: .swPlayback)
-                return false
-            }
-
-        case .software:
-            // bwdif is the primary (better edge reconstruction); yadif the fallback for older
-            // linked frameworks. Always send_frame: see class doc. No hw device involved, so
-            // the string-parse path is fine here.
-            let filterName = avfilter_get_by_name("bwdif") != nil ? "bwdif" : "yadif"
-            chain = "\(filterName)=mode=send_frame:parity=auto:deint=interlaced"
-
-            var inputs = avfilter_inout_alloc()
-            var outputs = avfilter_inout_alloc()
-            defer { avfilter_inout_free(&inputs); avfilter_inout_free(&outputs) }
-            guard inputs != nil, outputs != nil else { return false }
-            outputs!.pointee.name = strdup("in")
-            outputs!.pointee.filter_ctx = srcC
-            outputs!.pointee.pad_idx = 0
-            outputs!.pointee.next = nil
-            inputs!.pointee.name = strdup("out")
-            inputs!.pointee.filter_ctx = sinkC
-            inputs!.pointee.pad_idx = 0
-            inputs!.pointee.next = nil
-
-            let parseRet = avfilter_graph_parse_ptr(g, chain, &inputs, &outputs, nil)
-            guard parseRet >= 0 else {
-                EngineLog.emit("[Deinterlace] parse_ptr failed ret=\(parseRet) chain=\(chain)", category: .swPlayback)
-                return false
-            }
+        // Built filter by filter: the deinterlacer validates its device at init, which
+        // avfilter_graph_parse_ptr would run before a device could be attached.
+        // deint=interlaced: progressive frames pass through untouched.
+        let mode = config.fieldRate == .field ? "send_field" : "send_frame"
+        let deintOpts = "mode=\(mode):parity=auto:deint=interlaced"
+        guard let deintC = avfilter_graph_alloc_filter(g, deintFilter, "deint") else { return false }
+        deintC.pointee.hw_device_ctx = av_buffer_ref(dev)
+        let deintInit = avfilter_init_str(deintC, deintOpts)
+        guard deintInit >= 0 else {
+            EngineLog.emit("[Deinterlace] \(deintName) init failed ret=\(deintInit)", category: .swPlayback)
+            return false
         }
-
+        guard avfilter_link(srcC, 0, deintC, 0) >= 0, avfilter_link(deintC, 0, sinkC, 0) >= 0 else {
+            EngineLog.emit("[Deinterlace] graph link failed", category: .swPlayback)
+            return false
+        }
         let configRet = avfilter_graph_config(g, nil)
         guard configRet >= 0 else {
-            EngineLog.emit(
-                "[Deinterlace] graph_config failed ret=\(configRet) chain=\(chain)",
-                category: .swPlayback
-            )
+            EngineLog.emit("[Deinterlace] graph_config failed ret=\(configRet) \(deintName)=\(deintOpts)",
+                           category: .swPlayback)
             return false
         }
 
         built = true
         graph = g
-        srcCtx = src
-        sinkCtx = sink
-        engine = wanted
-        outputTimeBase = av_buffersink_get_time_base(sink)
-        width = frame.pointee.width
-        height = frame.pointee.height
-        pixFmt = frame.pointee.format
+        srcCtx = srcC
+        sinkCtx = sinkC
+        framesRef = frames
+        geometry = wanted
+        outputTimeBase = av_buffersink_get_time_base(sinkC)
         let buildMs = Double(DispatchTime.now().uptimeNanoseconds - buildStart.uptimeNanoseconds) / 1e6
         EngineLog.emit(
-            "[Deinterlace] engaged [\(wanted.rawValue)]: \(width)x\(height) pixFmt=\(pixFmt) (\(chain)) outTB=\(outputTimeBase.num)/\(outputTimeBase.den) built in \(String(format: "%.1f", buildMs))ms",
+            "[Deinterlace] engaged: \(wanted.width)x\(wanted.height) \(Self.fourCC(wanted.pixelFormatType)) "
+            + "(\(deintName)=\(deintOpts)) outTB=\(outputTimeBase.num)/\(outputTimeBase.den) "
+            + "built in \(String(format: "%.1f", buildMs))ms",
             category: .swPlayback
         )
         return true
     }
 
-    /// Create (once) the VideoToolbox hw device the hardware graph uploads into.
+    /// A VideoToolbox frames context describing the display buffers of `geometry`: their format and
+    /// range, and the display pool's attributes for the buffers the filter makes.
+    private static func framesContext(device: UnsafeMutablePointer<AVBufferRef>,
+                                      geometry: Geometry) -> UnsafeMutablePointer<AVBufferRef>? {
+        let swFormat = av_map_videotoolbox_format_to_pixfmt(geometry.pixelFormatType)
+        guard swFormat != AV_PIX_FMT_NONE, let ref = av_hwframe_ctx_alloc(device) else { return nil }
+        var owned: UnsafeMutablePointer<AVBufferRef>? = ref
+        let frames = ref.pointee.data.withMemoryRebound(to: AVHWFramesContext.self, capacity: 1) { $0 }
+        frames.pointee.format = AV_PIX_FMT_VIDEOTOOLBOX
+        frames.pointee.sw_format = swFormat
+        frames.pointee.width = Int32(geometry.width)
+        frames.pointee.height = Int32(geometry.height)
+        let vt = frames.pointee.hwctx.assumingMemoryBound(to: AVVTFramesContext.self)
+        let fullRange = SoftwareVideoDecoder.OutputFormat(pixelFormatType: geometry.pixelFormatType)?.fullRange ?? false
+        vt.pointee.color_range = fullRange ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG
+        vt.pointee.pixel_buffer_attributes = Unmanaged.passRetained(SoftwareVideoDecoder.displayBufferAttributes)
+        guard av_hwframe_ctx_init(ref) >= 0 else {
+            av_buffer_unref(&owned)
+            return nil
+        }
+        return ref
+    }
+
+    private static func fourCC(_ code: OSType) -> String {
+        String(bytes: [24, 16, 8, 0].map { UInt8((code >> $0) & 0xFF) }, encoding: .ascii) ?? "?"
+    }
+
+    /// Create (once) the VideoToolbox hw device the graph runs on.
     private func ensureHWDevice() -> Bool {
         if hwDeviceRef != nil { return true }
         let ret = av_hwdevice_ctx_create(&hwDeviceRef, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nil, nil, 0)
@@ -328,29 +236,28 @@ final class DeinterlaceFilter {
         return true
     }
 
-    /// #7: the bi-planar layout the hardware chain uploads, with the decoder's own subsampling. It
-    /// used to be NV12 / P010 for everything, so an interlaced 4:2:2 source (XDCAM / broadcast
-    /// contribution MPEG-2 4:2:2, H.264 High 4:2:2) was vertically downsampled to 4:2:0 BEFORE the
-    /// deinterlacer saw it, and that downsample filters chroma across the two fields of each frame:
-    /// colour from one instant smeared into the other, which no deinterlacer can undo. The Metal
-    /// kernels work plane by plane on any 8- or 16-bit bi-planar layout and the VideoToolbox hwframes
-    /// context takes NV16 / P210 / P216 / NV24 / P410 / P416, so the chroma keeps its own lines. 4:2:0
-    /// past 10 bits stays P010: VideoToolbox has no 16-bit 4:2:0 surface.
-    static func uploadFormat(for format: Int32) -> String {
-        guard let desc = av_pix_fmt_desc_get(AVPixelFormat(rawValue: format))?.pointee else { return "nv12" }
-        let depth = desc.comp.0.depth
-        if desc.nb_components >= 3, desc.log2_chroma_w == 0 {
-            return depth <= 8 ? "nv24" : (depth <= 10 ? "p410le" : "p416le")
+    /// Feed one display buffer, timed and described by `properties` (its decoded frame: pts, field
+    /// flags, aspect, colour, side data). The filter holds its own reference to `buffer`.
+    func push(_ buffer: CVPixelBuffer, properties: UnsafePointer<AVFrame>) -> Int32 {
+        guard let src = srcCtx, let framesRef, let frame = av_frame_alloc() else { return -1 }
+        var owned: UnsafeMutablePointer<AVFrame>? = frame
+        defer { av_frame_free(&owned) }
+        let copied = av_frame_copy_props(frame, properties)
+        guard copied >= 0 else { return copied }
+        frame.pointee.format = AV_PIX_FMT_VIDEOTOOLBOX.rawValue
+        frame.pointee.width = Int32(CVPixelBufferGetWidth(buffer))
+        frame.pointee.height = Int32(CVPixelBufferGetHeight(buffer))
+        let retained = Unmanaged.passRetained(buffer).toOpaque()
+        guard let ref = av_buffer_create(retained.assumingMemoryBound(to: UInt8.self), MemoryLayout<UnsafeRawPointer>.size, { _, data in
+            if let data { Unmanaged<CVPixelBuffer>.fromOpaque(data).release() }
+        }, nil, 0) else {
+            Unmanaged<CVPixelBuffer>.fromOpaque(retained).release()
+            return -12
         }
-        if desc.nb_components >= 3, desc.log2_chroma_h == 0 {
-            return depth <= 8 ? "nv16" : (depth <= 10 ? "p210le" : "p216le")
-        }
-        return depth <= 8 ? "nv12" : "p010le"
-    }
-
-    /// Feed a decoded frame (takes ownership; frame is reset after the call).
-    func push(_ frame: UnsafeMutablePointer<AVFrame>) -> Int32 {
-        guard let src = srcCtx else { return -1 }
+        frame.pointee.buf.0 = ref
+        frame.pointee.data.3 = retained.assumingMemoryBound(to: UInt8.self)
+        guard let hw = av_buffer_ref(framesRef) else { return -12 }
+        frame.pointee.hw_frames_ctx = hw
         return av_buffersrc_add_frame_flags(src, frame, 0)
     }
 
@@ -362,8 +269,8 @@ final class DeinterlaceFilter {
     }
 
     /// Pull the next filtered frame into `out`. Returns >= 0 on success, AVERROR(EAGAIN) when the
-    /// filter needs more input. Output PTS is on `outputTimeBase` (see class doc), and for the
-    /// hardware engine the frame is `AV_PIX_FMT_VIDEOTOOLBOX` (CVPixelBuffer in `data[3]`).
+    /// filter needs more input. Output PTS is on `outputTimeBase` (see class doc); the frame is
+    /// `AV_PIX_FMT_VIDEOTOOLBOX`, its display buffer in `data[3]`.
     func pull(into out: UnsafeMutablePointer<AVFrame>) -> Int32 {
         guard let sink = sinkCtx else { return -1 }
         return av_buffersink_get_frame(sink, out)
@@ -378,11 +285,9 @@ final class DeinterlaceFilter {
         graph = nil
         srcCtx = nil
         sinkCtx = nil
-        engine = nil
+        if framesRef != nil { av_buffer_unref(&framesRef) }
+        geometry = nil
         outputTimeBase = AVRational(num: 0, den: 1)
-        width = 0
-        height = 0
-        pixFmt = -1
     }
 
     deinit {

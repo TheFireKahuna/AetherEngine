@@ -2,7 +2,6 @@ import Foundation
 import os
 import CoreMedia
 import CoreVideo
-import VideoToolbox
 import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
@@ -36,8 +35,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var decodedFormatKey: DecodedFormatKey?
     private var reportedFormatKey: DecodedFormatKey?
 
-    /// The decoder's own output, taken before a deinterlace graph can rewrite the frame (the hardware
-    /// graph hands `emit` a VideoToolbox surface whose pixel format says nothing about the decode).
+    /// The decoder's own output, taken before the deinterlacer can rewrite the frame (it hands `emit` a
+    /// VideoToolbox frame whose pixel format says nothing about the decode).
     struct DecodedFormatKey: Equatable {
         var pixelFormat: Int32
         var color: ColorDescription
@@ -100,9 +99,23 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Engaged lazily on first interlaced frame; every subsequent frame routes through it. Guarded by `lock`.
     private let deinterlacer = DeinterlaceFilter()
 
-    /// Deinterlacer selection + cadence from LoadOptions. Set by the host BEFORE `open`;
-    /// applied to the filter there (mutating it mid-stream would need a graph rebuild).
+    /// Deinterlacer cadence from LoadOptions. Set by the host BEFORE `open`; applied to the filter there
+    /// (mutating it mid-stream would need a graph rebuild).
     var deinterlaceConfig = DeinterlaceConfig()
+
+    /// False puts every picture out as decoded, interlaced or not. Set before `open`; the format probe is
+    /// the only caller, it counts the decoder's own pictures.
+    var deinterlaces = true
+
+    /// The attributes of every display buffer: the finisher's pool and the deinterlacer's output pool
+    /// (`DeinterlaceFilter`), so the display layer sees one kind of buffer whichever made it. Format and
+    /// size are each pool's own.
+    static var displayBufferAttributes: CFDictionary {
+        [
+            kCVPixelBufferMetalCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: NSDictionary(),
+        ] as NSDictionary
+    }
 
     /// #544: decode on the calling thread with no frame-level threading. Set before `open`; the
     /// still extractor is the only caller, everything on a playback path wants the parallel default.
@@ -165,8 +178,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             }
         }
 
-        /// The buffer's own format read back, for a buffer this decoder did not convert (the
-        /// hardware deinterlacer's surfaces): nil for a format no `OutputFormat` describes.
+        /// A display buffer's format read back (the deinterlacer reads its range): nil for a format no
+        /// `OutputFormat` describes.
         init?(pixelFormatType type: OSType) {
             guard let match = Self.all.first(where: { $0.pixelFormatType == type }) else { return nil }
             self = match
@@ -278,11 +291,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// #407: frames whose PTS was reconstructed from `best_effort_timestamp` (see the repair site
     /// in drainDecodedFrames()). Guarded by `lock`.
     private var repairedTimestamps = 0
-
-    /// GPU-side copy from the hw-deinterlace filter's pool buffers into `pixelBufferPool` (see
-    /// the VT branch in emit()). Created lazily on the first hw frame; guarded by `lock`.
-    private var transferSession: VTPixelTransferSession?
-    private var loggedTransferFailure = false
 
     /// #220: a send failure that survives the drain-and-retry is release-visible once per
     /// decoder, so a wedge that is a genuine decode error is distinguishable in a field log
@@ -512,16 +520,22 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 }
             }
 
-            let isInterlaced = (f.pointee.flags & (1 << 3)) != 0  // AV_FRAME_FLAG_INTERLACED
-            if isInterlaced || deinterlacer.isActive {
-                if deinterlacer.ensureGraph(frame: f, timeBase: timeBase),
-                   deinterlacer.push(f) >= 0 {
+            let isInterlaced = (f.pointee.flags & AV_FRAME_FLAG_INTERLACED) != 0
+            if deinterlaces, isInterlaced || deinterlacer.isActive {
+                // The deinterlacer works on display buffers, so the picture is finished first, every one
+                // of them: a picture before a seek's target is still the next one's temporal context.
+                guard let finished = autoreleasepool(invoking: { finishFrame(f) }) else { lock.unlock(); continue }
+                if deinterlacer.ensureGraph(buffer: finished, properties: f, timeBase: timeBase),
+                   deinterlacer.push(finished, properties: f) >= 0 {
                     if filtered == nil { filtered = av_frame_alloc() }
                     if let out = filtered { emitDeinterlacedFrames(into: out) }
                     lock.unlock()
                     continue
                 }
-                // No deinterlacer in linked build or graph failure: fall through and render as-is (combing, but playing).
+                // No deinterlacer in the linked build or no graph (logged by the filter): shown as decoded.
+                emit(f, timeBase: timeBase, finished: finished)
+                lock.unlock()
+                continue
             }
             // emit() must stay under `lock`: close() releases the pool and the plans under the same lock.
             emit(f, timeBase: timeBase)
@@ -603,18 +617,19 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// `tb` is the time_base the frame's PTS rides on: the stream time_base for direct frames,
     /// `DeinterlaceFilter.outputTimeBase` for filtered ones (halved by yadif/bwdif; with
     /// send_field the fields sit on odd/even ticks, so rescaling into the stream base would
-    /// collapse each pair to duplicate timestamps).
-    private func emit(_ f: UnsafeMutablePointer<AVFrame>, timeBase tb: AVRational) {
+    /// collapse each pair to duplicate timestamps). `finished` is the display buffer when the
+    /// picture was already finished for the deinterlacer.
+    private func emit(_ f: UnsafeMutablePointer<AVFrame>, timeBase tb: AVRational, finished: CVPixelBuffer? = nil) {
         // Per-frame autorelease pool: the decode/feed loops are single long-running dispatch
-        // blocks, so without this, ObjC transients (VTPixelTransferSession internals, CV
-        // bridging) accumulate in the block's last-resort pool and only pop at session end,
-        // AFTER close() tore the session down, crashing the pop with an over-release
-        // (EXC_BAD_ACCESS in AutoreleasePoolPage::releaseUntil on engine.sw.feed), and
-        // bloating memory for the whole channel visit meanwhile.
-        autoreleasepool { emitInner(f, timeBase: tb) }
+        // blocks, so without this, ObjC transients (Metal command buffers, CV bridging)
+        // accumulate in the block's last-resort pool and only pop at session end, AFTER close()
+        // tore the session down, crashing the pop with an over-release (EXC_BAD_ACCESS in
+        // AutoreleasePoolPage::releaseUntil on engine.sw.feed), and bloating memory for the
+        // whole channel visit meanwhile.
+        autoreleasepool { emitInner(f, timeBase: tb, finished: finished) }
     }
 
-    private func emitInner(_ f: UnsafeMutablePointer<AVFrame>, timeBase tb: AVRational) {
+    private func emitInner(_ f: UnsafeMutablePointer<AVFrame>, timeBase tb: AVRational, finished: CVPixelBuffer?) {
         let cmPTS = SourceTimestampBounds.cmTime(ticks: f.pointee.pts, timeBase: tb)
         if let threshold = skipUntilPTS, cmPTS.isValid {
             if CMTimeCompare(cmPTS, threshold) < 0 {
@@ -625,29 +640,14 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
 
         let pixelBuffer: CVPixelBuffer
-        if f.pointee.format == AV_PIX_FMT_VIDEOTOOLBOX.rawValue {
-            // Hardware deinterlace path: the frame wraps a CVPixelBuffer from FFmpeg's
-            // VideoToolbox hwframes pool (data[3]). Do NOT hand that buffer to the display
-            // layer: its IOSurfaces carry different properties than our pool's, and on tvOS
-            // the display's direct video plane wedges on the first such frame, while GPU
-            // compositing keeps rendering them (visible through translucent overlays). A
-            // VTPixelTransferSession copies GPU-side into a buffer from our own pool (the
-            // same attributes the sw path has always displayed); still no sws, no CPU copy.
+        if let finished {
+            pixelBuffer = finished
+        } else if f.pointee.format == AV_PIX_FMT_VIDEOTOOLBOX.rawValue {
+            // The deinterlacer's output: a display buffer made with `displayBufferAttributes`, carrying the
+            // attachments of the buffer it was made from (colour, pixel aspect), or that buffer itself for a
+            // progressive picture it passed through.
             guard let raw = f.pointee.data.3 else { return }
-            let src = Unmanaged<CVPixelBuffer>.fromOpaque(UnsafeRawPointer(raw)).takeUnretainedValue()
-            if let copied = transferToOwnPool(src) {
-                pixelBuffer = copied
-            } else {
-                // Transfer unavailable: pass the pool buffer through (frozen-plane risk, but
-                // better than dropping video entirely).
-                if !loggedTransferFailure {
-                    loggedTransferFailure = true
-                    EngineLog.emit("[SWDecoder] VT pixel transfer failed; passing filter pool buffer through", category: .swPlayback)
-                }
-                pixelBuffer = src
-            }
-            attachColorSpace(from: f, to: pixelBuffer)
-            attachPixelAspectRatio(from: f, to: pixelBuffer)
+            pixelBuffer = Unmanaged<CVPixelBuffer>.fromOpaque(UnsafeRawPointer(raw)).takeUnretainedValue()
         } else {
             guard let finished = finishFrame(f) else { return }
             pixelBuffer = finished
@@ -731,10 +731,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         poolWidth = 0
         poolHeight = 0
         loggedOutputFormat = nil
-        if let session = transferSession {
-            VTPixelTransferSessionInvalidate(session)
-            transferSession = nil
-        }
         // Nil onFrame inside the lock: emit() reads it under the same lock; unsynchronized write is a data race.
         onFrame = nil
         lock.unlock()
@@ -746,55 +742,22 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - Decoder-owned pixel buffer pool
 
-    /// Create (or reuse) the decoder-owned CVPixelBufferPool for the given geometry. These
-    /// attributes (IOSurface + Metal compatible, NV12/P010) are the ones the display path has
-    /// always accepted; both the sws path and the hw-deinterlace transfer draw from here.
+    /// Create (or reuse) the pool the finisher writes display buffers into, for the given geometry, with
+    /// `displayBufferAttributes`.
     private func ensurePixelBufferPool(width: Int, height: Int, format: OutputFormat) -> CVPixelBufferPool? {
         if pixelBufferPool == nil || poolWidth != width || poolHeight != height || poolFormat != format {
             pixelBufferPool = nil
             let poolAttrs: NSDictionary = [kCVPixelBufferPoolMinimumBufferCountKey: 6]
-            let pbAttrs: NSDictionary = [
-                kCVPixelBufferPixelFormatTypeKey: format.pixelFormatType,
-                kCVPixelBufferWidthKey: width,
-                kCVPixelBufferHeightKey: height,
-                kCVPixelBufferMetalCompatibilityKey: true,
-                kCVPixelBufferIOSurfacePropertiesKey: NSDictionary(),
-            ]
+            let pbAttrs = NSMutableDictionary(dictionary: Self.displayBufferAttributes as NSDictionary)
+            pbAttrs[kCVPixelBufferPixelFormatTypeKey] = format.pixelFormatType
+            pbAttrs[kCVPixelBufferWidthKey] = width
+            pbAttrs[kCVPixelBufferHeightKey] = height
             CVPixelBufferPoolCreate(kCFAllocatorDefault, poolAttrs, pbAttrs, &pixelBufferPool)
             poolWidth = width
             poolHeight = height
             poolFormat = format
         }
         return pixelBufferPool
-    }
-
-    /// GPU-side copy of a hw-deinterlace filter frame into a buffer from our own pool.
-    /// Returns nil when the session or pool cannot be created or the transfer fails; the
-    /// caller then passes the filter's buffer through as a last resort.
-    private func transferToOwnPool(_ src: CVPixelBuffer) -> CVPixelBuffer? {
-        if transferSession == nil {
-            var session: VTPixelTransferSession?
-            let status = VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &session)
-            guard status == noErr, let s = session else { return nil }
-            transferSession = s
-        }
-        // #8: the surface's own format, so the transfer is a copy. It used to ask for 4:2:0 video range
-        // at the stream's default depth whatever the deinterlacer uploaded, which squeezed a full-range
-        // surface into video range and would have downsampled a 4:2:2 one.
-        let format = OutputFormat(pixelFormatType: CVPixelBufferGetPixelFormatType(src))
-            ?? OutputFormat(tenBit: use10Bit, fullRange: false)
-        logOutputFormat(format, source: "VideoToolbox deinterlacer surface", colorRange: nil)
-        guard let session = transferSession,
-              let pool = ensurePixelBufferPool(
-                  width: CVPixelBufferGetWidth(src),
-                  height: CVPixelBufferGetHeight(src),
-                  format: format
-              ) else { return nil }
-        var dst: CVPixelBuffer?
-        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &dst) == kCVReturnSuccess,
-              let out = dst else { return nil }
-        guard VTPixelTransferSessionTransferImage(session, from: src, to: out) == noErr else { return nil }
-        return out
     }
 
     private func reportDecodedFormat(pixelBuffer: CVPixelBuffer) {

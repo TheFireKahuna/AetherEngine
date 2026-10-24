@@ -35,10 +35,7 @@ final class DeinterlaceHardwareWarmup: @unchecked Sendable {
         }
     }
 
-    func waitIfNeeded(for mode: DeinterlaceMode) async -> Outcome? {
-        guard mode == .auto else {
-            return nil
-        }
-        return await task.value
+    func wait() async -> Outcome {
+        await task.value
     }
 }
