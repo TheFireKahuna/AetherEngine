@@ -3097,7 +3097,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     }
 
     /// The preview for a position outside the resident window: the keyframe that opens its plan
-    /// segment, read off the source by a side demuxer as the I-frame rendition reads it, wrapped
+    /// segment, read off the source as the I-frame rendition reads it (`IFrameKeyframeReader`), wrapped
     /// with the session's own sample entry, `dvcC` and `colr`. Nothing is decoded; the compositor
     /// colours it like the resident preview. Skipped when a newer request arrived meanwhile.
     private func sourceKeyframePreviewFile(atSeconds seconds: Double, request: Int) -> CompositorPreviewFile? {
@@ -3149,7 +3149,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return file
     }
 
-    /// The side reader and builder behind `sourceKeyframePreviewFile`, made on the first request
+    /// The keyframe reader and builder behind `sourceKeyframePreviewFile`, made on the first request
     /// that needs them and torn down by `stop()`, which drains a read in flight before it frees the
     /// codec parameters the builder reads.
     private func previewKeyframeSource(plan: [Segment], directory: URL)
@@ -3385,7 +3385,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                                  .map { IFrameFragmentBuilder.Output(initSegment: $0.initSegment, fragment: $0.fragment) }
                          })
         }
-        // The side reader owns the clone from here; `stop()` must not close it a second time.
+        // The keyframe reader owns the clone from here; `stop()` must not close it a second time.
         let custom = customIFrameReader
         customIFrameReader = nil
         return makeKeyframeRendition(
@@ -3394,7 +3394,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             format: .keyframes, buildFragment: buildKeyframe, companion: companion, custom: custom)
     }
 
-    /// The side-read half every keyframe consumer shares: a demuxer of its own on the source, the
+    /// The read half every keyframe consumer shares: the keyframe from the source's index, or from a
+    /// demuxer of its own where only libavformat can read the container (`IFrameKeyframeReader`), the
     /// P7 conversion the playing samples get, and the gates that keep it off a busy or serial origin.
     private func makeKeyframeRendition(
         config cfg: HLSSegmentProducer.StreamConfig,
@@ -3411,7 +3412,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
             extradata: cfg.codecpar.pointee.extradata.map { UnsafePointer($0) },
             size: Int(cfg.codecpar.pointee.extradata_size))
         let url = sourceURL, headers = sourceHTTPHeaders, headerStore = requestHeaders
-        let reader = IFrameSideReader(
+        let positions: [Int64: Int64] = demuxer.map { dem in
+            Dictionary(dem.indexedKeyframeEntries(streamIndex: dem.videoStreamIndex).map { ($0.pts, $0.pos) },
+                       uniquingKeysWith: { first, _ in first })
+        } ?? [:]
+        let session = demuxer
+        let reader = IFrameKeyframeReader(
+            resolveIndex: {
+                guard let session else { return .failed("the session's demuxer is gone") }
+                return await Self.iFrameKeyframeIndex(url: url, headers: headerStore.current, demuxer: session,
+                                                      custom: custom?.reader)
+            },
+            position: { positions[$0] },
             open: { dem in
                 if let custom {
                     try dem.open(reader: custom.reader, formatHint: custom.formatHint,

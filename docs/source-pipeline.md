@@ -2,9 +2,10 @@
 
 Status: in progress, written 2026-10-24 against `research/12bit-fel` at `a7a725e8` and the tvOS 27.2
 SDK (Xcode 27.2), brought up to `503c69f5`, then the cache's validators, write bound and budget
-review and the index's lifetime. Layers 1 and 2 are built (layer 2 for Matroska and MP4);
-MPEG-TS has no index and is handled on its own terms (its section below), including programs that
-change mid-stream; layer 3 is the remaining work. Each section says what is done, which tests hold
+review and the index's lifetime, then layer 3 step 4 (I-frame keyframes from the index).
+Layers 1 and 2 are built (layer 2 for Matroska and MP4); MPEG-TS has no index and is
+handled on its own terms (its section below), including programs that change mid-stream; layer 3 is
+the remaining work, step 4 built. Each section says what is done, which tests hold
 it, what is not yet ideal with the steps to get there, and what still waits for a device run.
 
 Waiting for a device run, in the order worth doing them:
@@ -15,6 +16,10 @@ Waiting for a device run, in the order worth doing them:
    index`, `[IndexedSubtitles] ... complete`).
 3. A transport stream whose PMT changes: a live channel with server-side ads, or a DVR `.ts` that
    crosses a programme boundary, ideally one whose codec changes there (the TS section).
+4. Scrubbing with keyframes from the index (layer 3, step 4): an MKV and an MP4, HDR included (the SDR
+   stills tier reads the same keyframes), and one non-indexed container for the demuxer route.
+   `[IFrameKeyframes] keyframes read from the index` and the `[SourceLedger]` line for the `iframe`
+   reader, against a session before it.
 
 ## Why
 
@@ -160,13 +165,14 @@ releases what no session is reading.
 | Piece | File | What it does |
 |---|---|---|
 | `SourceIndex` | `Demuxer/SourceIndex.swift` | The one shape every consumer reads: subtitle tracks, each track's frames (time, duration, where), `readFrame` returning the packet libavformat would hand over (for Matroska: stripped header restored, zlib inflated, WebVTT split into text and settings), the codecs for which that holds (`packetCodecs`), and the stream-to-track pairing. |
-| `MatroskaCueIndex` | `Demuxer/MatroskaCueIndex.swift` | Matroska's Cues, parsed off the source. Also the video keyframes. |
-| `MP4SampleIndex` | `Demuxer/MP4SampleIndex.swift` | An MP4's sample tables, not parsed again: the entries libavformat built at open (`Demuxer.sampleTable`, edit lists applied), which are what `av_read_frame` reads its packets from. A fragmented file (an `mvex` in the `moov`) has none; a track with an entry the edit list marks to discard is not trusted. mov_text only. |
+| `MatroskaCueIndex` | `Demuxer/MatroskaCueIndex.swift` | Matroska's Cues, parsed off the source. Also the video keyframes, read as packets (`readKeyframe`): where the Cues place the block, or, for a cue without `CueRelativePosition`, the block in its cluster whose time (cluster timestamp plus block offset) is the cue's. |
+| `MP4SampleIndex` | `Demuxer/MP4SampleIndex.swift` | An MP4's sample tables, not parsed again: the entries libavformat built at open (`Demuxer.sampleTable`, edit lists applied), which are what `av_read_frame` reads its packets from. Subtitles: mov_text only; a fragmented file's (an `mvex` in the `moov`) are never whole, and a track with an entry the edit list marks to discard is not trusted. Video keyframes: each keyframe entry's sample (position and size), fragmented files included, since every keyframe a plan lists is an entry the demuxer had. |
 | `SourceIndexRegistry` | `Demuxer/SourceIndexRegistry.swift` | One index per source and size, for whichever container the demuxer opened (`index(of:headers:demuxer:through:)`). Racing callers share the one read; later callers get the result. An uncovered container and a file without an index are kept answers; a read that broke off (including an unreadable head) is not, so the next consumer retries. The key is derived from the request and the reader's own size, so two consumers cannot name a source differently. |
 | `ParseToken` | same | Both index readers require one and only the registry can make it, so a second read cannot be added by accident. The parser's unit tests use a debug-only token; a release build pins that no production code does. |
-| Index consumers | `AetherEngine+SourceIndex.swift` | One exact reader factory (`indexedSourceReader`), one subtitle stream listing (`indexedSubtitleStreams`), the prefetch source builder. |
+| Index consumers | `AetherEngine+SourceIndex.swift` | One exact reader factory (`indexedSourceReader`, with a shorter request budget for a consumer a viewer waits on) and one opener over it for files and remote sources (`indexReader`), one subtitle stream listing (`indexedSubtitleStreams`), one video track listing (`indexedVideoTracks`), the prefetch source builder. |
 
-Consumers today, all container-agnostic: the indexed subtitle fill (`AetherEngine+IndexedSubtitles.swift`)
+Consumers today, all container-agnostic: the I-frame rendition and the compositor preview
+(`IFrameKeyframeReader`, layer 3 step 4), the indexed subtitle fill (`AetherEngine+IndexedSubtitles.swift`)
 and the forward subtitle prefetch, which reads frames from the index instead of walking the stream when
 the index lists every stream completely (`SubtitleForwardPrefetcher.IndexSource`, one loop over a
 `Source`). On an MP4 the walk it replaces delivered every video keyframe (its pacing stream sits at
@@ -178,7 +184,8 @@ the index lists every stream completely (`SubtitleForwardPrefetcher.IndexSource`
 |---|---|
 | Twelve racing consumers, one parse; a later consumer, no parse; source and size name the index; an index goes with its source (grace, idle release, another body) and is kept only while the cache holds the source | `SourceIndexRegistryTests` |
 | The index prefetch stores the same packets the walk would, in one time order, re-anchors in place, ends a dropped connection as a read failure, is all or nothing | `SubtitleIndexPrefetchTests` |
-| An MP4 sample read from the index is the packet `av_read_frame` hands over (bytes, time, duration), an empty edit included; the prefetch from it stores what its walk stores; an edit-list cut or a fragmented file is refused | `MP4SampleIndexTests` (fixtures made by ffmpeg and MP4Box, embedded) |
+| An MP4 sample read from the index is the packet `av_read_frame` hands over (bytes, time, duration), an empty edit included; the prefetch from it stores what its walk stores; an edit-list cut or a fragmented file's subtitles are not trusted, and a fragmented file's keyframes read | `MP4SampleIndexTests` (fixtures made by ffmpeg and MP4Box, embedded) |
+| A keyframe read from the index (Matroska with and without `CueRelativePosition`, MP4) or by the demuxer route (FLV) is the packet `av_read_frame` hands over | `IFrameKeyframeReaderTests` (fixtures made by ffmpeg, embedded) |
 | The walk's contract is unchanged through the one loop | `Issue151SubtitleForwardPrefetchTests`, `Issue230PrefetchReadPositionParkTests`, `Issue231PrefetchRestartTests`, `Issue234SideReaderSeekAnchorTests`, `Issue240SideReaderLinkPriorityTests` |
 
 ### Not yet ideal, and the steps
@@ -187,9 +194,9 @@ the index lists every stream completely (`SubtitleForwardPrefetcher.IndexSource`
    consumer moved onto it. MPEG-TS (and so every Blu-ray remux in `.m2ts`) has no index at all, and
    a recorded one was looked at and not built (see the decisions below): the TS walk is cheap, and
    what a recording would serve (back-seeks, re-reads) libavformat's own index entries largely cover.
-   - MP4 keyframes are not on `SourceIndex`: the segment plan already reads them from the same
-     libavformat entries (`Demuxer.indexedKeyframeEntries`). Matroska's stay on `MatroskaCueIndex`
-     until the I-frame playlist (layer 3, step 4) names what it needs from both.
+   - Keyframes are on `SourceIndex` for both (`coversKeyframes`, `readKeyframe`), addressed by the
+     position libavformat's index gives the segment plan (`Demuxer.indexedKeyframeEntries`), so the
+     plan and the reads name a keyframe the same way.
 2. **The index is named for subtitles and exposes only them. Done.** It is `MatroskaCueIndex`
    (`Demuxer/MatroskaCueIndex.swift`), and it exposes `videoTracks`, `keyframes(track:)` and
    `byteOffset(of:)` for the I-frame playlist and seeking (`MatroskaCueIndexTests.videoKeyframes`).
@@ -264,7 +271,7 @@ libavformat's own parsers and PMT handling are what the tests run against.
    can name the old and the new streams together, and after a seek it is corrected only at the next
    PMT cell. A new stream judged to take no role is therefore judged again when the programs change.
 
-## Layer 3: every output on request (next)
+## Layer 3: every output on request (step 4 built; the rest next)
 
 In order, each step replacing a reader rather than adding one:
 
@@ -278,8 +285,26 @@ In order, each step replacing a reader rather than adding one:
    270 s) stop being reasons to read ahead.
 3. **The PGS overlay pulls.** The drainer asks the subtitle source for its window around the playhead;
    the packet store becomes a cache of what was pulled, not a buffer filled ahead.
-4. **The I-frame playlist from the index.** `EXT-X-I-FRAMES-ONLY` entries from the keyframe positions,
-   each keyframe read exactly; the I-frame side demuxer goes.
+4. **The I-frame playlist from the index. Built.** `IFrameKeyframeReader`
+   (`Video/IFrameKeyframeReader.swift`, the side reader reworked) reads each keyframe one of two ways,
+   settled once per session by what the index covers:
+   - **The index** (Matroska's Cues, an MP4's sample entries): the keyframe is read exactly at the
+     position the plan's own index entry gives, through the exact range reader and the shared source
+     cache. No demuxer, no header parse, no read-ahead window.
+   - **libavformat**, for every other container (AVI, FLV, ASF, ...): their packets are wrapped in
+     framing only a demuxer takes apart (a chunk header, a tag, multiplexed payloads), so a demuxer
+     of its own still reads the keyframe there, seeking to its time.
+
+   The index is asked of `SourceIndexRegistry` (`HLSVideoEngine.iFrameKeyframeIndex`), so a source
+   the subtitle fill already indexed costs nothing more. An index that could not be read is a failed
+   request with the cool-down, asked again after it, never the demuxer route. Both routes share the
+   cool-down, interrupt, close and the P7 to 8.1 conversion. The compositor preview reads through the
+   same reader. Entries, eligibility, the SDR stills tier and the fragments are unchanged.
+   - Left: MPEG-TS has no I-frame rendition at all. Its plan is a uniform grid, not keyframe-aligned
+     (`planNotKeyframeAligned`), and an I-frame playlist has to list every keyframe before the first
+     scrub, which on TS only a read of the whole file finds. To be worked out separately.
+   - Left: the demuxer route still opens on the `iframe` side demuxer profile (an `AVIOReader` over
+     the shared cache), not on the exact range reader.
 5. **Unindexed containers.** The pump records the index as it reads (layer 2, step 1); a request ahead
    of the pump in an unindexed interleaved file is the one case where reading the video early is
    inherent, and it goes through the pump's own read-ahead into the cache, not a second walker.
@@ -328,6 +353,17 @@ else; the ledger's per-reader lines should show exactly that.
   for what is hot. If the device measurement shows a regression, one generalised RAM tier in front of
   the cache is the fallback, not three.
 - **Sodalite keeps its own sessions** (see layer 1, item 8).
+- **Two ways to read a keyframe, by container.** Index-only was weighed: it would have left AVI, FLV
+  and ASF titles without scrub thumbnails, since only libavformat can turn their index positions into
+  packets and re-implementing their packet assembly is the duplicate parser this plan refuses
+  elsewhere. So the index where it covers the container, a demuxer where only a demuxer can read it,
+  the same split the subtitle source will have.
+- **A Matroska cue without a relative position is matched by time, not taken as the cluster's first
+  block.** The first version assumed muxers start a cluster at the keyframe; a short file whose one
+  cluster holds every keyframe answered all of them with the first. The block's own time is exact.
+- **No deadline on resolving the index.** The first version gave up after twice the read deadline;
+  under load a Matroska parse that was slow but moving became failures and cool-downs. The reads it
+  makes carry their own timeouts, and teardown interrupts the wait.
 - **The write bound holds requests, not deliveries.** The first version waited inside `store`, which
   runs in the delivery callbacks; `appendPersistentData` records why that cannot work (#174, #220: a
   delivery callback that blocks does not slow the transport, CFNetwork keeps reading into its own
@@ -365,3 +401,5 @@ else; the ledger's per-reader lines should show exactly that.
 | `[HLSSegmentProducer] program change: video now on stream N (was M)[, another codec]` | What a pump makes of it |
 | `SSAI video program switch: ...` / `muxer rotation (programme back)` | The live ad's init, and the programme's again |
 | `[SWHost] program change: ...; rebuilding at the playhead` | The software path's rebuild for another codec |
+| `[IFrameKeyframes] keyframes read from the index (track N)` / `keyframes read by a demuxer of their own: <why>` | Which route a session's I-frame keyframes took, once per session |
+| `[IFrameKeyframes] <what>; leaving the source alone for Ns (consecutive failures: n)` | A failed keyframe read, index or open, and its cool-down |

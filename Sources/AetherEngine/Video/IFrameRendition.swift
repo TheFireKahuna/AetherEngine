@@ -37,8 +37,8 @@ enum IFrameRenditionFormat: Equatable, Sendable {
 
 }
 
-/// AE#682: answers `iframe_init.mp4` and `iframe{N}.mp4`. One request at a time: there is one side
-/// demuxer, and AVKit asks for up to five keyframes at once.
+/// AE#682: answers `iframe_init.mp4` and `iframe{N}.mp4`. One request at a time: there is one keyframe
+/// reader (`IFrameKeyframeReader`), and AVKit asks for up to five keyframes at once.
 final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
     struct Entry: Equatable, Sendable {
         let startPts: Int64
@@ -126,7 +126,7 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
         }
     }
 
-    /// The keyframe that opens segment `index`, from the cache or the side reader, and never a
+    /// The keyframe that opens segment `index`, from the cache or the keyframe reader, and never a
     /// neighbour's in its place: a scrub preview names the span it shows, so a stand-in would put
     /// the wrong picture over the right time. `isStale` is asked before the source is touched, so a
     /// queue of superseded requests costs no reads.

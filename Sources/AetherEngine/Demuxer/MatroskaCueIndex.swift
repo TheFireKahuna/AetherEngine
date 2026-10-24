@@ -83,6 +83,25 @@ struct MatroskaCueIndex: SourceIndex {
 
     func blocks(track: UInt64) -> [SourceIndexBlock] { blocksByTrack[track] ?? [] }
 
+    func coversKeyframes(track: UInt64) -> Bool {
+        if case .unsupported = encodingByTrack[track] ?? .none { return false }
+        return !(keyframesByTrack[track] ?? []).isEmpty
+    }
+
+    /// The block of the cluster at `position` nearest `ticks`, read where the Cues place it, or, for a
+    /// cue point without `CueRelativePosition`, found in the cluster by its time: the cluster's
+    /// timestamp plus the block's own offset is the cue's time, as libavformat stamps the packet.
+    func readKeyframe(track: UInt64, position: Int64, ticks: Int64, from source: RandomAccessByteSource) -> [UInt8]? {
+        let inCluster = keyframes(track: track).filter { byteOffset(of: $0) == position }
+        guard let keyframe = inCluster.min(by: { abs($0.ticks - ticks) < abs($1.ticks - ticks) }) else { return nil }
+        if let relative = keyframe.relativePosition {
+            let block = SourceIndexBlock(ticks: keyframe.ticks, durationTicks: nil,
+                                         offset: position + 4 + 1 + relative, size: nil)
+            return readFrame(block, track: track, from: source, prefix: nil)?.payload
+        }
+        return block(of: track, at: keyframe.ticks, inClusterAt: position, from: source)
+    }
+
     /// Every track counts in segment ticks.
     func timeBase(track: UInt64) -> AVRational {
         AVRational(num: Int32(clamping: timestampScale), den: 1_000_000_000)
@@ -414,11 +433,10 @@ struct MatroskaCueIndex: SourceIndex {
                 payload = full
                 isPrefix = false
             }
-            if case .strippedHeader(let stripped) = encodingByTrack[track] ?? .none { payload = stripped + payload }
+            guard let frame = restored(payload, track: track) else { return nil }
+            payload = frame
             var prefixed = isPrefix
             if compressed {
-                guard let inflated = ZlibBlock.inflate(payload) else { return nil }
-                payload = inflated
                 if let requestedPrefix, payload.count > requestedPrefix {
                     payload = Array(payload.prefix(requestedPrefix))
                     prefixed = true
@@ -436,27 +454,78 @@ struct MatroskaCueIndex: SourceIndex {
         return nil
     }
 
+    /// A frame's stored bytes as libavformat hands them over: the stripped header put back, a zlib frame
+    /// inflated. Nil for a frame that does not inflate.
+    private func restored(_ stored: [UInt8], track: UInt64) -> [UInt8]? {
+        switch encodingByTrack[track] ?? .none {
+        case .strippedHeader(let stripped): return stripped + stored
+        case .zlib: return ZlibBlock.inflate(stored)
+        case .none, .unsupported: return stored
+        }
+    }
+
+    /// Most of a cluster read to find its first block of a track: past it the cue is not where muxers put it.
+    static let clusterScanLimit = 8 << 20
+
+    /// The block of `track` at `ticks` in the cluster at `position`, walking the cluster's children
+    /// from its header. A cluster of unknown size (a live recording's) is walked the same way.
+    private func block(of track: UInt64, at ticks: Int64, inClusterAt position: Int64,
+                       from source: RandomAccessByteSource) -> [UInt8]? {
+        var window = source.read(at: position, count: 64 << 10) ?? []
+        func extend(to count: Int) -> Bool {
+            while window.count < count {
+                guard window.count < Self.clusterScanLimit,
+                      let more = source.read(at: position + Int64(window.count), count: max(count - window.count, 256 << 10)),
+                      !more.isEmpty else { return false }
+                window += more
+            }
+            return true
+        }
+        guard let cluster = EBML.element(window, at: 0), cluster.id == 0x1F43B675 else { return nil }
+        let clusterEnd = cluster.unknownSize ? Int.max : cluster.dataStart + Int(cluster.size)
+        var clusterTicks: Int64?
+        var offset = cluster.dataStart
+        while offset < clusterEnd {
+            guard extend(to: offset + 16), let child = EBML.element(window, at: offset), !child.unknownSize,
+                  child.id != 0x1F43B675 else { return nil }
+            let childEnd = child.dataStart + Int(child.size)
+            if child.id == 0xE7, extend(to: childEnd) { clusterTicks = Int64(EBML.uint(window, child)) }
+            if child.id == 0xA3 || child.id == 0xA0, let clusterTicks {
+                guard extend(to: min(childEnd, offset + 512)) else { return nil }
+                if let located = Self.locate(window, at: offset, track: track),
+                   clusterTicks + Int64(located.timecode) == ticks {
+                    guard extend(to: located.payloadStart + located.payloadLength) else { return nil }
+                    return restored(Array(window[located.payloadStart..<(located.payloadStart + located.payloadLength)]),
+                                    track: track)
+                }
+            }
+            offset = childEnd
+        }
+        return nil
+    }
+
     /// A SimpleBlock or BlockGroup of `track` starting at `at`: where its frame lies and its duration.
     /// Checked down to the block's track number and lacing, so a wrong guess of the cluster's size field
     /// cannot pass for a block.
     static func locate(_ bytes: [UInt8], at: Int, track: UInt64)
-        -> (payloadStart: Int, payloadLength: Int, durationTicks: Int64?)? {
+        -> (payloadStart: Int, payloadLength: Int, durationTicks: Int64?, timecode: Int16)? {
         guard let element = EBML.element(bytes, at: at), !element.unknownSize else { return nil }
         let end = element.dataStart + Int(element.size)
-        func block(_ start: Int, _ length: Int) -> (Int, Int)? {
+        func block(_ start: Int, _ length: Int) -> (Int, Int, Int16)? {
             guard let number = EBML.vint(bytes, at: start), number.value == track else { return nil }
             let flagsAt = start + number.length + 2
             guard flagsAt < bytes.count, length > number.length + 3 else { return nil }
-            guard bytes[flagsAt] & 0x06 == 0 else { return nil }   // laced: never a subtitle frame
+            guard bytes[flagsAt] & 0x06 == 0 else { return nil }   // laced: never a subtitle or video frame
+            let timecode = Int16(bitPattern: UInt16(bytes[flagsAt - 2]) << 8 | UInt16(bytes[flagsAt - 1]))
             let payloadStart = flagsAt + 1
-            return (payloadStart, length - (payloadStart - start))
+            return (payloadStart, length - (payloadStart - start), timecode)
         }
         switch element.id {
         case 0xA3:
-            guard let (start, length) = block(element.dataStart, Int(element.size)) else { return nil }
-            return (start, length, nil)
+            guard let (start, length, timecode) = block(element.dataStart, Int(element.size)) else { return nil }
+            return (start, length, nil, timecode)
         case 0xA0:
-            var found: (Int, Int)?
+            var found: (Int, Int, Int16)?
             var duration: Int64?
             var offset = element.dataStart
             while offset < min(end, bytes.count), let child = EBML.element(bytes, at: offset), !child.unknownSize {
@@ -466,8 +535,8 @@ struct MatroskaCueIndex: SourceIndex {
                 }
                 offset = child.dataStart + Int(child.size)
             }
-            guard let (start, length) = found else { return nil }
-            return (start, length, duration)
+            guard let (start, length, timecode) = found else { return nil }
+            return (start, length, duration, timecode)
         default:
             return nil
         }

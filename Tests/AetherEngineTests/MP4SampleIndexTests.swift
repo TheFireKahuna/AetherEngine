@@ -6,7 +6,7 @@ import AetherLibavutil
 
 /// `MP4SampleIndex` against libavformat itself: a subtitle sample read where the index says is the
 /// packet `av_read_frame` hands over (bytes, time, duration), an edit list included, and a track the
-/// edit list cuts, or a fragmented file, is not trusted.
+/// edit list cuts, or a fragmented file's, is not trusted; a fragmented file's keyframes are.
 ///
 /// The fixtures were made with ffmpeg 8 and MP4Box from two SRT files (English: cues at 1.5, 5 and
 /// 9 s; German: 2 and 7 s), the video a 32x32 testsrc at 1 fps:
@@ -207,6 +207,7 @@ struct MP4SampleIndexTests {
 
     private static func index(_ data: Data, demuxer: Demuxer) throws -> MP4SampleIndex {
         try MP4SampleIndex.read(demuxer: demuxer, streams: AetherEngine.indexedSubtitleStreams(of: demuxer),
+                                videoTracks: AetherEngine.indexedVideoTracks(of: demuxer),
                                 source: IOReaderByteSource(DataIOReader(data: data)), token: .forParserTests)
     }
 
@@ -260,11 +261,18 @@ struct MP4SampleIndexTests {
         #expect(index.isComplete(track: 3, frameCount: nil))
     }
 
-    @Test("a fragmented file has no index")
-    func fragmentedHasNoIndex() throws {
+    /// Its `moov` lists no samples; each `moof` lists its own as the stream is read, so no subtitle
+    /// track is ever whole, while each keyframe entry the demuxer has is its sample.
+    @Test("a fragmented file's subtitles are not complete, and the keyframes it lists read as their packets")
+    func fragmentedSubtitlesAreIncomplete() throws {
         let demuxer = try Self.open(Self.movTextFragmented)
         defer { demuxer.close() }
-        #expect(throws: SourceIndexError.noIndex) { try Self.index(Self.movTextFragmented, demuxer: demuxer) }
+        let index = try Self.index(Self.movTextFragmented, demuxer: demuxer)
+        for track in index.subtitleTracks { #expect(!index.isComplete(track: track.number, frameCount: nil)) }
+        let source = IOReaderByteSource(DataIOReader(data: Self.movTextFragmented))
+        for entry in demuxer.indexedKeyframeEntries(streamIndex: demuxer.videoStreamIndex) {
+            #expect(index.readKeyframe(track: 1, position: entry.pos, ticks: entry.pts, from: source) != nil)
+        }
     }
 
     /// The registry reads an MP4's index off the demuxer, and the forward prefetch then stores from it
