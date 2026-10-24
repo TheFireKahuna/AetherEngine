@@ -14,7 +14,9 @@ final class PulseHostView: UIView {
     }
 
     @MainActor
-    func playAVPlayer(_ url: URL, log: @escaping @Sendable (String) -> Void) async {
+    /// `seconds` stops the arm early (`secs=N`); unlike the engine arms there is no looping, so it never runs
+    /// past one pass through the clip.
+    func playAVPlayer(_ url: URL, seconds: Double? = nil, log: @escaping @Sendable (String) -> Void) async {
         let item = AVPlayerItem(url: url)
         let player = AVPlayer(playerItem: item)
         // AVPlayerLayer has no automatic criteria (that is AVPlayerViewController's); request them from the
@@ -31,7 +33,8 @@ final class PulseHostView: UIView {
         player.play()
         let deadline = Date().addingTimeInterval(80)
         let duration = (try? await item.asset.load(.duration).seconds) ?? 66
-        while Date() < deadline, item.status != .failed, player.currentTime().seconds < duration - 0.2 {
+        let stop = min(duration - 0.2, seconds ?? .infinity)
+        while Date() < deadline, item.status != .failed, player.currentTime().seconds < stop {
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         log("avplayer status=\(item.status.rawValue) error=\(String(describing: item.error)) t=\(player.currentTime().seconds)")

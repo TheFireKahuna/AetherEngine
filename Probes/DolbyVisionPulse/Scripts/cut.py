@@ -86,6 +86,7 @@ def main():
     ap.add_argument("--slates", action="store_true", help="only dump one still per slate, then stop")
     ap.add_argument("--out", default=None, help="output dir (default <recording>_arms next to the recording)")
     ap.add_argument("--scale", type=int, default=None, help="passed to analyze.py")
+    ap.add_argument("--color", action="store_true", help="passed to analyze.py (hue/saturation channels)")
     a = ap.parse_args()
 
     rec = a.recording
@@ -124,6 +125,8 @@ def main():
             cmd += ["--png", str(out / f"{tag}.png")]
         if a.scale:
             cmd += ["--scale", str(a.scale)]
+        if a.color:
+            cmd += ["--color"]
         print(f"\n=== {tag}  {arm['mode']} {arm['clip']}  video {lo:.1f}s +{dur:.1f}s ===", flush=True)
         r = subprocess.run(cmd)
         runs = []

@@ -37,25 +37,51 @@ def probe(path):
     return s["width"], s["height"], num / den
 
 
-def frames(path, scale):
-    """Yield luma frames as float32 [0,1], scaled to `scale` px wide (ffmpeg applies rotation)."""
+def frames(path, scale, color=False):
+    """Yield (t, luma, rgb) frames as float32 [0,1], scaled to `scale` px wide (ffmpeg applies rotation).
+    rgb is None unless `color`; luma is then derived from it (BT.709 weights on the camera's encoded RGB)."""
     w, h, fps = probe(path)
-    cmd = ["ffmpeg", "-v", "error", "-i", path, "-vf", f"scale={scale}:-2", "-pix_fmt", "gray16le",
-           "-f", "rawvideo", "-"]
+    cmd = ["ffmpeg", "-v", "error", "-i", path, "-vf", f"scale={scale}:-2", "-pix_fmt",
+           "rgb48le" if color else "gray16le", "-f", "rawvideo", "-"]
     # Output size: decode one frame to PGM and read its header (ffmpeg applies display rotation).
     pgm = subprocess.check_output(["ffmpeg", "-v", "error", "-i", path, "-vf", f"scale={scale}:-2",
                                    "-frames:v", "1", "-pix_fmt", "gray", "-f", "image2pipe", "-c:v", "pgm", "-"])
     ow, oh = (int(x) for x in pgm.split(b"\n")[1].split())
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-    n = ow * oh * 2
+    ch = 3 if color else 1
+    n = ow * oh * 2 * ch
     t = 0
     while True:
         buf = p.stdout.read(n)
         if len(buf) < n:
             break
-        yield t, np.frombuffer(buf, dtype="<u2").reshape(oh, ow).astype(np.float32) / 65535.0
+        F = np.frombuffer(buf, dtype="<u2").reshape(oh, ow, ch).astype(np.float32) / 65535.0
+        if color:
+            yield t, F @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32), F
+        else:
+            yield t, F[:, :, 0], None
         t += 1
     p.wait()
+
+
+# Colour channels (--color): per colour patch, the hue angle and the saturation of the camera's mean RGB,
+# in a BT.709 opponent space. Hue is re-centred per run and reported in degrees, saturation is chroma/luma.
+HUE_PATCHES = [n for n in G.COLORS if n != "gray150"]  # a grey has no hue
+SAT_PATCHES = list(G.COLORS)
+
+
+def colour_channels(rgb_means):
+    """rgb_means: {patch: (r, g, b)} -> ([hue degrees per HUE_PATCHES], [saturation per SAT_PATCHES])."""
+    def opp(c):
+        r, g, b = c
+        y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        return y, b - y, r - y
+    hue = [float(np.degrees(np.arctan2(opp(rgb_means[n])[2], opp(rgb_means[n])[1]))) for n in HUE_PATCHES]
+    sat = []
+    for n in SAT_PATCHES:
+        y, cb, cr = opp(rgb_means[n])
+        sat.append(float(np.hypot(cb, cr) / max(y, 1e-3)))
+    return hue, sat
 
 
 def find_corners(Y):
@@ -139,8 +165,9 @@ def sampler(L, Hm, Y_shape, inset=0.2, n=7):
     return names, [grid(b) for b in boxes], [grid(c) for c in L["code_cells"]]
 
 
-def analyse(path, arms, scale):
+def analyse(path, arms, scale, color=False):
     L = G.layout()
+    patch_names = [p["name"] for p in L["patches"]]
     W, H = L["width"], L["height"]
     m, s = 80, 200
     src_corners = np.array([[m, m], [W - m, m], [m, H - m], [W - m, H - m]], dtype=np.float64)
@@ -150,10 +177,14 @@ def analyse(path, arms, scale):
     names = None
     cache = None  # (corners, names, patch grids, cell grids)
     bad = 0
-    def decode(Y, c):
+    def decode(Y, c, RGB):
         nonlocal cache
         if cache is None or np.abs(cache[0] - c).max() > 3:
             names, pg, cg = sampler(L, homography(src_corners, c), Y.shape)
+            if color:
+                # colour channels go before black/fid, which stay last
+                names = (names[:-2] + [f"{n}.hue" for n in HUE_PATCHES] + [f"{n}.sat" for n in SAT_PATCHES]
+                         + names[-2:])
             cache = (c, names, pg, cg)
         _, names, pg, cg = cache
         vals = np.array([Y[v, u].mean() for v, u in pg])
@@ -167,19 +198,23 @@ def analyse(path, arms, scale):
         idx = G.decode_bits([int(x > thr) for x in cells])
         if idx is None or idx >= L["n_frames"]:
             return None
+        if color:
+            means = {n: RGB[pg[k][0], pg[k][1]].mean(axis=0) for k, n in enumerate(patch_names)}
+            hue, sat = colour_channels(means)
+            vals = np.concatenate([vals[:-2], hue, sat, vals[-2:]])
         return idx, vals
 
     good = None  # corners of the last frame that decoded: the phone is on a tripod, so they stay valid
-    for t, Y in frames(path, scale):
+    for t, Y, RGB in frames(path, scale, color):
         out = None
         c = find_corners(Y)
         if c is not None:
-            out = decode(Y, c)
+            out = decode(Y, c, RGB)
         if out is not None:
             good = c
         elif good is not None:
             # dim frames (the RPU can darken the whole picture) can fool the fiducial search
-            out = decode(Y, good)
+            out = decode(Y, good, RGB)
         if out is None:
             bad += 1
             continue
@@ -229,6 +264,11 @@ def analyse(path, arms, scale):
         V = np.array([r[2] for r in run])
         V = V[:, :-2]  # drop black, fid
         pnames = names[:-2]
+        hue_cols = [j for j, n in enumerate(pnames) if n.endswith(".hue")]
+        for j in hue_cols:
+            # re-centre on the run's circular mean so the +-180 wrap never splits a phase
+            ref = np.degrees(np.angle(np.exp(1j * np.radians(V[:, j])).mean()))
+            V[:, j] = (V[:, j] - ref + 180.0) % 360.0 - 180.0
         phase_no = np.where(idx < G.PREROLL, -1, (idx - G.PREROLL) // G.PHASE_LEN)
         pos = np.where(idx < G.PREROLL, idx, (idx - G.PREROLL) % G.PHASE_LEN)
         keep = (pos >= SETTLE) & (phase_no >= -1)
@@ -251,19 +291,41 @@ def analyse(path, arms, scale):
         sd = d.std(axis=0, ddof=1)
         tstat = mean_d / np.maximum(sd / np.sqrt(len(d)), 1e-6)
         rel = mean_d / np.maximum(base, 1e-3)
+        rel[hue_cols] = np.nan  # a re-centred angle has no level to be relative to
+        # The pulse verdict is about luma, as without --color; the colour channels get their own below.
+        luma = np.array(["." not in n for n in pnames])
         # Response lag: average trace around A->B switches of the most responsive patch.
-        j = int(np.argmax(np.abs(tstat)))
+        j = int(np.argmax(np.where(luma, np.abs(tstat), -1)))
         lag = step_lag(idx, V[:, j], phase_no, pos)
         span = (run[0][0] / cam_fps, run[-1][0] / cam_fps)
-        n_sig = int((np.abs(tstat) > 5).sum())
+        n_sig = int((np.abs(tstat[luma]) > 5).sum())
         verdict = "PULSE" if n_sig >= 3 else ("weak" if n_sig >= 1 else "steady")
         print(f"\n  [{label}] camera {span[0]:.1f}-{span[1]:.1f} s, clip frames {idx.min()}-{idx.max()}, "
               f"{len(d)} B phases -> {verdict} ({n_sig} patches |t|>5), lag {lag}")
         order = np.argsort(-np.abs(tstat))
         for i in order[:8]:
-            print(f"    {pnames[i]:>8}: level {base[i]:.3f}  B-A {mean_d[i]:+.4f} ({100 * rel[i]:+.1f}%)  t={tstat[i]:+.1f}")
+            unit = f"{mean_d[i]:+.2f} deg" if i in hue_cols else f"{mean_d[i]:+.4f} ({100 * rel[i]:+.1f}%)"
+            print(f"    {pnames[i]:>12}: level {base[i]:.3f}  B-A {unit}  t={tstat[i]:+.1f}")
+        signature = None
+        if color:
+            # The CM v4.0 six-vector signature (gen_pulse.py `hue`): red's hue and cyan's saturation move,
+            # while no grey patch changes level and no other colour changes hue.
+            t_of = dict(zip(pnames, tstat))
+            greys = [n for n in pnames if n.startswith("g") and "." not in n and n != "green"]
+            others = [f"{n}.hue" for n in HUE_PATCHES if n not in ("red", "cyan")]
+            grey_max = max(abs(t_of[n]) for n in greys)
+            other_max = max(abs(t_of[n]) for n in others)
+            red_t, cyan_t = t_of["red.hue"], t_of["cyan.sat"]
+            if abs(red_t) > 5 and abs(cyan_t) > 5 and grey_max < 5 and other_max < 5:
+                signature = "V4-SIGNATURE"
+            elif abs(red_t) > 5 or abs(cyan_t) > 5:
+                signature = "partial"
+            else:
+                signature = "none"
+            print(f"    colour: red.hue t={red_t:+.1f}, cyan.sat t={cyan_t:+.1f}, max |t| greys {grey_max:.1f}, "
+                  f"other hues {other_max:.1f} -> six-vector signature: {signature}")
         results.append({"arm": label, "span_s": span, "b_phases": len(d), "verdict": verdict,
-                        "n_sig": n_sig, "lag_clip_frames": lag,
+                        "n_sig": n_sig, "lag_clip_frames": lag, "six_vector_signature": signature,
                         "patches": {pnames[i]: {"level": float(base[i]), "delta": float(mean_d[i]),
                                                 "rel": float(rel[i]), "t": float(tstat[i])}
                                     for i in range(len(pnames))},
@@ -329,10 +391,12 @@ if __name__ == "__main__":
     ap.add_argument("recording")
     ap.add_argument("--arms", help="comma-separated labels for the runs, in order")
     ap.add_argument("--scale", type=int, default=1280, help="analysis width in px")
+    ap.add_argument("--color", action="store_true",
+                    help="also measure per-patch hue and saturation (SEQ=cm4's six-vector arms PH/TH)")
     ap.add_argument("--json", help="write full results (with traces) here")
     ap.add_argument("--png", help="write a trace plot here")
     a = ap.parse_args()
-    res = analyse(a.recording, a.arms.split(",") if a.arms else None, a.scale)
+    res = analyse(a.recording, a.arms.split(",") if a.arms else None, a.scale, a.color)
     if a.json:
         json.dump(res, open(a.json, "w"))
     if a.png and res:

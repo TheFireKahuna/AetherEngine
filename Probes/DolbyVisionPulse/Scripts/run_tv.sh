@@ -6,7 +6,10 @@
 #   DEVICE=... ./run_tv.sh --no-build           play only (app already installed)
 #   DEVICE=... SEQ=el ./run_tv.sh               TE engine (FEL) / NE enginenofel (EL dropped) on p7fel_el.mp4, then T
 #   DEVICE=... SEQ=vt ./run_tv.sh               the three VideoToolbox arms only, on pulse_l2.mp4
-#   DEVICE=... SEQ=cm4 ./run_tv.sh              CM v4.0: P8 AVPlayer / T8 engine (FEL) on the L8-only pulse, P/T the L2 controls
+#   DEVICE=... SEQ=cm4 ./run_tv.sh              CM v4.0 vs v2.9 on AVPlayer (P*) and the engine FEL route (T*): L2, L2 + v4.0
+#                                               defaults, L8 tone and L8 six-vector pulses; record, then analyze.py --color
+#   DEVICE=... SEQ=cm4q ./run_tv.sh             the same by eye: 8 arms of 20 s (P P4 P8 PH, T T4 T8 TH), about 3.5 min
+#   DEVICE=... SEQ=l8ladder ./run_tv.sh         by eye: the L8 ladder, 20 s per rung and route (LADDER=a,b,c,d default, or e,f,g,h; ROUTES=P,T)
 #   DEVICE=... SEQ=fmt ./run_tv.sh              the L2 pulse on the FEL route per output buffer: T p010, TF p010-full, TS sv22
 #   DEVICE=... SEQ=bits ./run_tv.sh             12-bit survival on p7fel_sub10: TD p010 dithered (+ control), TR p010-round
 #                                               (- control), TF p010-full, TS sv22; TF/TS pulse = bits below 10 reach the panel
@@ -67,10 +70,47 @@ case "$SEQ" in
     ARMS="SOAK|soak|$U|minutes=${SOAK_MIN:-5};seeks=${SOAK_SEEKS:-60@1800,150@600,240@3000}"
     LABELS=SOAK ;;
   cm4)
-    # Does CM v4.0 (L8) reach the panel? P/T pulse on L2 (v2.9) as the positive controls; P8/T8 only
-    # pulse if the L8 blocks survive to the TV's display manager.
-    ARMS="P|avplayer|$B/pulse_l2.mp4,P8|avplayer|$B/pulse_l8.mp4,T|engine|$B/p7fel_l2.mp4,T8|engine|$B/p7fel_l8.mp4"
-    LABELS=P,P8,T,T8 ;;
+    # Does CM v4.0 reach the panel's display manager intact, on AVPlayer (P*) and the engine's FEL route (T*)?
+    #   P/T    CM v2.9 L2 pulse            positive control: the panel follows trims at all (must pulse)
+    #   PN     CM v2.9, nothing switches   negative control (must stay steady)
+    #   P4/T4  CM v4.0 defaults, L2 pulse  steady = v4.0 arrived and the panel ignores L2; pulse = v4.0 stripped
+    #   P8/T8  CM v4.0, L8 tone pulse      pulse = L8 reaches a display manager
+    #   PH/TH  CM v4.0, L8 six-vector only red/cyan move, greys steady = the panel's own CM v4.0 reads our L8
+    # The closing P repeats the first arm, so drift or a mode change during the run shows.
+    ARMS="P|avplayer|$B/pulse_l2.mp4,PN|avplayer|$B/pulse_null.mp4,P4|avplayer|$B/pulse_l2v4.mp4"
+    ARMS+=",P8|avplayer|$B/pulse_l8.mp4,PH|avplayer|$B/pulse_hue.mp4,T|engine|$B/p7fel_l2.mp4"
+    ARMS+=",T4|engine|$B/p7fel_l2v4.mp4,T8|engine|$B/p7fel_l8.mp4,TH|engine|$B/p7fel_hue.mp4,P|avplayer|$B/pulse_l2.mp4"
+    LABELS=P,PN,P4,P8,PH,T,T4,T8,TH,P
+    for f in pulse_l2 pulse_null pulse_l2v4 pulse_l8 pulse_hue p7fel_l2 p7fel_l2v4 p7fel_l8 p7fel_hue; do
+      [[ -e "$OUT/$f.mp4" ]] || { echo "missing $OUT/$f.mp4 (Scripts/build.sh makes it)"; exit 1; }
+    done ;;
+  cm4q)
+    # cm4 by eye: the same arms minus the negative control and the closing repeat, 20 s each (the 6 s
+    # pre-roll, then 4-5 switches), about 3.5 min. Not enough B phases for analyze.py; use cm4 for that.
+    Q="secs=20"
+    ARMS="P|avplayer|$B/pulse_l2.mp4|$Q,P4|avplayer|$B/pulse_l2v4.mp4|$Q,P8|avplayer|$B/pulse_l8.mp4|$Q"
+    ARMS+=",PH|avplayer|$B/pulse_hue.mp4|$Q,T|engine|$B/p7fel_l2.mp4|$Q,T4|engine|$B/p7fel_l2v4.mp4|$Q"
+    ARMS+=",T8|engine|$B/p7fel_l8.mp4|$Q,TH|engine|$B/p7fel_hue.mp4|$Q"
+    LABELS=P,P4,P8,PH,T,T4,T8,TH
+    for f in pulse_l2 pulse_l2v4 pulse_l8 pulse_hue p7fel_l2 p7fel_l2v4 p7fel_l8 p7fel_hue; do
+      [[ -e "$OUT/$f.mp4" ]] || { echo "missing $OUT/$f.mp4 (Scripts/build.sh makes it)"; exit 1; }
+    done ;;
+  l8ladder)
+    # By eye, 20 s per arm: the L8 tone pulse with fewer / shorter blocks (gen_pulse.py L8_LADDER), on AVPlayer
+    # (PA-PD) then the engine FEL route (TA-TD). A one short block at 100 nits (streaming style), B one short
+    # block at 1000 nits, C five short blocks, D one long (25-byte) block at 1000 nits.
+    # LADDER=e,f,g,h (default a,b,c,d) picks the rungs: e/f a realistic / saturation-only trim at 1000 nits,
+    # g the extreme trim at 600 nits, h a's block at 25 bytes. ROUTES=P (or T) plays one route only.
+    Q="secs=20"; ARMS=""; LABELS=""
+    for r in P:avplayer:pulse T:engine:p7fel; do
+      [[ ",${ROUTES:-P,T}," == *",${r%%:*},"* ]] || continue
+      for x in ${(s:,:)${LADDER:-a,b,c,d}}; do
+        X=${(U)x}
+        ARMS+="${ARMS:+,}${r%%:*}$X|${${r#*:}%%:*}|$B/${r##*:}_l8$x.mp4|$Q"
+        LABELS+="${LABELS:+,}${r%%:*}$X"
+        [[ -e "$OUT/${r##*:}_l8$x.mp4" ]] || { echo "missing $OUT/${r##*:}_l8$x.mp4 (Scripts/build.sh makes it)"; exit 1; }
+      done
+    done ;;
   fmt)
     # Does the per-frame RPU still drive the panel when the composer hands tvOS P010 with the low bits
     # used, or a 16-bit 4:2:2 sv22 buffer? A flat TS (or an HDR10 badge) means sv22 loses Dolby Vision.
@@ -94,7 +134,7 @@ case "$SEQ" in
     for f in p7fel_card.mp4 card_amp10.bin card_identity.bin p7fel_bullseye.mp4; do
       [[ -e "$OUT/$f" ]] || { echo "missing $OUT/$f (Scripts/build.sh makes it)"; exit 1; }
     done ;;
-  *) echo "unknown SEQ=$SEQ (main|el|vt|count|cm4|fmt|bits|card|soak)"; exit 1 ;;
+  *) echo "unknown SEQ=$SEQ (main|el|vt|count|cm4|cm4q|l8ladder|fmt|bits|card|soak)"; exit 1 ;;
 esac
 
 if [[ "${1:-}" != "--no-build" ]]; then
@@ -125,7 +165,7 @@ LEGEND
 fi
 case "$SEQ" in
   soak) ;;
-  card) echo "watch the TV (no recording needed); launching in 10 s" ;;
+  card|cm4q|l8ladder) echo "watch the TV (no recording needed); launching in 10 s" ;;
   *) echo "start the phone recording now; launching in 10 s" ;;
 esac
 sleep 10
@@ -139,6 +179,6 @@ echo "log: $LOG (+ ${LOG%.log}.app.log)"
 if [[ "$SEQ" == soak ]]; then
   grep -h "soak summary" "$LOG" "${LOG%.log}.app.log" 2>/dev/null | sort -u || echo "(no soak summary line found)"
 else
-  echo "cut and analyse: python3 $HERE/cut.py <recording>.MOV $LOG --slates"
+  echo "cut and analyse: python3 $HERE/cut.py <recording>.MOV $LOG --slates$([[ $SEQ == cm4 ]] && echo " --color")"
   echo "                 then the same command with --sync <video seconds>=<clock read off the slate>"
 fi
