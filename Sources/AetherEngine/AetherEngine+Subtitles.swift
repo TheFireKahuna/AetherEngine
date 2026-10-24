@@ -1012,9 +1012,10 @@ extension AetherEngine {
             demuxer.discardAllStreamsExcept(streams, pacing: pacing)
 
             // Prewarm MKV cue index (lives at EOF), then bounded positioning with the verified
-            // byte-estimate fallback, both budgeted (#112 round 10). Skip prewarm for disc (#76).
+            // byte-estimate fallback, both budgeted (#112 round 10). The pump's rule decides
+            // where a prewarm loads anything (`HLSVideoEngine.cuePrewarmMayRun`).
             let duration = demuxer.duration
-            if duration > 0, !demuxer.isDiscSource {
+            if duration > 0, HLSVideoEngine.cuePrewarmMayRun(demuxer) {
                 demuxer.seekBounded(to: duration * 0.5, timeout: Self.sideReaderSeekBudgetSeconds)
             }
             // #234: anchor the positioning on the subtitle axis explicitly. A -1 seek lets libavformat
@@ -2025,11 +2026,11 @@ extension AetherEngine {
             reader?.close()
         }
 
-        // Prewarm MKV cue index (lives at EOF), same as the inline reader. Skip for disc sources (#76).
+        // Prewarm MKV cue index (lives at EOF), by the pump's rule (`HLSVideoEngine.cuePrewarmMayRun`).
         // #112 round 10: bounded like the inline reader's; on an index-less remote source the unbounded
         // timestamp seek is the same minutes-long wedge the embedded path had.
         let duration = demuxer.duration
-        if duration > 0, !demuxer.isDiscSource {
+        if duration > 0, HLSVideoEngine.cuePrewarmMayRun(demuxer) {
             demuxer.seekBounded(to: duration * 0.5, timeout: Self.sideReaderSeekBudgetSeconds)
         }
         let freshPlayhead = await MainActor.run { [weak self] in self?.sourceTime }

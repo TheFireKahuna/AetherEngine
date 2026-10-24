@@ -360,6 +360,10 @@ public final class Demuxer: @unchecked Sendable {
     /// reposition and by `close()`. Guarded by `accessLock`.
     private var peekedPackets: [UnsafeMutablePointer<AVPacket>] = []
 
+    /// Whether this source's video keyframes go into libavformat's index as they are read
+    /// (`recordKeyframeLocked`), decided on the first packet after an open. Guarded by `accessLock`.
+    private var recordsKeyframes: Bool?
+
     /// #407: video streams whose PTS `+genpts` invented out of decode order, because the container
     /// carries none of its own. Cleared on the way out of `readPacketLocked` so the decoder's reorder
     /// owns the presentation axis. Decided once at open, see `armGeneratedPTSSuppression`.
@@ -610,10 +614,15 @@ public final class Demuxer: @unchecked Sendable {
 
     nonisolated static let avTimeBase = AVRational(num: 1, den: AV_TIME_BASE)
 
-    /// True once a disc structure (BD/DVD/UDF) was recognized at open. Disc sources concat
-    /// MPEG-TS / VOB clips and have no EOF cue index, so the MKV cue-index prewarm seek is
-    /// useless there and a cold mid-disc range read is expensive on a remote ISO (#76).
+    /// True once a disc structure (BD/DVD/UDF) was recognized at open.
     var isDiscSource: Bool { !discTitles.isEmpty }
+
+    /// Whether libavformat loads this container's index on a first seek, the one thing the cue
+    /// prewarm seek is for: Matroska reads its Cues (usually at the end) only when a seek needs them.
+    /// Every other container has its index from the open (mov's sample tables, avi's idx1) or none to
+    /// load: an mpegts or mpegps seek (every disc, #76) is a timestamp search, which leaves behind only
+    /// the packets it probed, all flagged keyframe whatever they are (`mpegts_get_dts`).
+    var loadsIndexOnFirstSeek: Bool { containerFormatName?.contains("matroska") == true }
 
     /// The disc's titles mapped to the public model (empty for non-disc sources).
     func discTitleInfos() -> [TitleInfo] { discTitles.map { $0.titleInfo() } }
@@ -2002,9 +2011,10 @@ public final class Demuxer: @unchecked Sendable {
 
     /// Keyframe timestamps in stream native timebase from libavformat's index.
     /// MKV populates from Cues lazily on first seek (cue-prewarm in
-    /// HLSVideoEngine.start() ensures it's ready). MP4 stss / MPEG-TS populate
-    /// during avformat_find_stream_info. Empty = no usable index, fall back to
-    /// uniform-stride plan. AVINDEX_KEYFRAME checked defensively.
+    /// HLSVideoEngine.start() ensures it's ready); MP4 from stss at open. MPEG-TS and MPEG-PS have
+    /// none: their entries are what this demuxer has read (`recordKeyframeLocked`) plus the packets a
+    /// timestamp search probed, flagged keyframe whatever they are. Empty = no usable index, fall back
+    /// to uniform-stride plan. AVINDEX_KEYFRAME checked defensively.
     func indexedKeyframes(streamIndex: Int32) -> [Int64] {
         indexedKeyframeEntries(streamIndex: streamIndex).map(\.pts)
     }
@@ -2059,6 +2069,31 @@ public final class Demuxer: @unchecked Sendable {
                       flags: $0.pointee.flags)
             }
         }
+    }
+
+    /// A transport or program stream has no index: libavformat seeks it by a timestamp search, which
+    /// starts from the whole file unless the stream's index entries bound it (`ff_seek_frame_binary`),
+    /// and its only entries are the packets earlier searches probed. So each video keyframe read is
+    /// added at its position and decode time, the axis libavformat stamps them on (`mpegts_get_dts`),
+    /// and a seek back into what was read starts between two of them instead of probing the rest of
+    /// the file, mostly over the network. Not on a disc, which seeks by its EP map and whose clips
+    /// restart their clocks; not on a forward-only source, which cannot seek. Bounded by
+    /// libavformat's own index budget (`max_index_size`), as its probe entries are. Under `accessLock`.
+    private func recordKeyframeLocked(_ packet: UnsafeMutablePointer<AVPacket>,
+                                      _ ctx: UnsafeMutablePointer<AVFormatContext>) {
+        if recordsKeyframes == nil {
+            let names = ctx.pointee.iformat.map { String(cString: $0.pointee.name).split(separator: ",") } ?? []
+            recordsKeyframes = (names.contains("mpegts") || names.contains("mpegps")) && !isDiscSource
+                && isSourceSeekable
+        }
+        guard recordsKeyframes == true, packet.pointee.flags & AV_PKT_FLAG_KEY != 0,
+              packet.pointee.pos >= 0, packet.pointee.dts != Int64.min,
+              packet.pointee.stream_index >= 0, packet.pointee.stream_index < Int32(ctx.pointee.nb_streams),
+              let stream = ctx.pointee.streams[Int(packet.pointee.stream_index)],
+              stream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO else { return }
+        let budget = Int(ctx.pointee.max_index_size) / MemoryLayout<AVIndexEntry>.stride
+        guard Int(avformat_index_get_entries_count(stream)) < budget else { return }
+        av_add_index_entry(stream, packet.pointee.pos, packet.pointee.dts, 0, 0, AVINDEX_KEYFRAME)
     }
 
     func readPacket(isCurrent: @Sendable () -> Bool = { true }) throws -> UnsafeMutablePointer<AVPacket>? {
@@ -2330,6 +2365,7 @@ public final class Demuxer: @unchecked Sendable {
             guard let code = Self.readFailureCode(ret, closeRequested: isCloseRequested) else { return nil }
             throw DemuxerError.readFailed(code: code)
         }
+        if let pkt = packet { recordKeyframeLocked(pkt, ctx) }
         if let pkt = packet { boundTimestampsLocked(pkt) }
         // #407: before anything reads a timestamp off this packet. The PTS on these streams was
         // invented by `+genpts` out of decode order and transposes every B/P pair; dropping it leaves
@@ -3044,6 +3080,7 @@ public final class Demuxer: @unchecked Sendable {
         streamTableLock.unlock()
         dropPeekedPacketsLocked()
         dropHeldDolbyVisionBaseLocked()
+        recordsKeyframes = nil
         doviLayers = nil
         foldsBluRayDolbyVisionLayers = false
         if formatContext != nil {

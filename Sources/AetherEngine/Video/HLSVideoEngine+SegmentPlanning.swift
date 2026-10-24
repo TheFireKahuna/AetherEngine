@@ -34,9 +34,19 @@ extension HLSVideoEngine {
     /// The line below this one in the planner already skips its IRAP spacing scan for the same reason
     /// ("the scan would consume the non-replayable prefix"); this closes the larger hole above it.
     /// A segmented reader is excluded for the AE#268 reason instead: it has no index to load and every
-    /// reposition refetches a segment.
-    static func cuePrewarmMayRun(hasSegmentedReader: Bool, isSourceSeekable: Bool) -> Bool {
-        !hasSegmentedReader && isSourceSeekable
+    /// reposition refetches a segment. And only a container whose index a seek loads prewarms at all
+    /// (`Demuxer.loadsIndexOnFirstSeek`): on a transport stream the seek was a whole-file timestamp
+    /// search, mostly network reads into unwatched parts of the file, whose only product was probe
+    /// entries the plan then refused as too sparse. The pump and both subtitle side readers ask here.
+    static func cuePrewarmMayRun(loadsIndexOnFirstSeek: Bool, hasSegmentedReader: Bool,
+                                 isSourceSeekable: Bool) -> Bool {
+        loadsIndexOnFirstSeek && !hasSegmentedReader && isSourceSeekable
+    }
+
+    static func cuePrewarmMayRun(_ demuxer: Demuxer) -> Bool {
+        cuePrewarmMayRun(loadsIndexOnFirstSeek: demuxer.loadsIndexOnFirstSeek,
+                         hasSegmentedReader: demuxer.timeSeekableReader != nil,
+                         isSourceSeekable: demuxer.isSourceSeekable)
     }
 
     /// True when the indexed keyframe list is dense enough AND wide enough to trust for a keyframe-aligned plan (#64, #91).
@@ -108,6 +118,32 @@ extension HLSVideoEngine {
         case unknown
     }
 
+    /// What the #358 scan read off the bitstream: the IRAP spacing, and the first IRAP itself.
+    struct KeyframeScan: Equatable {
+        struct Stamp: Equatable {
+            var dts: Int64
+            var pts: Int64
+        }
+        var spacing: KeyframeSpacing
+        /// The first random-access point read (the parser's key flag), on both axes; nil when none was.
+        var firstKeyframe: Stamp?
+    }
+
+    /// Where the uniform fallback plan's segment 0 begins: the content's first IRAP, on the plan's
+    /// own axis, so that IRAP opens segment 0 (the cutter gates on that axis, AE#561). Without a scan
+    /// (a sequential origin, #370) the index's first entry or the stream's start, as before.
+    ///
+    /// The anchor used to be the index's first entry or, failing one, the stream's `start_time`, and
+    /// neither is a random-access point on the plan's axis: a transport stream's index holds only the
+    /// packets a seek probed (flagged keyframe whatever they are, the first one whatever sat at byte
+    /// 0), and `start_time` is a presentation time, a composition offset above the IRAP's decode time
+    /// on B-frame content, so that IRAP fell below segment 0's boundary. A Matroska index left
+    /// untrusted had the same mismatch with its presentation-stamped Cues.
+    static func uniformPlanAnchor(scan: KeyframeScan?, axis: PlanBoundaryAxis, provisional: Int64) -> Int64 {
+        guard let first = scan?.firstKeyframe else { return provisional }
+        return axis.timestamp(dts: first.dts, pts: first.pts)
+    }
+
     /// How far the #358 spacing scan reads before giving up, in seconds of content.
     static let keyframeSpacingScanBudgetSeconds: Double = 30
 
@@ -137,58 +173,58 @@ extension HLSVideoEngine {
         }
     }
 
-    /// Distance between the first two IRAPs at-or-after `fromSeconds`, read from the bitstream (#358).
+    /// The content's first IRAP and the distance to the next, read from the bitstream from the head
+    /// of the source (#358, `scanSourceHead`).
+    ///
+    /// From the head, not from a time: the anchor this feeds is "the first random-access point of the
+    /// content", and a timestamp seek to the content start lands on the wrong axis for some container.
+    /// An MPEG-TS seek searches decode times, and the content's start is a presentation time a
+    /// composition offset above its IRAP's decode time, so the seek put the read one frame past the
+    /// IRAP and the scan anchored on the next one.
     ///
     /// Only the untrusted-index path needs this, so the cost is paid exactly where the alternative is
     /// a plan that starves the session. Consumes packets and leaves the demuxer wherever it stopped,
     /// which matches `rebuildHEVCExtradataWithInBandParameterSets` above and the cue prewarm before it:
     /// nothing downstream of planning depends on the read cursor.
-    func measureKeyframeSpacing(
+    static func measureKeyframeSpacing(
         demuxer: Demuxer,
         videoStreamIndex: Int32,
-        videoTimeBase: AVRational,
-        fromSeconds: Double
-    ) -> KeyframeSpacing {
+        videoTimeBase: AVRational
+    ) -> KeyframeScan {
         let tb = Double(videoTimeBase.num) / Double(videoTimeBase.den)
-        guard tb > 0 else { return .unknown }
+        guard tb > 0 else { return KeyframeScan(spacing: .unknown) }
         let budget = Self.keyframeSpacingScanBudgetSeconds
-        demuxer.seek(to: Swift.max(0, fromSeconds))
-
         var firstKeyframe: Int64?
-        // Backstop against a stream that yields no video packet at all; the budget below is the
-        // real bound for anything that does.
-        var packetsRead = 0
-        let readBudget = 20_000
-
-        while packetsRead < readBudget {
-            let readResult: UnsafeMutablePointer<AVPacket>?
-            do {
-                readResult = try demuxer.readPacket()
-            } catch {
-                break
-            }
-            guard let pkt = readResult else { break }
-            defer {
-                var maybePkt: UnsafeMutablePointer<AVPacket>? = pkt
-                trackedPacketFree(&maybePkt)
-            }
-            packetsRead += 1
-            guard pkt.pointee.stream_index == videoStreamIndex else { continue }
+        var firstStamp: KeyframeScan.Stamp?
+        var result: KeyframeScan?
+        // The read budget is a backstop against a stream that yields no video packet at all; the
+        // content budget is the real bound for anything that does.
+        scanSourceHead(demuxer: demuxer, rewind: true, readBudget: 20_000) { pkt in
+            guard pkt.pointee.stream_index == videoStreamIndex else { return false }
             let stamp = pkt.pointee.pts != Int64.min ? pkt.pointee.pts : pkt.pointee.dts
-            guard stamp != Int64.min else { continue }
+            guard stamp != Int64.min else { return false }
             guard let first = firstKeyframe else {
-                if pkt.pointee.flags & AV_PKT_FLAG_KEY != 0 { firstKeyframe = stamp }
-                continue
+                if pkt.pointee.flags & AV_PKT_FLAG_KEY != 0 {
+                    firstKeyframe = stamp
+                    firstStamp = .init(dts: pkt.pointee.dts, pts: pkt.pointee.pts)
+                }
+                return false
             }
             let elapsed = Double(stamp &- first) * tb
             if pkt.pointee.flags & AV_PKT_FLAG_KEY != 0, elapsed > 0 {
-                return .measured(elapsed)
+                result = KeyframeScan(spacing: .measured(elapsed), firstKeyframe: firstStamp)
+                return true
             }
-            if elapsed > budget { return .exceedsBudget(budget) }
+            if elapsed > budget {
+                result = KeyframeScan(spacing: .exceedsBudget(budget), firstKeyframe: firstStamp)
+                return true
+            }
+            return false
         }
-        // Loop left on EOF or on the read backstop, not on the content budget: with one IRAP in hand
-        // the source has no second one, which is a different statement from "the GOP is long".
-        return firstKeyframe != nil ? .singleKeyframeInSource(budget) : .unknown
+        // Left on EOF or on the read backstop, not on the content budget: with one IRAP in hand the
+        // source has no second one, which is a different statement from "the GOP is long".
+        return result ?? KeyframeScan(spacing: firstKeyframe != nil ? .singleKeyframeInSource(budget) : .unknown,
+                                      firstKeyframe: firstStamp)
     }
 
     /// Most segments any plan builder emits (audit HLS-102). A week at the 4 s target is 151,200.
@@ -559,7 +595,7 @@ extension HLSVideoEngine {
         // Second cap so a stream that never yields a video packet cannot walk the whole source.
         let readBudget = 512
 
-        scanSourceHead(demuxer: demuxer, rewind: rewindBeforeScan, readBudget: readBudget) { pkt in
+        Self.scanSourceHead(demuxer: demuxer, rewind: rewindBeforeScan, readBudget: readBudget) { pkt in
             if pkt.pointee.stream_index != videoStreamIndex { return false }
             packetsScanned += 1
             guard let pktData = pkt.pointee.data else { return packetsScanned >= packetBudget }
@@ -586,7 +622,7 @@ extension HLSVideoEngine {
     /// has nothing to seek back with, so whatever the scan consumed is gone from the archive
     /// (audit HLS-103: a sequential origin lost its opening GOP to the framing probe). Those are
     /// PEEKED instead: the packets the scan looked at stay queued for the producer.
-    func scanSourceHead(
+    static func scanSourceHead(
         demuxer: Demuxer,
         rewind: Bool,
         readBudget: Int,
@@ -743,7 +779,7 @@ extension HLSVideoEngine {
         var annexB = 0
         var inspected = 0
 
-        scanSourceHead(demuxer: demuxer, rewind: true, readBudget: readBudget) { pkt in
+        Self.scanSourceHead(demuxer: demuxer, rewind: true, readBudget: readBudget) { pkt in
             guard pkt.pointee.stream_index == videoStreamIndex,
                   let data = pkt.pointee.data, pkt.pointee.size > 4 else { return false }
             inspected += 1

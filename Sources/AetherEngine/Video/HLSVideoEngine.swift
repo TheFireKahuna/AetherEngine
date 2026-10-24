@@ -1495,10 +1495,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
             //    #268: a segmented time-seekable source (HLS VOD ingest) has no index libavformat could
             //    load, and each reposition refetches a segment, so prewarming would buy the same
             //    uniform-stride plan for the price of two segment downloads at every session start.
-            if !Self.cuePrewarmMayRun(hasSegmentedReader: dem.timeSeekableReader != nil,
-                                      isSourceSeekable: dem.isSourceSeekable) {
+            if !Self.cuePrewarmMayRun(dem) {
                 EngineLog.emit(
-                    dem.timeSeekableReader != nil
+                    !dem.loadsIndexOnFirstSeek
+                        ? "[HLSVideoEngine] cue prewarm: skipped, \(dem.containerFormatName ?? "this container") has no index a seek loads"
+                        : dem.timeSeekableReader != nil
                         ? "[HLSVideoEngine] cue prewarm: skipped for a segmented source (no index to load, every reposition refetches a segment)"
                         : "[HLSVideoEngine] cue prewarm: skipped for a forward-only source (the seek would be a linear read, "
                           + "and the prefix it consumes is the producer's only pass)"
@@ -1580,15 +1581,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
             } else {
                 // Anchor the uniform plan at the content start so seg 0 is the first real keyframe, not an
                 // empty source-0 segment the producer never emits (which strands AVPlayer's seg0 fetch; #64
-                // follow-up). Prefer the first indexed keyframe; fall back to the video stream start_time.
+                // follow-up): the first IRAP the spacing scan reads from the head (`uniformPlanAnchor`),
+                // without a scan the first indexed entry or the stream's start_time.
                 let sorted = keyframes.sorted()
                 let streamStart = videoStream.pointee.start_time
-                let anchorPts = sorted.first ?? (streamStart != Int64.min ? max(0, streamStart) : 0)
+                let provisionalAnchor = sorted.first ?? (streamStart != Int64.min ? max(0, streamStart) : 0)
                 // #358: a grid finer than the GOP advertises boundaries no keyframe sits on, and the
                 // keyframe-gated cutter leaves every one of them without a segment while the playlist
                 // still offers it. Measure the spacing instead of assuming the target fits it.
-                let anchorSeconds = Double(anchorPts) * Double(videoTimeBase.num) / Double(videoTimeBase.den)
                 let spacing: KeyframeSpacing
+                var scan: KeyframeScan?
                 let stride: Double
                 if sequentialOriginPinsProducerToZero {
                     // #370: the spacing scan starts with a seek (a silent no-op on the non-seekable
@@ -1600,14 +1602,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     spacing = .unknown
                     stride = Self.targetSegmentDuration
                 } else {
-                    spacing = measureKeyframeSpacing(
+                    let measured = Self.measureKeyframeSpacing(
                         demuxer: dem,
                         videoStreamIndex: videoIndex,
-                        videoTimeBase: videoTimeBase,
-                        fromSeconds: anchorSeconds
+                        videoTimeBase: videoTimeBase
                     )
+                    scan = measured
+                    spacing = measured.spacing
                     stride = Self.uniformStrideSeconds(spacing: spacing)
                 }
+                let anchorPts = Self.uniformPlanAnchor(scan: scan, axis: planBoundaryAxis, provisional: provisionalAnchor)
                 plan = Self.buildUniformSegmentPlan(
                     videoTimeBase: videoTimeBase,
                     sourceDurationSeconds: durationSeconds,
@@ -1647,7 +1651,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     }
                 }
                 EngineLog.emit(
-                    "[HLSVideoEngine] segment plan: uniform stride fallback (\(reason), anchorPts=\(anchorPts), "
+                    "[HLSVideoEngine] segment plan: uniform stride fallback (\(reason), anchorPts=\(anchorPts) "
+                    + "(\(scan?.firstKeyframe != nil ? "first IRAP read" : "no IRAP read, index or stream start")), "
                     + "\(spacingText) → stride=\(String(format: "%.3f", stride))s, \(plan.count) segments)",
                     category: .session
                 )
