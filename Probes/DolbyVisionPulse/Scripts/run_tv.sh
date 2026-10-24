@@ -25,6 +25,8 @@
 #                                               GS seeks on the counter clip; by eye, about 2.5 min
 #   DEVICE=... SEQ=deint ./run_tv.sh            the deinterlace card on the software route (Scripts/build_deint.sh): DF field rate
 #                                               with a seek, DR frame rate, DW the wrong-field-order control; by eye, about 45 s
+#   DEVICE=... SEQ=film ./run_tv.sh             film in interlaced carriage (Scripts/build_film.sh), each clip ON then OFF
+#                                               (film=off): FS soft telecine, FH hard telecine, FP 2:2; by eye, about 90 s
 #   DEVICE=... SEQ=count ./run_tv.sh            counter clips: T / NE / TL (FEL route, residual, RPU pulse) and PM (8.1 control)
 #   DEVICE=... SEQ=soak SOAK_URL=<http url | file under $PULSE_OUT> [SOAK_MIN=5] [SOAK_SEEKS=60@1800,150@600,240@3000] ./run_tv.sh
 #                                               one FEL soak arm; its summary line is grepped at the end
@@ -200,7 +202,26 @@ case "$SEQ" in
     for f in deint_prog50.ts deint_tff.ts deint_bff.ts; do
       [[ -e "$OUT/$f" ]] || { echo "missing $OUT/$f (Scripts/build_deint.sh makes it)"; exit 1; }
     done ;;
-  *) echo "unknown SEQ=$SEQ (main|el|vt|count|cm4|cm4q|l8ladder|fmt|bits|card|cardov|placeholder|soak|deint)"; exit 1 ;;
+  film)
+    # Film in interlaced carriage (Scripts/build_film.sh, docs/software-route-gpu.md Part 6), by eye, each clip ON (film
+    # handling) then OFF (film=off: the container's rate and timing, interlaced pictures through bwdif, as before):
+    # FS soft telecine (DVD), FH hard telecine (broadcast), FP 2:2 (25p film in 1080i25). FILM_ARMS plays a subset.
+    ARMS="FS|soak|$B/film_soft.ts|minutes=0.17;slate=off"
+    ARMS+=",FSx|soak|$B/film_soft.ts|minutes=0.17;film=off;slate=off"
+    ARMS+=",FH|soak|$B/film_hard.ts|minutes=0.17;slate=off"
+    ARMS+=",FHx|soak|$B/film_hard.ts|minutes=0.17;film=off;slate=off"
+    ARMS+=",FP|soak|$B/film_psf.ts|minutes=0.17;slate=off"
+    ARMS+=",FPx|soak|$B/film_psf.ts|minutes=0.17;film=off;slate=off"
+    LABELS=FS,FSx,FH,FHx,FP,FPx
+    if [[ -n "${FILM_ARMS:-}" ]]; then
+      ARMS=$(print -r -- "$ARMS" | tr ',' '\n' | awk -v keep=",$FILM_ARMS," -F'|' \
+        'NF > 1 { k = index(keep, "," $1 ",") > 0 } k' | paste -sd, -)
+      LABELS=$FILM_ARMS
+    fi
+    for f in film_soft.ts film_hard.ts film_psf.ts; do
+      [[ -e "$OUT/$f" ]] || { echo "missing $OUT/$f (Scripts/build_film.sh makes it)"; exit 1; }
+    done ;;
+  *) echo "unknown SEQ=$SEQ (main|el|vt|count|cm4|cm4q|l8ladder|fmt|bits|card|cardov|placeholder|soak|deint|film)"; exit 1 ;;
 esac
 
 if [[ "${1:-}" != "--no-build" ]]; then
@@ -255,9 +276,20 @@ small box stepping right. Expect the TV at 50 Hz (Match Frame Rate on).
   any arm: a frozen picture with the tone still playing is the wedge the old transfer copy guarded against
 LEGEND
 fi
+if [[ "$SEQ" == film ]]; then
+  cat <<'LEGEND'
+the pan card: bars (top) and ruler ticks (bottom) panning right, two still lines between. Each clip plays twice,
+10 s each: ON (film handling) then OFF (as before this work). Watch the bars glide:
+  FS / FSx   3:2 soft telecine (DVD). ON: TV at 23.976, an even glide. OFF: TV at 29.97, a 2-3 stutter in the pan
+  FH / FHx   3:2 hard telecine (broadcast). ON: TV at 23.976, an even glide, crisp ticks. OFF: deinterlaced at field
+             rate, a stutter and softer, shimmering ticks
+  FP / FPx   2:2, 25p film in 1080i25. ON: an even glide, crisp ticks. OFF: deinterlaced, slightly softer ticks
+  every arm: the two middle lines never move; comb teeth on any edge are a fault
+LEGEND
+fi
 case "$SEQ" in
   soak) ;;
-  card|cardov|cm4q|l8ladder|placeholder|deint) echo "watch the TV (no recording needed); launching in 10 s" ;;
+  card|cardov|cm4q|l8ladder|placeholder|deint|film) echo "watch the TV (no recording needed); launching in 10 s" ;;
   *) echo "start the phone recording now; launching in 10 s" ;;
 esac
 sleep 10

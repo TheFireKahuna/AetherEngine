@@ -1,4 +1,5 @@
 import Foundation
+import os
 import CoreVideo
 import AVFoundation
 import AetherLibavformat
@@ -1184,6 +1185,17 @@ extension AetherEngine {
     nonisolated static func carriesSoftTelecine(codecID: AVCodecID, contentRate: Double?) -> Bool {
         guard codecID == AV_CODEC_ID_MPEG2VIDEO || codecID == AV_CODEC_ID_VC1, let contentRate else { return false }
         return [30000.0 / 1001, 30, 60000.0 / 1001, 60].contains { abs($0 - contentRate) < 0.01 }
+    }
+
+    nonisolated private static let filmDetectionSwitch = OSAllocatedUnfairLock(initialState: true)
+
+    /// Whether the load looks for film in interlaced carriage (docs/software-route-gpu.md Part 6): soft telecine, hard
+    /// telecine, 2:2. Off, film plays as it did before (the container's rate and timing, interlaced pictures through
+    /// the deinterlacer): the A/B control of the device probe. Read at load; applies to every load in the process.
+    @_spi(Diagnostics)
+    public nonisolated static var filmDetection: Bool {
+        get { filmDetectionSwitch.withLock { $0 } }
+        set { filmDetectionSwitch.withLock { $0 = newValue } }
     }
 
     /// Film can sit in this interlaced carriage with its cadence in the pixels (docs/software-route-gpu.md 6.2 - 6.4):

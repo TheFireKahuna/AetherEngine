@@ -1,7 +1,7 @@
 # The software route: one GPU pass, inside the native player
 
 Status: plan, written 2026-10-24 on `research/12bit-fel`. Parts 2 (the GPU finisher and H.273 colour) and 3 (AV1 into
-the slabs) are built and committed; part 4 (bwdif on the GPU) is built and verified on device; parts 1, 5 and 6 are open. The colour equations are in [colour-representation.md](colour-representation.md).
+the slabs) are built and committed; parts 4 (bwdif on the GPU) and 6 (film in interlaced carriage) are built and verified on device; parts 1 and 5 are open. The colour equations are in [colour-representation.md](colour-representation.md).
 
 ## Why
 
@@ -179,7 +179,7 @@ the finisher. AV1 specifies the synthesis exactly (section 7.18.3, its pseudo-ra
 builds the per-frame grain templates, the kernel applies them per 32x32 block, and the result must match dav1d's
 own grain bit for bit on test streams.
 
-## Part 6. Film in interlaced carriage: soft telecine, field matching, decimation (built; device test open)
+## Part 6. Film in interlaced carriage: soft telecine, field matching, decimation (built, verified on device)
 
 **Licensing.** bwdif, fieldmatch and decimate are transcriptions of FFmpeg's C (LGPL-2.1-or-later), so they cannot sit
 under the engine's App Store exception. They live in their own dynamic library,
@@ -279,6 +279,11 @@ mode does; the stages themselves cope with breaks (re-anchoring, combed pictures
   `fieldmatch,bwdif=mode=send_frame:deint=interlaced,decimate`, every output picture and timestamp equal, on 3:2 in
   both field orders, 4:2:2, a scene cut, an edit, a mid-cycle end, and 2:2. All equal.
 - The engagement table on the probe, and a `SEQ` arm on the TV for each row.
+- On the TV (`SEQ=film`, 2026-10-25), each clip with film handling on and off (`film=off`), read from the counters:
+  soft telecine 23.976 on a 23.98 Hz panel, one picture per 41.7 ms (off: 59.94 Hz, 33.4 / 50.1 ms, the 3:2 judder);
+  hard telecine 24 pictures a second on 23.98 Hz (off: 60 deinterlaced a second on 59.94 Hz); 2:2 25 a second on
+  50 Hz (off: 50 deinterlaced). The only drops fell in the first second, across the panel's mode switch. By eye the
+  difference did not show on the G5, which likely smooths 3:2 at 59.94 Hz itself.
 
 ## Banked
 

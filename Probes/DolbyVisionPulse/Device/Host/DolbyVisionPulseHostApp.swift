@@ -16,7 +16,7 @@ import UIKit
 //   PULSE_ARMS="label|mode|url[|k=v;k=v],label|mode|url,..."
 //
 // Arms play back to back with a 5 s slate naming the arm in between, so one phone recording covers
-// the whole sequence. Modes:
+// the whole sequence; an arm with `slate=off` follows the previous one directly. Modes:
 //
 // - `avplayer`: plain AVPlayer + AVPlayerLayer on the file (Apple's own path, the positive control).
 // - `vt`: AVAssetReader (VideoToolbox) output straight into AVSampleBufferDisplayLayer, with the
@@ -203,10 +203,17 @@ struct PulseHarnessView: View {
             armInfo = ([arm.label, arm.mode] + arm.params.sorted { $0.key < $1.key }.map { key, value in
                 key == "rpu" ? "rpu=\((value as NSString).lastPathComponent)" : "\(key)=\(value)"
             }).joined(separator: " · ")
-            host.window?.avDisplayManager.preferredDisplayCriteria = nil
-            say("slate \(arm.label)")
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
-            slate = ""
+            // `slate=off`: straight on from the previous arm with the panel left as it is, for by-eye A/B where
+            // a black gap between arms hides the difference (the top-left label still names the arm).
+            if arm.params["slate"] == "off" {
+                slate = ""
+                say("slate \(arm.label) skipped")
+            } else {
+                host.window?.avDisplayManager.preferredDisplayCriteria = nil
+                say("slate \(arm.label)")
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                slate = ""
+            }
             say("arm \(arm.label) start mode=\(arm.mode) url=\(arm.url.lastPathComponent)")
             switch arm.mode {
             case "avplayer":
@@ -379,6 +386,9 @@ struct PulseHarnessView: View {
             tally.ingest(line)
         }
         defer { EngineLog.handler = previous }
+        // `film=off`: the load does not look for film in interlaced carriage (SEQ=film's A/B control).
+        AetherEngine.filmDetection = arm.params["film"] != "off"
+        defer { AetherEngine.filmDetection = true }
         guard let e = try? AetherEngine() else { log("engine init failed"); return }
         engine = e
         do {

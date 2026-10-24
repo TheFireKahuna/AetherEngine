@@ -348,7 +348,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         allocator = frameAllocator
         let made = try PlanarFrameFinisher(device: device)
         finisher = made
-        filmCadence = FilmCadence(timeBase: timeBase)
+        filmCadence = AetherEngine.filmDetection ? FilmCadence(timeBase: timeBase) : nil
         if deinterlaces {
             window = BwdifWindow(timeBase: timeBase, fieldRate: deinterlaceConfig.fieldRate == .field)
             // A stream that declares interlacing compiles the deinterlacer's pipeline now, off this thread, so its first
