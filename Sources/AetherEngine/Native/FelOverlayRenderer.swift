@@ -291,7 +291,7 @@ public final class FelOverlayRenderer: @unchecked Sendable {
             frameIndex &+= 1
             let generation = self.generation
             let shownTime = frameTime
-            let rpu = frame.composedRpu
+            let rpu = DoviComposedRpuOverride.rpu(forComposed: frame.composedRpu)
             let composeStart = CACurrentMediaTime()
             // Stamped half a refresh before the refresh it was chosen for: that refresh, and no other, shows it.
             let presentation = CMTime(seconds: presentAt - duration / 2, preferredTimescale: 1_000_000_000)
