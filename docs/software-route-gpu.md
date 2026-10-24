@@ -109,7 +109,7 @@ path with exact rounding, block threads, luma table), `3df7eaa6` (the colour doc
 
 ## Part 3. libdav1d into the slabs (open)
 
-FFmpeg's libdav1d wrapper allocates through its own `av_buffer_pool_init(size, NULL)` (`libavcodec/libdav1d.c:77`,
+FFmpeg's libdav1d wrapper allocates through its own `av_buffer_pool_init(size, NULL)` (`libavcodec/libdav1d.c:92`,
 plain `av_malloc`) and never calls `get_buffer2`, so AV1 pictures are still copied into a slab today.
 
 1. FFmpegBuild patch (`patches/`): `libdav1d_picture_allocator` asks `avctx->get_buffer2` for a picture of the
@@ -144,7 +144,7 @@ fails, and `DeinterlaceMode.software`.
 ## Part 5. AV1 film grain on the GPU (open)
 
 dav1d applies film grain on the CPU by default, writing a second, grained picture. Set
-`AV_CODEC_EXPORT_DATA_FILM_GRAIN` (the wrapper then sets `apply_grain = 0`, `libdav1d.c:231`) and apply the grain in
+`AV_CODEC_EXPORT_DATA_FILM_GRAIN` (the wrapper then turns dav1d's `apply_grain` off, `libdav1d.c:231`) and apply the grain in
 the finisher. AV1 specifies the synthesis exactly (section 7.18.3, its pseudo-random generator included): the CPU
 builds the per-frame grain templates, the kernel applies them per 32x32 block, and the result must match dav1d's
 own grain bit for bit on test streams.
@@ -154,7 +154,7 @@ own grain bit for bit on test streams.
 - **Zero-copy rawvideo** by allocating its packets in slabs. Worth it only if a local or loopback producer ever feeds
   raw frames (then the copy is 300 to 750 MB/s, not bounded by the network).
 - **A GPU bwdif** port, as a quality upgrade over yadif.
-- **XYZ (MC 11, ST 428 primaries)**: showing it is a gamut conversion, not a representation change; refused today.
+- **XYZ (ST 428 primaries) and MatrixCoefficients 11 / 15**: showing them is a gamut or model conversion, not a representation change; refused today.
 
 ## Open questions
 
