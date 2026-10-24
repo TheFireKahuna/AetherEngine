@@ -4984,7 +4984,7 @@ public final class AetherEngine: ObservableObject {
         // and seekable only, the sample moves the read position of the demuxer the session reuses.
         var filmRate: Double?
         loadFilmCarriage = nil
-        if probeOpened, !options.isLive, probe.isSourceSeekable, probe.videoStreamIndex >= 0,
+        if Self.filmDetection, probeOpened, !options.isLive, probe.isSourceSeekable, probe.videoStreamIndex >= 0,
            Self.carriesSoftTelecine(codecID: detectedCodecID, contentRate: detectedRate) {
             let videoIdx = probe.videoStreamIndex
             let rate = await BlockingWork.detached(priority: .userInitiated) { [probe] () -> AVRational? in
@@ -5006,7 +5006,7 @@ public final class AetherEngine: ObservableObject {
         }
         // Hard telecine and progressive-segmented film (6.2 - 6.4): film whose cadence is in the pixels. The same kind of
         // sample, measured as fieldmatch and decimate measure it; 3:2 plays at 4/5 of the carriage rate, 2:2 at it.
-        if filmRate == nil, probeOpened, !options.isLive, probe.isSourceSeekable, probe.videoStreamIndex >= 0,
+        if filmRate == nil, Self.filmDetection, probeOpened, !options.isLive, probe.isSourceSeekable, probe.videoStreamIndex >= 0,
            Self.mayCarryFilm(codecID: detectedCodecID, fieldOrder: detectedFieldOrder, contentRate: detectedRate) {
             let videoIdx = probe.videoStreamIndex
             let film = await BlockingWork.detached(priority: .userInitiated) { [probe] () -> FilmCarriage? in
