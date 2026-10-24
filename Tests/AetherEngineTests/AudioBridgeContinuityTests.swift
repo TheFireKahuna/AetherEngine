@@ -24,7 +24,9 @@ struct AudioBridgeContinuityTests {
         av_channel_layout_default(&par.pointee.ch_layout, 2)
         par.pointee.bits_per_coded_sample = 16
         par.pointee.block_align = 4
-        return (try AudioBridge(srcCodecpar: par, srcTimeBase: Self.timeBase, mode: .lossless), par)
+        let bridge = try AudioBridge(srcCodecpar: par, srcTimeBase: Self.timeBase, mode: .lossless)
+        bridge.setSourceStart(0)
+        return (bridge, par)
     }
 
     /// A packet of `samples` frames stamped `pts` (sample units); `bytes` overrides the size, for a

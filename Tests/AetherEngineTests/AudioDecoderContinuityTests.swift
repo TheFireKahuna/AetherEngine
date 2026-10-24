@@ -25,6 +25,7 @@ struct AudioDecoderContinuityTests {
         par.pointee.bits_per_coded_sample = 16
         par.pointee.block_align = 4
         stream.pointee.time_base = timeBase
+        stream.pointee.start_time = 0
         return (ctx, stream)
     }
 

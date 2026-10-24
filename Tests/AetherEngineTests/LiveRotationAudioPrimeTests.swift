@@ -94,6 +94,7 @@ struct LiveRotationAudioPrimeTests {
                 mode: .surroundCompat,
                 forcedEncoder: AV_CODEC_ID_EAC3
             )
+            bridge.setSourceStart(0)
             self.bridge = bridge
             while let packet = try audioDemuxer.readPacket() {
                 var p: UnsafeMutablePointer<AVPacket>? = packet

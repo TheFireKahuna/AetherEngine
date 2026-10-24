@@ -105,6 +105,7 @@ struct Issue396SilentAudioBridgeTests {
         defer { freeAll(&packets); demuxer.close() }
 
         let bridge = try AudioBridge(srcCodecpar: codecpar, srcTimeBase: tb, mode: .surroundCompat)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
 
         var outputs: [UnsafeMutablePointer<AVPacket>] = []
@@ -131,6 +132,7 @@ struct Issue396SilentAudioBridgeTests {
         let bridge = try AudioBridge(srcCodecpar: codecpar,
                                      srcTimeBase: AVRational(num: 1, den: 1000),
                                      mode: .surroundCompat)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
 
         var packets = makeUndecodablePackets(count: 80)
@@ -183,6 +185,7 @@ struct Issue396SilentAudioBridgeTests {
         let bridge = try AudioBridge(srcCodecpar: codecpar,
                                      srcTimeBase: AVRational(num: 1, den: 1000),
                                      mode: .surroundCompat)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
 
         let engine = makeEngine()
@@ -205,6 +208,7 @@ struct Issue396SilentAudioBridgeTests {
         defer { freeAll(&packets); demuxer.close() }
 
         let bridge = try AudioBridge(srcCodecpar: codecpar, srcTimeBase: tb, mode: .surroundCompat)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         var outputs: [UnsafeMutablePointer<AVPacket>] = []
         defer { freeAll(&outputs) }
@@ -275,6 +279,7 @@ struct Issue396SilentAudioBridgeTests {
         let bridge = try AudioBridge(srcCodecpar: codecpar,
                                      srcTimeBase: AVRational(num: 1, den: 48_000),
                                      mode: .surroundCompat)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         #expect(bridge.outputCodecID == AV_CODEC_ID_FLAC,
                 "precondition: the default mode encodes a stereo source to FLAC")
@@ -305,6 +310,7 @@ struct Issue396SilentAudioBridgeTests {
         let bridge = try AudioBridge(srcCodecpar: codecpar,
                                      srcTimeBase: AVRational(num: 1, den: 48_000),
                                      mode: .surroundCompat)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
 
         var packets = makeTrueHDShapedPCMPackets(count: 400)
@@ -328,6 +334,7 @@ struct Issue396SilentAudioBridgeTests {
         let bridge = try AudioBridge(srcCodecpar: codecpar,
                                      srcTimeBase: AVRational(num: 1, den: 1000),
                                      mode: .surroundCompat)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
 
         var packets = makeUndecodablePackets(count: 80)
@@ -431,6 +438,7 @@ struct Issue396SilentAudioBridgeTests {
         let bridge = try AudioBridge(srcCodecpar: codecpar,
                                      srcTimeBase: AVRational(num: 1, den: 1000),
                                      mode: .surroundCompat)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         let verdict = DecoderVerdict()
         bridge.onDecoderProducedNothing = { verdict.set($0) }

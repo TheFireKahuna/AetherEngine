@@ -91,23 +91,19 @@ struct Issue464MuxerDelayTicksTests {
 @Suite("AE#464 why the obvious places are wrong")
 struct Issue464PlacementRationaleTests {
 
-    @Test("the gapless clock absorbs a sub-100 ms step, so an offset upstream of it would vanish")
-    func gaplessAnchorSwallowsASmallOffset() {
-        // The naive software implementation adds the delay to the container PTS before stamping.
-        // AudioClockAnchor keeps predicting from its own sample count unless the decoder's continuity
-        // rule asks it to re-anchor, so a nudged container PTS alone changes nothing (and, read by that
-        // rule, would be a source gap, not a delay). The delay is a retime in AudioOutput instead.
-        var clock = AudioClockAnchor()
-        let rate: Int32 = 48000
-        let first = CMTime(value: 0, timescale: rate)
-        let (p0, r0) = clock.resolve(startPTS: first, sampleRate: rate)
-        clock.commit(pts: p0, reanchor: r0, sampleCount: 1024)
-
-        let naturalNext = CMTime(value: 1024, timescale: rate)
-        let nudged = CMTimeAdd(naturalNext, CMTime(seconds: 0.05, preferredTimescale: rate))
-        let (p1, r1) = clock.resolve(startPTS: nudged, sampleRate: rate)
-        #expect(!r1, "the clock does not re-anchor on its own")
-        #expect(p1 == naturalNext, "the offset was absorbed: the stamped PTS is the predicted one")
+    @Test("an offset upstream of the grid is rounding or a splice, never a delay")
+    func gridReadsAnUpstreamOffsetAsRoundingOrASplice() {
+        // The naive software implementation adds the delay to the container PTS before the decoder
+        // places its frames. On the stream's grid a timestamp within half a tick of a grid point is
+        // rounding, so a small nudge is absorbed without a trace; a larger one allows no point of the
+        // run and reads as a cut in the source, a new run, not a delay. The delay is a retime in
+        // AudioOutput instead.
+        var grid = SourceGrid(origin: 0, step: 1024, tolerance: 25)
+        _ = grid.place(relative: 1024, estimate: 1024)
+        let small = grid.place(relative: 2048, estimate: 2048 + 20)
+        #expect(small.0 == .position(2048) && !small.restarted, "a sub-tick nudge is absorbed")
+        let large = grid.place(relative: 3072, estimate: 3072 + 2400)
+        #expect(large.restarted, "a 50 ms nudge reads as a splice")
     }
 
     @Test("a backwards audio step is clamped away, so a smaller offset cannot be spliced mid-track")

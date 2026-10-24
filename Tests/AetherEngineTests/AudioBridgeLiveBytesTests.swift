@@ -67,6 +67,7 @@ struct AudioBridgeLiveBytesTests {
         }
         let bridge = try AudioBridge(srcCodecpar: codecpar, srcTimeBase: AVRational(num: 1, den: 1000),
                                      mode: .surroundCompat)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
 
         let finished = Flag()
@@ -115,6 +116,7 @@ struct AudioBridgeLiveBytesTests {
         }
         let bridge = try AudioBridge(srcCodecpar: codecpar, srcTimeBase: AVRational(num: 1, den: 1000),
                                      mode: .surroundCompat)
+        bridge.setSourceStart(0)
         for i in 0..<3 {
             guard let pkt = makeFrame(rate48k: true, pts: Int64(i) * 24) else { continue }
             free((try? bridge.feed(packet: pkt)) ?? [])

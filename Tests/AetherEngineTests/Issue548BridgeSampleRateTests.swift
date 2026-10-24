@@ -93,6 +93,7 @@ struct Issue548BridgeSampleRateTests {
         let bridge = try AudioBridge(srcCodecpar: codecpar,
                                      srcTimeBase: AVRational(num: 1, den: 96_000),
                                      mode: .surroundCompat)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
 
         #expect(bridge.encoderCodecpar?.pointee.codec_id == AV_CODEC_ID_EAC3)
@@ -107,6 +108,7 @@ struct Issue548BridgeSampleRateTests {
         defer { freeAll(&packets); demuxer.close() }
 
         let bridge = try AudioBridge(srcCodecpar: codecpar, srcTimeBase: tb, mode: .surroundCompat)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
 
         var outputs: [UnsafeMutablePointer<AVPacket>] = []
@@ -129,6 +131,7 @@ struct Issue548BridgeSampleRateTests {
         let bridge = try AudioBridge(srcCodecpar: codecpar,
                                      srcTimeBase: AVRational(num: 1, den: 96_000),
                                      mode: .lossless)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
 
         #expect(bridge.encoderCodecpar?.pointee.codec_id == AV_CODEC_ID_FLAC)
