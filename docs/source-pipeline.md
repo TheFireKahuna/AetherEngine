@@ -1,7 +1,8 @@
 # Source pipeline: every byte once, every index once, every output on demand
 
 Status: in progress, written 2026-10-24 against `research/12bit-fel` at `a7a725e8` and the tvOS 27.2
-SDK (Xcode 27.2), brought up to `503c69f5`. Layers 1 and 2 are built (layer 2 for Matroska and MP4);
+SDK (Xcode 27.2), brought up to `503c69f5`, then the cache's validators, write bound and budget
+review and the index's lifetime. Layers 1 and 2 are built (layer 2 for Matroska and MP4);
 MPEG-TS has no index and is handled on its own terms (its section below), including programs that
 change mid-stream; layer 3 is the remaining work. Each section says what is done, which tests hold
 it, what is not yet ideal with the steps to get there, and what still waits for a device run.
@@ -54,7 +55,8 @@ engine should answer each request by reading exactly the bytes it needs, once, a
 | Piece | File | What it does |
 |---|---|---|
 | `EngineHTTP.session` | `Network/EngineHTTP.swift` | The one URLSession for every engine fetch: the pump, chunk and detour reads, probes, the tail prefetch, the streaming GET, the prewarm, the indexed subtitle reader, the disc reader, both HLS ingest readers, the audio tap, the carriage probe, the remote subtitle proxy, live subtitle renditions, the origin relay. The idle timeout rides each request; the resource ceiling is a per-task deadline (`armResourceDeadline`, reported as `URLError(.timedOut)` by `BoundedFetch`); teardown ends an owner's own tasks (`EngineHTTPRequests`). One serial user-initiated callback queue. |
-| `SourceByteCache` | `Demuxer/SourceByteCache.swift` | Every network delivery is kept, per source, in a sparse file in tmp. LRU by 4 MB block with `F_PUNCHHOLE`, budgeted through `RetentionClaims` beside the segment caches (up to 4 GiB or a quarter of free space). Read-your-writes: a stored range is servable at once, from memory until its write lands. The kernel's page cache is the memory tier. Also holds per source the total size and the resolved redirect target. |
+| `SourceByteCache` | `Demuxer/SourceByteCache.swift` | Every network delivery is kept, per source, in a sparse file in tmp. LRU by 4 MB block with `F_PUNCHHOLE`, budgeted through `RetentionClaims` beside the segment caches (up to 4 GiB or a quarter of free space), sized again every 256 MB written (`reviewBudget`, `RetentionClaims.Claim.resize`). Read-your-writes: a stored range is servable at once, from memory until its write lands. The kernel's page cache is the memory tier. Nothing is dropped: past 64 MB of pending writes, readers hold their next request until the disk catches up (`waitForWriteRoom`). Also holds per source the body its bytes are from and the resolved redirect target, and tells the index registry when a source goes (`observeReleases`). |
+| `SourceVersion` | `Demuxer/ByteSpanSet.swift` | Which body a response came from: its total size, `ETag` and `Last-Modified`, compared only where both sides state a field. Every response whose bytes are kept is noted (`noteVersion`): another body drops what was held. Every delivery is stored with its response's version, and one from another body than the recorded one is not kept. |
 | `SourceCacheKey` | `Demuxer/ByteSpanSet.swift` | What makes bytes shareable: the credential-free URL plus a SHA-256 of the credentials and request headers. Readers of one session share; another user, token or header set never does (the #551 rule). |
 | `SourceByteLedger` | `Demuxer/SourceByteLedger.swift` | Per source and per reader: fetched, unique, duplicate, discarded, served from cache. One line per reader close when the books changed, and a final line per source. |
 | `RangeReadableIOReader` | `IO/IOReader.swift` | Exact range reads, concurrent, no cursor. `HTTPDiscIOReader` serves held bytes and fetches exactly the gaps; one reader serves all twelve indexed-subtitle lanes. |
@@ -84,6 +86,8 @@ releases what no session is reading.
 | A return to the head, before or after the index pass or a move away, costs no request (#281, AE#585) | `Issue281ColdStartRoundTripTests`, `Issue585IndexPassKeepsTheHeadTests` |
 | A backward read into unfetched bytes keeps the detour and restart policies (#69, AE#782, DMX-105) | `Issue782RestartReanchorTests`, `DetourOriginTicketTests` |
 | The books are right | `SourceByteLedgerTests` |
+| Another body (`ETag`, `Last-Modified`, size) drops what was held, and a stale delivery is not kept; the pump does not replay a held span of a replaced file; a range reader drops the old body at its first response | `SourceByteCacheTests` (versions, `pumpDoesNotReplayAReplacedFile`, `rangeReaderDropsAReplacedFile`) |
+| Writes past the pending bound are all kept, and a request waits for the disk; the budget is sized again as the cache writes and evicts down to it | `SourceByteCacheTests`, `Issue687RetentionClaimsTests.resizeCountsOwnWritesBack` |
 
 ### On device
 
@@ -104,24 +108,36 @@ releases what no session is reading.
      the relay and the ingest read a segment once.
    - Where the tap duplicates AVPlayer on the bypass, have it read what AVPlayer was served (through
      the relay, which already sits between them when trust requires it) rather than fetch again.
-2. **The cache trusts size and headers, not the body's version.** A file replaced on the server with
-   one of the same size, inside the five-minute grace, would be served stale.
-   - Record `ETag` and `Last-Modified` from the first response per source; a reader whose response
-     disagrees invalidates the source exactly as a size change does (`noteTotalSize`).
+2. **The cache trusts size and headers, not the body's version. Done.** A source records the body its
+   bytes are from (`SourceVersion`). Every response whose bytes are kept is noted where it arrives:
+   the pump's connection response, the size probes and the HEAD fallback, the detour, chunk, tail and
+   streaming fetches, the range reader's GETs, the prewarm. A response stating another `ETag`,
+   `Last-Modified` or size drops what was held (and the source's index with it), and a delivery
+   from another body than the recorded one (a connection answered before the replacement) is not
+   kept. The #551 adoption check compares the whole version, not just the size.
+   - Left: an open that adopts the cache's bytes asks the origin nothing, so it reads what the cache
+     holds until its first network response (the pump's first range past the held head, a range
+     reader's first gap). A replacement is caught there, after the old head was read. Inside the
+     five-minute grace only; closing it would cost the round trip the adoption exists to save.
 3. **Small held spans are fetched through.** The pump splits a range around a held span only when
    the span is worth a split: `AVIOReader.heldSpanWorthASplit(bytesPerSecond:firstDataMs:)`, the bytes
    the link moves in one round trip (64 KB floor; 256 KB until a rate is measured). A span below that
    is cheaper to fetch through than to wait a round trip for, so subtitle blocks the index read ahead
    of the pump can still be fetched again. Tiny, and now the right trade by the link's own numbers.
    - Layer 3 removes the reads ahead of the pump that leave these spans.
-4. **Writes can be dropped.** Past 64 MB of pending writes the cache drops new ones (a fast link
-   outrunning the disk), and a dropped range can be fetched again.
-   - Count dropped bytes in the ledger. If they ever show, back-pressure the writer (the delivery
-     callbacks) instead of dropping.
-5. **The budget is sized once.** The shared claim is computed at first use from free space then; it is
-   not revisited if the disk fills during a long session.
-   - Re-size on the segment caches' own schedule through `RetentionClaims`, evicting down to the new
-     claim.
+4. **Writes can be dropped. Done.** A store now never drops and never blocks. Past 64 MB of pending
+   writes, a reader waits before it sends its next request (`waitForWriteRoom`: the pump's connection
+   start, every short fetch through `syncRequest`, each range GET of the range reader), so a link
+   faster than the disk is slowed to the disk. The wait is not in the delivery callback, which has
+   no flow control to push back with (#174: CFNetwork keeps reading into its own buffers), so the
+   queue can exceed the bound by what is already in flight. The write queue runs at the readers'
+   priority: utility I/O is throttled behind theirs, which is how it could fall behind at all.
+   `[SourceCache] ... released: ..., requests waited N ms for the disk` says if it ever happens.
+   - Left: the prewarm does not wait (async, a few bounded ranges).
+5. **The budget is sized once. Done.** The shared claim is sized again every 256 MB the cache writes,
+   from the free space then plus what the cache has written (the measurement no longer counts it)
+   less what other claims have yet to write, and the cache evicts down to it. Segment caches still
+   size once per session, which is their lifetime.
 6. **Fixed fetch sizes where exact would do. Done.** `IO/ReadAhead.swift` sizes the chunk path to the
    read (a floor, doubling on sequential continuation up to a ceiling), and a detour fetches from the
    read offset starting at 256 KB and growing to 4 MB (`ExactFetchSizeTests`). Layer 3 replaces the
@@ -160,7 +176,7 @@ the index lists every stream completely (`SubtitleForwardPrefetcher.IndexSource`
 
 | Guarantee | Tests |
 |---|---|
-| Twelve racing consumers, one parse; a later consumer, no parse; source and size name the index | `SourceIndexRegistryTests` |
+| Twelve racing consumers, one parse; a later consumer, no parse; source and size name the index; an index goes with its source (grace, idle release, another body) and is kept only while the cache holds the source | `SourceIndexRegistryTests` |
 | The index prefetch stores the same packets the walk would, in one time order, re-anchors in place, ends a dropped connection as a read failure, is all or nothing | `SubtitleIndexPrefetchTests` |
 | An MP4 sample read from the index is the packet `av_read_frame` hands over (bytes, time, duration), an empty edit included; the prefetch from it stores what its walk stores; an edit-list cut or a fragmented file is refused | `MP4SampleIndexTests` (fixtures made by ffmpeg and MP4Box, embedded) |
 | The walk's contract is unchanged through the one loop | `Issue151SubtitleForwardPrefetchTests`, `Issue230PrefetchReadPositionParkTests`, `Issue231PrefetchRestartTests`, `Issue234SideReaderSeekAnchorTests`, `Issue240SideReaderLinkPriorityTests` |
@@ -186,9 +202,13 @@ the index lists every stream completely (`SubtitleForwardPrefetcher.IndexSource`
    no Cues, a bzlib/lzo or encrypted track, a codec outside the index's `packetCodecs` (DVD and DVB
    bitmaps, whose packet parity with FFmpeg is unverified; in an MP4 anything but mov_text), a
    fragmented MP4 or an MP4 track its edit list cuts, and every MPEG-TS source (step 1).
-4. **The index outlives its source.** The registry keeps eight indexes, least recently asked for out;
-   it is not tied to the source cache's lifetime.
-   - Release an index with its source (`SourceByteCache` release), so the two share one lifetime.
+4. **The index outlives its source. Done.** The registry keeps an index while the source cache holds
+   its source at that size: while a reader has it open, through the grace after the last close (so a
+   reload or a track switch finds it), and no longer once the source is let go
+   (`SourceByteCache.observeReleases`: the grace, `releaseIdleSources`, another body). The cap of
+   eight is gone. A source the cache does not hold (a local file, a host's own reader) keeps its
+   index only while it is read, for the consumers racing for it; such a source is read once per
+   load, from disk.
 5. **"Parsed once" holds for the engine's parser, not for libavformat.** Every side demuxer (the
    I-frame reader, the prefetch's own open, the native subtitle readers, the still extractor, the
    Atmos confirmation and the Dolby Vision audit) parses the container header and its cues again: no
@@ -308,6 +328,12 @@ else; the ledger's per-reader lines should show exactly that.
   for what is hot. If the device measurement shows a regression, one generalised RAM tier in front of
   the cache is the fallback, not three.
 - **Sodalite keeps its own sessions** (see layer 1, item 8).
+- **The write bound holds requests, not deliveries.** The first version waited inside `store`, which
+  runs in the delivery callbacks; `appendPersistentData` records why that cannot work (#174, #220: a
+  delivery callback that blocks does not slow the transport, CFNetwork keeps reading into its own
+  buffers). The wait moved to where each reader sends its next request.
+- **An index's lifetime is its source's, not a count.** A cap of eight indexes kept one for hours
+  after its source went and could evict one a session was still using.
 - **`merge_pmt_versions` was measured and refused.** It keeps the old `AVStream` across a PMT change,
   which looks like the fix for a reader stuck on the old index, but `mpegts.c` updates the stream type
   before the check that would update the codec, so an H.264 to HEVC change carried on labelled H.264,
@@ -324,7 +350,10 @@ else; the ledger's per-reader lines should show exactly that.
 |---|---|
 | `[AVIOReader] origin transport: h3 over IPv6 at ...` | The connection's protocol and address family, once per origin |
 | `[SourceLedger] <source> <reader> closed: fetched ..., unique ..., duplicate ... (x%), served from cache ...; <reader> ... dup ... cache ...` | The books, per reader; the final line says `source done` |
-| `[SourceCache] <source> released: stored ..., served ... back to readers` | A source's cache going, after its grace |
+| `[SourceCache] <source> released: stored ..., served ... back to readers[, requests waited N ms for the disk]` | A source's cache going, after its grace; the wait only if the disk ever fell behind |
+| `[SourceCache] <source> is another body now (... -> ...); dropped what was held for it` | A response stated another size, `ETag` or `Last-Modified`: the file behind the request was replaced |
+| `[SourceCache] <source> write queue past 64 MB: requests wait for the disk; the first waited N ms` | The disk fell behind the link, once per process |
+| `[SourceCache] budget X MB -> Y MB (volume free Z MB)` | The claim sized again, when it moved by 64 MB or more |
 | `[AVIOReader] <reader> conn start ... from the source cache` | A pump range replayed from disk |
 | `[AVIOReader] <reader> source cache served the read at ...; no reconnect for it` | The first out-of-window read served from the cache, once per reader |
 | `#151 forward prefetch started from the index` / `walking the stream` | Which subtitle prefetch source a session got (Matroska or MP4 alike) |

@@ -131,3 +131,48 @@ struct SourceCacheKey: Hashable, Sendable {
         display = SourceIdentity.display(url)
     }
 }
+
+/// Which body of a source a response came from: its total length and the validators the origin sent
+/// with it (`ETag`, `Last-Modified`). The same request can be answered with another body once the
+/// file behind it is replaced, and a replacement of the same length is invisible to the size alone.
+/// A field is compared only where both sides know it: an origin that sends no validators is judged
+/// by its size, as before.
+struct SourceVersion: Equatable, Sendable {
+    var size: Int64?
+    var etag: String?
+    var lastModified: String?
+
+    init(size: Int64? = nil, etag: String? = nil, lastModified: String? = nil) {
+        self.size = size.flatMap { $0 > 0 ? $0 : nil }
+        self.etag = etag.flatMap { $0.isEmpty ? nil : $0 }
+        self.lastModified = lastModified.flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// The version `http` states, for a request that asked from `requestedOffset`: the total from its
+    /// `Content-Range`, or its length on a 2xx from the start (`AVIOReader.sizeFromResponse`).
+    init(_ http: HTTPURLResponse, requestedOffset: Int64) {
+        self.init(size: AVIOReader.sizeFromResponse(http, requestedOffset: requestedOffset),
+                  etag: http.value(forHTTPHeaderField: "ETag"),
+                  lastModified: http.value(forHTTPHeaderField: "Last-Modified"))
+    }
+
+    /// Whether the two cannot be one body: a field both know, differing.
+    func contradicts(_ other: SourceVersion) -> Bool {
+        func differ<T: Equatable>(_ a: T?, _ b: T?) -> Bool {
+            guard let a, let b else { return false }
+            return a != b
+        }
+        return differ(size, other.size) || differ(etag, other.etag) || differ(lastModified, other.lastModified)
+    }
+
+    /// What both say together, for versions that do not contradict each other.
+    func merged(with other: SourceVersion) -> SourceVersion {
+        SourceVersion(size: size ?? other.size, etag: etag ?? other.etag,
+                      lastModified: lastModified ?? other.lastModified)
+    }
+
+    var description: String {
+        [size.map { "\($0)B" }, etag.map { "ETag \($0)" }, lastModified.map { "Last-Modified \($0)" }]
+            .compactMap { $0 }.joined(separator: ", ")
+    }
+}

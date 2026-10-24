@@ -80,4 +80,21 @@ struct Issue687RetentionClaimsTests {
         }
         #expect(ring.bytes == PacketRingBuffer.minimumLiveByteBudget)
     }
+
+    /// The source cache lives as long as the process, so it is sized again as the disk fills.
+    @Test("A claim sized again counts its own writes back in and the others' unwritten claims out")
+    func resizeCountsOwnWritesBack() {
+        let ledger = RetentionClaims()
+        let other = session(ledger, free: 4 << 30)
+        let quarter: (Int64?) -> Int = { Int(($0 ?? 0) / 4) }
+        let cache = ledger.claim(volumeAvailableBytes: 3 << 30, sizing: quarter)
+        #expect(cache.bytes == 512 << 20, "3 GiB free, 1 GiB held back for the other")
+        cache.track { 256 << 20 }
+        // 1 GiB free now; this claim wrote 256 MB of what is gone, the other has written nothing.
+        #expect(cache.resize(volumeAvailableBytes: 1 << 30, sizing: quarter) == 64 << 20)
+        #expect(cache.bytes == 64 << 20)
+        // What it has written is past its new allowance, so nothing of it is held back for it.
+        let later = ledger.claim(volumeAvailableBytes: 1 << 30, sizing: quarter)
+        #expect(later.heldBackBytes == other.bytes)
+    }
 }

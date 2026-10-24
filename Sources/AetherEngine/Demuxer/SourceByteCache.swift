@@ -14,12 +14,18 @@ import Foundation
 /// gaps unallocated), with a `ByteSpanSet` saying which bytes are valid. Eviction is least recently
 /// used by `blockBytes` block and gives the space back with `F_PUNCHHOLE`. The budget is a claim on
 /// the same tmp-volume allowance the segment caches share (`RetentionClaims`), so the two never
-/// promise each other the same free space.
+/// promise each other the same free space, and it is sized again as the cache writes, since the disk
+/// can fill under a long session.
 ///
 /// A source is a `SourceCacheKey`: the credential-free URL plus a digest of how it is asked for, so
-/// bytes cross between readers of one session and never between users. Bytes are served only to a
-/// reader whose idea of the total size matches the size the cache recorded, and a size that changes
-/// drops what was held: the same request answering with a different length is a different body.
+/// bytes cross between readers of one session and never between users. Each source records the body
+/// its bytes are from (`SourceVersion`: the length, and the origin's `ETag` and `Last-Modified`). A
+/// response that states another body drops what was held, since the same request now answers with
+/// different bytes; a delivery from a response that states another body than the recorded one is
+/// not kept; and bytes are served only to a reader whose idea of the total size matches.
+///
+/// Whatever else is kept per source goes with it: `observeReleases` tells the source's index
+/// (`SourceIndexRegistry`) when the source is let go.
 ///
 /// A reader uses the cache only when it is handed one (`AVIOReader(sourceCache:)`,
 /// `HTTPDiscIOReader(sourceCache:)`): the engine's own construction sites pass `shared`, and a reader
@@ -37,11 +43,36 @@ final class SourceByteCache: @unchecked Sendable {
     /// How long a source's bytes outlive its last reader. A reload, a track switch or a resume from
     /// the detail page closes every reader and opens new ones moments later.
     static let releaseGraceSeconds: TimeInterval = 300
-    /// Bytes that may wait in memory for their write. Past it new writes are dropped (and fetched
-    /// again if needed): the cache must never become the thing that holds a gigabyte of RAM.
+    /// Bytes that may wait in memory for their write before readers hold their next request
+    /// (`waitForWriteRoom`): the cache must never become the thing that holds a gigabyte of RAM, and
+    /// a delivery it threw away would be fetched again by the next reader that wants it.
     static let maxPendingWriteBytes = 64 << 20
     /// Most the shared cache claims, whatever the volume has free.
     static let budgetCeilingBytes: Int64 = 4 << 30
+
+    /// How big the cache may grow.
+    enum Budget: Sendable {
+        /// A fixed size: a reader's own cache, and tests.
+        case fixed(Int64)
+        /// A claim beside the segment caches', sized again every `reviewEvery` bytes written.
+        case claimed(Allowance)
+    }
+
+    /// The shared cache's claim on the tmp volume: `sizing` over what `freeSpace` reports, less what
+    /// the other claims of `claims` have yet to write.
+    struct Allowance: Sendable {
+        let claims: RetentionClaims
+        let freeSpace: @Sendable () -> Int64?
+        let sizing: @Sendable (Int64?) -> Int
+        let reviewEvery: Int64
+
+        /// Up to `budgetCeilingBytes` or a quarter of the space left, reviewed every 256 MB written
+        /// (about half a minute of an 80 Mbit/s film fetched at its bitrate).
+        static let shared = Allowance(
+            claims: .shared, freeSpace: { RetentionClaims.tmpVolumeAvailableBytes() },
+            sizing: { left in Int(min(SourceByteCache.budgetCeilingBytes, (left ?? SourceByteCache.budgetCeilingBytes) / 4)) },
+            reviewEvery: 256 << 20)
+    }
 
     private final class Source: @unchecked Sendable {
         let fd: Int32
@@ -56,7 +87,8 @@ final class SourceByteCache: @unchecked Sendable {
         var visible = ByteSpanSet()
         /// Block index to the tick it was last written or read.
         var blockUse: [Int64: UInt64] = [:]
-        var totalSize: Int64?
+        /// The body the held bytes are from.
+        var version = SourceVersion()
         /// Where the source's bytes were actually served from, redirects followed (#551 round 2):
         /// a reader that pins it does not pay the resolver's 302 again.
         var resolvedURL: URL?
@@ -67,6 +99,8 @@ final class SourceByteCache: @unchecked Sendable {
         var release: DispatchWorkItem?
         var servedBytes: Int64 = 0
         var storedBytes: Int64 = 0
+        /// How long this source's readers held a request for the disk (`waitForWriteRoom`).
+        var writeWaitNanos: UInt64 = 0
 
         init?(directory: URL) {
             path = directory.appending(path: UUID().uuidString + ".bin").path
@@ -85,18 +119,25 @@ final class SourceByteCache: @unchecked Sendable {
     private let directory: URL
     /// A cache made for one reader removes its directory with itself.
     private let removesDirectory: Bool
-    private let byteBudget: Int64
+    private var byteBudget: Int64
     private let releaseGrace: TimeInterval
+    private let allowance: Allowance?
     private let claim: RetentionClaims.Claim?
-    private let lock = NSLock()
+    private let pendingWriteBound: Int
+    /// The cache's one lock, and the condition a reader waiting for the disk waits on.
+    private let lock = NSCondition()
     private var sources: [SourceCacheKey: Source] = [:]
     private var heldBytes: Int64 = 0
     private var pendingWriteBytes = 0
     private var nextPendingID: UInt64 = 0
     private var clock: UInt64 = 0
-    private var droppedWriteLogged = false
+    private var storedSinceReview: Int64 = 0
+    private var writeWaitLogged = false
     private var directoryReady = false
-    private let writeQueue = DispatchQueue(label: "aether.source-cache.write", qos: .utility)
+    private var releaseObservers: [@Sendable (SourceCacheKey) -> Void] = []
+    /// Readers wait on it once the queue is full, and they read at playback priority: a queue below
+    /// theirs would be the thing they wait for, and utility I/O is throttled behind theirs.
+    private let writeQueue = DispatchQueue(label: "aether.source-cache.write", qos: .userInitiated)
     private let releaseQueue = DispatchQueue(label: "aether.source-cache.release", qos: .utility)
 
     /// The shared cache: the engine's own directory, emptied of whatever an earlier process left, and
@@ -105,21 +146,26 @@ final class SourceByteCache: @unchecked Sendable {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "aether-source-cache", directoryHint: .isDirectory)
         try? FileManager.default.removeItem(at: directory)
-        let claim = RetentionClaims.shared.claim(
-            volumeAvailableBytes: RetentionClaims.tmpVolumeAvailableBytes()
-        ) { left in
-            Int(min(Self.budgetCeilingBytes, (left ?? Self.budgetCeilingBytes) / 4))
-        }
-        self.init(directory: directory, byteBudget: Int64(claim.bytes), claim: claim)
+        self.init(directory: directory, budget: .claimed(.shared))
     }
 
-    init(directory: URL, byteBudget: Int64, claim: RetentionClaims.Claim? = nil,
-         releaseGrace: TimeInterval = SourceByteCache.releaseGraceSeconds, removesDirectory: Bool = false) {
+    init(directory: URL, budget: Budget, releaseGrace: TimeInterval = SourceByteCache.releaseGraceSeconds,
+         pendingWriteBound: Int = SourceByteCache.maxPendingWriteBytes, removesDirectory: Bool = false) {
         self.directory = directory
         self.removesDirectory = removesDirectory
-        self.byteBudget = max(0, byteBudget)
         self.releaseGrace = releaseGrace
-        self.claim = claim
+        self.pendingWriteBound = pendingWriteBound
+        switch budget {
+        case .fixed(let bytes):
+            byteBudget = max(0, bytes)
+            allowance = nil
+            claim = nil
+        case .claimed(let allowance):
+            let claim = allowance.claims.claim(volumeAvailableBytes: allowance.freeSpace(), sizing: allowance.sizing)
+            byteBudget = Int64(claim.bytes)
+            self.allowance = allowance
+            self.claim = claim
+        }
         claim?.track { [weak self] in self.map { Int($0.heldBytesSnapshot) } ?? 0 }
     }
 
@@ -132,7 +178,7 @@ final class SourceByteCache: @unchecked Sendable {
             directory: FileManager.default.temporaryDirectory
                 .appending(path: "aether-reader-cache", directoryHint: .isDirectory)
                 .appending(path: UUID().uuidString, directoryHint: .isDirectory),
-            byteBudget: scopedBudgetBytes, releaseGrace: 0, removesDirectory: true)
+            budget: .fixed(scopedBudgetBytes), releaseGrace: 0, removesDirectory: true)
     }
 
     static let scopedBudgetBytes: Int64 = 64 << 20
@@ -158,27 +204,43 @@ final class SourceByteCache: @unchecked Sendable {
         scheduleReleaseLocked(key, source)
     }
 
-    /// The total size a reader learned for `url`. A different size from the one recorded means a
-    /// different body behind the same URL, and everything held for it goes.
-    func noteTotalSize(_ size: Int64, for key: SourceCacheKey) {
-        guard size > 0 else { return }
-        lock.lock(); defer { lock.unlock() }
-        guard let source = sourceLocked(key, create: true) else { return }
-        if let known = source.totalSize, known != size {
-                heldBytes -= source.spans.totalBytes
-            guard let fresh = Source(directory: directory) else { sources[key] = nil; return }
-            fresh.totalSize = size
-            fresh.openReaders = source.openReaders
-            source.release?.cancel()
-            sources[key] = fresh
-            scheduleReleaseLocked(key, fresh)
-            EngineLog.emit(
-                "[SourceCache] \(key.display) changed size \(known) -> \(size); "
-                + "dropped what was held for it", category: .demux)
+    /// What a response says about the body behind `key`: its size, its validators. One that cannot
+    /// be the recorded body means the file behind the request was replaced, and everything held for
+    /// it goes, with whatever is kept beside it (`observeReleases`).
+    func noteVersion(_ version: SourceVersion, for key: SourceCacheKey) {
+        guard version != SourceVersion() else { return }
+        lock.lock()
+        guard let source = sourceLocked(key, create: true) else { lock.unlock(); return }
+        guard source.version.contradicts(version) else {
+            source.version = source.version.merged(with: version)
+            scheduleReleaseLocked(key, source)
+            lock.unlock()
             return
         }
-        source.totalSize = size
-        scheduleReleaseLocked(key, source)
+        let was = source.version
+        heldBytes -= source.spans.totalBytes
+        source.release?.cancel()
+        if let fresh = Source(directory: directory) {
+            fresh.version = version
+            fresh.openReaders = source.openReaders
+            sources[key] = fresh
+            scheduleReleaseLocked(key, fresh)
+        } else {
+            sources[key] = nil
+        }
+        let observers = releaseObservers
+        lock.unlock()
+        EngineLog.emit(
+            "[SourceCache] \(key.display) is another body now (\(was.description) -> \(version.description)); "
+            + "dropped what was held for it", category: .demux)
+        for observer in observers { observer(key) }
+    }
+
+    /// `observer` is told each source the cache lets go: after its grace, by `releaseIdleSources`, or
+    /// when a response says it is another body now. Called outside the cache's lock.
+    func observeReleases(_ observer: @escaping @Sendable (SourceCacheKey) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        releaseObservers.append(observer)
     }
 
     /// Records where `key`'s bytes were served from, redirects followed; nil leaves what is known.
@@ -204,40 +266,48 @@ final class SourceByteCache: @unchecked Sendable {
     /// Lets go of every source no reader has open, now rather than after the grace: a host leaving the
     /// context its warms were made for (a sign-out, a server change).
     func releaseIdleSources() {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
+        var released: [SourceCacheKey] = []
         for (key, source) in sources where source.openReaders == 0 {
             source.release?.cancel()
             heldBytes -= source.spans.totalBytes
             sources[key] = nil
+            released.append(key)
         }
+        let observers = releaseObservers
+        lock.unlock()
+        for key in released { for observer in observers { observer(key) } }
     }
 
     /// The total size recorded for `url`, whichever reader learned it and under whichever token.
     func knownSize(_ key: SourceCacheKey) -> Int64? {
+        knownVersion(key)?.size
+    }
+
+    /// The body recorded for `key`: what a reader that adopts the cache's bytes without asking the
+    /// origin checks its first response against (#551).
+    func knownVersion(_ key: SourceCacheKey) -> SourceVersion? {
         lock.lock(); defer { lock.unlock() }
-        return sources[key]?.totalSize
+        return sources[key]?.version
     }
 
     // MARK: - Bytes
 
-    /// Keeps `data`, which a reader fetched for `url` at `offset`. Servable from the moment it is
-    /// stored (out of memory until its write lands); a write that would grow the queue past its bound
-    /// is dropped instead.
-    func store(_ data: Data, at offset: Int64, for key: SourceCacheKey) {
-        guard !data.isEmpty, offset >= 0, byteBudget > 0 else { return }
+    /// Keeps `data`, which a reader fetched for `key` at `offset` from a response that stated
+    /// `version`. Servable from the moment it is stored (out of memory until its write lands). A
+    /// delivery from another body than the recorded one is not kept: it came on a connection answered
+    /// before the file behind the request was replaced. Never blocks and never drops: it is called
+    /// from delivery callbacks, which have no flow control to push back with (#174), so the bound
+    /// is kept where readers send their next request (`waitForWriteRoom`).
+    func store(_ data: Data, at offset: Int64, version: SourceVersion, for key: SourceCacheKey) {
+        guard !data.isEmpty, offset >= 0 else { return }
         lock.lock()
-        guard let source = sourceLocked(key, create: true) else { lock.unlock(); return }
-        guard pendingWriteBytes + data.count <= Self.maxPendingWriteBytes else {
-            let first = !droppedWriteLogged
-            droppedWriteLogged = true
+        guard byteBudget > 0, let source = sourceLocked(key, create: true),
+              !source.version.contradicts(version) else {
             lock.unlock()
-            if first {
-                EngineLog.emit(
-                    "[SourceCache] write queue full (\(Self.maxPendingWriteBytes >> 20) MB pending); "
-                    + "dropping writes until it drains", category: .demux)
-            }
             return
         }
+        source.version = source.version.merged(with: version)
         pendingWriteBytes += data.count
         nextPendingID &+= 1
         let id = nextPendingID
@@ -249,11 +319,12 @@ final class SourceByteCache: @unchecked Sendable {
         writeQueue.async { [self] in
             let written = Self.writeAll(source.fd, data, at: offset)
             lock.lock()
-            defer { lock.unlock() }
             pendingWriteBytes -= data.count
+            lock.broadcast()
             source.pending.removeAll { $0.id == id }
             guard written, sources[key] === source else {
                 rebuildVisibleLocked(source)
+                lock.unlock()
                 return
             }
             let added = source.spans.insert(start: offset, end: offset + Int64(data.count))
@@ -261,6 +332,53 @@ final class SourceByteCache: @unchecked Sendable {
             source.storedBytes += added
             touchLocked(source, start: offset, end: offset + Int64(data.count))
             evictLocked()
+            storedSinceReview += added
+            let review = allowance.map { storedSinceReview >= $0.reviewEvery } ?? false
+            if review { storedSinceReview = 0 }
+            lock.unlock()
+            if review { reviewBudget() }
+        }
+    }
+
+    /// Sizes the claim again from the free space now and evicts down to it. The disk can fill under
+    /// a long session (another app, the segment caches), and a budget sized once at first use would
+    /// go on claiming space that is no longer there. Free space no longer counts what this cache has
+    /// written, so the claim adds it back (`RetentionClaims.Claim.resize`).
+    func reviewBudget() {
+        guard let allowance, let claim else { return }
+        let free = allowance.freeSpace()
+        let bytes = Int64(claim.resize(volumeAvailableBytes: free, sizing: allowance.sizing))
+        lock.lock()
+        let was = byteBudget
+        byteBudget = bytes
+        evictLocked()
+        lock.unlock()
+        if abs(bytes - was) >= Self.blockBytes * 16 {
+            EngineLog.emit(
+                "[SourceCache] budget \(Self.mb(was)) -> \(Self.mb(bytes)) "
+                + "(volume free \(free.map(Self.mb) ?? "unknown"))", category: .demux)
+        }
+    }
+
+    /// Blocks until the writes waiting in memory are back within their bound. A reader of `key`
+    /// calls it before each request it sends, on its own thread: what the disk has not yet taken
+    /// holds the next request back, so a link faster than the disk is slowed to it instead of the
+    /// cache growing without end or throwing deliveries away. What a request already in flight
+    /// delivers is kept whatever the queue holds.
+    func waitForWriteRoom(for key: SourceCacheKey) {
+        lock.lock()
+        guard pendingWriteBytes > pendingWriteBound else { lock.unlock(); return }
+        let began = DispatchTime.now().uptimeNanoseconds
+        while pendingWriteBytes > pendingWriteBound { lock.wait() }
+        let waited = DispatchTime.now().uptimeNanoseconds - began
+        sources[key]?.writeWaitNanos += waited
+        let first = !writeWaitLogged
+        writeWaitLogged = true
+        lock.unlock()
+        if first {
+            EngineLog.emit(
+                "[SourceCache] \(key.display) write queue past \(pendingWriteBound >> 20) MB: requests wait for "
+                + "the disk; the first waited \(waited / 1_000_000) ms", category: .demux)
         }
     }
 
@@ -363,6 +481,21 @@ final class SourceByteCache: @unchecked Sendable {
         return sources[key]?.spans.totalBytes ?? 0
     }
 
+    var pendingWriteBytesForTesting: Int {
+        lock.lock(); defer { lock.unlock() }
+        return pendingWriteBytes
+    }
+
+    var byteBudgetForTesting: Int64 {
+        lock.lock(); defer { lock.unlock() }
+        return byteBudget
+    }
+
+    func writeWaitNanosForTesting(_ key: SourceCacheKey) -> UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        return sources[key]?.writeWaitNanos ?? 0
+    }
+
     fileprivate var heldBytesSnapshot: Int64 {
         lock.lock(); defer { lock.unlock() }
         return heldBytes
@@ -379,7 +512,7 @@ final class SourceByteCache: @unchecked Sendable {
 
     private func servableLocked(_ key: SourceCacheKey, expectedSize: Int64?) -> Source? {
         guard let source = sources[key] else { return nil }
-        if let expectedSize, expectedSize > 0, let known = source.totalSize, known != expectedSize {
+        if let expectedSize, expectedSize > 0, let known = source.version.size, known != expectedSize {
             return nil
         }
         return source
@@ -418,13 +551,17 @@ final class SourceByteCache: @unchecked Sendable {
             }
             self.sources[key] = nil
             self.heldBytes -= source.spans.totalBytes
-            let stored = source.storedBytes, served = source.servedBytes
+            let stored = source.storedBytes, served = source.servedBytes, waited = source.writeWaitNanos
+            let observers = self.releaseObservers
             self.lock.unlock()
             if stored > 0 {
                 EngineLog.emit(
                     "[SourceCache] \(display) released: stored \(Self.mb(stored)), "
-                    + "served \(Self.mb(served)) back to readers", category: .demux)
+                    + "served \(Self.mb(served)) back to readers"
+                    + (waited > 0 ? ", requests waited \(waited / 1_000_000) ms for the disk" : ""),
+                    category: .demux)
             }
+            for observer in observers { observer(key) }
         }
         source.release = work
         releaseQueue.asyncAfter(deadline: .now() + releaseGrace, execute: work)

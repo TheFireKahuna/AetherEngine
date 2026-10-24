@@ -25,7 +25,7 @@ extension PrewarmSuites {
         private func freshCache() -> SourceByteCache {
             SourceByteCache(directory: FileManager.default.temporaryDirectory
                 .appending(path: "prewarm-adopt-\(UUID().uuidString)", directoryHint: .isDirectory),
-                            byteBudget: 64 << 20)
+                            budget: .fixed(64 << 20))
         }
 
         private func warm(_ server: ThrottledOriginServer, bytes: Int, into cache: SourceByteCache) async {

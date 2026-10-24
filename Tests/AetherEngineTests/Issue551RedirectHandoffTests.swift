@@ -27,7 +27,7 @@ extension PrewarmSuites {
         private func freshCache() -> SourceByteCache {
             SourceByteCache(directory: FileManager.default.temporaryDirectory
                 .appending(path: "prewarm-551r2-\(UUID().uuidString)", directoryHint: .isDirectory),
-                            byteBudget: 64 << 20)
+                            budget: .fixed(64 << 20))
         }
 
         private func read(_ reader: AVIOReader, upTo target: Int) -> Int {

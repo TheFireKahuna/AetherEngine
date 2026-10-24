@@ -274,8 +274,11 @@ struct MP4SampleIndexTests {
         let demuxer = try Self.open(Self.movText)
         defer { demuxer.close() }
         let reader = DataIOReader(data: Self.movText)
-        let outcome = await SourceIndexRegistry().index(of: URL(string: "https://media.example.com/a.mp4")!,
-                                                        headers: [:], demuxer: demuxer, through: reader)
+        let cache = SourceByteCache(directory: FileManager.default.temporaryDirectory
+            .appending(path: "mp4-index-\(UUID().uuidString)", directoryHint: .isDirectory), budget: .fixed(0),
+            removesDirectory: true)
+        let outcome = await SourceIndexRegistry(cache: cache).index(
+            of: URL(string: "https://media.example.com/a.mp4")!, headers: [:], demuxer: demuxer, through: reader)
         let index = try #require(outcome.index)
         let subtitles = demuxer.subtitleStreamIndices()
         let plan = SubtitleForwardPrefetcher.IndexSource.plan(
