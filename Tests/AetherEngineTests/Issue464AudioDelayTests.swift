@@ -94,9 +94,9 @@ struct Issue464PlacementRationaleTests {
     @Test("the gapless clock absorbs a sub-100 ms step, so an offset upstream of it would vanish")
     func gaplessAnchorSwallowsASmallOffset() {
         // The naive software implementation adds the delay to the container PTS before stamping.
-        // AudioClockAnchor reads anything below its discontinuity threshold as container rounding and
-        // keeps predicting from its own sample count, so a 50 ms nudge would produce no change at all
-        // and a host would report the setter as dead. This is that mechanism, stated.
+        // AudioClockAnchor keeps predicting from its own sample count unless the decoder's continuity
+        // rule asks it to re-anchor, so a nudged container PTS alone changes nothing (and, read by that
+        // rule, would be a source gap, not a delay). The delay is a retime in AudioOutput instead.
         var clock = AudioClockAnchor()
         let rate: Int32 = 48000
         let first = CMTime(value: 0, timescale: rate)
@@ -106,7 +106,7 @@ struct Issue464PlacementRationaleTests {
         let naturalNext = CMTime(value: 1024, timescale: rate)
         let nudged = CMTimeAdd(naturalNext, CMTime(seconds: 0.05, preferredTimescale: rate))
         let (p1, r1) = clock.resolve(startPTS: nudged, sampleRate: rate)
-        #expect(!r1, "a 50 ms step is below the discontinuity threshold, so it does not re-anchor")
+        #expect(!r1, "the clock does not re-anchor on its own")
         #expect(p1 == naturalNext, "the offset was absorbed: the stamped PTS is the predicted one")
     }
 

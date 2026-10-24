@@ -52,6 +52,13 @@ final class AudioDecoder: @unchecked Sendable {
     private(set) var channels: Int32 = 0
     /// The order the resampler writes and the tag stamped on it (see `ResamplerOutput`).
     private var output = ResamplerOutput(channels: 2)
+    /// The next buffer starts where its source says (`AudioContinuity`), not where the count does.
+    private var reanchorNext = false
+    /// Samples still to drop from the start of the next converted frames (an overlap).
+    private var pendingTrimSamples = 0
+    /// `AudioContinuity` placements, for tests and diagnostics.
+    private(set) var continuityGaps = 0
+    private(set) var continuityOverlaps = 0
 
     func open(stream: UnsafeMutablePointer<AVStream>) throws {
         guard let codecpar = stream.pointee.codecpar else {
@@ -76,6 +83,10 @@ final class AudioDecoder: @unchecked Sendable {
             throw AudioDecoderError.parameterCopyFailed
         }
 
+        // The packets' time base, so a decoder that trims priming (Opus pre-skip, a LAME header, an MP4
+        // edit list's AAC delay) moves the frame's pts past what it trimmed; without it the pts stays the
+        // packet's and the first audio played that much early.
+        ctx.pointee.pkt_timebase = stream.pointee.time_base
         guard openAudioDecoder(ctx, codec) >= 0 else {
             throw AudioDecoderError.openFailed
         }
@@ -111,6 +122,7 @@ final class AudioDecoder: @unchecked Sendable {
                 if let sampleBuffer = rebuildResampler(for: f) { results.append(sampleBuffer) }
                 if swrContext == nil { continue }
             }
+            placeAgainstSource(f, into: &results)
             appendFrameToPending(f)
             if pendingSampleCount >= Self.minSamplesPerBuffer {
                 if let sampleBuffer = emitPending() {
@@ -138,6 +150,8 @@ final class AudioDecoder: @unchecked Sendable {
             category: .swPlayback)
         swr_free(&swrContext)
         clock.reset()
+        reanchorNext = false
+        pendingTrimSamples = 0
         _ = initResamplerFromFrame(frame)
         return flushed
     }
@@ -219,6 +233,8 @@ final class AudioDecoder: @unchecked Sendable {
         resetPending()
         // Re-anchor the gapless clock to the post-seek PTS on the next emitted buffer.
         clock.reset()
+        reanchorNext = false
+        pendingTrimSamples = 0
         #if DEBUG
         _loggedZeroConvert = false
         #endif
@@ -360,14 +376,52 @@ final class AudioDecoder: @unchecked Sendable {
         }
         #endif
         guard convertedSamples > 0 else { return }
+        // An overlap `placeAgainstSource` found comes off the start of what this frame converted to.
+        let skip = min(pendingTrimSamples, Int(convertedSamples))
+        pendingTrimSamples -= skip
+        let kept = Int(convertedSamples) - skip
+        guard kept > 0 else { return }
 
         // First frame in a new accumulator captures the PTS; subsequent frames only extend the buffer.
         if pendingSampleCount == 0 {
-            pendingStartPTS = SourceTimestampBounds.cmTime(ticks: frame.pointee.pts, timeBase: timeBase)
+            pendingStartPTS = CMTimeAdd(SourceTimestampBounds.cmTime(ticks: frame.pointee.pts, timeBase: timeBase),
+                                        CMTime(value: Int64(skip), timescale: sampleRate))
         }
 
-        pendingBytes.append(tempBuffer, count: Int(convertedSamples) * bytesPerSample)
-        pendingSampleCount += Int(convertedSamples)
+        pendingBytes.append(tempBuffer + skip * bytesPerSample, count: kept * bytesPerSample)
+        pendingSampleCount += kept
+    }
+
+    /// Holds a decoded frame's own source time against where the count says it starts (what has been
+    /// emitted plus what is pending), and acts only where they disagree by more than the container can
+    /// state (`AudioContinuity`): a gap or a jump closes the pending buffer and starts the next one at
+    /// the frame's time, so the renderer leaves exactly that gap; an overlap comes off the frame's start.
+    private func placeAgainstSource(_ frame: UnsafeMutablePointer<AVFrame>,
+                                    into results: inout [CMSampleBuffer]) {
+        guard frame.pointee.pts != Int64.min, sampleRate > 0 else { return }
+        let expected: CMTime
+        if let next = clock.next(after: pendingSampleCount, sampleRate: sampleRate), !reanchorNext {
+            expected = next
+        } else if pendingSampleCount > 0, pendingStartPTS.isValid {
+            expected = CMTimeAdd(pendingStartPTS, CMTime(value: Int64(pendingSampleCount), timescale: sampleRate))
+        } else {
+            return
+        }
+        let actual = SourceTimestampBounds.cmTime(ticks: frame.pointee.pts, timeBase: timeBase)
+        let toSamples = { (t: CMTime) in CMTimeConvertScale(t, timescale: self.sampleRate, method: .roundHalfAwayFromZero).value }
+        let tolerance = AudioContinuity.tolerance(sourceTimeBase: timeBase, sampleRate: sampleRate)
+        switch AudioContinuity.decide(expected: toSamples(expected), actual: toSamples(actual),
+                                      tolerance: tolerance, sampleRate: sampleRate) {
+        case .continue:
+            return
+        case .gap, .jump:
+            if let buffer = emitPending() { results.append(buffer) }
+            reanchorNext = true
+            continuityGaps += 1
+        case .overlap(let samples):
+            pendingTrimSamples += Int(samples)
+            continuityOverlaps += 1
+        }
     }
 
     /// Build a CMSampleBuffer from the pending accumulator and reset it. Nil if nothing pending.
@@ -416,7 +470,7 @@ final class AudioDecoder: @unchecked Sendable {
         // consecutive buffers abut exactly, instead of from the container-quantized PTS (which leaves
         // +/-0.5 ms gaps and per-frame clicks for non-integer-ms frame durations). Committed only on
         // success below, so a dropped buffer never advances the clock.
-        let (outPTS, reanchor) = clock.resolve(startPTS: startPTS, sampleRate: sampleRate)
+        let (outPTS, reanchor) = clock.resolve(startPTS: startPTS, sampleRate: sampleRate, reanchor: reanchorNext)
 
         // Single timing entry: CoreMedia treats `duration` as per-SAMPLE, so LPCM must be 1/sampleRate. Stamping
         // the buffer total made GetDuration report totalSamples^2/sampleRate (~22s for 1024 samples), wedging
@@ -445,6 +499,7 @@ final class AudioDecoder: @unchecked Sendable {
         resetPending()
         guard status == noErr, let sample = sampleBuffer else { return nil }
         clock.commit(pts: outPTS, reanchor: reanchor, sampleCount: totalSamples)
+        reanchorNext = false
         return sample
     }
 

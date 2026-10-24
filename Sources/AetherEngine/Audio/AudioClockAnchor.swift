@@ -10,12 +10,12 @@ import CoreMedia
 /// (1536 samples = exactly 32 ms) is integer-ms so it never showed.
 ///
 /// Fix: anchor to the first frame's PTS, then advance by emitted sample count so consecutive buffers
-/// abut to the sample. `reset()` on flush; a real source PTS discontinuity (seek/edit, > 100 ms off
-/// the predicted clock) re-anchors so genuine gaps aren't papered over. Mirrors
+/// abut to the sample. `reset()` on flush. The clock never decides on its own that the source has
+/// moved: `AudioDecoder` holds every decoded frame against it (`AudioContinuity`) and asks for a new
+/// anchor exactly where the source breaks. (It used to re-anchor only past 100 ms off, so any smaller
+/// gap, a lost packet among them, left the audio early by that much until the next seek.) Mirrors
 /// `OutputTimestampSanitizer`'s focused, unit-testable mutating-struct shape (issue #89).
 struct AudioClockAnchor {
-    /// A real seek/edit moves the source clock by far more than container rounding jitter.
-    static let discontinuityThresholdSeconds = 0.10
 
     private var anchorPTS: CMTime = .invalid
     private var emittedSamplesSinceAnchor: Int64 = 0
@@ -29,18 +29,23 @@ struct AudioClockAnchor {
     /// Decide the PTS to stamp on a buffer whose container PTS is `startPTS`, without mutating state.
     /// `reanchor` distinguishes a fresh anchor (first buffer or post-discontinuity) from a continued
     /// gapless run; pass it back to `commit` once the buffer is actually emitted.
-    func resolve(startPTS: CMTime, sampleRate: Int32) -> (pts: CMTime, reanchor: Bool) {
-        guard anchorPTS.isValid, startPTS.isValid else {
-            return (startPTS, true)  // first buffer after open/flush, or no source PTS to anchor to
+    /// `reanchor` is the caller's: the source broke here, so the buffer plays at `startPTS`.
+    func resolve(startPTS: CMTime, sampleRate: Int32, reanchor: Bool = false) -> (pts: CMTime, reanchor: Bool) {
+        guard anchorPTS.isValid, startPTS.isValid, !reanchor else {
+            return (startPTS, true)  // first buffer after open/flush, a break, or no source PTS to anchor to
         }
-        let predicted = CMTimeAdd(
-            anchorPTS,
-            CMTime(value: emittedSamplesSinceAnchor, timescale: sampleRate)
-        )
-        if abs(CMTimeGetSeconds(CMTimeSubtract(startPTS, predicted))) > Self.discontinuityThresholdSeconds {
-            return (startPTS, true)   // real discontinuity (seek/edit): honour the source clock
-        }
-        return (predicted, false)     // gapless continuation: abut to the sample, ignore container rounding
+        return (predicted(sampleRate: sampleRate), false)  // gapless: abut to the sample, ignore container rounding
+    }
+
+    /// Where the next sample goes, `pending` samples after what has been emitted; nil before the
+    /// first anchor.
+    func next(after pending: Int, sampleRate: Int32) -> CMTime? {
+        guard anchorPTS.isValid else { return nil }
+        return CMTimeAdd(predicted(sampleRate: sampleRate), CMTime(value: Int64(pending), timescale: sampleRate))
+    }
+
+    private func predicted(sampleRate: Int32) -> CMTime {
+        CMTimeAdd(anchorPTS, CMTime(value: emittedSamplesSinceAnchor, timescale: sampleRate))
     }
 
     /// Advance the clock after a buffer was successfully emitted at `pts`. Only called on success so a

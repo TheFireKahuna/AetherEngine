@@ -85,8 +85,9 @@ final class AudioClockAnchorTests: XCTestCase {
         let ptsList = (0..<5).map { containerPTS(frame: $0, samplesPerFrame: spf, sampleRate: rate) }
         runStream(&anchor, ptsList: ptsList, samplesPerFrame: spf, sampleRate: rate)
 
-        let seek = CMTimeMake(value: 60_000, timescale: 1000)  // a 60 s jump dwarfs container jitter
-        let r = anchor.resolve(startPTS: seek, sampleRate: rate)
+        // The decoder's continuity rule (`AudioContinuity`) decides the source broke; the clock honours it.
+        let seek = CMTimeMake(value: 60_000, timescale: 1000)
+        let r = anchor.resolve(startPTS: seek, sampleRate: rate, reanchor: true)
         XCTAssertTrue(r.reanchor)
         XCTAssertEqual(r.pts, seek, "a real source discontinuity must be honoured, not papered over")
     }
