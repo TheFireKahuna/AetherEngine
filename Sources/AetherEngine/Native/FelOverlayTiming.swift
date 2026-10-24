@@ -2,6 +2,9 @@
 #if DualLayerDolbyVision
 import Foundation
 import QuartzCore
+#if os(macOS)
+import AppKit
+#endif
 
 /// The FEL overlay's timing as its frames reach the screen: what a frame costs us, how early it reaches the
 /// renderer, and how many display refreshes it actually stays on screen. The last is the cadence the viewer
@@ -26,8 +29,8 @@ final class FelOverlayTiming: @unchecked Sendable {
     private var refreshTimes: (first: Double, last: Double, count: Int)?
     /// The refresh interval the system states for the current display mode (`CADisplayLink.duration`).
     private var statedRefresh: Double?
-    private var maxDriftMs = 0.0
-    private var refollows = 0
+    /// The displayed frame's item time minus the item clock at that refresh: the picture against the audio.
+    private var offsetMs: [Double] = []
 
     func composed(ms: Double, leadMs lead: Double, frameDuration: Double?) {
         lock.withLock {
@@ -39,9 +42,10 @@ final class FelOverlayTiming: @unchecked Sendable {
 
     /// One display refresh: `shown` is the presentation time of the frame on screen, nil when none is.
     /// While the clock stands still (paused, scrubbing) nothing is counted.
-    func refresh(at timestamp: CFTimeInterval, stated: CFTimeInterval, shown: Double?, playing: Bool) {
+    func refresh(at timestamp: CFTimeInterval, stated: CFTimeInterval, shown: Double?, offsetMs offset: Double?, playing: Bool) {
         lock.withLock {
             if stated > 0 { statedRefresh = stated }
+            if playing, let offset { offsetMs.append(offset) }
             if let lastRefresh { refreshMs.append((timestamp - lastRefresh) * 1000) }
             lastRefresh = timestamp
             if let times = refreshTimes {
@@ -79,13 +83,6 @@ final class FelOverlayTiming: @unchecked Sendable {
         }
     }
 
-    func drift(ms: Double, refollowed: Bool) {
-        lock.withLock {
-            if abs(ms) > abs(maxDriftMs) { maxDriftMs = ms }
-            if refollowed { refollows += 1 }
-        }
-    }
-
     /// The clocks over the window: each one's rate against the host clock in parts per million, the display's
     /// measured refresh against the interval the system states for its mode and against the content's frame
     /// duration, and audio against display as how often a frame has to slip.
@@ -94,8 +91,6 @@ final class FelOverlayTiming: @unchecked Sendable {
             defer {
                 clockFirst = clockLast
                 refreshTimes = nil
-                maxDriftMs = 0
-                refollows = 0
             }
             var parts: [String] = []
             var audioPPM: Double?
@@ -127,7 +122,6 @@ final class FelOverlayTiming: @unchecked Sendable {
                 let minutes = abs(relative) > 0.01 ? period / (abs(relative) * 1e-6) / 60 : .infinity
                 parts.append(String(format: "audio vs display %+.1f ppm (a frame slips every %.0f min)", relative, minutes))
             }
-            parts.append(String(format: "synchronizer drift max %+.1f ms, follows %d", maxDriftMs, refollows))
             return "clocks: " + parts.joined(separator: "; ")
         }
     }
@@ -138,6 +132,7 @@ final class FelOverlayTiming: @unchecked Sendable {
             defer {
                 composeMs.removeAll(keepingCapacity: true)
                 leadMs.removeAll(keepingCapacity: true)
+                offsetMs.removeAll(keepingCapacity: true)
                 refreshMs.removeAll(keepingCapacity: true)
                 holds.removeAll()
                 skipped = 0
@@ -145,7 +140,7 @@ final class FelOverlayTiming: @unchecked Sendable {
             let held = holds.filter { $0.key >= 3 }.values.reduce(0, +)
             return "on screen: 1 refresh \(holds[1] ?? 0), 2 refreshes \(holds[2] ?? 0), 3+ \(held), skipped \(skipped); "
                 + "refresh interval \(Self.spread(refreshMs)); compose \(Self.spread(composeMs)); "
-                + "lead \(Self.spread(leadMs))"
+                + "lead \(Self.spread(leadMs)); picture vs audio clock \(Self.spread(offsetMs))"
         }
     }
 
@@ -157,34 +152,49 @@ final class FelOverlayTiming: @unchecked Sendable {
     }
 }
 
-#if os(tvOS) || os(iOS)
-/// A display link on its own thread, for reading what is on screen at every refresh.
-final class FelOverlayRefreshProbe: NSObject, @unchecked Sendable {
-    private let onRefresh: (CADisplayLink) -> Void
+/// The display link that drives the overlay, on its own thread: at every refresh, its timestamp and the
+/// refresh interval, in host time. On a Mac without a screen (tests), a timer stands in at 60 Hz.
+final class FelOverlayDisplayLink: NSObject, @unchecked Sendable {
+    private let onRefresh: (CFTimeInterval, CFTimeInterval) -> Void
     private var thread: Thread?
 
-    init(onRefresh: @escaping (CADisplayLink) -> Void) {
+    init(onRefresh: @escaping (_ timestamp: CFTimeInterval, _ duration: CFTimeInterval) -> Void) {
         self.onRefresh = onRefresh
     }
 
     func start() {
         let thread = Thread { [self] in
-            let link = CADisplayLink(target: self, selector: #selector(fire(_:)))
-            link.add(to: .current, forMode: .common)
+            let link = makeLink()
+            link?.add(to: .current, forMode: .common)
+            var fallback: Timer?
+            if link == nil {
+                fallback = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
+                    self?.onRefresh(CACurrentMediaTime(), 1.0 / 60)
+                }
+                RunLoop.current.add(fallback!, forMode: .common)
+            }
             while !Thread.current.isCancelled {
                 RunLoop.current.run(until: Date().addingTimeInterval(0.5))
             }
-            link.invalidate()
+            link?.invalidate()
+            fallback?.invalidate()
         }
         thread.qualityOfService = .userInteractive
-        thread.name = "aether.fel-overlay.refresh"
+        thread.name = "aether.fel-overlay.display-link"
         thread.start()
         self.thread = thread
     }
 
     func stop() { thread?.cancel() }
 
-    @objc private func fire(_ link: CADisplayLink) { onRefresh(link) }
+    private func makeLink() -> CADisplayLink? {
+        #if os(macOS)
+        return NSScreen.main?.displayLink(target: self, selector: #selector(fire(_:)))
+        #else
+        return CADisplayLink(target: self, selector: #selector(fire(_:)))
+        #endif
+    }
+
+    @objc private func fire(_ link: CADisplayLink) { onRefresh(link.timestamp, link.duration) }
 }
-#endif
 #endif
