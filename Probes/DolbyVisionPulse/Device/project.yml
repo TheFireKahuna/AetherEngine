@@ -46,6 +46,9 @@ targets:
         # The clips are served over plain http by Scripts/serve.py on the Mac next door.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+        # Picture in Picture (the `subs` pip arm) keeps playing with the app behind it, as in Sodalite.
+        UIBackgroundModes:
+          - audio
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(PULSE_BUNDLE_PREFIX).host

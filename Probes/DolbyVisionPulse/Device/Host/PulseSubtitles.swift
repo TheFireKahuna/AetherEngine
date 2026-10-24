@@ -17,7 +17,9 @@ import UIKit
 //   it is: does #3 stay frozen on screen? At 16 s the clear (deselect, reselect) is applied: does it go?
 // - `fix`: as `trap`, but at 10.5 s the line is cleared first (deselect, suppress, reselect): nothing may stay. At
 //   16 s suppression is lifted: AVKit draws again from the next line.
-// - `pip`: suppressed from the start, regular selected; at 4 s Picture in Picture is started, and on its start
+// - `pip`: suppressed from the start, regular selected; the playback audio session, as the engine sets it, and a PiP
+//   controller made at once, whose `isPictureInPicturePossible` is followed; at 4 s (or once PiP becomes possible,
+//   within 8 s) Picture in Picture is started, and on its start
 //   suppression is lifted (the window should show REGULAR lines); at 14 s it is stopped, and on its stop the line is
 //   cleared and suppression armed again: the full screen must show nothing, and no line may freeze.
 // - `sdh`: the viewer's caption display type set to Always On ("Closed Captions + SDH") for the arm, restored
@@ -34,7 +36,7 @@ final class SubtitleProbeSession: NSObject, AVPlayerItemLegibleOutputPushDelegat
     private var output: AVPlayerItemLegibleOutput?
     private var pip: AVPictureInPictureController?
     private var lastCue = ""
-    private var pipStarted: CheckedContinuation<Void, Never>?
+    private var pipPossible: NSKeyValueObservation?
 
     init(url: URL, params: [String: String], log: @escaping @Sendable (String) -> Void) {
         self.url = url
@@ -83,6 +85,17 @@ final class SubtitleProbeSession: NSObject, AVPlayerItemLegibleOutputPushDelegat
             self.output = output
             log("subs: legible output attached, suppressing=\(output.suppressesPlayerRendering)")
         }
+        if probeCase == "pip" {
+            // PiP is possible only for a player in the playback category, as the engine configures it.
+            do {
+                try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+                try AVAudioSession.sharedInstance().setActive(true)
+                log("subs: audio session playback / moviePlayback")
+            } catch {
+                log("subs: audio session failed: \(error)")
+            }
+            makePictureInPictureController()
+        }
         player.replaceCurrentItem(with: item)
         player.play()
 
@@ -113,7 +126,7 @@ final class SubtitleProbeSession: NSObject, AVPlayerItemLegibleOutputPushDelegat
         case "pip":
             select(named: "English")
             await watch(until: 4)
-            startPictureInPicture()
+            await startPictureInPicture()
             await watch(until: 14)
             stopPictureInPicture()
             await watch(until: 24)
@@ -174,7 +187,7 @@ final class SubtitleProbeSession: NSObject, AVPlayerItemLegibleOutputPushDelegat
 
     // MARK: - Picture in Picture
 
-    private func startPictureInPicture() {
+    private func makePictureInPictureController() {
         guard AVPictureInPictureController.isPictureInPictureSupported() else {
             log("subs: Picture in Picture is not supported here")
             return
@@ -182,8 +195,21 @@ final class SubtitleProbeSession: NSObject, AVPlayerItemLegibleOutputPushDelegat
         let controller = AVPictureInPictureController(contentSource: .init(playerLayer: view.playerLayer))
         controller.delegate = self
         pip = controller
-        log("subs: PiP possible=\(controller.isPictureInPicturePossible); starting")
-        controller.startPictureInPicture()
+        let log = log
+        pipPossible = controller.observe(\.isPictureInPicturePossible, options: [.initial, .new]) { pip, _ in
+            log("subs: PiP possible=\(pip.isPictureInPicturePossible)")
+        }
+    }
+
+    /// Starts PiP once it is possible, waiting up to 8 s for that.
+    private func startPictureInPicture() async {
+        guard let pip else { return }
+        let deadline = Date().addingTimeInterval(8)
+        while !pip.isPictureInPicturePossible, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        log("subs: starting PiP (possible=\(pip.isPictureInPicturePossible))")
+        pip.startPictureInPicture()
     }
 
     private func stopPictureInPicture() {
