@@ -10,6 +10,19 @@ import Foundation
 @Suite("Detour origin ticket", .serialized, .offCooperativePool)
 struct DetourOriginTicketTests {
 
+    /// A detour: a bounded fetch from the read itself, at most 4 MB. An anchored connection asks for
+    /// the pump's 32 MB range or more.
+    private static func isDetour(_ range: (start: Int64, end: Int64?), at start: Int64) -> Bool {
+        guard range.start == start, let end = range.end else { return false }
+        return end - start + 1 <= 4 * 1024 * 1024
+    }
+
+    private static func isAnchor(_ range: (start: Int64, end: Int64?), at start: Int64) -> Bool {
+        guard range.start == start else { return false }
+        guard let end = range.end else { return true }
+        return end - start + 1 > 4 * 1024 * 1024
+    }
+
     @Test("a detour block behind a pump holding one of two slots takes one slot and no wait",
           .timeLimit(.minutes(2)))
     func detourTakesOneTicket() async throws {
@@ -46,8 +59,7 @@ struct DetourOriginTicketTests {
         guard readForward(5 * 1024 * 1024) else { return }
         #expect(reader.hasLiveConnectionForTesting, "the pump was not on the link, so the detour had no rival")
 
-        // Backward past the window, into bytes nothing has fetched: the read that opens the detour
-        // block holding 20 to 24 MB.
+        // Backward past the window, into bytes nothing has fetched: the read that opens a detour.
         let target = Int64(21 * 1024 * 1024)
         #expect(reader.seek(offset: target, whence: Int32(SEEK_SET)) == target)
         let served = reader.read(into: buf, size: Int32(chunk))
@@ -62,10 +74,10 @@ struct DetourOriginTicketTests {
         let books = try #require(OriginRequestBudget.shared.snapshot(for: url))
         #expect(books.limit == 2)
         #expect(books.peakInflight == 2, "peak \(books.peakInflight) on the books against a limit of 2")
-        // The detour block is the 4 MB aligned block holding the target, and nothing else asks for
-        // exactly that range: the pump's refills are 32 MB and the tail prefetch is a suffix.
-        #expect(server.requestedRanges.contains { $0.start == 20 * 1024 * 1024 && $0.end == 24 * 1024 * 1024 - 1 },
-                "no detour block went out, so this measured nothing: \(server.requestedRanges)")
+        // The detour is a bounded fetch from the target, and nothing else asks for one there: the
+        // pump's refills are 32 MB and the tail prefetch is a suffix.
+        #expect(server.requestedRanges.contains { Self.isDetour($0, at: target) },
+                "no detour went out, so this measured nothing: \(server.requestedRanges)")
 
         // Arming a seek deadline must still reuse that held block without network I/O.
         let requestsBeforeHit = server.rangeRequestCount
@@ -111,8 +123,8 @@ struct DetourOriginTicketTests {
         #expect((0..<max(0, n)).allSatisfy {
             buf[$0] == ThrottledOriginServer.patternByte(at: target + Int64($0))
         })
-        #expect(server.requestedRanges.contains { $0.start == target })
-        #expect(!server.requestedRanges.contains { $0.start == 20 * 1024 * 1024 && $0.end == 24 * 1024 * 1024 - 1 })
+        #expect(server.requestedRanges.contains { Self.isAnchor($0, at: target) })
+        #expect(!server.requestedRanges.contains { Self.isDetour($0, at: target) })
         reader.endReadDeadline()
 
         // The policy is scoped to the bounded operation, not a sticky source-wide downgrade: the next
@@ -121,7 +133,7 @@ struct DetourOriginTicketTests {
         let later: Int64 = 10 * 1024 * 1024
         #expect(reader.seek(offset: later, whence: Int32(SEEK_SET)) == later)
         #expect(reader.read(into: buf, size: Int32(chunk)) == chunk)
-        #expect(server.requestedRanges.contains { $0.start == 8 * 1024 * 1024 && $0.end == 12 * 1024 * 1024 - 1 })
+        #expect(server.requestedRanges.contains { Self.isDetour($0, at: later) })
     }
 
     #if os(macOS)

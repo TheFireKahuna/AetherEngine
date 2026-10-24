@@ -47,9 +47,8 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     private var bufferStart: Int64 = -1
     private var buffer: [UInt8] = []
     /// End offset of the last buffer refill; a read starting here continues sequentially.
-    private var lastFetchEnd: Int64 = -1
+    private var readAhead: ReadAhead
     /// Current adaptive read-ahead window; grows on sequential refills, resets on a seek.
-    private var currentChunkSize: Int
     /// `cancelled` has its own lock: `read` holds `lock` across the (slow) fetch, and the fetch's
     /// retry loop must poll `cancelled` without re-entering the non-reentrant `lock`, and `cancel()`
     /// must be able to set it from another thread while a read is in flight.
@@ -140,7 +139,8 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         self.extraHeaders = extraHeaders
         self.baseChunkSize = max(64 * 1024, baseChunkSize)
         self.maxChunkSize = max(max(64 * 1024, baseChunkSize), maxChunkSize)
-        self.currentChunkSize = max(64 * 1024, baseChunkSize)
+        self.readAhead = ReadAhead(floor: max(64 * 1024, baseChunkSize),
+                                   ceiling: max(max(64 * 1024, baseChunkSize), maxChunkSize))
         self.maxRetries = max(0, maxRetries)
         self.requestTimeout = requestTimeout
         self.session = session
@@ -193,14 +193,6 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         return Int64(rest[rest.startIndex..<dash])
     }
 
-    /// Next adaptive window: `base` when `position` is not the sequential continuation of the last
-    /// refill, otherwise the previous window doubled and capped at `maxChunkSize`.
-    static func nextChunkSize(position: Int64, lastFetchEnd: Int64, current: Int,
-                              base: Int, maxChunk: Int) -> Int {
-        guard position == lastFetchEnd, lastFetchEnd >= 0 else { return base }
-        return min(current * 2, maxChunk)
-    }
-
     // MARK: - IOReader
 
     func read(_ outBuffer: UnsafeMutablePointer<UInt8>?, size n: Int32) -> Int32 {
@@ -209,15 +201,13 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         if position >= totalSize { return 0 }
 
         if position < bufferStart || position >= bufferStart + Int64(buffer.count) {
-            currentChunkSize = Self.nextChunkSize(
-                position: position, lastFetchEnd: lastFetchEnd,
-                current: currentChunkSize, base: baseChunkSize, maxChunk: maxChunkSize)
+            let chunk = readAhead.size(forReadAt: position, requested: Int(n))
             // Stop where a span the source cache holds begins: another reader of this source, a clone
             // of this one or a host's warm (#647) fetched it already.
             let limit = sourceCache?.nextHeldStart(
                 cacheKey, after: position, before: totalSize, expectedSize: totalSize) ?? totalSize
-            let want = Int(min(Int64(currentChunkSize), limit - position))
-            let held = sourceCache?.read(cacheKey, at: position, maxLength: currentChunkSize,
+            let want = Int(min(Int64(chunk), limit - position))
+            let held = sourceCache?.read(cacheKey, at: position, maxLength: chunk,
                                          expectedSize: totalSize)
             if let held { SourceByteLedger.shared.servedFromCache(url, reader: label, count: held.count) }
             guard want > 0 || held != nil,
@@ -226,7 +216,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
             }
             bufferStart = position
             buffer = [UInt8](data)
-            lastFetchEnd = position + Int64(buffer.count)
+            readAhead.fetched(at: position, count: buffer.count)
         }
 
         let bufOffset = Int(position - bufferStart)

@@ -30,7 +30,9 @@ final class SourceByteCache: @unchecked Sendable {
     /// Eviction unit, and the granularity of recency.
     static let blockBytes: Int64 = 4 << 20
     /// A held span shorter than this is not worth a request boundary of its own: the pump fetches
-    /// straight through it rather than split a range around a subtitle block.
+    /// straight through it rather than split a range around a subtitle block. The default until a
+    /// reader has measured its link; from then on the reader uses what the link moves in one round
+    /// trip (`AVIOReader.heldSpanWorthASplitLocked`).
     static let minimumServeBytes: Int64 = 256 << 10
     /// How long a source's bytes outlive its last reader. A reload, a track switch or a resume from
     /// the detail page closes every reader and opens new ones moments later.

@@ -45,10 +45,20 @@ struct Issue782RestartReanchorTests {
     }
 
     private static let blockStart: Int64 = 20 * 1024 * 1024
-    private static let blockBytes: Int64 = 4 * 1024 * 1024
+    /// The most a detour fetches; an anchored connection asks for the pump's 32 MB range or more.
+    private static let detourCeiling: Int64 = 4 * 1024 * 1024
 
-    private func isDetourBlock(_ range: (start: Int64, end: Int64?), at start: Int64) -> Bool {
-        range.start == start && range.end == start + Self.blockBytes - 1
+    /// A detour: a bounded fetch from the read itself, at most `detourCeiling`.
+    private func isDetour(_ range: (start: Int64, end: Int64?), at start: Int64) -> Bool {
+        guard range.start == start, let end = range.end else { return false }
+        return end - start + 1 <= Self.detourCeiling
+    }
+
+    /// The streaming connection anchored here: the pump's range, open-ended or longer than a detour.
+    private func isAnchor(_ range: (start: Int64, end: Int64?), at start: Int64) -> Bool {
+        guard range.start == start else { return false }
+        guard let end = range.end else { return true }
+        return end - start + 1 > Self.detourCeiling
     }
 
     @Test("a backward read after a playback reposition opens the connection there, not a detour block",
@@ -70,8 +80,8 @@ struct Issue782RestartReanchorTests {
         #expect(matchesPattern(buf, count: n, at: landing), "the landing served the wrong bytes")
 
         let ranges = server.requestedRanges
-        #expect(!ranges.contains { isDetourBlock($0, at: Self.blockStart) }, "the landing was served as a detour block")
-        #expect(ranges.contains { $0.start == landing },
+        #expect(!ranges.contains { isDetour($0, at: landing) }, "the landing was served as a detour")
+        #expect(ranges.contains { isAnchor($0, at: landing) },
                 "no connection was anchored at the landing: \(ranges.map(\.start))")
     }
 
@@ -90,8 +100,8 @@ struct Issue782RestartReanchorTests {
         #expect(reader.seek(offset: landing, whence: Int32(SEEK_SET)) == landing)
         #expect(reader.read(into: buf, size: Int32(Self.chunk)) > 0)
         let ranges = server.requestedRanges
-        #expect(ranges.contains { isDetourBlock($0, at: Self.blockStart) }, "no detour block: \(ranges.map(\.start))")
-        #expect(!ranges.contains { $0.start == landing })
+        #expect(ranges.contains { isDetour($0, at: landing) }, "no detour: \(ranges.map(\.start))")
+        #expect(!ranges.contains { isAnchor($0, at: landing) })
     }
 
     @Test("held bytes still serve the landing, and the first miss past them anchors",
@@ -105,24 +115,26 @@ struct Issue782RestartReanchorTests {
         defer { buf.deallocate() }
         try positionedAhead(reader, buf)
 
-        // An earlier scrub left the block at 20 to 24 MB held.
+        // An earlier scrub's detour left a run from 20 MB held.
         #expect(reader.seek(offset: Self.blockStart, whence: Int32(SEEK_SET)) == Self.blockStart)
-        #expect(reader.read(into: buf, size: Int32(Self.chunk)) > 0)
-        #expect(server.requestedRanges.contains { isDetourBlock($0, at: Self.blockStart) })
+        let scrubbed = Int64(reader.read(into: buf, size: Int32(Self.chunk)))
+        #expect(scrubbed > 0)
+        let detour = try #require(server.requestedRanges.last { isDetour($0, at: Self.blockStart) })
+        let heldEnd = try #require(detour.end) + 1
         let requestsBefore = server.requestedRanges.count
 
-        let landing = Self.blockStart + 2 * 1024 * 1024
+        let landing = Self.blockStart + (heldEnd - Self.blockStart) / 2
         #expect(reader.seek(offset: landing, whence: Int32(SEEK_SET)) == landing)
         reader.notePlaybackRepositioned()
-        #expect(reader.read(into: buf, size: Int32(Self.chunk)) > 0)
+        // A read that stays inside what is held; the read after it is the first miss.
+        #expect(reader.read(into: buf, size: Int32(heldEnd - landing)) == Int32(heldEnd - landing))
         #expect(server.requestedRanges.count == requestsBefore, "a held landing went to the network")
 
         #expect(readForward(reader, buf, bytes: 3 * 1024 * 1024))
-        let heldEnd = Self.blockStart + Self.blockBytes
         let ranges = server.requestedRanges
-        #expect(ranges.contains { $0.start == heldEnd },
-                "the first miss past the held block did not anchor there: \(ranges.map(\.start))")
-        #expect(!ranges.contains { isDetourBlock($0, at: heldEnd) },
-                "the first miss past the held block was fetched as a detour block")
+        #expect(ranges.contains { isAnchor($0, at: heldEnd) },
+                "the first miss past the held bytes did not anchor there: \(ranges.map(\.start))")
+        #expect(!ranges.contains { isDetour($0, at: heldEnd) },
+                "the first miss past the held bytes was fetched as a detour")
     }
 }
