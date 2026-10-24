@@ -291,7 +291,8 @@ struct PulseHarnessView: View {
             log("engine load failed: \(error)")
             return
         }
-        if overlay { log("route=\(e.videoRoute.rawValue) felOverlay=\(e.felOverlay != nil ? "on" : "off")") }
+        // The overlay is published after load returns; `[FelOverlayRenderer] installed` and its counters confirm it.
+        if overlay { log("route=\(e.videoRoute.rawValue)") }
         let deadline = Date().addingTimeInterval(min(seconds ?? 80, 80))
         while Date() < deadline {
             if e.state == .ended {
