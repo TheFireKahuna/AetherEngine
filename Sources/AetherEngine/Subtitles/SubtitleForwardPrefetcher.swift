@@ -207,15 +207,7 @@ enum SubtitleForwardPrefetcher {
         return Double(raw) * Double(timeBase.num) / Double(timeBase.den)
     }
 
-    /// Read/harvest until EOF, error, cancellation, or a nil playhead (engine gone). Returns why it
-    /// stopped and how many routed subtitle packets it harvested (#231: a read error is not an EOF
-    /// and the caller has to be able to tell them apart). The demuxer must be positioned by the
-    /// caller.
-    /// Harvest-then-park: the packet whose PTS crosses `playhead + leadSeconds` is stored before
-    /// the loop parks, so the store may hold one packet past the lead edge (harmless; the drainer
-    /// window decides what decodes). The playhead is snapshot at start and refreshed only inside
-    /// the park loop, matching the native readers: no MainActor hop per packet during a backfill
-    /// burst.
+    /// The stream walk: `run` over a positioned demuxer (`DemuxerSource`).
     ///
     /// #230: `pacingIndex` (-1 when the source has no usable one) names a non-subtitle stream the
     /// caller left at `AVDISCARD_NONKEY`. Its packets are freed unharvested and exist only to park
@@ -235,12 +227,38 @@ enum SubtitleForwardPrefetcher {
         fence: SubtitleResolutionStatement.Fence = .init(),
         playhead: @Sendable () async -> Double?
     ) async -> Outcome {
+        await run(source: DemuxerSource(demuxer: demuxer, streamIndices: streamIndices,
+                                        assemblyIndices: assemblyIndices, pacingIndex: pacingIndex),
+                  store: store, leadSeconds: leadSeconds, parkPollNanoseconds: parkPollNanoseconds,
+                  link: link, reanchor: reanchor, fence: fence, playhead: playhead)
+    }
+
+    /// Read/harvest until EOF, error, cancellation, or a nil playhead (engine gone). Returns why it
+    /// stopped and how many routed subtitle packets it harvested (#231: a read error is not an EOF
+    /// and the caller has to be able to tell them apart). The source must be positioned by the
+    /// caller. One loop whatever the packets come from (`Source`): the stream walk and the
+    /// container's index differ in how a packet is read and how a jump moves the reader, and in
+    /// nothing this loop decides.
+    /// Harvest-then-park: the packet whose PTS crosses `playhead + leadSeconds` is stored before
+    /// the loop parks, so the store may hold one packet past the lead edge (harmless; the drainer
+    /// window decides what decodes). The playhead is snapshot at start and refreshed only inside
+    /// the park loop, matching the native readers: no MainActor hop per packet during a backfill
+    /// burst.
+    ///
+    static func run(
+        source: Source,
+        store: SubtitlePacketStore,
+        leadSeconds: Double,
+        parkPollNanoseconds: UInt64,
+        link: SideReaderLinkArbiter? = nil,
+        reanchor: SideReaderReanchor? = nil,
+        fence: SubtitleResolutionStatement.Fence = .init(),
+        playhead: @Sendable () async -> Double?
+    ) async -> Outcome {
         guard var playheadSnapshot = await playhead() else {
             return Outcome(exit: .cancelled, harvested: 0)
         }
         var harvested = 0
-        var timeBaseCache: [Int32: AVRational] = [:]
-        var timeBaseFailures = 0
         var exit = Exit.cancelled
         /// #416: the last read position reported to the store's coverage ledger. Reported in steps
         /// rather than per packet: the ledger only has to be able to tell a hole of authored size
@@ -259,8 +277,8 @@ enum SubtitleForwardPrefetcher {
         defer { SubtitlePrefetchTelemetry.sessionEnded(generation: telemetryGeneration, exit: exit) }
         readLoop: while !Task.isCancelled {
             // #240: leave the link to the video path while it needs it. Asked before the read
-            // because `readPacket` is what pulls bytes, and on Matroska it pulls the video and audio
-            // bytes too. The lead is measured from the last read position, which is what the reader
+            // because the read is what pulls bytes, and on a Matroska walk it pulls the video and
+            // audio bytes too. The lead is measured from the last read position, which is what the reader
             // has actually banked; a session that has read nothing yet counts as lead 0 and is let
             // through by the floor rule, so positioning is never blocked behind a busy pump forever.
             if let link, valveGrantedUntil.map({ DispatchTime.now() > $0 }) ?? true {
@@ -301,10 +319,7 @@ enum SubtitleForwardPrefetcher {
             // and since the bounded ranges of #220 every one of those seeks costs a full 32 MiB
             // range off the link. A seek burst rebuilt the session once per jump.
             if let reanchor, let target = reanchor.take() {
-                let landed = reposition(demuxer: demuxer, to: target.seconds,
-                                        anchorStreamIndex: reanchor.anchorStreamIndex,
-                                        fallbackDuration: reanchor.fallbackDuration,
-                                        timeout: reanchor.seekTimeout)
+                let landed = source.reposition(to: target.seconds, reanchor: reanchor)
                 EngineLog.emit(
                     "[AetherEngine] #151 forward prefetch re-anchored in place at "
                     + "\(String(format: "%.2f", target.seconds))s (\(landed))",
@@ -324,9 +339,9 @@ enum SubtitleForwardPrefetcher {
                 if let fresh = await playhead() { playheadSnapshot = fresh }
             }
 
-            let next: UnsafeMutablePointer<AVPacket>?
+            let step: Step
             do {
-                next = try demuxer.readPacket()
+                step = try source.step(into: store)
             } catch {
                 // #231: a transport failure on the side reader, a stall that exhausts the read
                 // deadline, a reconnect that gives up. Distinct from EOF, and restartable.
@@ -337,51 +352,25 @@ enum SubtitleForwardPrefetcher {
                 exit = .readFailed
                 break
             }
-            guard let pkt = next else {
+            let position: Double?
+            switch step {
+            case .endOfFile:
                 exit = .endOfFile
-                break
-            }
-            let streamIdx = pkt.pointee.stream_index
-            let isTarget = streamIndices.contains(streamIdx)
-            guard isTarget || streamIdx == pacingIndex else {
-                var p: UnsafeMutablePointer<AVPacket>? = pkt
-                trackedPacketFree(&p)
+                break readLoop
+            case .skipped:
                 continue
-            }
-            // #220: an unusable time base drops the packet rather than harvesting it against a
-            // zero rate (every cue would land at second 0) and rather than parking against a
-            // meaningless PTS. It is not cached, so the next packet retries the lookup.
-            guard let tb = resolveTimeBase(streamIndex: streamIdx, cache: &timeBaseCache,
-                                           lookup: { demuxer.stream(at: $0)?.pointee.time_base })
-            else {
-                var p: UnsafeMutablePointer<AVPacket>? = pkt
-                trackedPacketFree(&p)
-                timeBaseFailures += 1
-                SubtitlePrefetchTelemetry.recordTimeBaseFallback()
-                if timeBaseFailures == 1 {
-                    EngineLog.emit(
-                        "[AetherEngine] #151 forward prefetch: no usable time base for stream "
-                        + "\(streamIdx); packet dropped (logged once)",
-                        category: .engine)
-                }
-                continue
-            }
-            if isTarget {
-                store.harvest(streamIndex: streamIdx, packet: pkt, timeBase: tb,
-                              assembleSplitDisplaySets: assemblyIndices.contains(streamIdx),
-                              writer: .prefetch)
+            case .harvested(let at):
                 harvested += 1
+                position = at
+            case .paced(let at):
+                position = at
             }
-            let position = packetSeconds(pts: pkt.pointee.pts, dts: pkt.pointee.dts,
-                                         timeBase: tb, preferDecodeOrder: !isTarget)
-            var p: UnsafeMutablePointer<AVPacket>? = pkt
-            trackedPacketFree(&p)
             // Park once the read passes the lead edge; a packet without a usable timestamp
             // (split-set continuation chunks) never parks, its set's PCS anchor already did the
             // pacing.
             guard let position else { continue }
-            // #220 gauge: `position` is the read position on the source axis for both packet
-            // kinds, a cue PTS for a harvested one and the monotone read DTS for a pacing one,
+            // #220 gauge: `position` is the read position on the source axis for both step
+            // kinds, a cue PTS for a harvested packet and the monotone read DTS for a pacing one,
             // which is the same quantity the park decides on. Since #230 that means
             // `prefetchLead` tracks the reader rather than the last cue, so on a sparse track it
             // now moves between cues instead of standing still.
@@ -411,5 +400,209 @@ enum SubtitleForwardPrefetcher {
             if didPark { SubtitlePrefetchTelemetry.recordPark(false) }
         }
         return Outcome(exit: exit, harvested: harvested)
+    }
+}
+
+// MARK: - Sources
+
+extension SubtitleForwardPrefetcher {
+
+    /// What one read of a source produced.
+    enum Step: Equatable {
+        /// A subtitle packet went into the store, at this source time (nil: no usable timestamp).
+        case harvested(at: Double?)
+        /// A pacing packet: a read position, nothing stored.
+        case paced(at: Double)
+        /// Read, and neither stored nor placed.
+        case skipped
+        case endOfFile
+    }
+
+    /// Where `run` gets its packets: the stream itself or the container's own index.
+    protocol Source: AnyObject {
+        /// One read. Throws for a transport failure (#231), which the caller restarts.
+        func step(into store: SubtitlePacketStore) throws -> Step
+        /// Move to `seconds` for an in-place re-anchor (#240); the answer is for the log line.
+        func reposition(to seconds: Double, reanchor: SideReaderReanchor) -> String
+    }
+
+    /// The stream walk: every packet the demuxer delivers, the targets harvested, the pacing stream
+    /// placed (#230).
+    final class DemuxerSource: Source {
+        private let demuxer: Demuxer
+        private let streamIndices: Set<Int32>
+        private let assemblyIndices: Set<Int32>
+        private let pacingIndex: Int32
+        private var timeBaseCache: [Int32: AVRational] = [:]
+        private var timeBaseFailures = 0
+
+        init(demuxer: Demuxer, streamIndices: Set<Int32>, assemblyIndices: Set<Int32>, pacingIndex: Int32) {
+            self.demuxer = demuxer
+            self.streamIndices = streamIndices
+            self.assemblyIndices = assemblyIndices
+            self.pacingIndex = pacingIndex
+        }
+
+        func step(into store: SubtitlePacketStore) throws -> Step {
+            guard let pkt = try demuxer.readPacket() else { return .endOfFile }
+            let streamIdx = pkt.pointee.stream_index
+            let isTarget = streamIndices.contains(streamIdx)
+            guard isTarget || streamIdx == pacingIndex else {
+                var p: UnsafeMutablePointer<AVPacket>? = pkt
+                trackedPacketFree(&p)
+                return .skipped
+            }
+            // #220: an unusable time base drops the packet rather than harvesting it against a
+            // zero rate (every cue would land at second 0) and rather than parking against a
+            // meaningless PTS. It is not cached, so the next packet retries the lookup.
+            guard let tb = resolveTimeBase(streamIndex: streamIdx, cache: &timeBaseCache,
+                                           lookup: { demuxer.stream(at: $0)?.pointee.time_base })
+            else {
+                var p: UnsafeMutablePointer<AVPacket>? = pkt
+                trackedPacketFree(&p)
+                timeBaseFailures += 1
+                SubtitlePrefetchTelemetry.recordTimeBaseFallback()
+                if timeBaseFailures == 1 {
+                    EngineLog.emit(
+                        "[AetherEngine] #151 forward prefetch: no usable time base for stream "
+                        + "\(streamIdx); packet dropped (logged once)",
+                        category: .engine)
+                }
+                return .skipped
+            }
+            if isTarget {
+                store.harvest(streamIndex: streamIdx, packet: pkt, timeBase: tb,
+                              assembleSplitDisplaySets: assemblyIndices.contains(streamIdx),
+                              writer: .prefetch)
+            }
+            let position = packetSeconds(pts: pkt.pointee.pts, dts: pkt.pointee.dts,
+                                         timeBase: tb, preferDecodeOrder: !isTarget)
+            var p: UnsafeMutablePointer<AVPacket>? = pkt
+            trackedPacketFree(&p)
+            if isTarget { return .harvested(at: position) }
+            return position.map { .paced(at: $0) } ?? .skipped
+        }
+
+        func reposition(to seconds: Double, reanchor: SideReaderReanchor) -> String {
+            let landed = SubtitleForwardPrefetcher.reposition(
+                demuxer: demuxer, to: seconds, anchorStreamIndex: reanchor.anchorStreamIndex,
+                fallbackDuration: reanchor.fallbackDuration, timeout: reanchor.seekTimeout)
+            return "\(landed)"
+        }
+    }
+
+    /// Codecs whose Matroska block is the packet libavformat would hand over, byte for byte, so a
+    /// packet read off the index is the packet the walk would have stored. WebVTT is not among them:
+    /// its cue settings travel in BlockAdditions, which libavformat turns into side data (#233), and
+    /// a bare block would lose the cue's placement.
+    static let indexableCodecs: Set<String> = ["subrip", "ass", "hdmv_pgs_subtitle"]
+
+    /// The container's index: every subtitle block read where the index says it is, in one time
+    /// order across the streams, and nothing else of the file. The walk reads the whole interleave
+    /// to find these packets, which on Matroska is the video too (libavformat reads every block off
+    /// the wire before honouring a discard), so a lead cost that much film; here it costs its cues.
+    /// No pacing stream is needed: blocks come in time order, so every step is a read position.
+    final class IndexSource: Source {
+        struct Stream: Sendable {
+            let streamIndex: Int32
+            let track: UInt64
+            let blocks: [MatroskaSubtitleIndex.Block]
+        }
+
+        /// Consecutive unreadable blocks that end the session as a read failure (a dropped
+        /// connection); a single block the index misplaced is skipped.
+        static let readFailureLimit = 8
+
+        private let index: MatroskaSubtitleIndex
+        private let bytes: RandomAccessByteSource
+        private let streams: [Stream]
+        private let assemblyIndices: Set<Int32>
+        private var cursor: [Int]
+        private var failures = 0
+
+        init(index: MatroskaSubtitleIndex, bytes: RandomAccessByteSource, streams: [Stream],
+             assemblyIndices: Set<Int32>, from seconds: Double) {
+            self.index = index
+            self.bytes = bytes
+            self.streams = streams
+            self.assemblyIndices = assemblyIndices
+            cursor = []
+            cursor = cursors(at: seconds)
+        }
+
+        /// The streams of `index` the walk would harvest, or nil when any of them is one the index
+        /// cannot stand in for (no track, a codec whose block is not its packet, an incomplete list).
+        /// All or nothing, so a stream the index cannot vouch for is never the one left out.
+        static func plan(index: MatroskaSubtitleIndex, listed: [AetherEngine.IndexedSubtitleStream],
+                         streams: Set<Int32>) -> (streams: [Stream], refused: [String]) {
+            let tracks = index.trackNumbers(for: listed.map(\.stream))
+            var plan: [Stream] = []
+            var refused: [String] = []
+            for entry in listed where streams.contains(entry.stream.streamIndex) {
+                let streamIndex = entry.stream.streamIndex
+                guard let track = tracks[streamIndex] else { refused.append("\(streamIndex): no track"); continue }
+                guard indexableCodecs.contains(entry.stream.codecName) else {
+                    refused.append("\(streamIndex): \(entry.stream.codecName)")
+                    continue
+                }
+                guard index.isComplete(track: track, frameCount: entry.frames) else {
+                    refused.append("\(streamIndex): incomplete")
+                    continue
+                }
+                plan.append(Stream(streamIndex: streamIndex, track: track, blocks: index.blocksByTrack[track] ?? []))
+            }
+            if plan.count != streams.count, refused.isEmpty { refused.append("streams not listed") }
+            return (plan, refused)
+        }
+
+        func step(into store: SubtitlePacketStore) throws -> Step {
+            var next: (stream: Int, seconds: Double)?
+            for (position, stream) in streams.enumerated() where cursor[position] < stream.blocks.count {
+                let seconds = index.seconds(ticks: stream.blocks[cursor[position]].ticks)
+                if next == nil || seconds < next!.seconds { next = (position, seconds) }
+            }
+            guard let next else { return .endOfFile }
+            let stream = streams[next.stream]
+            let block = stream.blocks[cursor[next.stream]]
+            cursor[next.stream] += 1
+            guard let frame = index.readFrame(block, track: stream.track, from: bytes) else {
+                failures += 1
+                if failures >= Self.readFailureLimit { throw IndexReadFailure(consecutive: failures) }
+                return .skipped
+            }
+            failures = 0
+            store.harvestChunk(
+                streamIndex: stream.streamIndex,
+                ptsSeconds: index.seconds(ticks: frame.ticks),
+                durationSeconds: frame.durationTicks.map { index.seconds(ticks: $0) } ?? 0,
+                flags: AV_PKT_FLAG_KEY,
+                payload: Data(frame.payload),
+                assembleSplitDisplaySets: assemblyIndices.contains(stream.streamIndex),
+                writer: .prefetch)
+            return .harvested(at: next.seconds)
+        }
+
+        func reposition(to seconds: Double, reanchor: SideReaderReanchor) -> String {
+            cursor = cursors(at: seconds)
+            return "index"
+        }
+
+        /// Per stream, the first block at or after `seconds` less the walk's own backscan.
+        private func cursors(at seconds: Double) -> [Int] {
+            let from = seconds - anchorBackscanSeconds
+            return streams.map { stream in
+                var low = 0, high = stream.blocks.count
+                while low < high {
+                    let mid = (low + high) / 2
+                    if index.seconds(ticks: stream.blocks[mid].ticks) < from { low = mid + 1 } else { high = mid }
+                }
+                return low
+            }
+        }
+
+        struct IndexReadFailure: Error, CustomStringConvertible {
+            let consecutive: Int
+            var description: String { "\(consecutive) index blocks unreadable in a row" }
+        }
     }
 }
