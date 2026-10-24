@@ -97,12 +97,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
         case bluRayLPCM(BluRayLPCM)
     }
 
-    /// Audio wiring for stream-copy (e.g. EAC3-JOC Atmos) or FLAC bridge (TrueHD/DTS/PCM).
+    /// Audio wiring for stream-copy (e.g. EAC3-JOC Atmos) or the bridge (TrueHD/DTS, ...).
     struct AudioConfig {
         let codecpar: UnsafePointer<AVCodecParameters>
         let timeBase: AVRational
         let sourceStreamIndex: Int32
-        /// TB of packets passed to av_write_frame: source TB for stream-copy, encoder TB 1/48000 for FLAC bridge.
+        /// TB of packets passed to av_write_frame: source TB for stream-copy, encoder TB 1/sample_rate for the bridge.
         let inputTimeBase: AVRational
         /// TB of demuxer packets BEFORE bridge re-stamps them. Gate target is rescaled into this TB; using
         /// inputTimeBase instead landed the target 48x too far into the source for bridged DTS.
@@ -1847,7 +1847,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     /// Returns muxer for targetIdx, advancing/allocating as needed. Forward-only: clamps late packets
-    /// (HEVC RASL B-frames, FLAC bridge lag) upward to avoid premature finalize. Returns nil on stop/alloc failure.
+    /// (HEVC RASL B-frames, bridge lag) upward to avoid premature finalize. Returns nil on stop/alloc failure.
     private func ensureMuxer(forSegmentIndex targetIdx: Int) -> MP4SegmentMuxer? {
         let effectiveIdx = max(targetIdx, currentMuxerSegmentIndex)
 
@@ -4273,7 +4273,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             planAnchorPts: planAnchorVideoPts)
                         videoShiftPts = SourceTimestampBounds.difference(firstActualVideoDts, pinnedTfdtPts)
                         if audioWaitForVideo, let audio = audioConfig {
-                            // Rescale into SOURCE audio TB (not encoder TB): FLAC bridge exposes this mismatch;
+                            // Rescale into SOURCE audio TB (not encoder TB): a bridge exposes this mismatch;
                             // using inputTimeBase landed the target 48x too far for bridged DTS sources.
                             restartTargetAudioDts = av_rescale_q(
                                 firstActualVideoDts,

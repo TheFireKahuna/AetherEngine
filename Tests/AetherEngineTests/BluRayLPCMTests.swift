@@ -62,7 +62,8 @@ struct BluRayLPCMTests {
     }
 
     @Test("every speaker's samples are the decoder's, in the order the disc stores them",
-          arguments: [(9, 1, 6, 6, 2), (11, 3, 8, 8, 3), (8, 1, 5, 6, 2), (10, 3, 7, 8, 3), (3, 3, 2, 2, 3), (1, 1, 1, 2, 2)])
+          arguments: [(9, 1, 6, 6, 2), (11, 3, 8, 8, 3), (11, 2, 8, 8, 3), (8, 1, 5, 6, 2), (10, 3, 7, 8, 3),
+                      (3, 3, 2, 2, 3), (1, 1, 1, 2, 2)])
     func samplesMatchTheDecoder(assignment: UInt8, depth: UInt8, channels: Int, stored: Int, bytes: Int) throws {
         let frames = 240
         let bd = packet(assignment: assignment, depth: depth, frames: frames, stored: stored, bytes: bytes)
@@ -90,7 +91,7 @@ struct BluRayLPCMTests {
         }
     }
 
-    @Test("the muxer is told big-endian samples, the stored speaker order, and 20-bit in 24")
+    @Test("the muxer is told big-endian samples, the stored speaker order, and 20-bit as its 24-bit words")
     func describesTheMuxerInput() throws {
         let bd = packet(assignment: 9, depth: 2, frames: 4, stored: 6, bytes: 3)
         let format = try #require(bd.withUnsafeBytes { BluRayLPCM(header: $0) })
@@ -98,7 +99,7 @@ struct BluRayLPCMTests {
         defer { avcodec_parameters_free(&par) }
         #expect(format.describe(par!))
         #expect(par!.pointee.codec_id == AV_CODEC_ID_PCM_S24BE)
-        #expect(par!.pointee.bits_per_raw_sample == 20)
+        #expect(par!.pointee.bits_per_raw_sample == 24, "pcmC's sample size: 16, 24 or 32")
         var layout = par!.pointee.ch_layout
         #expect((0..<6).map { av_channel_layout_channel_from_index(&layout, UInt32($0)) } == format.speakers)
         #expect(format.speakers.last == AV_CHAN_LOW_FREQUENCY, "the disc stores 5.1's LFE last")

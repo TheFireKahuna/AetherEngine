@@ -65,15 +65,15 @@ struct BluRayLPCM: Equatable {
     }
 
     /// The format a probed stream has, as libavcodec's decoder read it off the first header into
-    /// `codecpar` (layout, rate, depth); nil when probing read none. libavcodec rejects 20-bit
-    /// samples, so a 20-bit stream has no parameters to read here.
+    /// `codecpar` (layout, rate, depth); nil when probing read none. 20-bit needs FFmpegBuild's
+    /// `patch_ffmpeg_bluray_20bit`: stock libavcodec refuses it, and reads no parameters at all.
     init?(codecpar: UnsafePointer<AVCodecParameters>) {
         let par = codecpar.pointee
         guard par.codec_id == AV_CODEC_ID_PCM_BLURAY, par.ch_layout.nb_channels > 0 else { return nil }
         var layout = par.ch_layout
         let speakers = Set((0..<UInt32(par.ch_layout.nb_channels)).map { av_channel_layout_channel_from_index(&layout, $0).rawValue })
         let rates: [Int32: UInt8] = [48_000: 1, 96_000: 4, 192_000: 5]
-        let depths: [Int32: UInt8] = [16: 1, 24: 3]
+        let depths: [Int32: UInt8] = [16: 1, 20: 2, 24: 3]
         guard let rate = rates[par.sample_rate], let depth = depths[par.bits_per_coded_sample] else { return nil }
         // The channel assignment whose speakers these are: the header table is the only one.
         for assignment: UInt8 in 1...15 {
@@ -100,7 +100,10 @@ struct BluRayLPCM: Equatable {
         codecpar.pointee.codec_tag = 0
         codecpar.pointee.sample_rate = sampleRate
         codecpar.pointee.bits_per_coded_sample = Int32(bytesPerSample * 8)
-        codecpar.pointee.bits_per_raw_sample = Int32(bitsPerSample)
+        // The word size, 20-bit samples included: the muxer writes this into `pcmC`, whose sample size
+        // is 16, 24 or 32 and says how the data is laid out. Stated as 20, CoreMedia refused the track
+        // ("Cannot Open"); the 20 bits are the top of each word either way.
+        codecpar.pointee.bits_per_raw_sample = Int32(bytesPerSample * 8)
         codecpar.pointee.block_align = Int32(speakers.count * bytesPerSample)
         codecpar.pointee.bit_rate = Int64(speakers.count * bytesPerSample * 8) * Int64(sampleRate)
         codecpar.pointee.frame_size = 0

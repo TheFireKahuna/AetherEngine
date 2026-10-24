@@ -426,7 +426,7 @@ Sources/AetherEngine/
 │   ├── AtmosConfirmationWorker.swift        LoadOptions.confirmAtmos: runs the bounded JOC pass on a side demuxer after the session is up, one E-AC-3 track at a time, and republishes audioTracks via a source-keyed ledger (#214); declined on an origin limited to one request, sequentialOrigin and heldSourceConnection, re-checked per track
 │   ├── AtmosDetectionProbe.swift            Opt-in bounded E-AC-3 JOC decode pass behind probeDetectingAtmos: AtmosDetectionOptions caps, one decoder, no playback session (#214)
 │   ├── AudioAVPlayerHost.swift              Audio-only path: bare AVPlayer host for whitelisted codecs, owns the persistent per-player MPNowPlayingSession (tvOS / iOS); publishes the rebuffer axis (`waitingToPlayAtSpecifiedRate` / `AVPlayerItemPlaybackStalled` after first play) that the engine folds into `isBuffering`
-│   ├── AudioBridge.swift                    Native path: decode + re-encode per `AudioBridgeMode` (lossless FLAC default or EAC3 5.1 opt-in) for source codecs that can't stream-copy into fMP4
+│   ├── AudioBridge.swift                    Native path: decode + re-encode per `AudioBridgeMode` (the decoded PCM by default, EAC3 5.1 opt-in) for source codecs that can't stream-copy into fMP4
 │   ├── AudioClockAnchor.swift               SW path: sample-count PTS anchor so consecutive buffers abut exactly; re-anchors on >100 ms drift (AVSampleBufferAudioRenderer crackle, #89)
 │   ├── AudioDecoder.swift                   SW path: libavcodec → PCM → CMSampleBuffer with channel-layout tagging that names the resampler's own order (#401)
 │   ├── AudioOutput.swift                    SW path: AVSampleBufferAudioRenderer + Synchronizer (master clock)
@@ -577,7 +577,7 @@ Sources/AetherEngine/
 │   └── WebVTTSegmentParser.swift            One parsed WebVTT segment of a live SUBTITLES rendition: cue times are in the segment's own local clock (a counter providers run for days), and placement comes from the playlist geometry rather than the `X-TIMESTAMP-MAP` the spec offers (#359)
 ├── Video/
 │   ├── HLSVideoEngine.swift                 Native path: session orchestrator (start/stop, producer construction + restart, shift handling)
-│   ├── HLSVideoEngine+AudioRoute.swift      Native path: stream-copy -> FLAC-bridge -> video-only audio cascade
+│   ├── HLSVideoEngine+AudioRoute.swift      Native path: stream-copy -> bridge -> video-only audio cascade
 │   ├── HLSVideoEngine+SegmentPlanning.swift Native path: keyframe / uniform segment plans, extradata + AAC fixups
 │   ├── HLSVideoEngine+LiveReopen.swift      Native path: live source-loss recovery (capped-backoff reopen on the same timeline); VOD backpressure-wedge re-anchor + consumer re-engage nudge, which re-reads the rendered position at nudge time so the zero-tolerance seek never lands behind the on-screen frame (#115)
 │   ├── CodecRoutePolicy.swift               Native path: DV / HDR / codec routing decisions (track types, CODECS strings, VIDEO-RANGE)

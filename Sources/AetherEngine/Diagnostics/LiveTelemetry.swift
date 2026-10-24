@@ -26,7 +26,7 @@ public struct LiveTelemetry: Equatable, Sendable {
     public let averageBitrateMbps: Double?
     /// Live bitrate of the audio bridge's encoded output, or nil when no bridge is active (stream-copy /
     /// AVPlayer-native path) or before the first delta. Measured from the bridge's cumulative output-byte
-    /// counter, since the common FLAC bridge is lossless VBR and has no fixed configured rate.
+    /// counter, which E-AC-3 and PCM alike feed.
     public let audioBridgeBitrateMbps: Double?
     /// What the object renderer is doing while `objectAudioRendering` plays TrueHD Atmos or DTS:X:
     /// the bed it renders into and the objects the track declares, plays and lifts. nil on every

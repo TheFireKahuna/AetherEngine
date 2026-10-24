@@ -1368,7 +1368,7 @@ public final class AetherEngine: ObservableObject {
     /// "libavcodec VP9 (SW)"). nil while idle; cleared in stopInternal so sessions never inherit the previous label.
     @Published public internal(set) var activeVideoDecoder: String?
 
-    /// Human-readable audio pipeline label (e.g. "Stream-copy (EAC3+JOC Atmos)", "TrueHD → FLAC bridge",
+    /// Human-readable audio pipeline label (e.g. "Stream-copy (EAC3+JOC Atmos)", "TrueHD → PCM bridge",
     /// "libavcodec <codec> -> CoreAudio"). nil when no audio or no session.
     @Published public internal(set) var activeAudioDecoder: String?
 

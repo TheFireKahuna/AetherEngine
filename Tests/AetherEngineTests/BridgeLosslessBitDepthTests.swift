@@ -5,10 +5,10 @@ import AetherLibavutil
 @testable import AetherEngine
 
 /// #4: the `.lossless` bridge classified "lossless" by a codec list, and every codec off that list
-/// went to a 16-bit FLAC. 24-bit Blu-ray LPCM (`pcm_bluray`, the M2TS PCM track) was off the list,
-/// so the "lossless" mode cut its bottom 8 bits. The intermediate now follows the format the opened
-/// decoder produces. These run real 24-bit sources through the bridge and decode its FLAC back:
-/// every sample has to come out identical, not merely close.
+/// went out at 16 bits. 24-bit Blu-ray LPCM (`pcm_bluray`, the M2TS PCM track) was off the list,
+/// so the "lossless" mode cut its bottom 8 bits. The output depth now follows the format the opened
+/// decoder produces. These run real 24-bit sources through the bridge and read its PCM back: every
+/// sample has to come out identical, not merely close.
 @Suite("#4 the lossless bridge keeps a 24-bit source's 24 bits")
 struct BridgeLosslessBitDepthTests {
 
@@ -122,7 +122,7 @@ struct BridgeLosslessBitDepthTests {
 
     // MARK: - Through the bridge and back
 
-    /// Feeds every packet, flushes the tail, and decodes the bridge's FLAC to 24-bit values.
+    /// Feeds every packet, flushes the tail, and reads the bridge's PCM back as 24-bit values.
     private func roundTrip(packets: [UnsafeMutablePointer<AVPacket>],
                            codecpar: UnsafeMutablePointer<AVCodecParameters>) throws
         -> (samples: [Int32], encodedBits: Int32) {
@@ -142,8 +142,8 @@ struct BridgeLosslessBitDepthTests {
         outputs.append(contentsOf: bridge.flush())
 
         let encPar = try #require(bridge.encoderCodecpar)
-        #expect(encPar.pointee.codec_id == AV_CODEC_ID_FLAC)
-        let codec = try #require(avcodec_find_decoder(AV_CODEC_ID_FLAC))
+        #expect(bridge.output == .pcm)
+        let codec = try #require(avcodec_find_decoder(encPar.pointee.codec_id))
         var dec: UnsafeMutablePointer<AVCodecContext>? = avcodec_alloc_context3(codec)
         defer { avcodec_free_context(&dec) }
         let ctx = try #require(dec)
@@ -198,7 +198,7 @@ struct BridgeLosslessBitDepthTests {
             avcodec_parameters_free(&p)
         }
         let result = try roundTrip(packets: packets, codecpar: codecpar)
-        #expect(result.encodedBits == 24, "the FLAC is \(result.encodedBits)-bit")
+        #expect(result.encodedBits == 24, "the PCM is \(result.encodedBits)-bit")
         #expect(result.samples.count == pcm.count)
         #expect(result.samples == pcm, "the low 8 bits did not survive")
     }
@@ -220,18 +220,20 @@ struct BridgeLosslessBitDepthTests {
 
     // MARK: - The choice itself
 
-    @Test("only a decoder that produces 16 bits or fewer gets a 16-bit FLAC")
-    func intermediateFollowsTheDecodedFormat() {
+    @Test("only a decoder that produces 16 bits or fewer gets 16-bit PCM")
+    func outputDepthFollowsTheDecodedFormat() {
         for fmt in [AV_SAMPLE_FMT_U8, AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_S16P] {
-            #expect(AudioBridge.flacIntermediate(decodedFormat: fmt).bitsPerRawSample == 16)
+            let choice = AudioBridge.pcmEncoding(decodedFormat: fmt)
+            #expect(choice.encoder == AV_CODEC_ID_PCM_S16LE && choice.bitsPerRawSample == 16)
         }
         // Integer 24/32-bit, and float decodes of lossy codecs (AAC, Opus, Vorbis, MP3 decode to fltp),
         // whose precision a 16-bit requantisation would throw away; NONE is a decoder that defers its
         // format to the first frame (TrueHD, DTS), which must never be guessed down.
         for fmt in [AV_SAMPLE_FMT_S32, AV_SAMPLE_FMT_S32P, AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_FLTP,
                     AV_SAMPLE_FMT_DBLP, AV_SAMPLE_FMT_S64, AV_SAMPLE_FMT_NONE] {
-            let choice = AudioBridge.flacIntermediate(decodedFormat: fmt)
-            #expect(choice.format == AV_SAMPLE_FMT_S32 && choice.bitsPerRawSample == 24, "\(fmt.rawValue)")
+            let choice = AudioBridge.pcmEncoding(decodedFormat: fmt)
+            #expect(choice.encoder == AV_CODEC_ID_PCM_S24LE && choice.format == AV_SAMPLE_FMT_S32
+                    && choice.bitsPerRawSample == 24, "\(fmt.rawValue)")
         }
     }
 }
