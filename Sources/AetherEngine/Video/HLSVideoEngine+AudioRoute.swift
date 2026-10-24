@@ -86,12 +86,12 @@ extension HLSVideoEngine {
         /// CODECS attribute for the master playlist. Empty for bridged codecs (engine computes `fLaC` from the encoded stream).
         var hlsCodecsString: String {
             switch self {
-            case .aac:    return "mp4a.40.2"
+            case .aac, .aacLatm: return "mp4a.40.2"
             case .ac3:    return "ac-3"
             case .eac3:   return "ec-3"
             case .flac:   return "fLaC"
             case .alac:   return "alac"
-            case .mp3, .opus, .truehd, .dts, .vorbis, .pcm, .mp2, .aacLatm, .wma,
+            case .mp3, .opus, .truehd, .dts, .vorbis, .pcm, .mp2, .wma,
                  .nellymoser, .adpcmSwf, .speex, .realAudio, .amr, .unsupported:
                 // mp3: theoretically mp4a.40.34, but AVPlayer treats any mp4a as AAC and fails; bridge to FLAC.
                 return ""
@@ -101,7 +101,7 @@ extension HLSVideoEngine {
         /// Codecs that must go through AudioBridge. Opus is fMP4-spec-legal but AVPlayer rejects it in HLS-fMP4 in practice (only CAF/WebM paths work). MP3 writes `mp4a.40.34` but AVPlayer treats any mp4a as AAC, failing with -11829/-12848.
         var requiresBridge: Bool {
             switch self {
-            case .opus, .mp3, .truehd, .dts, .vorbis, .pcm, .mp2, .aacLatm, .wma,
+            case .opus, .mp3, .truehd, .dts, .vorbis, .pcm, .mp2, .wma,
                  .nellymoser, .adpcmSwf, .speex, .realAudio, .amr: return true
             default: return false
             }

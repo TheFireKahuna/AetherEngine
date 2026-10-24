@@ -2092,6 +2092,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 audioStream: audioStream, audioDemuxer: audioDem, streamIndex: audioStreamIndex)
             let compat = AudioCodecCompat.from(codecID)
             let sourceAudio = audioStream.pointee.codecpar.pointee
+            let latmConfig = Self.latmConfiguration(audioStream.pointee.codecpar)
             // AE#764: CoreMedia refuses a FLAC min_blocksize under 192 and hangs on frames smaller than the
             // field claims, so a stream with small blocks cannot be copied, only decoded.
             let flacBlocksTooSmall = compat == .flac
@@ -2105,10 +2106,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     + "\(FLACStreamInfo.coreMediaMinimumBlockSize), bridging instead of stream-copy",
                     category: .session
                 )
-            } else if compat.requiresBridge {
+            } else if compat.requiresBridge || (compat == .aacLatm && latmConfig == nil) {
                 bridgePreferred = true
                 EngineLog.emit(
-                    "[HLSVideoEngine] audio: codec=\(compat) (bridge required), decoding + "
+                    "[HLSVideoEngine] audio: codec=\(compat) "
+                        + (compat == .aacLatm ? "(no AudioSpecificConfig read out of it while probing)" : "(bridge required)")
+                        + ", decoding + "
                           + (Self.spatialRenderingLayout(
                                 rendering: objectAudioRendering, codecID: sourceAudio.codec_id,
                                 profile: sourceAudio.profile, sampleRate: sourceAudio.sample_rate)
@@ -2143,6 +2146,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     throw HLSVideoEngineError.openFailed(reason: "audio codecpar copy failed")
                 }
                 ownedCodecParams.append(ownedAudioParams)
+                // LATM: the muxer is given the AAC inside it; the demuxer's own stream stays LATM.
+                if let latmConfig {
+                    guard Self.prepareLATMForFMP4(ownedAudioParams.ptr, config: latmConfig) else {
+                        throw HLSVideoEngineError.openFailed(reason: "audio AudioSpecificConfig allocation failed")
+                    }
+                    EngineLog.emit(
+                        "[HLSVideoEngine] audio: AAC/LATM, AudioSpecificConfig "
+                        + latmConfig.map { String(format: "%02x", $0) }.joined()
+                        + " + unwrapping LATM for fMP4 stream-copy",
+                        category: .session
+                    )
+                }
                 streamCopyAudio = HLSSegmentProducer.AudioConfig(
                     codecpar: UnsafePointer(ownedAudioParams.ptr),
                     timeBase: audioStream.pointee.time_base,
@@ -2150,7 +2165,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     inputTimeBase: audioStream.pointee.time_base,
                     sourceTimeBase: audioStream.pointee.time_base,
                     bridge: nil,
-                    stripAacAdts: stripAdts,
+                    aacTransport: latmConfig.map { .latm(config: $0) } ?? (stripAdts ? .adts : .raw),
                     language: audioLanguage
                 )
                 // Audio fallback duration from codec-fixed frame sizes (AC3/EAC3=1536, AAC=1024).
@@ -2184,7 +2199,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 let isJOC = compat == .eac3 && acp.profile == 30
                 audioIsAtmosStreamCopy = isJOC
                 // RFC 6381: mp4a.40 and the object type, so HE-AAC is 40.5 and HE-AACv2 40.29.
-                audioHLSCodecs = compat == .aac
+                audioHLSCodecs = compat == .aac || compat == .aacLatm
                     ? "mp4a.40.\(Self.aacObjectType(profile: acp.profile, frameSize: acp.frame_size))"
                     : compat.hlsCodecsString
                 EngineLog.emit(

@@ -82,6 +82,18 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
     }
 
+    /// How a stream-copied AAC track's frames are framed in the source, and so what comes off them
+    /// before they are muxed.
+    enum AACTransport: Equatable {
+        /// Raw access units, as MP4 and Matroska carry them.
+        case raw
+        /// ADTS (MPEG-TS, a raw .aac): a 7 or 9 byte header per frame.
+        case adts
+        /// LOAS/LATM (`LATM`): the frame inside each AudioMuxElement. `config` is the
+        /// AudioSpecificConfig the init segment declares, which the stream's elements must keep.
+        case latm(config: [UInt8])
+    }
+
     /// Audio wiring for stream-copy (e.g. EAC3-JOC Atmos) or FLAC bridge (TrueHD/DTS/PCM).
     struct AudioConfig {
         let codecpar: UnsafePointer<AVCodecParameters>
@@ -94,8 +106,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
         let sourceTimeBase: AVRational
         /// Non-nil routes each packet through bridge.feed and muxes the returned FLAC packets.
         let bridge: (any AudioTranscodingBridge)?
-        /// Strip 7/9-byte ADTS header per frame for MPEG-TS AAC stream-copy into fMP4; engine synthesises the ASC.
-        let stripAacAdts: Bool
+        /// The framing a stream-copied AAC track's frames arrive in.
+        let aacTransport: AACTransport
         /// AE#458: the source track's language as ISO 639-2/T, carried into every muxer this config builds
         /// (a producer restart rebuilds one, so it has to live on the config, not on the first muxer).
         let language: String?
@@ -109,7 +121,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
              inputTimeBase: AVRational,
              sourceTimeBase: AVRational,
              bridge: (any AudioTranscodingBridge)?,
-             stripAacAdts: Bool = false,
+             aacTransport: AACTransport = .raw,
              language: String? = nil,
              sourceStart: Int64? = nil) {
             self.codecpar = codecpar
@@ -118,7 +130,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.inputTimeBase = inputTimeBase
             self.sourceTimeBase = sourceTimeBase
             self.bridge = bridge
-            self.stripAacAdts = stripAacAdts
+            self.aacTransport = aacTransport
             self.language = language
             self.sourceStart = sourceStart
         }
@@ -516,6 +528,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// One-packet look-behind; next packet's dts fills pending.duration when per-block duration is missing.
     private var pendingVideoPkt: UnsafeMutablePointer<AVPacket>?
+    /// The LATM elements of a stream-copied AAC track are read with (`AACTransport.latm`), and how
+    /// many were dropped.
+    private var latmReader = LATM.Reader()
+    private var latmDroppedElements = 0
     private var pendingAudioPkt: UnsafeMutablePointer<AVPacket>?
 
     /// Live segment index captured when pending packet was examined; the live cutter advances at keyframes.
@@ -4735,7 +4751,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         }
                         continue
                     }
-                    if audio.stripAacAdts { Self.stripADTSHeader(packet) }
+                    switch audio.aacTransport {
+                    case .raw: break
+                    case .adts: Self.stripADTSHeader(packet)
+                    case .latm(let config):
+                        guard unwrapLATM(packet, declared: config) else { continue }
+                    }
                     let thisAudioSeg: Int = isLive
                         ? liveCurrentSegmentIndex
                         : (audioFollowsVideoCut ? vodCutter.current : 0)
@@ -5078,6 +5099,35 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     /// Strip 7/9-byte ADTS header in-place (advances data pointer, shrinks size; buf untouched for unref safety).
+    /// Replace a LOAS/LATM packet's bytes with the AAC frame inside it (`LATM.Reader`). False drops
+    /// the packet: an element outside what `LATM` reads, or one whose stream changed its
+    /// AudioSpecificConfig away from the one the init segment declares, whose frames would be
+    /// decoded against the wrong configuration.
+    private func unwrapLATM(_ packet: UnsafeMutablePointer<AVPacket>, declared: [UInt8]) -> Bool {
+        guard let data = packet.pointee.data, packet.pointee.size > 0 else { return false }
+        let frame = latmReader.payload(UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)))
+        guard let frame, latmReader.config == declared else {
+            latmDroppedElements += 1
+            if latmDroppedElements == 1 || latmDroppedElements % 500 == 0 {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] LATM: dropped \(latmDroppedElements) element(s), the last "
+                    + (frame == nil ? "unreadable" : "carrying AudioSpecificConfig "
+                        + (latmReader.config ?? []).map { String(format: "%02x", $0) }.joined()
+                        + " where the init declares " + declared.map { String(format: "%02x", $0) }.joined()),
+                    category: .session)
+            }
+            return false
+        }
+        guard let buffer = av_buffer_alloc(frame.count + Int(AV_INPUT_BUFFER_PADDING_SIZE)) else { return false }
+        frame.withUnsafeBufferPointer { buffer.pointee.data.update(from: $0.baseAddress!, count: frame.count) }
+        memset(buffer.pointee.data + frame.count, 0, Int(AV_INPUT_BUFFER_PADDING_SIZE))
+        av_buffer_unref(&packet.pointee.buf)
+        packet.pointee.buf = buffer
+        packet.pointee.data = buffer.pointee.data
+        packet.pointee.size = Int32(frame.count)
+        return true
+    }
+
     private static func stripADTSHeader(_ packet: UnsafeMutablePointer<AVPacket>) {
         guard let data = packet.pointee.data, packet.pointee.size >= 7 else { return }
         guard data[0] == 0xFF, (data[1] & 0xF0) == 0xF0 else { return }  // ADTS sync word
