@@ -83,9 +83,15 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     deinit { truehd_atmos_decoder_destroy(handle) }
 
     func push(_ bytes: UnsafeRawBufferPointer) throws {
+        try push(bytes, pts: Int64.min)
+    }
+
+    /// The library reports `pts` back on the blocks whose access units start in these bytes, with
+    /// how many access units of the same push came before (`TrueHDAtmosBlock.pts_au_index`).
+    func push(_ bytes: UnsafeRawBufferPointer, pts: Int64) throws {
         guard let base = bytes.baseAddress, bytes.count > 0 else { return }
         let status = truehd_atmos_decoder_push(
-            handle, base.assumingMemoryBound(to: UInt8.self), bytes.count, Int64.min)
+            handle, base.assumingMemoryBound(to: UInt8.self), bytes.count, pts)
         // BUFFER_FULL (8 MiB waiting) cannot happen behind the bridge, which drains every block after
         // each push; a panic resets for the same reason as in `nextBlock`.
         if status == TRUEHD_ATMOS_ERR_PANIC {
@@ -145,6 +151,9 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         out.sampleRate = ObjectAudioRendering.sampleRate
         out.frameCount = main.frames
         out.inputFrameOffset = main.start
+        // The timestamp keeps marking the same input frame, now counted at 48 kHz: access units are
+        // 80 or 160 frames at 96 or 192 kHz, so the division is exact.
+        out.sourcePtsInputFrame = block.sourcePtsInputFrame / Int64(factor)
         out.planes = main.planes
         out.updates = main.updates
         out.isDiscontinuity = discontinuityPending
@@ -215,7 +224,10 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             roles: roles,
             planes: planes,
             updates: updates,
-            bed: bed), firstStates)
+            bed: bed,
+            sourcePts: block.pts == Int64.min ? nil : block.pts,
+            sourcePtsInputFrame: Int64(block.input_frame_offset)
+                - Int64(block.pts_au_index) * Int64(block.access_unit_frames)), firstStates)
     }
 
     func reset() {
