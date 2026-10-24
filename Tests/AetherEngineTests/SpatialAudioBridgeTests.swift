@@ -173,6 +173,26 @@ struct SpatialAudioBridgeTests {
     }
     #endif
 
+    #if TrueHDObjectAudio && DTSXObjectAudio
+    @Test("the probe anticipates APAC for TrueHD Atmos and for DTS-HD MA labelled DTS:X, not for unlabelled DTS-HD MA")
+    func anticipatesAPAC() {
+        let on = ObjectAudioRendering.apac(.l714)
+        #expect(HLSVideoEngine.probeAnticipatesAPAC(rendering: on, codecID: AV_CODEC_ID_TRUEHD,
+                                                    profile: AV_PROFILE_TRUEHD_ATMOS, sampleRate: 48_000))
+        #expect(HLSVideoEngine.probeAnticipatesAPAC(rendering: on, codecID: AV_CODEC_ID_DTS,
+                                                    profile: AV_PROFILE_DTS_HD_MA_X, sampleRate: 48_000))
+        #expect(HLSVideoEngine.probeAnticipatesAPAC(rendering: on, codecID: AV_CODEC_ID_DTS,
+                                                    profile: AV_PROFILE_DTS_HD_MA_X_IMAX, sampleRate: 48_000))
+        #expect(!HLSVideoEngine.probeAnticipatesAPAC(rendering: on, codecID: AV_CODEC_ID_DTS,
+                                                     profile: AV_PROFILE_DTS_HD_MA, sampleRate: 48_000),
+                "its first decoded frame decides, at routing")
+        #expect(!HLSVideoEngine.probeAnticipatesAPAC(rendering: .off, codecID: AV_CODEC_ID_DTS,
+                                                     profile: AV_PROFILE_DTS_HD_MA_X, sampleRate: 48_000))
+        #expect(!HLSVideoEngine.probeAnticipatesAPAC(rendering: on, codecID: AV_CODEC_ID_EAC3,
+                                                     profile: 30, sampleRate: 48_000))
+    }
+    #endif
+
     #if DTSXObjectAudio
     @Test("every 48 kHz DTS-HD MA track is a DTS:X candidate, whatever FFmpeg's label; lossy DTS is not")
     func dtsEligibility() {
