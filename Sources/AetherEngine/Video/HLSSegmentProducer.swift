@@ -842,6 +842,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// AE#464: the host's audio offset this producer's muxers write. Fixed for the producer's life;
     /// a new value arrives as a new producer (see `MP4SegmentMuxer.audioDelaySeconds`).
     private let audioDelaySeconds: Double
+    /// A stream-copied audio track's move into Apple's timestamp convention (`AppleAudioDecoderDelay`):
+    /// whole source ticks added to every packet as it is read, and the remainder the muxer adds.
+    private let streamCopyDecoderDelayTicks: Int64
+    private let streamCopyDecoderDelayResidualSeconds: Double
     /// `LoadOptions.progressiveSegmentDelivery`: register each VOD segment with the cache as it is
     /// opened, and flush fragments every `progressiveFragmentSeconds` so the loopback server has
     /// something to send while the segment is still being cut.
@@ -1572,6 +1576,34 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         self.convertP7Active = video.convertP7ToProfile81
         self.audioConfig = audio
+        if let audio, audio.bridge == nil {
+            let par = audio.codecpar.pointee
+            let name = avcodec_get_name(par.codec_id).map { String(cString: $0) } ?? "?"
+            if let samples = AppleAudioDecoderDelay.samples(codecID: par.codec_id, profile: par.profile) {
+                let split = AppleAudioDecoderDelay.split(samples: samples, sampleRate: par.sample_rate,
+                                                         timeBase: audio.sourceTimeBase)
+                streamCopyDecoderDelayTicks = split.ticks
+                streamCopyDecoderDelayResidualSeconds = split.residualSeconds
+                if samples > 0 {
+                    EngineLog.emit(
+                        "[HLSSegmentProducer] stream-copied \(name) (profile \(par.profile)) moves \(samples) samples "
+                        + "(\(String(format: "%.3f", Double(samples) / Double(max(par.sample_rate, 1)) * 1000)) ms) later: "
+                        + "the decoder delay AVFoundation trims"
+                        + (par.codec_id == AV_CODEC_ID_AAC && par.profile == -99 ? ", profile unknown, taken as AAC-LC" : ""),
+                        category: .session)
+                }
+            } else {
+                streamCopyDecoderDelayTicks = 0
+                streamCopyDecoderDelayResidualSeconds = 0
+                EngineLog.emit(
+                    "[HLSSegmentProducer] stream-copied \(name) (profile \(par.profile)) has no measured AVFoundation "
+                    + "decoder delay; its timestamps are copied as they are and its sync is unverified",
+                    category: .session)
+            }
+        } else {
+            streamCopyDecoderDelayTicks = 0
+            streamCopyDecoderDelayResidualSeconds = 0
+        }
         self.cache = cache
         self.baseIndex = baseIndex
         self.sourceVideoTimeBase = video.timeBase
@@ -2202,7 +2234,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // AE#222 + mid-session rotation: the last frame a muxer accepted, or the host's
                 // construction-time prime while no muxer has accepted one yet.
                 audioMoovPrimeFrame: audioMoovPrimeFrame,
-                audioDelaySeconds: audioDelaySeconds,
+                audioDelaySeconds: audioDelaySeconds + streamCopyDecoderDelayResidualSeconds,
                 onStorageExhausted: { [cache] in cache.noteStorageExhausted() },
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
@@ -3548,6 +3580,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         && (audioConfig.map { pktStreamIdx == $0.sourceStreamIndex } ?? false)
                 } else {
                     isAudioPkt = (audioConfig.map { pktStreamIdx == $0.sourceStreamIndex }) ?? false
+                }
+                // Into Apple's timestamp convention (`AppleAudioDecoderDelay`), before anything reads the
+                // audio's time. Only timestamps the packet arrived with: ones repaired below are built
+                // from the last audio timestamp, which has moved already.
+                if isAudioPkt, streamCopyDecoderDelayTicks != 0 {
+                    if packet.pointee.pts != Int64.min { packet.pointee.pts &+= streamCopyDecoderDelayTicks }
+                    if packet.pointee.dts != Int64.min { packet.pointee.dts &+= streamCopyDecoderDelayTicks }
                 }
                 // #77: hand the in-band caption-track packet to the observer (read-only). It's a foreign
                 // packet (the eia_608/c608 caption stream) and is dropped below, never muxed.
