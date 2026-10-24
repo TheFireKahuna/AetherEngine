@@ -382,9 +382,12 @@ struct PulseHarnessView: View {
         guard let e = try? AetherEngine() else { log("engine init failed"); return }
         engine = e
         do {
+            // `fieldrate=frame` deinterlaces at frame rate (SEQ=deint); the engine's default is field rate.
+            let fieldRate = arm.params["fieldrate"].flatMap(DeinterlaceFieldRate.init(rawValue:)) ?? .field
             try await e.load(url: arm.url, startPosition: nil,
                              options: LoadOptions(dolbyVisionHandling: .automatic, preferDualLayerDolbyVision: true,
-                                                  felOverlay: false, audioBridgeMode: .surroundCompat),
+                                                  felOverlay: false, audioBridgeMode: .surroundCompat,
+                                                  deinterlaceFieldRate: fieldRate),
                              audioSourceStreamIndex: nil)
             e.play()
         } catch {
