@@ -73,6 +73,13 @@ final class SegmentCache: @unchecked Sendable {
     /// adoption below the 64 highest at once, so after a backward seek each reader read as abandoned.
     private var sealedFromStaging: [URL: Int] = [:]
     private var sealedStagingOrder: [URL] = []
+    /// Bumped by every staging append the producer reports (`noteStagingAppended`). A progressive
+    /// reader that has drained its file parks on `condition` until this moves or its segment's state
+    /// changes, so it wakes on the write itself rather than on a timer.
+    private var stagingAppends: UInt64 = 0
+    /// Readers parked in `awaitStagingAppend`. Appends broadcast only while there are any, so the
+    /// muxer's writes do not wake the cache's other waiters for nothing.
+    private var stagingWaiters = 0
 
     /// Pinned in RAM (~3.5 KB); AVPlayer fetches exactly once per session; never evicted.
     private var initSegment: Data?
@@ -350,12 +357,14 @@ final class SegmentCache: @unchecked Sendable {
         return true
     }
 
+    /// Written in place, not through a temporary: the name is this store's own (`nextSegmentFileURL`)
+    /// and readers learn it only after the write returns, so nobody can see it half written.
     @discardableResult
     func store(index: Int, data: Data) -> Bool {
         let fileURL = nextSegmentFileURL(index: index)
         var writeOK: Bool
         do {
-            try data.write(to: fileURL, options: [.atomic])
+            try data.write(to: fileURL)
             writeOK = true
         } catch {
             // The retry's own error decides: a missing directory restored onto a full volume fails
@@ -363,7 +372,7 @@ final class SegmentCache: @unchecked Sendable {
             var finalError: Error? = error
             if restoreSessionDirIfMissing() {
                 do {
-                    try data.write(to: fileURL, options: [.atomic])
+                    try data.write(to: fileURL)
                     finalError = nil
                 } catch {
                     finalError = error
@@ -649,11 +658,40 @@ final class SegmentCache: @unchecked Sendable {
     }
 
     /// The producer gave up the segment it was writing (restart, failed cut, teardown), so its
-    /// partial bytes are never adopted. A reader draining it learns that on its next poll.
+    /// partial bytes are never adopted. The broadcast wakes a reader parked on it.
     func abandonInProgress(index: Int) {
         condition.lock()
         if inProgress.removeValue(forKey: index) != nil { condition.broadcast() }
         condition.unlock()
+    }
+
+    /// The producer appended to a staging file. Called after the write returns, so a reader woken by
+    /// it finds the bytes with `fstat`.
+    func noteStagingAppended() {
+        condition.lock()
+        stagingAppends &+= 1
+        if stagingWaiters > 0 { condition.broadcast() }
+        condition.unlock()
+    }
+
+    /// The append count, read before a reader looks at its file and handed to `awaitStagingAppend`:
+    /// an append landing between the look and the park then ends the park at once.
+    func stagingAppendCount() -> UInt64 {
+        condition.lock(); defer { condition.unlock() }
+        return stagingAppends
+    }
+
+    /// Parks until an append moves the count past `seen`, the segment stops being written (adopted,
+    /// abandoned, the cache closed), or `deadline`. False only when the deadline passed.
+    func awaitStagingAppend(after seen: UInt64, index: Int, stagingPath: URL, until deadline: Date) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        stagingWaiters += 1
+        defer { stagingWaiters -= 1 }
+        while stagingAppends == seen, !closed, inProgress[index] == stagingPath {
+            if !condition.wait(until: deadline) { return false }
+        }
+        return true
     }
 
     enum InProgressState: Equatable {
@@ -1207,7 +1245,7 @@ final class SegmentCache: @unchecked Sendable {
     /// the caller handles that by retrying or restarting the producer.
     private func readMapped(_ url: URL) -> Data? {
         do {
-            return try Data(contentsOf: url, options: [.alwaysMapped, .uncached])
+            return try Data(contentsOf: url, options: .alwaysMapped)
         } catch {
             EngineLog.emit("[SegmentCache] mmap read failed \(url.lastPathComponent): \(error)",
                            category: .session)
@@ -1264,24 +1302,20 @@ final class ProgressiveSegmentReader: @unchecked Sendable {
 
     /// The next bytes past `offset`, waiting for the producer to write them. `.finished` once the
     /// sealed segment is read to its end; `.abandoned` when the producer gave it up, or wrote nothing
-    /// for `idleTimeout` (a wedged producer must not hold a connection forever).
-    func next(maxBytes: Int = 256 * 1024, pollInterval: TimeInterval = 0.02,
-              idleTimeout: TimeInterval = 60) -> Next {
+    /// for `idleTimeout` (a wedged producer must not hold a connection forever). The wait is parked on
+    /// the cache and woken by the producer's append, seal or abandonment, never by a timer.
+    func next(maxBytes: Int = 256 * 1024, idleTimeout: TimeInterval = 60) -> Next {
         let deadline = Date().addingTimeInterval(idleTimeout)
         while true {
+            guard let cache else { return .abandoned }
+            let seenAppends = cache.stagingAppendCount()
             var st = stat()
             let statOK = fstat(fd, &st) == 0
             if statOK, st.st_size > offset {
                 let count = Int(min(Int64(maxBytes), st.st_size - offset))
-                var data = Data(count: count)
-                let read = data.withUnsafeMutableBytes { pread(fd, $0.baseAddress, count, off_t(offset)) }
-                if read > 0 {
-                    if read < count { data.removeSubrange(read ..< count) }
-                    offset += Int64(read)
-                    return .bytes(data)
-                }
+                if let data = readChunk(count: count) { return .bytes(data) }
             }
-            switch cache?.inProgressState(index: index, stagingPath: stagingPath) ?? .abandoned {
+            switch cache.inProgressState(index: index, stagingPath: stagingPath) {
             case .writing:
                 break
             case .sealed(let bytes):
@@ -1294,9 +1328,21 @@ final class ProgressiveSegmentReader: @unchecked Sendable {
             case .abandoned:
                 return .abandoned
             }
-            if Date() >= deadline { return .abandoned }
-            Thread.sleep(forTimeInterval: pollInterval)
+            if !cache.awaitStagingAppend(after: seenAppends, index: index, stagingPath: stagingPath,
+                                         until: deadline) {
+                return .abandoned
+            }
         }
+    }
+
+    /// Up to `count` bytes at `offset`, read straight into the buffer the returned `Data` owns.
+    private func readChunk(count: Int) -> Data? {
+        guard let buffer = malloc(count) else { return nil }
+        var read: Int
+        repeat { read = pread(fd, buffer, count, off_t(offset)) } while read < 0 && errno == EINTR
+        guard read > 0 else { free(buffer); return nil }
+        offset += Int64(read)
+        return Data(bytesNoCopy: buffer, count: read, deallocator: .free)
     }
 
     /// Reads to the seal, for a caller that needs the whole segment. nil when it was abandoned.

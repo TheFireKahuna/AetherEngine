@@ -314,6 +314,7 @@ final class MP4SegmentMuxer {
         audioMoovPrimeFrame: [UInt8]? = nil,
         audioDelaySeconds: Double = 0,
         onStorageExhausted: (@Sendable () -> Void)? = nil,
+        onBytesStaged: (@Sendable () -> Void)? = nil,
         inMemory: Bool = false,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
@@ -366,6 +367,7 @@ final class MP4SegmentMuxer {
         counter.fd = firstFd
         counter.memory = inMemory ? NSMutableData() : nil
         counter.onStorageExhausted = onStorageExhausted
+        counter.onBytesStaged = onBytesStaged
         self.byteCounter = counter
 
         let sampleEntryOverride = audio?.soundSampleEntryOverride
@@ -410,6 +412,7 @@ final class MP4SegmentMuxer {
                 }
                 counter.bytesWrittenCurrentSegment += count
                 counter.lifetimeFragmentBytes += count
+                counter.onBytesStaged?()
             },
             moofRewriter: sampleEntryOverride == nil ? nil : { moof in
                 guard let trackID = preRoll.trackID else { return moof }
@@ -1335,6 +1338,9 @@ private final class ByteCounter {
     var writeFailed: Bool = false
     /// Reports a staging write that hit a full volume to the session's cache.
     var onStorageExhausted: (@Sendable () -> Void)?
+    /// Told after each fragment write lands in the staging file, so a reader following the file
+    /// wakes on the write.
+    var onBytesStaged: (@Sendable () -> Void)?
     var lifetimeFragmentBytes: Int = 0
     var fragmentCuts: Int = 0
 }

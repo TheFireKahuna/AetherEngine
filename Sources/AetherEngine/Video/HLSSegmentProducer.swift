@@ -2348,6 +2348,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // #15: subtitles ship as a separate WebVTT rendition (HLSLocalServer), NOT muxed into the A/V
             // fMP4. In-band timed text is non-conformant for HLS and fails the AVPlayer open (RFC 8216 §3.1,
             // empirically -11829/-12848). The muxer carries no subtitle streams; the cue stores feed the WebVTT.
+            // Only a progressive serve follows a staging file while it grows.
+            var onBytesStaged: (@Sendable () -> Void)?
+            if servesProgressively { onBytesStaged = { [cache] in cache.noteStagingAppended() } }
             let muxer = try MP4SegmentMuxer(
                 initialSegmentIndex: initialSegmentIndex,
                 sessionDir: cache.sessionDir,
@@ -2365,6 +2368,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 audioDelaySeconds: (audioConfig?.bridge == nil ? audioDelaySeconds : 0)
                     + streamCopyDecoderDelayResidualSeconds,
                 onStorageExhausted: { [cache] in cache.noteStorageExhausted() },
+                onBytesStaged: onBytesStaged,
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if versionedInit {

@@ -85,7 +85,27 @@ struct ProgressiveSegmentDeliveryTests {
         let reader = try #require(ProgressiveSegmentReader(cache: cache, index: 10, stagingPath: staging))
         #expect(reader.next() == .bytes(payload))
         cache.adopt(index: 10, stagingPath: staging, byteCount: payload.count)
-        #expect(reader.next(pollInterval: 0.01, idleTimeout: 0.5) == .finished)
+        #expect(reader.next(idleTimeout: 0.5) == .finished)
+    }
+
+    @Test("a drained reader wakes on the producer's append, not on a timer")
+    func parkedReaderWakesOnAppend() throws {
+        let cache = makeCache()
+        defer { cache.close() }
+        let (staging, handle) = try makeStaging(cache, index: 4)
+        defer { try? handle.close() }
+        cache.beginInProgress(index: 4, stagingPath: staging)
+        let reader = try #require(ProgressiveSegmentReader(cache: cache, index: 4, stagingPath: staging))
+        let late = bytes(900, seed: 8)
+        let writer = Thread {
+            Thread.sleep(forTimeInterval: 0.2)
+            handle.write(late)
+            cache.noteStagingAppended()
+        }
+        writer.start()
+        let start = Date()
+        #expect(reader.next(idleTimeout: 10) == .bytes(late))
+        #expect(Date().timeIntervalSince(start) < 5, "the reader slept past the append")
     }
 
     @Test("a producer that stops writing does not hold a reader forever")
@@ -96,7 +116,7 @@ struct ProgressiveSegmentDeliveryTests {
         defer { try? handle.close() }
         cache.beginInProgress(index: 1, stagingPath: staging)
         let reader = try #require(ProgressiveSegmentReader(cache: cache, index: 1, stagingPath: staging))
-        #expect(reader.next(pollInterval: 0.01, idleTimeout: 0.2) == .abandoned)
+        #expect(reader.next(idleTimeout: 0.2) == .abandoned)
     }
 
     @Test("with the option off, a segment being written is not served until its cut")

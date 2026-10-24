@@ -7,6 +7,10 @@ public protocol ByteRangeSource: AnyObject, Sendable {
     /// Total size of the underlying object in bytes.
     var byteSize: Int64 { get }
 
+    /// The most one `read` can return in a single round trip. `SMBIOReader` grows its blocks up to
+    /// this while reads stay sequential.
+    var preferredReadSize: Int { get }
+
     /// Read up to `length` bytes starting at absolute `offset`. May return
     /// fewer bytes than requested at end of file, and an empty `Data` at or
     /// past EOF. Throws on a genuine I/O error.

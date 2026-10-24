@@ -381,11 +381,12 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
     private func makeWriter(_ id: UInt64) throws -> FileHandle {
         let url = chunkURL(id)
         pendingChunkID = id
-        // Never truncate an unexpected existing file, even inside our own unique directory.
-        try Data().write(to: url, options: .withoutOverwriting)
-        let handle = try FileHandle(forWritingTo: url)
+        // Never truncate an unexpected existing file, even inside our own unique directory: O_EXCL
+        // creates it and opens it in the one call.
+        let fd = Darwin.open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw Self.posixError() }
         pendingChunkID = nil
-        return handle
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 
     private func openFirstChunk() throws {
