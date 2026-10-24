@@ -28,7 +28,7 @@ struct MatroskaCueIndex: Sendable {
     /// How a track's frames are stored (Matroska ContentEncoding).
     enum FrameEncoding: Sendable, Equatable {
         case none
-        /// zlib; `EmbeddedSubtitleDecoder` inflates a zlib-wrapped payload on its own.
+        /// zlib; `readFrame` inflates it, as libavformat does.
         case zlib
         /// Header stripping: these bytes were removed from the front of every frame.
         case strippedHeader([UInt8])
@@ -391,10 +391,45 @@ struct MatroskaCueIndex: Sendable {
     struct Frame: Sendable {
         var ticks: Int64
         var durationTicks: Int64?
-        /// The frame as the decoder takes it: header-stripped bytes restored, zlib left for the decoder.
+        /// The frame as libavformat hands it over: header-stripped bytes restored, zlib inflated.
         var payload: [UInt8]
         /// True when only the first bytes were read (`readFrame(..., prefix:)`).
         var isPrefix: Bool
+    }
+
+    /// Whether `track` is a WebVTT subtitle track, whose blocks are split before they are a packet.
+    func isWebVTT(track: UInt64) -> Bool {
+        subtitleTracks.first(where: { $0.number == track }).flatMap { Self.codecFamily[$0.codecID] } == "webvtt"
+    }
+
+    /// A WebVTT block as libavformat hands it over (`matroska_parse_webvtt`): the payload is an
+    /// identifier line, a settings line and the cue text, each line ended by CR, LF or CRLF; the packet
+    /// is the text with its trailing line breaks stripped, and the settings ride as side data. Nil for
+    /// a block libavformat would refuse (a missing line, an empty text), which it drops.
+    static func webVTTCue(_ payload: [UInt8]) -> (text: [UInt8], settings: String)? {
+        var p = 0
+        func lineEnd(from start: Int) -> Int? {
+            var i = start
+            while i < payload.count {
+                if payload[i] == 0x0D || payload[i] == 0x0A { return i }
+                i += 1
+            }
+            return nil
+        }
+        func skipBreak(at end: Int) -> Int {
+            if payload[end] == 0x0D, end + 1 < payload.count, payload[end + 1] == 0x0A { return end + 2 }
+            return end + 1
+        }
+        guard let idEnd = lineEnd(from: p) else { return nil }
+        p = skipBreak(at: idEnd)
+        let settingsStart = p
+        guard let settingsEnd = lineEnd(from: p) else { return nil }
+        let settings = String(decoding: payload[settingsStart..<settingsEnd], as: UTF8.self)
+        p = skipBreak(at: settingsEnd)
+        var textEnd = payload.count
+        while textEnd > p, payload[textEnd - 1] == 0x0D || payload[textEnd - 1] == 0x0A { textEnd -= 1 }
+        guard textEnd > p else { return nil }
+        return (Array(payload[p..<textEnd]), settings)
     }
 
     /// The bytes a block read needs beyond the payload: the element's header plus the cluster size field
@@ -404,7 +439,11 @@ struct MatroskaCueIndex: Sendable {
     /// Reads `block` of `track`. With `prefix`, at most that many payload bytes (enough for a PGS
     /// composition header) instead of the whole frame. Nil when the block is not where the index says.
     func readFrame(_ block: Block, track: UInt64, from source: RandomAccessByteSource,
-                   prefix: Int? = nil) -> Frame? {
+                   prefix requestedPrefix: Int? = nil) -> Frame? {
+        // A compressed frame has no readable prefix: it is read whole and inflated, and the prefix is
+        // taken from what it inflates to.
+        let compressed = encodingByTrack[track] == .zlib
+        let prefix = compressed ? nil : requestedPrefix
         // The block starts at cluster + 4 (the cluster ID) + the size field (1...8) + relative position.
         let earliest = segmentDataStart + block.clusterPosition + 4 + 1 + block.relativePosition
         let want = (prefix ?? 512) + Self.blockHeaderSlack + 8
@@ -432,8 +471,17 @@ struct MatroskaCueIndex: Sendable {
                 isPrefix = false
             }
             if case .strippedHeader(let stripped) = encodingByTrack[track] ?? .none { payload = stripped + payload }
+            var prefixed = isPrefix
+            if compressed {
+                guard let inflated = ZlibBlock.inflate(payload) else { return nil }
+                payload = inflated
+                if let requestedPrefix, payload.count > requestedPrefix {
+                    payload = Array(payload.prefix(requestedPrefix))
+                    prefixed = true
+                }
+            }
             return Frame(ticks: block.ticks, durationTicks: located.durationTicks ?? block.durationTicks,
-                         payload: payload, isPrefix: isPrefix)
+                         payload: payload, isPrefix: prefixed)
         }
         return nil
     }

@@ -426,10 +426,20 @@ extension AetherEngine {
     nonisolated static func decode(_ frame: MatroskaCueIndex.Frame, plan: IndexedRenditionPlan,
                                    index: MatroskaCueIndex,
                                    decoder: EmbeddedSubtitleDecoder) -> EmbeddedSubtitleDecoder.SubtitleEvent? {
-        guard !frame.payload.isEmpty, let packet = trackedPacketAlloc() else { return nil }
+        // A WebVTT block is split the way libavformat splits it (`MatroskaCueIndex.webVTTCue`): the
+        // packet is the cue text, and the settings ride as side data, as the demuxer attaches them.
+        var payload = frame.payload
+        var settings: String?
+        if index.isWebVTT(track: plan.trackNumber) {
+            guard let cue = MatroskaCueIndex.webVTTCue(frame.payload) else { return nil }
+            payload = cue.text
+            settings = cue.settings
+        }
+        guard !payload.isEmpty, let packet = trackedPacketAlloc() else { return nil }
         defer { var p: UnsafeMutablePointer<AVPacket>? = packet; trackedPacketFree(&p) }
-        guard av_new_packet(packet, Int32(frame.payload.count)) == 0 else { return nil }
-        frame.payload.withUnsafeBufferPointer { packet.pointee.data.update(from: $0.baseAddress!, count: $0.count) }
+        guard av_new_packet(packet, Int32(payload.count)) == 0 else { return nil }
+        payload.withUnsafeBufferPointer { packet.pointee.data.update(from: $0.baseAddress!, count: $0.count) }
+        if let settings { WebVTTCueSettings.attach(settings: settings, to: packet) }
         let nanosPerTick = index.timestampScale
         let toStream = { (ticks: Int64) -> Int64 in
             av_rescale_q(ticks, AVRational(num: Int32(clamping: nanosPerTick), den: 1_000_000_000), plan.timeBase)

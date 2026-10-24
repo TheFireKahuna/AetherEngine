@@ -55,27 +55,31 @@ struct MatroskaCueIndexTests {
     /// Video track 1, text track 2, zlib PGS track 3, header-stripped track 4; clusters with 3- and
     /// 8-byte size fields; cues for every subtitle block, and for one video block without a relative
     /// position.
-    static func fixture(dropCueFor dropTrack: UInt64? = nil) -> Fixture {
+    /// `webVTT`: track 2 is S_TEXT/WEBVTT, its blocks an identifier line, a settings line and the text,
+    /// the way libavformat reads them (`matroska_parse_webvtt`).
+    static func fixture(dropCueFor dropTrack: UInt64? = nil, webVTT: Bool = false) -> Fixture {
         let ebml = element(0x1A45DFA3, element(0x4282, Array("matroska".utf8)))
         let info = element(0x1549A966, uint(0x2AD7B1, 1_000_000))
         let tracks = element(0x1654AE6B,
             element(0xAE, uint(0xD7, 1) + uint(0x83, 1))
-            + element(0xAE, uint(0xD7, 2) + uint(0x83, 0x11) + element(0x86, Array("S_TEXT/UTF8".utf8)))
+            + element(0xAE, uint(0xD7, 2) + uint(0x83, 0x11)
+                      + element(0x86, Array((webVTT ? "S_TEXT/WEBVTT" : "S_TEXT/UTF8").utf8)))
             + element(0xAE, uint(0xD7, 3) + uint(0x83, 0x11) + element(0x86, Array("S_HDMV/PGS".utf8))
                       + element(0x6D80, element(0x6240, element(0x5034, uint(0x4254, 0)))))
             + element(0xAE, uint(0xD7, 5) + uint(0x83, 0x11) + element(0x86, Array("X_NOT_A_SUBTITLE".utf8)))
             + element(0xAE, uint(0xD7, 4) + uint(0x83, 0x11) + element(0x86, Array("S_HDMV/PGS".utf8))
                       + element(0x6D80, element(0x6240, element(0x5034, uint(0x4254, 3)
                                                                       + element(0x4255, [0xAB, 0xCD]))))))
-        let pgs = zlibWrapped(pgsDisplaySet(state: 0x80, forced: true))
+        let pgsPlain = pgsDisplaySet(state: 0x80, forced: true)
+        let pgs = zlibWrapped(pgsPlain)
         let stripped: [UInt8] = [0x01, 0x02]
         // Cluster contents: (track, ticks, payload, duration, simple).
         let clusters: [(sizeLength: Int, ticks: Int64, blocks: [(UInt8, Int64, [UInt8], UInt64?, Bool)])] = [
             (3, 0, [(1, 0, [UInt8](repeating: 0x11, count: 300), nil, true),
-                    (2, 10, Array("Hello".utf8), 1200, false),
+                    (2, 10, Array((webVTT ? "cue-1\nline:90% align:start\nHello" : "Hello").utf8), 1200, false),
                     (3, 20, pgs, nil, false)]),
             (8, 5000, [(1, 5000, [UInt8](repeating: 0x22, count: 500), nil, true),
-                       (2, 5100, Array("World".utf8), 900, false),
+                       (2, 5100, Array((webVTT ? "\r\n\r\nWorld\r\n" : "World").utf8), 900, false),
                        (4, 5200, stripped, nil, true)]),
         ]
         // Layout: SeekHead (fixed size, filled in after), Info, Tracks, clusters, Cues.
@@ -103,7 +107,8 @@ struct MatroskaCueIndexTests {
                         uint(0xF7, 1) + uint(0xF1, UInt64(clusterPosition))))
                 }
                 if track != 1 {
-                    let restored = track == 4 ? [0xAB, 0xCD] + payload : payload
+                    // As libavformat hands frames over: stripped bytes restored, zlib inflated.
+                    let restored = track == 4 ? [0xAB, 0xCD] + payload : track == 3 ? pgsPlain : payload
                     expected[UInt64(track), default: []].append((ticks, restored, duration.map { Int64($0) }))
                 }
             }
@@ -149,6 +154,19 @@ struct MatroskaCueIndexTests {
 
     // MARK: - Tests
 
+    /// libavformat's split, case for case: what the walk's packet would carry is what the index's does.
+    @Test("a WebVTT block splits into text and settings as libavformat splits it")
+    func webVTTSplitMatchesTheDemuxer() throws {
+        let plain = try #require(MatroskaCueIndex.webVTTCue(Array("cue-1\nline:90% align:start\nHello\nthere\n".utf8)))
+        #expect(String(decoding: plain.text, as: UTF8.self) == "Hello\nthere")
+        #expect(plain.settings == "line:90% align:start")
+        let crlf = try #require(MatroskaCueIndex.webVTTCue(Array("\r\n\r\nWorld\r\n".utf8)))
+        #expect(String(decoding: crlf.text, as: UTF8.self) == "World")
+        #expect(crlf.settings.isEmpty)
+        #expect(MatroskaCueIndex.webVTTCue(Array("no settings line".utf8)) == nil)
+        #expect(MatroskaCueIndex.webVTTCue(Array("id\nsettings\n\n".utf8)) == nil, "an empty text is refused")
+    }
+
     /// The video track's cues are its keyframes: kept with the cluster they name even where the muxer
     /// wrote no relative position (the fixture's video cues have none), in time order, and each one's
     /// byte offset is where its cluster begins.
@@ -181,7 +199,7 @@ struct MatroskaCueIndexTests {
         #expect(index.encodingByTrack[4] == .strippedHeader([0xAB, 0xCD]))
     }
 
-    @Test("a block is read whatever its cluster's size field length, with its duration and a stripped header restored")
+    @Test("a block is read whatever its cluster's size field length, with its duration, a stripped header restored and zlib inflated")
     func readsFrames() throws {
         let fixture = Self.fixture()
         let src = source(fixture)
