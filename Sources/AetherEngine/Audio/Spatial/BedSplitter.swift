@@ -57,6 +57,7 @@ final class BedSplitter {
     /// Input frames after which the output no longer depends on anything before them: the frame
     /// and the balance window.
     static let memoryFrames = fftSize + balanceWindowHops * hop
+    static let span = AudioStageSpan(latency: latency, memory: memoryFrames)
     static let balanceLimit: Float = 4
     /// A lowering is applied at this fraction of its size in dB.
     static let balanceLowering: Float = 1.0 / 3

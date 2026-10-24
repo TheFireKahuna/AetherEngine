@@ -70,6 +70,9 @@ protocol ObjectAudioDecoding: AnyObject {
     /// The decoder's output is meant to come from its channel bed (`ObjectAudioDecodedBlock.bed`) and
     /// nothing else: a block without one plays as silence rather than through the renderer's mix.
     var playsBedOnly: Bool { get }
+    /// What its output at a position takes input from (`AudioStageSpan`), from where a read starts:
+    /// the wait for a point the bitstream decodes from, and the history the decode is coded against.
+    var span: AudioStageSpan { get }
 }
 
 extension ObjectAudioDecoding {

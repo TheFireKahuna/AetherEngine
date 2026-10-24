@@ -326,6 +326,73 @@ struct SpatialObjectRenderingTests {
         #expect(abs(out[r][299] - 1) < 1e-5)
     }
 
+    /// Block `b` of a programme whose updates come every 32 frames: ramps of 41 frames, each cut
+    /// short by the next update, until `settleFrom`, then ramps of 21 that end before the next.
+    private func settlingUpdates(block b: Int, settleFrom: Int) -> [ObjectAudioMetadataUpdate] {
+        [0, 32].map { offset in
+            let n = Float(2 * b + offset / 32)
+            let state = ObjectAudioElementState(position: SIMD3((n * 0.37).truncatingRemainder(dividingBy: 1), 0.3, 0),
+                                                gain: 0.5 + 0.5 * (n * 0.61).truncatingRemainder(dividingBy: 1))
+            return .init(frameOffset: offset, rampFrames: b < settleFrom ? 40 : 20, states: [state, ObjectAudioElementState()])
+        }
+    }
+
+    @Test("a run started mid-programme matches continuous playback bit for bit from the moment it says it has settled")
+    func settledMeansContinuous() {
+        let layout = SpatialSpeakerLayout.l714
+        let roles: [ObjectAudioRole] = [.object, .bed(.left)]
+        let signal = (0..<64).map { Float($0 % 13) / 13 - 0.4 }
+        let continuous = ObjectAudioRenderer(layout: layout, roles: roles)
+        var whole: [[[Float]]] = []
+        for b in 0..<30 {
+            whole.append(render(continuous, inputs: [signal, signal], frames: 64,
+                                updates: settlingUpdates(block: b, settleFrom: 20)))
+        }
+        let restarted = ObjectAudioRenderer(layout: layout, roles: roles)
+        for b in 8..<30 {
+            let out = render(restarted, inputs: [signal, signal], frames: 64,
+                             updates: settlingUpdates(block: b, settleFrom: 20))
+            if b < 20 {
+                #expect(!restarted.isSettled, "block \(b): every ramp so far was cut short")
+            } else {
+                #expect(restarted.isSettled, "block \(b): the ramp from frame 0 ended at 21, before the next update")
+            }
+            if b == 10 { #expect(out != whole[b], "before settling, the cut-short ramps still differ") }
+            if b > 20 { #expect(out == whole[b], "block \(b)") }
+        }
+    }
+
+    @Test("an update without a ramp settles its element at once, and a reset unsettles it")
+    func jumpSettles() {
+        let layout = SpatialSpeakerLayout.l714
+        let renderer = ObjectAudioRenderer(layout: layout, roles: [.object])
+        let ones = [Float](repeating: 1, count: 64)
+        #expect(!renderer.isSettled)
+        _ = render(renderer, inputs: [ones], frames: 64, updates: [
+            .init(frameOffset: 0, rampFrames: 1536, states: [ObjectAudioElementState(position: SIMD3(0, 0, 0))])])
+        #expect(!renderer.isSettled, "the first update jumps here, but continuous playback is still ramping")
+        _ = render(renderer, inputs: [ones], frames: 64, updates: [
+            .init(frameOffset: 10, rampFrames: 0, states: [ObjectAudioElementState(position: SIMD3(1, 0, 0))])])
+        #expect(renderer.isSettled)
+        renderer.reset()
+        #expect(!renderer.isSettled)
+    }
+
+    @Test("after a resync the next update settles its element, since every run jumps on it")
+    func discontinuitySettlesOnNextUpdate() {
+        let layout = SpatialSpeakerLayout.l714
+        let renderer = ObjectAudioRenderer(layout: layout, roles: [.object])
+        let ones = [Float](repeating: 1, count: 64)
+        _ = render(renderer, inputs: [ones], frames: 64, updates: [
+            .init(frameOffset: 0, rampFrames: 1536, states: [ObjectAudioElementState(position: SIMD3(0, 0, 0))])])
+        renderer.markDiscontinuity()
+        _ = render(renderer, inputs: [[Float](repeating: 1, count: 4096)], frames: 4096, updates: [])
+        #expect(!renderer.isSettled, "the ramp it was waiting on stopped where it was")
+        _ = render(renderer, inputs: [ones], frames: 64, updates: [
+            .init(frameOffset: 0, rampFrames: 1536, states: [ObjectAudioElementState(position: SIMD3(1, 0, 0))])])
+        #expect(renderer.isSettled)
+    }
+
     @Test("a snapshot mid-ramp reports the object where its ramp has got to, position and gain as its gains")
     func snapshotFollowsTheRamp() {
         let layout = SpatialSpeakerLayout.l714

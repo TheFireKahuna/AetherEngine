@@ -18,6 +18,9 @@ final class ObjectAudioDecimator {
     let factor: Int
     /// Output frames of look-ahead (the filter's half length at the output rate).
     static let delay = 24
+    /// Output frame `n` is a function of the input `delay` either side of it. The look-ahead is taken
+    /// inside (`delay`), so the timeline sees no latency.
+    static let span = AudioStageSpan(latency: 0, memory: delay)
     private let taps: [Float]
 
     /// Per channel: input not yet consumed, the filter's history included.

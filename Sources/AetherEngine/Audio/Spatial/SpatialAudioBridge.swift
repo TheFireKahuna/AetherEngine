@@ -53,11 +53,33 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// The encoder's priming: the first frames of every encoder run's decoded audio, before its content.
     var leadingFrames: Int { pipeline.leadingFrames }
 
+    /// What the bed handed to the encoder at a position takes input from, decoder to limiter
+    /// (`AudioStageSpan`). Two stages are not in it. The renderer's memory is the metadata's, and it
+    /// says itself when it has settled (`ObjectAudioRenderer.isSettled`). The encoder's never ends,
+    /// so a segment that must not depend on its run gets a run of its own
+    /// (`APACEncoder.segmentRunLeadFrames`).
+    var span: AudioStageSpan {
+        var stages = [decoder.span]
+#if TrueHDObjectAudio
+        if decoder.playsBedOnly { stages.append(BedSplitter.span) }
+#endif
+#if APACObjectOutput
+        if objectOutput { return .series(stages) }
+#endif
+        stages.append(PeakLimiter.span(sampleRate: Self.sampleRate))
+        return .series(stages)
+    }
+
     private let srcTimeBase: AVRational
     private let decoder: ObjectAudioDecoding
     private let pipeline: APACEncodePipeline
     private var renderer: ObjectAudioRenderer?
     private var rendererGeneration = -1
+    /// The renderer started over (built, or reset by a restart) and its next block marks where.
+    private var rendererRunPending = true
+    /// Where the renderer's run began, until it settles (`ObjectAudioRenderer.isSettled`): how long
+    /// that takes on real programmes is what a restart's pre-roll has to cover, so it is logged.
+    private var rendererSettlingFrom: Int64?
     /// What the encoder is fed, per bed channel, for the session log (see `BedLevelMeter`).
     private var levelMeter: BedLevelMeter
     /// Keeps the bed under full scale, since the encoder carries anything over it on (see `PeakLimiter`).
@@ -78,12 +100,13 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     private var splitterStartsFresh = true
     private var gainSnapshot = ObjectAudioGainSnapshot()
 #endif
-    /// Frames taken from the decoder that have not reached `output` yet.
+    /// Frames taken from the decoder that have not reached the encoder yet, outside `output`: the
+    /// splitter's and the limiter's look-ahead.
     private var heldBack: Int {
 #if TrueHDObjectAudio
-        splitter?.backlog ?? 0
+        (splitter?.backlog ?? 0) + limiter.backlog
 #else
-        0
+        limiter.backlog
 #endif
     }
     private static let encodeChunkFrames = 2048
@@ -173,7 +196,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         self.layout = layout
         self.decoder = decoder
         levelMeter = BedLevelMeter(layout: layout, sampleRate: Self.sampleRate)
-        limiter = PeakLimiter(sampleRate: Self.sampleRate)
+        limiter = PeakLimiter(sampleRate: Self.sampleRate, channels: layout.channelCount)
         let encoder: any APACChunkEncoding
         let channels: Int
         let rate: Int
@@ -382,6 +405,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         renderHeldBlocks(into: &stamped)
         drainSplitter()
         encodePending()
+        drainLimiter()
         logLevels(levelMeter.restart())
         let finished = pipeline.finish()
         stamped += finished.packets
@@ -399,6 +423,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         defer { opLock.unlock() }
         decoder.reset()
         renderer?.reset()
+        rendererRunPending = true
 #if TrueHDObjectAudio
         splitter?.reset()
         splitterStartsFresh = true
@@ -487,6 +512,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             )
             renderer = ObjectAudioRenderer(layout: layout, roles: block.roles)
             rendererGeneration = block.configurationGeneration
+            rendererRunPending = true
         } else if block.isDiscontinuity {
             renderer?.markDiscontinuity()
         }
@@ -574,9 +600,25 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             outputs: output.planes.map { $0 + pendingFrames })
         pendingFrames += block.frameCount
 #endif
+        noteRendererSettling(blockAt: position, frames: block.frameCount)
         stats.samplesEnqueued += Int64(block.frameCount)
         stats.packetsFedSinceLastEnqueue = 0
         if pendingFrames >= Self.encodeChunkFrames { encodePending() }
+    }
+
+    /// Log where the renderer settles, once per run.
+    private func noteRendererSettling(blockAt position: Int64, frames: Int) {
+        if rendererRunPending {
+            rendererRunPending = false
+            rendererSettlingFrom = position
+        }
+        guard let from = rendererSettlingFrom, renderer?.isSettled == true else { return }
+        rendererSettlingFrom = nil
+        let end = position + Int64(frames)
+        EngineLog.emit(
+            String(format: "[SpatialAudioBridge] render settled by %.3f s, %.3f s after its run began",
+                   Double(end) / Double(Self.sampleRate), Double(end - from) / Double(Self.sampleRate)),
+            category: .session)
     }
 
 #if APACObjectOutput
@@ -658,6 +700,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         }
         drainSplitter()
         encodePending()
+        drainLimiter()
         pipeline.restart()
         limiter.reset()
         anchor(at: target)
@@ -724,7 +767,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         guard pendingFrames > 0 else { return }
         var frames = pendingFrames
         pendingFrames = 0
-        guard let start = encoderStartFrame else { return }
+        guard encoderStartFrame != nil else { return }
         if pendingTrimFrames > 0 {
             let cut = Int(min(pendingTrimFrames, Int64(frames)))
             pendingTrimFrames -= Int64(cut)
@@ -741,9 +784,9 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
 #endif
             if frames == 0 { return }
         }
-        let position = start + encoderFramesIn
 #if APACObjectOutput
-        if objectOutput {
+        if objectOutput, let start = encoderStartFrame {
+            let position = start + encoderFramesIn
             // No bed to measure, but the objects and the LFE input still get their line.
             logLevels(levelMeter.addUnmeasured(frameCount: frames, startSeconds: Double(position) / Double(Self.sampleRate)))
             output = pipeline.submit(output, frames: frames, position: position)
@@ -755,7 +798,21 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             return
         }
 #endif
-        limiter.process(output.planes, frameCount: frames, lfe: layout.lfeIndex)
+        submitLimited(limiter.process(output.planes, frameCount: frames, lfe: layout.lfeIndex))
+    }
+
+    /// The frames the limiter still holds, to the encoder: before it restarts somewhere else or the
+    /// input ends, so the audio up to there plays in full. `output` is empty here.
+    private func drainLimiter() {
+        guard limiter.backlog > 0, encoderStartFrame != nil else { return }
+        output.ensureCapacity(limiter.backlog, keeping: 0)
+        submitLimited(limiter.drain(into: output.planes, lfe: layout.lfeIndex))
+    }
+
+    /// The first `frames` of `output`, which the limiter has handed on, to the encoder's queue.
+    private func submitLimited(_ frames: Int) {
+        guard frames > 0, let start = encoderStartFrame else { return }
+        let position = start + encoderFramesIn
         // Where this chunk plays, for the level line: the anchor is a source PTS in 48 kHz frames.
         logLevels(levelMeter.add(output.planes.map { UnsafePointer($0) }, frameCount: frames,
                                  startSeconds: Double(position) / Double(Self.sampleRate)))
