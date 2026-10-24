@@ -2,6 +2,7 @@ import Foundation
 import CoreGraphics
 import CoreMedia
 import CoreVideo
+import VideoToolbox
 import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
@@ -37,6 +38,9 @@ final class FrameDecodeContext: @unchecked Sendable {
     private var demuxer: Demuxer?
     /// Packet-fed contexts only: the stream's own parameters, owned, in place of a demuxer.
     private var streamParameters: UnsafeMutablePointer<AVCodecParameters>?
+    /// Packet-fed contexts only: VideoToolbox's scale and colour conversion, and the 10-bit buffers it fills.
+    private var stillScale: VTPixelTransferSession?
+    private var stillPool: (width: Int, height: Int, pool: CVPixelBufferPool)?
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
     private var hardwareDeviceContext: UnsafeMutablePointer<AVBufferRef>?
     private var hardwareDecodeDisabled = false
@@ -222,6 +226,9 @@ final class FrameDecodeContext: @unchecked Sendable {
             sws_freeContext(swsContext)
             swsContext = nil
         }
+        if let stillScale { VTPixelTransferSessionInvalidate(stillScale) }
+        stillScale = nil
+        stillPool = nil
         demuxer?.close()
         demuxer = nil
         boundedReader?.close()
@@ -710,8 +717,9 @@ final class FrameDecodeContext: @unchecked Sendable {
     
     }
 
-    /// Decodes one keyframe handed over whole (packet-fed contexts): the decoder stays open between stills,
-    /// so each costs one decode and its conversion. nil on a decode failure.
+    /// Decodes one keyframe handed over whole (packet-fed contexts) to a CGImage on the CPU path: the Dolby
+    /// Vision profile 5 converter, or the tone map. The decoder stays open between stills. nil on a failure.
+    /// `decodeScaledStill` is the fast path for everything VideoToolbox decodes.
     func decodeStill(keyframe payload: Data, targetWidth: Int) -> CGImage? {
         guard isOpen, let ctx = codecContext, streamParameters != nil, !payload.isEmpty,
               payload.count <= Int(Int32.max) else { return nil }
@@ -746,6 +754,86 @@ final class FrameDecodeContext: @unchecked Sendable {
             return decodeStill(keyframe: payload, targetWidth: targetWidth)
         }
         return image
+    }
+
+    /// Packet-fed contexts: one keyframe decoded on VideoToolbox and converted by VideoToolbox, never copied to
+    /// memory at 4K: scaled to `width` x `height` in 10-bit 4:2:0 and, when `destination` differs from the
+    /// source, mapped to it in the same pass (`VTPixelTransferSession` with BT.709 destination tags is Apple's
+    /// own HDR-to-SDR conversion, the curve `AVAssetImageGenerator`'s force-SDR policy produces). nil for a
+    /// frame that did not decode on VideoToolbox, and for Dolby Vision profile 5, whose IPT planes only its
+    /// converter reads (`decodeStill`).
+    func decodeScaledStill(keyframe payload: Data, width: Int, height: Int,
+                           destination: ColorAttachments.Tags) -> CVPixelBuffer? {
+        guard isOpen, let ctx = codecContext, streamParameters != nil, !payload.isEmpty,
+              payload.count <= Int(Int32.max), !isDolbyVisionNoBaseLayer else { return nil }
+        avcodec_flush_buffers(ctx)
+        defer { avcodec_flush_buffers(ctx) }
+        ctx.pointee.skip_frame = AVDISCARD_DEFAULT
+        var packet = av_packet_alloc()
+        defer { av_packet_free(&packet) }
+        guard let packet, av_new_packet(packet, Int32(payload.count)) == 0,
+              let dst = packet.pointee.data else { return nil }
+        payload.copyBytes(to: dst, count: payload.count)
+        packet.pointee.flags = AV_PKT_FLAG_KEY
+        packet.pointee.pts = 0
+        packet.pointee.dts = 0
+        guard avcodec_send_packet(ctx, packet) >= 0 else { return nil }
+        avcodec_send_packet(ctx, nil)
+        var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+        defer { av_frame_free(&frame) }
+        guard let frame, avcodec_receive_frame(ctx, frame) >= 0,
+              frame.pointee.format == AV_PIX_FMT_VIDEOTOOLBOX.rawValue,
+              let raw = frame.pointee.data.3 else { return nil }
+        ColorDescription.backfill(frame: frame, container: containerColor)
+        let source = Unmanaged<CVPixelBuffer>.fromOpaque(UnsafeRawPointer(raw)).takeUnretainedValue()
+        let tags = ColorAttachments.presented(ColorDescription(frame: UnsafePointer(frame)),
+                                              frameSize: (frame.pointee.width, frame.pointee.height))
+        for buffer in [source] {
+            CVBufferSetAttachment(buffer, kCVImageBufferColorPrimariesKey, tags.primaries, .shouldPropagate)
+            CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, tags.transfer, .shouldPropagate)
+            CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, tags.matrix, .shouldPropagate)
+        }
+        let destinationTags = destination
+        guard let session = stillScaleTransfer(tags: destinationTags),
+              let pool = stillBufferPool(width: width, height: height) else { return nil }
+        var destination: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &destination) == kCVReturnSuccess,
+              let destination,
+              VTPixelTransferSessionTransferImage(session, from: source, to: destination) == noErr else { return nil }
+        CVBufferSetAttachment(destination, kCVImageBufferColorPrimariesKey, destinationTags.primaries, .shouldPropagate)
+        CVBufferSetAttachment(destination, kCVImageBufferTransferFunctionKey, destinationTags.transfer, .shouldPropagate)
+        CVBufferSetAttachment(destination, kCVImageBufferYCbCrMatrixKey, destinationTags.matrix, .shouldPropagate)
+        return destination
+    }
+
+    /// All three destination tags are set: leaving any unset gives a different, flat curve.
+    private func stillScaleTransfer(tags: ColorAttachments.Tags) -> VTPixelTransferSession? {
+        if let stillScale { return stillScale }
+        var session: VTPixelTransferSession?
+        guard VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &session) == noErr,
+              let session else { return nil }
+        VTSessionSetProperty(session, key: kVTPixelTransferPropertyKey_ScalingMode, value: kVTScalingMode_Normal)
+        VTSessionSetProperty(session, key: kVTPixelTransferPropertyKey_DestinationColorPrimaries, value: tags.primaries)
+        VTSessionSetProperty(session, key: kVTPixelTransferPropertyKey_DestinationTransferFunction, value: tags.transfer)
+        VTSessionSetProperty(session, key: kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, value: tags.matrix)
+        VTSessionSetProperty(session, key: kVTPixelTransferPropertyKey_RealTime, value: kCFBooleanFalse)
+        stillScale = session
+        return session
+    }
+
+    private func stillBufferPool(width: Int, height: Int) -> CVPixelBufferPool? {
+        if let stillPool, stillPool.width == width, stillPool.height == height { return stillPool.pool }
+        let attributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+        ]
+        var pool: CVPixelBufferPool?
+        guard CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool) == kCVReturnSuccess,
+              let pool else { return nil }
+        stillPool = (width, height, pool)
+        return pool
     }
 
     /// Output pixel displayDimensions for a target display width, applying source SAR

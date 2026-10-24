@@ -4,6 +4,8 @@ import Foundation
 /// What the segment provider needs from an I-frame rendition (AE#682).
 protocol IFrameSegmentSource: AnyObject, Sendable {
     var format: IFrameRenditionFormat { get }
+    /// One entry per `iframe{N}.mp4`, the timeline both tiers' playlists list.
+    var entries: [IFrameRendition.Entry] { get }
     func initSegment() -> Data?
     func fragment(at index: Int) -> Data?
     /// The SDR companion listed beside an HDR session's keyframes (`iframe_sdr.m3u8`), nil when none.
@@ -22,17 +24,14 @@ extension IFrameSegmentSource {
 enum IFrameRenditionFormat: Equatable, Sendable {
     /// The source's own keyframes; the master repeats the variant's codec, range and size.
     case keyframes
-    /// One SDR Motion JPEG still per keyframe (`IFrameJPEGBuilder`): the companion of an HDR session's keyframes.
-    case jpeg(width: Int, height: Int, bandwidth: Int)
-    /// An HDR source's own keyframes declared `VIDEO-RANGE=SDR`: the experimental companion
-    /// (`IFrameHDRStills.keyframesLabeledSDR`).
-    case keyframesLabeledSDR
+    /// One 10-bit SDR HEVC still per keyframe (`IFrameStillBuilder`): the trick-play tier an HDR session lists
+    /// beside its own keyframes.
+    case sdrStills(width: Int, height: Int, codecs: String, bandwidth: Int, averageBandwidth: Int)
 
     var logName: String {
         switch self {
         case .keyframes: return "keyframes"
-        case .jpeg: return "jpeg"
-        case .keyframesLabeledSDR: return "keyframes-labeled-sdr"
+        case .sdrStills: return "sdr-hevc-stills"
         }
     }
 
@@ -41,7 +40,7 @@ enum IFrameRenditionFormat: Equatable, Sendable {
 /// AE#682: answers `iframe_init.mp4` and `iframe{N}.mp4`. One request at a time: there is one side
 /// demuxer, and AVKit asks for up to five keyframes at once.
 final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
-    struct Entry {
+    struct Entry: Equatable, Sendable {
         let startPts: Int64
         let startSeconds: Double
         let durationSeconds: Double
@@ -50,7 +49,7 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
     let format: IFrameRenditionFormat
     let companionFormat: IFrameRenditionFormat?
     private let buildCompanion: ((Data, Int, Entry) -> IFrameFragmentBuilder.Output?)?
-    private let entries: [Entry]
+    let entries: [Entry]
     private let cache: IFramePayloadCache
     private let readPayload: (Entry) -> Data?
     private let buildFragment: (Data, Int, Entry) -> IFrameFragmentBuilder.Output?
@@ -250,11 +249,11 @@ struct IFrameBuildTiming {
     }
 
     /// The summary line once `window` stills have been answered, nil before.
-    mutating func noteStill(totalMs: Double, buildMs: Double) -> String? {
+    mutating func noteStill(totalMs still: Double, buildMs stillBuild: Double) -> String? {
         stills += 1
-        self.totalMs += totalMs
-        maxTotalMs = max(maxTotalMs, totalMs)
-        self.buildMs += buildMs
+        totalMs += still
+        maxTotalMs = max(maxTotalMs, still)
+        buildMs += stillBuild
         guard stills >= window else { return nil }
         let n = Double(stills)
         let line = String(format: "%d answered, avg %.0f ms (max %.0f): build %.0f ms; %d source reads avg %.0f ms, %.0f KB",

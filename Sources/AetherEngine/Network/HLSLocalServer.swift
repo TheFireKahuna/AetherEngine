@@ -123,6 +123,8 @@ protocol HLSSegmentProvider: AnyObject {
     var iFrameRenditionServed: Bool { get }
     /// What the rendition carries; nil reads as `.keyframes`.
     var iFrameRenditionFormat: IFrameRenditionFormat? { get }
+    /// The I-frame playlists' entries, denser than the media segments; nil lists one per segment.
+    var iFrameTimeline: [IFrameRendition.Entry]? { get }
     func iFrameInitSegment() -> Data?
     func iFrameSegment(at index: Int) -> Data?
     /// The SDR companion an HDR session lists beside its keyframes (`iframe_sdr.m3u8`), nil when none.
@@ -208,6 +210,7 @@ extension HLSSegmentProvider {
     func nativeSubtitleRenditionRequested(ordinal: Int) {}
     var iFrameRenditionServed: Bool { false }
     var iFrameRenditionFormat: IFrameRenditionFormat? { nil }
+    var iFrameTimeline: [IFrameRendition.Entry]? { nil }
     func iFrameInitSegment() -> Data? { nil }
     func iFrameSegment(at index: Int) -> Data? { nil }
     var iFrameCompanionFormat: IFrameRenditionFormat? { nil }
@@ -522,8 +525,8 @@ final class HLSLocalServer: @unchecked Sendable {
         return servedMediaBytes
     }
 
-    /// AE#682: how long `iframe.m3u8` waits for the first media segment request when the rendition is
-    /// SDR JPEG next to an HDR variant. AVPlayer asks for the main variant's segments before the I-frame
+    /// AE#682: how long `iframe_sdr.m3u8`, the SDR stills tier listed next to an HDR variant, waits for the
+    /// first media segment request. AVPlayer asks for the main variant's segments before the I-frame
     /// playlist; one that refused the HDR variant never asks for a segment, and would otherwise play the
     /// stills as the video instead of failing into the media-playlist fallback.
     static let iFrameMainVariantWaitSeconds: TimeInterval = 3
@@ -1904,7 +1907,11 @@ final class HLSLocalServer: @unchecked Sendable {
         if provider.iFrameRenditionServed {
             // AE#682: BANDWIDTH is the variant's, an honest ceiling (one keyframe cannot outweigh the
             // segment it opens). A value below the real peak logs -12318 on every fetch.
-            var iFrameAttrs = ["BANDWIDTH=\(bandwidth)", "CODECS=\"\(videoCodecs(of: codecs))\""]
+            var iFrameAttrs: [String] = []
+            if let average = keyframeAverageBandwidth(provider: provider, ceiling: bandwidth) {
+                iFrameAttrs.append("AVERAGE-BANDWIDTH=\(average)")
+            }
+            iFrameAttrs.append(contentsOf: ["BANDWIDTH=\(bandwidth)", "CODECS=\"\(videoCodecs(of: codecs))\""])
             if variant == .primary, let supplemental = provider.masterSupplementalCodecs {
                 iFrameAttrs.append("SUPPLEMENTAL-CODECS=\"\(supplemental)\"")
             }
@@ -1914,27 +1921,48 @@ final class HLSLocalServer: @unchecked Sendable {
             if let range = provider.masterVideoRange {
                 iFrameAttrs.append("VIDEO-RANGE=\(range.rawValue)")
             }
+            // Same HDCP-LEVEL as the variant whose keyframes these are.
+            let hdcp = provider.masterHDCPLevel
+            if let hdcp { iFrameAttrs.append("HDCP-LEVEL=\(hdcp)") }
             iFrameAttrs.append("URI=\"iframe.m3u8\"")
             lines.append("#EXT-X-I-FRAME-STREAM-INF:\(iFrameAttrs.joined(separator: ","))")
-            // An HDR session's SDR companion, Apple's own layout: AVKit's scrub thumbnail player takes the
-            // lowest video range on offer, the main player scans on the keyframes above.
-            switch provider.iFrameCompanionFormat {
-            case .jpeg(let width, let height, let jpegBandwidth):
-                let attrs = ["BANDWIDTH=\(jpegBandwidth)", "CODECS=\"mjpg\"", "RESOLUTION=\(width)x\(height)",
-                             "VIDEO-RANGE=SDR", "URI=\"iframe_sdr.m3u8\""]
+            // An HDR session's SDR trick-play tier, Apple's own layout and a tvOS MUST of the HLS Authoring
+            // Specification (6.16): AVKit's scrub thumbnail player is capped at SDR and takes the lowest range
+            // on offer, while the main player scans on the keyframes above. Attribute order as the
+            // specification's examples give it.
+            if case .sdrStills(let width, let height, let stillCodecs, let peak, let average)? = provider.iFrameCompanionFormat {
+                var attrs = ["AVERAGE-BANDWIDTH=\(average)", "BANDWIDTH=\(peak)", "VIDEO-RANGE=SDR",
+                             "CODECS=\"\(stillCodecs)\"", "RESOLUTION=\(width)x\(height)"]
+                // An 800-pixel SDR picture needs no protection level; stated only when the variant states one.
+                if hdcp != nil { attrs.append("HDCP-LEVEL=NONE") }
+                attrs.append("URI=\"iframe_sdr.m3u8\"")
                 lines.append("#EXT-X-I-FRAME-STREAM-INF:\(attrs.joined(separator: ","))")
-            case .keyframesLabeledSDR:
-                var attrs = ["BANDWIDTH=\(bandwidth)", "CODECS=\"\(videoCodecs(of: codecs))\""]
-                if let resolution = provider.masterResolution {
-                    attrs.append("RESOLUTION=\(resolution.width)x\(resolution.height)")
-                }
-                attrs += ["VIDEO-RANGE=SDR", "URI=\"iframe_sdr.m3u8\""]
-                lines.append("#EXT-X-I-FRAME-STREAM-INF:\(attrs.joined(separator: ","))")
-            case .keyframes, nil:
-                break
             }
         }
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// How much heavier a keyframe is than the variant's average frame. Measured on a 71 Mbit/s Dolby
+    /// Vision Profile 7 remux (850 KB keyframes against 370 KB frames, 2.3) and the HDR10 fixture (2.5).
+    static let keyframeToAverageFrameRatio = 2.5
+
+    /// AVERAGE-BANDWIDTH of the keyframe tier: one keyframe, estimated from the variant's average frame,
+    /// over the mean I-frame entry. The index holds no keyframe sizes and the master is read once, before the
+    /// first keyframe is, so this is an estimate; nil when the variant states no average or frame rate.
+    static func keyframeAverageBandwidth(provider: HLSSegmentProvider, ceiling: Int) -> Int? {
+        let durations = iFrameDurations(provider: provider)
+        guard let variantAverage = provider.masterAverageBandwidth, variantAverage > 0,
+              let frameRate = provider.masterFrameRate, frameRate > 0, !durations.isEmpty
+        else { return nil }
+        let meanSegment = max(durations.reduce(0, +) / Double(durations.count), 0.1)
+        let keyframeBits = Double(variantAverage) / frameRate * keyframeToAverageFrameRatio
+        return min(ceiling, Int((keyframeBits / meanSegment).rounded(.up)))
+    }
+
+    /// Each I-frame entry's duration: the rendition's own timeline, or one per media segment.
+    static func iFrameDurations(provider: HLSSegmentProvider) -> [Double] {
+        provider.iFrameTimeline?.map(\.durationSeconds)
+            ?? (0..<provider.segmentCount).map { provider.segmentDuration(at: $0) }
     }
 
     /// The video entry of a master CODECS list. An I-frame variant carries no audio, and a CODECS
@@ -1962,9 +1990,8 @@ final class HLSLocalServer: @unchecked Sendable {
     static func buildIFramePlaylistText(provider: HLSSegmentProvider,
                                         subResourceBaseURL: URL? = nil,
                                         resourceName: String = "iframe") -> String {
-        let count = provider.segmentCount
-        var maxDuration: Double = 0
-        for i in 0..<count { maxDuration = max(maxDuration, provider.segmentDuration(at: i)) }
+        let durations = iFrameDurations(provider: provider)
+        let maxDuration = durations.max() ?? 0
         let targetDuration = LiveEdgePolicy.targetDurationSeconds(
             maxSegmentDuration: maxDuration, cutTargetSeconds: nil, cadenceFloorSeconds: nil)
         let prefix: String
@@ -1977,8 +2004,8 @@ final class HLSLocalServer: @unchecked Sendable {
         var lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-I-FRAMES-ONLY",
                      "#EXT-X-TARGETDURATION:\(targetDuration)", "#EXT-X-MEDIA-SEQUENCE:0",
                      "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-MAP:URI=\"\(prefix)\(resourceName)_init.mp4\""]
-        for i in 0..<count {
-            lines.append("#EXTINF:\(String(format: "%.3f", provider.segmentDuration(at: i))),")
+        for (i, duration) in durations.enumerated() {
+            lines.append("#EXTINF:\(String(format: "%.3f", duration)),")
             lines.append("\(prefix)\(resourceName)\(i).mp4")
         }
         lines.append("#EXT-X-ENDLIST")
