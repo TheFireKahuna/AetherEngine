@@ -61,15 +61,17 @@ struct ForcedSubtitleRenditionTests {
         #expect(infos[2].name.hasSuffix("(Forced)"))
     }
 
-    @Test("a store counts as being filled only while a feeder started on it or read it recently")
-    func feedingActivity() {
+    @Test("a store's reading counts as advancing only when it moves forward, not when a feeder merely exists")
+    func readingAdvance() {
         let store = NativeSubtitleCueStore()
-        #expect(!store.isBeingFed(within: 5))
-        store.markFeeding()
-        #expect(store.isBeingFed(within: 5))
-        let read = NativeSubtitleCueStore()
-        read.noteRead(from: 0, through: 10)
-        #expect(read.isBeingFed(within: 5))
+        #expect(!store.isReadingAdvancing(within: 5))
+        store.noteRead(from: 0, through: 10)
+        #expect(store.isReadingAdvancing(within: 5))
+        let stalled = NativeSubtitleCueStore()
+        stalled.noteRead(from: 0, through: 10)
+        Thread.sleep(forTimeInterval: 0.05)
+        stalled.noteRead(from: 0, through: 10)   // the same reading again: no advance
+        #expect(!stalled.isReadingAdvancing(within: 0.02))
     }
 
     @Test("the player asking for a rendition reaches its handler")

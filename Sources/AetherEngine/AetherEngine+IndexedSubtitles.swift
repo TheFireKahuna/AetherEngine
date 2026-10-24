@@ -163,13 +163,14 @@ extension AetherEngine {
             }
             guard installed else { state.close(); return }
 
-            for plan in complete.values.sorted(by: { $0.ordinal < $1.ordinal }) where plan.kind == .text {
-                guard !Task.isCancelled else { return }
-                await self?.fillIndexedText(plan, state: state, duration: duration, stores: stores)
-            }
+            // The forced rendition first: tvOS selects it by itself at load, the text ones wait for a pick.
             for plan in complete.values where plan.kind == .forcedBitmap {
                 guard !Task.isCancelled else { return }
                 await self?.fillIndexedForced(plan, state: state, duration: duration, stores: stores)
+            }
+            for plan in complete.values.sorted(by: { $0.ordinal < $1.ordinal }) where plan.kind == .text {
+                guard !Task.isCancelled else { return }
+                await self?.fillIndexedText(plan, state: state, duration: duration, stores: stores)
             }
         }
     }
@@ -310,7 +311,6 @@ extension AetherEngine {
         if indexedBitmapFillOrdinal == ordinal, indexedBitmapFillTask != nil { return true }
         indexedBitmapFillTask?.cancel()
         indexedBitmapFillOrdinal = ordinal
-        store.markFeeding()
         let duration = duration
         EngineLog.emit("[IndexedSubtitles] bitmap ordinal=\(ordinal) recognized from the index, from the playhead",
                        category: .engine)
