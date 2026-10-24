@@ -302,7 +302,10 @@ struct PlanarFrameFinisherTests {
             let x = sourceFullRange
                 ? ((c - pow(2, Double(d - 1))) * (pow(2, T) - 1) / (pow(2, Double(d)) - 1) + pow(2, T - 1)) * scale
                 : c * pow(2, T - Double(d)) * scale
-            return rounded(x)
+            // The kernel resamples in exact integers (weights n / 1024 per axis), as this does in Double: no allowance.
+            var w = rounded(x)
+            w.nearTie = false
+            return w
         }
 
         func rgb(_ x: Int, _ y: Int) -> (Double, Double, Double) {
