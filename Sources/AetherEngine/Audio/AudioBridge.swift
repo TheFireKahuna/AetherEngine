@@ -639,11 +639,11 @@ final class AudioBridge: @unchecked Sendable {
         /// `avcodec_receive_packet` answers that were neither a packet nor EAGAIN/EOF.
         var encodeErrors = 0
         var lastEncodeErrorCode: Int32 = 0
-        /// Source timestamps that disagreed with the bridge's own count of the audio it was given by
-        /// more than half a millisecond (a Matroska timestamp's rounding).
+        /// Source timestamps that no grid point of their run allowed (`SourceGrid`): a splice, where
+        /// the run was placed anew.
         var timestampMismatches = 0
-        /// Decoded audio dropped because nothing yet said where it plays (no timestamp on the first
-        /// packet since a reset, none on its blocks).
+        /// Decoded audio dropped because nothing yet said where it plays: no timestamp since the
+        /// decoder's reset, or no stream start.
         var blocksDroppedUnplaced = 0
         /// `AudioContinuity` placements: gaps filled with silence, overlaps trimmed, jumps re-anchored.
         var continuityGaps = 0

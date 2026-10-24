@@ -30,7 +30,9 @@ struct SpatialAudioBridgeTests {
         private var pushes = 0
         private var skipped = 0
         private var inputFrames: Int64 = 0
-        private var blocks: [(offset: Int64, frames: Int)] = []
+        private var blocks: [(offset: Int64, frames: Int, stamp: (Int64, Int64)?)] = []
+        /// The latest timestamp pushed and the input frame its push started at, as the real decoders keep.
+        private var stamp: (Int64, Int64)?
         private let planes: [UnsafeMutablePointer<Float>] = (0..<3).map { _ in .allocate(capacity: 1 << 16) }
         private var t = 0
 
@@ -41,8 +43,9 @@ struct SpatialAudioBridgeTests {
         }
         deinit { planes.forEach { $0.deallocate() } }
 
-        func push(_ bytes: UnsafeRawBufferPointer) throws {
+        func push(_ bytes: UnsafeRawBufferPointer, pts: Int64) throws {
             pushes += 1
+            if pts != Int64.min { stamp = (pts, inputFrames) }
             var start: Int64?
             var frames = 0
             var toDrop = (dropAt?.push == pushes) ? dropAt!.count : 0
@@ -51,13 +54,13 @@ struct SpatialAudioBridgeTests {
                 if skipped < skipAfterReset { skipped += 1; continue }
                 if toDrop > 0 {
                     toDrop -= 1
-                    if frames > 0 { blocks.append((start!, frames)); start = nil; frames = 0 }
+                    if frames > 0 { blocks.append((start!, frames, stamp)); start = nil; frames = 0 }
                     continue
                 }
                 if start == nil { start = inputFrames }
                 frames += framesPerAU
             }
-            if let start, frames > 0 { blocks.append((start, frames)) }
+            if let start, frames > 0 { blocks.append((start, frames, stamp)) }
         }
 
         func nextBlock() throws -> ObjectAudioDecodedBlock? {
@@ -76,16 +79,18 @@ struct SpatialAudioBridgeTests {
                 updates: [.init(frameOffset: 0, rampFrames: b.frames,
                                 states: [.init(), .init(), .init(position: SIMD3(x, 0.5, 1))])],
                 bed: withBed ? ObjectAudioBed(roles: [.bed(.left), .lfe],
-                                              planes: [UnsafePointer(planes[0]), UnsafePointer(planes[1])]) : nil)
+                                              planes: [UnsafePointer(planes[0]), UnsafePointer(planes[1])]) : nil,
+                sourcePts: b.stamp?.0, sourcePtsInputFrame: b.stamp?.1 ?? 0,
+                clockFrame: nil, gridFrames: framesPerAU)
         }
 
-        func reset() { skipped = 0; inputFrames = 0; blocks = []; pushes = 0 }
+        func reset() { skipped = 0; inputFrames = 0; blocks = []; pushes = 0; stamp = nil }
     }
 
     /// Stand-in decoder that refuses every access unit, as a corrupt or foreign stream would.
     final class RejectingDecoder: ObjectAudioDecoding {
         struct Refused: Error {}
-        func push(_ bytes: UnsafeRawBufferPointer) throws { throw Refused() }
+        func push(_ bytes: UnsafeRawBufferPointer, pts: Int64) throws { throw Refused() }
         func nextBlock() throws -> ObjectAudioDecodedBlock? { nil }
         func reset() {}
     }
@@ -96,7 +101,8 @@ struct SpatialAudioBridgeTests {
     final class ClickDecoder: ObjectAudioDecoding {
         let clickFrame: Int64
         private var inputFrames: Int64 = 0
-        private var blocks: [(offset: Int64, frames: Int)] = []
+        private var blocks: [(offset: Int64, frames: Int, stamp: (Int64, Int64)?)] = []
+        private var stamp: (Int64, Int64)?
         private var stateSent = false
         private let plane = UnsafeMutablePointer<Float>.allocate(capacity: 1 << 16)
 
@@ -104,8 +110,9 @@ struct SpatialAudioBridgeTests {
         init(clickFrame: Int64, withBed: Bool = false) { self.clickFrame = clickFrame; self.withBed = withBed }
         deinit { plane.deallocate() }
 
-        func push(_ bytes: UnsafeRawBufferPointer) throws {
-            blocks.append((inputFrames, bytes.count * 40))
+        func push(_ bytes: UnsafeRawBufferPointer, pts: Int64) throws {
+            if pts != Int64.min { stamp = (pts, inputFrames) }
+            blocks.append((inputFrames, bytes.count * 40, stamp))
             inputFrames += Int64(bytes.count * 40)
         }
 
@@ -121,10 +128,12 @@ struct SpatialAudioBridgeTests {
                 sampleRate: 48_000, frameCount: b.frames, inputFrameOffset: b.offset,
                 configurationGeneration: 0, roles: [.bed(.left)], planes: [UnsafePointer(plane)],
                 updates: stateSent ? [] : [.init(frameOffset: 0, rampFrames: 0, states: [.init()])],
-                bed: withBed ? ObjectAudioBed(roles: [.bed(.left)], planes: [UnsafePointer(plane)]) : nil)
+                bed: withBed ? ObjectAudioBed(roles: [.bed(.left)], planes: [UnsafePointer(plane)]) : nil,
+                sourcePts: b.stamp?.0, sourcePtsInputFrame: b.stamp?.1 ?? 0,
+                clockFrame: nil, gridFrames: 40)
         }
 
-        func reset() { inputFrames = 0; blocks = []; stateSent = false }
+        func reset() { inputFrames = 0; blocks = []; stateSent = false; stamp = nil }
     }
 
     /// Feed `count` 20 ms packets (24 access units) starting at `startMs` on a 1/1000 time base.
@@ -237,6 +246,7 @@ struct SpatialAudioBridgeTests {
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
             decoder: SyntheticDecoder(skipAfterReset: 5, withBed: withBed))
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         var packets = try feed(bridge, startMs: 1000, count: 100)
         packets += bridge.flush().map { fp in
@@ -270,6 +280,7 @@ struct SpatialAudioBridgeTests {
         let silent = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
             decoder: SyntheticDecoder(skipAfterReset: .max))
+        silent.setSourceStart(0)
         defer { silent.close() }
         let reports = Reports()
         silent.onDecoderProducedNothing = { _ in reports.add() }
@@ -281,6 +292,7 @@ struct SpatialAudioBridgeTests {
 
         let rejecting = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: RejectingDecoder())
+        rejecting.setSourceStart(0)
         defer { rejecting.close() }
         let rejected = Reports()
         rejecting.onDecoderProducedNothing = { _ in rejected.add() }
@@ -290,6 +302,7 @@ struct SpatialAudioBridgeTests {
         let healthy = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
             decoder: SyntheticDecoder(skipAfterReset: 5))
+        healthy.setSourceStart(0)
         defer { healthy.close() }
         let quiet = Reports()
         healthy.onDecoderProducedNothing = { _ in quiet.add() }
@@ -306,6 +319,7 @@ struct SpatialAudioBridgeTests {
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 48_000), layout: .l714,
             decoder: SyntheticDecoder(skipAfterReset: 102))
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         let reports = Reports()
         bridge.onDecoderProducedNothing = { _ in reports.add() }
@@ -333,8 +347,10 @@ struct SpatialAudioBridgeTests {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let pipelined = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: ClickDecoder(clickFrame: 30_000))
+        pipelined.setSourceStart(0)
         let settledEachFeed = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: ClickDecoder(clickFrame: 30_000))
+        settledEachFeed.setSourceStart(0)
         defer { pipelined.close(); settledEachFeed.close() }
         func take(_ packets: [UnsafeMutablePointer<AVPacket>]) -> [(pts: Int64, data: Data)] {
             packets.map { fp in
@@ -374,7 +390,7 @@ struct SpatialAudioBridgeTests {
         private var holding = true
         private(set) var releases = 0
 
-        func push(_ bytes: UnsafeRawBufferPointer) throws { try inner.push(bytes) }
+        func push(_ bytes: UnsafeRawBufferPointer, pts: Int64) throws { try inner.push(bytes, pts: pts) }
         func nextBlock() throws -> ObjectAudioDecodedBlock? { holding ? nil : try inner.nextBlock() }
         func reset() { inner.reset(); holding = true }
         func releaseHeldBlocks() { releases += 1; holding = false }
@@ -388,8 +404,10 @@ struct SpatialAudioBridgeTests {
         let holding = HoldingDecoder()
         let held = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: holding)
+        held.setSourceStart(0)
         let plain = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: ClickDecoder(clickFrame: 30_000))
+        plain.setSourceStart(0)
         defer { held.close(); plain.close() }
         func take(_ packets: [UnsafeMutablePointer<AVPacket>]) -> [(pts: Int64, data: Data)] {
             packets.map { fp in
@@ -415,6 +433,7 @@ struct SpatialAudioBridgeTests {
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l916,
             decoder: SyntheticDecoder(skipAfterReset: 3, withBed: withBed))
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         _ = try feed(bridge, startMs: 0, count: 30)
         bridge.startSegment()
@@ -429,6 +448,7 @@ struct SpatialAudioBridgeTests {
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
             decoder: SyntheticDecoder(skipAfterReset: 0, dropAt: (push: 10, count: 12), withBed: withBed))
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         var packets = try feed(bridge, startMs: 0, count: 100)
         packets += bridge.flush().map { fp in
@@ -524,6 +544,7 @@ struct SpatialAudioBridgeTests {
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
             decoder: SyntheticDecoder(skipAfterReset: 0))
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         guard let muxed = try muxWithProbeVideo(bridge, startMs: 0, count: 50) else { return }
         let sessionDir = muxed.sessionDir
@@ -555,6 +576,7 @@ struct SpatialAudioBridgeTests {
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
             decoder: ClickDecoder(clickFrame: 12_000, withBed: withBed))
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         guard let muxed = try muxWithProbeVideo(bridge, startMs: 0, count: 30) else { return }
         let sessionDir = muxed.sessionDir
@@ -587,6 +609,7 @@ struct SpatialAudioBridgeTests {
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
             decoder: SyntheticDecoder(skipAfterReset: 0))
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         bridge.setOutputOffset(seconds: seconds)
         let packets = try feed(bridge, startMs: 0, count: 30)
@@ -601,6 +624,7 @@ struct SpatialAudioBridgeTests {
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
             decoder: ClickDecoder(clickFrame: 12_000, withBed: withBed))
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         bridge.setOutputOffset(seconds: -0.15)
         guard let muxed = try muxWithProbeVideo(bridge, startMs: 0, count: 30) else { return }
@@ -627,6 +651,7 @@ struct SpatialAudioBridgeTests {
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
             decoder: SyntheticDecoder(skipAfterReset: 0), objectOutput: true)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         // Announced as the 7.1.4 tier tvOS delivers it as (see `SpatialAudioBridge.init`); the stream
         // itself is low profile, level 0.
@@ -645,6 +670,7 @@ struct SpatialAudioBridgeTests {
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: layout,
             decoder: SyntheticDecoder(skipAfterReset: 0), objectOutput: true)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         #expect(bridge.hlsCodecs == "apac.31.03")
         #expect(bridge.servedChannelCount == 12)
@@ -661,6 +687,7 @@ struct SpatialAudioBridgeTests {
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
             decoder: ClickDecoder(clickFrame: 12_000), objectOutput: true)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         bridge.setOutputOffset(seconds: offset)
         guard let muxed = try muxWithProbeVideo(bridge, startMs: 0, count: 30) else { return }
@@ -902,7 +929,8 @@ extension SpatialAudioBridgeTests {
         let panicAt: Int
         private var pushes = 0
         private var inputFrames: Int64 = 0
-        private var blocks: [(offset: Int64, frames: Int)] = []
+        private var blocks: [(offset: Int64, frames: Int, stamp: (Int64, Int64)?)] = []
+        private var stamp: (Int64, Int64)?
         private let plane = UnsafeMutablePointer<Float>.allocate(capacity: 1 << 16)
         private(set) var selfResetCount = 0
         struct Panic: Error {}
@@ -910,13 +938,14 @@ extension SpatialAudioBridgeTests {
         init(panicAt: Int) { self.panicAt = panicAt; plane.initialize(repeating: 0.1, count: 1 << 16) }
         deinit { plane.deallocate() }
 
-        func push(_ bytes: UnsafeRawBufferPointer) throws {
+        func push(_ bytes: UnsafeRawBufferPointer, pts: Int64) throws {
             pushes += 1
             if pushes == panicAt {
-                inputFrames = 0; blocks = []; selfResetCount += 1
+                inputFrames = 0; blocks = []; stamp = nil; selfResetCount += 1
                 throw Panic()
             }
-            blocks.append((inputFrames, bytes.count * 40))
+            if pts != Int64.min { stamp = (pts, inputFrames) }
+            blocks.append((inputFrames, bytes.count * 40, stamp))
             inputFrames += Int64(bytes.count * 40)
         }
 
@@ -925,10 +954,12 @@ extension SpatialAudioBridgeTests {
             let b = blocks.removeFirst()
             return ObjectAudioDecodedBlock(
                 sampleRate: 48_000, frameCount: b.frames, inputFrameOffset: b.offset,
-                configurationGeneration: 0, roles: [.bed(.left)], planes: [UnsafePointer(plane)], updates: [])
+                configurationGeneration: 0, roles: [.bed(.left)], planes: [UnsafePointer(plane)], updates: [],
+                bed: nil, sourcePts: b.stamp?.0, sourcePtsInputFrame: b.stamp?.1 ?? 0,
+                clockFrame: nil, gridFrames: 40)
         }
 
-        func reset() { inputFrames = 0; blocks = [] }
+        func reset() { inputFrames = 0; blocks = []; stamp = nil }
     }
 
     /// Decodes fine at a rate the renderer refuses, so every block throws.
@@ -936,13 +967,14 @@ extension SpatialAudioBridgeTests {
         private var pending = 0
         private let plane = UnsafeMutablePointer<Float>.allocate(capacity: 4096)
         deinit { plane.deallocate() }
-        func push(_ bytes: UnsafeRawBufferPointer) throws { pending += 1 }
+        func push(_ bytes: UnsafeRawBufferPointer, pts: Int64) throws { pending += 1 }
         func nextBlock() throws -> ObjectAudioDecodedBlock? {
             guard pending > 0 else { return nil }
             pending -= 1
             return ObjectAudioDecodedBlock(
                 sampleRate: 44_100, frameCount: 40, inputFrameOffset: 0, configurationGeneration: 0,
-                roles: [.bed(.left)], planes: [UnsafePointer(plane)], updates: [])
+                roles: [.bed(.left)], planes: [UnsafePointer(plane)], updates: [],
+                bed: nil, sourcePts: nil, sourcePtsInputFrame: 0, clockFrame: nil, gridFrames: 40)
         }
         func reset() { pending = 0 }
     }
@@ -959,6 +991,7 @@ extension SpatialAudioBridgeTests {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: SelfResettingDecoder(panicAt: 50))
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         // 100 packets of 20 ms from 1 s. Packet 50 is lost to the panic; its 960 frames come back as
         // silence, so the stream is as long as an unbroken one. Appended onto the encoder instead,
@@ -974,6 +1007,7 @@ extension SpatialAudioBridgeTests {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: ClickDecoder(clickFrame: .max))
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         _ = try feed(bridge, startMs: 0, count: 50)
         _ = drain(bridge)
@@ -988,6 +1022,7 @@ extension SpatialAudioBridgeTests {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: WrongRateDecoder())
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         let reports = Reports()
         bridge.onDecoderProducedNothing = { _ in reports.add() }
@@ -1002,6 +1037,7 @@ extension SpatialAudioBridgeTests {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 1000), layout: layout, decoder: ClickDecoder(clickFrame: .max))
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         #expect(bridge.encoderCodecpar?.pointee.ch_layout.nb_channels == 2)
         #expect(bridge.servedChannelCount == layout.channelCount)
@@ -1017,25 +1053,27 @@ extension SpatialAudioBridgeTests {
     /// reset (or at the start) emits nothing until `syncWait` pushes have passed, as TrueHD waits for a
     /// major sync. Offsets count every push since the reset.
     final class TimestampingDecoder: ObjectAudioDecoding {
-        let panicAt: Int?, syncWait: Int, reportsTimestamps: Bool
+        let panicAt: Int?, syncWait: Int
         private var pushes = 0, sinceReset = 0
         private var inputFrames: Int64 = 0
-        private var blocks: [(offset: Int64, frames: Int, pts: Int64)] = []
+        private var blocks: [(offset: Int64, frames: Int, stamp: (Int64, Int64)?)] = []
+        private var stamp: (Int64, Int64)?
         private let plane = UnsafeMutablePointer<Float>.allocate(capacity: 1 << 16)
         private(set) var selfResetCount = 0
         struct Panic: Error {}
-        init(panicAt: Int?, syncWait: Int, reportsTimestamps: Bool = true) {
-            self.panicAt = panicAt; self.syncWait = syncWait; self.reportsTimestamps = reportsTimestamps
+        init(panicAt: Int?, syncWait: Int) {
+            self.panicAt = panicAt; self.syncWait = syncWait
             plane.initialize(repeating: 0.1, count: 1 << 16)
         }
         deinit { plane.deallocate() }
-        func push(_ bytes: UnsafeRawBufferPointer) throws { try push(bytes, pts: Int64.min) }
         func push(_ bytes: UnsafeRawBufferPointer, pts: Int64) throws {
             pushes += 1
-            if pushes == panicAt { inputFrames = 0; blocks = []; sinceReset = 0; selfResetCount += 1; throw Panic() }
+            if pushes == panicAt { inputFrames = 0; blocks = []; sinceReset = 0; stamp = nil; selfResetCount += 1; throw Panic() }
             sinceReset += 1
             let frames = bytes.count * 40
-            if sinceReset > syncWait { blocks.append((inputFrames, frames, pts)) }
+            // Kept while waiting for a sync too: the frames it skips still count from it.
+            if pts != Int64.min { stamp = (pts, inputFrames) }
+            if sinceReset > syncWait { blocks.append((inputFrames, frames, stamp)) }
             inputFrames += Int64(frames)
         }
         func nextBlock() throws -> ObjectAudioDecodedBlock? {
@@ -1044,9 +1082,10 @@ extension SpatialAudioBridgeTests {
             return ObjectAudioDecodedBlock(
                 sampleRate: 48_000, frameCount: b.frames, inputFrameOffset: b.offset, configurationGeneration: 0,
                 roles: [.bed(.left)], planes: [UnsafePointer(plane)], updates: [],
-                sourcePts: reportsTimestamps && b.pts != Int64.min ? b.pts : nil, sourcePtsInputFrame: b.offset)
+                bed: nil, sourcePts: b.stamp?.0, sourcePtsInputFrame: b.stamp?.1 ?? 0,
+                clockFrame: nil, gridFrames: 40)
         }
-        func reset() { inputFrames = 0; blocks = []; sinceReset = 0 }
+        func reset() { inputFrames = 0; blocks = []; sinceReset = 0; stamp = nil }
     }
 
     /// `count` packets of 20 ms from `startMs`, packet i carrying a timestamp only when i % `every` == 0
@@ -1087,12 +1126,14 @@ extension SpatialAudioBridgeTests {
         // rest played three packets (60 ms) late; the lost packet 51 comes back as silence instead.
         let bridge = try SpatialAudioBridge(srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
                                             decoder: TimestampingDecoder(panicAt: 52, syncWait: 6))
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         let packets = try feedLaced(bridge, startMs: 1000, count: 100, every: 5)
         // The same stream without the panic, through the same decoder (which also waits for a sync at
         // the start): the timestamps have to come out identical.
         let unbroken = try SpatialAudioBridge(srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
                                               decoder: TimestampingDecoder(panicAt: nil, syncWait: 6))
+        unbroken.setSourceStart(0)
         defer { unbroken.close() }
         let reference = try feedLaced(unbroken, startMs: 1000, count: 100, every: 5)
         #expect(reference.first == Int64(53_760), "1 s plus the six 960-frame packets before the sync")
@@ -1100,27 +1141,12 @@ extension SpatialAudioBridgeTests {
         #expect(bridge.feedStats.timestampMismatches == 0)
     }
 
-    @Test("a decoder that reports no timestamps never puts audio after a reset late")
-    func lacedSelfResetWithoutBlockTimestamps() throws {
-        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
-        let bridge = try SpatialAudioBridge(srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
-                                            decoder: TimestampingDecoder(panicAt: 52, syncWait: 6, reportsTimestamps: false))
-        defer { bridge.close() }
-        let packets = try feedLaced(bridge, startMs: 1000, count: 100, every: 5)
-        let unbroken = try SpatialAudioBridge(srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
-                                              decoder: TimestampingDecoder(panicAt: nil, syncWait: 6, reportsTimestamps: false))
-        defer { unbroken.close() }
-        let reference = try feedLaced(unbroken, startMs: 1000, count: 100, every: 5)
-        // Packet 55's timestamp no longer anchors packet 52's frames; with nothing to say where they
-        // go, they follow on from what came before, losing at most the panicked packet's 20 ms.
-        #expect(packets.count <= reference.count && packets.count >= reference.count - 1)
-    }
-
     @Test("with no timestamp on the first packet, the first block that carries one anchors exactly")
     func firstTimestampFromBlock() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let bridge = try SpatialAudioBridge(srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
                                             decoder: TimestampingDecoder(panicAt: nil, syncWait: 0))
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         // Packets 0-4 carry no timestamp; packet 5 is stamped 1100 ms. Its block is input frame 4800,
         // so input frame 0 sits at 1000 ms; blocks before it are dropped, not placed at 0.

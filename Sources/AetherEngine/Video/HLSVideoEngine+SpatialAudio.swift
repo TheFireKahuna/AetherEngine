@@ -397,7 +397,8 @@ extension HLSVideoEngine {
             inputTimeBase: bridge.encoderTimeBase,
             sourceTimeBase: audioStream.pointee.time_base,
             bridge: bridge,
-            language: audioLanguage
+            language: audioLanguage,
+            sourceStart: audioStream.pointee.start_time == Int64.min ? nil : audioStream.pointee.start_time
         )
         savedAudioConfig = cfg
         audioBridge = bridge

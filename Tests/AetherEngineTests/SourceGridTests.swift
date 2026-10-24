@@ -1,0 +1,67 @@
+import Testing
+@testable import AetherEngine
+
+/// A run of decoded audio sits on the grid continuous playback puts the stream on, whatever the
+/// container rounded and wherever the run began (`SourceGrid`).
+@Suite("Source grid")
+struct SourceGridTests {
+
+    /// Matroska: a timestamp rounded to the millisecond, 24 frames at 48 kHz either way.
+    static let matroska: Int64 = 25
+
+    @Test("nothing is placed before the run's first timestamp")
+    func unplacedWithoutTimestamp() {
+        var grid = SourceGrid(origin: 0, step: 512, tolerance: Self.matroska)
+        #expect(grid.place(relative: 0, estimate: nil).0 == .unplaced)
+        #expect(!grid.isPlacing)
+    }
+
+    @Test("an exact timestamp places the run exactly")
+    func exact() {
+        var grid = SourceGrid(origin: 1_000, step: 40, tolerance: 2)
+        #expect(grid.place(relative: 120, estimate: 1_000 + 40 * 777).0 == .position(1_000 + 40 * 777))
+        #expect(grid.isResolved)
+        #expect(grid.place(relative: 160, estimate: nil).0 == .position(1_000 + 40 * 778))
+    }
+
+    @Test("a rounded timestamp lands on the exact DTS frame", arguments: [-24, -16, 0, 9, 24])
+    func dtsFrame(rounding: Int64) {
+        // Frame 1845 of a stream starting at 74 ms: what a seek into DTSX Emulator.mkv read.
+        let origin: Int64 = 74 * 48, frame: Int64 = 1845
+        var grid = SourceGrid(origin: origin, step: 512, tolerance: Self.matroska)
+        #expect(grid.place(relative: 0, estimate: origin + frame * 512 + rounding).0 == .position(origin + frame * 512))
+        #expect(grid.isResolved)
+    }
+
+    @Test("TrueHD's 40-frame access unit is pinned by a second timestamp when the first allows two")
+    func trueHDNeedsTwo() {
+        var grid = SourceGrid(origin: 0, step: 40, tolerance: Self.matroska)
+        // 24 frames past access unit 100: it allows 100 and 101.
+        _ = grid.place(relative: 0, estimate: 100 * 40 + 24)
+        #expect(!grid.isResolved)
+        // Ten access units later, rounded the other way: only 100 fits both.
+        let (placement, restarted) = grid.place(relative: 400, estimate: 110 * 40 - 8)
+        #expect(!restarted)
+        #expect(grid.isResolved)
+        #expect(placement == .position(110 * 40))
+        #expect(grid.place(relative: 0, estimate: nil).0 == .position(100 * 40))
+    }
+
+    @Test("a timestamp no point of the run allows starts a new run there: a splice")
+    func spliceRestarts() {
+        var grid = SourceGrid(origin: 0, step: 512, tolerance: Self.matroska)
+        _ = grid.place(relative: 0, estimate: 10 * 512)
+        let (placement, restarted) = grid.place(relative: 512, estimate: 50 * 512)
+        #expect(restarted)
+        #expect(placement == .position(50 * 512))
+    }
+
+    @Test("a restart forgets the run: the next timestamp places it")
+    func restart() {
+        var grid = SourceGrid(origin: 0, step: 40, tolerance: 2)
+        _ = grid.place(relative: 0, estimate: 400)
+        grid.restart()
+        #expect(grid.place(relative: 0, estimate: nil).0 == .unplaced)
+        #expect(grid.place(relative: 0, estimate: 8_000).0 == .position(8_000))
+    }
+}

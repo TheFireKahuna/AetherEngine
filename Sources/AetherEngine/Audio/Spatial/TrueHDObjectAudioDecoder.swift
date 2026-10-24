@@ -49,6 +49,9 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     private var decimator: ObjectAudioDecimator?
     private var bedDecimator: ObjectAudioDecimator?
     private var discontinuityPending = false
+    /// The last block's clock and its output_timing (`clock(_:)`). Kept across a reset: the clock is
+    /// the stream's, so a resync continues on it.
+    private var lastClock: (Int64, UInt16)?
 
     /// The listener's dialogue gain in dB (`LoadOptions.objectDialogueGain`), applied as
     /// `dialogueEnhancement(gain:maximum:)` has it.
@@ -81,10 +84,6 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     }
 
     deinit { truehd_atmos_decoder_destroy(handle) }
-
-    func push(_ bytes: UnsafeRawBufferPointer) throws {
-        try push(bytes, pts: Int64.min)
-    }
 
     /// The library reports `pts` back on the blocks whose access units start in these bytes, with
     /// how many access units of the same push came before (`TrueHDAtmosBlock.pts_au_index`).
@@ -154,6 +153,8 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         // The timestamp keeps marking the same input frame, now counted at 48 kHz: access units are
         // 80 or 160 frames at 96 or 192 kHz, so the division is exact.
         out.sourcePtsInputFrame = block.sourcePtsInputFrame / Int64(factor)
+        out.clockFrame = block.clockFrame.map { $0 / Int64(factor) }
+        out.gridFrames = block.gridFrames / factor
         out.planes = main.planes
         out.updates = main.updates
         out.isDiscontinuity = discontinuityPending
@@ -227,7 +228,22 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             bed: bed,
             sourcePts: block.pts == Int64.min ? nil : block.pts,
             sourcePtsInputFrame: Int64(block.input_frame_offset)
-                - Int64(block.pts_au_index) * Int64(block.access_unit_frames)), firstStates)
+                - Int64(block.pts_au_index) * Int64(block.access_unit_frames),
+            clockFrame: clock(block.output_timing),
+            gridFrames: Int(block.access_unit_frames)), firstStates)
+    }
+
+    /// output_timing (the frame this block plays at, modulo 2^16) counted on from the last block's,
+    /// so the clock keeps growing across its wraps.
+    private func clock(_ outputTiming: UInt32) -> Int64 {
+        let timing = UInt16(truncatingIfNeeded: outputTiming)
+        if let (last, lastTiming) = lastClock {
+            let next = last + Int64(timing &- lastTiming)
+            lastClock = (next, timing)
+            return next
+        }
+        lastClock = (Int64(timing), timing)
+        return Int64(timing)
     }
 
     func reset() {

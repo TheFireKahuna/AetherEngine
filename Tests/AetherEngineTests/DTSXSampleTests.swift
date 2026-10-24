@@ -25,7 +25,7 @@ struct DTSXSampleTests {
     private static func decodedFrames(_ data: Data) throws -> Int {
         let decoder = try DTSXObjectAudioDecoder()
         var frames = 0
-        try data.withUnsafeBytes { try decoder.push($0) }
+        try data.withUnsafeBytes { try decoder.push($0, pts: Int64.min) }
         decoder.releaseHeldBlocks()
         while let block = try decoder.nextBlock() { frames += block.frameCount }
         return frames
@@ -87,7 +87,7 @@ struct DTSXSampleTests {
             var offset = 0
             while offset < raw.count {
                 let n = min(4096, raw.count - offset)
-                try decoder.push(UnsafeRawBufferPointer(rebasing: raw[offset..<offset + n]))
+                try decoder.push(UnsafeRawBufferPointer(rebasing: raw[offset..<offset + n]), pts: Int64.min)
                 offset += n
                 while let block = try decoder.nextBlock() {
                     if renderer == nil {
@@ -144,6 +144,7 @@ struct DTSXSampleTests {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let bridge = try SpatialAudioBridge(
             srcTimeBase: AVRational(num: 1, den: 48_000), layout: .l714, decoder: DTSXObjectAudioDecoder())
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         var pts: [Int64] = []
         var bytes = 0

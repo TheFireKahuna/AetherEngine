@@ -51,6 +51,8 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
         var frameCount: Int
         var inputFrameOffset: Int64
         var isDiscontinuity: Bool
+        /// The latest timestamp at or before the frame, and the input frame it marks.
+        var stamp: (pts: Int64, inputFrame: Int64)?
     }
 
     private let context: UnsafeMutablePointer<AVCodecContext>
@@ -63,6 +65,8 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
     /// Frames of input taken since the last reset, decoded or not.
     private var inputFrames: Int64 = 0
     private var priming = primingFrames
+    /// The latest timestamp the parser reported, and the input frame of the frame it came with.
+    private var stamp: (pts: Int64, inputFrame: Int64)?
     private var discontinuity = true
     /// Samples in the last frame that decoded, for one that did not.
     private var nominalFrames = 512
@@ -117,7 +121,7 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
     func verdict(feeding bytes: UnsafeRawBufferPointer) -> Verdict? {
         var verdict: Verdict?
         do {
-            try parse(bytes) { [self] in
+            try parse(bytes, pts: Int64.min) { [self] in
                 guard verdict == nil else { return }
                 guard frame.pointee.sample_rate == Int32(ObjectAudioRendering.sampleRate) else {
                     verdict = .refused("\(frame.pointee.sample_rate) Hz")
@@ -136,9 +140,9 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
         return verdict
     }
 
-    func push(_ bytes: UnsafeRawBufferPointer) throws {
+    func push(_ bytes: UnsafeRawBufferPointer, pts: Int64) throws {
         releaseLent()
-        try parse(bytes) { [self] in try takeFrame() }
+        try parse(bytes, pts: pts) { [self] in try takeFrame() }
     }
 
     func nextBlock() throws -> ObjectAudioDecodedBlock? {
@@ -165,7 +169,12 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
             isDiscontinuity: block.isDiscontinuity,
             roles: Self.roles,
             planes: planes,
-            updates: updates)
+            updates: updates,
+            bed: nil,
+            sourcePts: block.stamp?.pts,
+            sourcePtsInputFrame: block.stamp?.inputFrame ?? 0,
+            clockFrame: nil,
+            gridFrames: block.frameCount)
     }
 
     func reset() {
@@ -174,6 +183,7 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
         av_parser_close(parser)
         parser = av_parser_init(Int32(AV_CODEC_ID_DTS.rawValue))!
         inputFrames = 0
+        stamp = nil
         priming = Self.primingFrames
         discontinuity = true
         framesWithoutHeights = 0
@@ -183,7 +193,7 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
     /// it to the decoder now. A new parser takes the input that follows.
     func releaseHeldBlocks() {
         releaseLent()
-        try? parse(nil) { [self] in try takeFrame() }
+        try? parse(nil, pts: Int64.min) { [self] in try takeFrame() }
         av_parser_close(parser)
         parser = av_parser_init(Int32(AV_CODEC_ID_DTS.rawValue))!
     }
@@ -192,19 +202,21 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
 
     /// Splits `bytes` into frames, decodes each and calls `onFrame` with every decoded frame in
     /// `frame`. A frame that does not decode still counts towards the input offsets. Nil flushes the
-    /// frame the parser holds.
-    private func parse(_ bytes: UnsafeRawBufferPointer?, onFrame: () throws -> Void) throws {
+    /// frame the parser holds. `pts` goes through the parser, which reports it on the frame these
+    /// bytes start however long it holds that frame; every frame, decoded, priming or not, keeps
+    /// `stamp` current.
+    private func parse(_ bytes: UnsafeRawBufferPointer?, pts: Int64, onFrame: () throws -> Void) throws {
         var data = bytes?.baseAddress?.assumingMemoryBound(to: UInt8.self)
         var remaining = Int32(bytes?.count ?? 0)
         repeat {
             var out: UnsafeMutablePointer<UInt8>?
             var outSize: Int32 = 0
-            let used = av_parser_parse2(parser, context, &out, &outSize, data, remaining,
-                                        Int64.min, Int64.min, 0)
+            let used = av_parser_parse2(parser, context, &out, &outSize, data, remaining, pts, pts, 0)
             guard used >= 0 else { throw DecoderError(message: "parser: \(FFmpegErr.text(for: used))") }
             data = data.map { $0 + Int(used) }
             remaining -= used
             if let out, outSize > 0 {
+                if parser.pointee.pts != Int64.min { stamp = (parser.pointee.pts, inputFrames) }
                 try decode(out, outSize, onFrame: onFrame)
             } else if used == 0 {
                 break
@@ -276,7 +288,7 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
             }
         }
         pending.append(Pending(samples: samples, frameCount: frames, inputFrameOffset: offset,
-                               isDiscontinuity: discontinuity))
+                               isDiscontinuity: discontinuity, stamp: stamp))
         discontinuity = false
     }
 

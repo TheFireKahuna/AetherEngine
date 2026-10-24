@@ -46,7 +46,7 @@ struct DTSXObjectMetadataMappingTests {
     @Test("the decoder opens, takes input and asks for more")
     func decoderLifecycle() throws {
         let decoder = try DTSXObjectAudioDecoder()
-        try [UInt8](repeating: 0, count: 64).withUnsafeBytes { try decoder.push($0) }
+        try [UInt8](repeating: 0, count: 64).withUnsafeBytes { try decoder.push($0, pts: Int64.min) }
         #expect(try decoder.nextBlock() == nil)
         decoder.releaseHeldBlocks()
         #expect(try decoder.nextBlock() == nil)

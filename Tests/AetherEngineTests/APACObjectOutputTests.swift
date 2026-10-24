@@ -434,7 +434,7 @@ struct APACObjectOutputTests {
             var offset = 0
             decoding: while offset < raw.count {
                 let n = min(65_536, raw.count - offset)
-                try decoder.push(UnsafeRawBufferPointer(rebasing: raw[offset..<offset + n]))
+                try decoder.push(UnsafeRawBufferPointer(rebasing: raw[offset..<offset + n]), pts: Int64.min)
                 offset += n
                 while let block = try decoder.nextBlock() {
                     if roles.isEmpty {

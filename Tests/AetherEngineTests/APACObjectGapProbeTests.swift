@@ -22,6 +22,7 @@ struct APACObjectGapProbeTests {
             let bridge = try SpatialAudioBridge(
                 srcTimeBase: AVRational(num: 1, den: 48_000), layout: .l714,
                 decoder: TrueHDObjectAudioDecoder(), objectOutput: true)
+            bridge.setSourceStart(0)
             defer { bridge.close() }
             var pts: [Int64] = []
             let start = Date()

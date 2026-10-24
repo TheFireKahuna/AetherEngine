@@ -270,7 +270,7 @@ struct TrueHDObjectMetadataMappingTests {
     func decoderLifecycle() throws {
         let decoder = try TrueHDObjectAudioDecoder()
         let junk = [UInt8](repeating: 0x5A, count: 4096)
-        try junk.withUnsafeBytes { try decoder.push($0) }
+        try junk.withUnsafeBytes { try decoder.push($0, pts: Int64.min) }
         #expect(try decoder.nextBlock() == nil)
         decoder.reset()
         #expect(try decoder.nextBlock() == nil)

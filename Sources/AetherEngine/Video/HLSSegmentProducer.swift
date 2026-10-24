@@ -99,6 +99,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         /// AE#458: the source track's language as ISO 639-2/T, carried into every muxer this config builds
         /// (a producer restart rebuilds one, so it has to live on the config, not on the first muxer).
         let language: String?
+        /// The source track's first timestamp (`AVStream.start_time`, `sourceTimeBase`), nil when the
+        /// container states none: where its first frame sits, the origin of `SourceGrid`.
+        let sourceStart: Int64?
 
         init(codecpar: UnsafePointer<AVCodecParameters>,
              timeBase: AVRational,
@@ -107,7 +110,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
              sourceTimeBase: AVRational,
              bridge: (any AudioTranscodingBridge)?,
              stripAacAdts: Bool = false,
-             language: String? = nil) {
+             language: String? = nil,
+             sourceStart: Int64? = nil) {
             self.codecpar = codecpar
             self.timeBase = timeBase
             self.sourceStreamIndex = sourceStreamIndex
@@ -116,6 +120,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.bridge = bridge
             self.stripAacAdts = stripAacAdts
             self.language = language
+            self.sourceStart = sourceStart
         }
     }
 
@@ -4321,6 +4326,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                 audioTb
                             )
                         }
+                        // The bridge's grid starts where the stream does, on the axis it is fed on.
+                        audioConfig?.bridge?.setSourceStart(audioConfig?.sourceStart.map { $0 - audioShiftPts })
                         let gapInAudioTb: Int64
                         if restartTargetVideoPts == Int64.min {
                             gapInAudioTb = 0
