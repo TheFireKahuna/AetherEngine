@@ -21,6 +21,8 @@
 #   cue-axis-bframes.mkv/.mp4     - one HEVC B-pyramid stream in both containers (AE#561)
 #   long-first-gop-{aac,pcm}.mkv  - 11 s first GOP, then 2 s GOPs; passthrough and bridged audio
 #   bridge-eac3-51.mkv            - 5.1 PCM in MKV, drives the EAC3 audio bridge (AE#561 follow-up)
+#   avsync/*                      - a white frame and a click at exactly 1 s, per audio codec and
+#                                   container, for AVSyncTests (audio against video, to the sample)
 #
 # Real-world DV / Atmos / multichannel sources have to come from your
 # own library. Drop those into ./Fixtures/user/ (also gitignored)
@@ -30,7 +32,8 @@
 #   ./Scripts/fetch-fixtures.sh
 #
 # Requires:
-#   - ffmpeg with libx264, libx265, libaom-av1, libvpx-vp9 enabled.
+#   - ffmpeg with libx264, libx265, libaom-av1, libvpx-vp9 enabled (and libopus, libmp3lame for
+#     the avsync clips).
 #     macOS: `brew install ffmpeg` covers all four codecs.
 
 set -euo pipefail
@@ -385,6 +388,35 @@ for AUDIO in aac pcm; do
         -g 1000 -sc_threshold 0 -force_key_frames "0,11,13,15,17,19,21,23,25,27,29" \
         -c:a "$CODEC" -ac 2 -f matroska "$FIXTURES_DIR/long-first-gop-$AUDIO.mkv"
 done
+
+# AVSyncTests: one white frame and one click at exactly the same instant (frame 24 at 24 fps, sample
+# 48000 at 48 kHz), in every audio codec the HLS route copies or bridges and in each container that
+# carries it. H.264 with B-frames, so the video side has a composition offset to keep straight. FFmpeg's
+# own decode puts the click on the frame in every clip (checked with -copyts); DTS is left out because
+# FFmpeg's experimental encoder adds 512 samples of delay it does not declare, so the clip itself is off.
+echo "→ avsync/* (frame and click at 1.000 s, per audio codec and container)"
+mkdir -p "$FIXTURES_DIR/avsync"
+AVSYNC_V="color=black:s=320x240:r=24:d=4,drawbox=x=0:y=0:w=320:h=240:color=white:t=fill:enable='eq(n,24)'"
+AVSYNC_CLICK="if(between(n,48000,48143),0.8*sin(2*PI*1000*(n-48000)/48000),0)"
+AVSYNC_STEREO="aevalsrc='$AVSYNC_CLICK|$AVSYNC_CLICK':s=48000:d=4"
+AVSYNC_51="aevalsrc='$AVSYNC_CLICK|0|0|0|0|0':s=48000:d=4:c=5.1"
+avsync_clip() {  # <name> <audio source> <audio args...>
+    local name="$1" source="$2"; shift 2
+    ffmpeg -hide_banner -loglevel error -y -f lavfi -i "$AVSYNC_V" -f lavfi -i "$source" "$@" \
+        -c:v libx264 -bf 3 -g 48 -pix_fmt yuv420p "$FIXTURES_DIR/avsync/$name"
+}
+avsync_clip aac.mkv "$AVSYNC_STEREO" -c:a aac -b:a 192k
+avsync_clip aac.mp4 "$AVSYNC_STEREO" -c:a aac -b:a 192k
+avsync_clip aac.ts "$AVSYNC_STEREO" -c:a aac -b:a 192k
+avsync_clip ac3.mkv "$AVSYNC_51" -c:a ac3
+avsync_clip ac3.ts "$AVSYNC_51" -c:a ac3
+avsync_clip eac3.mkv "$AVSYNC_51" -c:a eac3
+avsync_clip eac3.mp4 "$AVSYNC_51" -c:a eac3
+avsync_clip flac.mkv "$AVSYNC_STEREO" -c:a flac
+avsync_clip pcm.mkv "$AVSYNC_STEREO" -c:a pcm_s24le
+avsync_clip truehd.mkv "$AVSYNC_51" -c:a truehd -strict -2
+avsync_clip opus.mkv "$AVSYNC_STEREO" -c:a libopus
+avsync_clip mp3.mkv "$AVSYNC_STEREO" -c:a libmp3lame
 
 echo ""
 echo "Done. Try:"
