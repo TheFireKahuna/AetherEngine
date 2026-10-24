@@ -10,10 +10,10 @@ import Foundation
 /// engine still holds the timestamps. That is a different place on each route, and on both of them
 /// it is the LAST place rather than the obvious one:
 ///
-/// - `.software`: the decoded sample's stamped PTS, downstream of `AudioClockAnchor`. Applying it to
-///   the container PTS upstream instead would feed the gapless predictor an offset it treats as
-///   ordinary rounding jitter, so any nudge below its 100 ms discontinuity threshold would vanish
-///   without a trace, and the clock-arming decision (`SWClockAnchorPolicy`) would move with it.
+/// - `.software`: the decoded sample's stamped PTS, downstream of where the decoder places it on the
+///   stream's grid (`SourceGrid`). Applied to the container PTS upstream instead, an offset would
+///   move every timestamp off the grid the stream's start lays, and the clock-arming decision
+///   (`SWClockAnchorPolicy`) would move with it.
 /// - `.loopback`: the audio timestamps written into the fMP4 segments. Segments already cut carry
 ///   the old offset, and the two are not splicable: at the seam the audio track gains a gap or an
 ///   overlap of exactly the change, and a change that moves audio EARLIER walks into

@@ -307,10 +307,23 @@ final class AudioBridge: @unchecked Sendable {
     /// resume offset apart, and AVPlayer silently discarded everything (loadedTimeRanges never populated).
     private var rebaseFromNextSourcePTS: Bool = true
 
-    /// VOD: every decoded frame's own source timestamp is held against the count, and a break the
-    /// count cannot see is placed exactly (`AudioContinuity`). Live keeps the free-running counter, since
-    /// the producer re-times its splices itself (`noteTimelineJump`).
+    /// VOD: every decoded frame sits where `grid` puts it, exactly, and a frame that does not follow
+    /// on from the count is placed there (`place`). Live keeps the free-running counter, since the
+    /// producer re-times its splices itself (`noteTimelineJump`).
     private let followsSourceContinuity: Bool
+    /// The stream's frames on its lattice from its first coded frame (`SourceGrid`), at the decoded
+    /// rate; built at the first frame once `setSourceStart` has given the start.
+    private var grid: SourceGrid?
+    private var sourceStart: Int64?
+    /// What the grid needs of the source stream: its codec, frame length and delay. A copy, freed in
+    /// `cleanup`.
+    private var sourceParameters: UnsafeMutablePointer<AVCodecParameters>?
+    /// Frames the decoder has produced in the grid's current run, the frame being placed included.
+    private var runFrames: Int64 = 0
+    /// The decoder's count broke (a packet it rejected, a restart): the next frame starts a new run.
+    private var runBreakPending = false
+    /// No stream start was given, so no frame can be placed; logged once.
+    private var reportedNoSourceStart = false
     /// Output samples still to drop from the start of what the resampler produces (an overlap, or
     /// audio before the timeline's start).
     private var pendingTrimSamples: Int64 = 0
@@ -390,6 +403,8 @@ final class AudioBridge: @unchecked Sendable {
             cleanup()
             throw AudioBridgeError.decoderOpenFailed(code: openRet)
         }
+        sourceParameters = avcodec_parameters_alloc()
+        if let sourceParameters { _ = avcodec_parameters_copy(sourceParameters, srcCodecpar) }
 
         // 2. Source shape. The encoder cannot be chosen before this: `.surroundCompat` resolves to EAC3 only
         // for a source that HAS surround to carry, and the channel count is not final until the decoder is open.
@@ -809,12 +824,61 @@ final class AudioBridge: @unchecked Sendable {
         rebaseFromNextSourcePTS = true
         pendingTrimSamples = 0
         continuityBreakCause = nil
+        runBreakPending = true
     }
 
     func setOutputOffset(seconds: Double) {
         opLock.lock()
         defer { opLock.unlock() }
         outputOffsetSeconds = seconds
+    }
+
+    func setSourceStart(_ pts: Int64?) {
+        opLock.lock()
+        defer { opLock.unlock() }
+        guard pts != sourceStart else { return }
+        sourceStart = pts
+        grid = nil
+    }
+
+    /// Caller holds `opLock`. Where `frame` starts, in source frames at its rate: on the stream's grid,
+    /// placed by its timestamp (`ts`, nil for none) and every other one of its run. nil while nothing
+    /// can say. The frame's end is what is placed: a decoder that trims a codec's delay off the front
+    /// of the stream's first frame leaves that frame's start off the lattice, never its end.
+    private func gridPosition(of frame: UnsafeMutablePointer<AVFrame>, ts: Int64?) -> Int64? {
+        let rate = frame.pointee.sample_rate
+        guard rate > 0, let parameters = sourceParameters else { return nil }
+        if grid == nil {
+            guard let sourceStart else {
+                if !reportedNoSourceStart {
+                    reportedNoSourceStart = true
+                    EngineLog.emit("[AudioBridge] ERROR: no stream start, so no frame can be placed", category: .session)
+                }
+                return nil
+            }
+            grid = SourceGrid(
+                origin: SourceGrid.origin(start: sourceStart, timeBase: srcTimeBase, sampleRate: rate,
+                                          initialPadding: parameters.pointee.initial_padding),
+                step: SourceGrid.lattice(codecpar: parameters, sampleRate: rate),
+                tolerance: AudioContinuity.tolerance(sourceTimeBase: srcTimeBase, sampleRate: rate))
+            runFrames = 0
+        }
+        if runBreakPending {
+            runBreakPending = false
+            grid?.restart()
+            runFrames = 0
+        }
+        let frames = Int64(frame.pointee.nb_samples)
+        runFrames += frames
+        let end = ts.map { av_rescale_q($0, srcTimeBase, AVRational(num: 1, den: rate)) + frames }
+        let (placement, restarted) = grid!.place(relative: runFrames, estimate: end)
+        if restarted {
+            // A timestamp no grid point of the run allows: the stream was cut here.
+            stats.timestampMismatches += 1
+            continuityBreakCause = continuityBreakCause ?? "a splice in the source"
+        }
+        guard case .position(let at) = placement else { return nil }
+        return at - frames
     }
 
     /// Drain everything buffered at source EOF: remaining decoder frames, FIFO leftover (< one encoder frame),
@@ -945,6 +1009,9 @@ final class AudioBridge: @unchecked Sendable {
         if encoderCodecpar != nil {
             avcodec_parameters_free(&encoderCodecpar)
         }
+        if sourceParameters != nil {
+            avcodec_parameters_free(&sourceParameters)
+        }
         if resampledFrame != nil {
             av_frame_free(&resampledFrame)
         }
@@ -1010,7 +1077,20 @@ final class AudioBridge: @unchecked Sendable {
                 // packet's is the fallback for a decoder that sets neither.
                 let frameTs = sf.pointee.pts != Self.avNoPTS ? sf.pointee.pts
                     : sf.pointee.best_effort_timestamp != Self.avNoPTS ? sf.pointee.best_effort_timestamp : packetPts
-                if frameTs != Self.avNoPTS {
+                let ts: Int64? = frameTs != Self.avNoPTS ? frameTs : nil
+                // Where the frame starts, in encoder ticks: VOD on the stream's grid, exactly; live at its
+                // own timestamp, which the producer re-times at a splice.
+                let start: Int64?
+                if followsSourceContinuity {
+                    guard let source = gridPosition(of: sf, ts: ts) else {
+                        stats.blocksDroppedUnplaced += 1
+                        continue
+                    }
+                    start = av_rescale_q(source, AVRational(num: 1, den: sf.pointee.sample_rate), encoderTimeBase)
+                } else {
+                    start = ts.map { av_rescale_q($0, srcTimeBase, encoderTimeBase) }
+                }
+                if let start {
                     // AE#561 follow-up: the counter stamps the FRAME handed to the encoder, and an encoder
                     // that declares `initial_padding` (256 on the AC-3 family, 0 on FLAC) stamps its first
                     // PACKET that far below it, so the packet lands on the frame's source position with the
@@ -1021,8 +1101,7 @@ final class AudioBridge: @unchecked Sendable {
                         outputOffsetTicks = Int64((outputOffsetSeconds * Double(encoderTimeBase.den)
                                                    / Double(max(encoderTimeBase.num, 1))).rounded())
                     }
-                    let position = av_rescale_q(frameTs, srcTimeBase, encoderTimeBase)
-                        &+ Int64(enc.pointee.initial_padding) &+ outputOffsetTicks
+                    let position = start &+ Int64(enc.pointee.initial_padding) &+ outputOffsetTicks
                     if rebaseFromNextSourcePTS {
                         // Never below zero: `baseMediaDecodeTime` is unsigned (AE#561). Audio before the
                         // timeline's start comes off the frame instead of wrapping.
@@ -1052,6 +1131,7 @@ final class AudioBridge: @unchecked Sendable {
                 stats.packetsRejected += 1
                 stats.lastDecodeErrorCode = sendRet
                 continuityBreakCause = "a packet the decoder rejected"
+                runBreakPending = true
                 // Skippable single-packet rejections, decoder stays usable for the next packet:
                 //   invalidData = corrupt source packet (glitchy live MPEG-TS, broken mp2 header);
                 //   einval (-22) = a DTS-HD MA XLL frame that residual-codes channels without a usable core
@@ -1310,9 +1390,10 @@ final class AudioBridge: @unchecked Sendable {
         }
     }
 
-    /// Caller holds `opLock`. Holds a decoded frame's source position (encoder ticks, padding included,
-    /// as `nextEncoderPTS` counts) against where the count says the next sample goes, and places the
-    /// frame exactly where the two disagree by more than the source can state (`AudioContinuity`): a gap
+    /// Caller holds `opLock`. Holds a decoded frame's position on the stream's grid (encoder ticks,
+    /// padding included, as `nextEncoderPTS` counts) against where the count says the next sample goes,
+    /// and places the frame there wherever the two disagree by more than the encoder's rate conversion
+    /// can round (`AudioContinuity`): a gap
     /// becomes silence injected into the resampler, so it lands in order behind what is still inside
     /// it; an overlap comes off the frame's start; a jump flushes what is queued at its own position and
     /// re-anchors on the frame.
@@ -1322,7 +1403,8 @@ final class AudioBridge: @unchecked Sendable {
         let outRate = enc.pointee.sample_rate
         let inside = swr_get_delay(swr, Int64(outRate))
         let expected = nextEncoderPTS + Int64(av_audio_fifo_size(fifo)) + inside - pendingTrimSamples
-        let tolerance = AudioContinuity.tolerance(sourceTimeBase: srcTimeBase, sampleRate: outRate)
+        // Positions are exact (`gridPosition`); converted to the encoder's rate they can round by one.
+        let tolerance: Int64 = 1
         let decision = AudioContinuity.decide(expected: expected, actual: position, tolerance: tolerance, sampleRate: outRate)
         let cause = continuityBreakCause ?? "the source's own timestamps"
         continuityBreakCause = nil

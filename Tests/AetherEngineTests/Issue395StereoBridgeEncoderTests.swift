@@ -116,6 +116,7 @@ struct Issue395StereoBridgeEncoderTests {
                                      srcTimeBase: stream.pointee.time_base,
                                      mode: mode,
                                      forcedEncoder: forcedEncoder)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         try body(bridge, packets)
     }

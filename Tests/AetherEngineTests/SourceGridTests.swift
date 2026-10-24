@@ -65,3 +65,20 @@ struct SourceGridTests {
         #expect(grid.place(relative: 0, estimate: 8_000).0 == .position(8_000))
     }
 }
+
+extension SourceGridTests {
+    @Test("a cut that moves the frames off the lattice starts a run placed on every frame, until a restart")
+    func spliceOffTheLattice() {
+        var grid = SourceGrid(origin: 0, step: 1024, tolerance: Self.matroska)
+        _ = grid.place(relative: 0, estimate: 10 * 1024)
+        // After an edit, frames start 500 frames off the lattice: no lattice point within 25.
+        let (placement, restarted) = grid.place(relative: 1024, estimate: 30 * 1024 + 500)
+        #expect(restarted)
+        #expect(placement == .position(30 * 1024 + 500))
+        // Later frames of that run follow on from it.
+        #expect(grid.place(relative: 2048, estimate: nil).0 == .position(31 * 1024 + 500))
+        // A restart lays the stream's lattice again.
+        grid.restart()
+        #expect(grid.place(relative: 0, estimate: 40 * 1024 + 9).0 == .position(40 * 1024))
+    }
+}

@@ -332,7 +332,7 @@ extension HLSVideoEngine {
                         // channel count still gets the decoder-resolved answer; only the retry is forced.
                         forcedEncoder: attemptIndex == 0 ? nil : encoderAttempt,
                         // Live splices are re-timed by the producer (`noteTimelineJump`); VOD places each
-                        // decoded frame against its own source timestamp (`AudioContinuity`).
+                        // decoded frame on the stream's grid (`SourceGrid`).
                         followsSourceContinuity: !isLiveSession
                     )
                 } catch AudioBridge.AudioBridgeError.encoderNotFound(let missing) where !isLastAttempt {
@@ -363,7 +363,8 @@ extension HLSVideoEngine {
                     inputTimeBase: bridge.encoderTimeBase,
                     sourceTimeBase: audioStream.pointee.time_base,
                     bridge: bridge,
-                    language: audioLanguage
+                    language: audioLanguage,
+                    sourceStart: audioStream.pointee.start_time == Int64.min ? nil : audioStream.pointee.start_time
                 )
                 self.savedAudioConfig = cfg
                 self.audioBridge = bridge
