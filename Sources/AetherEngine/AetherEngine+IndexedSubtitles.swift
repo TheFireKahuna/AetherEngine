@@ -174,9 +174,8 @@ extension AetherEngine {
             let clone = customReader?.makeIndependentReader()
             return { clone }
         }
-        if url.isFileURL { return { FileIOReader(url: url) } }
         let resolved = indexedSubtitleRequestHeaders()
-        return { Self.indexedSourceReader(url: url, headers: resolved, label: "subindex") }
+        return { Self.indexReader(url: url, headers: resolved, label: "subindex") }
     }
 
     func cancelIndexedSubtitleFill() {

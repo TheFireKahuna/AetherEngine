@@ -1,18 +1,21 @@
 import Foundation
 import AetherLibavutil
 
-/// An MP4's own index of its subtitle samples: the sample tables in its `moov`, as libavformat read
-/// them at open. Not parsed again here: the demuxer that opened the source already built every
-/// stream's entries from `stts`, `stsz`, `stco` and `stsc` with the edit list applied, and those
-/// entries are what `av_read_frame` reads its packets from, so a sample read where an entry says is
-/// the packet the walk would get, with its time. The walk, which on an MP4 delivers every video
-/// keyframe to pace itself, is then not needed for the subtitles.
+/// An MP4's own index of its subtitle samples and video keyframes: the sample tables in its `moov`,
+/// as libavformat read them at open. Not parsed again here: the demuxer that opened the source
+/// already built every stream's entries from `stts`, `stsz`, `stco` and `stsc` with the edit list
+/// applied, and those entries are what `av_read_frame` reads its packets from, so a sample read where
+/// an entry says is the packet the walk would get, with its time. The walk, which on an MP4 delivers
+/// every video keyframe to pace itself, is then not needed for the subtitles, and an I-frame
+/// rendition reads each keyframe without a demuxer of its own.
 ///
-/// Trusted for a track only where the entries are the whole track as libavformat delivers it. They are
-/// by construction in a file that is not fragmented: `av_read_frame` reads from these entries and
-/// nothing else, and only a fragmented file adds to them (its samples are listed in each `moof`, read
-/// as the stream is). Not `AVStream.nb_frames`, which counts the `stts` samples, edited out or not. A
-/// track with an entry the edit list marked to discard is left to the walk.
+/// A subtitle track is trusted only where the entries are the whole track as libavformat delivers
+/// it. They are by construction in a file that is not fragmented: `av_read_frame` reads from these
+/// entries and nothing else, and only a fragmented file adds to them (its samples are listed in each
+/// `moof`, read as the stream is). Not `AVStream.nb_frames`, which counts the `stts` samples, edited
+/// out or not. A track with an entry the edit list marked to discard is left to the walk. A keyframe
+/// needs no whole track: each entry is its sample wherever it came from, and the keyframes a segment
+/// plan lists are entries the demuxer had when the plan was built.
 struct MP4SampleIndex: SourceIndex {
 
     struct Track: Sendable {
@@ -24,19 +27,33 @@ struct MP4SampleIndex: SourceIndex {
 
     var subtitleTracks: [SourceIndexTrack]
     var tracks: [UInt64: Track]
+    /// Per video track, each keyframe's sample: its position to its size.
+    var keyframeSamples: [UInt64: [Int64: Int]] = [:]
 
-    /// `AVINDEX_DISCARD_FRAME`, a macro Swift does not import.
+    /// `AVINDEX_KEYFRAME` and `AVINDEX_DISCARD_FRAME`, macros Swift does not import.
+    private static let keyframe: Int32 = 0x0001
     private static let discardFrame: Int32 = 0x0002
 
     /// mov_text's sample is its packet: libavformat reads it with `av_get_packet` and changes nothing.
     var packetCodecs: Set<String> { ["mov_text"] }
 
-    /// Reads the index of the MP4 `demuxer` opened, whose subtitle streams are `streams`. `source`
-    /// is read only for the file's top-level boxes, to tell a fragmented file. Only
-    /// `SourceIndexRegistry` can call this (it alone makes a `ParseToken`).
-    static func read(demuxer: Demuxer, streams: [IndexedSubtitleStream], source: RandomAccessByteSource,
-                     token: SourceIndexRegistry.ParseToken) throws -> MP4SampleIndex {
-        guard try !isFragmented(source) else { throw SourceIndexError.noIndex }
+    /// Reads the index of the MP4 `demuxer` opened, whose subtitle streams are `streams` and video
+    /// streams `videoTracks`. `source` is read only for the file's top-level boxes, to tell a
+    /// fragmented file. Only `SourceIndexRegistry` can call this (it alone makes a `ParseToken`).
+    static func read(demuxer: Demuxer, streams: [IndexedSubtitleStream], videoTracks: [IndexedVideoTrack],
+                     source: RandomAccessByteSource, token: SourceIndexRegistry.ParseToken) throws -> MP4SampleIndex {
+        let fragmented = try isFragmented(source)
+        var keyframeSamples: [UInt64: [Int64: Int]] = [:]
+        for video in videoTracks where video.trackID > 0 {
+            guard let table = demuxer.sampleTable(streamIndex: video.streamIndex) else {
+                throw SourceIndexError.malformed("stream \(video.streamIndex) closed during the read")
+            }
+            var samples: [Int64: Int] = [:]
+            for entry in table.entries where entry.flags & keyframe != 0 && entry.flags & discardFrame == 0 && entry.size > 0 {
+                samples[entry.pos] = entry.size
+            }
+            keyframeSamples[UInt64(video.trackID)] = samples
+        }
         var subtitleTracks: [SourceIndexTrack] = []
         var tracks: [UInt64: Track] = [:]
         for stream in streams where stream.trackID > 0 {
@@ -48,10 +65,10 @@ struct MP4SampleIndex: SourceIndex {
             subtitleTracks.append(SourceIndexTrack(number: number, codecName: stream.codecName,
                                                    language: stream.language))
             tracks[number] = Track(timeBase: stream.timeBase, blocks: blocks(of: table),
-                                   isWhole: !table.entries.isEmpty
+                                   isWhole: !fragmented && !table.entries.isEmpty
                                        && table.entries.allSatisfy { $0.flags & discardFrame == 0 })
         }
-        return MP4SampleIndex(subtitleTracks: subtitleTracks, tracks: tracks)
+        return MP4SampleIndex(subtitleTracks: subtitleTracks, tracks: tracks, keyframeSamples: keyframeSamples)
     }
 
     /// The entries as packets: a sample lasts until the next one starts, which is its `stts` delta,
@@ -113,6 +130,16 @@ struct MP4SampleIndex: SourceIndex {
     func isComplete(track: UInt64, frameCount: Int?) -> Bool {
         guard let entry = tracks[track], entry.isWhole else { return false }
         return frameCount.map { $0 == entry.blocks.count } ?? true
+    }
+
+    func coversKeyframes(track: UInt64) -> Bool { !(keyframeSamples[track] ?? [:]).isEmpty }
+
+    /// The sample at `position`, which is the keyframe's packet: libavformat reads it with
+    /// `av_get_packet` as it stands.
+    func readKeyframe(track: UInt64, position: Int64, ticks: Int64, from source: RandomAccessByteSource) -> [UInt8]? {
+        guard let size = keyframeSamples[track]?[position],
+              let bytes = source.read(at: position, count: size), bytes.count == size else { return nil }
+        return bytes
     }
 
     func readFrame(_ block: SourceIndexBlock, track: UInt64, from source: RandomAccessByteSource,

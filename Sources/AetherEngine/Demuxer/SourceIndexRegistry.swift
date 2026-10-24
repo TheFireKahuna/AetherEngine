@@ -81,8 +81,10 @@ final class SourceIndexRegistry: @unchecked Sendable {
         }
         if format.contains("mp4") {
             let streams = AetherEngine.indexedSubtitleStreams(of: demuxer)
+            let videos = AetherEngine.indexedVideoTracks(of: demuxer)
             return await index(for: key) { token in
-                try MP4SampleIndex.read(demuxer: demuxer, streams: streams, source: source, token: token)
+                try MP4SampleIndex.read(demuxer: demuxer, streams: streams, videoTracks: videos,
+                                        source: source, token: token)
             }
         }
         return .unavailable(.unsupportedContainer)

@@ -35,6 +35,16 @@ protocol SourceIndex: Sendable {
     /// or could not be read.
     func readFrame(_ block: SourceIndexBlock, track: UInt64, from source: RandomAccessByteSource,
                    prefix: Int?) -> SourceIndexFrame?
+
+    /// Whether the keyframes of video `track` can be read here (`readKeyframe`).
+    func coversKeyframes(track: UInt64) -> Bool
+
+    /// The keyframe of video `track` that libavformat's index places at `position` (the entry the
+    /// session's segment plan was built from, `Demuxer.indexedKeyframeEntries`), as the packet
+    /// libavformat hands over for it: an MP4 sample's own bytes; on Matroska the block of the cluster
+    /// at `position` whose time is nearest `ticks` (on `timeBase(track:)`). Nil when the index does not
+    /// list it or it could not be read.
+    func readKeyframe(track: UInt64, position: Int64, ticks: Int64, from source: RandomAccessByteSource) -> [UInt8]?
 }
 
 /// Why a source has no index.
@@ -82,6 +92,13 @@ struct SourceIndexTrack: Sendable, Equatable {
     /// Frame and byte statistics where the file states them (mkvmerge's tags).
     var frames: Int? = nil
     var bytes: Int64? = nil
+}
+
+/// A video stream as libavformat lists it, and the track behind it.
+struct IndexedVideoTrack: Sendable, Equatable {
+    var streamIndex: Int32
+    /// `AVStream.id`, as for `IndexedSubtitleStream.trackID`.
+    var trackID: Int32
 }
 
 /// A subtitle stream as libavformat lists it, with what an index consumer needs of it.
