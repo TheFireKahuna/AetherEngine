@@ -90,7 +90,10 @@ extension AetherEngine {
             }
             store.markFeeding()
             startSubtitleOCRWorker(ordinal: ordinal, streamIndex: Int32(stream))
-            startSubtitleForwardPrefetcher(startAt: sourceTime)
+            // The index fill reads its own blocks; only the packet-store worker needs the prefetcher.
+            if indexedBitmapFillOrdinal != ordinal, indexedSubtitles?.plans[ordinal] == nil {
+                startSubtitleForwardPrefetcher(startAt: sourceTime)
+            }
         } else {
             store.markFeeding()
             startLazyNativeSubtitleReadersWhenIdle()
@@ -784,7 +787,7 @@ extension AetherEngine {
         // #362: otherwise it parks a margin BEYOND the drain window, so the set at the window's
         // forward edge has its own clear stored and can be closed where the author closed it.
         let lead = subtitleOCRArmedOrdinal != nil
-            ? Self.subtitleOCRPrefetchLeadSeconds
+            ? subtitleOCRDemandLead(base: Self.subtitleOCRPrefetchLeadSeconds, playhead: anchor)
             : Self.subtitleDrainLeadSeconds + Self.subtitleForwardPrefetchLeadMarginSeconds
         // #240: a live session moves its own cursor. Only a changed lead still needs a rebuild
         // (the loop captures it at start), and only a live task can be handed the request at all.
@@ -1860,6 +1863,8 @@ extension AetherEngine {
             // Phase D: OCR ordinals are worker-fed; the reader would open a demuxer only to
             // skip their bitmap routes.
             guard ordinal < stores.count, let src = entry.sourceStreamIndex, !entry.needsOCR else { continue }
+            // Complete already (from the container's index): nothing left to read for it.
+            guard !stores[ordinal].isFinished else { continue }
             pairs.append((Int32(src), stores[ordinal]))
         }
         guard !pairs.isEmpty else { return }
@@ -2093,6 +2098,13 @@ extension AetherEngine {
         /// Where this run's reading began (its first packet, wherever the seek actually landed) and how far
         /// it has got, reported to the stores as it grows (`noteRead`).
         var readThrough: Double?
+        /// How far past the playhead to read before parking: the fixed lead, or further when the player
+        /// asks for windows beyond it (AVKit reads a rendition minutes ahead).
+        let routedStores = pairs.map(\.store)
+        func readAhead(_ playhead: Double) -> Double {
+            Self.subtitleReadAhead(base: Self.nativeSubtitleReadAheadSeconds, playhead: playhead,
+                                   requested: routedStores.compactMap { $0.furthestRequestedSourceSeconds() }.max())
+        }
 
         readLoop: while !Task.isCancelled {
             // #240: the video path owns the link; this reader is lookahead. Same rule as the #151
@@ -2177,13 +2189,13 @@ extension AetherEngine {
             // and cached empty for the VOD rendition. Only runs while a native rendition is selected (PiP).
             // Sodalite#32: a whole-program .vtt must hold EVERY cue, so read straight to EOF without parking
             // (cue data is tiny). markFinished after the loop lets the .vtt handler wait for a complete file.
-            if !readToEOF, let pktSeconds, pktSeconds > playheadSnapshot + Self.nativeSubtitleReadAheadSeconds {
+            if !readToEOF, let pktSeconds, pktSeconds > playheadSnapshot + readAhead(playheadSnapshot) {
                 while !Task.isCancelled {
                     guard let fresh = await MainActor.run(body: { [weak self] in self?.sourceTime }) else {
                         break readLoop
                     }
                     playheadSnapshot = fresh
-                    if pktSeconds <= playheadSnapshot + Self.nativeSubtitleReadAheadSeconds { break }
+                    if pktSeconds <= playheadSnapshot + readAhead(playheadSnapshot) { break }
                     if !parkLogged {
                         parkLogged = true
                         EngineLog.emit(

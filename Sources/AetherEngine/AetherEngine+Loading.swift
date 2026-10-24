@@ -1442,6 +1442,8 @@ extension AetherEngine {
                 // #88: load-declared external tracks fill their stores with one whole-file decode
                 // each (no side demuxer); embedded tracks keep the pump-tap / reader paths below.
                 startExternalNativeStoreFill(session: session)
+                // Embedded tracks the container indexes in full are read from the index instead.
+                startIndexedSubtitleFill(session: session, url: url)
                 // Sodalite#32: the producer's pump tap fills these stores for the whole produced region at
                 // zero side-channel bandwidth, so the eager at-load readers (which competed with playback
                 // for the remote link at startup) are only a fallback for sessions whose tap could not arm
