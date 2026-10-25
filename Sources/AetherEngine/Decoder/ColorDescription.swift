@@ -63,16 +63,39 @@ struct ColorDescription: Equatable {
             matrix: bitstream.matrix == AVCOL_SPC_UNSPECIFIED ? container.matrix : bitstream.matrix,
             range: bitstream.range == AVCOL_RANGE_UNSPECIFIED ? container.range : bitstream.range)
     }
+}
 
-    /// Write the resolved description back onto a freshly decoded frame, so every consumer downstream
-    /// (tone mapper, sws conversion, DV still converter, CoreVideo attachments) reads one answer instead
-    /// of each picking a source. Returns whether anything was filled in, which is also what makes it
-    /// safe to call per frame: the second pass over an already complete frame is a comparison and no
-    /// write.
+/// The container's description for one stream's frames, field by field, until the bitstream states that field
+/// itself (AE#499). A remux whose VUI says nothing is filled from the container throughout. A bitstream that has
+/// stated a field and then stops (a later sequence header or SPS without a colour description: a spliced stream, a
+/// broadcast programme switch) means unspecified, as the codec standards define it, and stays so: for MPEG-TS the
+/// "container" value is the first SPS's own, read by stream probing, so filling from it would bring back the colour
+/// the stream just left. Not thread-safe: one per decoder, used where its frames are received.
+struct ColourBackfill {
+    let container: ColorDescription
+    private var statedPrimaries = false
+    private var statedTransfer = false
+    private var statedMatrix = false
+    private var statedRange = false
+
+    init(container: ColorDescription) { self.container = container }
+
+    /// Writes the description to act on back onto a freshly decoded frame, so every consumer downstream (the
+    /// finisher, the Dolby Vision still converter, CoreVideo attachments) reads one answer. Returns whether anything
+    /// was filled in.
     @discardableResult
-    static func backfill(frame: UnsafeMutablePointer<AVFrame>, container: ColorDescription) -> Bool {
+    mutating func fill(_ frame: UnsafeMutablePointer<AVFrame>) -> Bool {
         let current = ColorDescription(frame: frame)
-        let resolved = resolved(bitstream: current, container: container)
+        statedPrimaries = statedPrimaries || current.primaries != AVCOL_PRI_UNSPECIFIED
+        statedTransfer = statedTransfer || current.transfer != AVCOL_TRC_UNSPECIFIED
+        statedMatrix = statedMatrix || current.matrix != AVCOL_SPC_UNSPECIFIED
+        statedRange = statedRange || current.range != AVCOL_RANGE_UNSPECIFIED
+        let open = ColorDescription(
+            primaries: statedPrimaries ? AVCOL_PRI_UNSPECIFIED : container.primaries,
+            transfer: statedTransfer ? AVCOL_TRC_UNSPECIFIED : container.transfer,
+            matrix: statedMatrix ? AVCOL_SPC_UNSPECIFIED : container.matrix,
+            range: statedRange ? AVCOL_RANGE_UNSPECIFIED : container.range)
+        let resolved = ColorDescription.resolved(bitstream: current, container: open)
         guard resolved != current else { return false }
         frame.pointee.color_primaries = resolved.primaries
         frame.pointee.color_trc = resolved.transfer

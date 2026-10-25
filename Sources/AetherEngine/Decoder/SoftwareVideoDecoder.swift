@@ -256,9 +256,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// exists. A decoded frame carries the VUI alone, and a remux whose VUI is empty would otherwise
     /// reach the display buffer as an untagged picture, so an HDR10 file decoded in software lost its
     /// PQ / BT.2020 attachments while the same file through the hardware decoder (which reads
-    /// `codecpar`) kept them. Written once in `open`, before the host can feed a packet, and read on
-    /// the decode thread afterwards, the same discipline as the other open-time fields.
-    private var containerColor = ColorDescription.unspecified
+    /// `codecpar`) kept them. Made in `open`, before the host can feed a packet; applied to each frame
+    /// on the decode thread under `lock`, where it learns which fields the bitstream states itself.
+    private var colourFill = ColourBackfill(container: .unspecified)
 
     /// Deinterlaced frames dropped for carrying no PTS (see the drop site in decode()). Guarded by `lock`.
     private var droppedUntimestampedFields = 0
@@ -366,7 +366,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         av_dict_free(&opts)
 
-        containerColor = ColorDescription(codecpar: codecpar)
+        colourFill = ColourBackfill(container: ColorDescription(codecpar: codecpar))
 
         // Release-visible log (no #if DEBUG): needed for TestFlight users and DrHurt #4 black-screen reports.
         EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), threads=\(ctx.pointee.thread_count), \(streamIs10Bit ? "10-bit" : "8-bit")", category: .swPlayback)
@@ -454,7 +454,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
             // AE#499: fill the fields the VUI left open from the container's declaration BEFORE any
             // consumer reads the frame, for the same reason the timestamp repair below runs here.
-            ColorDescription.backfill(frame: f, container: containerColor)
+            colourFill.fill(f)
             decodedFormatKey = DecodedFormatKey(pixelFormat: f.pointee.format, color: ColorDescription(frame: f))
 
             // #407: repair the frame's own timestamp BEFORE anything reads it. A frame that reaches

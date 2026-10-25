@@ -1,4 +1,5 @@
 import Foundation
+import AetherLibavutil
 
 /// Minimal H.264 SPS reader for SSAI direct play: ad creatives arrive mid-stream on a new PID with unparsed codecpar (width/height==0); calling avformat_find_stream_info would block the live pump. Field order per ITU-T H.264 §7.3.2.1.1.
 enum H264SPS {
@@ -22,6 +23,13 @@ enum H264SPS {
         parse(fromNAL: nal)?.signature
     }
 
+    /// The colour the SPS's VUI states (H.264 E.2.1): range from the video signal type, primaries, transfer and
+    /// matrix from its colour description, unspecified for what it leaves out and for reserved values (as FFmpeg's
+    /// VUI reader). For an init built from in-band parameter sets, whose `colr` would otherwise be missing.
+    static func colour(fromNAL nal: [UInt8]) -> ColorDescription? {
+        parse(fromNAL: nal)?.colour
+    }
+
     /// First SPS NAL (incl. 1-byte header) from codecpar extradata, accepting both layouts: Annex-B
     /// (MPEG-TS, start-code delimited) and avcC (MP4/MKV, configurationVersion byte 0x01 then
     /// length-prefixed parameter sets). Returns nil when neither layout yields an SPS.
@@ -39,7 +47,8 @@ enum H264SPS {
         return extradata.withUnsafeBufferPointer { extractSPSandPPS(fromAnnexB: $0)?.sps }
     }
 
-    private static func parse(fromNAL nal: [UInt8]) -> (width: Int, height: Int, frameMbsOnly: Bool, signature: [UInt8])? {
+    private static func parse(fromNAL nal: [UInt8])
+        -> (width: Int, height: Int, frameMbsOnly: Bool, signature: [UInt8], colour: ColorDescription)? {
         guard nal.count > 1, (nal[0] & 0x1f) == 7 else { return nil }
         let rbsp = unescape(Array(nal[1...]))  // strip NAL header + emulation-prevention (00 00 03 -> 00 00)
         var r = BitReader(rbsp)
@@ -111,15 +120,44 @@ enum H264SPS {
         }
 
         guard width > 0, height > 0 else { return nil }
+        let signatureEnd = r.position
+        let colour = vuiColour(&r)
         var core = BitReader(rbsp), signature = [UInt8(profileIdc)], packed = 0, count = 0
         _ = core.u(coreStart)
-        for _ in coreStart..<r.position {
+        for _ in coreStart..<signatureEnd {
             guard let b = core.u(1) else { return nil }
             packed = (packed << 1) | b; count += 1
             if count == 8 { signature.append(UInt8(packed)); packed = 0; count = 0 }
         }
         if count > 0 { signature.append(UInt8(packed << (8 - count))) }
-        return (width, height, frameMbsOnly, signature)
+        return (width, height, frameMbsOnly, signature, colour)
+    }
+
+    /// The VUI's colour fields, read from just after the cropping window (E.1.1); unspecified where absent or
+    /// truncated.
+    private static func vuiColour(_ r: inout BitReader) -> ColorDescription {
+        var colour = ColorDescription.unspecified
+        guard r.flag() == true else { return colour }            // vui_parameters_present_flag
+        if r.flag() == true {                                     // aspect_ratio_info_present_flag
+            guard let idc = r.u(8) else { return colour }
+            if idc == 255 { guard r.u(16) != nil, r.u(16) != nil else { return colour } }   // Extended_SAR
+        }
+        if r.flag() == true { _ = r.flag() }                      // overscan_info_present, overscan_appropriate
+        guard r.flag() == true else { return colour }            // video_signal_type_present_flag
+        guard r.u(3) != nil, let full = r.flag() else { return colour }   // video_format, video_full_range_flag
+        colour.range = full ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG
+        guard r.flag() == true, let p = r.u(8), let t = r.u(8), let m = r.u(8) else { return colour }
+        let primaries = AVColorPrimaries(rawValue: UInt32(p))
+        let transfer = AVColorTransferCharacteristic(rawValue: UInt32(t))
+        let matrix = AVColorSpace(rawValue: UInt32(m))
+        if primaries != AVCOL_PRI_RESERVED0, primaries != AVCOL_PRI_RESERVED, av_color_primaries_name(primaries) != nil {
+            colour.primaries = primaries
+        }
+        if transfer != AVCOL_TRC_RESERVED0, transfer != AVCOL_TRC_RESERVED, av_color_transfer_name(transfer) != nil {
+            colour.transfer = transfer
+        }
+        if matrix != AVCOL_SPC_RESERVED, av_color_space_name(matrix) != nil { colour.matrix = matrix }
+        return colour
     }
 
     /// Scan Annex-B for the first SPS (NAL type 7) and PPS (NAL type 8), returned with their 1-byte NAL header.
