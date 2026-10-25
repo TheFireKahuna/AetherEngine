@@ -32,6 +32,14 @@ final class HLSOriginRelay: @unchecked Sendable {
     private let sealingKey = SymmetricKey(size: .bits256)
     private let nonceKey = SymmetricKey(size: .bits256)
 
+    /// References already sealed, by origin URL: sealing is deterministic, so a live window's
+    /// reload, which names mostly the segments it named a moment ago, costs lookups rather than an
+    /// HMAC, an AES-GCM seal and a base64 encoding per line. Cleared whole at
+    /// `maximumSealedReferences`, which holds a feature-length VOD playlist and its renditions; the
+    /// next reloads refill it.
+    private var sealedReferences: [String: String] = [:]
+    private static let maximumSealedReferences = 8192
+
     /// What a relayed request produced, for the server to write.
     struct Response {
         let status: Int
@@ -250,6 +258,22 @@ final class HLSOriginRelay: @unchecked Sendable {
     /// local URL each time. Equal plaintexts are the only nonce reuse, and they reveal nothing
     /// beyond their equality. base64url without padding, which a query carries as it stands.
     private func seal(_ origin: URL) -> String? {
+        let key = origin.absoluteString
+        stateLock.lock()
+        let cached = sealedReferences[key]
+        stateLock.unlock()
+        if let cached { return cached }
+        guard let sealed = sealUncached(origin) else { return nil }
+        stateLock.lock()
+        if sealedReferences.count >= Self.maximumSealedReferences {
+            sealedReferences.removeAll(keepingCapacity: true)
+        }
+        sealedReferences[key] = sealed
+        stateLock.unlock()
+        return sealed
+    }
+
+    private func sealUncached(_ origin: URL) -> String? {
         let plaintext = Data(origin.absoluteString.utf8)
         let derived = HMAC<SHA256>.authenticationCode(for: plaintext, using: nonceKey)
         guard let nonce = try? AES.GCM.Nonce(data: Data(derived).prefix(12)),
@@ -355,8 +379,11 @@ final class HLSOriginRelay: @unchecked Sendable {
                         contentType: fetched.contentType ?? "application/octet-stream",
                         contentRange: fetched.contentRange))
             }
+            // RFC 3986 5.1.3: after a redirect the base is "the last URI used (i.e., the URI that
+            // resulted in the actual retrieval of the representation)", which is where RFC 8216 4.1's
+            // relative URIs point.
             let rewritten = rewritePlaylist(
-                String(decoding: fetched.body, as: UTF8.self), relativeTo: origin,
+                String(decoding: fetched.body, as: UTF8.self), relativeTo: fetched.respondedBy,
                 authority: Self.rewriteAuthority(host: host), port: port, token: token)
             // A rewritten body has a different length than the range that produced it, so the
             // partial framing cannot survive. Playlists are small and nothing ranges them.
@@ -382,6 +409,9 @@ final class HLSOriginRelay: @unchecked Sendable {
         let body: Data
         let contentType: String?
         let contentRange: String?
+        /// The URL that produced the body, redirects followed: a playlist's relative URIs resolve
+        /// against it (RFC 3986 5.1.3).
+        let respondedBy: URL
     }
 
     private enum Upstream {
@@ -483,7 +513,7 @@ final class HLSOriginRelay: @unchecked Sendable {
                 if isSuccess { return .failed }
                 return .held(
                     Fetched(status: http.statusCode, body: Data(), contentType: contentType,
-                            contentRange: contentRange))
+                            contentRange: contentRange, respondedBy: http.url ?? origin))
             }
             if let error = pump.awaitFailure() {
                 // A playlist read halfway is not a playlist, and the framing of a held answer is its
@@ -493,7 +523,7 @@ final class HLSOriginRelay: @unchecked Sendable {
             }
             return .held(
                 Fetched(status: http.statusCode, body: body, contentType: contentType,
-                        contentRange: contentRange))
+                        contentRange: contentRange, respondedBy: http.url ?? origin))
         }
 
         guard sink.head(http.statusCode, contentType ?? "application/octet-stream", contentRange,
@@ -557,11 +587,18 @@ final class HLSOriginRelay: @unchecked Sendable {
         // Split on \n and drop a trailing \r rather than splitting on any newline, which
         // would read a CRLF playlist as having a blank line between every real one. The
         // output is \n throughout, which AVPlayer reads the same as what came in.
+        var droppedSteering = false
         for rawLine in playlist.components(separatedBy: "\n") {
             let line = rawLine.hasSuffix("\r") ? String(rawLine.dropLast()) : rawLine
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty {
                 output.append(line)
+            } else if trimmed.hasPrefix(Self.contentSteeringTag) {
+                // Content Steering is optional for a client (draft-pantos-hls-rfc8216bis 7), and its
+                // manifest can send the client to other hosts by itself (URI-REPLACEMENT), past every
+                // URI this relay rewrites. Without the tag the client chooses among the playlist's
+                // own variants, every one of them relayed.
+                droppedSteering = true
             } else if trimmed.hasPrefix("#") {
                 output.append(Self.rewriteURIAttribute(in: line, using: rewriteOne))
             } else {
@@ -574,20 +611,34 @@ final class HLSOriginRelay: @unchecked Sendable {
             allowedOrigins.formUnion(discovered)
             stateLock.unlock()
         }
+        if droppedSteering {
+            EngineLog.emit("[HLSOriginRelay] removed EXT-X-CONTENT-STEERING from a relayed playlist; the "
+                           + "client chooses among its relayed variants", category: .hlsServer)
+        }
         return output.joined(separator: "\n")
     }
 
-    /// Rewrites the `URI="..."` value a tag carries, which is how keys, maps, renditions and
-    /// i-frame variants name what they need. Tags without one come back untouched.
-    private static func rewriteURIAttribute(in line: String, using rewrite: (String) -> String)
-        -> String
-    {
-        guard let attr = line.range(of: "URI=\"") else { return line }
-        let afterQuote = attr.upperBound
-        guard let closing = line[afterQuote...].firstIndex(of: "\"") else { return line }
-        let value = String(line[afterQuote..<closing])
-        guard !value.isEmpty else { return line }
-        return line.replacingCharacters(in: afterQuote..<closing, with: rewrite(value))
+    private static let contentSteeringTag = "#EXT-X-CONTENT-STEERING:"
+
+    /// Rewrites the value of the tag's `URI` attribute, which is how keys, maps, renditions, i-frame
+    /// variants, parts and preload hints name what they need. Matched as a whole attribute name
+    /// (RFC 8216 4.2: names are `[A-Z0-9-]`, after the tag's `:` or a `,`), so an attribute that
+    /// merely ends in `URI`, such as `SERVER-URI`, is not taken for it. Tags without one come back
+    /// untouched.
+    static func rewriteURIAttribute(in line: String, using rewrite: (String) -> String) -> String {
+        var searchFrom = line.startIndex
+        while let attr = line.range(of: "URI=\"", range: searchFrom..<line.endIndex) {
+            searchFrom = attr.upperBound
+            guard attr.lowerBound > line.startIndex else { continue }
+            let before = line[line.index(before: attr.lowerBound)]
+            guard before == ":" || before == "," else { continue }
+            let afterQuote = attr.upperBound
+            guard let closing = line[afterQuote...].firstIndex(of: "\"") else { return line }
+            let value = String(line[afterQuote..<closing])
+            guard !value.isEmpty else { return line }
+            return line.replacingCharacters(in: afterQuote..<closing, with: rewrite(value))
+        }
+        return line
     }
 }
 
