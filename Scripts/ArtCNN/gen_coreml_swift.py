@@ -1,26 +1,31 @@
-import base64, sys, hashlib, json
-out = sys.argv[1]; root = sys.argv[2]
+# Embeds the multifunction packages build_tiles.py made (<root>/tiles_C4F16.mlpackage, tiles_C4F32.mlpackage) as
+# ArtCNNCoreMLModels.swift. Usage: gen_coreml_swift.py out.swift root heights widths
+import base64, sys
+out, root = sys.argv[1], sys.argv[2]
+heights, widths = sys.argv[3], sys.argv[4]
 lines = ['import Foundation', '',
 '// Generated from ArtCNN (https://github.com/Artoriuz/ArtCNN, commit 0837e5326e710f49e2ab0a8d995da0708047442e), MIT',
-'// licensed (see ArtCNNLicense.swift): the networks of ArtCNNWeights as Core ML programs (coremltools 8.3, MIL opset',
-'// iOS16, Float16), built by the MIL builder from the same parameters, over a fixed tile.',
+'// licensed (see ArtCNNLicense.swift): the networks of ArtCNNWeights as Core ML multifunction programs (coremltools',
+'// 8.3, MIL opset iOS18, Float16), built by the MIL builder from the same parameters (Scripts/ArtCNN).',
 '',
-'/// ArtCNN C4F16 and C4F32 as Core ML `.mlpackage`s for ``SubtitleUpscaleNeuralEngine``: input `x`, Float16',
-'/// `(2, 1, 142, 718)`, two tile windows; output `y`, Float16 `(2, 1, 284, 1436)`, already clamped to [0, 1]. One',
-'/// fixed shape: the Neural Engine runs each shape as its own program and switching between them costs milliseconds.',
-'/// Each package is its manifest, model specification and weight blob, base64.',
+'/// ArtCNN C4F16 and C4F32 as Core ML `.mlpackage`s for ``SubtitleUpscaleNeuralEngine``, one function per window',
+'/// shape: function `h<H>w<W>` takes `x`, Float16 `(1, 1, H, W)`, and gives `y`, Float16 `(1, 4, H, W)`, the last',
+'/// convolution\'s four sub-pixel channels (channel `2 * row + column` of each 2x block), unclamped. Fixed shapes',
+'/// because Core ML runs a flexible shape on the Neural Engine only at its default size, or re-optimises it for',
+'/// milliseconds at each change; the functions of one package share its weights and switch for free. Each package is',
+'/// its manifest, model specification and weight blob, base64.',
 'enum ArtCNNCoreMLModels {',
-'    static let tileHeight = 142',
-'    static let tileWidth = 718',
-'    static let batch = 2',
+'    /// Window heights and widths, each a core plus the network\'s 7-pixel reach on both sides; the widths keep',
+'    /// every row a multiple of 64 bytes.',
+'    static let windowHeights = [%s]' % heights.replace(',', ', '),
+'    static let windowWidths = [%s]' % widths.replace(',', ', '),
 '']
 for m in ('C4F16', 'C4F32'):
-    pkg = '%s/tile_%s.mlpackage' % (root, m)
-    files = [('Manifest.json', 'Manifest.json'), ('Data/com.apple.CoreML/model.mlmodel', 'model'), ('Data/com.apple.CoreML/weights/weight.bin', 'weights')]
+    pkg = '%s/tiles_%s.mlpackage' % (root, m)
+    files = ['Manifest.json', 'Data/com.apple.CoreML/model.mlmodel', 'Data/com.apple.CoreML/weights/weight.bin']
     lines.append('    static let %s: [(path: String, base64: String)] = [' % m.lower())
-    for path, tag in files:
-        b = open(pkg + '/' + path, 'rb').read()
-        b64 = base64.b64encode(b).decode()
+    for path in files:
+        b64 = base64.b64encode(open(pkg + '/' + path, 'rb').read()).decode()
         lines.append('        ("%s", """' % path)
         for i in range(0, len(b64), 120): lines.append(b64[i:i+120])
         lines.append('"""),')

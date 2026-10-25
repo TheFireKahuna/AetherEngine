@@ -332,6 +332,30 @@ struct SubtitleUpscaleTests {
         #expect(try Self.run(empty, upscaler).pixels.allSatisfy { $0 == .zero })
     }
 
+    @Test("a picture the Neural Engine covers with mixed window shapes matches the Float32 reference")
+    func neuralEngineMixedGrid() throws {
+        let upscaler = try Self.neuralEngine(.c4f16)
+        // Text, and blocks in the corners, so the kept area is the whole picture: wider than the widest core and taller
+        // than the tallest, its cover mixes core sizes on both axes and reaches every edge.
+        let w = 2120, h = 150
+        var picture = SubtitleUpscaleFixtures.glyphs(width: w, height: h, lines: ["Mixed cores across a wide picture", "and two lines of text"],
+                                                     fontSize: 56)
+        for (x0, y0) in [(0, 0), (w - 12, 0), (0, h - 9), (w - 12, h - 9)] {
+            for y in y0..<(y0 + 9) { for x in x0..<(x0 + 12) { picture.rgba[(y * w + x) * 4 ..< (y * w + x) * 4 + 4] = [255, 255, 255, 255] } }
+        }
+        let bounds = picture.rgba.withUnsafeBytes {
+            SubtitleUpscaler.contentBounds($0.baseAddress!, width: picture.width, height: picture.height, bytesPerRow: picture.width * 4, alphaOffset: 3)
+        }!
+        let kept = bounds.integral.insetBy(dx: -5, dy: -5).intersection(CGRect(x: 0, y: 0, width: w, height: h))
+        let plan = SubtitleUpscaleTilePlan.plan(kept: (Int(kept.minX), Int(kept.minY), Int(kept.width), Int(kept.height)),
+                                                nanosecondsPerPixel: 2 * SubtitleUpscaleTilePlan.nanosecondsPerPixel(.c4f16),
+                                                nanosecondsPerCall: 2 * SubtitleUpscaleTilePlan.nanosecondsPerCall)
+        #expect(Set(plan.rows).count > 1 && Set(plan.columns).count > 1, "plan \(plan.rows) x \(plan.columns)")
+        let e = Self.error(try Self.run(picture, upscaler, bounds: bounds), Self.reference(picture, configuration: .c4f16))
+        print("[upscale] Neural Engine C4F16 \(w)x\(h) (\(plan.rows) x \(plan.columns)) vs fp32: \(e)")
+        #expect(e.maxAlpha < 0.005 && e.maxColour < 0.005, "\(e)")
+    }
+
     @Test("the Neural Engine backend runs only synchronously; its conveniences work")
     func neuralEngineConveniences() throws {
         let upscaler = try Self.neuralEngine(.default)
