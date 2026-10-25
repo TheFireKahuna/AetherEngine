@@ -1,5 +1,5 @@
 {
-  "originHash" : "a8f5cc1c315b3d7fde898964ffeb02c331f73240be0517fae9deb85bca66fe55",
+  "originHash" : "02a100086bca7e24d63ed902be8242c57deff599b4bca6230e72088ba57303fb",
   "pins" : [
     {
       "identity" : "ffmpegbuild",
@@ -30,11 +30,11 @@
     },
     {
       "identity" : "libtruehd",
-      "kind" : "localSourceControl",
+      "kind" : "remoteSourceControl",
       "location" : "https://github.com/TheFireKahuna/LibTrueHD",
       "state" : {
-        "revision" : "261d7d374917cecb39f889f81fa7d7753f0c0839",
-        "version" : "4.0.0"
+        "revision" : "c946b596944f03036c8caed2b7cb7726a47f32fc",
+        "version" : "4.0.0-fire.1"
       }
     },
     {

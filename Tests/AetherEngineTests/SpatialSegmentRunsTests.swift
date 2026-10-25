@@ -16,13 +16,11 @@ struct SpatialSegmentRunsTests {
     /// round the room.
     final class PositionalDecoder: ObjectAudioDecoding {
         let span = AudioStageSpan.instant
-        let withBed: Bool
         private var inputFrames: Int64 = 0
         private var blocks: [(offset: Int64, frames: Int, stamp: (Int64, Int64)?)] = []
         private var stamp: (Int64, Int64)?
         private let planes: [UnsafeMutablePointer<Float>] = (0..<3).map { _ in .allocate(capacity: 1 << 16) }
 
-        init(withBed: Bool) { self.withBed = withBed }
         deinit { planes.forEach { $0.deallocate() } }
 
         func push(_ bytes: UnsafeRawBufferPointer, pts: Int64) throws {
@@ -49,8 +47,6 @@ struct SpatialSegmentRunsTests {
                 planes: planes.map { UnsafePointer($0) },
                 updates: [.init(frameOffset: 0, rampFrames: b.frames,
                                 states: [.init(), .init(), .init(position: SIMD3(x, 0.5, 1))])],
-                bed: withBed ? ObjectAudioBed(roles: [.bed(.left), .lfe],
-                                              planes: [UnsafePointer(planes[0]), UnsafePointer(planes[1])]) : nil,
                 sourcePts: b.stamp?.0, sourcePtsInputFrame: b.stamp?.1 ?? 0,
                 clockFrame: nil, gridFrames: 40)
         }
@@ -67,10 +63,10 @@ struct SpatialSegmentRunsTests {
     /// 20 ms packets from `fromMs` to `toMs`, through segment runs whose segments are two seconds
     /// long from `base`; every packet handed on, by segment.
     @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
-    private func produce(withBed: Bool, fromMs: Int64, toMs: Int64, base: Int) throws -> (segments: [Int: [Out]], preRoll: Double) {
+    private func produce(fromMs: Int64, toMs: Int64, base: Int) throws -> (segments: [Int: [Out]], preRoll: Double) {
         let make = {
             try SpatialAudioBridge(srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
-                                   decoder: PositionalDecoder(withBed: withBed)) as any AudioTranscodingBridge
+                                   decoder: PositionalDecoder()) as any AudioTranscodingBridge
         }
         let par = try #require(avcodec_parameters_alloc())
         var p: UnsafeMutablePointer<AVCodecParameters>? = par
@@ -88,7 +84,7 @@ struct SpatialSegmentRunsTests {
         var segments: [Int: [Out]] = [:]
         func take(_ packets: [UnsafeMutablePointer<AVPacket>]) {
             for fp in packets {
-                segments[plan.segment(ofOutputPts: fp.pointee.pts), default: []]
+                segments[plan.segment(ofOutputPts: fp.pointee.pts, duration: fp.pointee.duration), default: []]
                     .append(Out(pts: fp.pointee.pts, bytes: Array(UnsafeBufferPointer(start: fp.pointee.data, count: Int(fp.pointee.size))),
                                 sync: fp.pointee.flags & AV_PKT_FLAG_KEY != 0))
                 var q: UnsafeMutablePointer<AVPacket>? = fp
@@ -111,10 +107,10 @@ struct SpatialSegmentRunsTests {
         return (segments, runs.preRollSeconds)
     }
 
-    @Test("a seek makes the APAC segments continuous playback made", arguments: [false, true])
-    func seekMatchesContinuous(withBed: Bool) throws {
+    @Test("a seek makes the APAC segments continuous playback made")
+    func seekMatchesContinuous() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
-        let continuous = try produce(withBed: withBed, fromMs: 0, toMs: 12_000, base: 0)
+        let continuous = try produce(fromMs: 0, toMs: 12_000, base: 0)
         let all = continuous.segments.keys.sorted().flatMap { continuous.segments[$0]! }
         try #require(all.count > 400)
         for (a, b) in zip(all, all.dropFirst()) { #expect(b.pts - a.pts == 1024, "\(a.pts) then \(b.pts)") }
@@ -122,7 +118,7 @@ struct SpatialSegmentRunsTests {
         for (segment, packets) in continuous.segments { #expect(packets.first?.sync == true, "segment \(segment)") }
         for k in [2, 4] {
             let fromMs = (Int64(k * 2_000) - Int64((continuous.preRoll * 1000).rounded(.up))) / 20 * 20
-            let seek = try produce(withBed: withBed, fromMs: fromMs, toMs: 12_000, base: k)
+            let seek = try produce(fromMs: fromMs, toMs: 12_000, base: k)
             for segment in k...(k + 1) {
                 let want = continuous.segments[segment] ?? []
                 let got = seek.segments[segment] ?? []

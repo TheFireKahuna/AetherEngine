@@ -594,9 +594,7 @@ public struct LoadOptions: Sendable, Equatable {
     /// (`AetherEngine.OptionalComponent`).
     public var objectAudioRendering: ObjectAudioRendering
 
-    /// Dialogue enhancement for TrueHD Atmos where the engine renders the objects itself (the exact
-    /// decode or object APAC, personal builds; the bed split plays Dolby's own channel mix and has no
-    /// objects to adjust), in dB: elements the stream marks as dialogue are raised or lowered by it,
+    /// Dialogue enhancement for TrueHD Atmos objects, in dB: elements the stream marks as dialogue are raised or lowered by it,
     /// as AC-4 specifies for object audio. A boost is limited to the most the stream allows, and
     /// TrueHD streams state none, so only a cut (a negative value) takes effect, and only on a stream
     /// that marks its dialogue, which no film surveyed does. Default 0.

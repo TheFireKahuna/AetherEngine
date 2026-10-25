@@ -50,7 +50,7 @@ struct TrueHDObjectMetadataMappingTests {
         #expect(TrueHDObjectAudioDecoder.role(forSpeaker: TRUEHD_ATMOS_SPEAKER_UNKNOWN) == .object)
     }
 
-    @Test("the bed split's guide is the element as TS 103 448 prepares it, in every build")
+    @Test("an element is prepared for panning: elevation switch, snap and zones")
     func guidePreparation() {
         // Elevation off: kept off the heights; snapped onto the nearest 22.2 target at ear level.
         let flags = TRUEHD_ATMOS_ELEMENT_ACTIVE | TRUEHD_ATMOS_ELEMENT_SNAP
@@ -64,7 +64,6 @@ struct TrueHDObjectMetadataMappingTests {
         #expect(TrueHDObjectAudioDecoder.state(for: element(position: (0.5, 0.5, -0.6))).position.z == 0)
     }
 
-    #if TrueHDReferenceRender
     @Test("an active elevated object keeps its position, gain and its size along each axis")
     func plainObject() {
         let state = TrueHDObjectAudioDecoder.state(for: element(size: (0.1, 0.3, 0.2)))
@@ -160,6 +159,15 @@ struct TrueHDObjectMetadataMappingTests {
         #expect(abs(db(TrueHDObjectAudioDecoder.dialogueEnhancement(gain: -6)) + 6) < 1e-5, "a cut always applies")
         #expect(abs(db(TrueHDObjectAudioDecoder.dialogueEnhancement(gain: 6, maximum: 9)) - 6) < 1e-5)
         #expect(abs(db(TrueHDObjectAudioDecoder.dialogueEnhancement(gain: 12, maximum: 9)) - 9) < 1e-5)
+    }
+
+    @Test("dialogue normalisation brings the stated dialogue level to -31 LKFS, and leaves a stream that states none")
+    func dialogueNormalisationGain() {
+        let db = { (level: Int32) in 20 * log10(TrueHDObjectAudioDecoder.normalisationGain(dialogueLevel: level)) }
+        #expect(abs(db(-27) + 4) < 1e-4)
+        #expect(abs(db(-24) + 7) < 1e-4)
+        #expect(db(-31) == 0)
+        #expect(db(0) == 0, "no dialogue level stated")
     }
 
     @Test("only an element marked as dialogue takes the dialogue gain")
@@ -264,7 +272,6 @@ struct TrueHDObjectMetadataMappingTests {
         #expect(abs(gains.reduce(0) { $0 + $1 * $1 } - 1) < 1e-5)
     }
 
-    #endif
 
     @Test("the decoder opens, takes input and asks for more")
     func decoderLifecycle() throws {

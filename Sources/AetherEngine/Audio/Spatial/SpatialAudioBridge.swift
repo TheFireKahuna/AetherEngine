@@ -60,9 +60,6 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// (`APACEncoder.segmentRunLeadFrames`).
     var span: AudioStageSpan {
         var stages = [decoder.span]
-#if TrueHDObjectAudio
-        if decoder.playsBedOnly { stages.append(BedSplitter.span) }
-#endif
 #if APACObjectOutput
         if objectOutput { return .series(stages) }
 #endif
@@ -105,24 +102,9 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// `encodeChunkFrames` at a time (see `APACEncodePipeline`).
     private var output: APACEncodePipeline.PlaneBuffer
     private var pendingFrames = 0
-#if TrueHDObjectAudio
-    /// Built from the first block that carries a bed: every output comes from that bed instead of
-    /// the renderer's mix (see `BedSplitter`). Its latency is the frames it holds, `backlog`.
-    private var splitter: BedSplitter?
-    /// The splitter starts fresh at the next block, its hops put on the stream's grid there
-    /// (`BedSplitter.reset(phase:)`): after it is built, a restart, or a drain.
-    private var splitterStartsFresh = true
-    private var gainSnapshot = ObjectAudioGainSnapshot()
-#endif
     /// Frames taken from the decoder that have not reached the encoder yet, outside `output`: the
-    /// splitter's and the limiter's look-ahead.
-    private var heldBack: Int {
-#if TrueHDObjectAudio
-        (splitter?.backlog ?? 0) + limiter.backlog
-#else
-        limiter.backlog
-#endif
-    }
+    /// limiter's look-ahead.
+    private var heldBack: Int { limiter.backlog }
     private static let encodeChunkFrames = 2048
 #if APACObjectOutput
     /// Elements go out as APAC objects (`APACObjectEncoder`): no renderer mix, no split, no limiter
@@ -427,7 +409,6 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         var stamped: [APACEncodePipeline.StampedPacket] = []
         // Audio the decoder held back for metadata that never came plays as it is.
         renderHeldBlocks(into: &stamped)
-        drainSplitter()
         encodePending()
         drainLimiter()
         restartLevels()
@@ -448,10 +429,6 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         decoder.reset()
         renderer?.reset()
         rendererRunPending = true
-#if TrueHDObjectAudio
-        splitter?.reset()
-        splitterStartsFresh = true
-#endif
         pipeline.reset()
         limiter.reset()
         restartLevels()
@@ -589,63 +566,10 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         }
 #endif
         output.ensureCapacity(pendingFrames + block.frameCount, keeping: pendingFrames)
-#if TrueHDObjectAudio
-        if let bed = block.bed {
-            if splitter?.bedRoles != bed.roles {
-                drainSplitter()
-                output.ensureCapacity(pendingFrames + block.frameCount, keeping: pendingFrames)
-                if announces || splitter != nil {
-                    EngineLog.emit(
-                        "[SpatialAudioBridge] every output from the stream's \(bed.roles.count)-channel presentation, "
-                        + "split by the objects' energy (latency \(BedSplitter.latency) frames)",
-                        category: .session)
-                }
-                splitter = BedSplitter(layout: layout, bedRoles: bed.roles)
-                splitterStartsFresh = true
-            }
-            if splitterStartsFresh, let grid {
-                splitterStartsFresh = false
-                splitter!.reset(phase: Int((position - grid.origin) % Int64(BedSplitter.hop)))
-            }
-            // Up to each hop boundary in turn, so the splitter reads the gains as they are on the
-            // hop's last frame, mid-ramp included, not as they are at the end of the block.
-            var start = 0
-            while start < block.frameCount {
-                let count = min(block.frameCount - start, splitter!.framesUntilHop)
-                let last = start + count == block.frameCount
-                let updates = block.updates.filter { $0.frameOffset >= start && ($0.frameOffset < start + count || last) }
-                    .map { u -> ObjectAudioMetadataUpdate in var u = u; u.frameOffset -= start; return u }
-                renderer!.advance(frameCount: count, updates: updates)
-                renderer!.snapshot(into: &gainSnapshot)
-                splitter!.setGains(gainSnapshot)
-                pendingFrames += splitter!.process(
-                    elements: block.planes.map { $0 + start }, bed: bed.planes.map { $0 + start }, frameCount: count,
-                    output: output.planes.map { $0 + pendingFrames })
-                start += count
-            }
-        } else if let splitter {
-            // A block without its bed in a stream that has one: silence on the bed's timeline.
-            renderer!.advance(frameCount: block.frameCount, updates: block.updates)
-            pendingFrames += splitter.process(
-                elements: nil, bed: nil, frameCount: block.frameCount,
-                output: output.planes.map { $0 + pendingFrames })
-        } else if decoder.playsBedOnly {
-            // No bed yet: silence, never a mix of the object signals.
-            renderer!.advance(frameCount: block.frameCount, updates: block.updates)
-            for plane in output.planes { (plane + pendingFrames).update(repeating: 0, count: block.frameCount) }
-            pendingFrames += block.frameCount
-        } else {
-            renderer!.render(
-                inputs: block.planes, frameCount: block.frameCount, updates: block.updates,
-                outputs: output.planes.map { $0 + pendingFrames })
-            pendingFrames += block.frameCount
-        }
-#else
         renderer!.render(
             inputs: block.planes, frameCount: block.frameCount, updates: block.updates,
             outputs: output.planes.map { $0 + pendingFrames })
         pendingFrames += block.frameCount
-#endif
         noteRendererSettling(blockAt: position, frames: block.frameCount)
         stats.samplesEnqueued += Int64(block.frameCount)
         stats.packetsFedSinceLastEnqueue = 0
@@ -744,7 +668,6 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             encodeSilence(frames: Int(gap))
             return
         }
-        drainSplitter()
         encodePending()
         drainLimiter()
         pipeline.restart()
@@ -770,7 +693,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     }
 
     /// Start a segment's run with the encoder at `start` whatever the first block is: audio rendered
-    /// before it only settles the renderer, splitter and limiter and comes off; a stream that begins
+    /// before it only settles the renderer and limiter and comes off; a stream that begins
     /// after it is preceded by silence.
     private func anchorRun(at start: Int64, firstBlockAt position: Int64) {
         encoderStartFrame = start
@@ -790,31 +713,11 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             let n = min(remaining, max(Self.encodeChunkFrames - pendingFrames, 0))
             if n == 0 { encodePending(); continue }
             output.ensureCapacity(pendingFrames + n, keeping: pendingFrames)
-#if TrueHDObjectAudio
-            if let splitter {
-                pendingFrames += splitter.process(
-                    elements: nil, bed: nil, frameCount: n, output: output.planes.map { $0 + pendingFrames })
-                remaining -= n
-                if pendingFrames >= Self.encodeChunkFrames { encodePending() }
-                continue
-            }
-#endif
             for plane in output.planes { (plane + pendingFrames).update(repeating: 0, count: n) }
             pendingFrames += n
             remaining -= n
             if pendingFrames >= Self.encodeChunkFrames { encodePending() }
         }
-    }
-
-    /// The frames the splitter still holds, into `output`: before the encoder restarts somewhere else
-    /// or the input ends, so the audio up to there plays in full.
-    private func drainSplitter() {
-#if TrueHDObjectAudio
-        splitterStartsFresh = true
-        guard let splitter, splitter.backlog > 0 else { return }
-        output.ensureCapacity(pendingFrames + splitter.backlog, keeping: pendingFrames)
-        pendingFrames += splitter.drain(output: output.planes.map { $0 + pendingFrames })
-#endif
     }
 
     /// Hand the rendered frames to the encoder's queue. Its packets come back through
