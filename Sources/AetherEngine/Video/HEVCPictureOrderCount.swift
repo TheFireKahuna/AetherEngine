@@ -66,27 +66,8 @@ struct HEVCPictureOrderCount {
     }
 
     private mutating func parseSPS(_ nal: UnsafePointer<UInt8>, _ len: Int) {
-        var r = Self.reader(nal, len, limit: 256)
-        guard r.u(4) != nil, let subLayers = r.u(3), r.u(1) != nil,
-              r.skip(88), r.skip(8) else { return }             // general profile_tier_level, level_idc
-        var present: [(profile: Bool, level: Bool)] = []
-        for _ in 0..<subLayers {
-            guard let p = r.flag(), let l = r.flag() else { return }
-            present.append((p, l))
-        }
-        if subLayers > 0 { guard r.skip(2 * (8 - subLayers)) else { return } }
-        for p in present {
-            guard r.skip(p.profile ? 88 : 0), r.skip(p.level ? 8 : 0) else { return }
-        }
-        // sps_seq_parameter_set_id is at most 15 and pps_pic_parameter_set_id at most 63 (7.4.3.2,
-        // 7.4.3.3): a stream naming more would otherwise grow these maps by one entry per NAL.
-        guard let id = r.ue(), id <= 15, let chroma = r.ue() else { return }
-        var separate = false
-        if chroma == 3 { guard let f = r.flag() else { return }; separate = f }
-        guard r.ue() != nil, r.ue() != nil, let window = r.flag() else { return }   // width, height
-        if window { for _ in 0..<4 { guard r.ue() != nil else { return } } }
-        guard r.ue() != nil, r.ue() != nil, let lsb = r.ue(), lsb <= 12 else { return }   // bit depths
-        sps[id] = SPS(pocLsbBits: lsb + 4, separateColourPlane: separate)
+        guard let parsed = HEVCSPS(nal: nal, length: len) else { return }
+        sps[parsed.id] = SPS(pocLsbBits: parsed.pocLsbBits, separateColourPlane: parsed.separateColourPlane)
     }
 
     private mutating func parsePPS(_ nal: UnsafePointer<UInt8>, _ len: Int) {
