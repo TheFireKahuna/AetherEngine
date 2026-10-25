@@ -26,20 +26,11 @@ struct NativeSubtitleReapplyTests {
 /// #93 PiP skips: AVKit-side seeks (PiP +-15s buttons) never pass through the engine's seek API,
 /// so the native subtitle readers kept reading FORWARD from the old region while the playhead
 /// jumped far back; AVKit's selection burst then fetched empty .vtt windows for the new region
-/// and cached them forever (#32). A settled far jump outside reader coverage with an active
+/// and cached them forever (#32). A settled landing outside reader coverage with an active
 /// rendition re-anchors the readers and replays the selection (whose deselect/reselect busts
 /// the cached empties).
 @MainActor
 struct NativeSubtitleReanchorTests {
-
-    @Test("a jump qualifies only at the threshold distance, in both directions")
-    func jumpDecision() {
-        #expect(!AetherEngine.isSubtitleReanchorJump(from: 100, to: 130))
-        #expect(!AetherEngine.isSubtitleReanchorJump(from: 100, to: 159.9))
-        #expect(AetherEngine.isSubtitleReanchorJump(from: 100, to: 160))
-        #expect(AetherEngine.isSubtitleReanchorJump(from: 1693, to: 1333))
-        #expect(AetherEngine.isSubtitleReanchorJump(from: 100, to: 900))
-    }
 
     @Test("coverage spans reader anchor to readMax plus catch-up slack; no readers = uncovered")
     func coverageDecision() {

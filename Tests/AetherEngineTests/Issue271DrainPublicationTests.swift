@@ -78,8 +78,8 @@ struct Issue271DrainPublicationTests {
     func slowTickIsNotASeek() {
         let cursor = SubtitleDrainCursor(lastDecodedPts: 150, lastPlayhead: 100)
         let plan = SubtitleOverlayDrainer.drainPlan(cursor: cursor, playhead: 104,
-                                                    lead: 60, backscan: 15, jumpThreshold: 2.5,
-                                                    elapsedSinceLastPlan: 4.0)
+                                                    lead: 60, backscan: 15, repositioning: .inferred(jumpThreshold: 2.5,
+                                                    elapsedSinceLastPlan: 4.0))
         guard case .decode = plan else {
             Issue.record("expected decode, got \(plan)"); return
         }
@@ -89,8 +89,8 @@ struct Issue271DrainPublicationTests {
     func realSeekDuringSlowTickStillResets() {
         let cursor = SubtitleDrainCursor(lastDecodedPts: 150, lastPlayhead: 100)
         let plan = SubtitleOverlayDrainer.drainPlan(cursor: cursor, playhead: 400,
-                                                    lead: 60, backscan: 15, jumpThreshold: 2.5,
-                                                    elapsedSinceLastPlan: 4.0)
+                                                    lead: 60, backscan: 15, repositioning: .inferred(jumpThreshold: 2.5,
+                                                    elapsedSinceLastPlan: 4.0))
         guard case .resetAndDecode(let from, _) = plan else {
             Issue.record("expected resetAndDecode, got \(plan)"); return
         }
@@ -103,8 +103,8 @@ struct Issue271DrainPublicationTests {
     func backwardJumpIsNeverForgiven() {
         let cursor = SubtitleDrainCursor(lastDecodedPts: 150, lastPlayhead: 100)
         let plan = SubtitleOverlayDrainer.drainPlan(cursor: cursor, playhead: 96,
-                                                    lead: 60, backscan: 15, jumpThreshold: 2.5,
-                                                    elapsedSinceLastPlan: 30)
+                                                    lead: 60, backscan: 15, repositioning: .inferred(jumpThreshold: 2.5,
+                                                    elapsedSinceLastPlan: 30))
         guard case .resetAndDecode(let from, _) = plan else {
             Issue.record("expected resetAndDecode, got \(plan)"); return
         }
@@ -115,7 +115,7 @@ struct Issue271DrainPublicationTests {
     func fastTickKeepsThresholdOnly() {
         let cursor = SubtitleDrainCursor(lastDecodedPts: 150, lastPlayhead: 100)
         let plan = SubtitleOverlayDrainer.drainPlan(cursor: cursor, playhead: 104,
-                                                    lead: 60, backscan: 15, jumpThreshold: 2.5)
+                                                    lead: 60, backscan: 15, repositioning: .inferred(jumpThreshold: 2.5))
         guard case .resetAndDecode = plan else {
             Issue.record("expected resetAndDecode, got \(plan)"); return
         }

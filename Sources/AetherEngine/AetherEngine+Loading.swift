@@ -1477,6 +1477,9 @@ extension AetherEngine {
             self.nativeVideoSession?.armLiveItemAxisStatement()
             self.liveItemAxisArmedGeneration = attaching.itemGeneration
         }
+        host.onDidAttachItem = { [weak self] item in
+            self?.armNativeItemObservers(on: item)
+        }
         applyDesiredVolume(to: host)
         applyDesiredRate(to: host)
         // Publish before wiring mirrors so subscribers see the AVPlayer before the first time update. Only emit on change: re-publishing the same instance retriggers the AVKit re-registration this reuse path avoids.
@@ -1494,13 +1497,7 @@ extension AetherEngine {
         host.$renderedTime
             .sink { [weak self] value in
                 guard let self = self else { return }
-                let shift = self.presentationAxis.shiftSeconds(atItemSeconds: value)
-                    ?? self.playlistShiftSeconds
-                // #93 PiP skips: AVKit-side seeks never reach the engine seek API; a far rendered-
-                // time jump is the engine-visible signal to re-anchor the subtitle readers.
-                if Self.isSubtitleReanchorJump(from: self.renderedPositionMirror.get(), to: value) {
-                    self.scheduleNativeSubtitleReanchor()
-                }
+                let shift = self.nativeItemShiftSeconds(atItemSeconds: value)
                 // #93 retest: retire the pending recovery seek target when it lands (rendered
                 // reaches its neighbourhood) or goes stale (organic progress far from it, i.e.
                 // AVPlayer abandoned the seek and playback runs elsewhere).
@@ -1553,7 +1550,7 @@ extension AetherEngine {
                 // would break both the documented `sourceTime == currentTime in steady play` relation
                 // and host-rendered sidecar cues (whose times are relative to the archive start, i.e.
                 // the item axis). Every other source keeps true source PTS for cue alignment.
-                self.clock.sourceTime = self.displayAxisIsItemAxis ? value : value + shift
+                self.clock.sourceTime = self.nativeSourceSeconds(atItemSeconds: value)
                 // bufferedPosition = the end of the contiguous safe range (origin -> disk), expressed on
                 // the display axis as the playhead plus contiguously available seconds ahead of it: the
                 // segments AVPlayer already fetched, plus the disk SegmentCache band above them, which is
@@ -1943,7 +1940,6 @@ extension AetherEngine {
                       audioIsAtmosStreamCopy: nativeVideoSession?.audioIsAtmosStreamCopy == true,
                       nativeVideoFrameDiagnostics: loadedOptions.nativeVideoFrameDiagnostics,
                       nativeVideoFrameRecovery: loadedOptions.nativeVideoFrameRecovery))
-        armNativeSubtitleSelection()
         // Sodalite#175: from the session's own pick, since a track-switch reload has no active index yet.
         let sessionAudioPick = nativeVideoSession.map(\.activeAudioSourceStreamIndex).flatMap { $0 >= 0 ? Int($0) : nil }
         let audioPick = sessionAudioPick ?? audioSourceStreamIndex.flatMap { Int(exactly: $0) } ?? activeAudioTrackIndex

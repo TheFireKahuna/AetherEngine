@@ -31,6 +31,28 @@ struct SubtitleDrainCursor: Sendable {
     var harvestGapAt: Double? = nil
     var harvestGapSequence: UInt64 = 0
     var harvestGapTicksLeft: Int = 0
+    /// The player's landing count when this cursor was written (`SubtitleRepositioning.signalled`): a
+    /// later count is a landing the cursor has not followed yet.
+    var landingGeneration: UInt64 = 0
+}
+
+/// The latest landing the native item stated, on the source axis, and the presented frame's time when it
+/// came: the drain stands at the landing until `sourceTime` moves off that value, i.e. until the picture
+/// reports where it really is.
+struct SubtitleLanding: Equatable, Sendable {
+    let seconds: Double
+    let heldWhileSourceTimeIs: Double
+}
+
+/// How a drain tick learns that the playhead was repositioned.
+enum SubtitleRepositioning: Equatable, Sendable {
+    /// The player states every landing: on the native route the item posts
+    /// `AVPlayerItemTimeJumpedNotification` for each seek, AVKit's own scrubbing and PiP skips included,
+    /// and for each step of a reverse scan. `generation` counts them.
+    case signalled(generation: UInt64)
+    /// No player states one (the software route), so a step the playhead cannot have taken by playing is
+    /// read as one. `elapsedSinceLastPlan` is #271's allowance; see `SubtitleOverlayDrainer.drainPlan`.
+    case inferred(jumpThreshold: Double, elapsedSinceLastPlan: Double = 0)
 }
 
 enum SubtitleDrainPlan: Equatable, Sendable {
@@ -48,24 +70,33 @@ enum SubtitleOverlayDrainer {
     /// the scan never skips late-arriving packets.
     static let minimumScanWindowSeconds: Double = 1.0
 
-    /// #271: `elapsedSinceLastPlan` is the wall time between this plan and the previous one. Steady
-    /// playback advances the playhead by roughly that much, so a tick that itself took longer than
-    /// `jumpThreshold` would otherwise read its own duration as a seek and reset onto a fresh,
-    /// disjoint window: a positive feedback loop where one slow tick guarantees the next one is
-    /// slower. Only FORWARD drift is forgiven; playback never moves the playhead backwards, so a
-    /// backward delta is a seek at any tick duration. Rate is not modelled: above 1x a pathologically
-    /// slow tick can still trip the threshold, which costs a redundant window decode, not correctness.
+    /// A signalled landing resets the cursor exactly once, whatever the step.
+    ///
+    /// An inferred one is a step past `jumpThreshold`. #271: `elapsedSinceLastPlan` is the wall time
+    /// between this plan and the previous one. Steady playback advances the playhead by roughly that
+    /// much, so a tick that itself took longer than `jumpThreshold` would otherwise read its own
+    /// duration as a seek and reset onto a fresh, disjoint window: a positive feedback loop where one
+    /// slow tick guarantees the next one is slower. Only FORWARD drift is forgiven; playback never moves
+    /// the playhead backwards, so a backward delta is a seek at any tick duration. Rate is not modelled:
+    /// above 1x a pathologically slow tick can still trip the threshold, which costs a redundant window
+    /// decode, not correctness.
     static func drainPlan(cursor: SubtitleDrainCursor?, playhead: Double,
                           lead: Double, backscan: Double,
-                          jumpThreshold: Double,
-                          elapsedSinceLastPlan: Double = 0) -> SubtitleDrainPlan {
+                          repositioning: SubtitleRepositioning) -> SubtitleDrainPlan {
         let through = playhead + lead
         guard let cursor else {
             return .resetAndDecode(from: playhead - backscan, through: through)
         }
-        let delta = playhead - cursor.lastPlayhead
-        let allowance = delta > 0 ? jumpThreshold + max(0, elapsedSinceLastPlan) : jumpThreshold
-        if abs(delta) > allowance {
+        let repositioned: Bool
+        switch repositioning {
+        case .signalled(let generation):
+            repositioned = generation != cursor.landingGeneration
+        case .inferred(let jumpThreshold, let elapsedSinceLastPlan):
+            let delta = playhead - cursor.lastPlayhead
+            let allowance = delta > 0 ? jumpThreshold + max(0, elapsedSinceLastPlan) : jumpThreshold
+            repositioned = abs(delta) > allowance
+        }
+        if repositioned {
             return .resetAndDecode(from: playhead - backscan, through: through)
         }
         guard through - cursor.lastDecodedPts >= minimumScanWindowSeconds else {
