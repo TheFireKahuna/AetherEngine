@@ -1,102 +1,88 @@
 import AetherLibavcodec
-import AetherLibavformat
 import AetherLibavutil
+import CoreMedia
 import Foundation
 import Testing
 @testable import AetherEngine
 
-/// LATM is a transport around AAC: taken out of it, a stream's frames and its AudioSpecificConfig
-/// are AAC like any other (`LATM`). The proof is libavcodec's own two decoders: the frames
-/// unwrapped here, decoded as plain AAC with the configuration unwrapped with them, give exactly
-/// the samples its LATM decoder gives for the stream as it was.
+/// LATM is a transport around AAC: taken out of it, a stream's frames and its AudioSpecificConfig are AAC like any
+/// other (`LATM`). The proof is the engine's own path: the HLS route's configuration and AAC parameters for the
+/// stream, its frames unwrapped, decode to exactly the samples the stream decodes to as it was.
 @Suite("LATM unwraps to AAC")
 struct LATMTests {
 
-    /// The demuxed LOAS frames and the stream's `extradata` after probing.
-    private func demux(_ data: Data) throws -> (packets: [[UInt8]], extradata: [UInt8]) {
+    private struct Run {
+        var pcm = Data()
+        var elements: [[UInt8]] = []
+        var unwrapped = 0
+        /// The configuration the HLS route declares for the stream, and the one its elements carried.
+        var declared: [UInt8]?
+        var carried: [UInt8]?
+    }
+
+    /// The fixture opened the way the engine opens a file and decoded by the engine's audio decoder: as it is, or
+    /// `unwrapped` as the HLS route copies it, the stream's parameters made AAC and each element's frame taken out.
+    private func decoded(_ data: Data, unwrapped: Bool) throws -> Run {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("latm-\(UUID().uuidString).latm")
         try data.write(to: url)
         defer { try? FileManager.default.removeItem(at: url) }
-        var input: UnsafeMutablePointer<AVFormatContext>?
-        try #require(avformat_open_input(&input, url.path, nil, nil) == 0)
-        defer { avformat_close_input(&input) }
-        let ctx = try #require(input)
-        try #require(avformat_find_stream_info(ctx, nil) >= 0)
-        let par = try #require(ctx.pointee.streams[0]).pointee.codecpar!
-        try #require(par.pointee.codec_id == AV_CODEC_ID_AAC_LATM)
-        let extradata = Array(UnsafeBufferPointer(start: par.pointee.extradata, count: Int(par.pointee.extradata_size)))
-        var packets: [[UInt8]] = []
-        var pkt = av_packet_alloc()
-        defer { av_packet_free(&pkt) }
-        while av_read_frame(ctx, pkt) >= 0 {
-            packets.append(Array(UnsafeBufferPointer(start: pkt!.pointee.data, count: Int(pkt!.pointee.size))))
-            av_packet_unref(pkt)
+        let demuxer = Demuxer()
+        try demuxer.open(url: url)
+        defer { demuxer.close() }
+        let stream = try #require(demuxer.stream(at: demuxer.audioStreamIndex))
+        var run = Run()
+        var reader = LATM.Reader()
+        if unwrapped {
+            let declared = try #require(HLSVideoEngine.latmConfiguration(stream.pointee.codecpar))
+            try #require(HLSVideoEngine.prepareLATMForFMP4(stream.pointee.codecpar, config: declared))
+            run.declared = declared
         }
-        return (packets, extradata)
-    }
-
-    /// Every sample `packets` decode to through `codec`, planes concatenated per frame.
-    private func decode(_ packets: [[UInt8]], codec id: AVCodecID, extradata: [UInt8]?) throws -> [Float] {
-        let codec = try #require(avcodec_find_decoder(id))
-        var ctx = avcodec_alloc_context3(codec)
-        defer { avcodec_free_context(&ctx) }
-        let c = try #require(ctx)
-        if let extradata {
-            c.pointee.extradata = av_mallocz(extradata.count + Int(AV_INPUT_BUFFER_PADDING_SIZE))?.assumingMemoryBound(to: UInt8.self)
-            c.pointee.extradata.update(from: extradata, count: extradata.count)
-            c.pointee.extradata_size = Int32(extradata.count)
-        }
-        try #require(avcodec_open2(c, codec, nil) == 0)
-        var samples: [Float] = []
-        var frame = av_frame_alloc()
-        defer { av_frame_free(&frame) }
-        func drain() {
-            while avcodec_receive_frame(c, frame) == 0 {
-                let f = frame!.pointee
-                for ch in 0..<Int(f.ch_layout.nb_channels) {
-                    let plane = UnsafeRawPointer(f.extended_data[ch]!).assumingMemoryBound(to: Float.self)
-                    samples += UnsafeBufferPointer(start: plane, count: Int(f.nb_samples))
-                }
+        let decoder = AudioDecoder()
+        try decoder.open(stream: stream)
+        defer { decoder.close() }
+        var buffers: [CMSampleBuffer] = []
+        while let pkt = try demuxer.readPacket() {
+            let element = [UInt8](UnsafeRawBufferPointer(start: pkt.pointee.data, count: Int(pkt.pointee.size)))
+            run.elements.append(element)
+            if unwrapped, let frame = element.withUnsafeBytes({ reader.payload($0) }) {
+                run.unwrapped += 1
+                try #require(HLSSegmentProducer.replacePayload(of: pkt, with: frame))
             }
+            buffers += decoder.decode(packet: pkt)
+            var p: UnsafeMutablePointer<AVPacket>? = pkt
+            trackedPacketFree(&p)
         }
-        var pkt = av_packet_alloc()
-        defer { av_packet_free(&pkt) }
-        for p in packets {
-            _ = av_new_packet(pkt, Int32(p.count))
-            pkt!.pointee.data.update(from: p, count: p.count)
-            _ = avcodec_send_packet(c, pkt)
-            av_packet_unref(pkt)
-            drain()
+        buffers += decoder.drain()
+        run.carried = reader.config
+        for b in buffers {
+            let block = try #require(CMSampleBufferGetDataBuffer(b))
+            var bytes = [UInt8](repeating: 0, count: CMBlockBufferGetDataLength(block))
+            CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: bytes.count, destination: &bytes)
+            run.pcm.append(contentsOf: bytes)
         }
-        _ = avcodec_send_packet(c, nil)
-        drain()
-        return samples
+        return run
     }
 
-    @Test("the unwrapped frames decode as AAC to exactly what the LATM decoder gives",
+    @Test("the unwrapped frames decode as AAC to exactly what the LATM stream decodes to",
           arguments: ["lowComplexity", "highEfficiency"])
     func unwrapsLosslessly(fixture: String) throws {
-        let (packets, extradata) = try demux(fixture == "lowComplexity" ? LATMFixture.lowComplexity : LATMFixture.highEfficiency)
-        var reader = LATM.Reader()
-        let frames = packets.compactMap { p in p.withUnsafeBytes { reader.payload($0) } }
-        #expect(frames.count == packets.count, "every element unwraps")
-        let config = try #require(reader.config)
-        #expect(extradata.withUnsafeBytes { LATM.configuration(extradata: $0) } == config,
-                "the probe's extradata, cut at its end, is the stream's configuration")
-        let unwrapped = try decode(frames, codec: AV_CODEC_ID_AAC, extradata: config)
-        let original = try decode(packets, codec: AV_CODEC_ID_AAC_LATM, extradata: nil)
-        #expect(unwrapped.count > 40_000)
-        #expect(unwrapped == original)
+        let data = fixture == "lowComplexity" ? LATMFixture.lowComplexity : LATMFixture.highEfficiency
+        let original = try decoded(data, unwrapped: false)
+        let unwrapped = try decoded(data, unwrapped: true)
+        #expect(unwrapped.unwrapped == unwrapped.elements.count, "every element unwraps")
+        #expect(unwrapped.carried == unwrapped.declared, "the probe's configuration is the one the elements carry")
+        #expect(unwrapped.pcm.count > 100_000)
+        #expect(unwrapped.pcm == original.pcm)
     }
 
     @Test("an element reusing a configuration no element has carried yet is not read")
     func needsAConfiguration() throws {
-        let (packets, _) = try demux(LATMFixture.lowComplexity)
-        var reader = LATM.Reader()
         // The muxer carries the configuration in every fifth element, the first included.
-        #expect(packets[1].withUnsafeBytes { reader.payload($0) } == nil)
-        #expect(packets[0].withUnsafeBytes { reader.payload($0) } != nil)
-        #expect(packets[1].withUnsafeBytes { reader.payload($0) } != nil)
+        let elements = try decoded(LATMFixture.lowComplexity, unwrapped: false).elements
+        var reader = LATM.Reader()
+        #expect(elements[1].withUnsafeBytes { reader.payload($0) } == nil)
+        #expect(elements[0].withUnsafeBytes { reader.payload($0) } != nil)
+        #expect(elements[1].withUnsafeBytes { reader.payload($0) } != nil)
     }
 
     @Test("the configuration's length is read off its own syntax")
