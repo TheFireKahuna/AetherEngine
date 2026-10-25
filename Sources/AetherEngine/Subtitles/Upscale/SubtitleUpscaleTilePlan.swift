@@ -9,7 +9,7 @@ import Foundation
 /// cores across just the columns its own support spans, so two lines of different lengths, or the gap between them,
 /// cost only what they hold. Rows with no support take no band. The choice is a dynamic programme over the rows (a
 /// band of each height, or skipping an unsupported row), each band's columns the cheapest cover of its span, every
-/// window costed by its measured prediction time (``milliseconds(_:height:width:)``).
+/// window costed by its measured prediction time (``milliseconds(alpha:luma:height:width:)``).
 struct SubtitleUpscaleTilePlan: Equatable {
     struct Window: Equatable {
         /// Picture position of the window's top-left pixel: its core's minus 7 on each axis.
@@ -34,17 +34,24 @@ struct SubtitleUpscaleTilePlan: Equatable {
 
     static let reach = 7
 
-    /// Wall milliseconds of one synchronous prediction of `model` on a window, measured on the A15 (Apple TV 4K,
-    /// tvOS 27.2, Release; ``SubtitleUpscaler/benchmark(iterations:)`` prints the device's own). Proportions, not
-    /// the absolute times, steer the plan, and they hold across Apple's Neural Engines.
-    static func milliseconds(_ model: ArtCNNModel, height: Int, width: Int) -> Double {
-        let table: [Int: [Int: Double]] = switch model {
-        case .c4f16: [46: [256: 0.44, 512: 0.55, 1024: 0.59, 2048: 0.85],
-                      78: [256: 0.49, 512: 0.61, 1024: 0.79, 2048: 1.23],
-                      142: [256: 0.55, 512: 0.75, 1024: 1.17, 2048: 2.25]]
-        case .c4f32: [46: [256: 0.47, 512: 0.54, 1024: 0.86, 2048: 1.40],
-                      78: [256: 0.52, 512: 0.78, 1024: 1.25, 2048: 2.26],
-                      142: [256: 0.75, 512: 1.16, 1024: 2.15, 2048: 4.55]]
+    /// Wall milliseconds of one synchronous prediction of both of a window's planes (`alpha` and `luma` the
+    /// networks on them), measured on the A15 (Apple TV 4K, tvOS 27.2, Release, the `fastPrediction`
+    /// specialisation; ``SubtitleUpscaler/benchmark(iterations:)`` prints the device's own). Proportions, not the
+    /// absolute times, steer the plan.
+    static func milliseconds(alpha: ArtCNNModel, luma: ArtCNNModel, height: Int, width: Int) -> Double {
+        let table: [Int: [Int: Double]] = switch (alpha, luma) {
+        case (.c4f16, .c4f16): [46: [256: 1.09, 512: 1.27, 1024: 1.30, 2048: 1.73],
+                                  78: [256: 0.54, 512: 0.75, 1024: 1.17, 2048: 2.14],
+                                  142: [256: 0.68, 512: 1.05, 1024: 1.84, 2048: 3.65]]
+        case (.c4f16, .c4f32): [46: [256: 0.57, 512: 0.76, 1024: 1.15, 2048: 2.09],
+                                  78: [256: 0.68, 512: 0.96, 1024: 1.67, 2048: 3.72],
+                                  142: [256: 0.86, 512: 1.47, 1024: 2.76, 2048: 6.29]]
+        case (.c4f32, .c4f16): [46: [256: 0.56, 512: 0.72, 1024: 1.05, 2048: 1.91],
+                                  78: [256: 0.66, 512: 0.96, 1024: 1.59, 2048: 2.97],
+                                  142: [256: 0.86, 512: 1.49, 1024: 2.54, 2048: 5.62]]
+        case (.c4f32, .c4f32): [46: [256: 0.68, 512: 0.83, 1024: 1.46, 2048: 2.75],
+                                  78: [256: 0.73, 512: 1.18, 1024: 2.19, 2048: 4.94],
+                                  142: [256: 1.05, 512: 1.89, 1024: 3.95, 2048: 9.07]]
         }
         return table[height]![width]!
     }
@@ -69,23 +76,33 @@ struct SubtitleUpscaleTilePlan: Equatable {
                 span[yy] = span[yy].map { (min($0.0, lo), max($0.1, hi)) } ?? (lo, hi)
             }
         }
-        // The cheapest cover of `length` columns with cores of height `h`: memoised per height.
-        var covers: [Int: [Int: (cost: Double, cores: [Int])]] = [:]
-        func cover(_ length: Int, _ h: Int) -> (cost: Double, cores: [Int]) {
-            if let made = covers[h]?[length] { return made }
-            var best = [(cost: Double, cores: [Int])](repeating: (.infinity, []), count: length + 1)
-            best[0] = (0, [])
-            for t in 1...length {
-                for c in coreWidths {
-                    let before = best[max(0, t - c)]
-                    let cost = before.cost + milliseconds(alpha, height: h + 2 * r, width: c + 2 * r)
-                        + milliseconds(luma, height: h + 2 * r, width: c + 2 * r)
-                    if cost < best[t].cost { best[t] = (cost, before.cores + [c]) }
+        // The cheapest cover of `length` columns with cores of height `h`: per height one table up to the widest span
+        // (the kept width), each entry its cost and its last core, followed back to list the cores.
+        var tables: [Int: (cost: [Double], last: [Int])] = [:]
+        func table(_ h: Int) -> (cost: [Double], last: [Int]) {
+            if let made = tables[h] { return made }
+            let n = kept.width
+            let prices = coreWidths.map { milliseconds(alpha: alpha, luma: luma, height: h + 2 * r, width: $0 + 2 * r) }
+            var cost = [Double](repeating: .infinity, count: n + 1)
+            var last = [Int](repeating: 0, count: n + 1)
+            cost[0] = 0
+            for t in 1...n {
+                for (k, c) in coreWidths.enumerated() {
+                    let v = cost[max(0, t - c)] + prices[k]
+                    if v < cost[t] { cost[t] = v; last[t] = c }
                 }
             }
-            for t in 1...length { covers[h, default: [:]][t] = best[t] }
-            return best[length]
+            tables[h] = (cost, last)
+            return (cost, last)
         }
+        func cover(_ length: Int, _ h: Int) -> (cost: Double, cores: [Int]) {
+            let t = table(h)
+            var cores: [Int] = []
+            var at = length
+            while at > 0 { cores.append(t.last[at]); at -= t.last[at] }
+            return (t.cost[length], cores)
+        }
+        func coverCost(_ length: Int, _ h: Int) -> Double { table(h).cost[length] }
         // A band of core height h from row t: the union of its rows' spans, nil when it holds no support.
         func bandSpan(_ t: Int, _ h: Int) -> (Int, Int)? {
             var lo = Int.max, hi = -1
@@ -103,7 +120,7 @@ struct SubtitleUpscaleTilePlan: Equatable {
             for h in coreHeights {
                 let rest = best[min(n, i + h)]
                 guard let s = bandSpan(t, h) else { continue }
-                let cost = cover(s.1 - s.0 + 1, h).cost + rest
+                let cost = coverCost(s.1 - s.0 + 1, h) + rest
                 if cost < best[i] { best[i] = cost; step[i] = h }
             }
         }

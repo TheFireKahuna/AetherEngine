@@ -21,30 +21,38 @@ enum SubtitleUpscaleNeuralEngine {
 
     static let shapes = ArtCNNCoreMLModels.windowHeights.flatMap { h in ArtCNNCoreMLModels.windowWidths.map { Shape(height: h, width: $0) } }
 
+    /// The networks on a window's two planes.
+    struct Pair: Hashable {
+        var alpha: ArtCNNModel
+        var luma: ArtCNNModel
+        var name: String { "\(alpha.rawValue)_\(luma.rawValue)" }
+    }
+
     private struct Key: Hashable {
-        var model: ArtCNNModel
+        var pair: Pair
         var shape: Shape
     }
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var models: [Key: Result<MLModel, Error>] = [:]
 
-    /// The model's function for `shape`, materialised and compiled into the caches directory on first use (once per
-    /// install: the compiled model is kept), then loaded for the CPU and Neural Engine. Blocks for the load, about
-    /// 150 ms for each function the first time in a process; ``prewarm()`` does them all in the background.
-    static func model(_ model: ArtCNNModel, _ shape: Shape) throws -> MLModel {
+    /// The pair's function for `shape`, materialised and compiled into the caches directory on first use (once per
+    /// install: the compiled model is kept), then loaded for the CPU and Neural Engine, specialised for prediction
+    /// latency. Blocks for the load, about 150 ms for each function the first time in a process; ``prewarm(_:)``
+    /// does them all in the background.
+    static func model(_ pair: Pair, _ shape: Shape) throws -> MLModel {
         lock.lock()
         defer { lock.unlock() }
-        let key = Key(model: model, shape: shape)
+        let key = Key(pair: pair, shape: shape)
         if let cached = models[key] { return try cached.get() }
-        let made = Result { try load(model, shape) }
+        let made = Result { try load(pair, shape) }
         models[key] = made
         return try made.get()
     }
 
     /// Where an app-open prewarm's time went, in wall milliseconds.
     struct PrewarmTimes {
-        /// Materialising and compiling the packages (nothing when the compiled models are already on disk).
+        /// Materialising and compiling the package (nothing when the compiled model is already on disk).
         var compile = 0.0
         /// Loading every function.
         var load = 0.0
@@ -54,27 +62,28 @@ enum SubtitleUpscaleNeuralEngine {
         var total: Double { compile + load + firstPrediction }
     }
 
-    /// Compiles both models, loads every function and runs each once, so nothing is left for the first subtitle
+    /// Compiles `pair`'s package, loads every function and runs each once, so nothing is left for the first subtitle
     /// but the prediction itself.
     @discardableResult
-    static func prewarm() throws -> PrewarmTimes {
+    static func prewarm(_ pair: Pair) throws -> PrewarmTimes {
         var times = PrewarmTimes()
         func lap(_ t0: UInt64) -> Double { Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6 }
-        for m in ArtCNNModel.allCases {
-            var t0 = DispatchTime.now().uptimeNanoseconds
-            _ = try compiledURL(m)
-            times.compile += lap(t0)
-            for shape in shapes {
-                t0 = DispatchTime.now().uptimeNanoseconds
-                let loaded = try model(m, shape)
-                times.load += lap(t0)
-                let input = try MLMultiArray(shape: [1, 1, shape.height, shape.width].map { NSNumber(value: $0) }, dataType: .float16)
-                let features = try MLDictionaryFeatureProvider(dictionary: ["x": MLFeatureValue(multiArray: input)])
-                t0 = DispatchTime.now().uptimeNanoseconds
-                _ = try loaded.prediction(from: features)
-                times.firstPrediction += lap(t0)
-                times.functions += 1
-            }
+        var t0 = DispatchTime.now().uptimeNanoseconds
+        _ = try compiledURL(pair)
+        times.compile += lap(t0)
+        for shape in shapes {
+            t0 = DispatchTime.now().uptimeNanoseconds
+            let loaded = try model(pair, shape)
+            times.load += lap(t0)
+            let dims = [1, 1, shape.height, shape.width].map { NSNumber(value: $0) }
+            let features = try MLDictionaryFeatureProvider(dictionary: [
+                "xa": MLFeatureValue(multiArray: try MLMultiArray(shape: dims, dataType: .float16)),
+                "xl": MLFeatureValue(multiArray: try MLMultiArray(shape: dims, dataType: .float16)),
+            ])
+            t0 = DispatchTime.now().uptimeNanoseconds
+            _ = try loaded.prediction(from: features)
+            times.firstPrediction += lap(t0)
+            times.functions += 1
         }
         return times
     }
@@ -92,30 +101,26 @@ enum SubtitleUpscaleNeuralEngine {
         if FileManager.default.fileExists(atPath: root.path) { try FileManager.default.removeItem(at: root) }
     }
 
-    private static func files(_ model: ArtCNNModel) -> [(path: String, base64: String)] {
-        switch model {
-        case .c4f16: ArtCNNCoreMLModels.c4f16
-        case .c4f32: ArtCNNCoreMLModels.c4f32
-        }
-    }
-
-    private static func load(_ model: ArtCNNModel, _ shape: Shape) throws -> MLModel {
+    private static func load(_ pair: Pair, _ shape: Shape) throws -> MLModel {
         let configuration = MLModelConfiguration()
         configuration.computeUnits = .cpuAndNeuralEngine
         configuration.functionName = shape.function
-        return try MLModel(contentsOf: try compiledURL(model), configuration: configuration)
+        var hints = MLOptimizationHints()
+        hints.specializationStrategy = .fastPrediction
+        configuration.optimizationHints = hints
+        return try MLModel(contentsOf: try compiledURL(pair), configuration: configuration)
     }
 
     /// The compiled model in the caches directory, compiled from ``ArtCNNCoreMLModels`` when it is not there yet.
-    static func compiledURL(_ model: ArtCNNModel) throws -> URL {
-        let files = files(model)
+    static func compiledURL(_ pair: Pair) throws -> URL {
+        let files = ArtCNNCoreMLModels.package(alpha: pair.alpha, luma: pair.luma)
         // FNV-1a over the package, so a changed model never reuses a stale compile.
         var hash: UInt64 = 0xcbf2_9ce4_8422_2325
         for f in files { for b in f.base64.utf8 { hash = (hash ^ UInt64(b)) &* 0x100_0000_01b3 } }
         let fm = FileManager.default
         let root = try fm.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
             .appendingPathComponent("AetherEngine-ArtCNN", isDirectory: true)
-        let name = "ArtCNN_\(model.rawValue)_\(String(hash, radix: 16))"
+        let name = "ArtCNN_\(pair.name)_\(String(hash, radix: 16))"
         let compiled = root.appendingPathComponent(name + ".mlmodelc", isDirectory: true)
         if !fm.fileExists(atPath: compiled.path) {
             let package = root.appendingPathComponent(name + ".mlpackage", isDirectory: true)
@@ -135,15 +140,14 @@ enum SubtitleUpscaleNeuralEngine {
         return compiled
     }
 
-    /// Runs `model` on one window's input plane into its output plane (``Surfaces``). Core ML writes the output
-    /// into the backing; an output anywhere else is an error, not a copy.
-    static func predict(_ model: MLModel, input: Surfaces.Plane, output: Surfaces.Plane) throws {
-        let options = MLPredictionOptions()
-        options.outputBackings = ["y": output.array]
-        let result = try model.prediction(from: try MLDictionaryFeatureProvider(dictionary: ["x": MLFeatureValue(multiArray: input.array)]),
-                                          options: options)
-        guard let written = result.featureValue(for: "y")?.multiArrayValue?.pixelBuffer, written === output.pixelBuffer else {
-            throw SubtitleUpscaler.UpscaleError.unavailable("Core ML did not write the output backing")
+    /// Runs `model` on one window's two planes (``Surfaces``), one call for both. Core ML writes the outputs into
+    /// their backings; an output anywhere else is an error, not a copy.
+    static func predict(_ model: MLModel, _ surfaces: Surfaces) throws {
+        let result = try model.prediction(from: surfaces.inputs, options: surfaces.options)
+        for (name, plane) in [("ya", surfaces.alphaOut), ("yl", surfaces.lumaOut)] {
+            guard let written = result.featureValue(for: name)?.multiArrayValue?.pixelBuffer, written === plane.pixelBuffer else {
+                throw SubtitleUpscaler.UpscaleError.unavailable("Core ML did not write the \(name) backing")
+            }
         }
     }
 
@@ -164,6 +168,9 @@ enum SubtitleUpscaleNeuralEngine {
         let lumaIn: Plane
         let alphaOut: Plane
         let lumaOut: Plane
+        /// The prediction's inputs and output backings, made once: every call on these surfaces is the same.
+        let inputs: MLFeatureProvider
+        let options: MLPredictionOptions
 
         init(shape: Shape, device: MTLDevice) throws {
             self.shape = shape
@@ -172,6 +179,10 @@ enum SubtitleUpscaleNeuralEngine {
             lumaIn = try Self.plane(device, width: w, rows: h, shape: [1, 1, h, w])
             alphaOut = try Self.plane(device, width: w, rows: 4 * h, shape: [1, 4, h, w])
             lumaOut = try Self.plane(device, width: w, rows: 4 * h, shape: [1, 4, h, w])
+            inputs = try MLDictionaryFeatureProvider(dictionary: ["xa": MLFeatureValue(multiArray: alphaIn.array),
+                                                                  "xl": MLFeatureValue(multiArray: lumaIn.array)])
+            options = MLPredictionOptions()
+            options.outputBackings = ["ya": alphaOut.array, "yl": lumaOut.array]
         }
 
         private static func plane(_ device: MTLDevice, width: Int, rows: Int, shape: [Int]) throws -> Plane {

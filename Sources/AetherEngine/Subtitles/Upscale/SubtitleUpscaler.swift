@@ -2,6 +2,7 @@ import CoreGraphics
 import CoreVideo
 import Foundation
 import Metal
+import os
 
 /// Upscales a bitmap subtitle (PGS, DVB, DVD, a display set's RGBA picture) 2x with ArtCNN on the Neural Engine,
 /// leaving the GPU to the video (``SubtitleUpscaleNeuralEngine``; GPU passes prepare its input and composite its output).
@@ -13,7 +14,7 @@ import Metal
 /// Output pixels farther than 5 source pixels from any non-transparent pixel are exactly transparent, so the
 /// network runs only on the content bounds grown by that support (``SubtitleUpscaleTilePlan``).
 ///
-/// One process-wide device, queue, pipeline set and model set (``prewarm()``); each upscaler keeps its
+/// One process-wide device, queue, pipeline set and model set (``prewarm(_:)``); each upscaler keeps its
 /// working buffers and window surfaces between calls, so the steady state allocates nothing. An instance runs one
 /// picture at a time (calls are serialised); ``upscale(_:)`` runs a burst and waits.
 public final class SubtitleUpscaler: @unchecked Sendable {
@@ -45,6 +46,8 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         /// C4F16 everywhere does, because the fill edge is where a subtitle's contrast is.
         public static let balanced = Configuration(alphaModel: .c4f16, lumaModel: .c4f32)
         public static let c4f16 = Configuration(alphaModel: .c4f16, lumaModel: .c4f16)
+
+        var pair: SubtitleUpscaleNeuralEngine.Pair { .init(alpha: alphaModel, luma: lumaModel) }
     }
 
     public enum UpscaleError: Error, CustomStringConvertible {
@@ -180,6 +183,7 @@ public final class SubtitleUpscaler: @unchecked Sendable {
 
     /// Wall milliseconds of the last pass's stages, for the benchmark.
     struct NeuralEngineStages {
+        var plan = 0.0
         var gather = 0.0
         var predict = 0.0
         var composite = 0.0
@@ -193,13 +197,13 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         didSet { precondition((1...7).contains(supportRadius)) }
     }
 
-    /// Compiles the shared pipelines, compiles and loads the Core ML models and has the Neural Engine compile each
-    /// function, on a background queue, so the first picture waits for none of it. For app open: a few seconds
-    /// after an install, an OS update or a purged cache, under a second otherwise.
-    public static func prewarm() {
+    /// Compiles the shared pipelines, compiles and loads `configuration`'s Core ML model and has the Neural Engine
+    /// compile each function, on a background queue, so the first picture waits for none of it. For app open: a few
+    /// seconds after an install, an OS update or a purged cache, under a second otherwise.
+    public static func prewarm(_ configuration: Configuration = .default) {
         DispatchQueue.global(qos: .utility).async {
             _ = try? SubtitleUpscaleKernels.get()
-            try? SubtitleUpscaleNeuralEngine.prewarm()
+            try? SubtitleUpscaleNeuralEngine.prewarm(configuration.pair)
         }
     }
 
@@ -210,17 +214,16 @@ public final class SubtitleUpscaler: @unchecked Sendable {
     }
 
     /// Makes this upscaler's window surfaces, one set per window shape, and runs each through the configuration's
-    /// models once, then one small picture through the whole pass, so the first subtitle pays only the steady-state
+    /// model once, then one small picture through the whole pass, so the first subtitle pays only the steady-state
     /// cost. Blocks (most of it is the Neural Engine's first use of each surface); for a background queue at app open
-    /// or when a session starts, after ``prewarm()``. A plan that needs more windows of one shape than this made still
+    /// or when a session starts, after ``prewarm(_:)``. A plan that needs more windows of one shape than this made still
     /// makes them on first use.
     public func prepare() throws {
         try lock.withLock {
             let config = _configuration
             let windows = SubtitleUpscaleNeuralEngine.shapes.map { SubtitleUpscaleTilePlan.Window(x: 0, y: 0, width: $0.width, height: $0.height) }
             for s in try workspace.surfaces.surfaces(for: windows) {
-                try SubtitleUpscaleNeuralEngine.predict(try SubtitleUpscaleNeuralEngine.model(config.alphaModel, s.shape), input: s.alphaIn, output: s.alphaOut)
-                try SubtitleUpscaleNeuralEngine.predict(try SubtitleUpscaleNeuralEngine.model(config.lumaModel, s.shape), input: s.lumaIn, output: s.lumaOut)
+                try SubtitleUpscaleNeuralEngine.predict(try SubtitleUpscaleNeuralEngine.model(config.pair, s.shape), s)
             }
             // One opaque pixel: the GPU passes' first dispatches and the mask buffers.
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 16, height: 16, mipmapped: false)
@@ -453,6 +456,14 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         guard job.destination.width == 2 * pw, job.destination.height == 2 * ph else {
             throw UpscaleError.size("destination \(job.destination.width)x\(job.destination.height) is not 2x \(pw)x\(ph)")
         }
+        var stages = NeuralEngineStages()
+        var mark = DispatchTime.now().uptimeNanoseconds
+        func lap() -> Double {
+            let now = DispatchTime.now().uptimeNanoseconds
+            defer { mark = now }
+            return Double(now - mark) / 1e6
+        }
+        defer { lastNeuralEngineStages = stages }
         let content = job.content ?? Content(bounds: CGRect(x: 0, y: 0, width: pw, height: ph))
         let kept = content.kept(width: pw, height: ph, support: supportRadius)
         let plan = SubtitleUpscaleTilePlan.plan(content: content, width: pw, height: ph, support: supportRadius,
@@ -467,61 +478,90 @@ public final class SubtitleUpscaler: @unchecked Sendable {
                                 coreWidth: UInt32(core.width), coreHeight: UInt32(core.height))
         }
         var g = Geometry()
-        var stages = NeuralEngineStages()
-        var mark = DispatchTime.now().uptimeNanoseconds
-        func lap() -> Double {
-            let now = DispatchTime.now().uptimeNanoseconds
-            defer { mark = now }
-            return Double(now - mark) / 1e6
+        stages.plan = lap()
+        // The gather, then every window's composite, each composite waiting on its window's event, which the CPU
+        // signals when that window's prediction returns: both command buffers go to the GPU before any prediction
+        // runs, and each composite starts as its window's outputs are ready while later windows are still predicting.
+        guard let gather = kernels.queue.makeCommandBuffer(), let compose = kernels.queue.makeCommandBuffer() else {
+            throw UpscaleError.gpu("no command buffer")
         }
-        defer { lastNeuralEngineStages = stages }
-        var empty = false
-        try run { commandBuffer in
-            guard let encoder = commandBuffer.makeComputeCommandEncoder(dispatchType: .serial) else { throw UpscaleError.gpu("no compute encoder") }
-            defer { encoder.endEncoding() }
-            encoder.setComputePipelineState(kernels.clearRect)
-            encoder.setTexture(job.destination, index: 0)
-            for var rect in clears.map({ SIMD4<Int32>(Int32($0.x), Int32($0.y), Int32($0.width), Int32($0.height)) }) {
-                encoder.setBytes(&rect, length: MemoryLayout<SIMD4<Int32>>.stride, index: 0)
-                dispatch(encoder, kernels.clearRect, width: Int(rect.z), height: Int(rect.w))
-            }
-            guard let made = try encodeMask(job, kept: kept, encoder: encoder) else { empty = true; return }
-            g = made
-            encoder.setComputePipelineState(kernels.tileGather)
-            encoder.setTexture(job.source, index: 0)
-            encoder.setBytes(&g, length: MemoryLayout<Geometry>.stride, index: 0)
-            for (k, var record) in records.enumerated() {
-                encoder.setTexture(surfaces[k].alphaIn.texture, index: 1)
-                encoder.setTexture(surfaces[k].lumaIn.texture, index: 2)
-                encoder.setBytes(&record, length: MemoryLayout<WindowRecord>.stride, index: 1)
-                encoder.dispatchThreads(MTLSize(width: plan.windows[k].width, height: plan.windows[k].height, depth: 1),
-                                        threadsPerThreadgroup: MTLSize(width: 32, height: 8, depth: 1))
-            }
+        guard let encoder = gather.makeComputeCommandEncoder(dispatchType: .serial) else { throw UpscaleError.gpu("no compute encoder") }
+        encoder.setComputePipelineState(kernels.clearRect)
+        encoder.setTexture(job.destination, index: 0)
+        for var rect in clears.map({ SIMD4<Int32>(Int32($0.x), Int32($0.y), Int32($0.width), Int32($0.height)) }) {
+            encoder.setBytes(&rect, length: MemoryLayout<SIMD4<Int32>>.stride, index: 0)
+            dispatch(encoder, kernels.clearRect, width: Int(rect.z), height: Int(rect.w))
         }
-        stages.gather = lap()
-        stages.tiles = records.count
-        guard !empty, !records.isEmpty else { return }
-        for s in surfaces {
-            try SubtitleUpscaleNeuralEngine.predict(try SubtitleUpscaleNeuralEngine.model(config.alphaModel, s.shape), input: s.alphaIn, output: s.alphaOut)
-            try SubtitleUpscaleNeuralEngine.predict(try SubtitleUpscaleNeuralEngine.model(config.lumaModel, s.shape), input: s.lumaIn, output: s.lumaOut)
+        guard let made = try encodeMask(job, kept: kept, encoder: encoder), !records.isEmpty else {
+            encoder.endEncoding()
+            gather.commit()
+            gather.waitUntilCompleted()
+            if let error = gather.error { throw UpscaleError.gpu("\(error)") }
+            return
         }
-        stages.predict = lap()
-        defer { stages.composite = lap() }
-        try run { commandBuffer in
-            guard let encoder = commandBuffer.makeComputeCommandEncoder(dispatchType: .serial) else { throw UpscaleError.gpu("no compute encoder") }
-            defer { encoder.endEncoding() }
+        g = made
+        encoder.setComputePipelineState(kernels.tileGather)
+        encoder.setTexture(job.source, index: 0)
+        encoder.setBytes(&g, length: MemoryLayout<Geometry>.stride, index: 0)
+        for (k, var record) in records.enumerated() {
+            encoder.setTexture(surfaces[k].alphaIn.texture, index: 1)
+            encoder.setTexture(surfaces[k].lumaIn.texture, index: 2)
+            encoder.setBytes(&record, length: MemoryLayout<WindowRecord>.stride, index: 1)
+            encoder.dispatchThreads(MTLSize(width: plan.windows[k].width, height: plan.windows[k].height, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 32, height: 8, depth: 1))
+        }
+        encoder.endEncoding()
+
+        let events = try workspace.events(records.count)
+        let value = workspace.nextEventValue()
+        for (k, var record) in records.enumerated() {
+            compose.encodeWaitForEvent(events[k], value: value)
+            guard record.coreWidth > 0, record.coreHeight > 0 else { continue }
+            guard let encoder = compose.makeComputeCommandEncoder(dispatchType: .serial) else { throw UpscaleError.gpu("no compute encoder") }
             encoder.setComputePipelineState(kernels.compositeTiles)
             encoder.setTexture(job.source, index: 0)
             encoder.setTexture(job.destination, index: 1)
             encoder.setBuffer(workspace.support, offset: 0, index: 0)
             encoder.setBytes(&g, length: MemoryLayout<Geometry>.stride, index: 1)
-            for (k, var record) in records.enumerated() where record.coreWidth > 0 && record.coreHeight > 0 {
-                encoder.setTexture(surfaces[k].alphaOut.texture, index: 2)
-                encoder.setTexture(surfaces[k].lumaOut.texture, index: 3)
-                encoder.setBytes(&record, length: MemoryLayout<WindowRecord>.stride, index: 2)
-                dispatch(encoder, kernels.compositeTiles, width: Int(record.coreWidth), height: Int(record.coreHeight))
-            }
+            encoder.setTexture(surfaces[k].alphaOut.texture, index: 2)
+            encoder.setTexture(surfaces[k].lumaOut.texture, index: 3)
+            encoder.setBytes(&record, length: MemoryLayout<WindowRecord>.stride, index: 2)
+            dispatch(encoder, kernels.compositeTiles, width: Int(record.coreWidth), height: Int(record.coreHeight))
+            encoder.endEncoding()
         }
+        gather.commit()
+        compose.commit()
+        // Whatever happens below, every event is signalled, so the queued composite never waits forever.
+        var signalled = false
+        func release() {
+            guard !signalled else { return }
+            signalled = true
+            for e in events.prefix(records.count) where e.signaledValue < value { e.signaledValue = value }
+        }
+        defer { release() }
+        gather.waitUntilCompleted()
+        stages.gather = lap()
+        stages.tiles = records.count
+        if let error = gather.error { release(); compose.waitUntilCompleted(); throw UpscaleError.gpu("\(error)") }
+
+        // All windows' predictions in flight together, each signalling its window's event as it returns.
+        let failure = OSAllocatedUnfairLock<Error?>(initialState: nil)
+        let pair = config.pair
+        nonisolated(unsafe) let windows = surfaces
+        DispatchQueue.concurrentPerform(iterations: windows.count) { k in
+            do {
+                try SubtitleUpscaleNeuralEngine.predict(try SubtitleUpscaleNeuralEngine.model(pair, windows[k].shape), windows[k])
+            } catch {
+                failure.withLock { if $0 == nil { $0 = error } }
+            }
+            events[k].signaledValue = value
+        }
+        signalled = true
+        stages.predict = lap()
+        compose.waitUntilCompleted()
+        stages.composite = lap()
+        if let error = failure.withLock({ $0 }) { throw error }
+        if let error = compose.error { throw UpscaleError.gpu("\(error)") }
     }
 
     private func dispatch(_ encoder: MTLComputeCommandEncoder, _ pipeline: MTLComputePipelineState, width: Int, height: Int) {
@@ -543,6 +583,10 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         private(set) var support: MTLBuffer!
         /// The window surfaces, shared by Metal and Core ML.
         let surfaces: SubtitleUpscaleNeuralEngine.Surfaces.Pool
+        /// One event per window, which the CPU signals when that window's prediction returns and its composite
+        /// waits on; every pass signals a new value.
+        private var windowEvents: [MTLSharedEvent] = []
+        private var eventValue: UInt64 = 0
         private var maskCapacity = 0
         private var textures: [Int: MTLTexture] = [:]
         private var textureCache: CVMetalTextureCache?
@@ -557,6 +601,19 @@ public final class SubtitleUpscaler: @unchecked Sendable {
                 throw UpscaleError.unavailable("no \(length)-byte buffer")
             }
             return b
+        }
+
+        func events(_ count: Int) throws -> [MTLSharedEvent] {
+            while windowEvents.count < count {
+                guard let e = device.makeSharedEvent() else { throw UpscaleError.unavailable("no shared event") }
+                windowEvents.append(e)
+            }
+            return windowEvents
+        }
+
+        func nextEventValue() -> UInt64 {
+            eventValue += 1
+            return eventValue
         }
 
         func reserveMask(height: Int, wordsX: Int) throws {
