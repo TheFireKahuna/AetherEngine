@@ -39,9 +39,11 @@ extension AetherEngine {
     }
 
     /// Show track `index` as FORCED subtitles: what plays when the viewer has chosen no subtitle, the lines
-    /// a forced track carries, or only the lines a full track flags as forced. Everything else is
-    /// `selectSubtitleTrack(index:)`: the track becomes the active one and feeds `subtitleCues` (a host
-    /// drawing its own forced lines filters them by `SubtitleCue.isForced`). What differs is the native
+    /// a forced track carries, or only the lines a full bitmap track flags as forced. Everything else is
+    /// `selectSubtitleTrack(index:)`: the track becomes the active one and feeds `subtitleCues`, with only the
+    /// lines it flags forced (`SubtitleCue.isForced`) when it is a full bitmap track; a display set with none
+    /// is a clear, as on a disc player showing forced subtitles. The same holds when tvOS selects a full
+    /// track's forced rendition by itself and the engine follows it. What differs is the native
     /// rendition while `setNativeSubtitleRendering(true)` holds: it is the track's forced one, declared
     /// `FORCED=YES` under `LoadOptions.forcedSubtitleTrack`, which AVKit leaves out of its menu, so the menu
     /// keeps saying Off. tvOS normally selects that rendition by itself; this is for a host that has to
@@ -93,6 +95,15 @@ extension AetherEngine {
     func resumeForcedRenditionFill() {
         guard let ordinal = forcedRenditionRequestedOrdinal, subtitleOCRArmedOrdinal == nil else { return }
         fillForcedRendition(ordinal: ordinal)
+    }
+
+    /// The primary track shows as forced subtitles of a full bitmap track, which shows only the lines the track
+    /// flags forced (`selectForcedSubtitleTrack`), so the drain keeps only those. A forced track's every line is
+    /// forced by authoring, whatever its per-cue flags say.
+    func primaryShowsFlaggedForcedLinesOnly(decoder: EmbeddedSubtitleDecoder) -> Bool {
+        guard forcedSubtitleSelection, EmbeddedSubtitleDecoder.isBitmapCodec(decoder.codecID),
+              let id = activeSubtitleTrackIndex else { return false }
+        return !(subtitleTracks.first { $0.id == id }?.isForced ?? false)
     }
 
     private func selectSubtitleTrackPublicly(index: Int) {
@@ -589,7 +600,8 @@ extension AetherEngine {
                 window: window, coverageStart: coverageStart, retained: retained,
                 decoder: decoder, entries: entries, batchEnd: batchEnd, decodeEnd: decodeEnd,
                 gapHoldAt: gapHoldAt, gapHoldSequence: gapHoldSequence,
-                gapHoldTicksLeft: gapHoldTicksLeft, pulled: pulls))
+                gapHoldTicksLeft: gapHoldTicksLeft, pulled: pulls,
+                forcedLinesOnly: channel == .primary && primaryShowsFlaggedForcedLinesOnly(decoder: decoder)))
         }
         return work
     }
@@ -2324,6 +2336,8 @@ struct SubtitleDrainChannelWork {
     let gapHoldTicksLeft: Int
     /// The stream is pulled from the index (layer 3 step 3).
     let pulled: Bool
+    /// Only the lines the track flags forced show (`primaryShowsFlaggedForcedLinesOnly`).
+    let forcedLinesOnly: Bool
 }
 
 struct SubtitleDrainTickWork {
@@ -2338,6 +2352,7 @@ struct SubtitleDrainTickWork {
     var decodeHandoff: SubtitleDrainDecodeHandoff {
         SubtitleDrainDecodeHandoff(
             jobs: channels.map { ($0.decoder, $0.entries[..<$0.decodeEnd]) },
+            forcedLinesOnly: channels.map(\.forcedLinesOnly),
             upscaling: upscale.map { request in
                 (request, channels.map(\.streamIndex),
                  channels.map { $0.isReset && EmbeddedSubtitleDecoder.isBitmapCodec($0.decoder.codecID) })
@@ -2351,6 +2366,9 @@ struct SubtitleDrainTickWork {
 /// never read again once its batch lands.
 struct SubtitleDrainDecodeHandoff: @unchecked Sendable {
     let jobs: [(decoder: EmbeddedSubtitleDecoder, packets: ArraySlice<StoredSubtitlePacket>)]
+    /// Per job, whether only the cues the track flags forced show: the others are dropped from their events,
+    /// which keep their trims, so a display set without a forced object reads as a clear.
+    var forcedLinesOnly: [Bool] = []
     /// The overlay's upscale, each job's stream, and whether the job is a bitmap landing
     /// (`BitmapSubtitleUpscaling`); nil leaves the events as decoded, as the OCR worker reads them.
     var upscaling: (request: BitmapSubtitleUpscaling.Request, streams: [Int32], landings: [Bool])? = nil
@@ -2362,25 +2380,39 @@ struct SubtitleDrainDecodeHandoff: @unchecked Sendable {
     /// of that PTS's packets (#271): the tick publishes only once its cues are upscaled, so the landing line waits
     /// for its own upscale and its successor's, not the whole lead's, and the pass ends as it always does.
     func decode() -> [[EmbeddedSubtitleDecoder.SubtitleEvent?]] {
-        jobs.indices.map { k in
+        var tally = BitmapSubtitleUpscaling.Tally()
+        let decoded = jobs.indices.map { k in
             let job = jobs[k]
-            guard let upscaling else {
-                return job.packets.map { AetherEngine.decodeStoredSubtitlePacket($0, with: job.decoder) }
+            let forced = k < forcedLinesOnly.count && forcedLinesOnly[k]
+            func decode(_ packet: StoredSubtitlePacket) -> EmbeddedSubtitleDecoder.SubtitleEvent? {
+                let event = AetherEngine.decodeStoredSubtitlePacket(packet, with: job.decoder)
+                return forced ? event.map(Self.forcedLines) : event
             }
+            guard let upscaling else { return job.packets.map(decode) }
             let playhead = upscaling.request.playhead
             var events: [EmbeddedSubtitleDecoder.SubtitleEvent?] = []
             var stopAfter: Double?
             for packet in job.packets {
                 if let stop = stopAfter, packet.ptsSeconds > stop { break }
-                let event = AetherEngine.decodeStoredSubtitlePacket(packet, with: job.decoder)
+                let event = decode(packet)
                 events.append(event)
                 if upscaling.landings[k], stopAfter == nil,
                    event?.cues.contains(where: { $0.startTime >= playhead }) == true {
                     stopAfter = packet.ptsSeconds
                 }
             }
-            BitmapSubtitleUpscaling.shared.upscale(&events, stream: upscaling.streams[k], request: upscaling.request)
+            tally.add(BitmapSubtitleUpscaling.shared.upscale(&events, stream: upscaling.streams[k],
+                                                               request: upscaling.request))
             return events
         }
+        tally.report()
+        return decoded
+    }
+
+    /// `event` with only the cues its track flags forced, its trims kept.
+    static func forcedLines(_ event: EmbeddedSubtitleDecoder.SubtitleEvent) -> EmbeddedSubtitleDecoder.SubtitleEvent {
+        EmbeddedSubtitleDecoder.SubtitleEvent(cues: event.cues.filter(\.isForced), isPGS: event.isPGS,
+                                              pgsTrimAt: event.pgsTrimAt, textTrimAt: event.textTrimAt,
+                                              isSelfContainedPGS: event.isSelfContainedPGS)
     }
 }
