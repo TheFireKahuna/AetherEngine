@@ -43,6 +43,9 @@ final class Issue268HLSVODIngestTests: XCTestCase {
             Issue268URLProtocol.headersByURL[segment.absoluteString]?["X-Fixture"],
             "allowed"
         )
+        // The producer carries on with the response the carriage probe opened; a second request for
+        // the first segment would put its round trip in front of the first frame.
+        XCTAssertEqual(Issue268URLProtocol.requestCount(segment), 1)
     }
 
     func testMasterPlaylistUsesHighestBandwidthHEVCVariant() async throws {
@@ -424,10 +427,14 @@ final class Issue268HLSVODIngestTests: XCTestCase {
 final class Issue268URLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var bodyByURL: [String: Data] = [:]
     nonisolated(unsafe) static var headersByURL: [String: [String: String]] = [:]
+    private static let countLock = NSLock()
+    nonisolated(unsafe) private static var _requestCountByURL: [String: Int] = [:]
+    static func requestCount(_ url: URL) -> Int { countLock.withLock { _requestCountByURL[url.absoluteString] ?? 0 } }
 
     static func reset() {
         bodyByURL = [:]
         headersByURL = [:]
+        countLock.withLock { _requestCountByURL = [:] }
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -440,6 +447,7 @@ final class Issue268URLProtocol: URLProtocol, @unchecked Sendable {
             return
         }
         Self.headersByURL[url.absoluteString] = request.allHTTPHeaderFields ?? [:]
+        Self.countLock.withLock { Self._requestCountByURL[url.absoluteString, default: 0] += 1 }
         guard let data = Self.bodyByURL[url.absoluteString] else {
             client?.urlProtocol(self, didFailWithError: URLError(.fileDoesNotExist))
             return

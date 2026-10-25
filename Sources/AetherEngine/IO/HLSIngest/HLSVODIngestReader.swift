@@ -36,15 +36,29 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     /// AE#732: set under `LoadOptions.heldSourceConnection`. Every request of this reader then goes over
     /// one persistent HTTP/1.1 connection per origin, segments one at a time, instead of `session`.
     private let transport: PersistentHTTP1Transport?
-    /// AE#732: the first segment as the carriage probe left it on the persistent path, its head read and
-    /// the rest of the response still open, so the producer that starts there carries on with the same
-    /// response instead of asking for the segment again.
+    /// The first segment as the carriage probe left it, its head read and the rest of the response
+    /// still open, so the producer that starts there carries on with the same response instead of
+    /// asking for the segment again: a second request would put its round trip in front of the first
+    /// frame.
     private var primedSegment: PrimedSegment?
 
     private struct PrimedSegment {
         let url: URL
         let head: Data
-        let body: PersistentHTTP1Transport.Body
+        let rest: Rest
+
+        enum Rest {
+            /// AE#732: on the persistent HTTP/1.1 connection, which the open body holds.
+            case persistent(PersistentHTTP1Transport.Body)
+            /// On the engine's pool.
+            case pooled(HLSCarriageProbe.SegmentStream)
+        }
+
+        /// Lets go of the rest of the response: the persistent body drains or closes its connection,
+        /// a pooled stream ends its transfer once nothing holds it.
+        func abandon() {
+            if case .persistent(let body) = rest { body.abandon() }
+        }
     }
     private let condition = NSCondition()
     private let keyCacheLock = NSLock()
@@ -284,7 +298,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         condition.broadcast()
         condition.unlock()
         task?.cancel()
-        primed?.body.abandon()
+        primed?.abandon()
         transport?.close()
         // An injected session is its caller's; the pool is everyone's, so only this reader's own go.
         if session === EngineHTTP.session { requests.cancelAll() }
@@ -394,6 +408,18 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             return
         }
 
+        // The probe's response for the first segment, when this run opens on it.
+        let primed = condition.withLock { () -> PrimedSegment? in
+            defer { primedSegment = nil }
+            return primedSegment
+        }
+        var primedStream: (head: Data, rest: HLSCarriageProbe.SegmentStream)?
+        if let primed, case .pooled(let rest) = primed.rest,
+           resolvedSegments.first?.1 == primed.url, resolvedSegments.first?.0.crypt == nil {
+            primedStream = (primed.head, rest)
+        } else {
+            primed?.abandon()
+        }
         var window = Self.maxConcurrentSegmentFetches
         var checked = false
         var firstSegmentBytes = 0
@@ -409,8 +435,12 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             },
             stream: { [self] index, deliver in
                 let (segment, url) = resolvedSegments[index]
-                return try await streamSegment(
-                    url, limit: BoundedFetch.segmentLimit(forDuration: segment.duration), into: deliver)
+                let limit = BoundedFetch.segmentLimit(forDuration: segment.duration)
+                if index == 0, let opened = primedStream {
+                    primedStream = nil
+                    return try await continueSegment(opened.rest, after: opened.head, limit: limit, into: deliver)
+                }
+                return try await streamSegment(url, limit: limit, into: deliver)
             },
             deliver: { [self] index, bytes, isLast in
                 if index == 0 {
@@ -440,9 +470,29 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         }
         let status = (body.response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else { throw HLSIngestError.playlistUnreachable(status: status) }
-        var total = 0
+        var chunks = body.chunks.makeAsyncIterator()
+        return try await deliverBody(head: Data(), next: { try await chunks.next() }, status: status,
+                                     limit: limit, into: deliver)
+    }
+
+    /// The rest of a segment whose head the carriage probe already read off the same response.
+    private func continueSegment(
+        _ rest: HLSCarriageProbe.SegmentStream, after head: Data, limit: Int,
+        into deliver: (Data) async throws -> Bool
+    ) async throws -> Bool {
+        let status = (rest.response as? HTTPURLResponse)?.statusCode ?? -1
+        return try await deliverBody(head: head, next: { try await rest.next() }, status: status,
+                                     limit: limit, into: deliver)
+    }
+
+    private func deliverBody(
+        head: Data, next: () async throws -> Data?, status: Int, limit: Int,
+        into deliver: (Data) async throws -> Bool
+    ) async throws -> Bool {
+        var total = head.count
+        if !head.isEmpty, !(try await deliver(head)) { return false }
         do {
-            for try await chunk in body.chunks {
+            while let chunk = try await next() {
                 total += chunk.count
                 guard try await deliver(chunk) else { return false }
             }
@@ -469,10 +519,10 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         // A probe response this run does not open with holds the origin; let it go before any request,
         // or that request waits behind a body nobody will read.
         if let ready = primed, segments.first?.1 != ready.url || segments.first?.0.crypt != nil {
-            ready.body.abandon()
+            ready.abandon()
             primed = nil
         }
-        defer { primed?.body.abandon() }
+        defer { primed?.abandon() }
         for (offset, (segment, url)) in segments.enumerated() {
             try Task.checkCancellation()
             // Runs on the producer's BlockingWork executor. The last offered chunk can fill the
@@ -490,11 +540,11 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             }
             let head: Data
             let body: PersistentHTTP1Transport.Body
-            if offset == 0, let ready = primed, ready.url == url {
-                (head, body) = (ready.head, ready.body)
+            if offset == 0, let ready = primed, ready.url == url, case .persistent(let readyBody) = ready.rest {
+                (head, body) = (ready.head, readyBody)
                 primed = nil
             } else {
-                primed?.body.abandon()
+                primed?.abandon()
                 primed = nil
                 body = try await openSegment(url, limit: BoundedFetch.segmentLimit(forDuration: segment.duration))
                 head = Data()
@@ -759,21 +809,33 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             }
             guard !head.isEmpty else { throw HLSIngestError.unsupportedSegmentFormat }
             if verdict == .hevcInMPEGTS {
-                let displaced = condition.withLock { () -> PrimedSegment? in
-                    defer { primedSegment = PrimedSegment(url: url, head: head, body: body) }
-                    return primedSegment
-                }
-                displaced?.body.abandon()
+                prime(PrimedSegment(url: url, head: head, rest: .persistent(body)))
             } else {
                 body.abandon()
             }
             return verdict
         }
-        return try await HLSCarriageProbe.classifySegmentHead(
+        // The whole segment is asked for and the head read off its front: an HEVC source keeps the
+        // response for its producer, any other ends it here.
+        let (head, rest) = try await HLSCarriageProbe.openSegmentHead(
             url: url,
-            httpHeaders: RedirectHeaderPolicy.scoped(httpHeaders, grantedFor: playlistURL, sentTo: url),
-            session: session
-        )
+            httpHeaders: scopedHeaders(url),
+            session: session,
+            limit: BoundedFetch.segmentLimit(forDuration: duration),
+            owner: session === EngineHTTP.session ? requests : nil)
+        if head.verdict == .hevcInMPEGTS {
+            prime(PrimedSegment(url: url, head: head.bytes, rest: .pooled(rest)))
+        }
+        return head.verdict
+    }
+
+    /// Keeps `primed` for the producer, letting go of whatever it displaces.
+    private func prime(_ primed: PrimedSegment) {
+        let displaced = condition.withLock { () -> PrimedSegment? in
+            defer { primedSegment = primed }
+            return primedSegment
+        }
+        displaced?.abandon()
     }
 
     private func decrypt(

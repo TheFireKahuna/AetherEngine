@@ -117,10 +117,10 @@ enum HLSCarriageProbe {
         }
     }
 
-    /// Reads the head of a segment and classifies its carriage. The body is streamed and abandoned at the
-    /// first definitive verdict, so a conforming segment costs the two packets that carry PAT and PMT
-    /// rather than the full ceiling; an origin that ignores the Range request is bounded the same way, by
-    /// cancelling the task instead of buffering the segment.
+    /// Reads the head of a segment and classifies its carriage. The body is read in the chunks the
+    /// session delivers and abandoned at the first definitive verdict, so a conforming segment costs
+    /// the two packets that carry PAT and PMT rather than the full ceiling; an origin that ignores the
+    /// Range request is bounded the same way, by ending the transfer instead of buffering the segment.
     static func classifySegmentHead(
         url: URL,
         httpHeaders: [String: String],
@@ -128,31 +128,82 @@ enum HLSCarriageProbe {
     ) async throws -> MPEGTransportStreamCodecProbe.Verdict {
         var request = makeRequest(url, httpHeaders: httpHeaders)
         request.setValue("bytes=0-\(maximumSegmentHeadBytes - 1)", forHTTPHeaderField: "Range")
-        if session === EngineHTTP.session { request.timeoutInterval = idleTimeoutSeconds }
-        let (bytes, response) = try await session.bytes(for: request)
-        defer { bytes.task.cancel() }
-        if session === EngineHTTP.session {
-            EngineHTTP.armResourceDeadline(bytes.task, seconds: resourceTimeoutSeconds)
+        let stream = try await openSegment(request, session: session, limit: .max)
+        return try await readHead(of: stream).verdict
+    }
+
+    /// A segment's head, classified, with the rest of its response still open: the VOD ingest starts
+    /// its producer on the same response rather than asking for the segment again, which would put a
+    /// second round trip in front of the first frame. `limit` bounds the whole body.
+    static func openSegmentHead(
+        url: URL,
+        httpHeaders: [String: String],
+        session: URLSession,
+        limit: Int,
+        owner: EngineHTTPRequests? = nil
+    ) async throws -> (head: SegmentHead, rest: SegmentStream) {
+        let stream = try await openSegment(makeRequest(url, httpHeaders: httpHeaders), session: session,
+                                           limit: limit, owner: owner)
+        return (try await readHead(of: stream), stream)
+    }
+
+    /// What the head read settled on, and the bytes it took to get there.
+    struct SegmentHead {
+        let verdict: MPEGTransportStreamCodecProbe.Verdict
+        let bytes: Data
+    }
+
+    /// A segment body being read as it arrives (`BoundedFetch.stream`), by one consumer at a time,
+    /// which may hand it on: the probe reads the head, the producer reads the rest. Dropping it ends
+    /// the transfer.
+    final class SegmentStream: @unchecked Sendable {
+        let response: URLResponse
+        private var iterator: AsyncThrowingStream<Data, Error>.AsyncIterator
+
+        fileprivate init(_ body: BoundedFetch.BodyStream) {
+            response = body.response
+            iterator = body.chunks.makeAsyncIterator()
         }
-        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+
+        /// The next piece of the body, nil at its end.
+        func next() async throws -> Data? {
+            try await iterator.next()
+        }
+    }
+
+    private static func openSegment(
+        _ request: URLRequest, session: URLSession, limit: Int, owner: EngineHTTPRequests? = nil
+    ) async throws -> SegmentStream {
+        var request = request
+        let pooled = session === EngineHTTP.session
+        if pooled { request.timeoutInterval = idleTimeoutSeconds }
+        let body = try await BoundedFetch.stream(
+            for: request, session: session, limit: limit,
+            resourceTimeout: pooled ? resourceTimeoutSeconds : nil, owner: owner)
+        let status = (body.response as? HTTPURLResponse)?.statusCode ?? -1
         guard status == 200 || status == 206 else {
             throw HLSIngestError.playlistUnreachable(status: status)
         }
+        return SegmentStream(body)
+    }
+
+    /// Reads `stream` until the PMT settles the carriage or `maximumSegmentHeadBytes` have arrived,
+    /// re-judging every `segmentHeadChunkBytes`.
+    private static func readHead(of stream: SegmentStream) async throws -> SegmentHead {
         var data = Data()
         data.reserveCapacity(segmentHeadChunkBytes)
         var nextVerdictAt = segmentHeadChunkBytes
-        for try await byte in bytes {
-            data.append(byte)
+        while let chunk = try await stream.next() {
+            data.append(chunk)
             guard data.count >= nextVerdictAt else { continue }
-            let verdict = MPEGTransportStreamCodecProbe.classify(data)
-            if verdict != .inconclusive { return verdict }
+            let verdict = MPEGTransportStreamCodecProbe.classify(data.prefix(maximumSegmentHeadBytes))
+            if verdict != .inconclusive { return SegmentHead(verdict: verdict, bytes: data) }
             guard data.count < maximumSegmentHeadBytes else { break }
             nextVerdictAt = min(maximumSegmentHeadBytes, data.count + segmentHeadChunkBytes)
         }
-        guard !data.isEmpty else {
-            throw HLSIngestError.unsupportedSegmentFormat
-        }
-        return MPEGTransportStreamCodecProbe.classify(data)
+        guard !data.isEmpty else { throw HLSIngestError.unsupportedSegmentFormat }
+        return SegmentHead(verdict: MPEGTransportStreamCodecProbe.classify(data.prefix(maximumSegmentHeadBytes)),
+                           bytes: data)
     }
 
     /// Resolves the playlist down to the segment whose PMT answers the question, or settles the verdict
