@@ -158,6 +158,20 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         return decoded.filter { $0.key <= ms }.max { $0.key < $1.key }.map { ($0.value, Double($0.key) / 1000) }
     }
 
+    /// Whether a picture within `toleranceSeconds` of `seconds` (item time) has been decoded.
+    func hasPicture(near seconds: Double, toleranceSeconds: Double) -> Bool {
+        let ms = Int64((seconds * 1000).rounded()), tolerance = Int64((toleranceSeconds * 1000).rounded())
+        state.lock()
+        defer { state.unlock() }
+        return decoded.keys.contains { abs($0 - ms) <= tolerance }
+    }
+
+    /// Where the decode works toward, in item seconds.
+    var clockSeconds: Double {
+        state.lock(); defer { state.unlock() }
+        return Double(clockMs) / 1000
+    }
+
     var held: (units: Int, decoded: Int) {
         state.lock(); defer { state.unlock() }
         return (entries.count, decoded.count)

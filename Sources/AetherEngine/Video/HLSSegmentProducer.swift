@@ -648,6 +648,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// The overlay session's decode, handed every source video packet before the placeholder takes its place. Set
     /// with `overlayPlaceholder`.
     var overlayDecodeTap: OverlayDecodeTap?
+    /// Whether this run's first segment has been released to AVPlayer (`releaseOverlayRunStart`). Pump thread only.
+    private var overlayRunStartReleased = false
+    /// Bounds the wait for a run's first picture: a decoder that cannot produce it in this long would not keep up
+    /// with the clock either, and AVPlayer is better told by a stall than by a wedged segment.
+    static let overlayRunStartTimeout: TimeInterval = 5
     private var loggedFirstDtsBump = false
     private var loggedFirstDtsDrop = false
 
@@ -2758,6 +2763,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // the NEW producer's position. Cutting on it would adopt this pump's partial segment under
         // its full index; the teardown rule decides what happens to the in-flight segment instead.
         if checkShouldStop() { return nil }
+        releaseOverlayRunStart()
         switch muxer.cutFragmentForNextSegment(newIdx) {
         case .completed(let path, let bytesWritten):
             EngineLog.emit(
@@ -2993,7 +2999,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var servesProgressively: Bool { !isLive && servesSegmentsProgressively }
 
     private func noteSegmentInProgress(_ index: Int, muxer: MP4SegmentMuxer) {
-        guard servesProgressively else { return }
+        // An overlay run's first segment is served whole, once its picture is decoded.
+        guard servesProgressively, overlayDecodeTap == nil || overlayRunStartReleased else { return }
         cache.beginInProgress(index: index, stagingPath: muxer.stagingURL)
     }
 
@@ -3018,9 +3025,25 @@ final class HLSSegmentProducer: @unchecked Sendable {
         onSegmentWritten?(index, Double(videoShiftPts) * sourceVideoTbSeconds)
     }
 
+    /// An overlay session: the run's first segment waits for the overlay's decode to have the run's first picture.
+    /// AVPlayer prerolls the placeholder at once and starts its clock as soon as it has the segment, so this is the
+    /// one point where it has to wait for a decoder it does not own; after it the decoder only has to keep pace.
+    private func releaseOverlayRunStart() {
+        guard let overlayDecodeTap, !overlayRunStartReleased else { return }
+        overlayRunStartReleased = true
+        let start = DispatchTime.now()
+        let ready = overlayDecodeTap.awaitRunStart(timeout: Self.overlayRunStartTimeout) { [weak self] in
+            self?.checkShouldStop() ?? true
+        }
+        let waitedMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
+        EngineLog.emit("[HLSSegmentProducer] overlay run start: \(ready ? "first picture decoded" : "no picture yet, released") "
+                       + "after \(String(format: "%.0f", waitedMs)) ms", category: .session)
+    }
+
     private func finalizeSessionMuxerAndAdopt() {
         guard let muxer = currentMuxer else { return }
         let idx = currentMuxerSegmentIndex
+        releaseOverlayRunStart()
         if let result = muxer.finalize() {
             EngineLog.emit(
                 "[HLSSegmentProducer] seg-\(idx).m4s captured (\(result.bytesWritten) B)",
@@ -3861,7 +3884,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // AVC VOD can carry new SPS/PPS even while its file header stays unchanged.
                 // Inspect on the producer queue, before the first stale-init sample is written.
                 // An active IDR reference is required; unused/repeated sets do not change routing.
-                if packet.pointee.stream_index == videoStreamIndex,
+                // An overlay session's init is its placeholder's, which no source change touches: its decoder takes
+                // the source's parameter sets in band.
+                if overlayPlaceholder == nil, packet.pointee.stream_index == videoStreamIndex,
                    case .lengthPrefixed(let size) = a53NALFraming,
                    let data = packet.pointee.data, packet.pointee.size > 0,
                    let mismatch = vodH264Configuration?.observe(
@@ -3871,7 +3896,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     exitReason = .videoConfigurationChanged(summary: mismatch.summary)
                     break readLoop
                 }
-                if packet.pointee.stream_index == videoStreamIndex,
+                if overlayPlaceholder == nil, packet.pointee.stream_index == videoStreamIndex,
                    let data = packet.pointee.data, packet.pointee.size > 0,
                    let mismatch = vodHEVCConfiguration?.observe(UnsafeBufferPointer(start: data, count: Int(packet.pointee.size))) {
                     EngineLog.emit("[HLSSegmentProducer] \(mismatch.summary); stopping stale-init VOD epoch=\(epoch)",

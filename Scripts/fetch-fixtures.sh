@@ -9,6 +9,7 @@
 #   hdr10-hevc.mp4  - HEVC Main10 BT.2020 / PQ, native AVPlayer path with HDR
 #   av1.mp4         - AV1, software dav1d path on devices without HW
 #   vp9.webm        - VP9, software libavcodec path
+#   overlay-mpeg2.mkv - MPEG-2 + AAC, 8 s, a keyframe every 2 s: the software overlay over an AVPlayer placeholder
 #
 # plus two clips for RestartTimelineContinuityTests (the suite skips
 # those tests when the clips are absent, e.g. on CI):
@@ -115,6 +116,15 @@ ffmpeg -hide_banner -loglevel error -y \
     -f lavfi -i "testsrc2=size=1920x1080:rate=24" \
     -t 5 -c:v libvpx-vp9 -crf 30 -b:v 0 -cpu-used 8 \
     "$FIXTURES_DIR/vp9.webm"
+
+# MPEG-2 with B-frames and AAC: a codec AVPlayer cannot decode, so the session decodes it and shows it in the
+# software overlay over a placeholder (docs/software-route-gpu.md Part 1). Drives SoftwareOverlayEngineTests.
+echo "→ overlay-mpeg2.mkv (MPEG-2 720p @ 25fps + AAC, 8s)"
+ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "testsrc2=size=1280x720:rate=25" \
+    -f lavfi -i "sine=frequency=440:sample_rate=48000" \
+    -t 8 -c:v mpeg2video -q:v 4 -g 50 -bf 2 -c:a aac -b:a 128k \
+    "$FIXTURES_DIR/overlay-mpeg2.mkv"
 
 # Restart-continuity witness: A/V with real B-frame reorder (bf 3) and a keyframe
 # every 2 s so the 4 s segment plan cuts on keyframes. Drives

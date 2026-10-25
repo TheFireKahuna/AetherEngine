@@ -928,6 +928,10 @@ extension AetherEngine {
         // LoadOptions.felOverlay: the session's own read of the source feeds the overlay's enhancement layer.
         session.felTap = felOverlayWanted ? FelEnhancementTap() : nil
         #endif
+        // A stream AVPlayer cannot decode: the session decodes it for the software overlay, which shows it over a
+        // placeholder, deinterlaced or film-matched as the load decided.
+        session.overlayDecodesVideo = overlayDecodesVideoWanted
+        session.overlayDeinterlace = DeinterlaceConfig(fieldRate: loadedOptions.deinterlaceFieldRate, film: loadFilmCarriage)
         // #240: a scrub thumbnail waits out a seek in flight. Set before start().
         session.seekInFlight = seekInFlight
         // How far the subtitle consumers ask the pump to have read on the source axis: the playback clock
