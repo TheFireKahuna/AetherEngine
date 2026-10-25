@@ -50,73 +50,11 @@ struct RendererRecoveryTests {
         #expect(reported == [3, 123, 243])
     }
 
-    private func pcm(pts: Int64) throws -> CMSampleBuffer {
-        var asbd = AudioStreamBasicDescription(mSampleRate: 48_000, mFormatID: kAudioFormatLinearPCM,
-                                               mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-                                               mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4,
-                                               mChannelsPerFrame: 1, mBitsPerChannel: 32, mReserved: 0)
-        var format: CMAudioFormatDescription?
-        CMAudioFormatDescriptionCreate(allocator: nil, asbd: &asbd, layoutSize: 0, layout: nil, magicCookieSize: 0,
-                                       magicCookie: nil, extensions: nil, formatDescriptionOut: &format)
-        var block: CMBlockBuffer?
-        CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil, blockLength: 4096, blockAllocator: nil,
-                                           customBlockSource: nil, offsetToData: 0, dataLength: 4096,
-                                           flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block)
-        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 48_000),
-                                        presentationTimeStamp: CMTime(value: pts, timescale: 48_000), decodeTimeStamp: .invalid)
-        var out: CMSampleBuffer?
-        CMSampleBufferCreate(allocator: nil, dataBuffer: block, dataReady: true, makeDataReadyCallback: nil, refcon: nil,
-                             formatDescription: try #require(format), sampleCount: 1024, sampleTimingEntryCount: 1,
-                             sampleTimingArray: &timing, sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &out)
-        return try #require(out)
-    }
-
     private final class Count: @unchecked Sendable {
         private let lock = NSLock()
         private var n = 0
         func bump() { lock.withLock { n += 1 } }
         var value: Int { lock.withLock { n } }
-    }
-
-    @Test("the audio output reports a failed renderer once, and again only after a flush")
-    func audioReportsOncePerFlush() throws {
-        let output = AudioOutput()
-        let reports = Count()
-        output.onRendererFailed = { _ in reports.bump() }
-        output.simulatesRendererFailureForTesting = true
-        output.enqueue(sampleBuffer: try pcm(pts: 0))
-        output.enqueue(sampleBuffer: try pcm(pts: 1024))
-        #expect(reports.value == 1)
-        output.flush()
-        output.enqueue(sampleBuffer: try pcm(pts: 2048))
-        #expect(reports.value == 2)
-    }
-
-    /// A buffer no renderer can play: an unknown compressed format. On macOS it fails the renderer for real
-    /// (-11800), which `simulatesRendererFailureForTesting` only pretends.
-    private func unplayable(pts: Int64) throws -> CMSampleBuffer {
-        var asbd = AudioStreamBasicDescription(mSampleRate: 48_000, mFormatID: 0x7878_7878, mFormatFlags: 0,
-                                               mBytesPerPacket: 0, mFramesPerPacket: 1024, mBytesPerFrame: 0,
-                                               mChannelsPerFrame: 2, mBitsPerChannel: 0, mReserved: 0)
-        var format: CMAudioFormatDescription?
-        CMAudioFormatDescriptionCreate(allocator: nil, asbd: &asbd, layoutSize: 0, layout: nil, magicCookieSize: 0,
-                                       magicCookie: nil, extensions: nil, formatDescriptionOut: &format)
-        var block: CMBlockBuffer?
-        CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil, blockLength: 512, blockAllocator: nil,
-                                           customBlockSource: nil, offsetToData: 0, dataLength: 512,
-                                           flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block)
-        var packet = AudioStreamPacketDescription(mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: 512)
-        var out: CMSampleBuffer?
-        CMAudioSampleBufferCreateReadyWithPacketDescriptions(
-            allocator: nil, dataBuffer: try #require(block), formatDescription: try #require(format), sampleCount: 1,
-            presentationTimeStamp: CMTime(value: pts, timescale: 48_000), packetDescriptions: &packet,
-            sampleBufferOut: &out)
-        return try #require(out)
-    }
-
-    private func waitUntil(_ condition: () -> Bool) async throws -> Bool {
-        for _ in 0..<200 where !condition() { try await Task.sleep(for: .milliseconds(10)) }
-        return condition()
     }
 
     /// Feeds PCM the way a playing session does, from `pts` on, until `reports` reaches `count`. The renderer's own
@@ -125,7 +63,7 @@ struct RendererRecoveryTests {
     private func feed(_ output: AudioOutput, from pts: Int64, until reports: Count, reach count: Int) async throws -> Int64 {
         var next = pts
         for _ in 0..<100 where reports.value < count {
-            output.enqueue(sampleBuffer: try pcm(pts: next))
+            output.enqueue(sampleBuffer: try audioPacket(pts: next))
             next += 1024
             try await Task.sleep(for: .milliseconds(20))
         }
@@ -138,7 +76,8 @@ struct RendererRecoveryTests {
         let output = AudioOutput(throughReceivers: throughReceivers)
         let reports = Count()
         output.onRendererFailed = { _ in reports.bump() }
-        output.enqueue(sampleBuffer: try unplayable(pts: 0))
+        // A format no renderer can play fails it for real.
+        output.enqueue(sampleBuffer: try audioPacket(pts: 0, format: 0x7878_7878))
         let next = try await feed(output, from: 1024, until: reports, reach: 1)
         #expect(reports.value == 1)
         output.flush()
@@ -155,7 +94,7 @@ struct RendererRecoveryTests {
         let reports = Count()
         output.onRendererFailed = { _ in reports.bump() }
         // The renderer fails on a buffer it cannot play only when that is its first format.
-        output.enqueue(sampleBuffer: try unplayable(pts: 0))
+        output.enqueue(sampleBuffer: try audioPacket(pts: 0, format: 0x7878_7878))
         let next = try await feed(output, from: 1024, until: reports, reach: 1)
         #expect(reports.value == 1)
         let failed = output.renderer
@@ -168,8 +107,7 @@ struct RendererRecoveryTests {
         #expect(fresh.volume == 0.25)
         #expect(output.usesReceiver == throughReceivers, "the replacement goes the way the first renderer went")
         #expect(output.rendererReplacementCount == 1)
-        #expect(try await waitUntil { !output.synchronizer.renderers.contains { $0 === failed } },
-                "the failed renderer leaves the synchronizer")
+        try await waitFor { !output.synchronizer.renderers.contains { $0 === failed } }
         #expect(output.synchronizer.renderers.contains { $0 === fresh })
 
         // The refeed carried the unplayable buffer too, so the new renderer fails on it and says so: reported afresh.
@@ -185,7 +123,7 @@ struct RendererRecoveryTests {
         output.flush()
         let replacedAgain = output.replaceFailedRenderer()
         #expect(replacedAgain == 0, "a flush left nothing to give back")
-        for i in 0..<5 { output.enqueue(sampleBuffer: try pcm(pts: after + Int64(i) * 1024)) }
+        for i in 0..<5 { output.enqueue(sampleBuffer: try audioPacket(pts: after + Int64(i) * 1024)) }
         try await Task.sleep(for: .milliseconds(200))
         #expect(reports.value == 2)
         #expect(output.renderer.status != .failed)

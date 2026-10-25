@@ -559,9 +559,6 @@ final class AudioOutput: @unchecked Sendable {
         if let offsetLine { EngineLog.emit(offsetLine, category: .swPlayback) }
         if let automaticFlushLine { EngineLog.emit(automaticFlushLine, category: .swPlayback) }
         if failure != nil { reportRendererFailure(of: enqueuedInto) }
-        #if DEBUG
-        if simulatesRendererFailureForTesting { reportRendererFailure(of: enqueuedInto) }
-        #endif
 
         #if DEBUG
         // Once per session: first enqueue + any renderer rejection, to distinguish "nothing enqueued" from
@@ -584,9 +581,7 @@ final class AudioOutput: @unchecked Sendable {
     }
 
     #if DEBUG
-    /// Test-only: every enqueue reports as if the renderer had failed, the one state a test cannot put it in.
-    var simulatesRendererFailureForTesting = false
-    /// Test-only: answers the partial flush of an offset change in place of the renderer within
+    /// Test-only: asks the renderer for the partial flush of an offset change without
     /// `AudioRendererIO.partialFlushTimeout`, whose answer on a loaded machine comes after it and turns `.flushed` into
     /// `.unanswered`. Called with `lock` held.
     var partialFlushForTesting: ((AudioRendererIO, CMTime) -> AudioRendererIO.PartialFlush)?
