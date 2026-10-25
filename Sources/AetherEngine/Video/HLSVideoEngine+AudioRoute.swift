@@ -250,7 +250,7 @@ extension HLSVideoEngine {
             )
             let probeAudio = MP4SegmentMuxer.AudioConfig(
                 codecpar: cfg.codecpar,
-                timeBase: cfg.timeBase
+                timeBase: cfg.inputTimeBase
             )
             let probeRet = MP4SegmentMuxer.probeWriteHeader(
                 video: probeVideo,
@@ -358,14 +358,11 @@ extension HLSVideoEngine {
                     return run
                 } ?? bridge
                 let cfg = HLSSegmentProducer.AudioConfig(
+                    bridging: audioStream,
                     codecpar: cp,
-                    timeBase: bridge.encoderTimeBase,
                     sourceStreamIndex: sourceAudioStreamIndex,
-                    inputTimeBase: bridge.encoderTimeBase,
-                    sourceTimeBase: audioStream.pointee.time_base,
                     bridge: delivered,
-                    language: audioLanguage,
-                    sourceStart: audioStream.pointee.start_time == Int64.min ? nil : audioStream.pointee.start_time
+                    language: audioLanguage
                 )
                 self.savedAudioConfig = cfg
                 self.audioBridge = delivered

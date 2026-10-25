@@ -21,9 +21,11 @@ struct AVSyncTests {
 
     struct Clip: CustomTestStringConvertible, Sendable {
         let name: String
-        /// Matroska stores 1 ms ticks, so a clip's first audio timestamp is up to half of one off what
-        /// the codec's frame grid says; the other containers state the sample.
-        var toleranceSamples: Double { name.hasSuffix(".mkv") ? 24 : 1 }
+        /// Matroska stores 1 ms ticks, up to 24 samples either side of a frame. Audio coded in frames
+        /// is placed on its frame grid, which the rounded timestamp names exactly (`SourceGrid`), so it
+        /// lands on the sample like every other container's; PCM has no grid, frames start anywhere,
+        /// and the rounded timestamp is all there is.
+        var toleranceSamples: Double { name == "pcm.mkv" ? 24 : 1 }
         var testDescription: String { name }
     }
 

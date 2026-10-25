@@ -84,12 +84,8 @@ struct LiveSourceReplayTests {
         let stream = try #require(demuxer.stream(at: index))
         var audio: HLSSegmentProducer.AudioConfig?
         if let stream = demuxer.stream(at: demuxer.audioStreamIndex) {
-            audio = .init(codecpar: UnsafePointer(stream.pointee.codecpar),
-                          timeBase: stream.pointee.time_base,
-                          sourceStreamIndex: demuxer.audioStreamIndex,
-                          inputTimeBase: stream.pointee.time_base,
-                          sourceTimeBase: stream.pointee.time_base,
-                          bridge: nil, framing: .adts)
+            audio = .init(copying: stream, codecpar: UnsafePointer(stream.pointee.codecpar),
+                          sourceStreamIndex: demuxer.audioStreamIndex, framing: .adts)
         }
         let cache = retainedCache ?? SegmentCache(forwardWindow: 32, backwardWindow: 32)
         let baseIndex = predecessor == nil ? 0 : cache.count

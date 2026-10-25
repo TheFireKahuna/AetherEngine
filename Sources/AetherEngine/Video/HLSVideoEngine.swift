@@ -527,10 +527,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
     }
 
-    /// Per-frame fallback durations in source time_base for backfilling `pkt->duration`
-    /// when the matroska demuxer drops per-block durations. Computed once in `start()`.
+    /// Per-frame fallback duration in source time_base for backfilling `pkt->duration` when the
+    /// matroska demuxer drops per-block durations. Computed once in `start()`; audio's is its
+    /// `AudioConfig.frameDuration`.
     private var videoFallbackDurationPts: Int64 = 40
-    private var audioFallbackDurationPts: Int64 = 0
 
     /// First video keyframe PTS in source video TB. Non-zero on MKV remuxes where the IDR lives
     /// past PTS=0. Producer subtracts this from every packet so seg-0's tfdt aligns with the
@@ -2161,39 +2161,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     )
                 }
                 streamCopyAudio = HLSSegmentProducer.AudioConfig(
+                    copying: audioStream,
                     codecpar: UnsafePointer(ownedAudioParams.ptr),
-                    timeBase: audioStream.pointee.time_base,
                     sourceStreamIndex: audioStreamIndex,
-                    inputTimeBase: audioStream.pointee.time_base,
-                    sourceTimeBase: audioStream.pointee.time_base,
-                    bridge: nil,
                     framing: latmConfig.map { .latm(config: $0) }
                         ?? bluRayLPCM.map { .bluRayLPCM($0) } ?? (stripAdts ? .adts : .raw),
                     language: audioLanguage
                 )
-                // Audio fallback duration from codec-fixed frame sizes (AC3/EAC3=1536, AAC=1024).
                 let acp = audioStream.pointee.codecpar.pointee
-                let sampleRate = Int64(acp.sample_rate)
-                let frameSamples: Int64 = {
-                    if acp.frame_size > 0 { return Int64(acp.frame_size) }
-                    if let declared = FLACStreamInfo.fixedBlockSize(UnsafePointer(audioStream.pointee.codecpar)) {
-                        return declared
-                    }
-                    switch acp.codec_id {
-                    case AV_CODEC_ID_AC3, AV_CODEC_ID_EAC3: return 1536
-                    case AV_CODEC_ID_AAC: return 1024
-                    case AV_CODEC_ID_MP3: return 1152
-                    case AV_CODEC_ID_FLAC, AV_CODEC_ID_ALAC: return 4096
-                    default: return 1024
-                    }
-                }()
-                let audioTb = audioStream.pointee.time_base
-                self.audioFallbackDurationPts = {
-                    guard sampleRate > 0, audioTb.num > 0, audioTb.den > 0 else { return 1 }
-                    let num = frameSamples * Int64(audioTb.den)
-                    let den = sampleRate * Int64(audioTb.num)
-                    return max(1, num / den)
-                }()
                 // Always `ec-3` per RFC 6381 (never `ec+3`: tvOS 26.5 enforces strict RFC 6381,
                 // same as iOS; `ec+3` produced -11848/-15517, Vincent test 2026-05-26). JOC/Atmos
                 // signaling lives in the per-segment `dec3` box, not the CODECS string (#34).
@@ -2209,7 +2184,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 EngineLog.emit(
                     "[HLSVideoEngine] audio: codec=\(compat) → stream-copy as `\(audioHLSCodecs ?? "?")` "
                     + "\(isJOC ? "[JOC=Atmos] " : "")"
-                    + "(fallback duration=\(audioFallbackDurationPts) in audioTb \(audioTb.num)/\(audioTb.den))",
+                    + "(frame \(streamCopyAudio?.frameDuration ?? 0) samples)",
                     category: .session
                 )
             } else {
@@ -3519,7 +3494,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
             baseIndex: baseIndex,
             targetSegmentDurationSeconds: liveCutTargetSeconds,
             videoFallbackDurationPts: videoFallbackDurationPts,
-            audioFallbackDurationPts: audioFallbackDurationPts,
             restartTargetVideoPts: videoTarget,
             boundaryClaimsRandomAccess: planBoundariesClaimRandomAccess,
             planBoundaryAxis: planBoundaryAxis,
