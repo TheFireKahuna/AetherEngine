@@ -4,19 +4,19 @@
     {
       "identity" : "ffmpegbuild",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/superuser404notfound/FFmpegBuild",
+      "location" : "https://github.com/TheFireKahuna/FFmpegBuild",
       "state" : {
-        "revision" : "013c48bd4d3073428f31cade039ec4ed958d0ceb",
-        "version" : "3.7.1"
+        "revision" : "6a2d3af66eddc417a1ee95add60f867475c34054",
+        "version" : "3.10.1"
       }
     },
     {
-      "identity" : "libdovi",
+      "identity" : "libdeinterlace",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/superuser404notfound/LibDovi",
+      "location" : "https://github.com/TheFireKahuna/LibDeinterlace",
       "state" : {
-        "revision" : "0d7cce1d6836a30d13a3a2326e50a153af53f014",
-        "version" : "2.1.0"
+        "revision" : "dc5f8bc289799b7dd17b74a16ada9cc87f9840fc",
+        "version" : "1.0.0"
       }
     },
     {

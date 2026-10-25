@@ -97,7 +97,17 @@ struct HEVCInBandColour {
     /// The colour the SPS's VUI states, nil for each field it leaves out; nil altogether when CoreMedia cannot read the
     /// parameter sets.
     static func colour(vps: [UInt8]?, sps: [UInt8], pps: [UInt8]?) -> Tags? {
-        guard let vps, let pps else { return nil }
+        guard let vps, let pps, let description = formatDescription(vps: vps, sps: sps, pps: pps) else { return nil }
+        func value(_ key: CFString) -> CFString? {
+            CMFormatDescriptionGetExtension(description, extensionKey: key).flatMap { $0 as? String }.map { $0 as CFString }
+        }
+        return Tags(primaries: value(kCMFormatDescriptionExtension_ColorPrimaries),
+                    transfer: value(kCMFormatDescriptionExtension_TransferFunction),
+                    matrix: value(kCMFormatDescriptionExtension_YCbCrMatrix))
+    }
+
+    /// CoreMedia's description of one VPS, SPS and PPS (NALs with their 2-byte headers): it parses the VUI.
+    static func formatDescription(vps: [UInt8], sps: [UInt8], pps: [UInt8]) -> CMFormatDescription? {
         let sets = [vps, sps, pps]
         var description: CMFormatDescription?
         let status = sets[0].withUnsafeBufferPointer { v in
@@ -111,12 +121,6 @@ struct HEVCInBandColour {
                 }
             }
         }
-        guard status == noErr, let description else { return nil }
-        func value(_ key: CFString) -> CFString? {
-            CMFormatDescriptionGetExtension(description, extensionKey: key).flatMap { $0 as? String }.map { $0 as CFString }
-        }
-        return Tags(primaries: value(kCMFormatDescriptionExtension_ColorPrimaries),
-                    transfer: value(kCMFormatDescriptionExtension_TransferFunction),
-                    matrix: value(kCMFormatDescriptionExtension_YCbCrMatrix))
+        return status == noErr ? description : nil
     }
 }

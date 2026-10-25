@@ -442,6 +442,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// uses), independent of whether the demuxer emits AV_PKT_DATA_NEW_EXTRADATA. Set at gate-open and each rotation.
     private var activeMuxerVideoExtradata: [UInt8]?
     private var vodH264Configuration: H264ConfigurationTracker?
+    private var vodHEVCConfiguration: HEVCConfigurationTracker?
 
     /// #133 follow-up diag: count of same-PID in-band parameter-set changes rotated in place, surfaced in the log.
     private var samePIDReinitCount = 0
@@ -1489,6 +1490,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// (in-band SPS+PPS and an IDR or immediate intra recovery point, AE#627) arrives, rather than
     /// opening on any AV_PKT_FLAG_KEY packet.
     private let liveH264AnnexBJoin: Bool
+    /// Live H.264 or HEVC on Annex B (MPEG-TS, HLS ingest): a keyframe's in-band parameter sets that differ from the
+    /// running init's get a versioned init (#133 follow-up for H.264; HEVC the same).
+    private let liveAnnexBReinit: Bool
 
     /// Sodalite#32: text-subtitle tap, generalizing the #77 CC tap. Streams in this set are kept by the
     /// pump (not discarded) and each of their packets is handed to `subtitleTapObserver` (with the
@@ -1676,11 +1680,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
             isLive: isLive,
             codecIsH264: a53CodecKind == .h264,
             framingIsAnnexB: a53NALFraming == .annexB)
+        self.liveAnnexBReinit = isLive && a53CodecKind != nil && a53NALFraming == .annexB
         if !isLive, a53CodecKind == .h264, case .lengthPrefixed = a53NALFraming {
             let extra = video.extradataOverride ?? video.codecpar.pointee.extradata.map {
                 Array(UnsafeBufferPointer(start: $0, count: Int(video.codecpar.pointee.extradata_size)))
             }
             if let extra { vodH264Configuration = H264ConfigurationTracker(avcC: extra) }
+        }
+        // HEVC VOD, on either framing: the muxer's record is length-prefixed in both (#365 converts Annex B samples).
+        if !isLive, a53CodecKind == .hevc,
+           let extra = video.extradataOverride ?? video.codecpar.pointee.extradata.map({
+               Array(UnsafeBufferPointer(start: $0, count: Int(video.codecpar.pointee.extradata_size)))
+           }) {
+            vodHEVCConfiguration = HEVCConfigurationTracker(hvcC: extra, framing: a53NALFraming)
         }
         self.convertP7Active = video.convertP7ToProfile81
         self.audioConfig = audio
@@ -2030,28 +2042,59 @@ final class HLSSegmentProducer: @unchecked Sendable {
         var config: InBandVideoConfig?
     }
 
-    /// An H.264 video configuration read from a keyframe's in-band parameter sets (a live join whose probe saw no
-    /// SPS, an SSAI creative, a same-PID parameter-set change): what an init built from it says. Its colour is the
-    /// new SPS's VUI and, over a backward-compatible declaration, the keyframe's alternative transfer SEI (HLG, as
-    /// the demuxer promotes it at open, AE#839), so the versioned init's `colr` describes the new program.
+    /// A video configuration read from a keyframe's in-band parameter sets (a live join whose probe saw no SPS, an
+    /// SSAI creative, a same-PID parameter-set change): what an init built from it says. Its colour is the new SPS's
+    /// VUI and, over a backward-compatible declaration, the keyframe's alternative transfer SEI (HLG, as the demuxer
+    /// promotes it at open, AE#839), so the versioned init's `colr` describes the new program.
     struct InBandVideoConfig: Equatable {
+        var codecID: AVCodecID
         var width: Int32
         var height: Int32
+        /// The parameter sets, Annex B: what the configuration is compared by.
         var extradata: [UInt8]
+        /// HEVC: the length-prefixed record the muxer is handed so it copies the samples, which the producer converts
+        /// with their in-band parameter sets kept (#365). nil for H.264, whose muxer reads `extradata`.
+        var lengthPrefixedRecord: [UInt8]?
         var colour: ColorDescription
 
-        init?(annexB buf: UnsafeBufferPointer<UInt8>, requiresRandomAccess: Bool) {
-            guard let (sps, pps) = H264SPS.extractSPSandPPS(fromAnnexB: buf),
-                  !requiresRandomAccess || H264SPS.isRandomAccessEntry(fromAnnexB: buf),
-                  let dim = H264SPS.dimensions(fromNAL: sps) else { return nil }
-            width = Int32(dim.width)
-            height = Int32(dim.height)
-            extradata = H264SPS.annexBExtradata(sps: sps, pps: pps)
-            colour = H264SPS.colour(fromNAL: sps) ?? .unspecified
-            if AlternativeTransferSEI.declaredTransferMayHideHLG(codecID: AV_CODEC_ID_H264, primaries: colour.primaries,
+        init?(annexB buf: UnsafeBufferPointer<UInt8>, codec: A53SEIParser.CodecKind, requiresRandomAccess: Bool) {
+            switch codec {
+            case .h264:
+                guard let (sps, pps) = H264SPS.extractSPSandPPS(fromAnnexB: buf),
+                      !requiresRandomAccess || H264SPS.isRandomAccessEntry(fromAnnexB: buf),
+                      let dim = H264SPS.dimensions(fromNAL: sps) else { return nil }
+                codecID = AV_CODEC_ID_H264
+                width = Int32(dim.width)
+                height = Int32(dim.height)
+                extradata = H264SPS.annexBExtradata(sps: sps, pps: pps)
+                colour = H264SPS.colour(fromNAL: sps) ?? .unspecified
+            case .hevc:
+                let sets = HEVCSPS.parameterSets(fromAnnexB: buf)
+                guard let vps = sets.vps, let sps = sets.sps, let pps = sets.pps, !requiresRandomAccess || sets.irap,
+                      let summary = HEVCSPS(nal: sps) else { return nil }
+                codecID = AV_CODEC_ID_HEVC
+                width = Int32(summary.width)
+                height = Int32(summary.height)
+                let startCode: [UInt8] = [0, 0, 0, 1]
+                extradata = startCode + vps + startCode + sps + startCode + pps
+                lengthPrefixedRecord = VideoConfigRecord.fromAnnexB(extradata, codecID: AV_CODEC_ID_HEVC,
+                                                                    width: width, height: height)
+                let description = HEVCInBandColour.formatDescription(vps: vps, sps: sps, pps: pps)
+                func value(_ key: CFString) -> CFString? {
+                    description.flatMap { CMFormatDescriptionGetExtension($0, extensionKey: key) as? String }.map { $0 as CFString }
+                }
+                let fullRange = description.flatMap {
+                    CMFormatDescriptionGetExtension($0, extensionKey: kCMFormatDescriptionExtension_FullRangeVideo) as? Bool
+                }
+                colour = ColorAttachments.description(primaries: value(kCMFormatDescriptionExtension_ColorPrimaries),
+                                                      transfer: value(kCMFormatDescriptionExtension_TransferFunction),
+                                                      matrix: value(kCMFormatDescriptionExtension_YCbCrMatrix),
+                                                      fullRange: fullRange)
+            }
+            if AlternativeTransferSEI.declaredTransferMayHideHLG(codecID: codecID, primaries: colour.primaries,
                                                                  transfer: colour.transfer),
                let base = buf.baseAddress,
-               AlternativeTransferSEI.preferredTransfer(in: base, size: buf.count, codec: .h264, framing: .annexB)
+               AlternativeTransferSEI.preferredTransfer(in: base, size: buf.count, codec: codec, framing: .annexB)
                 == AlternativeTransferSEI.hlgTransfer {
                 colour.transfer = AVCOL_TRC_ARIB_STD_B67
             }
@@ -2064,16 +2107,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private func programSwitchOpening(_ change: ProgramSuccession.Change,
                                       _ packet: UnsafeMutablePointer<AVPacket>) -> ProgramSwitchOpening? {
         guard packet.pointee.flags & AV_PKT_FLAG_KEY != 0 else { return nil }
-        let inBand = extractAdVideoConfig(packet)
+        // The creative's own codec: an H.264 ad can interrupt an HEVC programme.
+        let codecID = demuxer.stream(at: change.to)?.pointee.codecpar.pointee.codec_id
+        let inBand = extractAdVideoConfig(packet, codec: codecID == AV_CODEC_ID_HEVC ? .hevc : .h264)
         if change.to == change.logical { return ProgramSwitchOpening(config: inBand) }
         return inBand.map { ProgramSwitchOpening(config: $0) }
     }
 
     /// Extract H.264 ad video config from in-band Annex-B SPS/PPS. nil on mid-GOP join (no parameter sets).
-    private func extractAdVideoConfig(_ packet: UnsafeMutablePointer<AVPacket>) -> InBandVideoConfig? {
+    private func extractAdVideoConfig(_ packet: UnsafeMutablePointer<AVPacket>,
+                                      codec: A53SEIParser.CodecKind) -> InBandVideoConfig? {
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return nil }
         return InBandVideoConfig(annexB: UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)),
-                                 requiresRandomAccess: false)
+                                 codec: codec, requiresRandomAccess: false)
     }
 
     /// #133: whether the stricter live-join gate engages (withhold the video gate until a decodable IDR
@@ -2100,7 +2146,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private func extractJoinVideoConfig(_ packet: UnsafeMutablePointer<AVPacket>) -> InBandVideoConfig? {
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return nil }
         return InBandVideoConfig(annexB: UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)),
-                                 requiresRandomAccess: true)
+                                 codec: .h264, requiresRandomAccess: true)
     }
 
     /// Pump-side backpressure wait. Returns true on release, false when stop was requested.
@@ -2390,7 +2436,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if let reconstructedVideoConfig {
             guard let par = avcodec_parameters_alloc() else { return nil }
             par.pointee.codec_type = AVMEDIA_TYPE_VIDEO
-            par.pointee.codec_id = AV_CODEC_ID_H264
+            par.pointee.codec_id = reconstructedVideoConfig.codecID
             par.pointee.width = reconstructedVideoConfig.width
             par.pointee.height = reconstructedVideoConfig.height
             // The init's `colr` (movenc writes it from these) describes the parameter sets it is built from.
@@ -2421,8 +2467,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // parameter-set change is still the same program, so it keeps them (isAdCreative false).
             doviConfig: isAdCreative ? .keep : videoConfig.doviConfig,
             colorOverride: isAdCreative ? nil : videoConfig.colorOverride,
-            extradataOverride: isAdCreative ? nil : videoConfig.extradataOverride,
-            convertsAnnexBSamples: isAdCreative ? false : videoConfig.convertsAnnexBSamples,
+            // An init built from in-band HEVC sets gets their own record and converts its samples (#365), whatever
+            // the open's were; the open's record never describes another program's sets.
+            extradataOverride: reconstructedVideoConfig.map { $0.lengthPrefixedRecord }
+                ?? (isAdCreative ? nil : videoConfig.extradataOverride),
+            convertsAnnexBSamples: reconstructedVideoConfig.map { $0.lengthPrefixedRecord != nil }
+                ?? (isAdCreative ? false : videoConfig.convertsAnnexBSamples),
             nalFramingLatch: isAdCreative ? nil : videoConfig.nalFramingLatch
         )
         let muxerAudio: MP4SegmentMuxer.AudioConfig? = audioConfig.map { a in
@@ -3798,6 +3848,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     exitReason = .videoConfigurationChanged(summary: mismatch.summary)
                     break readLoop
                 }
+                if packet.pointee.stream_index == videoStreamIndex,
+                   let data = packet.pointee.data, packet.pointee.size > 0,
+                   let mismatch = vodHEVCConfiguration?.observe(UnsafeBufferPointer(start: data, count: Int(packet.pointee.size))) {
+                    EngineLog.emit("[HLSSegmentProducer] \(mismatch.summary); stopping stale-init VOD epoch=\(epoch)",
+                                   category: .session)
+                    exitReason = .videoConfigurationChanged(summary: mismatch.summary)
+                    break readLoop
+                }
                 av_packet_free_side_data(packet)
 
                 let pktStreamIdx = packet.pointee.stream_index
@@ -4458,10 +4516,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         // new slices decode against a stale avcC (recurring green frames + "non-existing PPS" bursts,
                         // exactly the UK-DVB-via-Xtream report). Route it through the same EXT-X-MAP rotation SSAI uses,
                         // parsing the sets ourselves so it fires whether or not the demuxer emits NEW_EXTRADATA.
-                        if liveH264AnnexBJoin,
+                        // HEVC has no join config: its first keyframe after the gate is the baseline.
+                        if liveAnnexBReinit, activeMuxerVideoExtradata == nil,
+                           (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0,
+                           let first = extractAdVideoConfig(packet, codec: a53CodecKind ?? .h264) {
+                            activeMuxerVideoExtradata = first.extradata
+                        } else if liveAnnexBReinit,
                            (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0,
                            !pendingVideoProgramSwitch,
-                           let incoming = extractAdVideoConfig(packet),
+                           let incoming = extractAdVideoConfig(packet, codec: a53CodecKind ?? .h264),
                            Self.parameterSetsDiverged(active: activeMuxerVideoExtradata, incoming: incoming.extradata) {
                             samePIDReinitCount += 1
                             EngineLog.emit(
