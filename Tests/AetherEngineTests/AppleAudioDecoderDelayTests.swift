@@ -1,6 +1,5 @@
 import AVFoundation
 import AetherLibavcodec
-import AetherLibavformat
 import AetherLibavutil
 import Foundation
 import Testing
@@ -38,7 +37,7 @@ struct AppleAudioDecoderDelayTests {
         let file = try Self.appleHLS(formatID: profile.formatID, bitRate: profile.bitRate)
         defer { try? FileManager.default.removeItem(at: file) }
         let expected = try #require(AppleAudioDecoderDelay.samples(codecID: AV_CODEC_ID_AAC, profile: profile.ffmpegProfile))
-        let ffmpeg = try #require(Self.ffmpegClickSample(file), "FFmpeg decoded no click")
+        let ffmpeg = try #require(try Self.ffmpegClickSample(file), "FFmpeg decoded no click")
         #expect(ffmpeg - 48_000 == expected, "FFmpeg hears Apple's \(profile.name) \(ffmpeg - 48_000) samples late")
         let avf = try #require(AVSyncTests.measure(file).1, "AVFoundation decoded no click")
         #expect(abs(avf - 1) * 48_000 <= 1, "AVFoundation plays it \((avf - 1) * 48_000) samples off")
@@ -103,44 +102,22 @@ struct AppleAudioDecoderDelayTests {
         return url
     }
 
-    /// The click's first sample in FFmpeg's decode of `file`'s audio, counted from the stream's first
-    /// decoded sample: nothing trimmed that the stream does not state.
-    static func ffmpegClickSample(_ file: URL) -> Int? {
-        var fmt: UnsafeMutablePointer<AVFormatContext>?
-        guard avformat_open_input(&fmt, file.path, nil, nil) == 0, let ctx = fmt else { return nil }
-        defer { avformat_close_input(&fmt) }
-        guard avformat_find_stream_info(ctx, nil) >= 0 else { return nil }
-        let index = av_find_best_stream(ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nil, 0)
-        guard index >= 0, let par = ctx.pointee.streams[Int(index)]?.pointee.codecpar,
-              let codec = avcodec_find_decoder(par.pointee.codec_id), var dec = avcodec_alloc_context3(codec) else { return nil }
-        defer { var d: UnsafeMutablePointer<AVCodecContext>? = dec; avcodec_free_context(&d) }
-        guard avcodec_parameters_to_context(dec, par) >= 0, avcodec_open2(dec, codec, nil) >= 0 else { return nil }
-        var mono: [Float] = []
-        var packet = av_packet_alloc(), frame = av_frame_alloc()
-        defer { av_packet_free(&packet); av_frame_free(&frame) }
-        func drain() {
-            while avcodec_receive_frame(dec, frame) >= 0 {
-                let n = Int(frame!.pointee.nb_samples)
-                guard frame!.pointee.format == AV_SAMPLE_FMT_FLTP.rawValue,
-                      let plane = frame!.pointee.extended_data[0] else { continue }
-                mono.append(contentsOf: UnsafeBufferPointer(start: UnsafeRawPointer(plane).assumingMemoryBound(to: Float.self), count: n))
-            }
+    /// The click's first sample in the engine's decode of `file`'s audio (FFmpeg's decoders, which trim nothing the
+    /// stream does not state), counted from the first decoded sample.
+    static func ffmpegClickSample(_ file: URL) throws -> Int? {
+        let demuxer = Demuxer()
+        try demuxer.open(url: file)
+        defer { demuxer.close() }
+        let decoder = AudioDecoder()
+        try decoder.open(stream: try #require(demuxer.stream(at: demuxer.audioStreamIndex)))
+        defer { decoder.close() }
+        var buffers: [CMSampleBuffer] = []
+        while let pkt = try demuxer.readPacket() {
+            if pkt.pointee.stream_index == demuxer.audioStreamIndex { buffers += decoder.decode(packet: pkt) }
+            var p: UnsafeMutablePointer<AVPacket>? = pkt
+            trackedPacketFree(&p)
         }
-        while av_read_frame(ctx, packet) >= 0 {
-            if packet!.pointee.stream_index == index { avcodec_send_packet(dec, packet); drain() }
-            av_packet_unref(packet)
-        }
-        avcodec_send_packet(dec, nil)
-        drain()
-        _ = dec
-        let burst = (0..<144).map { 0.8 * sinf(2 * .pi * 1000 * Float($0) / 48_000) }
-        guard mono.count > 60_000 else { return nil }
-        var best = 40_000, bestValue: Float = -.infinity
-        for lag in 40_000..<(min(mono.count, 60_000) - 144) {
-            var acc: Float = 0
-            for k in 0..<144 { acc += mono[lag + k] * burst[k] }
-            if acc > bestValue { bestValue = acc; best = lag }
-        }
-        return best
+        buffers += decoder.drain()
+        return AVSyncTests.clickLag(buffers).map { Int($0.rounded()) }
     }
 }
