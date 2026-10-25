@@ -596,34 +596,6 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         return grainBuffers[index].buffer
     }
 
-    /// The `width` x `height` picture in `planes` with `grain` applied, written into `destination` at the source's own
-    /// layout (`destination` laid out as `planes`): AV1's grained output itself, which reference decoders' checksums
-    /// cover. `plan` is any plan for the source with `grain`; only its reader is used.
-    func grainedPlanes(_ planes: Planes, plan: Plan, width: Int, height: Int, grain: FilmGrainParameters,
-                       into destination: MTLBuffer) -> Bool {
-        guard plan.grain, let tables = grainTables(grain, plan: plan, width: width, height: height, index: 0),
-              let pipeline = try? pipeline(for: plan, function: "fg_planes"),
-              let commands = queue.makeCommandBuffer(), let encoder = commands.makeComputeCommandEncoder() else { return false }
-        var frame = Data()
-        for word in [UInt32(width), UInt32(height), 0, 0] + planes.offsets + planes.linesizes {
-            withUnsafeBytes(of: word) { frame.append(contentsOf: $0) }
-        }
-        for value in plan.rows + plan.cl + plan.tp + [plan.tieBound] { withUnsafeBytes(of: value) { frame.append(contentsOf: $0) } }
-        withUnsafeBytes(of: UInt32(0)) { frame.append(contentsOf: $0) }
-        encoder.setComputePipelineState(pipeline)
-        encoder.setBuffer(planes.buffer, offset: 0, index: 0)
-        frame.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }
-        encoder.setBuffer(tables, offset: 0, index: 5)
-        encoder.setBuffer(destination, offset: 0, index: 6)
-        let w = pipeline.threadExecutionWidth
-        encoder.dispatchThreads(MTLSize(width: width, height: height, depth: grain.monochrome ? 1 : 3),
-                                threadsPerThreadgroup: MTLSize(width: w, height: max(1, pipeline.maxTotalThreadsPerThreadgroup / w), depth: 1))
-        encoder.endEncoding()
-        commands.commit()
-        commands.waitUntilCompleted()
-        return commands.status == .completed
-    }
-
     private func texture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat) -> CVMetalTexture? {
         var texture: CVMetalTexture?
         guard CVMetalTextureCacheCreateTextureFromImage(
