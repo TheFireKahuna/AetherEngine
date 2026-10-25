@@ -821,6 +821,28 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var connRetryAfter: TimeInterval = 0
     // Bumped on every (re)connect; stale delegate callbacks are ignored.
     private var connGeneration = 0
+    /// Where every generation number comes from, the current one and a hedge's alike, so a hedge's
+    /// number can never be one a later start hands out again. winCond-guarded.
+    private var generationCounter = 0
+
+    /// Caller holds `winCond`.
+    private func nextGenerationLocked() -> Int {
+        generationCounter &+= 1
+        return generationCounter
+    }
+
+    /// A second request at the frontier, racing a connection that has gone quiet while the demuxer
+    /// waits on it (`startHedgeIfDue`). Whichever delivers first is the generation from then on and
+    /// the other is cancelled; the old one ending first promotes the hedge at once. winCond-guarded.
+    private struct Hedge {
+        let generation: Int
+        let offset: Int64
+        let transfer: any PersistentTransfer
+        let startedAt: DispatchTime
+    }
+    private var hedge: Hedge?
+    /// The generation a hedge was last raced against: one hedge per generation. winCond-guarded.
+    private var hedgeRacedGeneration: Int?
     /// #377: what is on the link for this reader. Either shape is ONE request against the
     /// origin holding one slot of its budget; they differ only in who decides when bytes
     /// move, and every other piece of this reader (window, frontier, reconnect ladder,
@@ -1720,9 +1742,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         rangeIgnoredAtOpenLength = nil
         if fileSize > 0 { return (true, nil, connStatus, nil) }
         let status = connStatus
-        connGeneration &+= 1
+        connGeneration = nextGenerationLocked()
         let transfer = activeTransfer
         activeTransfer = nil
+        dropHedgeLocked()
         window.removeAll()
         connEnded = true
         winCond.broadcast()
@@ -1741,9 +1764,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         rangeVerdictPending = false
         guard let contentLength = rangeIgnoredAtOpenLength else { return nil }
         rangeIgnoredAtOpenLength = nil
-        connGeneration &+= 1
+        connGeneration = nextGenerationLocked()
         let transfer = activeTransfer
         activeTransfer = nil
+        dropHedgeLocked()
         window.removeAll()
         connEnded = true
         winCond.broadcast()
@@ -1893,7 +1917,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if wasSuspended { sTask?.resume() }
         sTask?.cancel()
         winCond.lock()
-        connGeneration &+= 1
+        connGeneration = nextGenerationLocked()
         // #93/#96 residual: cancel the persistent Range GET here, not only in close(). markClosed is
         // the abort used by the #79 reopen path (dem.markClosed() to unblock a wedged read); leaving
         // its long-lived open-ended connection alive lets it keep draining the origin for the whole
@@ -1903,6 +1927,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // is released. Grab under winCond, invalidate outside it (mirrors close()).
         let transfer = activeTransfer
         activeTransfer = nil
+        dropHedgeLocked()
         connEnded = true
         // #281: a speculative fetch outlives nothing. Same reasoning as the persistent GET above:
         // an abandoned reader's in-flight request fair-shares the origin with the fresh reader's
@@ -1958,10 +1983,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         sTask?.cancel()
 
         winCond.lock()
-        connGeneration &+= 1
+        connGeneration = nextGenerationLocked()
         connEnded = true
         let transfer = activeTransfer
         activeTransfer = nil
+        dropHedgeLocked()
         window.removeAll()
         let tailTask = tailPrefetchTask
         tailPrefetchTask = nil
@@ -2568,15 +2594,28 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             }
 
             if !ended {
+                // A connection that has gone quiet while the demuxer waits on it gets a hedge raced
+                // against it well before the stall threshold, which on its own is sized for CPU
+                // starvation (#272) and would otherwise leave the read waiting it out in full.
+                if let hedgeIn = hedgeDueInLocked(), hedgeIn <= 0 {
+                    winCond.unlock()
+                    startHedge(at: frontier)
+                    continue
+                }
                 // Wait for the live connection to fill forward. A false return
-                // means connStallTimeout elapsed with no data (socket stall).
+                // means connStallTimeout elapsed with no data (socket stall), unless the wake is the
+                // hedge's turn, which is not a stall.
                 let waitStart = DispatchTime.now()
-                let signaled = winCond.wait(until: min(Date(timeIntervalSinceNow: connStallTimeout), readDeadline))
+                let stallAt = min(Date(timeIntervalSinceNow: connStallTimeout), readDeadline)
+                let hedgeAt = hedgeDueInLocked().map { Date(timeIntervalSinceNow: $0) }
+                let wakeAt = hedgeAt.map { min($0, stallAt) } ?? stallAt
+                let signaled = winCond.wait(until: wakeAt)
                 winCond.unlock()
                 diag.recordStallWait(ms: msSince(waitStart), signaled: signaled)
                 // Check deadline before stall handling to avoid misrouting a
                 // deadline wake as a socket stall (which would reconnect).
                 if isPastReadDeadline { continue }
+                if !signaled, let hedgeAt, hedgeAt <= stallAt { continue }
                 if !signaled {
                     if recordReconnectAndShouldGiveUp() {
                         EngineLog.emit("[AVIOReader] \(label) stall gave up at offset \(frontier) (\(unproductiveReconnects) unproductive)\(isLive ? " [live source lost]" : "")", category: .demux)
@@ -3276,7 +3315,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// connection are ignored.
     private func startPersistentConnection(at offset: Int64, boundedTo: Int64? = nil, openEnded: Bool = false) {
         winCond.lock()
-        connGeneration &+= 1
+        connGeneration = nextGenerationLocked()
         let generation = connGeneration
         connHeaderRevision = requestHeaderStore?.revision ?? 0
         // #295: a request that begins inside the resident window, or exactly at its end, is a
@@ -3375,6 +3414,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // faulted lineage.
         let oldTransfer = activeTransfer
         activeTransfer = nil
+        dropHedgeLocked()
         winCond.broadcast()
         winCond.unlock()
 
@@ -3595,6 +3635,140 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         persistentConnectionEnded(error: nil, generation: generation)
     }
 
+    // MARK: - Hedged refill
+
+    /// The least a connection has to have been quiet for, with the demuxer waiting on it, before a
+    /// hedge is raced against it.
+    static let hedgeFloorSeconds: TimeInterval = 2
+
+    /// How long a quiet connection is given before its hedge: six measured round trips (the time to
+    /// first data of this origin's last connection), never under `hedgeFloorSeconds` and never past
+    /// half the stall threshold, so the hedge always speaks well before the stall would.
+    static func hedgeDelay(firstDataMs: Double, stallTimeout: TimeInterval) -> TimeInterval {
+        min(stallTimeout / 2, max(hedgeFloorSeconds, 6 * firstDataMs / 1000))
+    }
+
+    /// Seconds until the current generation is due a hedge (zero or less: due now), or nil when it
+    /// cannot have one: live (its offsets are the origin's to interpret), a held connection (demand
+    /// driven, quiet on purpose), a replay from the source cache, an open-ended request, a stall
+    /// threshold too short to leave room before it, a start still waiting for its slot, a hedge
+    /// already raced, or no flow at all. Caller holds `winCond`.
+    private func hedgeDueInLocked() -> TimeInterval? {
+        guard !isLive, !heldConnectionEnabled, hedge == nil, hedgeRacedGeneration != connGeneration,
+              !connEnded, !connStartingLocked, connRangeEnd != nil,
+              connStallTimeout >= 2 * Self.hedgeFloorSeconds,
+              let transfer = activeTransfer, !(transfer is CachedSpanTransfer) else { return nil }
+        let quiet = Double(DispatchTime.now().uptimeNanoseconds - lastDeliveryAt.uptimeNanoseconds)
+            / 1_000_000_000
+        return Self.hedgeDelay(firstDataMs: lastFirstDataMs, stallTimeout: connStallTimeout) - quiet
+    }
+
+    /// Races a second request against the current generation from `frontier` to the end of the range
+    /// it asked for. Only with a slot free right now: a hedge is a bet, and on an origin with no room
+    /// it would queue behind the very connection it is meant to replace. Charges no ladder: if the
+    /// quiet connection was merely slow (a starved delivery thread, #272), it may still win.
+    private func startHedge(at frontier: Int64) {
+        winCond.lock()
+        let raced = connGeneration
+        guard hedgeDueInLocked() != nil, let rangeEnd = connRangeEnd, frontier <= rangeEnd,
+              frontier == winStart + Int64(window.count) else {
+            winCond.unlock()
+            return
+        }
+        hedgeRacedGeneration = raced
+        let generation = nextGenerationLocked()
+        winCond.unlock()
+
+        var request = URLRequest(url: requestURL())
+        request.setValue("bytes=\(frontier)-\(rangeEnd)", forHTTPHeaderField: "Range")
+        request.timeoutInterval = 0
+        applyExtraHeaders(&request)
+        let requestURLForBudget = request.url ?? url
+        guard let ticket = OriginRequestBudget.shared.tryAcquire(
+            for: requestURLForBudget, label: "\(label)#\(openDiagnosticID) hedge") else {
+            EngineLog.emit("[AVIOReader] \(label) gen=\(raced) quiet at offset \(frontier); no origin slot "
+                           + "free for a hedge, leaving it to the stall threshold", category: .demux)
+            return
+        }
+        let delegate = PersistentReadDelegate(reader: self, generation: generation,
+                                              extraHeaders: headers(for: request.url), ticket: ticket,
+                                              originURL: requestURLForBudget)
+        let task = EngineHTTP.session.dataTask(with: request)
+        task.priority = taskPriority
+        task.delegate = delegate
+
+        winCond.lock()
+        guard raced == connGeneration, !connEnded, hedge == nil, !isClosed,
+              frontier == winStart + Int64(window.count) else {
+            winCond.unlock()
+            task.cancel()
+            delegate.releaseTicket()
+            return
+        }
+        hedge = Hedge(generation: generation, offset: frontier, transfer: task, startedAt: .now())
+        let quiet = Double(DispatchTime.now().uptimeNanoseconds - lastDeliveryAt.uptimeNanoseconds)
+            / 1_000_000_000
+        winCond.unlock()
+        task.resume()
+        EngineLog.emit(
+            "[AVIOReader] \(label) gen=\(raced) quiet for \(String(format: "%.1f", quiet))s at offset "
+            + "\(frontier) with the demuxer waiting; racing a hedge gen=\(generation)", category: .demux)
+    }
+
+    /// A hedge's response head: nil when `generation` is not the hedge, otherwise whether to take its
+    /// body. Only a 206 that starts at the frontier is taken; anything else ends the hedge and leaves
+    /// the connection it raced untouched, its status unrecorded: one request's refusal is not the
+    /// session's.
+    private func hedgeResponse(_ http: HTTPURLResponse, generation: Int) -> Bool? {
+        winCond.lock()
+        guard let racing = hedge, racing.generation == generation else {
+            winCond.unlock()
+            return nil
+        }
+        let usable = http.statusCode == 206 && Self.misplacedRangeStart(http, requestedOffset: racing.offset) == nil
+        if !usable { hedge = nil }
+        winCond.unlock()
+        if !usable {
+            racing.transfer.releaseOriginTicket()
+            EngineLog.emit("[AVIOReader] \(label) hedge gen=\(generation) answered \(http.statusCode); dropping it",
+                           category: .demux)
+        }
+        return usable
+    }
+
+    /// Whether `racing` still starts where the window ends. It stops doing so once the connection it
+    /// raced delivers, which settles the race the other way. Caller holds `winCond`.
+    private func hedgeStillFitsLocked(_ racing: Hedge) -> Bool {
+        racing.offset == winStart + Int64(window.count)
+    }
+
+    /// Makes `racing` (which `hedgeStillFitsLocked`) the current generation and returns the transfer
+    /// it replaced, for the caller to cancel outside the lock. Caller holds `winCond`.
+    private func adoptHedgeLocked(_ racing: Hedge, reason: String) -> (any PersistentTransfer)? {
+        hedge = nil
+        let replaced = activeTransfer
+        activeTransfer = racing.transfer
+        connGeneration = racing.generation
+        connRequestedOffset = racing.offset
+        connStartedAt = racing.startedAt
+        connEnded = false
+        connStatus = 206
+        lastDeliveryAt = .now()
+        armDeliveryGapWatchdog(generation: racing.generation, after: connStallTimeout)
+        EngineLog.emit("[AVIOReader] \(label) hedge gen=\(racing.generation) \(reason) at offset "
+                       + "\(racing.offset); it is the connection now", category: .demux)
+        return replaced
+    }
+
+    /// Ends a hedge whose generation was superseded (a seek, a close, a fresh start). Caller holds
+    /// `winCond`; the cancel is a non-blocking call on the transfer, safe under the lock.
+    private func dropHedgeLocked() {
+        guard let racing = hedge else { return }
+        hedge = nil
+        racing.transfer.cancelTransfer()
+        racing.transfer.releaseOriginTicket()
+    }
+
     /// #309: timer queue for the delivery-gap watchdog. Shared and serial: the work is one
     /// timestamp comparison per armed generation and never touches the network.
     private static let deliveryGapQueue = DispatchQueue(label: "aether.avio.delivery-gap")
@@ -3669,6 +3843,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             winCond.unlock()
             return
         }
+        if let racing = hedge {
+            let gap = Double(DispatchTime.now().uptimeNanoseconds - lastDeliveryAt.uptimeNanoseconds)
+                / 1_000_000_000
+            if gap >= connStallTimeout, hedgeStillFitsLocked(racing) {
+                let loser = adoptHedgeLocked(racing, reason: "raced a connection silent for the stall threshold")
+                winCond.broadcast()
+                winCond.unlock()
+                loser?.cancelTransfer()
+                loser?.releaseOriginTicket()
+                return
+            }
+        }
         // The open is waiting on this generation's first byte with a budget of its own
         // (`SourceOpenPolicy`), which a host sets longer than the stall threshold for an origin that
         // is slow to answer. Ending it here cut both open attempts at the threshold instead.
@@ -3734,7 +3920,22 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// about the origin, so it moves neither the round-trip estimate nor the fault ladder, and the
     /// ledger counts it as served rather than fetched.
     fileprivate func appendPersistentData(_ delivered: Data, generation: Int, fromCache: Bool = false) {
+        var losingHedgeRace: (any PersistentTransfer)?
+        defer {
+            losingHedgeRace?.cancelTransfer()
+            losingHedgeRace?.releaseOriginTicket()
+        }
         winCond.lock()
+        if let racing = hedge {
+            if generation == racing.generation, hedgeStillFitsLocked(racing) {
+                losingHedgeRace = adoptHedgeLocked(racing, reason: "delivered first")
+            } else if generation == racing.generation || generation == connGeneration {
+                losingHedgeRace = racing.transfer
+                hedge = nil
+                EngineLog.emit("[AVIOReader] \(label) gen=\(connGeneration) delivered before its hedge; "
+                               + "cancelling the hedge", category: .demux)
+            }
+        }
         guard generation == connGeneration, !isFullyClosed else {
             // #93: a slow read's summary line reports how much data the stale-generation
             // guard discarded while the read waited.
@@ -3888,6 +4089,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         respondedBy: URL?,
         generation: Int
     ) -> Bool {
+        if let verdict = hedgeResponse(http, generation: generation) { return verdict }
         let status = http.statusCode
         var isOK = status == 200 || status == 206
         var retryAfter: TimeInterval = 0
@@ -4037,6 +4239,24 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     fileprivate func persistentConnectionEnded(error: Error?, generation: Int) {
         winCond.lock()
+        if let racing = hedge {
+            if generation == racing.generation {
+                // The hedge ended without winning: the connection it raced is still the one.
+                hedge = nil
+                winCond.unlock()
+                racing.transfer.releaseOriginTicket()
+                return
+            }
+            if generation == connGeneration, hedgeStillFitsLocked(racing) {
+                // The quiet connection gave up first: the hedge, already on the link, is the flow.
+                let loser = adoptHedgeLocked(racing, reason: "outlived the connection it raced")
+                winCond.broadcast()
+                winCond.unlock()
+                loser?.releaseOriginTicket()
+                return
+            }
+            if generation == connGeneration { dropHedgeLocked() }
+        }
         let isCurrentGen = (generation == connGeneration)
         if isCurrentGen {
             connEnded = true
