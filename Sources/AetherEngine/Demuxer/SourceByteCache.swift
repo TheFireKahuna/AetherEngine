@@ -63,8 +63,9 @@ final class SourceByteCache: @unchecked Sendable {
         /// Bytes a reader asked for by position (a detour, the tail, a chunk): kept.
         case always
         /// A reader's sequential stream: kept within `streamEdgeBytes` of either end of the source,
-        /// or while another reader of it is open to come back for the bytes (the subtitle walk ahead
-        /// of the pump, the pump behind it). Otherwise passed over, which costs only a fetch if a
+        /// or while another reader streams it and can come back for the bytes (the subtitle walk ahead
+        /// of the pump, the pump behind it). A reader asking by position does not count: it reads only
+        /// the bytes it names, which are kept. Otherwise passed over, which costs only a fetch if a
         /// later reader does want them.
         case streamed
     }
@@ -113,7 +114,11 @@ final class SourceByteCache: @unchecked Sendable {
         /// Where the source's bytes were actually served from, redirects followed (#551 round 2):
         /// a reader that pins it does not pay the resolver's 302 again.
         var resolvedURL: URL?
+        /// Every open reader: the source is let go only when none is left.
         var openReaders = 0
+        /// The open readers that stream it (`readerOpened(_:streams:)`): only another of these comes back
+        /// for a stream's bytes, so only these decide whether a streamed delivery is kept.
+        var streamingReaders = 0
         /// Bumped by every eviction, so a read that raced one is discarded instead of returning a
         /// punched hole's zeros.
         var evictions: UInt64 = 0
@@ -220,18 +225,24 @@ final class SourceByteCache: @unchecked Sendable {
 
     // MARK: - Lifetime
 
-    func readerOpened(_ key: SourceCacheKey) {
+    /// A reader of `key` opened. `streams`: it reads the source as a stream (the pump, the subtitle walk),
+    /// rather than asking for the bytes it wants by position (an index's frames, a disc's blocks), whose
+    /// deliveries are kept anyway (`Retention.always`) and which never come back for a stream's.
+    func readerOpened(_ key: SourceCacheKey, streams: Bool) {
         lock.lock(); defer { lock.unlock() }
         guard let source = sourceLocked(key, create: true) else { return }
         source.openReaders += 1
+        if streams { source.streamingReaders += 1 }
         source.release?.cancel()
         source.release = nil
     }
 
-    func readerClosed(_ key: SourceCacheKey) {
+    /// The reader `readerOpened(_:streams:)` announced closed; `streams` as it was opened with.
+    func readerClosed(_ key: SourceCacheKey, streams: Bool) {
         lock.lock(); defer { lock.unlock() }
         guard let source = sources[key] else { return }
         source.openReaders = max(0, source.openReaders - 1)
+        if streams { source.streamingReaders = max(0, source.streamingReaders - 1) }
         scheduleReleaseLocked(key, source)
     }
 
@@ -254,6 +265,7 @@ final class SourceByteCache: @unchecked Sendable {
         if let fresh = Source(directory: directory) {
             fresh.version = version
             fresh.openReaders = source.openReaders
+            fresh.streamingReaders = source.streamingReaders
             sources[key] = fresh
             scheduleReleaseLocked(key, fresh)
         } else {
@@ -341,7 +353,7 @@ final class SourceByteCache: @unchecked Sendable {
             return
         }
         source.version = source.version.merged(with: version)
-        if retention == .streamed, source.openReaders < 2,
+        if retention == .streamed, source.streamingReaders < 2,
            !Self.nearEdge(offset: offset, count: Int64(data.count), size: source.version.size, edge: streamEdge) {
             source.passedOverBytes += Int64(data.count)
             scheduleReleaseLocked(key, source)

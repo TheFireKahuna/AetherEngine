@@ -23,7 +23,7 @@ struct SourceIndexRegistryTests {
         -> (SourceIndexRegistry, SourceByteCache) {
         let cache = Self.cache(grace: grace)
         for key in keys {
-            cache.readerOpened(key.source)
+            cache.readerOpened(key.source, streams: true)
             cache.noteVersion(SourceVersion(size: key.size), for: key.source)
         }
         return (SourceIndexRegistry(cache: cache), cache)
@@ -125,7 +125,7 @@ struct SourceIndexRegistryTests {
         _ = await registry.index(for: key, read: opener.read)
         _ = await registry.index(for: key, read: opener.read)
         #expect(registry.parseCount == 1, "held while a reader has the source open")
-        cache.readerClosed(key.source)
+        cache.readerClosed(key.source, streams: true)
         try await waitFor { registry.heldCount == 0 }
         _ = await registry.index(for: key, read: opener.read)
         #expect(registry.parseCount == 2)
@@ -155,7 +155,7 @@ struct SourceIndexRegistryTests {
         _ = await registry.index(for: Self.key("local"), read: opener.read)
         #expect(registry.parseCount == 2)
         // Held under another size is not held at this one.
-        cache.readerOpened(Self.key("local").source)
+        cache.readerOpened(Self.key("local").source, streams: true)
         cache.noteVersion(SourceVersion(size: 2_000), for: Self.key("local").source)
         _ = await registry.index(for: Self.key("local"), read: opener.read)
         #expect(registry.heldCount == 0)
@@ -168,7 +168,7 @@ struct SourceIndexRegistryTests {
         _ = await registry.index(for: key, read: Opener(MatroskaCueIndexTests.fixture().bytes).read)
         cache.releaseIdleSources()
         #expect(registry.heldCount == 1, "a reader still has it open")
-        cache.readerClosed(key.source)
+        cache.readerClosed(key.source, streams: true)
         cache.releaseIdleSources()
         #expect(registry.heldCount == 0)
     }

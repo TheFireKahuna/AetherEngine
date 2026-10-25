@@ -202,7 +202,7 @@ struct SourceByteCacheTests {
             .appending(path: "source-cache-bound-\(UUID().uuidString)", directoryHint: .isDirectory)
         let cache = SourceByteCache(directory: dir, budget: .fixed(256 << 20), pendingWriteBound: 1 << 20,
                                     removesDirectory: true)
-        cache.readerOpened(Self.source)
+        cache.readerOpened(Self.source, streams: true)
         cache.noteVersion(SourceVersion(size: 64 << 20), for: Self.source)
         // Faster than any disk: 32 MB stored back to back, as deliveries outrunning the writes.
         let piece = Self.pattern(64 << 10)
@@ -241,7 +241,7 @@ struct SourceByteCacheTests {
                                    reviewEvery: 4 * block)),
             removesDirectory: true)
         #expect(cache.byteBudgetForTesting == 8 * block)
-        cache.readerOpened(Self.source)
+        cache.readerOpened(Self.source, streams: true)
         cache.noteVersion(SourceVersion(size: 64 * block), for: Self.source)
         for n in 0..<3 {
             cache.store(Self.pattern(Int(block), seed: n), at: Int64(n) * block, version: SourceVersion(), for: Self.source)
@@ -290,13 +290,13 @@ struct SourceByteCacheTests {
         let kept = Self.key("https://media.example.com/kept")
         let gone = Self.key("https://media.example.com/gone")
         for url in [kept, gone] {
-            cache.readerOpened(url)
+            cache.readerOpened(url, streams: true)
             cache.store(Self.pattern(100), at: 0, version: SourceVersion(), for: url)
         }
         cache.drainWritesForTesting()
-        cache.readerClosed(kept)
-        cache.readerClosed(gone)
-        cache.readerOpened(kept)
+        cache.readerClosed(kept, streams: true)
+        cache.readerClosed(gone, streams: true)
+        cache.readerOpened(kept, streams: true)
         try await Task.sleep(for: .milliseconds(600))
         #expect(cache.heldBytesForTesting(kept) == 100)
         #expect(cache.heldBytesForTesting(gone) == 0)
@@ -310,7 +310,7 @@ struct SourceByteCacheTests {
         let warmed = Self.key("https://media.example.com/warmed")
         let playing = Self.key("https://media.example.com/playing")
         cache.store(Self.pattern(100), at: 0, version: SourceVersion(), for: warmed)
-        cache.readerOpened(playing)
+        cache.readerOpened(playing, streams: true)
         cache.store(Self.pattern(100), at: 0, version: SourceVersion(), for: playing)
         cache.noteResolvedURL(URL(string: "https://edge.example.com/warmed"), for: warmed)
         cache.drainWritesForTesting()
@@ -325,7 +325,7 @@ struct SourceByteCacheTests {
         let cache = Self.freshCache(budget: 1 << 30)
         let size: Int64 = 1 << 30
         let edge = SourceByteCache.streamEdgeBytes
-        cache.readerOpened(Self.source)
+        cache.readerOpened(Self.source, streams: true)
         cache.noteVersion(SourceVersion(size: size), for: Self.source)
         let chunk = Self.pattern(1000)
         for offset in [0, edge - 1, size / 2, edge + 999, size - edge - 1000, size - edge - 999] {
@@ -346,8 +346,8 @@ struct SourceByteCacheTests {
         let sized = Self.key("https://media.example.com/sized")
         let unsized = Self.key("https://media.example.com/unsized")
         let middle: Int64 = 512 << 20
-        cache.readerOpened(sized)
-        cache.readerOpened(unsized)
+        cache.readerOpened(sized, streams: true)
+        cache.readerOpened(unsized, streams: true)
         cache.noteVersion(SourceVersion(size: 1 << 30), for: sized)
         cache.store(Self.pattern(1000), at: middle, version: SourceVersion(), for: sized)
         cache.store(Self.pattern(1000), at: middle, version: SourceVersion(), for: unsized, retention: .streamed)
@@ -361,11 +361,11 @@ struct SourceByteCacheTests {
         let cache = Self.freshCache(budget: 1 << 30)
         let size: Int64 = 1 << 30
         let middle: Int64 = 512 << 20
-        cache.readerOpened(Self.source)
-        cache.readerOpened(Self.source)
+        cache.readerOpened(Self.source, streams: true)
+        cache.readerOpened(Self.source, streams: true)
         cache.noteVersion(SourceVersion(size: size), for: Self.source)
         cache.store(Self.pattern(1000), at: middle, version: SourceVersion(), for: Self.source, retention: .streamed)
-        cache.readerClosed(Self.source)
+        cache.readerClosed(Self.source, streams: true)
         cache.store(Self.pattern(1000), at: middle + 1000, version: SourceVersion(), for: Self.source, retention: .streamed)
         cache.drainWritesForTesting()
         #expect(cache.heldLength(Self.source, at: middle, expectedSize: size) == 1000)
@@ -452,20 +452,28 @@ struct SourceByteCacheTests {
 
     /// The whole pump through a real reader: alone, it keeps the head and the end and passes over the
     /// middle; beside another reader of the source, it keeps everything. The edge is sized to the file.
-    @Test("A lone pump keeps only the ends of what it streams; beside another reader it keeps it all",
-          .timeLimit(.minutes(1)), arguments: [false, true])
-    func pumpKeepsTheMiddleOnlyWhenShared(shared: Bool) throws {
+    /// Who else reads the source while the pump plays it.
+    enum Beside: CaseIterable, Sendable { case nobody, aStream, exactRanges }
+
+    @Test("A lone pump keeps only the ends of what it streams; beside another stream it keeps it all, beside a reader of exact ranges only the ends",
+          .timeLimit(.minutes(1)), arguments: Beside.allCases)
+    func pumpKeepsTheMiddleOnlyWhenShared(beside: Beside) throws {
         let size = 6 * 1024 * 1024
         let edge: Int64 = 1024 * 1024
-        let body = Self.pattern(size, seed: shared ? 13 : 17)
+        let body = Self.pattern(size, seed: beside == .aStream ? 13 : 17)
         let origin = try #require(KeepAliveRangeOrigin(data: body))
         defer { origin.stop() }
         let url = URL(string: "http://127.0.0.1:\(origin.port)/edges-\(UUID().uuidString).bin")!
         let dir = FileManager.default.temporaryDirectory
             .appending(path: "source-cache-tests-\(UUID().uuidString)", directoryHint: .isDirectory)
         let cache = SourceByteCache(directory: dir, budget: .fixed(64 << 20), streamEdge: edge)
-        let hold = shared ? AVIOReader(url: url, label: "hold", prefetchEnabled: false, sourceCache: cache) : nil
-        defer { hold?.close() }
+        // A subtitle pull's reader asks for its frames by position, so it is no reason to keep the stream.
+        let streamHold = beside == .aStream
+            ? AVIOReader(url: url, label: "hold", prefetchEnabled: false, sourceCache: cache) : nil
+        defer { streamHold?.close() }
+        let rangeHold = beside == .exactRanges
+            ? try #require(HTTPDiscIOReader(url: url, extraHeaders: [:], sourceCache: cache, label: "subpull")) : nil
+        defer { rangeHold?.close() }
 
         let reader = AVIOReader(url: url, label: "pump", prefetchEnabled: true, sourceCache: cache)
         defer { reader.markClosed(); reader.close() }
@@ -486,7 +494,7 @@ struct SourceByteCacheTests {
         #expect(cache.heldLength(key, at: 0, expectedSize: total) >= edge)
         #expect(cache.heldLength(key, at: total - edge, expectedSize: total) == edge)
         let middle = cache.heldLength(key, at: total / 2, expectedSize: total)
-        if shared {
+        if beside == .aStream {
             #expect(middle > 0)
         } else {
             #expect(middle == 0)
