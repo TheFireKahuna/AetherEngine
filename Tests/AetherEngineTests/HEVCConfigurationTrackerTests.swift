@@ -37,4 +37,15 @@ struct HEVCConfigurationTrackerTests {
         var tracker = try Self.tracker()
         #expect(Self.observe(&tracker, [C.compatVPS, C.compatSPS, C.compatPPS, C.slice(C.trail)]) == nil)
     }
+
+    /// A NAL moved to nuh_layer_id 1: the header's layer bits set.
+    static func layerOne(_ nal: [UInt8]) -> [UInt8] { [nal[0] & 0xFE, (nal[1] & 0x07) | (1 << 3)] + nal[2...] }
+
+    @Test("A second layer's parameter sets and pictures (MV-HEVC, a scalable layer) are not the base layer's")
+    func secondLayerIgnored() throws {
+        var tracker = try Self.tracker()
+        let other = [C.compatVPS, C.compatSPS, C.compatPPS, C.slice(C.idr)].map(Self.layerOne)
+        #expect(Self.observe(&tracker, [C.taggedVPS, C.taggedSPS, C.taggedPPS, C.slice(C.idr)] + other) == nil)
+        #expect(Self.observe(&tracker, [C.slice(C.idr)]) == nil, "the base layer's sets were not replaced")
+    }
 }
