@@ -36,11 +36,14 @@ enum LogRedaction {
     /// such as `hasToken` and `refreshTokenAt` are left alone. Audit SUB-109 added the names other
     /// backends use as whole keys (`api-key` covers `X-Api-Key` through the `-` boundary, `cookie` covers
     /// `Set-Cookie`); bare `pass`, `key`, `auth` and `sid` stay out, because prose carries them.
+    /// `mediabrowsertoken` (the header's field run together) and `pw` (a query parameter some panels
+    /// use) complete the set a host's own redactor knows, so a host can take an engine line as it
+    /// arrives at `EngineLog.handler` rather than scanning it a second time.
     private static let keys: [[UInt8]] = [
-        "x-mediabrowser-token", "x-emby-token", "access_token", "accesstoken", "refreshtoken",
-        "sessiontoken", "auth_token", "authtoken", "connect.sid", "session_id", "sessionid",
-        "signature", "password", "api_key", "api-key", "apikey", "passwd", "secret", "cookie",
-        "token", "pwd",
+        "x-mediabrowser-token", "mediabrowsertoken", "x-emby-token", "access_token", "accesstoken",
+        "refreshtoken", "sessiontoken", "auth_token", "authtoken", "connect.sid", "session_id",
+        "sessionid", "signature", "password", "api_key", "api-key", "apikey", "passwd", "secret",
+        "cookie", "token", "pwd", "pw",
     ].map { Array($0.utf8) }
 
     private static let placeholderBytes = Array(placeholder.utf8)
