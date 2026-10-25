@@ -534,25 +534,3 @@ enum TransportStreamFixture {
         }
     }
 }
-
-/// A reader over bytes in memory that counts what is read from it.
-final class CountingDataReader: IOReader, @unchecked Sendable {
-    private let base: DataIOReader
-    private let lock = NSLock()
-    private var read = 0
-
-    init(_ data: Data) { base = DataIOReader(data: data) }
-
-    var bytesRead: Int { lock.lock(); defer { lock.unlock() }; return read }
-
-    func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
-        let got = base.read(buffer, size: size)
-        if got > 0 { lock.lock(); read += Int(got); lock.unlock() }
-        return got
-    }
-    func seek(offset: Int64, whence: Int32) -> Int64 { base.seek(offset: offset, whence: whence) }
-    func close() { base.close() }
-    func cancel() {}
-    func makeIndependentReader() -> IOReader? { base.makeIndependentReader() }
-    var discImageProbeEnabled: Bool { false }
-}

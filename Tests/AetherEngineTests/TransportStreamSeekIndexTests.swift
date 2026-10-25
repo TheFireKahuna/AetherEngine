@@ -89,15 +89,17 @@ struct TransportStreamSeekIndexTests {
     @Test("a seek back into what was read reads a fraction of what the same seek reads cold")
     func backSeekIsBounded() throws {
         let written = TransportStreamFixture.write([.init(frames: 250)], padding: 60_000)
-        func seekCost(afterReadingAll: Bool) throws -> (bytes: Int, landed: Int64?) {
-            let reader = CountingDataReader(written.data)
+        let origin = try #require(KeepAliveRangeOrigin(data: written.data))
+        defer { origin.stop() }
+        func seekCost(afterReadingAll: Bool) throws -> (bytes: Int64, landed: Int64?) {
+            let reader = try #require(HTTPDiscIOReader(url: URL(string: "http://127.0.0.1:\(origin.port)/stream.ts")!))
             let demuxer = try Self.open(written.data, reader: reader)
             defer { demuxer.close() }
             if afterReadingAll { try Self.drain(demuxer) }
-            let before = reader.bytesRead
+            let before = reader.sourceBytesFetched
             // Absolute source seconds: the stream starts at 10 s.
             #expect(demuxer.seek(to: 16.0))
-            let cost = reader.bytesRead - before
+            let cost = reader.sourceBytesFetched - before
             var landed: Int64?
             while landed == nil, let packet = try demuxer.readPacket() {
                 if packet.pointee.stream_index == demuxer.videoStreamIndex { landed = packet.pointee.pts }
