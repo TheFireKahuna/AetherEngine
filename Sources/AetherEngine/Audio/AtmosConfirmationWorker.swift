@@ -1,11 +1,12 @@
 import Foundation
+import AetherLibavcodec
 
 // #214 follow-up: opt-in confirmation of E-AC-3 JOC on the session's own audio tracks, so
 // `TrackInfo.isAtmos` is an answer rather than the pre-decode guess a host cannot act on. Nothing in
 // libavformat sets AV_PROFILE_EAC3_DDP_ATMOS, so the flag only ever appeared when find_stream_info
-// happened to decode an audio frame by itself. This runs the same bounded pass as
-// `AetherEngine.probeDetectingAtmos` (AtmosDetectionProbe.swift) on a second handle to the source,
-// after the session is up, and republishes `audioTracks` as tracks confirm.
+// happened to decode an audio frame by itself. This runs the same bounded scan as
+// `AetherEngine.probeDetectingAtmos` (`AtmosJOCDecoder`) on the packets the session's own reader reads
+// (`Demuxer.observe`), and republishes `audioTracks` as tracks confirm.
 extension AetherEngine {
 
     /// Stream indices worth a pass: E-AC-3 (the sole carrier of JOC), not already confirmed, and backed by
@@ -45,23 +46,13 @@ extension AetherEngine {
     /// Arm the pass for the loaded session. Called at the end of `load()` on every backend, so it runs
     /// after playback is up and never sits in front of the first frame.
     ///
-    /// Skipped for live sources: a second connection to a live origin costs a tuner on some backends, the
-    /// pass would start at the live edge rather than where playback is, and a live Atmos badge does not
-    /// justify either. Skipped for forward-only custom readers, which cannot hand out a second cursor.
-    /// Skipped where the origin rations requests (`atmosConfirmationDeclineReason`).
+    /// The candidates' packets come from the session's own reader as it plays: a stream nobody plays is
+    /// read beside the one that is, for as long as its scan lasts (about two seconds of audio), and goes no
+    /// further. Nothing opens the source a second time, so no origin is asked anything it is not asked
+    /// already: a serial or held-connection origin and a live source are confirmed like any other.
     func startAtmosConfirmation() {
         cancelAtmosConfirmation()
-        guard loadedOptions.confirmAtmos, !isLive, let url = loadedURL else { return }
-        if let reason = Self.atmosConfirmationDeclineReason(
-            originSerial: !isCustomSource && OriginRequestBudget.shared.requiresSerialRequests(url),
-            sequentialOrigin: loadedOptions.sequentialOrigin,
-            heldSourceConnection: loadedOptions.heldSourceConnection
-        ) {
-            EngineLog.emit(
-                "[AtmosConfirmation] skipped: \(reason); isAtmos stays the pre-decode guess",
-                category: .engine)
-            return
-        }
+        guard loadedOptions.confirmAtmos, let url = loadedURL else { return }
         // A session-preserving reload of the same item keeps what the previous pass already learned and
         // only chases what is still open; a new item starts from scratch.
         if confirmedAtmosSource != url {
@@ -70,102 +61,34 @@ extension AetherEngine {
         }
         applyConfirmedTrackFlags()
         let candidates = Self.atmosConfirmationCandidates(in: audioTracks)
-        guard !candidates.isEmpty else { return }
-        if isCustomSource, !Self.canForkCustomReader(customReader) { return }
-
-        let headers = loadedOptions.httpHeaders
-        let formatHint = customFormatHint
-        let probesize = loadedOptions.probesize
-        let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
-        let budgetURL = isCustomSource ? nil : url
-        atmosConfirmationTask = BlockingWork.detached(priority: .utility) { [weak self] in
-            await self?.runAtmosConfirmation(
-                url: url, budgetURL: budgetURL, formatHint: formatHint, headers: headers,
-                callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
-                candidates: candidates)
+        guard !candidates.isEmpty,
+              let demuxer = nativeVideoSession?.demuxer ?? softwareHost?.subtitleSourceDemuxer else { return }
+        let pass = AtmosConfirmationPass(candidates: candidates, demuxer: demuxer) { [weak self] index in
+            Task { @MainActor [weak self] in
+                guard let self, self.loadedURL == self.confirmedAtmosSource else { return }
+                self.confirmedAtmosStreamIndices.insert(index)
+                self.applyConfirmedTrackFlags()
+            }
         }
+        guard let pass else { return }
+        atmosConfirmation = (pass, demuxer)
+        demuxer.observe(Set(pass.streams)) { packet in pass.feed(packet) }
     }
 
-    /// Why the pass must not run on this origin, or nil when it may.
-    ///
-    /// Each track's pass is a second handle on the source (head, Matroska Cues at the tail, then paced
-    /// cluster reads), and on an origin limited to one request every one of those reads takes the slot
-    /// the video pump needs. Measured at an Xtream origin that refuses a second connection with 509: a
-    /// 4K remux with 17 E-AC-3 tracks stalled every ten seconds for as long as the pass ran, and the pass
-    /// never finished. `sequentialOrigin` and `heldSourceConnection` are declarations of the same kind of
-    /// origin, one that punishes a second request rather than merely slowing it down. The I-frame
-    /// rendition declines the same three for the same reason.
-    nonisolated static func atmosConfirmationDeclineReason(
-        originSerial: Bool, sequentialOrigin: Bool, heldSourceConnection: Bool
-    ) -> String? {
-        if originSerial { return "the origin is limited to one request at a time (#377)" }
-        if sequentialOrigin { return "sequentialOrigin" }
-        if heldSourceConnection { return "heldSourceConnection" }
-        return nil
-    }
-
-    /// Whether the host's reader can hand out the independent cursor each pass needs. The probe builds a
-    /// real reader, which the `IOReader` contract leaves to the engine to close (audit DEC-109); a host
-    /// whose fork opens a connection would otherwise hold one per load for nothing.
-    nonisolated static func canForkCustomReader(_ reader: IOReader?) -> Bool {
-        guard let probe = reader?.makeIndependentReader() else { return false }
-        probe.close()
-        return true
-    }
-
-    /// Teardown. `markClosed()` on the side demuxer so a parked AVIO read cannot outlive the session,
-    /// the same rule the subtitle source's walk follows.
+    /// Teardown: the observed streams go back to what the session's reader asked for, and a pass that had
+    /// not finished says how far it got.
     func cancelAtmosConfirmation() {
-        atmosConfirmationTask?.cancel()
-        atmosConfirmationTask = nil
-        atmosConfirmationDemuxer?.markClosed()
-        atmosConfirmationDemuxer = nil
-    }
-
-    /// One bounded pass per candidate, sequentially. Each opens its own demuxer and closes it before the
-    /// next starts, so at most one extra handle on the source exists at a time. Every failure is silent
-    /// and terminal for that track: the badge simply does not appear.
-    ///
-    /// `budgetURL` is re-checked before every track: an uncapped origin that answers 429/503/509 is lowered
-    /// to one request by the budget mid-session, and the remaining passes would then compete with the pump.
-    nonisolated private func runAtmosConfirmation(
-        url: URL, budgetURL: URL?, formatHint: String?, headers: [String: String],
-        callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?,
-        candidates: [Int32]
-    ) async {
-        var confirmed: [Int32] = []
-        var scanned = 0
-        var stopReason: String?
-        for index in candidates {
-            if Task.isCancelled { stopReason = "cancelled"; break }
-            if let budgetURL, OriginRequestBudget.shared.requiresSerialRequests(budgetURL) {
-                stopReason = "the origin dropped to one request at a time"
-                break
-            }
-            if await confirmAtmosForOneTrack(
-                url: url, formatHint: formatHint, headers: headers,
-                callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration,
-                targetIndex: index
-            ) {
-                confirmed.append(index)
-                await MainActor.run { [weak self] in
-                    guard let self, self.loadedURL == self.confirmedAtmosSource else { return }
-                    self.confirmedAtmosStreamIndices.insert(index)
-                    self.applyConfirmedTrackFlags()
-                }
-            }
-            scanned += 1
+        guard let (pass, demuxer) = atmosConfirmation else { return }
+        atmosConfirmation = nil
+        // Once the observation has ended, the reading thread no longer feeds the pass.
+        demuxer.endObservation()
+        if let line = pass.unfinishedSummary(stopReason: "the session moved on") {
+            EngineLog.emit(line, category: .engine)
         }
-        if stopReason == nil, Task.isCancelled { stopReason = "cancelled" }
-        EngineLog.emit(
-            Self.atmosConfirmationSummary(
-                scanned: scanned, of: candidates.count, confirmed: confirmed, stopReason: stopReason),
-            category: .engine
-        )
     }
 
-    /// The pass's one log line. Emitted on every exit, a stopped pass included, so a report shows how far
-    /// it got instead of showing nothing at all.
+    /// The pass's one log line, once every candidate has an answer. A track whose scan never finished (the
+    /// session ended first) is named as not scanned rather than as not Atmos.
     nonisolated static func atmosConfirmationSummary(
         scanned: Int, of total: Int, confirmed: [Int32], stopReason: String?
     ) -> String {
@@ -176,67 +99,59 @@ extension AetherEngine {
         return "[AtmosConfirmation] stopped (\(stopReason)) after \(scanned) of \(total) E-AC-3 track(s), "
             + "confirmed JOC on \(joc)"
     }
+}
 
-    /// Open, detect, close. Returns whether this track is authoritatively JOC.
-    nonisolated private func confirmAtmosForOneTrack(
-        url: URL, formatHint: String?, headers: [String: String],
-        callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?,
-        targetIndex: Int32
-    ) async -> Bool {
-        // A fresh clone per pass: a demuxer owns its reader's cursor, so the passes cannot share one.
-        let reader: IOReader? = await MainActor.run { [weak self] in
-            guard let self, self.isCustomSource else { return nil }
-            return self.customReader?.makeIndependentReader()
-        }
-        let demuxer = Demuxer()
-        let registered = await MainActor.run { [weak self] () -> Bool in
-            guard !Task.isCancelled, let self else { return false }
-            self.atmosConfirmationDemuxer = demuxer
-            return true
-        }
-        guard registered else {
-            reader?.close()
-            return false
-        }
-        defer {
-            demuxer.close()
-            reader?.close()
-            Task { @MainActor [weak self, weak demuxer] in
-                if let self, let demuxer, self.atmosConfirmationDemuxer === demuxer {
-                    self.atmosConfirmationDemuxer = nil
+/// One confirmation pass: a JOC scan per candidate stream, fed the packets the session's reader reads.
+/// Runs on the reading thread under the demuxer's lock (`Demuxer.observe`), so it only decodes.
+final class AtmosConfirmationPass: @unchecked Sendable {
+    private var decoders: [Int32: AtmosJOCDecoder]
+    let streams: [Int32]
+    private let total: Int
+    private var confirmed: [Int32] = []
+    private let onConfirmed: @Sendable (Int32) -> Void
+
+    /// nil when no candidate's decoder opens.
+    init?(candidates: [Int32], demuxer: Demuxer, options: AtmosDetectionOptions = AtmosDetectionOptions(),
+          onConfirmed: @escaping @Sendable (Int32) -> Void) {
+        var decoders: [Int32: AtmosJOCDecoder] = [:]
+        for index in candidates {
+            guard let decoder = demuxer.withStream(at: index, { stream -> AtmosJOCDecoder? in
+                guard let codecpar = stream.pointee.codecpar, codecpar.pointee.codec_id == AV_CODEC_ID_EAC3 else {
+                    return nil
                 }
-            }
+                return AtmosJOCDecoder(codecpar: codecpar, maxPackets: options.maxPackets, maxBytes: options.maxBytes)
+            }) ?? nil else { continue }
+            decoders[index] = decoder
         }
-
-        guard AetherEngine.openAtmosConfirmationDemuxer(
-            demuxer, url: url, reader: reader, formatHint: formatHint, headers: headers,
-            callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration
-        ) else { return false }
-        guard !Task.isCancelled else { return false }
-        return AetherEngine.detectAtmos(
-            demuxer: demuxer, targetIndex: targetIndex, options: AtmosDetectionOptions()
-        ).confirmedAtmos
+        guard !decoders.isEmpty else { return nil }
+        self.decoders = decoders
+        streams = decoders.keys.sorted()
+        total = candidates.count
+        self.onConfirmed = onConfirmed
     }
 
-    /// Open `demuxer` on the source the way the confirmation pass wants it. Extracted so a test can drive
-    /// the real open profile against real media without a session; the engine keeps ownership of the
-    /// demuxer so `cancelAtmosConfirmation` can still `markClosed()` a parked read. An unopenable source
-    /// is a false, never a throw: a background enrichment must not surface an error the host did not ask for.
-    nonisolated static func openAtmosConfirmationDemuxer(
-        _ demuxer: Demuxer, url: URL, reader: IOReader?, formatHint: String?,
-        headers: [String: String], callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?
-    ) -> Bool {
-        let profile = DemuxerOpenProfile.atmosConfirmationDemuxer(
-            callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration)
-        do {
-            if let reader {
-                try demuxer.open(reader: reader, formatHint: formatHint, profile: profile)
-            } else {
-                try demuxer.open(url: url, extraHeaders: headers, profile: profile)
-            }
-            return true
-        } catch {
-            return false
+    /// The stop line for a pass some of whose candidates have no answer yet; nil once every one has.
+    /// Called after the observation ended, so nothing feeds the pass any more.
+    func unfinishedSummary(stopReason: String) -> String? {
+        guard !decoders.isEmpty else { return nil }
+        return AetherEngine.atmosConfirmationSummary(scanned: total - decoders.count, of: total,
+                                                     confirmed: confirmed.sorted(), stopReason: stopReason)
+    }
+
+    /// One packet of a candidate; true once that candidate has its answer.
+    func feed(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
+        let index = packet.pointee.stream_index
+        guard let decoder = decoders[index] else { return true }
+        guard let outcome = decoder.feed(packet) else { return false }
+        decoders[index] = nil
+        if outcome.confirmedAtmos {
+            confirmed.append(index)
+            onConfirmed(index)
         }
+        if decoders.isEmpty {
+            EngineLog.emit(AetherEngine.atmosConfirmationSummary(
+                scanned: total, of: total, confirmed: confirmed.sorted(), stopReason: nil), category: .engine)
+        }
+        return true
     }
 }

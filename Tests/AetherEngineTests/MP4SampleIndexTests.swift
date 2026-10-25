@@ -201,7 +201,7 @@ struct MP4SampleIndexTests {
     private static func open(_ data: Data) throws -> Demuxer {
         let demuxer = Demuxer()
         try demuxer.open(reader: DataIOReader(data: data),
-                         profile: .subtitleSideDemuxer(callerProbesize: nil, callerMaxAnalyzeDuration: nil))
+                         profile: .headPackets)
         return demuxer
     }
 

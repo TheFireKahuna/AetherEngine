@@ -89,50 +89,19 @@ struct DemuxerProfileTests {
         #expect(p.avioMaxRetries == still.avioMaxRetries)
     }
 
-    // MARK: - subtitleSideDemuxer (#76: bounded embedded-subtitle open)
+    // MARK: - headPackets (#76, #87: a bounded open for a stream's first packets)
 
-    @Test("subtitleSideDemuxer caps the probe far below playback but keeps playback AVIO tuning")
-    func subtitleSideDemuxerCapsProbe() {
+    @Test("headPackets caps the probe far below playback, keeps playback AVIO tuning and skips stream info")
+    func headPacketsCapsProbe() {
         let playback = DemuxerOpenProfile.playback
-        let p = DemuxerOpenProfile.subtitleSideDemuxer(callerProbesize: nil, callerMaxAnalyzeDuration: nil)
-        // The whole point of #76: do not chase sparse PGS/DVB tracks to the 50 MB budget.
+        let p = DemuxerOpenProfile.headPackets
         #expect(p.probesize == 4 * 1024 * 1024)
         #expect(p.maxAnalyzeDuration == 5 * 1_000_000)
         #expect(p.probesize < playback.probesize)
-        #expect(p.maxAnalyzeDuration < playback.maxAnalyzeDuration)
-        // The reader does sustained paced reads, so it must NOT inherit stillExtraction's
-        // aggressive single-attempt / short-timeout AVIO tuning; it keeps playback's.
         #expect(p.avioPrefetch == playback.avioPrefetch)
         #expect(p.avioChunkSize == playback.avioChunkSize)
         #expect(p.avioRequestTimeout == playback.avioRequestTimeout)
         #expect(p.avioMaxRetries == playback.avioMaxRetries)
-    }
-
-    @Test("subtitleSideDemuxer honors an even tighter caller budget (#68)")
-    func subtitleSideDemuxerTighterCallerWins() {
-        let p = DemuxerOpenProfile.subtitleSideDemuxer(
-            callerProbesize: 1 * 1024 * 1024, callerMaxAnalyzeDuration: 2 * 1_000_000)
-        #expect(p.probesize == 1 * 1024 * 1024)
-        #expect(p.maxAnalyzeDuration == 2 * 1_000_000)
-    }
-
-    @Test("subtitleSideDemuxer never widens past its ceiling for a looser caller budget")
-    func subtitleSideDemuxerLooserCallerIgnored() {
-        let p = DemuxerOpenProfile.subtitleSideDemuxer(
-            callerProbesize: 40 * 1024 * 1024, callerMaxAnalyzeDuration: 60 * 1_000_000)
-        #expect(p.probesize == 4 * 1024 * 1024)
-        #expect(p.maxAnalyzeDuration == 5 * 1_000_000)
-    }
-
-    // MARK: - skipStreamInfo (#87: drop the find_stream_info chase on the side demuxer)
-
-    /// #87: PGS/HDMV bitmap tracks keep `has_codec_parameters` false to the budget cap, so
-    /// find_stream_info reads to the full 5 s ceiling on a remote URL source, landing as a flat
-    /// startup stall. The side demuxer only needs `codec_id` / `codec_type` (carried in the
-    /// container header / PMT, resolved by avformat_open_input), so it opts out of the chase.
-    @Test("subtitleSideDemuxer opts out of find_stream_info")
-    func subtitleSideDemuxerSkipsStreamInfo() {
-        let p = DemuxerOpenProfile.subtitleSideDemuxer(callerProbesize: nil, callerMaxAnalyzeDuration: nil)
         #expect(p.skipStreamInfo == true)
     }
 
@@ -185,14 +154,13 @@ extension DemuxerProfileTests {
     }
 
     /// The bound is scoped to the reopen alone. Playback must keep streaming from byte 0 open-ended
-    /// (it plays forward from the start), and neither the still-extraction nor the subtitle side
-    /// demuxer opens should acquire a finite open range.
+    /// (it plays forward from the start), and neither the still-extraction nor the head-packets
+    /// opens should acquire a finite open range.
     @Test("every non-reopen profile keeps the open-ended `bytes=0-` open")
     func nonReopenProfilesStayOpenEnded() {
         #expect(DemuxerOpenProfile.playback.boundedInitialFetch == nil)
         #expect(DemuxerOpenProfile.stillExtraction.boundedInitialFetch == nil)
-        #expect(DemuxerOpenProfile.subtitleSideDemuxer(
-            callerProbesize: nil, callerMaxAnalyzeDuration: nil).boundedInitialFetch == nil)
+        #expect(DemuxerOpenProfile.headPackets.boundedInitialFetch == nil)
         // withProbeBudget must not fabricate a bound when the receiver had none.
         #expect(DemuxerOpenProfile.playback.withProbeBudget(
             probesize: 1, maxAnalyzeDuration: nil).boundedInitialFetch == nil)

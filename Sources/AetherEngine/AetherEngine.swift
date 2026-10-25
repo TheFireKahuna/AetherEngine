@@ -2578,8 +2578,8 @@ public final class AetherEngine: ObservableObject {
     /// stream indices carry JOC, because a mid-session audio switch republishes `audioTracks` and would
     /// otherwise drop a confirmed flag. It is keyed to the source it was gathered from, so it invalidates
     /// itself on a new item and survives a session-preserving reload of the same one.
-    var atmosConfirmationTask: Task<Void, Never>?
-    var atmosConfirmationDemuxer: Demuxer?
+    /// The pass in flight and the session demuxer whose reads feed it (`Demuxer.observe`).
+    var atmosConfirmation: (pass: AtmosConfirmationPass, demuxer: Demuxer)?
     var confirmedAtmosStreamIndices: Set<Int32> = []
     var confirmedAtmosSource: URL?
 
@@ -4723,16 +4723,17 @@ public final class AetherEngine: ObservableObject {
                 // AE#532: a Profile 5 record over a VUI that contradicts it is the one claim in a
                 // container worth checking against the bitstream, because a Profile 5 RPU cannot carry a
                 // residual or an NLQ and the RPU is therefore proof rather than a guess. Gated on that
-                // pairing, so no other source reads a packet here. `.url` only: a custom reader has no
-                // second open to give, and live is not a class this was reported on.
-                if case .url(let auditURL) = source, !options.isLive,
+                // pairing, so no other source reads a packet here. The packets are the probe's own,
+                // peeked and held for the session that reads it next. Live is not a class this was
+                // reported on, and its head is wherever the join landed.
+                if !options.isLive,
                    DolbyVisionRecordAudit.recordIsContradicted(
                        codecID: detectedCodecID, dvProfile: detectedDVProfileNum,
                        colorTransfer: stream.pointee.codecpar.pointee.color_trc,
                        colorMatrix: stream.pointee.codecpar.pointee.color_space) {
-                    let auditHeaders = options.httpHeaders
-                    detectedDVRPUProfile = await BlockingWork.detached(priority: .userInitiated) {
-                        DolbyVisionRecordAudit.rpuProfileOfSource(url: auditURL, extraHeaders: auditHeaders)
+                    let videoIndex = probe.videoStreamIndex
+                    detectedDVRPUProfile = await BlockingWork.detached(priority: .userInitiated) { [probe] in
+                        DolbyVisionRecordAudit.rpuProfile(peeking: probe, streamIndex: videoIndex)
                     }.value
                     correctedDVProfile = DolbyVisionRecordAudit.correctedProfile(
                         record: detectedDVProfileNum, rpu: detectedDVRPUProfile)
@@ -5479,9 +5480,7 @@ public final class AetherEngine: ObservableObject {
             enhancementLayerInPackets: !probe.foldsBluRayDolbyVisionLayers) == nil {
             let vIdx = probe.videoStreamIndex
             elType = await BlockingWork.detached(priority: .userInitiated) { [probe] in
-                let result = DolbyVisionRecordAudit.probeEnhancementLayerType(demuxer: probe, streamIndex: vIdx)
-                probe.seek(to: 0)
-                return result
+                DolbyVisionRecordAudit.probeEnhancementLayerType(peeking: probe, streamIndex: vIdx)
             }.value
             if loadGeneration != gen {
                 probe.markClosed()

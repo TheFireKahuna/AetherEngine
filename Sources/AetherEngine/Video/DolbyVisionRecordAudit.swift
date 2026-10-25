@@ -129,12 +129,12 @@ public enum DolbyVisionRecordAudit {
     }
 
     /// Run the recordless audit on a freshly probed video stream: when it is a candidate, read the first
-    /// RPU from a second open of `url` and add the Profile 5 record if it says so. Called by the demuxer
-    /// at the end of its own probe, so the load, the HLS producer's own open and every rebuild see the
-    /// same stream and none of them needs the verdict carried to it. A failed read is no evidence.
+    /// RPU from `demuxer`'s own first packets and add the Profile 5 record if it says so. Called by the
+    /// demuxer at the end of its own open, so the load, the HLS producer's own open and every rebuild see
+    /// the same stream and none of them needs the verdict carried to it. A failed read is no evidence.
     @discardableResult
     static func addRecordIfProfile5(
-        codecpar: UnsafeMutablePointer<AVCodecParameters>, url: URL, extraHeaders: [String: String]
+        codecpar: UnsafeMutablePointer<AVCodecParameters>, peeking demuxer: Demuxer, streamIndex: Int32
     ) -> Bool {
         let hasRecord = (0..<Int(codecpar.pointee.nb_coded_side_data)).contains {
             codecpar.pointee.coded_side_data?[$0].type == AV_PKT_DATA_DOVI_CONF
@@ -144,8 +144,7 @@ public enum DolbyVisionRecordAudit {
             pixelFormat: codecpar.pointee.format,
             colorTransfer: codecpar.pointee.color_trc, colorMatrix: codecpar.pointee.color_space,
             colorPrimaries: codecpar.pointee.color_primaries) else { return false }
-        let rpu = rpuProfileOfSource(
-            url: url, extraHeaders: extraHeaders, packetBudget: recordlessPacketBudget)
+        let rpu = rpuProfile(peeking: demuxer, streamIndex: streamIndex, packetBudget: recordlessPacketBudget)
         guard rpuProvesProfile5(rpu), synthesizeProfile5Record(codecpar) else {
             EngineLog.emit(
                 "[AetherEngine] AE#recordless: untagged 10-bit HEVC with no DV record, RPU "
@@ -159,162 +158,102 @@ public enum DolbyVisionRecordAudit {
         return true
     }
 
-    /// How many video packets to walk before giving up. Every frame of a Dolby Vision source carries an
+    /// How many video packets to look at before giving up. Every frame of a Dolby Vision source carries an
     /// RPU, so the answer is in the first one; the slack is for a container whose head is audio.
     private static let auditPacketBudget = 16
 
     /// The same for the recordless gate, where the slack is paid by the wrong sources. #532 reads packets
     /// only for a record its own VUI already contradicts, which is a source that is broken either way;
     /// the recordless gate is met by every untagged 10-bit HEVC, and an SDR encode with no colour
-    /// description is a common shape that walks the whole budget to learn nothing. Measured against an
-    /// origin at 150 ms latency and 1 MB/s on a 30 MB untagged 10-bit SDR Matroska: `probe` costs 0.50 s
-    /// without the audit, 2.75 s at a budget of 16 and about 1.2 s at 2. A Profile 5 answers in the first
-    /// video packet, so four is slack and not budget.
+    /// description is a common shape that looks through the whole budget to learn nothing. A Profile 5
+    /// answers in the first video packet, so four is slack and not budget.
     private static let recordlessPacketBudget = 4
 
-    /// Open the source a second time and read what its first RPU says. nil when the source cannot be
-    /// opened, carries no video, or holds no parseable RPU in its first frames, which all mean the same
-    /// thing to the caller: the record stands.
+    /// The profile the first RPU of `demuxer`'s video stream reads, or nil when no packet within the
+    /// budget carries a parseable one, which means the same thing to every caller: the record stands.
     ///
-    /// A second open rather than a read from the session's own probe demuxer, because that demuxer is
-    /// handed to the software path as it stands and packets taken out of it here would be packets that
-    /// path never sees. The audit is gated on `recordIsContradicted`, so this cost is paid by the one
-    /// class of source that is already broken without it, and by no other.
-    static func rpuProfileOfSource(
-        url: URL, extraHeaders: [String: String], packetBudget: Int = auditPacketBudget
-    ) -> Int? {
-        let demuxer = Demuxer()
-        defer { demuxer.close() }
-        do {
-            try demuxer.open(
-                url: url, extraHeaders: extraHeaders,
-                profile: .dolbyVisionRecordAuditDemuxer(callerProbesize: nil, callerMaxAnalyzeDuration: nil))
-        } catch {
-            return nil
-        }
-        return rpuProfile(walking: demuxer, packetBudget: packetBudget)
-    }
-
-    /// The walk over an opened demuxer, split out so a test can hand it a counting reader.
+    /// The packets are peeked where the demuxer stands (`Demuxer.peekPackets`): held, so whoever reads the
+    /// demuxer next (the software path, the producer) gets them first, and the source is neither opened nor
+    /// read a second time for the answer. The demuxer has usually read them already, while it probed.
     static func rpuProfile(
-        walking demuxer: Demuxer, packetBudget: Int = auditPacketBudget,
+        peeking demuxer: Demuxer, streamIndex: Int32, packetBudget: Int = auditPacketBudget,
         byteBudget: Int64 = Int64(walkByteBudget)
     ) -> Int? {
-        let videoIdx = demuxer.videoStreamIndex
-        guard videoIdx >= 0, let stream = demuxer.stream(at: videoIdx) else { return nil }
-        let codecpar = stream.pointee.codecpar
-        let framing = A53SEIParser.nalFraming(
-            codec: .hevc, extradata: codecpar?.pointee.extradata,
-            size: Int(codecpar?.pointee.extradata_size ?? 0))
-
-        // Audit BIT-103: Matroska resyncs byte by byte through junk inside one av_read_frame, where
-        // neither the packet fuse nor the packet byte count below can see the bytes go by.
-        demuxer.beginInputByteBudget(byteBudget)
-        defer { demuxer.endInputByteBudget() }
-
-        var walked = 0
-        var packetsRead = 0
-        var bytesRead = 0
-        while walked < packetBudget {
-            guard !walkExhausted(packetsRead: packetsRead, bytesRead: bytesRead, packetBudget: packetBudget)
-            else { return nil }
-            guard let packet = (try? demuxer.readPacket()) ?? nil else { return nil }
-            defer {
-                av_packet_unref(packet)
-                av_packet_free_safe(packet)
-            }
-            packetsRead += 1
-            bytesRead += Int(max(packet.pointee.size, 0))
-            guard packet.pointee.stream_index == videoIdx else { continue }
-            walked += 1
-            if let profile = rpuProfile(packet, framing: framing) { return profile }
+        firstRPU(peeking: demuxer, streamIndex: streamIndex, packetBudget: packetBudget, byteBudget: byteBudget) {
+            rpuProfile($0, framing: $1)
         }
-        return nil
     }
 
-    /// Walks the first video packets of an open demuxer for the first RPU of a Profile 7 source and reads
-    /// its enhancement-layer type ("FEL" or "MEL"). nil when no packet in the budget carries one.
-    ///
-    /// Takes the session's own probe demuxer, so the packets read here are packets the caller must not
-    /// need afterwards: the caller seeks it back or opens another. The same packet and byte ceilings as
-    /// `rpuProfile(walking:)` apply, for the same reason (audit BIT-2, BIT-103).
+    /// The enhancement-layer type ("FEL" or "MEL") of a Profile 7 source's first RPU, peeked the same way.
     static func probeEnhancementLayerType(
-        demuxer: Demuxer, streamIndex: Int32, packetBudget: Int = auditPacketBudget,
+        peeking demuxer: Demuxer, streamIndex: Int32, packetBudget: Int = auditPacketBudget,
         byteBudget: Int64 = Int64(walkByteBudget)
     ) -> String? {
+        firstRPU(peeking: demuxer, streamIndex: streamIndex, packetBudget: packetBudget, byteBudget: byteBudget) {
+            DoviRpuConverter.enhancementLayerType($0, framing: $1)
+        }
+    }
+
+    /// The first answer `read` gives for a packet of `streamIndex`, looking at no more than `packetBudget`
+    /// of its packets, `foreignPacketFuseMultiplier` times that of every stream, and `byteBudget` of input.
+    private static func firstRPU<T>(
+        peeking demuxer: Demuxer, streamIndex: Int32, packetBudget: Int, byteBudget: Int64,
+        read: (UnsafeMutablePointer<AVPacket>, VideoNALFraming) -> T?
+    ) -> T? {
         guard let stream = demuxer.stream(at: streamIndex) else { return nil }
         let codecpar = stream.pointee.codecpar
         let framing = A53SEIParser.nalFraming(
             codec: .hevc, extradata: codecpar?.pointee.extradata,
             size: Int(codecpar?.pointee.extradata_size ?? 0))
-
+        // Audit BIT-103: Matroska resyncs byte by byte through junk inside one av_read_frame, where
+        // neither the packet fuse nor the packet byte count below can see the bytes go by.
         demuxer.beginInputByteBudget(byteBudget)
         defer { demuxer.endInputByteBudget() }
-
-        var walked = 0
-        var packetsRead = 0
-        var bytesRead = 0
-        while walked < packetBudget {
-            guard !walkExhausted(packetsRead: packetsRead, bytesRead: bytesRead, packetBudget: packetBudget)
-            else { return nil }
-            guard let packet = (try? demuxer.readPacket()) ?? nil else { return nil }
-            defer {
-                av_packet_unref(packet)
-                av_packet_free_safe(packet)
+        let (fuse, overflow) = packetBudget.multipliedReportingOverflow(by: foreignPacketFuseMultiplier)
+        var looked = 0
+        var bytes = 0
+        var answer: T?
+        try? demuxer.peekPackets(maxPackets: overflow ? Int.max : fuse) { packet in
+            bytes += Int(max(packet.pointee.size, 0))
+            if packet.pointee.stream_index == streamIndex {
+                looked += 1
+                if let found = read(packet, framing) { answer = found; return true }
             }
-            packetsRead += 1
-            bytesRead += Int(max(packet.pointee.size, 0))
-            guard packet.pointee.stream_index == streamIndex else { continue }
-            walked += 1
-            if let type = DoviRpuConverter.enhancementLayerType(packet, framing: framing) { return type }
+            return looked >= packetBudget || Int64(bytes) >= byteBudget
         }
-        return nil
+        return answer
     }
 
-    /// Audit BIT-2: the walk counted only video packets, so a source that stops delivering video after
+    /// Audit BIT-2: the look counted only video packets, so a source that stops delivering video after
     /// its head made every open read the rest of the file. Every packet counts against these instead.
     /// No AVDISCARD_ALL on the other streams: the demuxer would then skip them inside one read, where
     /// neither ceiling can see the bytes go by.
     static let foreignPacketFuseMultiplier = 16
     static let walkByteBudget = 64 * 1024 * 1024
 
-    static func walkExhausted(packetsRead: Int, bytesRead: Int, packetBudget: Int) -> Bool {
-        let (fuse, overflow) = packetBudget.multipliedReportingOverflow(by: foreignPacketFuseMultiplier)
-        return packetsRead >= (overflow ? Int.max : fuse) || bytesRead >= walkByteBudget
-    }
-
     /// The verdict for a source in one call, gate included: opens it, reads the record and the VUI, and
-    /// walks packets only when the record is contradicted. nil means the record stands.
+    /// peeks at packets only when the record is contradicted. nil means the record stands.
     ///
     /// For a caller that has no probe of its own, which is the CLI harness. A session gates on the record
-    /// its own probe already read and calls `rpuProfileOfSource` directly, so it does not open the source
-    /// a second time for a source there is nothing to audit.
+    /// its own probe already read and peeks at its own demuxer.
     public static func rpuCorrection(url: URL, extraHeaders: [String: String] = [:]) -> Int? {
         let demuxer = Demuxer()
+        defer { demuxer.close() }
+        // The full profile: the gate reads the DOVI record and the colour description, and both arrive
+        // only with `find_stream_info`.
         do {
-            // The full profile, not the audit one: the gate reads the DOVI record and the colour
-            // description, and both arrive only with `find_stream_info`. Measured, not assumed: the same
-            // fixture comes back with no record at all under `skipStreamInfo`, while the extradata the
-            // packet walk needs for its framing survives it, which is why `rpuProfileOfSource` can stay
-            // on the cheap open and this cannot.
             try demuxer.open(url: url, extraHeaders: extraHeaders, profile: .playback)
         } catch {
-            demuxer.close()
             return nil
         }
         let videoIdx = demuxer.videoStreamIndex
         guard videoIdx >= 0, let stream = demuxer.stream(at: videoIdx),
-              let codecpar = stream.pointee.codecpar else {
-            demuxer.close()
-            return nil
-        }
+              let codecpar = stream.pointee.codecpar else { return nil }
         let record = AetherEngine.dvConfig(stream: stream)
-        let contradicted = recordIsContradicted(
+        guard recordIsContradicted(
             codecID: codecpar.pointee.codec_id, dvProfile: record?.profile,
-            colorTransfer: codecpar.pointee.color_trc, colorMatrix: codecpar.pointee.color_space)
-        demuxer.close()
-        guard contradicted else { return nil }
+            colorTransfer: codecpar.pointee.color_trc, colorMatrix: codecpar.pointee.color_space) else { return nil }
         return correctedProfile(record: record?.profile,
-                                rpu: rpuProfileOfSource(url: url, extraHeaders: extraHeaders))
+                                rpu: rpuProfile(peeking: demuxer, streamIndex: videoIdx))
     }
 }
