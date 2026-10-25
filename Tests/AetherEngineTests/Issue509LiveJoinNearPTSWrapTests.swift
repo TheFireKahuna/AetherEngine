@@ -7,7 +7,7 @@ import Foundation
 /// `loadedTimeRanges` stayed empty with `item.status` never leaving `.unknown`, `item.error` nil and
 /// `errorLog()` empty for the full 20 s.
 ///
-/// The producer publishes the epoch's first frame at `pinnedFirstTfdtPts`, and that value was allowed
+/// The producer publishes the epoch's first frame at `firstItemTfdtPts`, and that value was allowed
 /// to go negative. `tfdt` carries `unsigned int(64)` (ISO/IEC 14496-12), so a negative item axis has
 /// no representation: movenc writes the bits and AVPlayer reads `baseMediaDecodeTime = 2^64 - |dts|`.
 /// Measured on the harness at a source 53.7 s below the wrap: `video gate open: actual=-4834592
@@ -45,8 +45,8 @@ struct Issue509LiveJoinNearPTSWrapTests {
     func negativeSourceClockIsClampedAtZero() {
         // -53.717689 s, the value the harness fixture demuxes at (`-output_ts_offset 95390`).
         let firstDts: Int64 = -4_834_592
-        let pinned = HLSSegmentProducer.pinnedFirstTfdtPts(
-            actualFirstDts: firstDts, desiredTfdtPts: 0, planAnchorPts: 0)
+        let pinned = HLSSegmentProducer.firstItemTfdtPts(
+            actualFirstDts: firstDts, desiredTfdtPts: 0, planAnchorPts: 0, isLive: true)
         #expect(pinned == 0)
         // The shift the producer derives from it moves the axis onto zero, which is what the playlist
         // advertises. Unclamped this was 0, and every packet kept its negative source timestamp.
@@ -78,20 +78,22 @@ struct Issue509LiveJoinNearPTSWrapTests {
     @Test("AE#408's early open is untouched by the clamp")
     func earlyOpenStillKeepsItsPosition() {
         // Every operand AE#408 works with is at or above zero, so the clamp cannot reach its cases.
-        #expect(HLSSegmentProducer.pinnedFirstTfdtPts(
-            actualFirstDts: 243_118, desiredTfdtPts: 244_119, planAnchorPts: 0) == 243_118)
-        #expect(HLSSegmentProducer.pinnedFirstTfdtPts(
-            actualFirstDts: 255_297, desiredTfdtPts: 244_119, planAnchorPts: 0) == 244_119)
+        #expect(HLSSegmentProducer.firstItemTfdtPts(
+            actualFirstDts: 243_118, desiredTfdtPts: 244_119, planAnchorPts: 0, isLive: false) == 243_118)
+        #expect(HLSSegmentProducer.firstItemTfdtPts(
+            actualFirstDts: 255_297, desiredTfdtPts: 244_119, planAnchorPts: 0, isLive: false) == 255_297)
         // An early open whose whole margin is the plan anchor still lands where AE#418 put it.
-        #expect(HLSSegmentProducer.pinnedFirstTfdtPts(
-            actualFirstDts: 48_128, desiredTfdtPts: 48_128, planAnchorPts: 1_024) == 47_104)
+        #expect(HLSSegmentProducer.firstItemTfdtPts(
+            actualFirstDts: 48_128, desiredTfdtPts: 48_128, planAnchorPts: 1_024, isLive: false) == 47_104)
     }
 
     @Test("a plan anchor above the source clock cannot publish a negative restart axis either")
     func planAnchorOvershootIsClampedToo() {
         // The same expression reaches below zero without any wrap involved, when the anchor a restart
         // folds back is above the sample the gate opened on.
-        #expect(HLSSegmentProducer.pinnedFirstTfdtPts(
-            actualFirstDts: 1_000, desiredTfdtPts: 48_128, planAnchorPts: 90_000) == 0)
+        for isLive in [false, true] {
+            #expect(HLSSegmentProducer.firstItemTfdtPts(
+                actualFirstDts: 1_000, desiredTfdtPts: 48_128, planAnchorPts: 90_000, isLive: isLive) == 0)
+        }
     }
 }

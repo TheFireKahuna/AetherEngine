@@ -1141,20 +1141,23 @@ final class HLSSegmentProducer: @unchecked Sendable {
         return keyframePts > boundaryPts &+ toleranceTicks
     }
 
-    /// AE#408: which item-axis timestamp the epoch's first frame is published at.
+    /// Which item-axis timestamp the epoch's first frame is published at.
     ///
-    /// A gate that opened LATE is pinned to the advertised start, because the alternative is a hole
-    /// at that time and AVPlayer waits on holes forever; the resulting shift is what moves the whole
-    /// item axis. A gate that opened EARLY (a re-aim went back for a sync sample covering the
-    /// boundary) keeps its own position instead: that publishes an overlap with the previous segment,
-    /// which AVPlayer absorbs, and it leaves the item axis where the plan puts it, so the seek that
-    /// caused the restart lands where it was aimed.
+    /// On VOD it is the frame's own: item time is source time minus the plan anchor in every run, so
+    /// a segment carries the same timestamps (and is cut at the same frames) whichever run made it.
+    /// Measured with `play --picture-probe` on a fixture whose Cues sit 0.2 s below each sync sample:
+    /// AVPlayer presents a segment that opens past its advertised start at the PLAYLIST position
+    /// either way (AE#418), with no wait on the gap, so publishing the frame at its own time moves
+    /// nothing on screen. Pinning it to the advertised start instead shifted the whole run by the
+    /// overshoot, which moved every later cut in that run and made the segment cache hold different
+    /// bytes for one index depending on where playback had started.
+    ///
+    /// Live keeps the pin for a late open: its target is the end of the previous epoch's output on
+    /// a timeline nothing else describes, and the pin is what keeps that timeline free of a hole.
     ///
     /// Both operands must be on the ITEM axis. `actualFirstDts` is a source timestamp, and the two
     /// differ by the plan anchor on every source whose content does not start at PTS 0 (a Blu-ray
-    /// beginning at 11.6 s, the restart-witness fixture at 0.083 s). Comparing them raw published
-    /// every restarted epoch a whole anchor early, which is what the fixture-backed restart-continuity
-    /// tests caught.
+    /// beginning at 11.6 s, the restart-witness fixture at 0.083 s).
     ///
     /// AE#509: and never below zero. `tfdt` carries `unsigned int(64)` (ISO/IEC 14496-12), so a
     /// negative item axis is not expressible at all: movenc writes the value as-is and AVPlayer reads
@@ -1165,11 +1168,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// `AV_PTS_WRAP_SUB_OFFSET` and every timestamp comes out 2^33 ticks low (demux.c, "correct first
     /// time stamps to negative values"). That is an ordinary live join, not an early-opening gate,
     /// and the clamp is what keeps the two apart.
-    static func pinnedFirstTfdtPts(
-        actualFirstDts: Int64, desiredTfdtPts: Int64, planAnchorPts: Int64
+    static func firstItemTfdtPts(
+        actualFirstDts: Int64, desiredTfdtPts: Int64, planAnchorPts: Int64, isLive: Bool
     ) -> Int64 {
         guard actualFirstDts != Int64.min else { return desiredTfdtPts }
         let actualItemPts = actualFirstDts &- planAnchorPts
+        guard isLive else { return max(0, actualItemPts) }
         return max(0, actualItemPts < desiredTfdtPts ? actualItemPts : desiredTfdtPts)
     }
 
@@ -4268,17 +4272,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         if isLive, lastLiveSegmentFinalizeAt == nil {
                             stampLiveSegmentFinalize()
                         }
-                        // AE#408: a re-aimed gate opens BELOW the segment's advertised start. Pinning
-                        // that frame to the advertised start would relabel the whole item axis by the
-                        // backoff, trading a late landing for an early one; keeping its own timestamp
-                        // costs an overlap with the previous segment instead, which is the direction
-                        // AVPlayer absorbs (a HOLE at the advertised start is what stalls it, and that
-                        // is what the pin exists for when the gate opens late).
-                        let pinnedTfdtPts = Self.pinnedFirstTfdtPts(
+                        let firstTfdtPts = Self.firstItemTfdtPts(
                             actualFirstDts: firstActualVideoDts,
                             desiredTfdtPts: desiredFirstVideoTfdtPts,
-                            planAnchorPts: planAnchorVideoPts)
-                        videoShiftPts = SourceTimestampBounds.difference(firstActualVideoDts, pinnedTfdtPts)
+                            planAnchorPts: planAnchorVideoPts,
+                            isLive: isLive)
+                        videoShiftPts = SourceTimestampBounds.difference(firstActualVideoDts, firstTfdtPts)
                         if audioWaitForVideo, let audio = audioConfig {
                             // Rescale into SOURCE audio TB (not encoder TB): a bridge exposes this mismatch;
                             // using inputTimeBase landed the target 48x too far for bridged DTS sources.
@@ -4297,8 +4296,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             + (effectiveGateTargetPts != restartTargetVideoPts
                                 ? "reaimedTo=\(effectiveGateTargetPts) " : "")
                             + "desired=\(desiredFirstVideoTfdtPts) "
-                            + (pinnedTfdtPts != desiredFirstVideoTfdtPts
-                                ? "pinnedTo=\(pinnedTfdtPts) " : "")
+                            + (firstTfdtPts != desiredFirstVideoTfdtPts
+                                ? "publishedAt=\(firstTfdtPts) " : "")
                             + "shift=\(videoShiftPts) "
                             + (Self.presentedShiftPts(actualFirstPts: firstActualVideoPts,
                                                       desiredTfdtPts: desiredFirstVideoTfdtPts) != videoShiftPts

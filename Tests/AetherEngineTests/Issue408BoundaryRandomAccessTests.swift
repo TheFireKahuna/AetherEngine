@@ -184,29 +184,34 @@ struct Issue408BoundaryRandomAccessTests {
         // 243.118 for a segment advertised at 244.119: publishing it at the advertised start would
         // relabel the axis by a second and land the seek a second early. The overlap with the
         // previous segment is the cost, and AVPlayer absorbs it.
-        #expect(HLSSegmentProducer.pinnedFirstTfdtPts(
+        #expect(HLSSegmentProducer.firstItemTfdtPts(
             actualFirstDts: Self.prevSyncSample, desiredTfdtPts: Self.boundary,
-            planAnchorPts: 0) == Self.prevSyncSample)
+            planAnchorPts: 0, isLive: false) == Self.prevSyncSample)
     }
 
-    @Test("a gate that opened late is still pinned to the advertised start")
-    func lateOpenStaysPinned() {
-        // The budget can run out on a source with a genuine drought. Publishing 255.297 at its own
-        // time would leave a hole where the playlist promises 244.119, and AVPlayer waits on holes
-        // forever; the pin (and the shift it produces) is what keeps that playable.
-        #expect(HLSSegmentProducer.pinnedFirstTfdtPts(
+    @Test("a VOD gate that opened late keeps its own position too; live pins it to the advertised start")
+    func lateOpenKeepsItsPositionOnVOD() {
+        // The budget can run out on a source with a genuine drought. On VOD the frame keeps 255.297:
+        // AVPlayer places the segment at its playlist position whatever its tfdt says, so the pin
+        // moved nothing on screen and only made this run's cuts differ from every other run's.
+        #expect(HLSSegmentProducer.firstItemTfdtPts(
             actualFirstDts: Self.nextSyncSample, desiredTfdtPts: Self.boundary,
-            planAnchorPts: 0) == Self.boundary)
+            planAnchorPts: 0, isLive: false) == Self.nextSyncSample)
+        #expect(HLSSegmentProducer.firstItemTfdtPts(
+            actualFirstDts: Self.nextSyncSample, desiredTfdtPts: Self.boundary,
+            planAnchorPts: 0, isLive: true) == Self.boundary)
     }
 
     @Test("an exact landing publishes at the advertised start either way")
     func exactLandingIsUnchanged() {
-        #expect(HLSSegmentProducer.pinnedFirstTfdtPts(
-            actualFirstDts: Self.boundary, desiredTfdtPts: Self.boundary,
-            planAnchorPts: 0) == Self.boundary)
-        #expect(HLSSegmentProducer.pinnedFirstTfdtPts(
-            actualFirstDts: Int64.min, desiredTfdtPts: Self.boundary,
-            planAnchorPts: 0) == Self.boundary)
+        for isLive in [false, true] {
+            #expect(HLSSegmentProducer.firstItemTfdtPts(
+                actualFirstDts: Self.boundary, desiredTfdtPts: Self.boundary,
+                planAnchorPts: 0, isLive: isLive) == Self.boundary)
+            #expect(HLSSegmentProducer.firstItemTfdtPts(
+                actualFirstDts: Int64.min, desiredTfdtPts: Self.boundary,
+                planAnchorPts: 0, isLive: isLive) == Self.boundary)
+        }
     }
 
     @Test("both operands are on the item axis, so a source starting after PTS 0 is unmoved")
@@ -217,12 +222,12 @@ struct Issue408BoundaryRandomAccessTests {
         // tfdt 48128 against the continuous run's 49152, and as a seam reported at 0.083 s.
         let anchor: Int64 = 1024
         let advertised: Int64 = 48_128        // item axis
-        #expect(HLSSegmentProducer.pinnedFirstTfdtPts(
+        #expect(HLSSegmentProducer.firstItemTfdtPts(
             actualFirstDts: advertised + anchor, desiredTfdtPts: advertised,
-            planAnchorPts: anchor) == advertised)
+            planAnchorPts: anchor, isLive: false) == advertised)
         // A genuine early open on the same source still keeps its position, one anchor lower.
-        #expect(HLSSegmentProducer.pinnedFirstTfdtPts(
+        #expect(HLSSegmentProducer.firstItemTfdtPts(
             actualFirstDts: advertised, desiredTfdtPts: advertised,
-            planAnchorPts: anchor) == advertised - anchor)
+            planAnchorPts: anchor, isLive: false) == advertised - anchor)
     }
 }
