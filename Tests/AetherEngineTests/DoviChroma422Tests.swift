@@ -91,6 +91,49 @@ struct DoviChroma422Tests {
         }
     }
 
+    @Test("an MMR piece too large for the float-pinned high word takes the two-word path, and both equal the spec")
+    func mmrBothPathsEqualTheSpec() throws {
+        // Cb = c * (u - 1/2) + 1/2 at Q23 with c = 2^6: a steep but in-range curve whose |coefficient * term| sum is
+        // 2^29 * 2^20 + (2^28 - 2^22) * 2^20, over the 2^49 bound, so the kernel cannot pin the high word from the
+        // estimate. Cr is the same curve at c = 2^2, inside the bound: the estimate path.
+        var p = DoviGpuEdgeCaseTests.params(flags: [.disableResidual])
+        for (comp, c) in [(0, Int32(1) << 29), (1, Int32(1) << 25)] {
+            var poly = DoviPolynomialParams()
+            poly.numPivots = 2; poly.pivots[0] = 0; poly.pivots[1] = 1023
+            poly.method[0] = DoviMapping.mmr.rawValue; poly.order[0] = 1; poly.coefShift[0] = 23
+            var mmr = DoviMmrParams()
+            mmr.coefShift = 23
+            mmr.coef[0][1 + comp] = c                       // the component's own term, u or v
+            mmr.constant[0] = (1 << 22) - c / 2             // 1/2 - c / 2
+            if comp == 0 { (p.polyCb, p.mmrCb) = (poly, mmr) } else { (p.polyCr, p.mmrCr) = (poly, mmr) }
+        }
+        var table = [Int32](repeating: 0, count: DoviFelComposer.mmrTableCount)
+        DoviFelComposer.populateMmrTable(into: &table, params: p)
+        let stride = DoviFelComposer.mmrTablePieceStride, flag = stride - 1
+        #expect(table[1 * 8 * stride + flag] == 0, "Cb: over the bound, the two-word path")
+        #expect(table[2 * 8 * stride + flag] == 1, "Cr: within it, the estimate path")
+
+        let (w, h) = (128, 32)
+        let (bl, el) = try Self.buffers(width: w, height: h,
+            bl: { x, y, _ in 64 + (7 * x + 3 * y) % 800 }, blUV: { x, y, _ in 500 + (x + 3 * y) % 25 },
+            el: { _, _, _ in 512 }, elUV: { _, _, _ in 512 })
+        let out = M.plane(try Self.sv22(bl, el, p), 1, components: 2)
+        let model = M.Model(p)
+        let blP = M.plane(bl, 0, components: 1), blUV = M.plane(bl, 1, components: 2), elUV = M.plane(el, 1, components: 2)
+        var cb = M.Stat(), cr = M.Stat(), spread = Set<Int>()
+        for row in 0..<h {
+            for x in 0..<(w / 2) {
+                let (mcb, mcr) = model.chroma422Sum(bl: blP, blUV: blUV, elUV: elUV, x: x, row: row)
+                cb.add(Self.word(mcb) - Int(out.word(x, row, 0)))
+                cr.add(Self.word(mcr) - Int(out.word(x, row, 1)))
+                spread.insert(Int(out.word(x, row, 0)))
+            }
+        }
+        #expect(spread.count > 20, "the steep Cb curve spans many output words, not a clamp")
+        #expect(cb.exact == cb.n, "two-word path: \(cb.description)")
+        #expect(cr.exact == cr.n, "estimate path: \(cr.description)")
+    }
+
     @Test("on flat luma and flat chroma the 4:2:2-site result is the 4:2:0 result on both rows")
     func flatFieldMatchesDuplicated() throws {
         let sets = [("identity", DoviGpuEdgeCaseTests.params())] + Self.realParams()

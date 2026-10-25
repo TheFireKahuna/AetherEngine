@@ -41,9 +41,11 @@ typedef int  dovi_i32;
 #define DOVI_MAPPING_POLYNOMIAL       0
 #define DOVI_MAPPING_MMR              1
 
-/* ---- per-frame MMR table (buffer 3): [Y, Cb, Cr][piece 0..7][constant, 21 coefficients] ---- */
-#define DOVI_MMR_TABLE_PIECE_STRIDE      22
+/* ---- per-frame MMR table (buffer 3): [Y, Cb, Cr][piece 0..7][constant, 21 coefficients, estimate flag] as int,
+        then the same layout again as float (the coefficients' float values; the flag slot unused) ---- */
+#define DOVI_MMR_TABLE_PIECE_STRIDE      23
 #define DOVI_MMR_TABLE_COMPONENT_STRIDE  (8 * DOVI_MMR_TABLE_PIECE_STRIDE)
+#define DOVI_MMR_TABLE_FLOAT_OFFSET      (3 * DOVI_MMR_TABLE_COMPONENT_STRIDE)
 
 /* ---- flags ---- */
 #define DOVI_FLAG_DISABLE_RESIDUAL    0x1u /* disable_residual_flag, or el_type == MEL */
@@ -254,15 +256,66 @@ static inline uint dovi_q20_shift(uint bl_max) {
     return 20u - (32u - clz(bl_max));
 }
 
+// The arithmetic is the spec's 64-bit integers, carried in 32-bit words, which Apple GPUs multiply natively where
+// 64-bit integers are emulated:
+// - every term is non-negative and below 2^20 (a clamped base-layer value in Q20, or a product of two), so a product
+//   of two is below 2^40 and (a * b) >> 20 is its high word shifted up by 12 and its low word down by 20, exactly;
+// - a sum of coefficient * term (a signed 32-bit coefficient times a term below 2^20) is a two-word accumulator,
+//   each product's words from mul and the signed mulhi, the carry added by hand: int64 arithmetic, wrapping
+//   included.
+
+// (a * b) >> 20 for a * b below 2^52.
+static inline uint dovi_mul_q20(uint a, uint b) {
+    return (mulhi(a, b) << 12) | ((a * b) >> 20);
+}
+
+// A 64-bit sum as its high (signed) and low words.
+struct DoviAcc {
+    int hi;
+    uint lo;
+};
+
+// constant << 20, the spec's `coef * tt[0]` (`poly_coef[0] * (1 << 20)`).
+static inline DoviAcc dovi_acc_constant(int c) {
+    return DoviAcc{ c >> 12, uint(c) << 20 };
+}
+
+// acc += c * t, for 0 <= t < 2^31.
+static inline void dovi_acc_add(thread DoviAcc &acc, int c, uint t) {
+    uint lo = uint(c) * t;
+    int hi = mulhi(c, int(t));
+    uint sum = acc.lo + lo;
+    acc.hi += hi + (sum < lo ? 1 : 0);
+    acc.lo = sum;
+}
+
+// 5.4.2.3: the accumulated Q(20 + coefficient_log2_denom) sum to the 16-bit prediction: negative sums 0,
+// `>> (4 + coefficient_log2_denom)`, capped at 0xffff. The shift is held below 64, where a hostile coef_shift would
+// otherwise leave it undefined.
+static inline int dovi_prediction(DoviAcc acc, uint coef_shift) {
+    if (acc.hi < 0) {
+        return 0;
+    }
+    uint k = min(4u + coef_shift, 63u);
+    uint hi = uint(acc.hi);
+    if (k >= 32u) {
+        return int(min(hi >> (k - 32u), 0xffffu));
+    }
+    if ((hi >> k) != 0u) {
+        return 0xffff;   // at least 2^32 after the shift
+    }
+    return int(min((hi << (32u - k)) | (acc.lo >> k), 0xffffu));
+}
+
 // Index of the piece owning t: the last pivot that t reaches. 5.4.2.2 takes the first piece whose next pivot is
 // above s, which is the same piece, a zero-width piece (two equal pivots) included: both give the later one. Past
 // the last pivot the spec's index runs one beyond the pieces; the value is clamped to that pivot anyway, so the
 // last piece is the one that applies.
-static inline int dovi_select_piece(constant struct DoviPolynomialParams &curve, long t, uint shift) {
+static inline int dovi_select_piece(constant struct DoviPolynomialParams &curve, uint t, uint shift) {
     int last_piece = int(curve.num_pivots) - 2;
     int piece = 0;
     for (int i = 0; i <= last_piece; ++i) {
-        if (t >= (long(curve.pivots[i]) << shift)) {
+        if (t >= (curve.pivots[i] << shift)) {
             piece = i;
         }
     }
@@ -271,86 +324,132 @@ static inline int dovi_select_piece(constant struct DoviPolynomialParams &curve,
 
 // t clamped to a component's pivot range, in Q20 (5.4.2.3.2 and the s0 / s1 / s2 clamps of 5.4.2.3.3). A
 // component with no usable curve (num_pivots < 2) has no range and is left as is.
-static inline long dovi_clamp_to_pivots(constant struct DoviPolynomialParams &curve, long t, uint shift) {
+static inline uint dovi_clamp_to_pivots(constant struct DoviPolynomialParams &curve, uint t, uint shift) {
     if (curve.num_pivots < 2u) {
         return t;
     }
-    return clamp(t, long(curve.pivots[0]) << shift, long(curve.pivots[curve.num_pivots - 1u]) << shift);
+    return clamp(t, curve.pivots[0] << shift, curve.pivots[curve.num_pivots - 1u] << shift);
 }
 
-// 5.4.2.3: the accumulated Q(20 + coefficient_log2_denom) sum to the 16-bit prediction. The shift is held below
-// 64, where a hostile coef_shift would make it undefined.
-static inline int dovi_prediction(long vv, uint coef_shift) {
-    vv = max(vv, 0l);
-    return int(min(vv >> min(4u + coef_shift, 63u), 0xffffl));
-}
-
-// 5.4.2.3.2, polynomial piece: vv = sum of poly_coef[i] * s^i at Q20, i <= 2.
-static inline int dovi_eval_poly(constant struct DoviPolynomialParams &curve, int piece, long t, uint shift) {
+// 5.4.2.3.2, polynomial piece: the sum of poly_coef[i] * s^i at Q20, i <= 2.
+static inline int dovi_eval_poly(constant struct DoviPolynomialParams &curve, int piece, uint t, uint shift) {
     t = dovi_clamp_to_pivots(curve, t, shift);
-    long vv = long(curve.coef[piece][0]) << 20;
+    DoviAcc acc = dovi_acc_constant(curve.coef[piece][0]);
     uint order = curve.order[piece];
     if (order >= 1u) {
-        vv += long(curve.coef[piece][1]) * t;
+        dovi_acc_add(acc, curve.coef[piece][1], t);
     }
     if (order >= 2u) {
-        vv += long(curve.coef[piece][2]) * ((t * t) >> 20);
+        dovi_acc_add(acc, curve.coef[piece][2], dovi_mul_q20(t, t));
     }
-    return dovi_prediction(vv, curve.coef_shift[piece]);
+    return dovi_prediction(acc, curve.coef_shift[piece]);
 }
 
-// 5.4.2.3.3, MMR piece: the constant and, per order, the seven terms [s0, s1, s2, s0s1, s0s2, s1s2, s0s1s2] raised
-// to that order, each product truncated back to Q20 as the spec's tt[] are. `k` is this component's slice of the
-// per-frame MMR table (`populateMmrTable`): per piece the constant then the 21 coefficients, Q(coef_shift).
-static inline int dovi_eval_mmr(device const int* k, int piece, uint order, uint coef_shift,
-                                long t0, long t1, long t2) {
-    device const int* c = k + piece * DOVI_MMR_TABLE_PIECE_STRIDE;
-    long base[7] = { t0, t1, t2, (t0 * t1) >> 20, (t0 * t2) >> 20, (t1 * t2) >> 20, 0 };
-    base[6] = (base[3] * t2) >> 20;
-    long vv = long(c[0]) << 20;
-    order = min(order, 3u);
-    long term[7];
-    for (int j = 0; j < 7; ++j) {
-        term[j] = base[j];
-    }
-    for (uint o = 0u; o < order; ++o) {
+// 5.4.2.3.3's tt[1...21] for MMR inputs already clamped to their pivots, up to `order`: the seven terms [s0, s1, s2,
+// s0s1, s0s2, s1s2, s0s1s2], then their squares, then their cubes (term * square), each product truncated back to
+// Q20 as the spec's are. Cb and Cr read the same three inputs, so a chroma sample forms these once for both.
+static inline void dovi_mmr_terms(uint t0, uint t1, uint t2, uint order, thread uint* tt, thread float* ttf) {
+    tt[0] = t0;
+    tt[1] = t1;
+    tt[2] = t2;
+    tt[3] = dovi_mul_q20(t0, t1);
+    tt[4] = dovi_mul_q20(t0, t2);
+    tt[5] = dovi_mul_q20(t1, t2);
+    tt[6] = dovi_mul_q20(tt[3], t2);
+    if (order >= 2u) {
         for (int j = 0; j < 7; ++j) {
-            vv += long(c[1u + o * 7u + uint(j)]) * term[j];
+            tt[7 + j] = dovi_mul_q20(tt[j], tt[j]);
         }
-        if (o + 1u < order) {
-            // tt[8..14] = (base * base) >> 20, tt[15..21] = (base * tt[8..14]) >> 20.
-            for (int j = 0; j < 7; ++j) {
-                term[j] = (term[j] * base[j]) >> 20;
+    }
+    if (order >= 3u) {
+        for (int j = 0; j < 7; ++j) {
+            tt[14 + j] = dovi_mul_q20(tt[j], tt[7 + j]);
+        }
+    }
+    // The float values the estimate reads (exact: every term is below 2^24), formed once for Cb and Cr.
+    for (int j = 0; j < 21; ++j) {
+        ttf[j] = float(tt[j]);
+    }
+}
+
+// 5.4.2.3.3, MMR piece: the constant and the order's terms against their coefficients. `k` is this component's slice
+// of the per-frame MMR table (`populateMmrTable`): per piece the constant, the 21 coefficients, Q(coef_shift), and
+// whether the estimate below is safe for the piece.
+//
+// The sum vv is the spec's 64-bit integer. Its low word is exact from wrapping 32-bit multiply-adds, one multiply per
+// coefficient. Its high word is pinned by a float estimate E of the same sum, the coefficients' float values against
+// the exact terms: with A = sum of |c * t|, E is within (n + 2) * 2^-24 * A of vv, and for A <= 2^49 that is under
+// 2^31, so hi = rint((E - lo) / 2^32) is vv's high word exactly. The CPU bounds A per piece with the term ceiling
+// 2^20 and sets the flag; a piece it cannot bound takes the two-word product path, exact for any coefficient.
+static inline int dovi_eval_mmr(device const int* k, int piece, uint order, uint coef_shift, thread const uint* tt,
+                                thread const float* ttf) {
+    device const int* c = k + piece * DOVI_MMR_TABLE_PIECE_STRIDE;
+    // Loops of fixed length, the order tested per block of seven: a loop bound known only at run time would keep
+    // tt[] in addressable memory instead of registers.
+    if (c[22] != 0) {
+        device const float* f = (device const float*)(c + DOVI_MMR_TABLE_FLOAT_OFFSET);
+        uint lo = uint(c[0]) << 20;
+        float e = f[0] * 1048576.0f;
+        for (uint o = 0u; o < 3u; ++o) {
+            if (o < order) {
+                for (uint j = 0u; j < 7u; ++j) {
+                    uint i = o * 7u + j;
+                    lo += uint(c[1u + i]) * tt[i];
+                    e = fma(f[1u + i], ttf[i], e);
+                }
+            }
+        }
+        int hi = int(rint((e - float(lo)) * 0x1p-32f));
+        return dovi_prediction(DoviAcc{ hi, lo }, coef_shift);
+    }
+    DoviAcc acc = dovi_acc_constant(c[0]);
+    for (uint o = 0u; o < 3u; ++o) {
+        if (o < order) {
+            for (uint j = 0u; j < 7u; ++j) {
+                dovi_acc_add(acc, c[1u + o * 7u + j], tt[o * 7u + j]);
             }
         }
     }
-    return dovi_prediction(vv, coef_shift);
+    return dovi_prediction(acc, coef_shift);
 }
 
-// One component's 16-bit prediction. `t` is the component's own value, t0 / t1 / t2 the luma (downsampled to the
-// chroma site, 5.4.2.3.3) and the two chroma values an MMR piece reads, all Q20. num_pivots < 2 is the parser's
-// fail-safe for a curve it could not trust, and means identity: the base layer passes through untouched
-// (v = s << (16 - BL_bit_depth), the identity polynomial's exact value).
+// The MMR inputs of a sample: luma (downsampled to the chroma site, 5.4.2.3.3) and the two chroma values, each
+// clamped to its own component's pivots.
+static inline void dovi_mmr_inputs(constant struct DoviMetalParams &params, uint t0, uint t1, uint t2, uint shift,
+                                   thread uint &c0, thread uint &c1, thread uint &c2) {
+    c0 = dovi_clamp_to_pivots(params.poly_y, t0, shift);
+    c1 = dovi_clamp_to_pivots(params.poly_cb, t1, shift);
+    c2 = dovi_clamp_to_pivots(params.poly_cr, t2, shift);
+}
+
+// Whether `curve`'s piece for t is MMR, and that piece's order (0 when it is not).
+static inline uint dovi_mmr_order(constant struct DoviPolynomialParams &curve, uint t, uint shift) {
+    if (curve.num_pivots < 2u) {
+        return 0u;
+    }
+    int piece = dovi_select_piece(curve, t, shift);
+    return curve.method[piece] == DOVI_MAPPING_MMR ? curve.order[piece] : 0u;
+}
+
+// One component's 16-bit prediction from its own value t (Q20). An MMR piece reads `tt`, the sample's MMR terms
+// (dovi_mmr_terms), formed up to at least its order. num_pivots < 2 is the parser's fail-safe for a curve it could
+// not trust, and means identity: the base layer passes through untouched (v = s << (16 - BL_bit_depth), the identity
+// polynomial's exact value).
 static inline int dovi_eval_curve(
     constant struct DoviPolynomialParams &curve,
     device const int* mmr,
     uint mmr_coef_shift,
-    constant struct DoviPolynomialParams &poly_y,
-    constant struct DoviPolynomialParams &poly_cb,
-    constant struct DoviPolynomialParams &poly_cr,
-    long t,
-    long t0, long t1, long t2,
+    uint t,
+    thread const uint* tt,
+    thread const float* ttf,
     uint shift)
 {
     if (curve.num_pivots < 2u) {
-        return int(min(max(t, 0l) >> 4, 0xffffl));
+        return int(min(t >> 4, 0xffffu));
     }
     int piece = dovi_select_piece(curve, t, shift);
     if (curve.method[piece] == DOVI_MAPPING_MMR) {
-        return dovi_eval_mmr(mmr, piece, curve.order[piece], mmr_coef_shift,
-                             dovi_clamp_to_pivots(poly_y, t0, shift),
-                             dovi_clamp_to_pivots(poly_cb, t1, shift),
-                             dovi_clamp_to_pivots(poly_cr, t2, shift));
+        return dovi_eval_mmr(mmr, piece, curve.order[piece], mmr_coef_shift, tt, ttf);
     }
     return dovi_eval_poly(curve, piece, t, shift);
 }
@@ -539,10 +638,16 @@ kernel void dovi_compose_luma(
     } else {
         uint shift = dovi_q20_shift(params.bl_max);
         ushort4 bl_uv = bl_uv_tex.read(uint2(gid.x >> 1, gid.y >> 1));
-        long t = long(bl_y) << shift;
-        h = dovi_eval_curve(params.poly_y, mmr_table, params.mmr_y.coef_shift,
-                            params.poly_y, params.poly_cb, params.poly_cr, t,
-                            t, long(bl_uv.r >> 6) << shift, long(bl_uv.g >> 6) << shift, shift);
+        uint t = uint(bl_y) << shift;
+        uint tt[21];
+        float ttf[21];
+        uint order = dovi_mmr_order(params.poly_y, t, shift);
+        if (order > 0u) {
+            uint c0, c1, c2;
+            dovi_mmr_inputs(params, t, uint(bl_uv.r >> 6) << shift, uint(bl_uv.g >> 6) << shift, shift, c0, c1, c2);
+            dovi_mmr_terms(c0, c1, c2, order, tt, ttf);
+        }
+        h = dovi_eval_curve(params.poly_y, mmr_table, params.mmr_y.coef_shift, t, tt, ttf, shift);
     }
 
     if ((params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u &&
@@ -628,11 +733,19 @@ kernel void dovi_compose_chroma(
     int bl_cr = int(bl_uv.g >> 6);
 
     uint shift = dovi_q20_shift(params.bl_max);
-    long t0 = long(bl_y) << shift, t1 = long(bl_cb) << shift, t2 = long(bl_cr) << shift;
+    uint t0 = uint(bl_y) << shift, t1 = uint(bl_cb) << shift, t2 = uint(bl_cr) << shift;
+    uint order = max(dovi_mmr_order(params.poly_cb, t1, shift), dovi_mmr_order(params.poly_cr, t2, shift));
+    uint tt[21];
+    float ttf[21];
+    if (order > 0u) {
+        uint c0, c1, c2;
+        dovi_mmr_inputs(params, t0, t1, t2, shift, c0, c1, c2);
+        dovi_mmr_terms(c0, c1, c2, order, tt, ttf);
+    }
     int h_cb = dovi_eval_curve(params.poly_cb, mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE, params.mmr_cb.coef_shift,
-                               params.poly_y, params.poly_cb, params.poly_cr, t1, t0, t1, t2, shift);
+                               t1, tt, ttf, shift);
     int h_cr = dovi_eval_curve(params.poly_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE, params.mmr_cr.coef_shift,
-                               params.poly_y, params.poly_cb, params.poly_cr, t2, t0, t1, t2, shift);
+                               t2, tt, ttf, shift);
 
     if ((params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u && dovi_residual_at(params, gid.x * 2u)) {
         bool cb_active = (params.nlq_cb.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cb.nlq_scale != 0);
@@ -762,11 +875,19 @@ kernel void dovi_compose_chroma_422(
     // The interpolated chroma is a multiple of 1/128 of a code, so its Q20 value is exact.
     uint shift = dovi_q20_shift(params.bl_max);
     float q20 = float(1u << shift);
-    long t0 = long(bl_y) << shift, t1 = long(rint(bl_uv.x * q20)), t2 = long(rint(bl_uv.y * q20));
+    uint t0 = uint(bl_y) << shift, t1 = uint(rint(bl_uv.x * q20)), t2 = uint(rint(bl_uv.y * q20));
+    uint order = max(dovi_mmr_order(params.poly_cb, t1, shift), dovi_mmr_order(params.poly_cr, t2, shift));
+    uint tt[21];
+    float ttf[21];
+    if (order > 0u) {
+        uint c0, c1, c2;
+        dovi_mmr_inputs(params, t0, t1, t2, shift, c0, c1, c2);
+        dovi_mmr_terms(c0, c1, c2, order, tt, ttf);
+    }
     int h_cb = dovi_eval_curve(params.poly_cb, mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE, params.mmr_cb.coef_shift,
-                               params.poly_y, params.poly_cb, params.poly_cr, t1, t0, t1, t2, shift);
+                               t1, tt, ttf, shift);
     int h_cr = dovi_eval_curve(params.poly_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE, params.mmr_cr.coef_shift,
-                               params.poly_y, params.poly_cb, params.poly_cr, t2, t0, t1, t2, shift);
+                               t2, tt, ttf, shift);
 
     if ((params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u && dovi_residual_at(params, gid.x * 2u)) {
         bool cb_active = (params.nlq_cb.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cb.nlq_scale != 0);
