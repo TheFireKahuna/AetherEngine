@@ -64,8 +64,11 @@ final class SubtitleSource {
         /// A decoder for a stream, made as the overlay's are, so a cue reads the same whichever reader
         /// decoded it.
         let makeDecoder: @MainActor @Sendable (Int32) -> EmbeddedSubtitleDecoder?
-        /// The playhead on the source axis; nil once the engine is gone.
+        /// The playhead on the source axis; nil once the engine is gone. Where a demand anchors the walk.
         let playhead: @MainActor @Sendable () -> Double?
+        /// The playhead the walk paces against, read where it parks, off the main actor
+        /// (`SourcePlayheadClock`); nil while no clock runs, which the walk waits out.
+        let pacingPlayhead: @Sendable () -> Double?
         let duration: @MainActor @Sendable () -> Double
         /// A producer restart is executing (#93): a walk opened now would compete with it for the link.
         let videoRestarting: @MainActor @Sendable () -> Bool
@@ -786,8 +789,7 @@ final class SubtitleSource {
                     return
                 }
                 do { try await Task.sleep(nanoseconds: backoff) } catch { return }
-                guard let fresh = await MainActor.run(body: { host.playhead() }) else { return }
-                resumeAt = max(0, fresh)
+                if let fresh = host.pacingPlayhead() { resumeAt = max(0, fresh) }
                 EngineLog.emit("[SubtitleSource] restarting after a read failure (restart \(budget.restarts)) at "
                                + "\(String(format: "%.2f", resumeAt))s", category: .engine)
             }
@@ -931,7 +933,7 @@ final class SubtitleSource {
             source: walk, store: store, lead: { leads.furthest(playhead: $0, where: { !indexedStreams.contains($0) }) },
             parkPollNanoseconds: AetherEngine.subtitleForwardPrefetchParkPollNanoseconds,
             link: link, reanchor: reanchor, fence: fence,
-            playhead: { await MainActor.run(body: { host.playhead() }) })
+            playhead: { host.pacingPlayhead() })
         EngineLog.emit("[SubtitleSource] session exited (reason=\(outcome.exit) cancelled=\(Task.isCancelled)) "
                        + "harvested=\(outcome.harvested)", category: .engine)
         // #250: EOF is the one exit that strengthens the claim: everything ahead of the playhead is read.

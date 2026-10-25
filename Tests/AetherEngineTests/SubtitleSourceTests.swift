@@ -18,7 +18,9 @@ struct SubtitleSourceTests {
         let demuxer: Demuxer
         let packetStore = SubtitlePacketStore()
         let cueStores: [Int32: NativeSubtitleCueStore]
-        var playhead: Double = 0
+        var playhead: Double = 0 { didSet { clock.set(playhead) } }
+        /// The playhead the walk paces against, as a session's clock would give it.
+        let clock = AtomicDouble(0)
         var restarting = false
         var endsOfFile = 0
         var stops: [SubtitleDrainStopReason?] = []
@@ -47,6 +49,7 @@ struct SubtitleSourceTests {
                     } ?? nil
                 },
                 playhead: { [weak self] in self?.playhead },
+                pacingPlayhead: { [clock] in clock.get() },
                 duration: { 12 },
                 videoRestarting: { [weak self] in self?.restarting ?? false },
                 linkGate: SideReaderLinkGate(),

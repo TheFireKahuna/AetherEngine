@@ -387,7 +387,7 @@ In order, each step replacing a reader rather than adding one:
        (Sodalite's subtitle style menu; nothing in the engine).
      - *Authoring 5.8* (a language's regular rendition also contains its forced lines) holds whenever
        the source's regular track carries them, which is the authored norm; nothing is synthesised.
-3. **The PGS overlay pulls. Built, but for pacing the walk against the timebase.** The drainer and the OCR worker ask the subtitle source for their
+3. **The PGS overlay pulls. Built.** The drainer and the OCR worker ask the subtitle source for their
    windows around the playhead; for an indexed stream the packet store becomes a cache of what was
    pulled, not a buffer filled ahead.
    - **Why the engine still draws.** tvOS 27.2 offers no native route for a bitmap subtitle:
@@ -411,8 +411,11 @@ In order, each step replacing a reader rather than adding one:
      (the fill, the forced lines, a pull) opens its lanes for the read and closes them after
      (`FrameReaders.url`). A host's own reader, outside the cache, is held as the one clone; one that can
      neither read exact ranges nor hand out independent readers cannot be pulled, so its streams are all
-     walked. Left: a positional reader should not count as one that comes back for a stream at all (the
-     cache's own rule, to settle with its owner). Pulls of one
+     walked. And the cache counts only the readers that stream a source (`readerOpened(_:streams:)`:
+     `AVIOReader` streams, `HTTPDiscIOReader` asks by position) when it decides whether a streamed
+     delivery is kept; every reader still holds the source open. So a pull, or any reader of exact
+     ranges, beside the pump keeps nothing of its stream but the ends (`SourceByteCacheTests`, the pump
+     beside a reader of exact ranges). Pulls of one
      stream are coalesced (a span already pulled or in flight is not asked again) and a newer landing
      cancels an older one's unread remainder.
    - **The drainer asks for its own window, nothing more.** Each tick it pulls `[playhead - backscan,
@@ -441,11 +444,14 @@ In order, each step replacing a reader rather than adding one:
      the corrected position. The jump threshold (#271) and #93's
      60 s rendered-time rule are gone from it; the threshold stays the software route's, which has no
      AVPlayer. The landing pull (above) will start here.
-   - **Pacing reads the item's timebase. Not built.** The walk's lead is judged against the playhead on
-     the source axis read off the main actor: on the software route the synchronizer's
-     (`softwarePresentationTimebase`), on the native route `AVPlayerItem.timebase` as a child timebase
-     offset by the seam shift and re-anchored when the axis moves, as `AudioOutput.sourceTimebase` does;
-     not a main-actor hop for `sourceTime` at every park.
+   - **Pacing reads the clock playback runs on. Built.** The walk's lead is judged against
+     `SourcePlayheadClock`, read where it parks, off the main actor: on the native route
+     `AVPlayerItem.timebase` folded onto the source axis by the seam shift the engine states as it folds
+     `sourceTime` (and wherever the axis moves), so the walk follows a landing as soon as the timebase
+     jumps rather than when the picture gets there; on the software route the synchronizer's source-axis
+     timebase (`SoftwarePlaybackHost.presentationTimebases`). While no clock runs (a load before its item
+     attaches) nothing plays, and the walk waits; a session that goes away closes its source, which
+     cancels it, so a missing clock is no longer read as the engine having gone.
    - **What the index makes exact.** A bitmap set's end is the next block's time in the index, known
      without reading it, so `firstPTS(after:)` and its derivation horizon (#362 round 2) are the walk's
      only; a pulled span has no holes, so the harvest-gap hold (#362) is the walk's only; a pulled span
