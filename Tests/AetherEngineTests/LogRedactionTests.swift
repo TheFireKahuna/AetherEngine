@@ -28,7 +28,7 @@ struct LogRedactionTests {
 
     @Test("the generic credential parameter names are covered", arguments: [
         "api_key", "ApiKey", "access_token", "token", "password", "secret", "signature",
-        "X-Emby-Token", "X-MediaBrowser-Token",
+        "X-Emby-Token", "X-MediaBrowser-Token", "MediaBrowserToken", "pw",
     ])
     func genericKeyNames(key: String) {
         let line = LogRedaction.redact("[x] https://s/a?\(key)=\(token)&keep=1")
@@ -263,7 +263,7 @@ struct LogRedactionTests {
         #expect(EngineLog.registerSecret(secret))
         #expect(EngineLog.registerSecret(secret))
         EngineLog.unregisterSecret(secret)
-        #expect(LogRedaction.redact("[x] pw=\(secret)x") == "[x] pw=<redacted>x")
+        #expect(LogRedaction.redact("[x] v=\(secret)x") == "[x] v=<redacted>x")
         EngineLog.unregisterSecret(secret)
         #expect(LogRedaction.redact("[x] v=\(secret)x") == "[x] v=\(secret)x")
     }

@@ -20,7 +20,10 @@ public enum EngineLog {
     }
 
     /// Optional host handler for every diagnostic line (in-app overlay, aetherctl stdout).
-    /// Called on whatever thread emitted the line; must be thread-safe and non-blocking.
+    /// Called on whatever thread emitted the line; must be thread-safe and non-blocking. The line has
+    /// already been through the engine's redaction (named credential keys and headers, userinfo,
+    /// `Bearer` / `Basic` credentials, encoded payloads, Xtream Codes paths and every value passed to
+    /// `registerSecret(_:)`), so a host need not scan it again.
     /// Lock-guarded: multi-word closure swap against concurrent reads is a data race.
     public static var handler: ((String) -> Void)? {
         get { handlerLock.lock(); defer { handlerLock.unlock() }; return _handler }
