@@ -75,7 +75,7 @@ struct AudioSegmentRunsTests {
         var segments: [Int: [Out]] = [:]
         func take(_ packets: [UnsafeMutablePointer<AVPacket>]) {
             for p in packets {
-                segments[plan.segment(ofOutputPts: p.pointee.pts), default: []]
+                segments[plan.segment(ofOutputPts: p.pointee.pts, duration: p.pointee.duration), default: []]
                     .append(Out(pts: p.pointee.pts, bytes: Array(UnsafeBufferPointer(start: p.pointee.data, count: Int(p.pointee.size)))))
                 var q: UnsafeMutablePointer<AVPacket>? = p
                 trackedPacketFree(&q)
@@ -118,9 +118,10 @@ struct AudioSegmentRunsTests {
         }
 
         for k in [1, 2, 4] {
-            // The seek reads from the last packet at or before the pre-roll ahead of segment k.
+            // The seek reads from the last packet at or before the pre-roll ahead of segment k, and a
+            // positive delay earlier still: the sound that plays at the boundary was read that much before.
             let readFrom = Int64(k * 2) * Int64(clip.timeBase.den) / Int64(clip.timeBase.num)
-                - Int64((continuous.preRoll * Double(clip.timeBase.den) / Double(clip.timeBase.num)).rounded(.up))
+                - Int64(((continuous.preRoll + max(0, delay)) * Double(clip.timeBase.den) / Double(clip.timeBase.num)).rounded(.up))
             let first = clip.packets.lastIndex { $0.pointee.pts <= readFrom } ?? 0
             let seek = try produce(clip, mode: mode, from: first, base: k, seconds: seconds, delay: delay)
             for segment in k...(k + 1) {

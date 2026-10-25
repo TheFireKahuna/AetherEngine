@@ -2032,6 +2032,15 @@ public final class Demuxer: @unchecked Sendable {
         PlanBoundaryAxis.forContainer(formatName: containerFormatName) == .decode
     }
 
+    /// Whether a seek puts each stream at its own sample: mov/mp4 indexes every track and positions
+    /// each at the sample its seek flags name, so an at-or-before seek to a video keyframe lands the
+    /// video on that keyframe and the audio on the sample playing across it. Other containers move
+    /// one read position for all streams, and audio stored before the keyframe is read only by reading
+    /// from before it.
+    var seeksEachStream: Bool {
+        containerFormatName?.split(separator: ",").contains("mov") ?? false
+    }
+
     /// Whether a seek to a time lands without the container's index: a transport or program stream
     /// searches its timestamps (bounded by the keyframes read, `recordKeyframeLocked`), a disc title looks
     /// its EP maps or time map up. Any other container without an index would read up to the target, and a

@@ -2,42 +2,51 @@ import AetherLibavcodec
 import AetherLibavutil
 import Foundation
 
-/// A producer's segments as its bridged audio is routed to them (`HLSSegmentProducer`): segment
-/// `baseIndex + i` holds the output whose routed time, its pts less the audio delay the bridge stamps
-/// in, falls in the plan's [boundaries[i], boundaries[i + 1]), the first and the last open-ended.
+/// A producer's segments as its bridged audio is routed to them (`HLSSegmentProducer`), by the one rule
+/// every audio packet is routed by: a packet belongs to the segment its last sample plays in, on the
+/// output timeline with the audio delay in, the timeline the picture plays on. Segment `baseIndex + i`
+/// holds the packets whose last sample plays in the plan's [boundaries[i], boundaries[i + 1]), the first
+/// and the last open-ended; a packet that straddles a boundary opens the segment after it, so a segment
+/// has sound from its first picture.
 struct AudioRunPlan {
     let baseIndex: Int
     /// The plan's boundaries from the producer's first segment on: absolute, video time base.
     let boundaries: [Int64]
     let planAnchor: Int64
     let videoTimeBase: AVRational
-    /// The bridge's output time base, which routed time is counted in.
+    /// The bridge's output time base, which routing counts in.
     let outputTimeBase: AVRational
-    /// The audio delay the bridge stamps into its output (`setOutputOffset`), output ticks.
+    /// The audio delay the bridge stamps into its output (`setOutputOffset`), output ticks: what maps
+    /// the output timeline back to the source it was read from. Routing is on the output timeline.
     let delayTicks: Int64
 
-    /// The segment output stamped `pts` belongs to.
-    func segment(ofOutputPts pts: Int64) -> Int {
-        segment(ofRouted: pts &- delayTicks)
+    /// The segment an output packet at `pts`, `duration` long, plays its last sample in.
+    func segment(ofOutputPts pts: Int64, duration: Int64) -> Int {
+        segment(ofPlayed: pts &+ max(duration, 1) &- 1)
     }
 
-    func segment(ofRouted ticks: Int64) -> Int {
+    /// The segment output tick `ticks` plays in. AE#268: an output tick maps onto the plan by the PLAN
+    /// ANCHOR, not the producer's video shift. The two are equal whenever the gate opened on the boundary
+    /// the restart aimed at, but a restart that landed off a random-access point carries the whole
+    /// overshoot in the shift, and folding that back routed audio into a segment the video cutter never
+    /// opened (a 10 s GOP under a 4 s plan skewed them by up to two segments).
+    func segment(ofPlayed ticks: Int64) -> Int {
         baseIndex + HLSSegmentProducer.segmentOffset(
             forAbsolutePts: av_rescale_q(ticks, outputTimeBase, videoTimeBase) &+ planAnchor,
             boundaries: boundaries)
     }
 
-    /// The first routed tick of segment `index`, nil past the plan's last segment. The producer's
-    /// first segment starts at its boundary: routing puts everything before it there too, and nothing
-    /// before it is made.
+    /// The first output tick segment `index` plays from, nil past the plan's last segment. The
+    /// producer's first segment starts at its boundary: routing puts everything before it there too,
+    /// and nothing before it is made.
     func start(ofSegment index: Int) -> Int64? {
         let i = index - baseIndex
         guard i >= 0, i <= boundaries.count - 2 else { return nil }
         var tick = av_rescale_q(boundaries[i] &- planAnchor, videoTimeBase, outputTimeBase)
         guard i > 0 else { return tick }
         // The rescale rounds; the tick routing itself starts the segment at is the one that counts.
-        while segment(ofRouted: tick - 1) >= index { tick -= 1 }
-        while segment(ofRouted: tick) < index { tick += 1 }
+        while segment(ofPlayed: tick - 1) >= index { tick -= 1 }
+        while segment(ofPlayed: tick) < index { tick += 1 }
         return tick
     }
 }
@@ -87,6 +96,7 @@ final class AudioSegmentRuns: AudioTranscodingBridge, @unchecked Sendable {
 
     private final class Run {
         let segment: Int
+        /// The output ticks the segment plays over (`AudioRunPlan.start(ofSegment:)`).
         let start: Int64
         let end: Int64?
         let bridge: any AudioTranscodingBridge
@@ -342,19 +352,19 @@ final class AudioSegmentRuns: AudioTranscodingBridge, @unchecked Sendable {
 
     // MARK: Private (callers hold `lock`)
 
-    /// Where `packet` starts on the routed axis, output ticks.
+    /// Where `packet` starts on the source's own axis, output ticks (the output timeline less the delay).
     private func ticks(of packet: UnsafePointer<AVPacket>) -> Int64? {
         let ts = packet.pointee.pts != Int64.min ? packet.pointee.pts : packet.pointee.dts
         return ts == Int64.min ? nil : av_rescale_q(ts, sourceTimeBase, encoderTimeBase)
     }
 
     /// Where segment `index`'s run starts its encoder on the output timeline: on the packet grid, the
-    /// encoder's memory in whole packets before the segment's first packet, and never before the
-    /// timeline's start, so the first segment's run begins with the encoder's own priming as a
-    /// single run would.
+    /// encoder's memory in whole packets before the segment's first packet (the one whose last sample
+    /// plays at or after the segment's start), and never before the timeline's start, so the first
+    /// segment's run begins with the encoder's own priming as a single run would.
     private func gridStart(of index: Int, plan: AudioRunPlan) -> Int64? {
         guard let start = plan.start(ofSegment: index) else { return nil }
-        let first = Self.ceil(start &+ plan.delayTicks, packetFrames) * packetFrames
+        let first = Self.ceil(start &- packetFrames &+ 1, packetFrames) * packetFrames
         let lead = Self.ceil(encoderMemory, packetFrames) * packetFrames
         return max(first - lead, 0)
     }
@@ -376,8 +386,7 @@ final class AudioSegmentRuns: AudioTranscodingBridge, @unchecked Sendable {
         bridge.setOutputOffset(seconds: outputOffsetSeconds)
         let run = Run(segment: index, start: plan.start(ofSegment: index) ?? gridStart,
                       end: plan.start(ofSegment: index + 1), bridge: bridge)
-        bridge.startRun(atFrame: gridStart,
-                        segment: (run.start &+ plan.delayTicks)..<(run.end.map { $0 &+ plan.delayTicks } ?? Int64.max))
+        bridge.startRun(atFrame: gridStart, segment: run.start..<(run.end ?? Int64.max))
         runs.append(run)
         // The packet being fed is in `ring` already and goes to every run after this.
         let available = ring.count - 1
@@ -428,12 +437,12 @@ final class AudioSegmentRuns: AudioTranscodingBridge, @unchecked Sendable {
         }
     }
 
-    /// Keep what is the run's own segment; earlier output only settled its stages, and output of the
-    /// next segment means the run is done.
+    /// Keep what is the run's own segment, by where each packet's last sample plays; earlier output
+    /// only settled its stages, and output of the next segment means the run is done.
     private func accept(_ packets: [UnsafeMutablePointer<AVPacket>], into run: Run) {
         for packet in packets {
             var p: UnsafeMutablePointer<AVPacket>? = packet
-            let routed = packet.pointee.pts &- (plan?.delayTicks ?? 0)
+            let routed = packet.pointee.pts &+ max(packet.pointee.duration, 1) &- 1
             if routed < run.start {
                 trackedPacketFree(&p)
             } else if let end = run.end, routed >= end {
