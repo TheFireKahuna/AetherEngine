@@ -603,6 +603,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `LoadOptions.felOverlay`: every producer of the session hands its enhancement layer to this tap, which
     /// the FEL overlay reads. Set by the engine before the session starts.
     var felTap: FelEnhancementTap?
+    /// Whether the video's parameter sets state full range, which is the range AVPlayer decodes the picture with:
+    /// the FEL overlay asks for the matching format so it reads the base layer's own codes. Set by `prepare()`.
+    private(set) var parameterSetsStateFullRange = false
     #endif
 
     /// AE#270: source PTS the container's timeline starts at, clamped at 0. The published playhead folds
@@ -1852,6 +1855,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             ?? codecpar.pointee.extradata.map { Array(UnsafeBufferPointer(start: $0, count: Int(codecpar.pointee.extradata_size))) }
             ?? []
         let parameterSetRange = BitstreamVideoRange.range(codecID: codecpar.pointee.codec_id, record: initRecord)
+        #if DualLayerDolbyVision
+        parameterSetsStateFullRange = parameterSetRange == AVCOL_RANGE_JPEG
+        #endif
         let p5ColorOverride: MP4SegmentMuxer.ColorOverride?
         if codecTagOverride == "dvh1" {
             let sourceRange = codecpar.pointee.color_range

@@ -324,9 +324,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         self.colorPrimaries = presented.primaries
         self.colorTransfer = presented.transfer
         self.colorMatrix = presented.matrix
-        let pixelFormat: OSType = use10Bit
-            ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-            : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        let fullRange = BitstreamVideoRange.range(codecID: AV_CODEC_ID_HEVC, record: [UInt8](hvcCData)) == AVCOL_RANGE_JPEG
+        let pixelFormat = Self.pixelFormat(tenBit: use10Bit, fullRange: fullRange)
 
         let pixelBufferAttrs: NSDictionary = [
             kCVPixelBufferPixelFormatTypeKey: pixelFormat,
@@ -430,6 +429,18 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
     #endif
 
+    /// The display buffer format for a stream whose SPS states `fullRange`. VideoToolbox converts the codes when the
+    /// requested format's range differs from the SPS, so the matching format is the one that hands over the
+    /// bitstream's own codes, which is what the Dolby Vision composer reads its layers as.
+    static func pixelFormat(tenBit: Bool, fullRange: Bool) -> OSType {
+        switch (tenBit, fullRange) {
+        case (true, false): return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        case (true, true): return kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+        case (false, false): return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        case (false, true): return kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        }
+    }
+
     /// Opens a decoder session from raw HEVC parameter sets (VPS, SPS, PPS), used for the Enhancement Layer (EL)
     /// in Dolby Vision Profile 7 dual-layer decoding.
     func open(
@@ -491,8 +502,9 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         self.colorTransfer = kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
         self.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_2020
 
+        let fullRange = CMFormatDescriptionGetExtension(formatDesc, extensionKey: kCMFormatDescriptionExtension_FullRangeVideo) as? Bool ?? false
         let pixelBufferAttrs: NSDictionary = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelBufferPixelFormatTypeKey: Self.pixelFormat(tenBit: true, fullRange: fullRange),
             kCVPixelBufferIOSurfacePropertiesKey: NSDictionary(),
             kCVPixelBufferMetalCompatibilityKey: true,
         ]

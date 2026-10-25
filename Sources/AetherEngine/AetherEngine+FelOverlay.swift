@@ -8,8 +8,10 @@ extension AetherEngine {
         #if DualLayerDolbyVision
         felOverlay?.stop()
         felOverlay = nil
-        guard felOverlayWanted, let item = currentAVPlayerItem, let tap = nativeVideoSession?.felTap else { return }
-        guard let renderer = FelOverlayRenderer(item: item, tap: tap) else {
+        guard felOverlayWanted, let item = currentAVPlayerItem, let session = nativeVideoSession,
+              let tap = session.felTap else { return }
+        guard let renderer = FelOverlayRenderer(item: item, tap: tap,
+                                                baseLayerFullRange: session.parameterSetsStateFullRange) else {
             EngineLog.emit("[AetherEngine] FEL overlay unavailable (no composer); the base layer plays alone", category: .engine)
             return
         }

@@ -22,7 +22,8 @@ extension FelOverlayTests {
     /// A renderer over an idle tap, both closed by the caller.
     private func makeRenderer() throws -> (FelOverlayRenderer, FelEnhancementTap) {
         let tap = FelEnhancementTap()
-        let renderer = try #require(FelOverlayRenderer(item: AVPlayerItem(url: URL(fileURLWithPath: "/dev/null")), tap: tap))
+        let renderer = try #require(FelOverlayRenderer(item: AVPlayerItem(url: URL(fileURLWithPath: "/dev/null")), tap: tap,
+                                                                  baseLayerFullRange: false))
         return (renderer, tap)
     }
 

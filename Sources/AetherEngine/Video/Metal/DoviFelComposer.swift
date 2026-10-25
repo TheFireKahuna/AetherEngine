@@ -1500,11 +1500,6 @@ final class DoviFelComposer: @unchecked Sendable {
             return nil
         }
 
-        if header.pointee.bl_video_full_range_flag {
-            logAssumptionOnce("bl_video_full_range_flag", "[DoviFelComposer] bl_video_full_range_flag = 1; the composer "
-                + "writes video-range P010 (luma 64...940, chroma 64...960), as every surveyed Profile 7 stream "
-                + "is. A full-range reconstruction is clipped to that range.")
-        }
         if header.pointee.disable_residual_flag {
             params.flags.insert(.disableResidual)
         }
