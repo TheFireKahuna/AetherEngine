@@ -215,6 +215,44 @@ struct OriginRequestBudgetTests {
         tickets.forEach { budget.release($0) }
     }
 
+    @Test("a learned ceiling is lifted after a quiet stretch; a host ceiling never is")
+    func learnedCeilingLiftsAfterQuiet() {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+        let tickets = (0..<2).map { budget.acquire(for: url, label: "path\($0)", timeout: 0.1) }
+        #expect(budget.noteRefusal(for: url, status: 503) == 1)
+        tickets.forEach { budget.release($0) }
+
+        clock.advance(by: OriginRequestBudget.learnedLimitLiftSeconds - 1)
+        #expect(budget.limit(for: url) == 1, "the ceiling holds through the refusal window")
+        clock.advance(by: 2)
+        #expect(budget.limit(for: url) == nil,
+                "one refusal must not cap the origin for as long as the app runs")
+        #expect(!budget.requiresSerialRequests(url))
+
+        budget.setHostLimit(1, for: otherOrigin)
+        budget.noteRefusal(for: otherOrigin, status: 503)
+        clock.advance(by: OriginRequestBudget.learnedLimitLiftSeconds * 2)
+        #expect(budget.limit(for: otherOrigin) == 1, "the host's own ceiling is not ours to lift")
+    }
+
+    @Test("lifting a ceiling releases the requests parked behind it", .timeLimit(.minutes(1)))
+    func liftReleasesParkedWaiters() async throws {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+        let held = budget.acquire(for: url, label: "pump", timeout: 0.1)
+        #expect(budget.noteRefusal(for: url, status: 503) == 1)
+        clock.advance(by: 120)  // past the pacer's quiet disarm, inside the ceiling's lifetime
+        let parked = Task.detached { budget.acquire(for: url, label: "detour", timeout: 30) }
+        while budget.snapshot(for: url)?.waiting != 1 { try await Task.sleep(for: .milliseconds(5)) }
+        clock.advance(by: OriginRequestBudget.learnedLimitLiftSeconds)
+        _ = budget.limit(for: url)
+        let ticket = await parked.value
+        #expect(ticket?.granted == true, "the waiter is let through when the ceiling goes")
+        budget.release(ticket)
+        budget.release(held)
+    }
+
     @Test("an unrefused origin never arms the request-rate pacer")
     func unrefusedOriginIsNeverPaced() {
         let clock = ManualDispatchClock()

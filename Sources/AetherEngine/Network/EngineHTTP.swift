@@ -51,6 +51,9 @@ enum EngineHTTP {
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         configuration.urlCache = nil
         configuration.httpMaximumConnectionsPerHost = connectionsPerHost
+        // Media bytes: the system marks the flows for the video access category on Wi-Fi (WMM),
+        // which a congested access point schedules ahead of best-effort traffic.
+        configuration.networkServiceType = .avStreaming
         // The ceiling is per task now (`armResourceDeadline`); the session imposes none of its own.
         configuration.timeoutIntervalForResource = .greatestFiniteMagnitude
         return URLSession(configuration: configuration, delegate: EngineTLS.sessionDelegate,
