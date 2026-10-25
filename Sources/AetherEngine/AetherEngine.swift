@@ -2070,13 +2070,6 @@ public final class AetherEngine: ObservableObject {
     /// Cancelled in stopInternal so it can never outlive its session.
     var liveReloadWatchdogTask: Task<Void, Never>?
 
-    /// AE#418 round 3: bounded read of the item's loaded ranges after a VOD axis seam, which is where
-    /// AVPlayer says it holds the bytes that seam describes. One at a time, newest wins, cancelled in
-    /// stopInternal: it exists only to check the axis just published, so an older check is stale.
-    var placementVerificationTask: Task<Void, Never>?
-    /// AE#481: the sampler reading what the run holding a seek landing carries. One at a time, and the
-    /// newest seek owns it: an older landing describes a position the playhead has left.
-    var landingAxisTask: Task<Void, Never>?
 
     /// 1 Hz live-telemetry sampler. Lifecycle mirrors memoryProbeTask. Holds a weak engine reference
     /// so the retained task can't keep self alive past teardown.
@@ -6380,36 +6373,9 @@ public final class AetherEngine: ObservableObject {
         // i.e. clockTarget == the 0-based playlist time (AE#105). Origin 0 off disc, so this stays
         // `target - playlistShiftSeconds` for normal VOD; SW/audio hosts run on source time (shift 0), no-op.
         var clockTarget = PresentationAxis.source(displayTime: target, origin: sourcePresentationOrigin) - playlistShiftSeconds
-        // AE#418 round 2: AVPlayer throws a sub-second axis offset away at a seek and snaps back to
-        // the playlist; a larger one it carries through unchanged (measured with `play
-        // --picture-probe`: -0.500 and -0.875 read `axisErr=0.000` after a seek, -1.000 through
-        // -11.000 all survive one). The target above is deliberately computed on the axis AVPlayer
-        // still had when the seek was issued; from the landing forward the clock describes the axis
-        // it will have instead.
-        // AE#534: whether AVPlayer already HOLDS the landing, which is what decides if this seek
-        // rebuilds its timeline and therefore whether it throws the axis away at all. Measured at
-        // exactly this point before it went in: 0.10 ms median and 0.70 ms worst of 215 seeks, on an
-        // idle and on a loaded box, including seeks issued on top of unsettled ones. That is the size
-        // of `prepareSeekLanding` below, an off-main hop this path already takes unconditionally, so
-        // this adds a second hop of a size already accepted here rather than a first one.
-        //
-        // An item that answers nothing reads as not placed, which is the behaviour this rule had
-        // before, so a failed read costs the axis and never the session.
-        let landingIsPlaced = nativeVideoSession != nil && nativeHost != nil
-            ? await avPlayerLoadedRanges().contains { clockTarget >= $0.0 && clockTarget <= $0.1 }
-            : false
-        guard loadGeneration == loadGen, seekGeneration == seekGen else { return }
-        nativeVideoSession?.snapAxisAfterSeek(
-            landingItemSeconds: clockTarget, landingIsPlaced: landingIsPlaced)
-        // AE#481: and what the landing's run carries is a READING, not the composition it inherits. A
-        // seek that opens a new run at a segment written on its planned position lands on a source-true
-        // stretch, which nothing else in the session ever looks at: measured on the #418 chain with the
-        // re-anchoring seek last, the clock stayed 9 s over the picture from the landing to the end of
-        // the session. Armed here rather than at the landing because the sampler waits for a run to
-        // hold the target anyway, and a superseded seek cancels it.
-        if let session = nativeVideoSession, nativeHost != nil {
-            verifyAxisAtSeekLanding(session: session, landingItemSeconds: clockTarget)
-        }
+        // The target is computed on the axis in force when the seek is issued. Where AVPlayer then
+        // puts the run it lands in is measured, not assumed: the landing segment's in-band clock
+        // arrives at the landing (`HLSVideoEngine.noteInBandClock`) and moves the axis from there.
         // AE#412: inside a keyframe drought, audio opened plan boundaries the keyframe-gated cutter
         // folded, so the landing segment can carry no random-access point at all. AVPlayer reaches
         // back a fixed few seconds on a cold seek and does not look for one, so the picture would
@@ -8008,10 +7974,6 @@ public final class AetherEngine: ObservableObject {
         // populated across the seam (issue #15). SW-path callers must release the preserved host themselves.
         memoryProbeTask?.cancel()
         memoryProbeTask = nil
-        placementVerificationTask?.cancel()
-        placementVerificationTask = nil
-        landingAxisTask?.cancel()
-        landingAxisTask = nil
         // AE#446: the outage watcher belongs to the session whose window was closed with ENDLIST.
         liveOutageResumeWatcher?.cancel()
         liveOutageResumeWatcher = nil

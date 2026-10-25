@@ -30,6 +30,16 @@ final class PreRollTrack: @unchecked Sendable {
     var trackID: UInt32?
 }
 
+/// What the splitter stamps a segment's first `moof` with (`InBandClock`): which segment the muxer is
+/// writing, the earliest picture written to it so far, on the muxer's video time base. Written by the
+/// muxer as packets go in, read by the splitter as the fragment goes out, both on the pump thread.
+final class SegmentClockState: @unchecked Sendable {
+    var segmentIndex: Int
+    var pictureFirstPts: Int64 = Int64.min
+    var timeBase = AVRational(num: 0, den: 1)
+    init(segmentIndex: Int) { self.segmentIndex = segmentIndex }
+}
+
 final class MP4SegmentMuxer {
 
     // MARK: - Types
@@ -173,7 +183,10 @@ final class MP4SegmentMuxer {
 
     // MARK: - State
 
-    private(set) var currentSegmentIndex: Int
+    private(set) var currentSegmentIndex: Int {
+        didSet { clockState.segmentIndex = currentSegmentIndex }
+    }
+    private let clockState: SegmentClockState
     /// Same volume as cache adopt target so rename is metadata-only.
     private let sessionDir: URL
     private var currentStagingPath: URL
@@ -290,7 +303,10 @@ final class MP4SegmentMuxer {
         let pictureFirstPts: Int64?
         let sound: (first: Int64, last: Int64)?
     }
-    private var segmentPictureFirstPts: Int64 = Int64.min
+    private var segmentPictureFirstPts: Int64 {
+        get { clockState.pictureFirstPts }
+        set { clockState.pictureFirstPts = newValue }
+    }
     private var segmentSoundFirstPts: Int64 = Int64.min
     private var segmentSoundLastPts: Int64 = Int64.min
 
@@ -328,8 +344,11 @@ final class MP4SegmentMuxer {
         onStorageExhausted: (@Sendable () -> Void)? = nil,
         onBytesStaged: (@Sendable () -> Void)? = nil,
         inMemory: Bool = false,
+        segmentClock: ((_ segmentIndex: Int, _ pictureFirstPts: Int64, _ timeBase: AVRational) -> InBandClock.Stamp?)? = nil,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
+        let clockState = SegmentClockState(segmentIndex: initialSegmentIndex)
+        self.clockState = clockState
         self.currentSegmentIndex = initialSegmentIndex
         self.sessionDir = sessionDir
         self.haveAudio = audio != nil
@@ -426,9 +445,22 @@ final class MP4SegmentMuxer {
                 counter.lifetimeFragmentBytes += count
                 counter.onBytesStaged?()
             },
-            moofRewriter: sampleEntryOverride == nil ? nil : { moof in
-                guard let trackID = preRoll.trackID else { return moof }
-                return APACPreRollGroup.addingPreRoll(toMoof: moof, trackID: trackID) ?? moof
+            moofRewriter: sampleEntryOverride == nil && segmentClock == nil ? nil : { moof in
+                var out = moof
+                if sampleEntryOverride != nil, let trackID = preRoll.trackID {
+                    out = APACPreRollGroup.addingPreRoll(toMoof: out, trackID: trackID) ?? out
+                }
+                // A segment's first fragment opens with its in-band clock (`InBandClock`), timed on its
+                // first picture: an `emsg` is a top-level box ahead of the `moof`, and every `trun`
+                // offset is relative to its `moof`, so it moves no sample.
+                if let segmentClock, counter.bytesWrittenCurrentSegment == 0,
+                   clockState.pictureFirstPts != Int64.min,
+                   clockState.timeBase.num == 1, clockState.timeBase.den > 0,
+                   let stamp = segmentClock(clockState.segmentIndex, clockState.pictureFirstPts, clockState.timeBase) {
+                    out = InBandClock.eventMessage(stamp, presentationTime: clockState.pictureFirstPts,
+                                                   timescale: UInt32(clockState.timeBase.den)) + out
+                }
+                return out
             }
         )
 
@@ -469,6 +501,7 @@ final class MP4SegmentMuxer {
         self.headerWritten = true
 
         muxerVideoTimeBase = ctx.pointee.streams.advanced(by: 0).pointee!.pointee.time_base
+        clockState.timeBase = muxerVideoTimeBase
         if haveAudio {
             muxerAudioTimeBase = ctx.pointee.streams.advanced(by: 1).pointee!.pointee.time_base
             // AE#464: same reason as the bound below. Latched after write_header rewrote the stream

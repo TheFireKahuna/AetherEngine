@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A picture that states its own source frame number, for `aetherctl play --picture-probe` (AE#418).
+# A picture that states its own source frame number, for `aetherctl play --picture-probe`.
 #
 # Every axis observable the engine has describes what it WROTE. None of them says where AVPlayer then
 # PUT that segment, and AE#408 shipped an early-opening gate on an assumption about exactly that. With
@@ -18,103 +18,23 @@
 # boundary at 52.000 and reads `axisErr=-9.000`, the whole re-aim, constant for the run. (Before
 # AE#423 evened out the backoff steps it opened at 38.417 and read `-13.583`.)
 #
-# AE#418 round 2 needs one seek on top of that, because the axis COMPOSES and a resume alone cannot
-# show it. Add `--seek-every 12 --seek-count 1 --seek-pattern <target>` to the line above:
+# The engine reads that axis from each segment's in-band clock (docs/segment-axis.md) and logs it,
+# `segN plays from item Xs at source Ys: axis Zs`, so on every arm `axisErr` matches the logged axis
+# and `capErr` stays inside the probe's two-frame quantisation. Arms worth running, on the line above:
 #
-#   80  a seek onto an axis-true segment: the axis must stay -9.000 (the reporter's failing case)
-#   65  a seek that re-places the overlong segment: the axis doubles to -18.000
-#   60  a seek whose restart re-aims 5 s more: the axis composes to -14.000
+#   --seek-every 12 --seek-count 1 --seek-pattern 80     a seek onto an axis-true stretch
+#   --seek-every 12 --seek-count 1 --seek-pattern 65     a seek that re-places the re-aimed segment
+#   --seek-every 12 --seek-count 1 --seek-pattern 60     a seek whose restart re-aims again
+#   --seek-every 2 --seek-count 4 --seek-pattern 65,60,70,58   a burst
 #
-# Arm 60 lands two ways, 2 of 4 each, and both are correct: AVPlayer either fetches seg12 (worth
-# -5.000, the axis composes to -14.000 and the placement is confirmed) or seg17 (worth 0.000, which
-# extends the run it is already playing, so it opens no run of its own and prints
-# `#418 seg17 opened no run of its own to measure`). Read `capErr`, not the segment number: it stays
-# inside a frame of zero either way. Under round 3 the second shape printed a CONFIRMATION, because
-# the reading it took was the previous epoch's run.
-#
-# `capErr` is the verdict in all three, and it is the error a host placing a cue at `sourceTime`
-# would make: about +0.017 (one frame at 24 fps) when the engine describes the axis correctly, and
-# -8.983 for each of the three under 6.43.0.
-#
-# AE#418 round 3 uses the same three arms as a CONTROL. The axis is no longer predicted: the engine
-# reads `AVPlayerItem.loadedTimeRanges` after each seam and measures where AVPlayer put the segment,
-# so every arm above must print `#418 segN placement confirmed` and none of them may print
-# `#418 segN placed on base ...`.
-#
-# AE#418 round 4 needs a second fixture, because this one has no B-FRAMES and that is what hid the
-# case. `-preset ultrafast` disables them, so its dts and pts are one number and a gate opening on a
-# random-access point is presented where it is decoded. Real content is not like that. The script
-# writes `tc-bframes.mkv` alongside (`-bf 3`, `b-pyramid=normal`, `has_b_frames=2`), and on it the
-# same resume opens `actual=42917 anchorPts=43000`: an epoch worth -9.083 s by the decode time and
-# -9.000 s by the presented one. Round 4 takes the presented one, and the composition is then
-# corrected by the reading rather than confirmed against itself:
-#
-#   Scripts/timecode-fixture.sh /tmp
-#   python3 Scripts/mkv-cue-fixture.py /tmp/tc-bframes.mkv /tmp/tc-bf-cues-lie.mkv \
-#       "$(python3 -c 'print(",".join(str(i) for i in range(1,120)))')"
-#   swift run aetherctl play --seconds 40 --start-position 53 --picture-probe \
-#       --seek-every 14 --seek-count 2 --seek-pattern 65,60 file:///tmp/tc-bf-cues-lie.mkv
-#
-# The verdict is the mean of `capErr` per axis over the run (a single tick carries up to two frames
-# of the probe's own quantisation, so read the mean, not a tick). Measured, 39 ticks, twice:
-#
-#   before   axis -9.000 mean +0.113   axis -18.083 mean +0.113
-#   after    axis -9.000 mean +0.031   axis -18.083 mean +0.031   (+0.030 is this probe's own bias)
-#
-# and the second epoch prints the correction the reading makes:
-# `#418 seg13 placed on base -9.083s, not -9.000s (... residual -0.083s): axis -18.000s -> -18.083s`.
-#
-# AE#418 round 5 turns that correction into a prediction, because the 0.083 s is not noise: it is the
-# gate sample's own presentation lead, and a composition lands on the BASE, which sits that far under
-# the axis. The pair is the whole proof, same arm on both fixtures:
-#
-#   tc-bframes.mkv   AVPlayer holds the re-placed seg13 from item 61.083, picture reads -18.083
-#   tc-drought.mkv   AVPlayer holds it from item 61.000,                  picture reads -18.000
-#
-# AE#418 round 6 measures that coefficient instead of carrying it, because it is NOT a constant. The
-# script writes a THIRD clip, `tc-bf1.mkv`, identical to `tc-bframes.mkv` but for `-bf 1` (one frame
-# of reorder instead of two, which is the reporter's asset at 23.976 fps). Same burst arm on all
-# three, three runs each, the reading and the picture agreeing in all nine:
-#
-#   tc-drought.mkv  lead 0.000  base = the axis           -9.000 -> -18.000 -> -23.000
-#   tc-bf1.mkv      lead 0.042  base = the axis           -9.000 -> -18.000 -> -23.000
-#   tc-bframes.mkv  lead 0.083  base = axis - one lead    -9.000 -> -18.083 -> -23.166
-#
-# So a session starts with no coefficient, composes without one, and the first placement it can read
-# back states it (`#418 segN says a lead counts 1.00x on this source`). Under round 5 the middle row
-# was composed at -18.042 and corrected back on every measurable placement, and its unmeasurable one
-# kept -23.042, one lead over the picture. The case that pays for all of it is the placement that
-# cannot be measured at all, a seek burst that reopens backwards inside the buffer:
-#
-#   swift run aetherctl play --seconds 30 --start-position 53 --picture-probe \
-#       --seek-every 2 --seek-count 4 --seek-pattern 65,60,70,58 file:///tmp/tc-bf-cues-lie.mkv
-#
-# It ends on `#418 segN opened no run of its own to measure`, so whatever the composition said is
-# what the session keeps. Measured on tc-bframes.mkv, two shapes, both matching the picture exactly:
-# `-23.166` after two compositions and `-27.166` after three. Under round 4 those were kept at
-# -23.083 and -27.000, i.e. one lead per composition, which is why an unmeasured chain drifts and a
-# measured one does not. Run the same line against `tc-bf1-cues-lie.mkv` for the other geometry: the
-# coefficient reads 0.00x and the chain must end on -23.000 / -27.000, with the picture agreeing.
-#
-# AE#418 round 9 needs a LONG chain, which is what the reporter's session had and the arms above do
-# not: three placements cannot separate a standing quantity from a one-off reading. Serve the fixture
-# over a throttled origin (Scripts/slowrange.py is that origin: a delay on every response and a
-# rate shared across them) and drive twenty-four seeks through the drought:
-#
-#   aetherctl play --seconds 62 --start-position 53 --picture-probe --seek-every 2 --seek-count 24 \
-#     --seek-pattern 65,60,70,58,75,50,85,45,90,40,95,35,100,30,105,25,110,22,64,59,69,57,74,49 \
-#     http://127.0.0.1:8871/tc-cues-lie.mkv
-#
-# Ten placements, byte-identical across three runs: seg13, seg13, seg12, seg10, seg9, seg8, seg7,
-# seg5, seg4, seg3, composing to -34.334 with the picture agreeing. Nine of them read a distance of
-# 0.000 and `seg5` reads 0.042, so the composition after it is one frame out and the reading after
-# THAT puts it back. That is the reporter's arm 1 in miniature, and it is the arm to run before
-# proposing any smoothing rule for the standing distance: the fixture wants the deviation ignored and
-# his asset wants it followed, so a rule that is right on one is wrong on the other.
+# The script also writes `tc-bframes.mkv` (`-bf 3`, `has_b_frames=2`) and `tc-bf1.mkv` (one frame of
+# reorder): the same arms on their cues-lie twins open on a random-access point decoded a frame or two
+# before it is presented. On `tc-bf-cues-lie.mkv`, `--seconds 40 --start-position 53 --seek-every 14
+# --seek-count 2 --seek-pattern 65,60` is the arm where AVPlayer appends a re-aimed segment to the run it
+# is playing (`seg34 plays from item 73.833s at source 64.833s: axis -9.000s`).
 #
 # For magnitudes this fixture cannot reach, engineer the droughts: a key 3 s below a boundary gives
-# -3, 5 s gives -5, and a key under a second below one gives an axis AVPlayer THROWS AWAY at the
-# next seek (measured: -0.500 and -0.875 snap to 0, -1.000 and above survive).
+# -3, 5 s gives -5.
 set -euo pipefail
 OUT_DIR="${1:?usage: timecode-fixture.sh <out-dir> [offset-seconds]}"
 DUR=120

@@ -76,7 +76,6 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     var runSpan: AudioStageSpan? { span.then(AudioStageSpan(latency: 0, memory: APACEncoder.segmentRunLeadFrames)) }
     var runEncoderMemory: Int { APACEncoder.segmentRunLeadFrames }
     var runPacketFrames: Int { APACEncoder.framesPerPacket }
-    var presentationDelay: Int64 { Int64(leadingFrames) }
 
     private let srcTimeBase: AVRational
     private let decoder: ObjectAudioDecoding

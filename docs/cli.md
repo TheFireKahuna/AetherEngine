@@ -337,102 +337,26 @@ engine's continuous clock, so below one frame it carries the sub-frame phase of 
 frame have not been shown to differ.
 Needs a fixture whose picture states its own frame number, which `Scripts/timecode-fixture.sh`
 writes; against anything else it prints `pic=none` or nonsense. `pic=none` is also the normal read
-before the first frame and during a stall, so it is not reported as a zero. This is what settled
-AE#418: AVPlayer presents a segment at the position the PLAYLIST gives it, not at the tfdt it
-carries, and then plays continuously from there, so a gate that opened below its boundary shifts the
-whole run by the re-aim (`axisErr=-13.583` on a 13.583 s re-aim, constant for the run).
+before the first frame and during a stall, so it is not reported as a zero.
 
-Round 3 added a second oracle, and this one works on a device with no capture card:
-`AVPlayerItem.loadedTimeRanges`. The range holding the playhead begins where AVPlayer PLACED that
-run, so `advertised - rangeStart` is the axis it composed onto, measured rather than assumed. The
-engine reads it after every VOD seam and says what it found, `#418 segN placement confirmed` or
-`#418 segN placed on base Xs, not Ys`, the second of which is a placement this side counted that
-AVPlayer discarded (a fetch during a seek burst, which is a fetch and not a placement). Against the
-picture probe the two oracles agree exactly: a resume predicting a seam at `52.000` reads
-`loaded [52.000-64.958]`, and a far seek predicting `21.000` reads `[21.000-38.622]`.
+The probe is the oracle for the VOD axis (docs/segment-axis.md). AVPlayer places the first segment of
+every run it opens at that segment's playlist position whatever `tfdt` it carries, so a segment whose
+content does not begin at its advertised start gives its run an offset (`axisErr=-9.000` on a resume
+that opened 9 s below its boundary). The engine does not predict that offset: every VOD segment opens
+with an in-band clock (`InBandClock`, an `emsg` in Apple's ID3 scheme stating the segment's index and
+its first picture's source time), and `AVPlayerItemMetadataOutput` reports the item time AVPlayer plays
+it at. Each reading that moves the axis is logged:
 
-**Round 4 lets that reading WIN.** Round 3 collapsed the measured base onto the nearest axis the
-session had already published, which made the prediction the yardstick for the measurement meant to
-check it: a base matching no prediction was refused (a reporter's session composed to `-26.152` while
-two readings 400 s of media apart both said `-10.93`, and ended 42.6 s out), and a base a frame or
-two off was called a confirmation, so that difference stayed in the axis and the next placement
-composed on top of it. What decides now is where the reading came from: a run that overlaps nothing
-the item held when the placement was recorded, or one that opened ABOVE it. A start that walked
-DOWNWARD is the same run backfilling, which AVPlayer does after a run opens, and is never read. The
-new lines are `#418 segN placement confirmed` (residual under a millisecond), `#418 segN placed on
-base Xs, not Ys (... residual Zs)`, `#418 segN opened no run of its own to measure`, and
-`#418 segN superseded before it was measured`.
+```
+[HLSVideoEngine] seg34 plays from item 73.833s at source 64.833s: axis -9.000s
+```
 
-Round 4 also needs a fixture with B-FRAMES, and `Scripts/timecode-fixture.sh` now writes one
-(`tc-bframes.mkv`). `-preset ultrafast` disables them, so on `tc-drought.mkv` a segment's dts and pts
-are one number and the gate's offset is the same either way. On real content they are not: the gate
-opens on a random-access point in DECODE order, and taking the offset there put the axis
-`video_delay` frames under the truth on every epoch. The pair isolates exactly that. Read the verdict per axis in
-`capFr`, whole frames: a single tick carries up to two frames of the probe's own quantisation. A mean
-of `|capErr|` over ticks does NOT buy resolution below that quantum, it averages the sampling phase
-(AE#418 round 11).
-
-**Round 8: how far a placement sits below its axis is MEASURED, in seconds.** Rounds 5, 6 and 7 read
-that distance as a multiple of the epoch's presentation lead: round 5 shipped the multiple as
-arithmetic, round 6 measured it per source, round 7 held the median of its readings. The premise was
-that the distance is a geometry of the source. It is not. `Scripts/timecode-fixture.sh` writes three
-clips identical but for their reorder depth, and on the same burst arm over a throttled origin
-(`Scripts/slowrange.py`, 3200 kbps + 100 ms), `--picture-probe` reading the axis off AVPlayer's own video
-output, 2 runs each and every run identical:
-
-| clip | gate lead | placement 2 sits | placement 3 sits |
-|---|---|---|---|
-| `tc-cues-lie.mkv` | 0.000 (no reordering) | 0.000 below its axis | **0.042 below its axis** |
-| `tc-bf1-cues-lie.mkv` | 0.042 (one frame) | 0.000 | 0.083 |
-| `tc-bf-cues-lie.mkv` | 0.083 (two frames) | 0.083 | 0.125 |
-
-The bold cell is what retires the model: that clip has `has_b_frames=0`, every gate opens with
-`lead=0`, and its third placement still sits a frame below its axis. A quantity that is nonzero where
-the lead is exactly zero is not a multiple of the lead, and no coefficient can express it. The middle
-row retires the source-law premise separately: one source, two placements, 0.000 then 0.083.
-
-So the session carries the distance in the units it corrects, reads it off the same placement reading
-that already measures the base, and every reading teaches it, a confirmation included. That is also
-what fixes the starvation round 7 shipped: only a placement carrying a lead could teach, and on a
-source without reordering, or on any session whose placements are AE#412 re-cuts (worth 0 and lead 0
-by construction), there is never one. Measured on `tc-wide-cues-lie.mkv`, 13 of 13 placements across
-two runs carried `lead 0.000s`, so the parameter could not move at all.
-
-Each `placed` line names what it composed with (`sitting 0.083s below its axis`), and a reading that
-moves it says so: `#418 segN sat Xs below the axis it composed on, not Ys; the next composition
-starts there`. An item's FIRST placement is no longer a case of its own: with nothing measured yet
-the distance is zero, which is what AVPlayer does there (measured base 0.000 on every arm of every
-fixture). The gate-open line still prints `lead=`, now purely as a source fact.
-
-Round 9 puts the lesson on the reading's own line, because round 8 printed only the MOVES and two
-different things were silent under that. Every verdict line now ends in one of three clauses: `taught
-the distance Xs` (an own-run reading that moved it, with the `sat` line under it), `taught the
-standing distance Xs again` (an own-run reading that agreed with it), or `taught nothing, read off a
-rebuilt timeline; the distance stays Xs`. The third is the one worth having: a rebuilt-timeline
-reading corrects the axis like any other, by 28.000 s on `tc-wide-cues-lie.mkv`, and round 7 refuses
-it the parameter on purpose, so its correction line was otherwise indistinguishable from one that had
-just taught a 28 s lesson.
-
-AE#481 is the case those ten rounds could not see, because a seek burst heals it inside a second. The
-axis belongs to the RUN a re-aimed segment opened, not to the timeline from its advertised start on:
-run the same chain with the re-anchoring seek LAST (`--seek-count 5 --seek-pattern 65,60,70,58,75`,
-served through `Scripts/slowrange.py` at 600 kbps / 300 ms) and the picture reads `pic - picItem` of
--9.000 at item 53.000 and 0.000 everywhere the landing goes, while the session keeps mapping with
--9.000 and `capErr` sits at +9.017 to the end of the run. A seek landing now reads what its run
-carries, and says so: `#481 the run holding the landing at item Xs opens at Ys, which is segN's own
-playlist position, so it carries Zs and not the Ws this session was mapping with`. The discriminator
-is that opening, asked of ONE segment: the first the local server answered after the seek, which is the
-one whose content opens that run. It goes into a timeline carrying an axis at the seam that axis
-predicts and into a timeline carrying nothing at its own position, which is round 7's pair of
-admissible answers. Asked of the whole plan the same rule publishes on a coincidence (31 boundaries
-over 120 s against a half-second tolerance: measured, a 0.000 axis written into a timeline carrying
--27.875 s). Measured on the arm above, `capErr` goes from +9.037 to +0.037, which is 216 frames and the
-only unambiguous number in the set, while the 24-seek arms it must not touch are unchanged (10
-placements, axis -34.376, no reading fired in 2 of 2 runs). On the two slow arms the `capErr` tail
-moves onto the same one-frame lattice pair the fast arm sits on (`+0.009` / `-0.033`). That is a
-sub-frame move and carries no accuracy claim in either direction: an earlier revision of this
-paragraph read it as an improvement from 0.0230 and 0.0411 to 0.0162, which is the mistake AE#418
-round 11 documents on both sides of that thread.
+so on any arm `axisErr` and the logged axis agree, and `capErr` stays within the probe's own two-frame
+quantisation. The arms worth running are the lying-Cues fixtures `Scripts/timecode-fixture.sh` builds:
+a resume into the drought, single seeks to 80, 65 and 60, the two-seek arm on the B-frame twin, and the
+burst `--seek-every 2 --seek-count 4 --seek-pattern 65,60,70,58`. The two-seek arm is the case the
+prediction this replaced could not see: AVPlayer appended a re-aimed segment to the run it was playing,
+the prediction published -12.167 s against a picture on -9.000 s, and the reading states -9.000 s.
 
 `--start-position S` starts at a resume anchor, the same one `serve` takes. `--sw` forces the software path for a source that would route native, which is how a native-only fixture exercises the SW pipeline.
 
