@@ -20,12 +20,15 @@ import notify
 /// - Public, UIKit: the screen's mode, maximum frame rate, native bounds, EDR headroom, gamut, headroom-usage limit,
 ///   calibrated latency and reference-mode status with their notifications; the output refresh rate measured from a
 ///   display link's ticks; the app's lifecycle, with follow-ups at the 0.7 s and 2.5 s marks AE#535 measured.
-/// - Public libc, private names: the Darwin notify keys PineBoard publishes for a switch in progress and for a
-///   display-state change.
+/// - Public libc, private names, `DEBUG` builds only: the Darwin notify keys PineBoard publishes for a switch in
+///   progress and for a display-state change.
 /// - Public, audio: the route's ports and channels, rendering mode and spatial capability (the eARC end of the chain).
-/// - Reference, private: `CADisplay`'s current mode (its HDR mode, bit depth, colour mode, refresh) and HDR-mode
+/// - Reference, private, `DEBUG` builds only: `CADisplay`'s current mode (its HDR mode, bit depth, colour mode, refresh) and HDR-mode
 ///   lists, and `PBSDisplayManager`'s separate dynamic-range and frame-rate matching flags. Read off the main
 ///   thread, since the PineBoard client's first use waits on its service.
+///
+/// The private names stay out of a Release binary, the build that goes to App Review; there `notifySwitch` reads `?`
+/// and no reference line is logged.
 ///
 /// Every line is `[DisplaySignals]` in the `display.signals` category; one event's lines share its `#n`.
 public enum DisplaySignalProbe {
@@ -79,7 +82,9 @@ final class DisplaySignalRuntime {
     /// Which scheduled run `oracleTask` is, so a cancelled run finishing late does not clear a newer one's handle.
     private var oracleGeneration = 0
     private var lastOracleRun: ContinuousClock.Instant?
+    #if DEBUG
     private let referenceQueue = DispatchQueue(label: "aetherengine.display-signals.reference")
+    #endif
 
     /// The oracle is spent once per this interval at most, whatever asks for it.
     private static let oracleInterval: Duration = .seconds(60)
@@ -108,7 +113,9 @@ final class DisplaySignalRuntime {
             ("dvHW", DisplaySignals.yn(VTIsHardwareDecodeSupported(kCMVideoCodecType_DolbyVisionHEVC))),
         ]))
         observeNotifications()
+        #if DEBUG
         observeNotifyKeys()
+        #endif
         snapshot("start")
         measureCadence("start", after: .milliseconds(500))
         scheduleOracle("start", after: .seconds(5))
@@ -220,6 +227,7 @@ final class DisplaySignalRuntime {
         }
     }
 
+    #if DEBUG
     /// PineBoard's Darwin keys, through the public notify API. `display_mode_switch_active` carries state (1 during
     /// a switch, 0 after; AVKit reads exactly this); `PBSDisplayStateChangedModification` is the ping PineBoard's
     /// client refetches its display state on.
@@ -241,6 +249,7 @@ final class DisplaySignalRuntime {
             if key.hasSuffix("display_mode_switch_active") { switchActiveToken = token }
         }
     }
+    #endif
 
     // MARK: - Events and snapshots
 
@@ -283,7 +292,9 @@ final class DisplaySignalRuntime {
         let window = Self.window()
         emit(DisplaySignals.line("#\(n) display", [("trigger", trigger)] + extra + displayFields(window)))
         emit(DisplaySignals.line("#\(n) audio", audioFields()))
+        #if DEBUG
         readReference(n)
+        #endif
         return n
     }
 
@@ -341,6 +352,8 @@ final class DisplaySignalRuntime {
     }
 
     // MARK: - Reference (private)
+
+    #if DEBUG
 
     private func readReference(_ n: Int) {
         referenceQueue.async {
@@ -408,6 +421,8 @@ final class DisplaySignalRuntime {
         if let number = value as? NSNumber { return number.stringValue }
         return DisplaySignals.brief(value)
     }
+
+    #endif
 
     // MARK: - Refresh cadence
 
