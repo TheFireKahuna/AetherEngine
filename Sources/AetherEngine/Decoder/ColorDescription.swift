@@ -14,7 +14,7 @@ import AetherLibavcodec
 ///
 /// Same shape as `SoftwareVideoDecoder.declaredStreamSAR(bitstream:container:)`, and for the same
 /// reason: two declarations of one fact, resolved once so every consumer sees the same answer.
-struct ColorDescription: Equatable {
+struct ColorDescription: Equatable, Sendable {
     var primaries: AVColorPrimaries
     var transfer: AVColorTransferCharacteristic
     var matrix: AVColorSpace

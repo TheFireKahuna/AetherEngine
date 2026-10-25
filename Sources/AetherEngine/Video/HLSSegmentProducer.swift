@@ -291,6 +291,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// Fires synchronously on the pump thread per finalized live segment (index, duration, startSeconds, discontinuous).
     var onLiveSegmentFinalized: (@Sendable (Int, Double, Double, Bool) -> Void)?
+    /// A live versioned init's colour (a programme or ad switch, a parameter-set change), reported with the start of
+    /// its first segment on the output axis (the item clock) when that segment is finalized, ahead of playback.
+    var onLiveVideoColour: (@Sendable (_ startSeconds: Double, _ colour: ColorDescription) -> Void)?
+    /// The colour of each versioned init by the segment it opens on, until that segment is finalized. Pump thread.
+    private var liveColourBySegment: [Int: ColorDescription] = [:]
     /// AE#684: the sound a finalized live segment carries (index, first and last audio packet on the
     /// output axis, seconds). Fired just before `onLiveSegmentFinalized` for the same index.
     var onLiveSegmentSound: (@Sendable (Int, Double, Double) -> Void)?
@@ -2459,6 +2464,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
             videoCodecpar = videoConfig.codecpar
         }
 
+        if isLive, versionedInit {
+            liveColourBySegment[initialSegmentIndex] = ColorDescription(codecpar: videoCodecpar)
+        }
         let muxerVideo = MP4SegmentMuxer.VideoConfig(
             codecpar: videoCodecpar,
             timeBase: videoConfig.timeBase,
@@ -2922,6 +2930,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         )
         if let span = sound ?? nil { onLiveSegmentSound?(index, span.first, span.last) }
         onLiveSegmentFinalized?(index, duration, startSeconds, discontinuous)
+        if let colour = liveColourBySegment.removeValue(forKey: index) { onLiveVideoColour?(startSeconds, colour) }
     }
 
     /// AE#412: what the segment finalized at `index` offers a cold arrival, as an offset from its
