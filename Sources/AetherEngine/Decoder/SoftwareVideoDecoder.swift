@@ -332,6 +332,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         guard avcodec_parameters_to_context(ctx, codecpar) >= 0 else {
             throw VideoDecoderError.noCodecParameters
         }
+        let container = ColorDescription(decoding: codecpar)
+        ctx.pointee.color_range = container.range
 
         // Reject VideoToolbox pixel format to force pure software decode (some decoders ignore this).
         ctx.pointee.get_format = { _, fmts in
@@ -366,7 +368,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         av_dict_free(&opts)
 
-        colourFill = ColourBackfill(container: ColorDescription(codecpar: codecpar))
+        colourFill = ColourBackfill(container: container)
 
         // Release-visible log (no #if DEBUG): needed for TestFlight users and DrHurt #4 black-screen reports.
         EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), threads=\(ctx.pointee.thread_count), \(streamIs10Bit ? "10-bit" : "8-bit")", category: .swPlayback)

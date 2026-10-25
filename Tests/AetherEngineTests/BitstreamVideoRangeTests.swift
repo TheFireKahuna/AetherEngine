@@ -5,13 +5,14 @@ import AetherLibavutil
 @testable import AetherEngine
 
 /// The init's `colr` range is the one its picture is decoded with: the parameter sets', whatever the container said.
+/// The software decoders take the same range for their pictures (`ColorDescription(decoding:)`).
 ///
 /// The records are real: libx265 / libx264 encodes of a black-and-white test card, stream-copied into MP4 with a
 /// `colr` that contradicts the SPS, the clips `research/colour-range-dv/tools/make_range_clips.sh` builds. On every one
 /// VideoToolbox decoded by the SPS (`probes/cm-parameter-set-range`): the SPS-limited ones gave black 65 / white 940
 /// under a full-range `colr`, the SPS-full one needed conversion into video range, and an SPS with no
 /// `video_signal_type` decoded as limited.
-@Suite("Init colr range follows the parameter sets")
+@Suite("Range follows the parameter sets: the init's colr and the software decoders")
 struct BitstreamVideoRangeTests {
 
     static func bytes(_ hex: String) -> [UInt8] {
@@ -80,5 +81,38 @@ struct BitstreamVideoRangeTests {
         let colour = try #require(HEVCInBandColour.colourDescription(vps: sets.vps, sps: sets.sps, pps: sets.pps))
         #expect(colour.range == AVCOL_RANGE_JPEG)
         #expect(colour.primaries == AVCOL_PRI_BT709)
+    }
+    /// codecpar as a demuxer leaves it: `container` is the container's range, `record` the extradata.
+    private static func decodingRange(codec: AVCodecID, record: [UInt8], container: AVColorRange) throws -> AVColorRange {
+        let par = try #require(avcodec_parameters_alloc())
+        defer { var p: UnsafeMutablePointer<AVCodecParameters>? = par; avcodec_parameters_free(&p) }
+        par.pointee.codec_type = AVMEDIA_TYPE_VIDEO
+        par.pointee.codec_id = codec
+        par.pointee.color_range = container
+        if !record.isEmpty {
+            let bytes = try #require(av_mallocz(record.count + Int(AV_INPUT_BUFFER_PADDING_SIZE)))
+                .assumingMemoryBound(to: UInt8.self)
+            record.withUnsafeBufferPointer { bytes.update(from: $0.baseAddress!, count: record.count) }
+            par.pointee.extradata = bytes
+            par.pointee.extradata_size = Int32(record.count)
+        }
+        return ColorDescription(decoding: par).range
+    }
+
+    @Test("a decoder takes the SPS's range over the container's, limited where the SPS signals none",
+          arguments: [(AV_CODEC_ID_H264, h264NoSignalType, AVCOL_RANGE_JPEG, AVCOL_RANGE_MPEG),
+                      (AV_CODEC_ID_H264, h264Limited, AVCOL_RANGE_JPEG, AVCOL_RANGE_MPEG),
+                      (AV_CODEC_ID_H264, h264Full, AVCOL_RANGE_MPEG, AVCOL_RANGE_JPEG),
+                      (AV_CODEC_ID_HEVC, hevcNoSignalType, AVCOL_RANGE_JPEG, AVCOL_RANGE_MPEG),
+                      (AV_CODEC_ID_HEVC, hevcFull, AVCOL_RANGE_MPEG, AVCOL_RANGE_JPEG)])
+    func decoderRange(codec: AVCodecID, record: [UInt8], container: AVColorRange, expected: AVColorRange) throws {
+        #expect(try Self.decodingRange(codec: codec, record: record, container: container) == expected)
+    }
+
+    @Test("a stream with no parameter sets to read keeps the container's range")
+    func decoderRangeWithoutSets() throws {
+        #expect(try Self.decodingRange(codec: AV_CODEC_ID_MPEG2VIDEO, record: [], container: AVCOL_RANGE_JPEG) == AVCOL_RANGE_JPEG)
+        #expect(try Self.decodingRange(codec: AV_CODEC_ID_H264, record: [], container: AVCOL_RANGE_JPEG) == AVCOL_RANGE_JPEG)
+        #expect(try Self.decodingRange(codec: AV_CODEC_ID_AV1, record: Self.hevcFull, container: AVCOL_RANGE_MPEG) == AVCOL_RANGE_MPEG)
     }
 }

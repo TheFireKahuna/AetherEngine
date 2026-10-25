@@ -50,6 +50,22 @@ struct ColorDescription: Equatable, Sendable {
                   range: codecpar.pointee.color_range)
     }
 
+    /// What a decoder of `codecpar`'s stream should take its pictures as before the bitstream says otherwise: the
+    /// container's description, with the range its extradata's parameter sets state where it has them. FFmpeg keeps a
+    /// container's range over the SPS's in codecpar, and its H.264 decoder writes a frame's range only when the SPS
+    /// carries one, so a stream with no `video_signal_type` under a full-range container would decode as full range
+    /// where the codec defines limited and VideoToolbox decodes limited. A codec without parameter sets to read, or
+    /// with them in band only, keeps the container's range.
+    init(decoding codecpar: UnsafePointer<AVCodecParameters>) {
+        self.init(codecpar: codecpar)
+        let record = codecpar.pointee.extradata.map {
+            Array(UnsafeBufferPointer(start: $0, count: Int(codecpar.pointee.extradata_size)))
+        } ?? []
+        if let stated = BitstreamVideoRange.range(codecID: codecpar.pointee.codec_id, record: record) {
+            range = stated
+        }
+    }
+
     /// The description to act on: the bitstream wherever it committed to a value, the container for the
     /// fields it left open. Per field, because a partially filled VUI is the common case and the one
     /// that fails silently (a matrix without a transfer reads HDR to a gate and reads nothing to zimg).

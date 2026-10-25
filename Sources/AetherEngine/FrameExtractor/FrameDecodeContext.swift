@@ -303,7 +303,7 @@ final class FrameDecodeContext: @unchecked Sendable {
     }
 
     private func openDecoder(codecpar: UnsafeMutablePointer<AVCodecParameters>) throws {
-        colourFill = ColourBackfill(container: ColorDescription(codecpar: codecpar))
+        colourFill = ColourBackfill(container: ColorDescription(decoding: codecpar))
         isDolbyVisionNoBaseLayer = Self.isDVNoBaseLayer(codecpar: codecpar)
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
             throw FrameDecodeError.unsupportedCodec
@@ -350,6 +350,7 @@ final class FrameDecodeContext: @unchecked Sendable {
             avcodec_free_context(&doomed)
             throw FrameDecodeError.noCodecParameters
         }
+        ctx.pointee.color_range = ColorDescription(decoding: codecpar).range
 
         // A software picture goes into the slabs the finisher reads, as on the software playback route. A hardware
         // context gets them too: VideoToolbox frames come from the hwaccel's own allocator, and a codec the hwaccel
