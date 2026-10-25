@@ -25,6 +25,26 @@ final class BitmapSubtitleUpscaling: @unchecked Sendable {
         let playhead: Double
     }
 
+    /// What a tick's upscale did, for its log line: cues upscaled, cues found kept, and the wall time.
+    struct Tally {
+        var upscaled = 0
+        var reused = 0
+        var milliseconds = 0.0
+
+        mutating func add(_ other: Tally) {
+            upscaled += other.upscaled
+            reused += other.reused
+            milliseconds += other.milliseconds
+        }
+
+        /// One line per tick that upscaled anything.
+        func report() {
+            guard upscaled > 0 else { return }
+            EngineLog.emit("[BitmapSubtitleUpscaling] upscaled \(upscaled) cue\(upscaled == 1 ? "" : "s") in "
+                           + String(format: "%.1f", milliseconds) + " ms (\(reused) kept)", category: .engine)
+        }
+    }
+
     /// Below this scale a cue is drawn as decoded: a 1080p canvas on a 1080p panel needs nothing.
     static let minimumScale: CGFloat = 1.2
 
@@ -67,17 +87,22 @@ final class BitmapSubtitleUpscaling: @unchecked Sendable {
     /// Replaces each image cue of `events` that can still show at `request.playhead` with its upscale: every cue of
     /// the last event starting at or before the playhead (the line a landing shows), and of every event after it.
     /// Earlier events are history the reconstruction pass reads, which nothing will show. Blocks.
-    func upscale(_ events: inout [EmbeddedSubtitleDecoder.SubtitleEvent?], stream: Int32, request: Request) {
+    @discardableResult
+    func upscale(_ events: inout [EmbeddedSubtitleDecoder.SubtitleEvent?], stream: Int32, request: Request) -> Tally {
+        var tally = Tally()
         #if MLSubtitleUpscale
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        defer { tally.milliseconds = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6 }
         let first = Self.firstShowable(events, playhead: request.playhead)
-        guard first < events.count else { return }
+        guard first < events.count else { return tally }
         lock.withLock { kept = kept.filter { abs($0.key.start - request.playhead) <= Self.keptSeconds } }
         for i in first..<events.count {
             guard let event = events[i], event.cues.contains(where: { if case .image = $0.body { true } else { false } }) else { continue }
             let cues = event.cues.map { cue -> SubtitleCue in
                 guard case .image(let image) = cue.body,
                       let size = Self.outputSize(image, pixelSize: request.pixelSize) else { return cue }
-                guard let upscaled = upscaled(image, size: size, stream: stream, start: cue.startTime) else { return cue }
+                guard let (upscaled, kept) = upscaled(image, size: size, stream: stream, start: cue.startTime) else { return cue }
+                if kept { tally.reused += 1 } else { tally.upscaled += 1 }
                 return cue.with(body: .image(SubtitleImage(cgImage: upscaled, position: image.position,
                                                            canvasSize: image.canvasSize, isForced: image.isForced)))
             }
@@ -86,6 +111,7 @@ final class BitmapSubtitleUpscaling: @unchecked Sendable {
                                                               isSelfContainedPGS: event.isSelfContainedPGS)
         }
         #endif
+        return tally
     }
 
     /// The index of the last event with cues starting at or before `playhead`, or 0 when none does.
@@ -118,15 +144,16 @@ final class BitmapSubtitleUpscaling: @unchecked Sendable {
     }
 
     #if MLSubtitleUpscale
-    private func upscaled(_ image: SubtitleImage, size: CGSize, stream: Int32, start: Double) -> CGImage? {
+    /// The upscale of `image`, and whether it was kept from before.
+    private func upscaled(_ image: SubtitleImage, size: CGSize, stream: Int32, start: Double) -> (CGImage, Bool)? {
         let p = image.position
         let key = Key(stream: stream, start: start, position: [p.minX, p.minY, p.width, p.height],
                       width: Int(size.width), height: Int(size.height))
-        if let made = lock.withLock({ kept[key] }) { return made }
+        if let made = lock.withLock({ kept[key] }) { return (made, true) }
         do {
             let made = try upscalerLocked().upscale(image.cgImage, size: size)
             lock.withLock { kept[key] = made }
-            return made
+            return (made, false)
         } catch {
             let first = lock.withLock { () -> Bool in
                 failed = true

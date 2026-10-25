@@ -50,16 +50,17 @@ struct BitmapSubtitleUpscaleTests {
         [type, UInt8((body.count >> 8) & 0xFF), UInt8(body.count & 0xFF)] + body
     }
 
-    /// A self-contained (Epoch Start) display set on a 1920x1080 canvas: one 8x8 opaque white object at (100, 900).
-    private static let displaySet: Data = {
+    /// A self-contained (Epoch Start) display set on a 1920x1080 canvas: one 8x8 opaque white object at (100, 900),
+    /// `forced` setting its composition object's forced flag.
+    private static func displaySet(forced: Bool = false) -> Data {
         let pcs = segment(0x16, [0x07, 0x80, 0x04, 0x38, 0x10, 0x00, 0x01, 0x80, 0x00, 0x00, 0x01,
-                                 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x03, 0x84])
+                                 0x00, 0x00, 0x00, forced ? 0x40 : 0x00, 0x00, 0x64, 0x03, 0x84])
         let wds = segment(0x17, [0x01, 0x00, 0x00, 0x64, 0x03, 0x84, 0x00, 0x08, 0x00, 0x08])
         let pds = segment(0x14, [0x00, 0x00, 0x00, 0x10, 0x80, 0x80, 0x00, 0x01, 0xEB, 0x80, 0x80, 0xFF])
         let rle = Array(repeating: [0x00, 0x88, 0x01, 0x00, 0x00] as [UInt8], count: 8).flatMap { $0 }
         let ods = segment(0x15, [0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x2C, 0x00, 0x08, 0x00, 0x08] + rle)
         return Data(pcs + wds + pds + ods + segment(0x80, []))
-    }()
+    }
 
     /// A PGS stream for the decoders, held by a format context the test frees.
     private final class PGSStream {
@@ -77,14 +78,15 @@ struct BitmapSubtitleUpscaleTests {
 
     private static let streamIndex: Int32 = 3
 
-    /// An engine drawing at 3840x2160, playhead 17, with display sets at 10, 16, 30 and 60 s stored.
+    /// An engine drawing at `pixelSize`, playhead 17, with display sets at 10, 16, 30 and 60 s stored, those in
+    /// `forced` flagged forced.
     @MainActor
-    private func engine(pixelSize: CGSize?) throws -> (AetherEngine, PGSStream) {
+    private func engine(pixelSize: CGSize?, forced: Set<Double> = []) throws -> (AetherEngine, PGSStream) {
         let pgs = try PGSStream()
         let store = SubtitlePacketStore()
         for start in [10.0, 16, 30, 60] {
             store.append(streamIndex: Self.streamIndex, ptsSeconds: start, durationSeconds: 0, flags: 1,
-                         payload: Self.displaySet)
+                         payload: Self.displaySet(forced: forced.contains(start)))
         }
         // The harvest read the whole stretch, so a set behind the playhead may claim the landing (#416).
         store.noteHarvestAnchor(at: 0)
@@ -116,6 +118,21 @@ struct BitmapSubtitleUpscaleTests {
         await engine.subtitleDrainTickInFlight?.value
         #expect(Self.sizes(engine.subtitleCues) == [16: 8, 30: 8, 60: 8])
         #expect(engine.subtitleDrainTickInFlight == nil)
+        withExtendedLifetime(pgs) {}
+    }
+
+    @MainActor
+    @Test("a full track shown as forced subtitles publishes only its forced lines, an unforced set closing the one before")
+    func forcedLinesOnly() async throws {
+        let (engine, pgs) = try engine(pixelSize: nil, forced: [10, 16, 60])
+        engine.subtitleTracks = [TrackInfo(id: Int(Self.streamIndex), name: "English", codec: "pgssub",
+                                           language: "eng", isDefault: false)]
+        engine.activeSubtitleTrackIndex = Int(Self.streamIndex)
+        engine.forcedSubtitleSelection = true
+        engine.requestSubtitleDrainTick()
+        await engine.subtitleDrainTickInFlight?.value
+        #expect(engine.subtitleCues.map(\.startTime) == [16, 60])
+        #expect(engine.subtitleCues.first?.endTime == 30)
         withExtendedLifetime(pgs) {}
     }
 
