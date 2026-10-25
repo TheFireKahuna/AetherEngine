@@ -146,7 +146,7 @@ struct DiscRecognitionBoundsTests {
         }
         #expect(files.map { $0.first } == (0..<200).map { Optional(UInt8(truncatingIfNeeded: $0)) })
         #expect(gauge.peak > 1)
-        #expect(gauge.peak <= DiscReader.smallFileLanes)
+        #expect(gauge.peak <= BlockingWork.readLanes)
     }
 
     // MARK: - MPLSParser

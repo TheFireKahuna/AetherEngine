@@ -340,10 +340,6 @@ final class SubtitleSource {
 
     // MARK: - Indexed renditions, whole
 
-    /// Parallel lanes for block reads: a remote range read costs a round trip each (about 40 ms measured
-    /// through a reverse proxy), so they go out side by side.
-    nonisolated static let readLanes = 12
-
     /// Every indexed text stream with a rendition: all of its frames, decoded in order into its store,
     /// which is then complete. A stream with frames that could not be read keeps what was read as a head
     /// start and stays open.
@@ -631,24 +627,15 @@ final class SubtitleSource {
                                        readers: FrameReaders, prefix: Int? = nil,
                                        stop: StopFlag) -> [Int: SourceIndexFrame] {
         guard !blocks.isEmpty else { return [:] }
-        let sources = readers.lanes(min(readLanes, blocks.count), label: "subpull")
+        let sources = readers.lanes(min(BlockingWork.readLanes, blocks.count), label: "subpull")
         defer { sources.forEach { $0.close() } }
         guard !sources.isEmpty else { return [:] }
-        final class Frames: @unchecked Sendable {
-            let lock = NSLock()
-            var byPosition: [Int: SourceIndexFrame] = [:]
+        let frames = BlockingWork.lanes(count: blocks.count, width: sources.count, isStopped: { stop.isRaised }) { lane, k in
+            index.readFrame(blocks[k], track: track, from: sources[lane], prefix: prefix)
         }
-        let out = Frames()
-        DispatchQueue.concurrentPerform(iterations: sources.count) { lane in
-            var k = lane
-            while k < blocks.count, !stop.isRaised {
-                if let frame = index.readFrame(blocks[k], track: track, from: sources[lane], prefix: prefix) {
-                    out.lock.lock(); out.byPosition[k] = frame; out.lock.unlock()
-                }
-                k += sources.count
-            }
-        }
-        return out.byPosition
+        var byPosition: [Int: SourceIndexFrame] = [:]
+        for (k, frame) in frames.enumerated() { if let frame { byPosition[k] = frame } }
+        return byPosition
     }
 
     /// One frame through the decoder as the packet libavformat would hand over (WebVTT settings as side
