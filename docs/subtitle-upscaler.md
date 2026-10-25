@@ -15,9 +15,9 @@ it (`AetherEngine.OptionalComponent.mlSubtitleUpscale`). The engine re-exports t
 - `AetherEngine.prewarmBitmapSubtitleUpscaler()` at app open: the models load in the background, under 2 s the
   first time after an install or an OS update (the default specialisation), well under one otherwise, and the
   `fastPrediction` ones replace them behind that.
-- `bitmapSubtitlePixelSize`: the picture area it draws bitmap subtitles into, in pixels. A cue's canvas maps onto
-  it width-aligned, as hosts place cues; under 1.2x of its own size a cue stays as decoded (a 1080p canvas on a
-  1080p panel). Applies to cues decoded after it is set.
+- `bitmapSubtitlePixelSize`: the picture's rect it draws bitmap subtitles into, in pixels. A cue's canvas is scaled
+  to cover it, centred, as Sodalite places cues; under 1.2x of its own size a cue stays as decoded (a 1080p canvas
+  on a 1080p panel). Applies to cues decoded after it is set.
 
 ## How a cue is upscaled (`BitmapSubtitleUpscaling`)
 

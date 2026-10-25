@@ -1377,11 +1377,12 @@ public final class AetherEngine: ObservableObject {
     /// Decoded cues for the active subtitle source (sidecar or embedded side-demuxer). When
     /// `LoadOptions.prepareNativeSubtitles` is set, cues also flow into NativeSubtitleCueStore for mov_text injection (#55).
     @Published public internal(set) var subtitleCues: [SubtitleCue] = []
-    /// The pixels the host draws bitmap subtitles (PGS, DVB, DVD) into: the picture area's size in pixels, its
-    /// points times the screen's scale. With the `MLSubtitleUpscale` trait, each bitmap cue is upscaled to it
-    /// before it enters `subtitleCues` (a 1080p canvas on a 2160p picture is 2x; under 1.2x of its own size a cue
-    /// stays as decoded), and a session with a bitmap track starts playing once the upscaler is ready. Applies to
-    /// cues decoded after it is set. nil (default), or without the trait: cues as decoded.
+    /// The pixels the host draws bitmap subtitles (PGS, DVB, DVD) into: the picture's rect in pixels, its points times
+    /// the screen's scale, which a cue's canvas is scaled to cover, centred. With the `MLSubtitleUpscale` trait, each
+    /// bitmap cue is upscaled to its size there before it enters `subtitleCues` (a 1080p canvas on a 2160p picture is
+    /// 2x; under 1.2x of its own size a cue stays as decoded), and a session with a bitmap track starts playing once
+    /// the upscaler is ready. Applies to cues decoded after it is set. nil (default), or without the trait: cues as
+    /// decoded.
     public var bitmapSubtitlePixelSize: CGSize?
     /// #100: per-channel holdback for PGS cues arriving behind the playhead (catch-up bursts after
     /// side-reader starvation). Reset wherever the cue arrays reset (track switch, seek re-anchor,

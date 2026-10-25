@@ -86,11 +86,13 @@ final class BitmapSubtitleUpscaling: @unchecked Sendable {
         events.lastIndex { $0.map { !$0.cues.isEmpty && $0.cues.allSatisfy { $0.startTime <= playhead } } ?? false } ?? 0
     }
 
-    /// The pixel size `image` is drawn at: its canvas mapped width-aligned onto `pixelSize`, as hosts place it. nil
-    /// when that is less than ``minimumScale`` of its own, or the canvas is unknown.
+    /// The pixel size `image` is drawn at: its canvas scaled to cover the picture's `pixelSize`, centred, as hosts
+    /// place it (the picture is a crop or a rescale of the canvas, so the canvas covers it). nil when that is less than
+    /// ``minimumScale`` of its own, or the canvas is unknown.
     static func outputSize(_ image: SubtitleImage, pixelSize: CGSize) -> CGSize? {
-        guard image.canvasSize.width > 0, pixelSize.width > 0 else { return nil }
-        let scale = pixelSize.width / image.canvasSize.width
+        let canvas = image.canvasSize
+        guard canvas.width > 0, canvas.height > 0, pixelSize.width > 0, pixelSize.height > 0 else { return nil }
+        let scale = max(pixelSize.width / canvas.width, pixelSize.height / canvas.height)
         guard scale >= minimumScale else { return nil }
         return CGSize(width: (CGFloat(image.cgImage.width) * scale).rounded(),
                       height: (CGFloat(image.cgImage.height) * scale).rounded())
