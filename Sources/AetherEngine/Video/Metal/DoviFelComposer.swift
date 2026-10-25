@@ -341,9 +341,9 @@ final class DoviFelComposer: @unchecked Sendable {
         var mmrBuffers: [MTLBuffer] = []
         for _ in 0..<Self.maxFramesInFlight {
             guard let buf = dev.makeBuffer(length: DoviMetalParams.serializedSize, options: .storageModeShared),
-                  let lut = dev.makeBuffer(length: 1024 * MemoryLayout<Float>.stride, options: .storageModeShared),
+                  let lut = dev.makeBuffer(length: 1024 * MemoryLayout<Int32>.stride, options: .storageModeShared),
                   let nlq = dev.makeBuffer(length: 3 * 1024 * MemoryLayout<Int32>.stride, options: .storageModeShared),
-                  let mmr = dev.makeBuffer(length: Self.mmrTableCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+                  let mmr = dev.makeBuffer(length: Self.mmrTableCount * MemoryLayout<Int32>.stride, options: .storageModeShared) else {
                 return nil
             }
             pBuffers.append(buf)
@@ -1023,11 +1023,11 @@ final class DoviFelComposer: @unchecked Sendable {
         }
 
         let lutBuffer = lumaLutBuffers[paramSlot]
-        populateLumaLut(into: lutBuffer.contents().assumingMemoryBound(to: Float.self), params: metalParams)
+        populateLumaLut(into: lutBuffer.contents().assumingMemoryBound(to: Int32.self), params: metalParams)
         let nlqBuffer = nlqLutBuffers[paramSlot]
         Self.populateNlqLut(into: nlqBuffer.contents().assumingMemoryBound(to: Int32.self), params: serialized)
         let mmrBuffer = mmrTableBuffers[paramSlot]
-        Self.populateMmrTable(into: mmrBuffer.contents().assumingMemoryBound(to: Float.self), params: serialized)
+        Self.populateMmrTable(into: mmrBuffer.contents().assumingMemoryBound(to: Int32.self), params: serialized)
 
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             returnParamSlot(paramSlot)
@@ -1073,55 +1073,45 @@ final class DoviFelComposer: @unchecked Sendable {
         return EncodedFrame(commandBuffer: commandBuffer, destination: dst, keepAlive: keepAliveTextures, paramSlot: paramSlot)
     }
 
-    /// Precomputes the 1024-entry luma prediction table when luma is polynomial (dolby-vision-fel.md §5.6).
-    func populateLumaLut(into ptr: UnsafeMutablePointer<Float>, params: DoviMetalParams) {
-        let poly = params.polyY
-        let blMax = Float(params.blMax) + 1   // normalise by 2^bits, as the kernels do
-        guard poly.numPivots >= 2 else {
-            for code in 0..<1024 {
-                ptr[code] = Float(code) / blMax
-            }
-            return
+    /// The 1024-entry luma prediction table when luma is polynomial (dolby-vision-fel.md §5.6): the 16-bit
+    /// prediction of every base-layer code, ``polynomialPrediction(_:code:blBitDepth:)``. An MMR piece (the luma
+    /// kernel evaluates those itself, `DoviComposerFlags.lumaMmr`) gets the identity value.
+    func populateLumaLut(into ptr: UnsafeMutablePointer<Int32>, params: DoviMetalParams) {
+        let blBitDepth = Self.bitDepth(ofMax: params.blMax)
+        for code in 0..<1024 {
+            ptr[code] = Self.polynomialPrediction(params.polyY, code: code, blBitDepth: blBitDepth)
         }
+    }
 
+    /// `n` for a maximum code `2^n - 1`.
+    static func bitDepth(ofMax max: UInt32) -> Int { UInt32.bitWidth - max.leadingZeroBitCount }
+
+    /// ETSI GS CCM 001 5.4.2.2 and 5.4.2.3.2 for one base-layer code: the piece it falls in and that piece's
+    /// polynomial at it, as the spec's 16-bit prediction (`vv >> (4 + coefficient_log2_denom)`, negative sums 0,
+    /// capped at 0xffff). A curve the parser could not trust (`numPivots < 2`), or an MMR piece, gives the identity
+    /// value `code << (16 - BL_bit_depth)`, which is also what the identity polynomial computes.
+    static func polynomialPrediction(_ poly: DoviPolynomialParams, code: Int, blBitDepth: Int) -> Int32 {
+        let identity = Int32(min(code << (16 - blBitDepth), 0xffff))
+        guard poly.numPivots >= 2 else { return identity }
         let numPivots = Int(poly.numPivots)
         let lastPiece = numPivots - 2
-        let lo = Int(poly.pivots[0])
-        let hi = Int(poly.pivots[numPivots - 1])
+        var piece = 0
+        for i in 0...lastPiece where code >= Int(poly.pivots[i]) { piece = i }
+        guard piece < poly.method.count, poly.method[piece] == DoviMapping.polynomial.rawValue else { return identity }
 
-        for code in 0..<1024 {
-            var piece = 0
-            for i in 0...lastPiece {
-                if code >= Int(poly.pivots[i]) {
-                    piece = i
-                }
-            }
-            let p = max(0, min(piece, lastPiece))
-            let method = (p < DoviPolynomialParams.maxPieces && p < poly.method.count) ? poly.method[p] : DoviMapping.polynomial.rawValue
-            if method != DoviMapping.polynomial.rawValue {
-                ptr[code] = Float(code) / blMax
-                continue
-            }
-
-            let clamped = min(max(code, lo), hi)
-            let x = Float(clamped) / blMax
-            let shift = (p < poly.coefShift.count) ? Int32(poly.coefShift[p]) : 0
-            let inv = ldexpf(1.0, -shift)
-            let coefs = (p < poly.coef.count) ? poly.coef[p] : [0, 0, 0]
-            let c0 = (coefs.count > 0) ? Float(coefs[0]) : 0
-            let c1 = (coefs.count > 1) ? Float(coefs[1]) : 0
-            let c2 = (coefs.count > 2) ? Float(coefs[2]) : 0
-
-            var pred = c0 * inv
-            let order = (p < poly.order.count) ? poly.order[p] : 0
-            if order >= 1 {
-                pred = fmaf(c1 * inv, x, pred)
-            }
-            if order >= 2 {
-                pred = fmaf(c2 * inv, x * x, pred)
-            }
-            ptr[code] = pred
+        let s = Int64(min(max(code, Int(poly.pivots[0])), Int(poly.pivots[numPivots - 1])))
+        let coefs = poly.coef[piece]
+        var vv: Int64 = 0
+        var ss: Int64 = 1
+        var shift = 20   // 2 * (maximum BL_bit_depth)
+        // The syntax allows linear and quadratic pieces only; the kernels read no term past the second either.
+        for i in 0...min(Int(poly.order[piece]), 2) where i < coefs.count {
+            vv &+= Int64(coefs[i]) &* (ss << shift)
+            ss &*= s
+            shift -= blBitDepth
         }
+        vv = max(vv, 0)
+        return Int32(min(vv >> (4 + Int64(poly.coefShift[piece])), 0xffff))
     }
 
     /// Fills the 3 x 1024 inverse-NLQ table the kernels index (Y, Cb, Cr; one entry per 10-bit EL code), with
@@ -1138,19 +1128,16 @@ final class DoviFelComposer: @unchecked Sendable {
     /// Floats in the per-frame MMR table: Y, Cb, Cr, each `maxPieces` pieces of the constant and 21 terms.
     static let mmrTableCount = 3 * DoviMmrParams.maxPieces * (1 + DoviMmrParams.coefficientsPerPiece)
 
-    /// Fills the MMR table the kernels read (`DOVI_MMR_TABLE_*` in the shader): each coefficient as
-    /// float(coef) * 2^-coef_shift, the value the kernel used to form per term per sample. The scale is a
-    /// power of two, so it is exact and the kernels' sums are bit-identical; 1056 conversions on the CPU
-    /// per frame replace an int-to-float conversion and a multiply per MMR term per GPU sample (UHD p010
-    /// about 0.045 ms per frame on an M4 Pro, DoviGpuBenchmark).
-    static func populateMmrTable(into ptr: UnsafeMutablePointer<Float>, params: DoviMetalParams) {
+    /// Fills the MMR table the kernels read (`DOVI_MMR_TABLE_*` in the shader): per component and piece the
+    /// constant then the 21 coefficients, Q(coefficient_log2_denom), which the kernels multiply into the spec's
+    /// 64-bit sum (5.4.2.3.3).
+    static func populateMmrTable(into ptr: UnsafeMutablePointer<Int32>, params: DoviMetalParams) {
         let piece = 1 + DoviMmrParams.coefficientsPerPiece
         for (component, mmr) in [params.mmrY, params.mmrCb, params.mmrCr].enumerated() {
-            let inv = ldexpf(1, -Int32(truncatingIfNeeded: mmr.coefShift))
             for p in 0..<DoviMmrParams.maxPieces {
                 let base = ptr + (component * DoviMmrParams.maxPieces + p) * piece
-                base[0] = Float(mmr.constant[p]) * inv
-                for t in 0..<DoviMmrParams.coefficientsPerPiece { base[1 + t] = Float(mmr.coef[p][t]) * inv }
+                base[0] = mmr.constant[p]
+                for t in 0..<DoviMmrParams.coefficientsPerPiece { base[1 + t] = mmr.coef[p][t] }
             }
         }
     }
@@ -1160,41 +1147,30 @@ final class DoviFelComposer: @unchecked Sendable {
         for code in 0..<1024 { ptr[code] = inverseNlq(nlq, elCode: code) }
     }
 
-    /// Inverse linear-deadzone quantiser for one 10-bit EL code, in VDR code units.
+    /// Inverse linear-deadzone quantiser for one 10-bit EL code: ETSI GS CCM 001 5.4.3.2 line for line, with
+    /// EL_bit_depth 10 (the only depth `layerBitDepthsSupported` admits). The result is the spec's 16-bit signed
+    /// residual r, which 5.4.3.3 adds to the 16-bit prediction before the one rounding.
     ///
-    /// The scaled magnitude is Q(coefficient_log2_denom) of the normalised residual, so the shift
-    /// by nlq_shift = coefficient_log2_denom - vdr_bit_depth lands it in VDR code
-    /// units. That reading is corroborated by the RPUs themselves: both test streams
-    /// carry linear_deadzone_slope = 2048 and vdr_in_max = 0.125 at denom 23, and
-    /// 512 * 2048 >> 11 is exactly 512, i.e. the slope is tuned so the enhancement
-    /// layer's full +/-512 swing lands precisely on vdr_in_max. Shifting by denom
-    /// instead (the convention the vc4 composer uses) collapses every residual to
-    /// zero, and no other shift makes the two fields agree.
+    /// S, T and R are `linear_deadzone_slope`, `linear_deadzone_threshold` and `vdr_in_max` in
+    /// Q(coefficient_log2_denom). The reconstruction sits at the middle of the quantisation step, (2|rr| - 1) * S,
+    /// in doubled fixed point, the threshold is added to the magnitude (the spec's `TT`, DoViBaker's
+    /// `dq += T * sign`), the doubled product is clamped to +/-2R, and `nlqShift` (coefficient_log2_denom - 5 -
+    /// EL_bit_depth) takes it to 16 bits with an arithmetic shift, so a negative residual rounds down as the spec's
+    /// does. Every real stream carries linear_deadzone_slope 2048 and vdr_in_max 0.125 at denom 23: an EL swing of
+    /// +/-512 lands on +/-0.125, and the threshold is 0 (RPU survey, 9,816 RPUs).
     ///
-    /// The threshold is ADDED to the magnitude, in the same Q(coefficient_log2_denom) domain as
-    /// (|r| - 1/2) * slope, and there is no early zero: that is the spec's pseudo-code, and DoViBaker
-    /// implements it (`dq += T * sign`). Every real stream carries linear_deadzone_threshold == 0 (RPU
-    /// survey, 9,816 RPUs), where all readings agree. Subtracting it, or zeroing anything inside the
-    /// deadzone, would be a different reading and does not match a second implementation.
-    ///
-    /// The final shift has no rounding offset, so the magnitude truncates to a whole VDR code. Neither
-    /// reference rounds there: DoViBaker shifts with no offset as well (it keeps four more fractional bits
-    /// and rounds once, at the output) and libplacebo works in float. Carrying that fraction into the output
-    /// quantiser would be the change worth measuring, not an offset here.
-    ///
-    /// Wrapping arithmetic, as the kernels' 32/64-bit integers had: parameters no real stream carries (a
-    /// negative or huge scale, an offset far outside the code range) must give some deterministic value, not trap.
+    /// Wrapping arithmetic: parameters no real stream carries (a negative or huge slope, an offset far outside the
+    /// code range) must give some deterministic value, not trap.
     static func inverseNlq(_ nlq: DoviNlqParams, elCode: Int) -> Int32 {
         guard nlq.nlqMethod == .linear, nlq.nlqScale != 0 else { return 0 }
-        let r = Int32(truncatingIfNeeded: elCode) &- nlq.nlqOffset
-        if r == 0 { return 0 }
-        // Reconstruction at the middle of the quantisation step, (|r| - 1/2) * scale, in doubled fixed
-        // point so the half step stays exact.
-        let magFp = (2 &* Int64(r.magnitude) &- 1) &* Int64(nlq.nlqScale)
-        var mag = (magFp &+ 2 &* Int64(nlq.nlqThreshold)) >> (Int64(nlq.nlqShift) + 1)
-        if nlq.vdrInMax > 0 && mag > Int64(nlq.vdrInMax) { mag = Int64(nlq.vdrInMax) }
-        let m = Int32(truncatingIfNeeded: mag)
-        return r < 0 ? 0 &- m : m
+        let rr = Int64(elCode) &- Int64(nlq.nlqOffset)
+        if rr == 0 { return 0 }
+        let sign: Int64 = rr < 0 ? -1 : 1
+        var dq = ((rr << 1) &- sign) &* Int64(nlq.nlqScale)
+        dq &+= (Int64(nlq.nlqThreshold) << 1) &* sign
+        let limit = Int64(nlq.vdrInMax) << 1
+        dq = min(max(dq, -limit), limit)
+        return Int32(truncatingIfNeeded: dq >> Int64(nlq.nlqShift))
     }
 
     /// Sizes threadgroups using the pipeline's execution width (dolby-vision-fel.md §5.6).
@@ -1458,16 +1434,15 @@ final class DoviFelComposer: @unchecked Sendable {
             params.flags.insert(.disableResidual)
         }
 
-        // The inverse NLQ product is Q(coefficient_log2_denom) of a normalised
-        // residual; this shift brings it into VDR code units. A denominator below
-        // the VDR depth would make the shift negative and the whole derivation
-        // meaningless, so that disables the residual rather than shifting the
-        // other way.
-        let nlqShift = UInt32(max(0, coefLog2Denom - vdrBitDepth))
+        // The inverse NLQ product is a doubled Q(coefficient_log2_denom) of a normalised residual; 5.4.3.2's
+        // final shift, coefficient_log2_denom - 5 - EL_bit_depth, takes it to 16 bits. A denominator below
+        // 5 + EL_bit_depth would make the shift negative, which the spec does not define, so that disables the
+        // residual rather than shifting the other way.
+        let nlqShift = UInt32(max(0, coefLog2Denom - 5 - elBitDepth))
         let nlqMethodIdc = mapping.pointee.nlq_method_idc
         var nlqMethod: DoviNlqMethod = .none
-        if coefLog2Denom < vdrBitDepth {
-            logOnce("[DoviFelComposer] coefficient_log2_denom \(coefLog2Denom) below vdr_bit_depth \(vdrBitDepth); dropping residual", category: .swPlayback)
+        if coefLog2Denom < 5 + elBitDepth {
+            logOnce("[DoviFelComposer] coefficient_log2_denom \(coefLog2Denom) below 5 + el_bit_depth \(elBitDepth); dropping residual", category: .swPlayback)
         } else if nlqMethodIdc == 0 {
             nlqMethod = .linear
         } else if nlqMethodIdc > 0 {
@@ -1747,11 +1722,10 @@ final class DoviFelComposer: @unchecked Sendable {
             return disabled
         }
 
-        // vdr_in_max is a normalised ceiling in Q(coefficient_log2_denom); the
-        // same shift that converts the residual converts the ceiling.
-        let scaledMax = maxFp >> Int64(nlqShift)
-        guard scaledMax >= 0, scaledMax <= Int64(Int32.max) else {
-            logOnce("[DoviFelComposer] \(label) vdr_in_max \(scaledMax) out of range; dropping residual", category: .swPlayback)
+        // vdr_in_max is a normalised ceiling in Q(coefficient_log2_denom), compared with the doubled product
+        // before the shift (`RR = R << 1`), so it is kept as it is.
+        guard maxFp >= 0, maxFp <= Int64(Int32.max) else {
+            logOnce("[DoviFelComposer] \(label) vdr_in_max \(maxFp) out of range; dropping residual", category: .swPlayback)
             return disabled
         }
 
@@ -1775,7 +1749,7 @@ final class DoviFelComposer: @unchecked Sendable {
         params.nlqOffset = Int32(offset)
         params.nlqScale = scale
         params.nlqThreshold = threshold
-        params.vdrInMax = Int32(scaledMax)
+        params.vdrInMax = Int32(maxFp)
         return params
     }
 }

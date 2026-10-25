@@ -101,11 +101,11 @@ struct DoviGpuBenchmark {
         let pbuf = try #require(device.makeBuffer(length: DoviMetalParams.serializedSize, options: .storageModeShared))
         params.serialize(into: UnsafeMutableRawBufferPointer(start: pbuf.contents(), count: DoviMetalParams.serializedSize))
         let lut = try #require(device.makeBuffer(length: 1024 * 4, options: .storageModeShared))
-        try #require(DoviFelComposer()).populateLumaLut(into: lut.contents().assumingMemoryBound(to: Float.self), params: params)
+        try #require(DoviFelComposer()).populateLumaLut(into: lut.contents().assumingMemoryBound(to: Int32.self), params: params)
         let nlq = try #require(device.makeBuffer(length: 3 * 1024 * 4, options: .storageModeShared))
         DoviFelComposer.populateNlqLut(into: nlq.contents().assumingMemoryBound(to: Int32.self), params: params)
         let mmr = try #require(device.makeBuffer(length: DoviFelComposer.mmrTableCount * 4, options: .storageModeShared))
-        DoviFelComposer.populateMmrTable(into: mmr.contents().assumingMemoryBound(to: Float.self), params: params)
+        DoviFelComposer.populateMmrTable(into: mmr.contents().assumingMemoryBound(to: Int32.self), params: params)
         return Rig(device: device, queue: queue, cache: try #require(cache), base: base, enhancement: el, params: pbuf, lut: lut, nlq: nlq, mmr: mmr)
     }
 
@@ -229,8 +229,8 @@ struct DoviGpuBenchmark {
 
     /// LUT in device memory: per-thread indices into `constant` memory serialise on Apple GPUs.
     static let deviceLut: [(String, String)] = [
-        ("constant float*                        luma_lut      [[buffer(1)]],",
-         "device const float*                    luma_lut      [[buffer(1)]],"),
+        ("constant int*                          luma_lut      [[buffer(1)]],",
+         "device const int*                      luma_lut      [[buffer(1)]],"),
     ]
 
     /// Dither only where it is used, and its table addressed arithmetically instead of a constant array:
@@ -247,12 +247,6 @@ struct DoviGpuBenchmark {
     uint k = ((xy & 1u) << 5) | ((dy & 1u) << 4) | ((xy & 2u) << 2) | ((dy & 2u) << 1) | ((xy & 4u) >> 1) | ((dy & 4u) >> 2);
     float d = float(k) * (1.0f / 64.0f);
 """),
-    ]
-
-    /// The full-precision word by shift: vdr_scale is a power of two and vdr_val is clamped >= 0.
-    static let shiftFullPrecision: [(String, String)] = [
-        ("    int v = (vdr_val * 64 + int(vdr_scale >> 1)) / int(vdr_scale);",
-         "    int v = (vdr_val * 64 + int(vdr_scale >> 1)) >> ctz(vdr_scale);"),
     ]
 
     /// Each thread composes `n` horizontally adjacent sites (luma pixels / chroma samples) instead of one:
@@ -281,7 +275,7 @@ struct DoviGpuBenchmark {
         ("""
     int bl_y = int(bl_y_tex.read(gid).r >> 6);
 
-    float pred;
+    int h;
 """, """
     int bl_y = int(bl_y_tex.read(gid).r >> 6);
     {
@@ -289,7 +283,7 @@ struct DoviGpuBenchmark {
         out_y_tex.write(ushort4(ushort((bl_y + e) << 6), 0, 0, 0), gid);
         return;
     }
-    float pred;
+    int h;
 """),
         ("""
     ushort4 bl_uv = bl_uv_tex.read(gid);
@@ -334,53 +328,12 @@ struct DoviGpuBenchmark {
     ]
     static let chromaNoQuantize: [(String, String)] = [
         ("""
-    int out_cb = dovi_quantize(vdr_cb, params.vdr_scale, params.dither_mode,
-                               dovi_dither(gid, params.frame_index, uint2(1u, 0u)), 64, 960);
-    int out_cr = dovi_quantize(vdr_cr, params.vdr_scale, params.dither_mode,
-                               dovi_dither(gid, params.frame_index, uint2(1u, 1u)), 64, 960);
+    int out_cb = dovi_quantize(h_cb, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 0u)), 64, 960);
+    int out_cr = dovi_quantize(h_cr, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 1u)), 64, 960);
 """, """
-    int out_cb = vdr_cb >> 2;
-    int out_cr = vdr_cr >> 2;
+    int out_cb = h_cb >> 6;
+    int out_cr = h_cr >> 6;
 """),
-    ]
-
-    /// The previous MMR evaluation, int coefficients converted and scaled per term per sample in the kernel,
-    /// kept as the proof that the per-frame float table (`DoviFelComposer.populateMmrTable`) is bit-exact.
-    static let intMmr: [(String, String)] = [
-        ("""
-    device const float* k,
-    int piece,
-    float y_norm, float u_norm, float v_norm)
-{
-    // y_norm, u_norm and v_norm are already clamped to their components' pivot ranges.
-    device const float* c = k + piece * DOVI_MMR_TABLE_PIECE_STRIDE;
-    float s = c[0];
-""", """
-    constant struct DoviMmrParams &mmr,
-    int piece,
-    float y_norm, float u_norm, float v_norm)
-{
-    float inv = ldexp(1.0f, -int(mmr.coef_shift));
-    float s = float(mmr.mmr_constant[piece]) * inv;
-"""),
-        ("            s = fma(c[1u + o * 7u + uint(k)], t[k], s);",
-         "            s = fma(float(mmr.coef[piece][o * 7u + uint(k)]) * inv, t[k], s);"),
-        ("""
-    device const float* mmr,
-    constant struct DoviPolynomialParams &poly_y,
-""", """
-    constant struct DoviMmrParams &mmr,
-    constant struct DoviPolynomialParams &poly_y,
-"""),
-        ("pred = dovi_eval_curve(params.poly_y, mmr_table,", "pred = dovi_eval_curve(params.poly_y, params.mmr_y,"),
-        ("float pred_cb = dovi_eval_curve(params.poly_cb, mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE,",
-         "float pred_cb = dovi_eval_curve(params.poly_cb, params.mmr_cb,"),
-        ("float pred_cr = dovi_eval_curve(params.poly_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE,",
-         "float pred_cr = dovi_eval_curve(params.poly_cr, params.mmr_cr,"),
-        ("float pred_cb = dovi_eval_curve_f(params.poly_cb, mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE,",
-         "float pred_cb = dovi_eval_curve_f(params.poly_cb, params.mmr_cb,"),
-        ("float pred_cr = dovi_eval_curve_f(params.poly_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE,",
-         "float pred_cr = dovi_eval_curve_f(params.poly_cr, params.mmr_cr,"),
     ]
 
     @Test("UHD composition GPU time per kernel", .enabled(if: enabled, "set DOVI_BENCH=1"))
@@ -388,14 +341,12 @@ struct DoviGpuBenchmark {
         let rig = try Self.rig()
         print("[bench] device \(rig.device.name), \(Self.width)x\(Self.height), median of \(Self.iterations)")
         let base = DoviShaderSource.source
-        let all = Self.deviceLut + Self.lazyDither + Self.shiftFullPrecision
+        let all = Self.deviceLut + Self.lazyDither
         let variants: [(String, String, [(MTLBuffer, Int)])] = [
             ("baseline     ", base, []),
             ("device-lut   ", try Self.patched(base, Self.deviceLut), []),
             ("lazy-dither  ", try Self.patched(base, Self.lazyDither), []),
-            ("shift-fullp  ", try Self.patched(base, Self.shiftFullPrecision), []),
             ("all          ", try Self.patched(base, all), []),
-            ("int-mmr      ", try Self.patched(base, Self.intMmr), []),
             ("FLOOR (I/O)  ", try Self.patched(base, Self.floorOnly), []),
             ("c: 1-tap luma", try Self.patched(base, Self.chromaOneTap), []),
             ("c: no MMR    ", try Self.patched(base, Self.chromaNoMmr), []),

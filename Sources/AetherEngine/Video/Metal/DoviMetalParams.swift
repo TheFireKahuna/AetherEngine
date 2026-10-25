@@ -20,11 +20,11 @@ enum DoviNlqMethod: UInt32, Sendable {
 enum DoviDither: UInt32, Sendable {
     case none = 0
     case bayer8x8 = 1
-    /// Test only: planes hold the un-quantised 12-bit VDR code shifted left 4, not P010.
+    /// Test only: planes hold the spec's reconstructed 12-bit VDR sample (CCM 001 5.4.3.3) shifted left 4, not P010.
     case debugRawVDR = 2
-    /// Undithered, but the VDR bits below the 10-bit code are kept in P010's unused low 6 bits,
-    /// so a consumer that reads the full 16-bit word sees 12-bit (or finer) precision while one
-    /// that reads the top 10 bits sees the truncated code. Not validated on a display path yet.
+    /// Undithered: the 16-bit sum of prediction and residual, before the spec's rounding, so P010's unused low
+    /// 6 bits hold what lies below the 10-bit code; a consumer that reads the full 16-bit word sees all of it,
+    /// one that reads the top 10 bits the truncated code. Not validated on a display path yet.
     case fullPrecision = 3
     /// Like ``bayer8x8``, a threshold added before the floor, with the same exact 0.5 mean, but taken from a
     /// static 64x64 blue-noise map (`DoviShaderSource.blueNoiseRows`) instead of the 8x8 Bayer matrix with its
@@ -151,7 +151,9 @@ struct DoviNlqParams: Sendable {
     var nlqOffset: Int32 = 0
     var nlqScale: Int32 = 0
     var nlqThreshold: Int32 = 0
+    /// `vdr_in_max` (the spec's `fp_hdr_in_max`, R), Q(coefficient_log2_denom): the residual's magnitude ceiling.
     var vdrInMax: Int32 = 0
+    /// 5.4.3.2's final shift, coefficient_log2_denom - 5 - EL_bit_depth, to the 16-bit residual.
     var nlqShift: UInt32 = 0
     /// Decoded (prefix-summed) `nlq_pred_pivot_value`. Carried for diagnostics;
     /// the linear inverse has a single segment and does not consult them.

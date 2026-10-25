@@ -69,6 +69,7 @@ enum DoviResidualSurvey {
         let stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
         guard width > 0, height > 0 else { return nil }
 
+        // The table holds the spec's 16-bit residual; the statistics are in 12-bit codes, 16 of its units each.
         var histogram = [Int](repeating: 0, count: 4096)
         var sumAbs = 0
         var sumSigned = 0
@@ -80,8 +81,8 @@ enum DoviResidualSurvey {
                 let a = abs(r)
                 sumAbs += a
                 sumSigned += r
-                if a >= 4 { visible += 1 }
-                histogram[min(a, 4095)] += 1
+                if a >= 4 << 4 { visible += 1 }
+                histogram[min((a + 8) >> 4, 4095)] += 1
             }
         }
         let count = width * height
@@ -91,7 +92,8 @@ enum DoviResidualSurvey {
             target -= n
             if target < 0 { p99 = value; break }
         }
-        return (Double(sumAbs) / Double(count), Double(sumSigned) / Double(count), p99, Double(visible) / Double(count))
+        let units = Double(count * 16)
+        return (Double(sumAbs) / units, Double(sumSigned) / units, p99, Double(visible) / Double(count))
     }
 }
 
