@@ -69,14 +69,21 @@ struct HEVCSPS: Equatable {
         self = parsed
     }
 
-    /// The first VPS, SPS and PPS NALs (2-byte header included) of an Annex B access unit, and whether it holds an
-    /// IRAP picture (NAL types 16-23).
+    /// Whether a NAL (2-byte header) belongs to the base layer, nuh_layer_id 0. A second layer (MV-HEVC's other view,
+    /// a scalable layer) brings parameter sets and pictures of its own, which say nothing about the base layer's
+    /// sample description or colour.
+    static func isBaseLayer(_ nal: UnsafePointer<UInt8>) -> Bool {
+        (Int(nal[0] & 1) << 5 | Int(nal[1] >> 3)) == 0
+    }
+
+    /// The first base-layer VPS, SPS and PPS NALs (2-byte header included) of an Annex B access unit, and whether it
+    /// holds a base-layer IRAP picture (NAL types 16-23).
     static func parameterSets(fromAnnexB buf: UnsafeBufferPointer<UInt8>)
         -> (vps: [UInt8]?, sps: [UInt8]?, pps: [UInt8]?, irap: Bool) {
         var vps: [UInt8]?, sps: [UInt8]?, pps: [UInt8]?, irap = false
         guard let base = buf.baseAddress else { return (nil, nil, nil, false) }
         A53SEIParser.forEachNAL(base, buf.count, .annexB) { nal, length in
-            guard length > 2 else { return }
+            guard length > 2, isBaseLayer(nal) else { return }
             switch (nal[0] >> 1) & 0x3F {
             case 32: if vps == nil { vps = Array(UnsafeBufferPointer(start: nal, count: length)) }
             case 33: if sps == nil { sps = Array(UnsafeBufferPointer(start: nal, count: length)) }

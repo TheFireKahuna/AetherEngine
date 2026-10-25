@@ -3,8 +3,9 @@ import Foundation
 /// Pump-local evidence that an HEVC access unit no longer matches the sample description, `H264ConfigurationTracker`'s
 /// counterpart: an IRAP picture whose SPS has a decoder signature (`HEVCSPS.decoderSignature`: dimensions, chroma format,
 /// bit depths) that the init's `hvcC` does not carry. A new PPS, VUI or level is not one: the samples keep their in-band
-/// parameter sets (#365) and the native decoder takes them. No frames are decoded; only parameter sets and the first
-/// bytes of IRAP slice headers are read.
+/// parameter sets (#365) and the native decoder takes them. Base layer only: a second layer's sets and pictures (MV-HEVC,
+/// a scalable layer) are its own. No frames are decoded; only parameter sets and the first bytes of IRAP slice headers
+/// are read.
 struct HEVCConfigurationTracker {
     struct Mismatch: Sendable, Equatable {
         let width: Int
@@ -54,7 +55,7 @@ struct HEVCConfigurationTracker {
         guard let base = bytes.baseAddress else { return nil }
         var mismatch: Mismatch?
         A53SEIParser.forEachNAL(base, bytes.count, framing) { nal, length in
-            guard mismatch == nil, length > 2 else { return }
+            guard mismatch == nil, length > 2, HEVCSPS.isBaseLayer(nal) else { return }
             let type = (nal[0] >> 1) & 0x3F
             switch type {
             case 33:

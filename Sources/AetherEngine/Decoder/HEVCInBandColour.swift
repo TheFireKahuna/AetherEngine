@@ -52,7 +52,7 @@ struct HEVCInBandColour {
     mutating func tags(forAccessUnit data: UnsafePointer<UInt8>, size: Int) -> Tags {
         var newSPS: [UInt8]?, vclType: UInt8?, preferred: UInt8?
         A53SEIParser.forEachNAL(data, size, framing) { nal, length in
-            guard length > 2 else { return }
+            guard length > 2, HEVCSPS.isBaseLayer(nal) else { return }
             let type = (nal[0] >> 1) & 0x3F
             switch type {
             case 32: vps = Array(UnsafeBufferPointer(start: nal, count: length))
