@@ -16,13 +16,17 @@ struct BitmapSubtitleUpscaleTests {
                              canvasSize: canvas)
     }
 
-    @Test("a cue is drawn at its canvas mapped width-aligned onto the host's pixels, and not upscaled below 1.2x")
+    @Test("a cue is drawn at its canvas scaled to cover the host's picture, and not upscaled below 1.2x")
     func outputSize() {
         let pgs = Self.image(width: 900, height: 80, canvas: CGSize(width: 1920, height: 1080))
         #expect(BitmapSubtitleUpscaling.outputSize(pgs, pixelSize: CGSize(width: 3840, height: 2160)) == CGSize(width: 1800, height: 160))
         #expect(BitmapSubtitleUpscaling.outputSize(pgs, pixelSize: CGSize(width: 1920, height: 1080)) == nil)
         let dvd = Self.image(width: 360, height: 40, canvas: CGSize(width: 720, height: 480))
         #expect(BitmapSubtitleUpscaling.outputSize(dvd, pixelSize: CGSize(width: 3840, height: 2160)) == CGSize(width: 1920, height: 213))
+        // A 4:3 picture on a 2160p panel: the 16:9 canvas covers it by height.
+        #expect(BitmapSubtitleUpscaling.outputSize(pgs, pixelSize: CGSize(width: 2880, height: 2160)) == CGSize(width: 1800, height: 160))
+        // A scope picture: by width.
+        #expect(BitmapSubtitleUpscaling.outputSize(pgs, pixelSize: CGSize(width: 3840, height: 1607)) == CGSize(width: 1800, height: 160))
         let unknown = Self.image(width: 360, height: 40, canvas: .zero)
         #expect(BitmapSubtitleUpscaling.outputSize(unknown, pixelSize: CGSize(width: 3840, height: 2160)) == nil)
     }
