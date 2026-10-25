@@ -146,6 +146,33 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         workspace = Workspace(device: kernels.device)
     }
 
+    /// Makes this upscaler's window surfaces, one set per window shape, and runs each through the configuration's
+    /// models once, then one small picture through the whole pass, so the first subtitle pays only the steady-state
+    /// cost. Blocks (most of it is the Neural Engine's first use of each surface); for a background queue at app open
+    /// or when a session starts, after ``prewarm()``. A plan that needs more windows of one shape than this made still
+    /// makes them on first use.
+    public func prepare() throws {
+        try lock.withLock {
+            let config = _configuration
+            let windows = SubtitleUpscaleNeuralEngine.shapes.map { SubtitleUpscaleTilePlan.Window(x: 0, y: 0, width: $0.width, height: $0.height) }
+            for s in try workspace.surfaces.surfaces(for: windows) {
+                try SubtitleUpscaleNeuralEngine.predict(try SubtitleUpscaleNeuralEngine.model(config.alphaModel, s.shape), input: s.alphaIn, output: s.alphaOut)
+                try SubtitleUpscaleNeuralEngine.predict(try SubtitleUpscaleNeuralEngine.model(config.lumaModel, s.shape), input: s.lumaIn, output: s.lumaOut)
+            }
+            // One opaque pixel: the GPU passes' first dispatches and the mask buffers.
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 16, height: 16, mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .shared
+            guard let source = device.makeTexture(descriptor: d) else { throw UpscaleError.unavailable("no texture") }
+            var pixel: [UInt8] = [255, 255, 255, 255]
+            source.replace(region: MTLRegionMake2D(8, 8, 1, 1), mipmapLevel: 0, withBytes: &pixel, bytesPerRow: 4)
+            d.width = 32; d.height = 32
+            d.storageMode = .private
+            guard let destination = device.makeTexture(descriptor: d) else { throw UpscaleError.unavailable("no texture") }
+            try upscale([Job(source: source, destination: destination, contentBounds: CGRect(x: 8, y: 8, width: 1, height: 1))])
+        }
+    }
+
     /// Upscales each job and waits. A destination twice its source takes one 2x pass; any other size takes 2x passes
     /// (one, or two when the destination is at least 4x) then a Lanczos-3 resample to the exact size, antialiased
     /// when it reduces.

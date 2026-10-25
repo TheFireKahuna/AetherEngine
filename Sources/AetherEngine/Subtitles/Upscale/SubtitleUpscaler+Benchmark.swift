@@ -44,7 +44,8 @@ extension SubtitleUpscaler {
     ///    Neural Engine models cold (compiled models deleted, as after an install, an OS update or a purged cache)
     ///    and warm (compiled models on disk, nothing loaded, as on a later launch), each split into the package
     ///    compile, the function loads and the first predictions.
-    /// 2. The first picture on a new upscaler after the prewarm: its surfaces and buffers, made on first use.
+    /// 2. A new upscaler's ``prepare()`` (its surfaces and their first use), and the first picture on it, against
+    ///    the first picture on an upscaler that was not prepared.
     /// 3. Steady state: `iterations` pictures on that upscaler, as percentiles, in all and per stage (GPU gather,
     ///    predictions, GPU composite).
     ///
@@ -71,13 +72,18 @@ extension SubtitleUpscaler {
 
             // 2 and 3. Per picture, after the prewarm.
             _ = try SubtitleUpscaleKernels.get()
-            lines.append("2. first picture on a new upscaler | 3. steady state over \(iterations) pictures")
+            lines.append("2. prepare, first picture (unprepared upscaler's first) | 3. steady state over \(iterations) pictures")
             let configurations: [(String, Configuration)] = [("C4F16", .c4f16), ("C4F32", .c4f32), ("balanced", .balanced)]
             for c in benchmarkCases() {
                 for (name, configuration) in configurations {
+                    let cold = try SubtitleUpscaler(configuration: configuration).measureRun(c.picture, iterations: 0)
                     let upscaler = try SubtitleUpscaler(configuration: configuration)
+                    t0 = DispatchTime.now().uptimeNanoseconds
+                    try upscaler.prepare()
+                    let prepare = ms(t0)
                     let run = try upscaler.measureRun(c.picture, iterations: iterations)
-                    lines.append(String(format: "  %@ %-8@ first %6.2f | %@", c.name as NSString, name as NSString, run.first, run.wall.text))
+                    lines.append(String(format: "  %@ %-8@ prepare %6.1f, first %6.2f (%6.2f) | %@", c.name as NSString, name as NSString,
+                                        prepare, run.first, cold.first, run.wall.text))
                     lines.append("      gather    \(run.gather.text)")
                     lines.append("      predict   \(run.predict.text)   (\(run.windows) windows, 2 planes)")
                     lines.append("      composite \(run.composite.text)")
