@@ -35,7 +35,8 @@ enum DiscReader {
     /// FFmpeg open that reports a bare INVALIDDATA). Non-disc sources stay silent.
     /// `udfAnchorChecked`: the caller has already found the UDF anchor, so it is not read again.
     static func wrapBluRay(_ reader: IOReader, selectTitleID: Int? = nil, cacheKey: String? = nil,
-                           udfAnchorChecked: Bool = false) throws -> DiscInfo? {
+                           udfAnchorChecked: Bool = false,
+                           scope: DiscRecognitionScope = DiscRecognitionScope()) throws -> DiscInfo? {
         guard udfAnchorChecked || looksLikeUDF(reader) else { return nil }
         EngineLog.emit("[disc] UDF anchor present; attempting Blu-ray BDMV", category: .demux)
         let udf: UDFReader
@@ -51,8 +52,7 @@ enum DiscReader {
             return nil
         }
         let playlistDir = (try? udf.list(path: ["BDMV", "PLAYLIST"])) ?? []
-        let parsed = scanPlaylists(playlistDir,
-                                   extents: { (try? udf.extents(of: $0)) ?? [] },
+        let parsed = scanPlaylists(playlistDir, extents: { udf.extents(of: $0) }, scope: scope,
                                    read: { readAll(reader, $0) })
         let titles = BDTitleSelector.enumerateTitles(parsed)
         guard !titles.isEmpty else {
@@ -63,11 +63,15 @@ enum DiscReader {
         let selected = titles[selectedIndex]
         let streamDir = (try? udf.list(path: ["BDMV", "STREAM"])) ?? []
         let streamIndex = Dictionary(streamDir.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+        // Every clip's file entry first, in the order they sit on the image (`UDFReader.extents(of:)`).
+        let streamEntries = Array(Set(selected.bdClipIDs ?? []).compactMap { streamIndex["\($0).m2ts"] })
+        let streamExtents = Dictionary(zip(streamEntries.map(\.name), udf.extents(of: streamEntries)),
+                                       uniquingKeysWith: { first, _ in first })
         let assembled = assembleBluRayTitle(
             clipIDs: selected.bdClipIDs ?? [],
             subtractTicks: selected.bdClipSubtractTicks ?? [],
             cumulativeBeforeTicks: selected.bdClipCumulativeBeforeTicks ?? [],
-            extentsOfClip: { clip in streamIndex["\(clip).m2ts"].flatMap { try? udf.extents(of: $0) } })
+            extentsOfClip: { clip in streamExtents["\(clip).m2ts"] ?? nil })
         let allExtents = assembled.extents
         var clipTimeline = assembled.clipTimeline
         guard !allExtents.isEmpty else {
@@ -83,11 +87,19 @@ enum DiscReader {
         let totalBytes = allExtents.reduce(Int64(0)) { $0 + max(0, $1.length) }
         EngineLog.emit("[disc] Blu-ray recognized: \(titles.count) title(s), selected \(selectedIndex) clips=\(selected.bdClipIDs ?? []) m2ts-extents=\(allExtents.count) bytes=\(totalBytes) clipSpans=\(clipTimeline.count) stnLanguages=\(selected.streamLanguages.count)", category: .demux)
         let clipInfoDir = (try? udf.list(path: ["BDMV", "CLIPINF"])) ?? []
-        let seekTable = buildSeekTable(title: selected, resolved: assembled.resolved) { clip in
-            guard let entry = clipInfoDir.first(where: { $0.name.caseInsensitiveCompare("\(clip).clpi") == .orderedSame }),
-                  let extents = try? udf.extents(of: entry), !extents.isEmpty else { return nil }
-            return readAll(reader, extents)
+        let clipInfoIndex = Dictionary(clipInfoDir.map { ($0.name.uppercased(), $0) }, uniquingKeysWith: { first, _ in first })
+        let seekTable = buildSeekTable(title: selected, resolved: assembled.resolved) { clips in
+            let entries = clips.compactMap { clipInfoIndex["\($0).clpi".uppercased()] }
+            guard entries.count == clips.count else { return Array(repeating: [], count: clips.count) }
+            let extents = udf.extents(of: entries).map { $0 ?? [] }
+            let declared = extents.map { $0.reduce(Int64(0)) { $0 + max(0, $1.length) } }
+            guard clipInfoFitsBudget(declared) else { return nil }
+            return readImageFiles(declared: declared, offsets: extents.map { $0.first?.offset ?? .max },
+                                  scope: scope, read: { readAll(reader, extents[$0]) })
         }
+        // A stopped scope left playlists or clip information unread: that title list and table must not
+        // reach the cache, where the next load of this disc would take them.
+        guard !scope.isStopped else { throw DiscError.recognitionStopped }
         storeRecognition(cacheKey: cacheKey, selectTitleID: selectTitleID,
                          formatHint: "mpegts", titles: titles, selectedIndex: selectedIndex,
                          extents: allExtents, clipTimeline: clipTimeline, seekTable: seekTable)
@@ -109,41 +121,43 @@ enum DiscReader {
     /// repeats a short clip a few hundred times.
     static let maxTitleExtents = 65_536
     /// A run of this many unreadable playlists means the source is gone (cancelled or closed reader).
-    private static let maxConsecutiveShortReads = 16
+    static let maxConsecutiveShortReads = 16
     /// `readAll`'s ceiling.
     static let maxSmallFileBytes: Int64 = 8 * 1024 * 1024
 
     /// Reads and parses the `.mpls` entries of a PLAYLIST directory under the bounds above. Stops at the
-    /// first bound that trips and keeps what was parsed before it.
+    /// first bound that trips and keeps what was parsed before it. Each entry's file entry and bytes are
+    /// read in the order they sit on the image (`UDFReader.extents(of:)`, `readImageFiles`).
     static func scanPlaylists(
         _ entries: [UDFEntry],
-        extents: (UDFEntry) -> [(offset: Int64, length: Int64)],
-        read: ([(offset: Int64, length: Int64)]) -> [UInt8]
+        extents: ([UDFEntry]) -> [[(offset: Int64, length: Int64)]?],
+        scope: DiscRecognitionScope = DiscRecognitionScope(),
+        read: @escaping @Sendable ([(offset: Int64, length: Int64)]) -> [UInt8]
     ) -> [MPLSPlaylist] {
-        scanPlaylists(entries, name: \.name, extents: extents, read: { _, exts in read(exts) })
+        scanPlaylists(entries, name: \.name, extents: extents, readsInPlace: true, scope: scope,
+                      read: { _, exts in read(exts) })
     }
 
     /// The same scan over any directory listing: a UDF directory, or the files of a disc folder
-    /// (`DiscDirectoryReader`), where each playlist is one whole file rather than a set of extents.
-    static func scanPlaylists<Entry>(
+    /// (`DiscDirectoryReader`), where each playlist is one whole file rather than a set of extents and
+    /// is read through its own reader (`readsInPlace` false: `readFolderFiles`).
+    static func scanPlaylists<Entry: Sendable>(
         _ entries: [Entry],
         name: (Entry) -> String,
-        extents: (Entry) -> [(offset: Int64, length: Int64)],
-        read: (Entry, [(offset: Int64, length: Int64)]) -> [UInt8]
+        extents: ([Entry]) -> [[(offset: Int64, length: Int64)]?],
+        readsInPlace: Bool,
+        scope: DiscRecognitionScope,
+        read: @escaping @Sendable (Entry, [(offset: Int64, length: Int64)]) -> [UInt8]
     ) -> [MPLSPlaylist] {
-        var parsed: [MPLSPlaylist] = []
-        var examined = 0
+        var candidates = entries.filter { name($0).hasSuffix(".mpls") }
+        if candidates.count > maxPlaylistFiles {
+            EngineLog.emit("[disc] PLAYLIST scan stopped at \(maxPlaylistFiles) .mpls entries", category: .demux)
+            candidates = Array(candidates.prefix(maxPlaylistFiles))
+        }
+        var chosen: [(entry: Entry, extents: [(offset: Int64, length: Int64)], declared: Int64)] = []
         var bytesRead: Int64 = 0
-        var items = 0
-        var shortReads = 0
-        for e in entries where name(e).hasSuffix(".mpls") {
-            examined += 1
-            guard examined <= maxPlaylistFiles else {
-                EngineLog.emit("[disc] PLAYLIST scan stopped at \(maxPlaylistFiles) .mpls entries", category: .demux)
-                break
-            }
-            let exts = extents(e)
-            guard !exts.isEmpty else { continue }
+        for (entry, exts) in zip(candidates, extents(candidates)) {
+            guard let exts, !exts.isEmpty else { continue }
             let declared = exts.reduce(Int64(0)) { $0 + max(0, $1.length) }
             guard declared > 0, declared <= maxSmallFileBytes else { continue }
             bytesRead += declared
@@ -151,16 +165,16 @@ enum DiscReader {
                 EngineLog.emit("[disc] PLAYLIST scan stopped after \(maxPlaylistBytes) bytes of playlists", category: .demux)
                 break
             }
-            let bytes = read(e, exts)
-            if Int64(bytes.count) < declared {
-                shortReads += 1
-                if shortReads >= maxConsecutiveShortReads {
-                    EngineLog.emit("[disc] PLAYLIST scan stopped, \(shortReads) unreadable playlists in a row", category: .demux)
-                    break
-                }
-            } else {
-                shortReads = 0
-            }
+            chosen.append((entry, exts, declared))
+        }
+        let files = chosen
+        let contents = readsInPlace
+            ? readImageFiles(declared: files.map(\.declared), offsets: files.map { $0.extents[0].offset },
+                             scope: scope, read: { read(files[$0].entry, files[$0].extents) })
+            : readFolderFiles(count: files.count, scope: scope) { read(files[$0].entry, files[$0].extents) }
+        var parsed: [MPLSPlaylist] = []
+        var items = 0
+        for bytes in contents {
             guard let pl = MPLSParser.parse(bytes) else { continue }
             items += pl.clipIDs.count
             guard items <= maxPlaylistItems else {
@@ -248,6 +262,75 @@ enum DiscReader {
         }
     }
 
+    /// Files of a disc folder read at once, each through its own reader: as many lanes as the indexed
+    /// subtitle pull reads with (`SubtitleSource.readLanes`), for the same latency-bound requests.
+    static let smallFileLanes = 12
+
+    /// Reads an image's small files (`.mpls`, `.clpi`) through its one reader, in the order their bytes
+    /// sit on it (`offsets`, one per file) rather than the order asked, so the reader's read-ahead serves
+    /// neighbours from one fetch: over HTTP a few hundred files cost a few range requests rather than one
+    /// or two each. `read(i)` gives file i's bytes. The results come back in the order asked, empty for a
+    /// file left unread: a stopped `scope` ends the reading, and so does a run of `maxConsecutiveShortReads`
+    /// files shorter than `declared` (the source is gone).
+    static func readImageFiles(declared: [Int64], offsets: [Int64], scope: DiscRecognitionScope,
+                               read: (Int) -> [UInt8]) -> [[UInt8]] {
+        precondition(offsets.count == declared.count)
+        var out = Array(repeating: [UInt8](), count: declared.count)
+        var shortRun = 0
+        for i in declared.indices.sorted(by: { offsets[$0] < offsets[$1] }) {
+            guard !scope.isStopped else { break }
+            out[i] = read(i)
+            if Int64(out[i].count) < declared[i] {
+                shortRun += 1
+                if shortRun >= maxConsecutiveShortReads {
+                    EngineLog.emit("[disc] small file reads stopped, \(shortRun) unreadable in a row", category: .demux)
+                    break
+                }
+            } else {
+                shortRun = 0
+            }
+        }
+        return out
+    }
+
+    /// Reads a disc folder's small files, each through its own reader (`DiscDirectoryReader.openDiscFile`),
+    /// `smallFileLanes` at once, each lane a thread of its own: the reads wait on the network, not the
+    /// CPU, and `DispatchQueue.concurrentPerform`, which sizes its width to the CPUs it finds idle, ran
+    /// them one at a time on a loaded machine. The lanes run at user-initiated priority, as the first
+    /// frame waits on them. `read(i)` gives file i's bytes and is called from those threads, several at
+    /// once; it opens the file through `scope` (`DiscRecognitionScope.withFile`), so a stop cancels the
+    /// files being read and the lanes take no more. The results come back in the order asked, empty for a
+    /// file left unread, once every lane has finished.
+    static func readFolderFiles(count: Int, scope: DiscRecognitionScope,
+                                read: @escaping @Sendable (Int) -> [UInt8]) -> [[UInt8]] {
+        guard count > 0 else { return [] }
+        final class Results: @unchecked Sendable {
+            private let lock = NSLock()
+            private var files: [[UInt8]]
+            init(_ count: Int) { files = Array(repeating: [], count: count) }
+            func set(_ i: Int, _ bytes: [UInt8]) { lock.lock(); files[i] = bytes; lock.unlock() }
+            var all: [[UInt8]] { lock.lock(); defer { lock.unlock() }; return files }
+        }
+        let results = Results(count)
+        let lanes = min(smallFileLanes, count)
+        let done = DispatchGroup()
+        for lane in 0..<lanes {
+            done.enter()
+            let thread = Thread {
+                defer { done.leave() }
+                for i in stride(from: lane, to: count, by: lanes) {
+                    guard !scope.isStopped else { break }
+                    results.set(i, read(i))
+                }
+            }
+            thread.name = "disc.smallfiles.\(lane)"
+            thread.qualityOfService = .userInitiated
+            thread.start()
+        }
+        done.wait()
+        return results.all
+    }
+
     /// Read all bytes of an extent list into memory (small files only: mpls).
     static func readAll(_ base: IOReader, _ exts: [(offset: Int64, length: Int64)]) -> [UInt8] {
         // Extent lengths are untrusted on-disc bytes (up to ~1 GB each). Cap the total before
@@ -272,15 +355,28 @@ enum DiscReader {
     /// Returns a `DiscInfo` (selected-title reader + format hint + the full title list) for a DVD or
     /// Blu-ray ISO, else nil. `selectTitleID` chooses the title (default = main). DVD titles are the
     /// per-VTS VOB groups, filtered by the VMGI TT_SRPT title list (whole-VTS; per-cell splitting deferred).
-    static func wrap(_ reader: IOReader, selectTitleID: Int? = nil, cacheKey: String? = nil) throws -> DiscInfo? {
+    /// `scope` is the recognition's own reading, which its caller can stop (`DiscRecognitionScope`). What a
+    /// stopped scope read is partial, so it throws `DiscError.recognitionStopped` rather than answer, a
+    /// title list or "not a disc" alike.
+    static func wrap(_ reader: IOReader, selectTitleID: Int? = nil, cacheKey: String? = nil,
+                     scope: DiscRecognitionScope = DiscRecognitionScope()) throws -> DiscInfo? {
+        let info = try recognize(reader, selectTitleID: selectTitleID, cacheKey: cacheKey, scope: scope)
+        guard !scope.isStopped else { throw DiscError.recognitionStopped }
+        return info
+    }
+
+    private static func recognize(_ reader: IOReader, selectTitleID: Int?, cacheKey: String?,
+                                  scope: DiscRecognitionScope) throws -> DiscInfo? {
         // A disc folder is a set of files, not one byte range, so it is recognized before the cache,
         // which rebuilds a reader from extents of a single image.
         if let folder = reader as? DiscDirectoryReader {
             // Blu-ray first and DVD-Video as the fallback, as on an image, so a hybrid listing with both
             // trees plays its Blu-ray title.
             func has(_ root: String) -> Bool { folder.discFiles.contains { $0.path.uppercased().hasPrefix(root) } }
-            guard has("VIDEO_TS/") else { return wrapBluRayFolder(folder, selectTitleID: selectTitleID) }
-            if has("BDMV/"), let bluRay = wrapBluRayFolder(folder, selectTitleID: selectTitleID) { return bluRay }
+            guard has("VIDEO_TS/") else { return wrapBluRayFolder(folder, selectTitleID: selectTitleID, scope: scope) }
+            if has("BDMV/"), let bluRay = wrapBluRayFolder(folder, selectTitleID: selectTitleID, scope: scope) {
+                return bluRay
+            }
             return wrapDVDFolder(folder, selectTitleID: selectTitleID)
         }
         if let cacheKey, let cached = DiscRecognitionCache.lookup(key: cacheKey, selectTitleID: selectTitleID) {
@@ -294,7 +390,7 @@ enum DiscReader {
             // The anchor is read once: a probe's input budget counts every read recognition makes.
             guard looksLikeUDF(reader) else { return nil }
             if let bluRay = try wrapBluRay(reader, selectTitleID: selectTitleID, cacheKey: cacheKey,
-                                           udfAnchorChecked: true) {
+                                           udfAnchorChecked: true, scope: scope) {
                 return bluRay
             }
             return wrapUDFDVD(reader, selectTitleID: selectTitleID, cacheKey: cacheKey)
@@ -303,19 +399,19 @@ enum DiscReader {
         do {
             iso = try ISO9660Reader(reader: reader)
         } catch DiscError.notISO9660 {
-            return try wrapBluRay(reader, selectTitleID: selectTitleID, cacheKey: cacheKey)
+            return try wrapBluRay(reader, selectTitleID: selectTitleID, cacheKey: cacheKey, scope: scope)
         }
         let files: [DiscFile]
         do {
             files = try iso.list(directory: "VIDEO_TS")
         } catch DiscError.directoryNotFound {
-            return try wrapBluRay(reader, selectTitleID: selectTitleID, cacheKey: cacheKey)  // ISO9660 but not a DVD-Video disc (Blu-ray / data disc)
+            return try wrapBluRay(reader, selectTitleID: selectTitleID, cacheKey: cacheKey, scope: scope)  // ISO9660 but not a DVD-Video disc (Blu-ray / data disc)
         }
         if let dvd = wrapDVD(reader, files: files, sectorSize: iso.sectorSize, selectTitleID: selectTitleID,
                              cacheKey: cacheKey) {
             return dvd
         }
-        return try wrapBluRay(reader, selectTitleID: selectTitleID, cacheKey: cacheKey)
+        return try wrapBluRay(reader, selectTitleID: selectTitleID, cacheKey: cacheKey, scope: scope)
     }
 
     /// A DVD-Video image with no ISO9660 bridge volume: sector 16 starts UDF's BEA01 directly, so the image

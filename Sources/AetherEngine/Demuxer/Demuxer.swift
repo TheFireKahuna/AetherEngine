@@ -308,6 +308,23 @@ public final class Demuxer: @unchecked Sendable {
     private let closeRequestLock = NSLock()
     private var closeRequested = false
     private var isCloseRequested: Bool { closeRequestLock.withLock { closeRequested } }
+    /// The disc recognition an open is running (`DiscReader.wrap`), which `markClosed()` stops: before a
+    /// provider exists nothing else reaches the files a disc folder's recognition reads. Guarded by
+    /// `closeRequestLock`.
+    private var discRecognition: DiscRecognitionScope?
+
+    /// The scope for the disc recognition an open is about to run: stopped by `markClosed()`, already
+    /// stopped when a close came first, and stopped too when this open's probe is.
+    private func beginDiscRecognition() -> DiscRecognitionScope {
+        let control = probeControl
+        let scope = DiscRecognitionScope(stoppedOutside: { control?.isStopped == true })
+        let closing = closeRequestLock.withLock { () -> Bool in
+            discRecognition = scope
+            return closeRequested
+        }
+        if closing { scope.stop() }
+        return scope
+    }
     private var openProfile: DemuxerOpenProfile = .playback
 
     /// Audit NAT-7: the stream pointers `stream(at:)` hands out, copied out of `formatContext`
@@ -725,7 +742,8 @@ public final class Demuxer: @unchecked Sendable {
             // Route a local DVD ISO through the disc adapter (FileIOReader keeps it
             // out of RAM). Falls back to the normal local open when not a disc.
             if url.isFileURL, let fileReader = FileIOReader(url: url),
-               let discInfo = try DiscReader.wrap(fileReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString) {
+               let discInfo = try DiscReader.wrap(fileReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString,
+                                                  scope: beginDiscRecognition()) {
                 adoptDiscInfo(discInfo)
                 auditSource = nil
                 let bridge = CustomIOReaderBridge(reader: discInfo.reader)
@@ -778,7 +796,8 @@ public final class Demuxer: @unchecked Sendable {
         beginOpenTiming()
         self.auditSource = nil
         if reader.discImageProbeEnabled,
-           let discInfo = try DiscReader.wrap(reader, selectTitleID: selectTitleID, cacheKey: discCacheKey) {
+           let discInfo = try DiscReader.wrap(reader, selectTitleID: selectTitleID, cacheKey: discCacheKey,
+                                              scope: beginDiscRecognition()) {
             adoptDiscInfo(discInfo)
             let bridge = CustomIOReaderBridge(reader: discInfo.reader, preservesSourcePosition: isLive)
             let inputFormat = av_find_input_format(discInfo.formatHint)
@@ -812,7 +831,8 @@ public final class Demuxer: @unchecked Sendable {
                 }
                 let discInfo: DiscInfo?
                 do {
-                    discInfo = try DiscReader.wrap(discReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString)
+                    discInfo = try DiscReader.wrap(discReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString,
+                                                   scope: beginDiscRecognition())
                 } catch {
                     releaseOwnedSourceReader()
                     throw error
@@ -3227,8 +3247,10 @@ public final class Demuxer: @unchecked Sendable {
         closeRequestLock.lock()
         closeRequested = true
         let provider = avioProvider
+        let recognition = discRecognition
         closeRequestLock.unlock()
         provider?.markClosed()
+        recognition?.stop()
         cancelOwnedSourceReader()
     }
 
