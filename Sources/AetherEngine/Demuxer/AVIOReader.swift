@@ -1260,14 +1260,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.detourFetchBudget = detourFetchBudget ?? Self.detourFetchBudgetSeconds
         self.heldConnectionEnabled = heldConnection
         SourceByteLedger.shared.readerOpened(ledgerSource)
-        self.sourceCache.readerOpened(cacheKey)
+        self.sourceCache.readerOpened(cacheKey, streams: true)
     }
 
     /// A reader released without `close()` still closes its ledger books and its cache hold.
     deinit {
         if !isFullyClosed {
             SourceByteLedger.shared.readerClosed(ledgerSource, reader: label)
-            sourceCache.readerClosed(cacheKey)
+            sourceCache.readerClosed(cacheKey, streams: true)
         }
     }
 
@@ -1953,7 +1953,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         isFullyClosed = true
         defer {
             SourceByteLedger.shared.readerClosed(ledgerSource, reader: label)
-            sourceCache.readerClosed(cacheKey)
+            sourceCache.readerClosed(cacheKey, streams: true)
         }
         isClosed = true
         if let ctx = context {

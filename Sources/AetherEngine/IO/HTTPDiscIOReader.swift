@@ -153,7 +153,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         self.ownsSession = session !== EngineHTTP.session
         self.totalSize = totalSize
         SourceByteLedger.shared.readerOpened(ledgerSource)
-        sourceCache?.readerOpened(cacheKey)
+        sourceCache?.readerOpened(cacheKey, streams: false)
         sourceCache?.noteVersion(version, for: cacheKey)
     }
 
@@ -322,7 +322,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         cancelLock.unlock()
         if first {
             SourceByteLedger.shared.readerClosed(ledgerSource, reader: label)
-            sourceCache?.readerClosed(cacheKey)
+            sourceCache?.readerClosed(cacheKey, streams: false)
         }
     }
 
