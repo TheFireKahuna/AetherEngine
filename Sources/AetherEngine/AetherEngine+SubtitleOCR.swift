@@ -3,7 +3,7 @@ import Foundation
 // Phase D: selection-armed worker feeding a bitmap track's native WebVTT rendition with
 // OCR-recognized text cues, so PGS/DVB/DVD subtitles survive PiP / AirPlay / external display
 // on the native path. Packet source is the session SubtitlePacketStore: an indexed stream's window is
-// pulled by the tick itself, a walked one's kept ahead by the worker's demand on the walk; the tick
+// pulled by the tick itself, a pumped one's kept ahead by the worker's demand on the pump; the tick
 // plans and resolves on the MainActor, decodes off it (AE#628), and Vision runs on a dedicated thread.
 extension AetherEngine {
 
@@ -12,11 +12,11 @@ extension AetherEngine {
         cancelSubtitleOCRWorker()
         guard let store = nativeStore(atOrdinal: ordinal) else { return }
         subtitleOCRArmedOrdinal = ordinal
-        // A walked stream has to be in the packet store before the worker gets there: the walk reads a
+        // A pumped stream has to be in the packet store before the worker gets there: the pump reads a
         // margin past the window, as far as the player asks the rendition. An indexed one is pulled by each
         // tick.
         subtitleSource?.demand(.ocr, streams: [streamIndex], lead: { playhead in
-            Self.subtitleReadAhead(base: Self.subtitleOCRPrefetchLeadSeconds, playhead: playhead,
+            Self.subtitleReadAhead(base: Self.subtitleOCRReadAheadSeconds, playhead: playhead,
                                    requested: store.furthestRequestedSourceSeconds())
         })
         let language = ordinal < nativeSubtitleTrackTable.count
@@ -164,7 +164,7 @@ extension AetherEngine {
         case .resetAndDecode: isReset = true
         }
         if isReset || subtitleOCRReadStarts[ordinal] == nil { subtitleOCRReadStarts[ordinal] = tick.window.from }
-        // What was read: for a pulled stream the pulls themselves, for a walked one the harvest's reading.
+        // What was read: for a pulled stream the pulls themselves, for a pumped one the harvest's reading.
         let reach = tick.pulled
             ? packetStore.pulledReach(streamIndex: tick.streamIndex, from: tick.window.from)
             : packetStore.harvestReach(from: tick.window.from)

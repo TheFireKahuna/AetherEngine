@@ -167,7 +167,7 @@ struct DemuxedTimestampBoundsTests {
         while let packet = try demuxer.readPacket() {
             var owned: UnsafeMutablePointer<AVPacket>? = packet
             defer { trackedPacketFree(&owned) }
-            store.harvest(streamIndex: 0, packet: packet, timeBase: stream.pointee.time_base, writer: .pump)
+            store.harvest(streamIndex: 0, packet: packet, timeBase: stream.pointee.time_base)
         }
         let entries = store.entries(streamIndex: 0, from: 0, through: 10)
         try #require(entries.count == 1)

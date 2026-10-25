@@ -165,13 +165,13 @@ struct ForcedSubtitleRenditionTests {
     func harvestReach() {
         var coverage = SubtitleHarvestCoverage()
         #expect(coverage.reach(from: 10) == nil)
-        coverage.noteAnchor(.pump, at: 0)
-        coverage.noteProgress(.pump, through: 20)
-        coverage.noteAnchor(.prefetch, at: 20.1)
-        for t in stride(from: 20.5, through: 40, by: 0.5) { coverage.noteProgress(.prefetch, through: t) }
+        coverage.noteAnchor(at: 0)
+        coverage.noteProgress(through: 20)
+        coverage.noteAnchor(at: 20.1)
+        for t in stride(from: 20.5, through: 40, by: 0.5) { coverage.noteProgress(through: t) }
         #expect(coverage.reach(from: 10) == 40)
-        coverage.noteAnchor(.pump, at: 60)
-        coverage.noteProgress(.pump, through: 70)
+        coverage.noteAnchor(at: 60)
+        coverage.noteProgress(through: 70)
         #expect(coverage.reach(from: 10) == 40)
         #expect(coverage.reach(from: 65) == 70)
         #expect(coverage.reach(from: 50) == nil)

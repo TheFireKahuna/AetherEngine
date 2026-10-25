@@ -1575,20 +1575,44 @@ final class SoftwarePlaybackHost {
             let initialSourceClock = initialClockTime.seconds
             let videoReorderDepth = Self.presentationReorderDepth(
                 codecID: decodeStream.pointee.codecpar?.pointee.codec_id.rawValue ?? vCodecID)
+            let subIndices = subtitleStreamIndices
+            let subTimeBases = subtitleStreamTimeBases
+            let subSplitSetIndices = splitDisplaySetSubtitleStreamIndices
             let cacheResult = await BlockingWork.detached(priority: .utility) { () throws -> (SoftwarePacketReadAhead, RetentionClaims.Claim?)? in
                 let segments = HLSVideoEngine.clampedForwardWindow(forwardBufferSegments)
                 guard let (fifo, bytes, claim) = try Self.makePacketStore(
                     storage: packetCacheStorage, forwardSegments: segments,
                     requestedBytes: sessionCacheByteBudget) else { return nil }
+                // Layer 3 step 5: this read-ahead is the session's one reader of the source, so the subtitle
+                // streams are harvested where it reads, as far ahead as their consumers ask, and the
+                // packets it stores are the ones playback decodes.
+                let videoIndex = video.index
+                let videoTbSeconds = Double(video.numerator) / Double(max(1, video.denominator))
                 let readAhead = SoftwarePacketReadAhead(
                     video: video, audio: audio, byteBudget: bytes,
                     forwardSeconds: Double(segments) * 4,
                     initialSourceClock: initialSourceClock, fifo: fifo,
-                    videoReorderDepth: videoReorderDepth
-                ) { isCurrent in
-                    guard let packet = try dem.readPacket(isCurrent: isCurrent) else { return nil }
-                    defer { av_packet_unref(packet); av_packet_free_safe(packet) }
-                    return try SoftwareStoredPacket(copying: packet)
+                    videoReorderDepth: videoReorderDepth,
+                    readAheadSeconds: { [weak self] in self?.subtitleReadAhead?() }
+                ) { [weak self] isCurrent in
+                    while true {
+                        guard let packet = try dem.readPacket(isCurrent: isCurrent) else {
+                            self?.subtitleReadThroughSink?(.infinity)
+                            return nil
+                        }
+                        defer { av_packet_unref(packet); av_packet_free_safe(packet) }
+                        let streamIdx = packet.pointee.stream_index
+                        if subIndices.contains(streamIdx) {
+                            self?.subtitleTapSink?(streamIdx, packet,
+                                                   subTimeBases[streamIdx] ?? AVRational(num: 1, den: 1000),
+                                                   subSplitSetIndices.contains(streamIdx))
+                            continue
+                        }
+                        if streamIdx == videoIndex, packet.pointee.dts != Int64.min {
+                            self?.subtitleReadThroughSink?(Double(packet.pointee.dts) * videoTbSeconds)
+                        }
+                        return try SoftwareStoredPacket(copying: packet)
+                    }
                 }
                 claim?.track { [weak readAhead] in readAhead?.snapshot.residentBytes ?? 0 }
                 return (readAhead, claim)
@@ -1673,6 +1697,14 @@ final class SoftwarePlaybackHost {
     /// the packet pointer never escapes the demux thread. The trailing Bool marks packets of
     /// split-PES PGS streams (MPEG-TS) that need display-set reassembly in the store.
     nonisolated(unsafe) var subtitleTapSink: (@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?
+
+    /// Layer 3 step 5: how far past the playhead the subtitle consumers ask a stream only this host's
+    /// reader reaches to have been read (nil: nobody asks). The VOD read-ahead reads on that far past its
+    /// own forward window, harvesting as it goes. Same unsynchronized pattern as the taps.
+    nonisolated(unsafe) var subtitleReadAhead: (@Sendable () -> Double?)?
+    /// Where the VOD read-ahead has read the source to (the video's decode time on the source axis), and
+    /// `.infinity` at its end: every subtitle packet below it is in the store.
+    nonisolated(unsafe) var subtitleReadThroughSink: (@Sendable (Double) -> Void)?
 
     /// #112 rework: embedded subtitle stream indices + time bases, captured at load before the
     /// demux loop starts (the SW host applies no stream discard, so these packets already flow).

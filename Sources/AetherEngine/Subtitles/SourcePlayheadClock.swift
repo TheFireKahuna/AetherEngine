@@ -2,8 +2,8 @@ import AVFoundation
 import CoreMedia
 import Foundation
 
-/// The playhead on the source axis, readable on any thread: what the subtitle walk paces its read-ahead
-/// against (layer 3 step 3), read where it parks rather than by a hop to the main actor for `sourceTime`.
+/// The playhead on the source axis, readable on any thread: what the pump measures its subtitle read-ahead
+/// from (layer 3 step 5), read where it parks rather than by a hop to the main actor for `sourceTime`.
 ///
 /// It reads the clock playback runs on, the way Apple's own pull output is meant to be paced ("monitor the
 /// item timebase, and pause pulling" once near-term playback is covered, `AVPlayerItemSampleBufferOutput.h`):
@@ -11,12 +11,12 @@ import Foundation
 /// - **The native route:** the item's timebase (`AVPlayerItem.timebase`, readable off the main actor), on
 ///   the item axis, folded onto the source axis by the seam shift at the playhead, which the engine states
 ///   as it changes (`noteShift`). The timebase jumps at a seek's landing, not when the picture gets there,
-///   so the walk reads ahead of where playback is going.
+///   so the pump reads ahead of where playback is going.
 /// - **The software route:** the render synchronizer's timebase, already on the source axis
 ///   (`SoftwarePlaybackHost.presentationTimebases`).
 ///
-/// Nil while no clock runs (a load before its item attaches): nothing plays, so there is nothing to pace
-/// against, and the walk waits.
+/// Nil while no clock runs (a load before its item attaches): nothing plays, so there is nothing to read
+/// ahead of, and the pump keeps to its own forward window.
 final class SourcePlayheadClock: @unchecked Sendable {
     private let lock = NSLock()
     private weak var item: AVPlayerItem?

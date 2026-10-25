@@ -3030,7 +3030,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     static let atmosChannelsAttribute = "16/JOC"
 
     /// A subtitle store's reading counts as advancing while it moved forward within this. Generous next to
-    /// every progressive feeder's cadence (a side reader reports per packet, the OCR worker per recognized
+    /// every progressive feeder's cadence (the pump reports every half second, the OCR worker per recognized
     /// batch), so a feeder that is reading never misses it.
     static let subtitleFeedAliveSeconds = 5.0
 

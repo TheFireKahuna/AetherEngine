@@ -282,7 +282,7 @@ extension AetherEngine {
 
     /// Every forced bitmap rendition whose stream the container's index reads is recognized whole at load,
     /// before tvOS reaches for it: only the display sets the index's composition headers mark forced are
-    /// decoded and recognized, and the rendition is then complete. A forced rendition of a walked stream is
+    /// decoded and recognized, and the rendition is then complete. A forced rendition of a pumped stream is
     /// recognized by the OCR worker once the player asks for it (`fillForcedRendition`).
     func fillIndexedForcedRenditions() {
         guard let source = subtitleSource else { return }

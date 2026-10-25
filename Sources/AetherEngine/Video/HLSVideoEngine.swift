@@ -529,6 +529,46 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
     }
 
+    /// Where the installed producer began reading and how far it has read, for the cue stores' reading spans
+    /// (`noteSourceRead`). Under `subtitleTapLock`.
+    private var sourceReadRun: (epoch: UInt64, from: Double)?
+
+    /// Pump thread: the installed producer has read the source through `seconds` (`.infinity`: to its end).
+    /// Its run of the harvest coverage (#416) begins at its first read and extends with every later one, so
+    /// the drain and the OCR worker can tell a stretch with no subtitle in it from one nobody read; each text
+    /// stream the tap decodes has every cue before it, so its rendition can answer a request there at once.
+    /// A cue store is told a margin short of the read: a muxer interleaves a subtitle block by its own time,
+    /// which can trail the video packet in hand.
+    private func noteSourceRead(through seconds: Double, producerEpoch: UInt64) {
+        subtitleTapLock.lock()
+        defer { subtitleTapLock.unlock() }
+        guard let run = sourceReadRun, run.epoch == producerEpoch else {
+            sourceReadRun = (producerEpoch, seconds)
+            subtitlePacketStore.noteHarvestAnchor(at: seconds)
+            return
+        }
+        guard seconds.isFinite else {
+            subtitlePacketStore.noteHarvestEnd()
+            for route in subtitleTapRoutes.values { route.store.noteRead(from: run.from, through: .infinity) }
+            onSourceReadToEnd?()
+            return
+        }
+        subtitlePacketStore.noteHarvestProgress(through: seconds)
+        let through = seconds - AetherEngine.nativeSubtitleReadMarginSeconds
+        guard through > run.from else { return }
+        for route in subtitleTapRoutes.values { route.store.noteRead(from: run.from, through: through) }
+    }
+
+    /// The installed producer read the source to its end: every subtitle packet is in the store.
+    var onSourceReadToEnd: (@Sendable () -> Void)?
+
+    /// The segment that holds `subtitleReadAheadThrough`, one past it so the read covers its end; nil while
+    /// nobody asks. On the playlist axis the plan is stamped on: source time less the seam shift.
+    private func subtitleReadAheadSegmentIndex() -> Int? {
+        guard let through = subtitleReadAheadThrough?(), through.isFinite else { return nil }
+        return segmentIndexForPlaylistTime(through - playlistShiftSeconds) + 1
+    }
+
     /// Pump-thread callback: decode the tapped packet into its ordinal's cue store. Text subtitle decode
     /// is a parse (microseconds), so it runs inline; the lock serializes an abandoned producer's tail
     /// against the replacement producer.
@@ -641,10 +681,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// and can still be in AVPlayer's buffer, so the host records a seam rather than replacing the scalar (#260).
     var onPlaylistShiftChanged: (@Sendable (Double, Double) -> Void)?
 
-    /// #240: link arbitration shared with the engine's subtitle side readers. Set by `AetherEngine`
-    /// before `start()`; nil when the session is driven without one (`aetherctl`, tests), which
-    /// leaves the readers ungated exactly as before.
-    var sideReaderLinkGate: SideReaderLinkGate?
+    /// #240: whether a seek is in flight, which a scrub thumbnail's read waits out. Set by `AetherEngine`
+    /// before `start()`; nil when the session is driven without one (`aetherctl`, tests).
+    var seekInFlight: SeekInFlightSignal?
+
+    /// Layer 3 step 5: how far on the source axis the subtitle consumers want a stream only the pump reads
+    /// to have been read; nil while nobody asks. Read by every producer where it parks, which then reads
+    /// on past its forward window to the segment that holds it. Set by `AetherEngine` before `start()`.
+    var subtitleReadAheadThrough: (@Sendable () -> Double?)?
 
     /// Fires when AVKit scrub drives a producer restart (AetherEngine#38). `(true, playlistTime)`
     /// at restart-run start; `(false, nil)` when settled. `playlistTime` folds with
@@ -2387,7 +2431,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             let openIndex = max(0, min(initialProducerBaseIndex, plan.count - 1))
             let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
             subtitlePacketStore.noteHarvestAnchor(
-                .pump, at: Double(plan[openIndex].startPts) * Double(tb.num) / Double(tb.den))
+                at: Double(plan[openIndex].startPts) * Double(tb.num) / Double(tb.den))
         }
         prod.start()
         preparedServe = PreparedServe(
@@ -3406,7 +3450,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 // out, but not ordinary fetching, or it would stall whenever the pump is busy.
                 let deadline = Date().addingTimeInterval(2)
                 while Date() < deadline, !shouldStop(), let self,
-                      self.restartInFlight || (self.sideReaderLinkGate?.state.seeking ?? false) {
+                      self.restartInFlight || (self.seekInFlight?.isSeeking ?? false) {
                     Thread.sleep(forTimeInterval: 0.05)
                 }
             },
@@ -3524,10 +3568,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
             servesSegmentsProgressively: servesSegmentsProgressively,
             epoch: producerEpoch
         )
-        // #240: threaded onto every producer (initial + restart), like the wedge-detector providers
-        // below. The side readers read one gate for the whole session, so a restart must not leave
-        // a gap where nobody claims the link.
-        prod.sideReaderLinkGate = sideReaderLinkGate
+        // Layer 3 step 5: every producer (initial + restart) reads on for the subtitle consumers, and
+        // states how far it has read.
+        prod.subtitleReadAheadReach = { [weak self] in self?.subtitleReadAheadSegmentIndex() }
+        prod.onSourceReadThrough = { [weak self] seconds in
+            guard let self, self.isInstalledProducer(producerEpoch) else { return }
+            self.noteSourceRead(through: seconds, producerEpoch: producerEpoch)
+        }
         #if DualLayerDolbyVision
         prod.felTap = felTap
         #endif
@@ -4273,7 +4320,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // #416: the outgoing pump's run ends where it got to and the new one begins here. Whatever
         // lies between the two was skipped, and a subtitle set stranded on the near side of that
         // gap can no longer be read as the line still on screen at the landing.
-        subtitlePacketStore.noteHarvestAnchor(.pump, at: absoluteTargetSeconds)
+        subtitlePacketStore.noteHarvestAnchor(at: absoluteTargetSeconds)
         // build = everything after the seek (re-validation, muxer/producer construction, start).
         let buildMs = max(0, elapsedMs - stopWaitMs - (reopenMs ?? 0) - seekMs)
         EngineLog.emit(

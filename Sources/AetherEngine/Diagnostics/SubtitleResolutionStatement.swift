@@ -17,25 +17,25 @@ import Foundation
 /// - The drain cursor (`lastDecodedPts`) is the last actual cue. On a sparse track it stands still
 ///   for minutes, so every dialogue pause would read as unresolved.
 ///
-/// So it is the decode window clamped to a harvest frontier, and the frontier's SOURCE travels with
-/// it. `via=prefetch` is exact: since #230 the #151 reader's banked position is the read position on
-/// the source axis (a cue PTS for a harvested packet, the monotone read DTS for a pacing one), so
-/// everything below it that is not in the store genuinely carries no subtitle packet. `via=eof` is
-/// the strongest state: the reader reached end of stream, so the whole window is determined.
-/// `via=pump` is the weak one and says so: the producer tap has no read-position surface at all,
+/// So it is the decode window clamped to a read frontier, and the frontier's SOURCE travels with
+/// it. `via=read` is exact: it is how far the store knows the stream was read on unbroken from the
+/// playhead (the pump's harvest coverage, #416, or a pulled stream's pulled spans), so everything
+/// below it that is not in the store genuinely carries no subtitle packet. `via=eof` is the
+/// strongest state: the reading reached the end of the source, so the whole window is determined.
+/// `via=cursor` is the weak one and says so: nothing is known to have been read at the playhead,
 /// so the claim collapses to the drain cursor, a lower bound rather than a contiguity claim. A
-/// `via=pump` line is itself the answer "not determined beyond what is already on screen".
+/// `via=cursor` line is itself the answer "not determined beyond what is already on screen".
 enum SubtitleResolutionStatement {
 
     /// What bounds `resolvedThrough`, and therefore how much the number is worth.
     enum Frontier: String, Sendable {
-        /// The #151 side reader's banked read position. Exact.
-        case prefetch
-        /// The side reader reached end of stream; the window is determined in full.
+        /// How far the stream is known to have been read on from the playhead. Exact.
+        case read
+        /// The reading reached the end of the source; the window is determined in full.
         case eof
-        /// No usable side-reader frontier (never started, exited, or fenced to a superseded
-        /// generation). Falls back to the drain cursor: a lower bound, not a contiguity claim.
-        case pump
+        /// Nothing is known to have been read at the playhead (the pump has not got there, or a
+        /// pull has not landed). Falls back to the drain cursor: a lower bound, not a contiguity claim.
+        case cursor
     }
 
     /// Why the line was emitted. Deliberately not every drain tick: the drainer runs at 2 Hz per
@@ -45,18 +45,17 @@ enum SubtitleResolutionStatement {
         case reconstruction
         /// Steady-state cadence, riding the 30 s memory probe.
         case tick
-        /// The forward prefetcher reached end of stream.
+        /// The pump read to the end of the source.
         case eof
-        /// The frontier's source changed, e.g. the prefetcher died and the pump is all that is left.
+        /// The frontier's source changed, e.g. the reading reached the playhead or fell behind it.
         case frontier
         /// #318: determination first reached the playhead under this fence.
         case coverage
     }
 
-    /// The engine's fence for a subtitle-resolution claim. A side-reader frontier is only usable
-    /// while both counters still match the engine's live ones: `loadGeneration` rules out a
-    /// different source entirely, `seekGeneration` rules out a position banked before the seek in
-    /// question. Counting log lines cannot do this, which is the whole reason the numbers are here.
+    /// The engine's generations a subtitle-resolution claim was made under: `loadGeneration` names
+    /// the source, `seekGeneration` the seek it follows. Counting log lines cannot tell two claims
+    /// apart across a seek, which is the whole reason the numbers are on the line.
     struct Fence: Equatable, Sendable {
         var loadGeneration: UInt64
         var seekGeneration: UInt64
@@ -142,29 +141,25 @@ enum SubtitleResolutionStatement {
         return next
     }
 
-    /// Which frontier bounds the claim. Split out because the drain tick needs it every tick to
-    /// notice a change of source, and that check must not cost a store scan: it depends only on
-    /// the side reader's fenced state.
-    static func via(prefetchFrontier: Double?, prefetchAtEndOfFile: Bool) -> Frontier {
-        if prefetchAtEndOfFile { return .eof }
-        if let prefetchFrontier, prefetchFrontier.isFinite { return .prefetch }
-        return .pump
+    /// Which frontier bounds the claim, from how far the stream is known to have been read.
+    static func via(readThrough: Double?) -> Frontier {
+        guard let readThrough, !readThrough.isNaN else { return .cursor }
+        return readThrough == .infinity ? .eof : .read
     }
 
-    /// Build the statement from what the drain tick and the prefetch telemetry each know.
+    /// Build the statement from what the drain tick and the packet store each know.
     ///
     /// - Parameters:
     ///   - windowThrough: the decode window's lead edge, `playhead + lead`.
     ///   - coveredFrom: the start of the contiguous decoded run, i.e. the window start of the last
     ///     reset. Not the current tick's window start: steady ticks decode forward from the cursor.
     ///   - decodedThrough: the drain cursor, the last packet handed to the overlay decoder. Also
-    ///     the pump case's whole answer: the drainer scans its window every tick, so the cursor is
+    ///     the cursor case's whole answer: the drainer scans its window every tick, so the cursor is
     ///     the last packet stored inside it. A session-wide store frontier could not stand in for
     ///     that, since after a backward seek it sits far ahead of the window and would claim
     ///     determination over a region the pump never revisited.
-    ///   - prefetchFrontier: the side reader's banked read position, or nil when it is unusable.
-    ///     The caller is responsible for the fence check; an unfenced position is worse than none.
-    ///   - prefetchAtEndOfFile: the fenced session ended at EOF.
+    ///   - readThrough: how far the stream is known to have been read on unbroken from the playhead,
+    ///     `.infinity` when to the end of the source, nil when the playhead itself was never read.
     ///   - retainedFrom: `Retention.from` for the channel, or nil when nothing is retained. The
     ///     only field on the line that deliberately outlives a seek generation, because it is the
     ///     engine's own reconciliation of runs it fenced itself. It dies with the drain cursor,
@@ -176,18 +171,16 @@ enum SubtitleResolutionStatement {
         coveredFrom: Double,
         windowThrough: Double,
         decodedThrough: Double,
-        prefetchFrontier: Double?,
-        prefetchAtEndOfFile: Bool,
+        readThrough: Double?,
         retainedFrom: Double?,
         reason: Reason
     ) -> Statement {
-        let via = self.via(prefetchFrontier: prefetchFrontier,
-                           prefetchAtEndOfFile: prefetchAtEndOfFile)
+        let via = self.via(readThrough: readThrough)
         let bound: Double?
         switch via {
         case .eof: bound = windowThrough
-        case .prefetch: bound = prefetchFrontier
-        case .pump: bound = decodedThrough
+        case .read: bound = readThrough
+        case .cursor: bound = decodedThrough
         }
         var resolved: Double? = nil
         if let bound, bound.isFinite, bound >= coveredFrom {
@@ -200,13 +193,13 @@ enum SubtitleResolutionStatement {
 
     /// #318: does this statement claim determination at the playhead itself?
     ///
-    /// Three conditions, and each one is a way the claim could be hollow. `via=pump` is excluded
-    /// outright: the pump case's bound is the drain cursor, a lower bound on what was decoded and
+    /// Three conditions, and each one is a way the claim could be hollow. `via=cursor` is excluded
+    /// outright: the cursor case's bound is the drain cursor, a lower bound on what was decoded and
     /// not a contiguity claim, so it can never answer "determined here". `resolvedThrough` has to
     /// reach the playhead, and `coveredFrom` has to lie at or below it, because the statement claims
     /// a SPAN and a span that ends above the playhead but starts above it too does not contain it.
     static func statesCoverage(_ s: Statement, playhead: Double) -> Bool {
-        guard playhead.isFinite, s.via != .pump else { return false }
+        guard playhead.isFinite, s.via != .cursor else { return false }
         guard let resolved = s.resolvedThrough, resolved.isFinite else { return false }
         return resolved >= playhead && s.coveredFrom <= playhead
     }
@@ -220,11 +213,10 @@ enum SubtitleResolutionStatement {
     ///   that line already states coverage the caller records it as stated, and no second line
     ///   repeats it.
     /// - A first crossing outranks a frontier change, and the two coincide often: the tick where the
-    ///   side reader's position first becomes usable is frequently the tick where it is already
-    ///   past the playhead. `via=` carries the frontier change either way, whereas nothing else in
+    ///   reading first reaches the playhead is frequently the tick where it is already past it. `via=` carries the frontier change either way, whereas nothing else in
     ///   the log marks the crossing, which is the point of #318.
-    /// - A frontier change with no crossing is the #231 case: determination just collapsed to the
-    ///   pump's lookahead and the harness has to hear about it before the next cadence tick.
+    /// - A frontier change with no crossing is determination collapsing to the cursor (a seek past
+    ///   the reading) and the harness has to hear about it before the next cadence tick.
     static func transitionReason(_ s: Statement, playhead: Double, isReset: Bool,
                                  coverageStated: Bool, lastFrontier: Frontier?) -> Reason? {
         if isReset { return .reconstruction }

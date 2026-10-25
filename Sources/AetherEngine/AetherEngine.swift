@@ -368,7 +368,7 @@ public final class AetherEngine: ObservableObject {
         let seeking = programmaticSeekInFlight || nativeScrubSeekInFlight || deferredSeekInFlight
         // #240: a seek owns the link until it lands. Set unconditionally (not inside the
         // change guard) so the gate cannot drift from the flags it mirrors.
-        sideReaderLinkGate.setSeeking(seeking)
+        seekInFlight.set(seeking)
         if isSeeking != seeking { isSeeking = seeking }
         let target = programmaticSeekTarget ?? nativeScrubSeekTarget ?? deferredSeekTarget
         if seekTarget != target { seekTarget = target }
@@ -1412,7 +1412,7 @@ public final class AetherEngine: ObservableObject {
     /// #271: the OCR worker's own tick timestamp; same rule, separate cadence.
     var subtitleOCRLastTickUptime: Double?
     /// #250: the frontier source of the last statement emitted per channel, so a change of source
-    /// (the prefetcher dying, EOF landing) gets its own line instead of waiting for the 30 s
+    /// (the reading falling behind the playhead, EOF landing) gets its own line instead of waiting for the 30 s
     /// cadence. nil before the first statement of a session.
     var subtitleResolutionLastFrontier: [SubtitleChannel: SubtitleResolutionStatement.Frontier] = [:]
     /// #318: channels whose current decoded run has already stated determination at the playhead,
@@ -1425,16 +1425,18 @@ public final class AetherEngine: ObservableObject {
     var subtitleDeliveryLastOutcome: [SubtitleChannel: SubtitleDeliveryStatement.Outcome] = [:]
     /// The session's one reader of its embedded subtitle streams (`SubtitleSource`): the overlay
     /// drainer, the OCR worker and the native renditions state how far ahead they want packets, and it
-    /// reads them from the container's index or by one walk of the stream. nil without a session.
+    /// reads them from the container's index or has the pump read on to them. nil without a session.
     var subtitleSource: SubtitleSource?
-    /// #496: why the session's subtitle reading last stopped. Set only when the reading actually
-    /// stopped, so it names a real teardown rather than the many no-op withdrawals on the way through
-    /// a selection. Mirrors the log line; kept as state so a test can assert the routing.
+    /// The subtitle consumers' leads, which the session's pump reads where it parks to know how far past
+    /// its own forward window to read (`SubtitleSource.Leads.readAhead`). One per engine: the source of
+    /// each session writes it, the pump of each session reads it.
+    nonisolated let subtitleReadAheadLeads = SubtitleSource.Leads()
+    /// #496: why the pump's read-ahead for subtitles last lapsed. Set only when it actually lapsed, so it
+    /// names a real teardown rather than the many no-op withdrawals on the way through a selection.
+    /// Mirrors the log line; kept as state so a test can assert the routing.
     var lastSubtitleDrainStopReason: SubtitleDrainStopReason?
-    /// #240: link arbitration between the video path and the subtitle side readers. On Matroska a
-    /// side reader is a second full copy of the stream, so on a link with little headroom the two
-    /// starve each other; the video path has priority. See `SideReaderLinkPolicy`.
-    nonisolated let sideReaderLinkGate = SideReaderLinkGate()
+    /// #240: whether a seek is in flight, which a scrub thumbnail's read waits out.
+    nonisolated let seekInFlight = SeekInFlightSignal()
     /// #121: session-monotonic id source for cues entering the retained overlay stores
     /// (`subtitleCues` / `secondarySubtitleCues`). The overlay decoder is rebuilt on every seek
     /// (`.resetAndDecode`), restarting its own `nextCueID` at zero, so decoder-local ids cannot stay
@@ -1444,7 +1446,7 @@ public final class AetherEngine: ObservableObject {
     /// array-clear sites.
     var nextRetainedSubtitleCueID: Int = 0
     nonisolated static let subtitleDrainLeadSeconds: Double = 60
-    /// #362: how far the forward prefetch (#151) parks BEYOND the drain window's forward edge.
+    /// #362: how far the pump reads BEYOND the drain window's forward edge.
     ///
     /// Without it the two lines coincide, and that is where a bitmap set loses its authored end: the
     /// last set inside the drain window publishes with FFmpeg's open placeholder, and the clear that
@@ -1454,7 +1456,7 @@ public final class AetherEngine: ObservableObject {
     /// is sequential either way, the park only decides when), it just keeps the harvest one authored
     /// step ahead of the decode, which is what `SubtitlePacketStore.firstPTS(streamIndex:after:)`
     /// needs to answer at all.
-    nonisolated static let subtitleForwardPrefetchLeadMarginSeconds: Double = 15
+    nonisolated static let subtitleReadAheadMarginSeconds: Double = 15
     /// #362: how many ticks a hole may hold the cursor before the tick decodes across it anyway.
     /// The second backstop; the first is the playhead reaching the hold, which ends it regardless.
     /// Generous on purpose (10 s at 2 Hz): the hold delays a region the drain is filling 60 s ahead
@@ -1475,20 +1477,12 @@ public final class AetherEngine: ObservableObject {
     /// Phase D: the OCR worker decodes bitmap compositions to playhead + this lead so AVKit's
     /// ~240 s forward .vtt prefetch burst at selection is served populated, never cached empty.
     nonisolated static let subtitleOCRLeadSeconds: Double = 240
-    /// Phase D: forward-prefetch lead while the OCR worker is armed; exceeds
+    /// Phase D: the pump's read-ahead while the OCR worker is armed on a pumped stream; exceeds
     /// subtitleOCRLeadSeconds so the packet store actually holds the worker's window.
-    nonisolated static let subtitleOCRPrefetchLeadSeconds: Double = 270
+    nonisolated static let subtitleOCRReadAheadSeconds: Double = 270
     /// Phase D: per-tick decode cap; smooths the initial 240 s backfill over a few ticks
     /// instead of one long MainActor pass.
     nonisolated static let subtitleOCRMaxPacketsPerTick: Int = 48
-    nonisolated static let subtitleForwardPrefetchParkPollNanoseconds: UInt64 = 500_000_000
-    /// #231: a prefetch session that dies on a read error is restarted, bounded. Consecutive
-    /// failures are what a dead link looks like; the total ceiling covers a source that fails in a
-    /// loop after harvesting a packet each time.
-    nonisolated static let subtitleForwardPrefetchMaxConsecutiveFailures: Int = 3
-    nonisolated static let subtitleForwardPrefetchMaxRestarts: Int = 8
-    /// Doubles per consecutive failure (1s, 2s, 4s), capped by the consecutive-failure ceiling.
-    nonisolated static let subtitleForwardPrefetchRestartBackoffNanoseconds: UInt64 = 1_000_000_000
 
     @Published public internal(set) var isLoadingSubtitles: Bool = false
     @Published public internal(set) var isSubtitleActive: Bool = false
@@ -2525,7 +2519,7 @@ public final class AetherEngine: ObservableObject {
         /// Container HEARING_IMPAIRED disposition: declared as an SDH rendition.
         var isHearingImpaired: Bool = false
         /// Phase D: bitmap (PGS/DVB/DVD) entry whose store is filled by the OCR worker /
-        /// sidecar OCR fill, not by the pump tap or the side readers.
+        /// sidecar OCR fill, not by the pump tap.
         var needsOCR: Bool = false
         /// `LoadOptions.forcedSubtitleTrack`: the forced-only rendition of an embedded bitmap track,
         /// holding just the lines the track flags as forced. Same source stream as the full track's
@@ -2616,7 +2610,8 @@ public final class AetherEngine: ObservableObject {
     var nativeItemTimeJumpObserver: NSObjectProtocol? = nil
     var subtitleLandingGeneration: UInt64 = 0
     var subtitleLanding: SubtitleLanding? = nil
-    /// The playhead on the source axis for readers off the main actor: the subtitle walk paces against it.
+    /// The playhead on the source axis for readers off the main actor: the pump's subtitle read-ahead is
+    /// measured from it.
     let sourcePlayheadClock = SourcePlayheadClock()
     /// What the selection observer last applied.
     var nativeSubtitleFollowedKey: NativeSubtitleFollowedKey? = nil
@@ -3737,11 +3732,6 @@ public final class AetherEngine: ObservableObject {
     }
 
     #if DEBUG
-    /// Test-only override for the session's restart-in-flight signal (#93 residual deferral tests).
-    var testHookRestartInFlightOverride: Bool? = nil
-    #endif
-
-    #if DEBUG
     /// Test-only store override for the external instant-backfill path (#88); production reads the
     /// live session's stores.
     var testHookNativeStores: [NativeSubtitleCueStore]? = nil
@@ -3885,11 +3875,11 @@ public final class AetherEngine: ObservableObject {
     /// so the test never has to know which decoder produced the cue.
     nonisolated static let subtitleOpenEndedWindowSeconds: Double = 3600
 
-    /// #15: native WebVTT readers must stay ahead of AVPlayer's subtitle prefetch (~240s burst at PiP start),
-    /// otherwise far segments are fetched empty and cached empty for the VOD rendition. Larger than the inline
-    /// reader's 90s lead; only runs while a native rendition is selected (PiP), so the extra read is bounded.
+    /// #15: a native rendition's reading must stay ahead of AVPlayer's subtitle fetch (~240s burst at PiP
+    /// start), otherwise far segments are answered from a reading that has not got there. Only asked while a
+    /// native rendition is selected, so the pump's extra read-ahead is bounded.
     nonisolated static let nativeSubtitleReadAheadSeconds: Double = 300
-    /// How far behind the packet in hand a side reader claims its reading complete (`noteRead`): a subtitle
+    /// How far behind the packet in hand the pump claims a cue store's reading complete (`noteRead`): a subtitle
     /// block is interleaved by its own time, which can trail the reference packet by a fraction of a second.
     nonisolated static let nativeSubtitleReadMarginSeconds: Double = 1.0
 
@@ -6327,7 +6317,7 @@ public final class AetherEngine: ObservableObject {
                 // #416, and #107 round 2 for the axis: the ledger's notes and the overlay drainer's
                 // playhead are both source-axis, so the anchor is stated there too.
                 let targetSource = host.sourceSeconds(forSession: target)
-                softwareSubtitlePacketStore?.noteHarvestAnchor(.pump, at: targetSource)
+                softwareSubtitlePacketStore?.noteHarvestAnchor(at: targetSource)
                 await host.seek(to: target)
                 guard loadGeneration == loadGen, seekGeneration == seekGen else { return }
                 clock.currentTime = target
@@ -6430,7 +6420,7 @@ public final class AetherEngine: ObservableObject {
             // silently extends one run over the whole offset, which is exactly the claim
             // `SubtitleHarvestCoverage` exists to refuse.
             softwareSubtitlePacketStore?.noteHarvestAnchor(
-                .pump, at: host.sourceSeconds(forSession: clockTarget))
+                at: host.sourceSeconds(forSession: clockTarget))
             hostReposition = await host.seek(to: clockTarget)
         } else {
             // #93 retest: remember the target as recovery intent BEFORE awaiting; a wedged seek

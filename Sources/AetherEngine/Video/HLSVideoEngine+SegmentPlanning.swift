@@ -37,7 +37,7 @@ extension HLSVideoEngine {
     /// reposition refetches a segment. And only a container whose index a seek loads prewarms at all
     /// (`Demuxer.loadsIndexOnFirstSeek`): on a transport stream the seek was a whole-file timestamp
     /// search, mostly network reads into unwatched parts of the file, whose only product was probe
-    /// entries the plan then refused as too sparse. The pump and the subtitle source's walk ask here.
+    /// entries the plan then refused as too sparse. The pump asks here.
     static func cuePrewarmMayRun(loadsIndexOnFirstSeek: Bool, hasSegmentedReader: Bool,
                                  isSourceSeekable: Bool) -> Bool {
         loadsIndexOnFirstSeek && !hasSegmentedReader && isSourceSeekable

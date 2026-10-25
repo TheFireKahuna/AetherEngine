@@ -3,9 +3,9 @@ import Testing
 import AetherLibavutil
 @testable import AetherEngine
 
-/// Audit DMX-113, BIT-105, DMX-103: every seconds-based reposition becomes integer ticks in the Demuxer,
+/// Audit DMX-113, BIT-105: every seconds-based reposition becomes integer ticks in the Demuxer,
 /// and `Int64(_:)` traps on NaN, infinity and anything past `Int64`. Host values (a 0/0 scrub fraction,
-/// `.infinity` as "resume at the end") and an origin that inflates its `Content-Range` total reached it.
+/// `.infinity` as "resume at the end") reached it.
 @Suite("Seek targets that do not fit a tick count fail instead of trapping")
 struct SeekTargetConversionTests {
 
@@ -47,7 +47,7 @@ struct SeekTargetConversionTests {
         #expect(demuxer.seek(to: 0))
     }
 
-    @Test("seekBounded refuses NaN, infinity and a target past Int64, stream-anchored or not", arguments: [
+    @Test("seekBounded refuses NaN, infinity and a target past Int64", arguments: [
         Double.nan, .infinity, 1e300,
     ])
     func demuxerSeekBoundedRefuses(seconds: Double) throws {
@@ -55,18 +55,6 @@ struct SeekTargetConversionTests {
         defer { demuxer.close() }
         try demuxer.open(reader: DataIOReader(data: Self.fixture()), formatHint: "mp4")
         #expect(demuxer.seekBounded(to: seconds, timeout: 2) == false)
-        #expect(demuxer.seekBounded(to: seconds, anchorStreamIndex: demuxer.videoStreamIndex, timeout: 2) == false)
-    }
-
-    // MARK: - Byte estimate
-
-    @Test("A byte estimate against an inflated total saturates at the total")
-    func byteEstimateSaturates() {
-        #expect(Demuxer.byteEstimateTarget(fileSize: .max, duration: 10, target: 100) == .max)
-        #expect(Demuxer.byteEstimateCorrection(
-            landed: 1.5, target: 3600, startOrigin: 0, duration: 3600,
-            fileSize: 1_000_000_000_000_000_000, currentByte: 997_000_000_000_000_000, attempt: 0)
-                == .probe(1_000_000_000_000_000_000))
     }
 
     // MARK: - FrameExtractor boundary

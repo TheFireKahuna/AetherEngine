@@ -127,9 +127,9 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     /// A feeder has read the source from `from` through `through` (source axis) and every cue in it has
     /// been appended. A span that continues the one held extends it; one that does not (a reader that
     /// re-anchored after a seek) replaces it, because what was read before is no longer contiguous with
-    /// what is read now.
+    /// what is read now. `through` is `.infinity` for a feeder that read to the end of the source.
     func noteRead(from: Double, through: Double) {
-        guard from.isFinite, through.isFinite, through >= from else { return }
+        guard from.isFinite, !through.isNaN, through >= from else { return }
         lock.lock(); defer { lock.unlock() }
         if let span = readSpan, from >= span.from, from <= span.through + Self.readSeamSeconds {
             if through > span.through { lastReadAdvance = .now() }
