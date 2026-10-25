@@ -1678,15 +1678,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
 
         // 5b. HDR10 static metadata stated only in-band (MPEG-TS, a Matroska remuxed from one): read
-        //     the SEI so movenc writes `mdcv` / `clli`, and for a `dvh1` sample entry the RPU's base-layer
-        //     range. See `InBandHDRStaticMetadata`.
+        //     the SEI so movenc writes `mdcv` / `clli`, and for a `dvh1` sample entry or a composed FEL the
+        //     first RPU's base-layer range and L6. See `InBandHDRStaticMetadata`.
         let inBandHDRMetadata = scanInBandHDRStaticMetadata(
             demuxer: dem,
             videoStreamIndex: videoIndex,
             codecpar: codecpar,
             framing: measuredVideoNALFraming,
             isLive: isLiveSession,
-            readsDolbyVisionRange: codecTagOverride == "dvh1"
+            readsDolbyVisionRPU: codecTagOverride == "dvh1" || composesFEL
         )
         let sdrUpgradedToHLG = inBandHDRMetadata.videoRange(upgrading: videoRange) != videoRange
         if sdrUpgradedToHLG {
@@ -1827,6 +1827,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
             ownedVideoParams.ptr.pointee.color_range = parameterSetRange
         }
         let liftedHDRBoxes = inBandHDRMetadata.attach(to: ownedVideoParams.ptr)
+        // A session whose FEL is composed over AVPlayer shows the master, so its init describes the master: the
+        // RPU's L6 over the base layer's grade (`DolbyVisionLevel6`).
+        if composesFEL, let level6 = inBandHDRMetadata.dolbyVisionLevel6 {
+            let described = level6.describeMaster(on: ownedVideoParams.ptr)
+            if !described.isEmpty {
+                EngineLog.emit("[HLSVideoEngine] composed FEL: init states the master's L6, "
+                               + described.joined(separator: ", "), category: .session)
+            }
+        }
         // The `colr` the MPEG-TS delivery of the same stream carries (see `InBandHDRStaticMetadata`).
         if sdrUpgradedToHLG { ownedVideoParams.ptr.pointee.color_trc = AVCOL_TRC_ARIB_STD_B67 }
         if !liftedHDRBoxes.isEmpty {

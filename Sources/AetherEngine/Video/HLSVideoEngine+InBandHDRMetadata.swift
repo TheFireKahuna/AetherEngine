@@ -40,9 +40,10 @@ import Dovi
 /// The SEI is also looked for in the config record: x265 and other encoders can put prefix SEI arrays in the hvcC,
 /// which `canonicalizeHEVCConfigRecord` strips before the init is written (AE#187), so they are read first.
 ///
-/// For a Dolby Vision `dvh1` sample entry the same scan reads the first RPU's `bl_video_full_range_flag`: the range a
-/// Profile 5 base layer is coded in is stated there (libdovi requires it set for Profile 5), and the SPS of such a
-/// stream often has no VUI to say it (#19).
+/// For a Dolby Vision `dvh1` sample entry, or a session that composes the FEL, the same scan reads the first RPU: its
+/// `bl_video_full_range_flag`, where a Profile 5 base layer's range is stated (libdovi requires it set for Profile 5,
+/// and the SPS of such a stream often has no VUI to say it, #19), and its L6, the master's mastering display and
+/// light level (`DolbyVisionLevel6`).
 struct InBandHDRStaticMetadata: Equatable {
     /// mastering_display_colour_volume payload (24 bytes: G, B, R, white point, max / min luminance).
     var masteringDisplay: [UInt8]?
@@ -52,8 +53,9 @@ struct InBandHDRStaticMetadata: Equatable {
     var ambientViewing: [UInt8]?
     /// alternative_transfer_characteristics: preferred_transfer_characteristics.
     var alternativeTransfer: UInt8?
-    /// The first parseable RPU's `bl_video_full_range_flag`, when the scan was asked to read it.
+    /// The first parseable RPU's `bl_video_full_range_flag` and L6, when the scan was asked to read the RPU.
     var dolbyVisionBaseLayerFullRange: Bool?
+    var dolbyVisionLevel6: DolbyVisionLevel6?
 
     var isEmpty: Bool { masteringDisplay == nil && contentLightLevel == nil && ambientViewing == nil }
 
@@ -111,19 +113,23 @@ struct InBandHDRStaticMetadata: Equatable {
         }
     }
 
-    /// Read `bl_video_full_range_flag` from the first RPU (unspec62 NAL) in one HEVC access unit that libdovi parses.
-    mutating func collectDolbyVisionRange(from data: UnsafePointer<UInt8>, size: Int, framing: VideoNALFraming) {
+    /// Read `bl_video_full_range_flag` and L6 from the first RPU (unspec62 NAL) in one HEVC access unit that libdovi
+    /// parses. Both come from that one RPU, so a later one never mixes in.
+    mutating func collectDolbyVisionRPU(from data: UnsafePointer<UInt8>, size: Int, framing: VideoNALFraming) {
         guard dolbyVisionBaseLayerFullRange == nil, size > 0 else { return }
-        var found: Bool?
+        var found: (fullRange: Bool, level6: DolbyVisionLevel6?)?
         A53SEIParser.forEachNAL(data, size, framing) { nal, length in
             guard found == nil, length > 2, (nal[0] >> 1) & 0x3F == 62,
                   let rpu = DoviRpuGuard.parse(nal, length) else { return }
             defer { dovi_rpu_free(rpu) }
             guard let header = dovi_rpu_get_header(rpu) else { return }
             defer { dovi_rpu_free_header(header) }
-            found = header.pointee.bl_video_full_range_flag
+            found = (header.pointee.bl_video_full_range_flag, DolbyVisionLevel6(rpu: rpu))
         }
-        dolbyVisionBaseLayerFullRange = found
+        if let found {
+            dolbyVisionBaseLayerFullRange = found.fullRange
+            dolbyVisionLevel6 = found.level6
+        }
     }
 
     /// Read the messages out of one H.264 / HEVC access unit, keeping the first of each.
@@ -228,10 +234,19 @@ struct InBandHDRStaticMetadata: Equatable {
 
 extension HLSVideoEngine {
 
+    /// Whether this session's FEL is composed over AVPlayer (`felTap`): the picture on screen is then the master.
+    var composesFEL: Bool {
+        #if DualLayerDolbyVision
+        felTap != nil
+        #else
+        false
+        #endif
+    }
+
     /// Look for the in-band HDR10 static metadata a source's codecpar does not state completely
     /// (`InBandHDRStaticMetadata`): first in the config record, then in the first video access units. The
     /// messages ride the first IRAP, so a short budget covers every encoder measured. With
-    /// `readsDolbyVisionRange` the same access units also yield the first RPU's base-layer range. A VOD source
+    /// `readsDolbyVisionRPU` the same access units also yield the first RPU's base-layer range and L6. A VOD source
     /// is scanned like the parameter-set scan (rewound, consumed, `start()` seeks back to 0); a live one is only
     /// peeked, so its packets stay queued for the producer. No head read when the record answered everything.
     func scanInBandHDRStaticMetadata(
@@ -240,7 +255,7 @@ extension HLSVideoEngine {
         codecpar: UnsafePointer<AVCodecParameters>,
         framing measuredFraming: VideoNALFraming?,
         isLive: Bool,
-        readsDolbyVisionRange: Bool = false
+        readsDolbyVisionRPU: Bool = false
     ) -> InBandHDRStaticMetadata {
         var metadata = InBandHDRStaticMetadata()
         let par = codecpar.pointee
@@ -252,7 +267,7 @@ extension HLSVideoEngine {
             primaries: par.color_primaries, transfer: par.color_trc)
         let wantsStatic = InBandHDRStaticMetadata.wantsStaticMetadata(
             transfer: par.color_trc, hasMastering: hasMastering, hasLightLevel: hasLightLevel)
-        let readsRange = readsDolbyVisionRange && par.codec_id == AV_CODEC_ID_HEVC
+        let readsRange = readsDolbyVisionRPU && par.codec_id == AV_CODEC_ID_HEVC
         guard wantsStatic || wantsTransfer || readsRange else { return metadata }
         if let extradata = par.extradata, par.extradata_size > 0 {
             metadata.collect(fromConfigRecord: Array(UnsafeBufferPointer(start: extradata, count: Int(par.extradata_size))),
@@ -279,7 +294,7 @@ extension HLSVideoEngine {
             videoPackets += 1
             if let data = pkt.pointee.data {
                 metadata.collect(from: data, size: Int(pkt.pointee.size), codecID: par.codec_id, framing: framing)
-                if readsRange { metadata.collectDolbyVisionRange(from: data, size: Int(pkt.pointee.size), framing: framing) }
+                if readsRange { metadata.collectDolbyVisionRPU(from: data, size: Int(pkt.pointee.size), framing: framing) }
             }
             return done() || videoPackets >= packetBudget
         }
