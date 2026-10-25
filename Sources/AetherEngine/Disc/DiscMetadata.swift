@@ -162,8 +162,30 @@ struct DVDTimeMap: Sendable, Equatable {
 }
 
 enum ClipFold {
+    /// The span of the 33-bit 90 kHz presentation clock, seconds: a timestamp libavformat has unwrapped
+    /// can sit any whole number of these from the playlist's 32-bit 45 kHz times.
+    static let wrapSeconds = Double(UInt64(1) << 33) / 90000
+
     static func offsetSeconds(observedBaseSec: Double, base0Sec: Double, cumulativeBeforeSec: Double) -> Double {
         observedBaseSec - base0Sec - cumulativeBeforeSec
+    }
+
+    /// Where a Blu-ray title starts on the demuxer's source axis: play item 0's `in_time`, in the clock
+    /// span of `nearRawSec`, any timestamp read from clip 0. Clip 0 is not folded, so its timestamps are
+    /// the source axis and the title runs from here.
+    static func titleOriginSeconds(inTime0Sec: Double, nearRawSec: Double) -> Double {
+        inTime0Sec + wrapSeconds * ((nearRawSec - inTime0Sec) / wrapSeconds).rounded()
+    }
+
+    /// A Blu-ray clip's fold offset as the playlist states it: what takes the clip's `in_time` to the
+    /// title time its play item starts at (`predictedSec`, `inTime[k] - inTime[0] - cumulativeBefore[k]`),
+    /// in the clock span `rawSec` shows, any timestamp read from the clip. It does not depend on which
+    /// packet of the clip is read first, so playing into a clip, seeking into it and the segment plan all
+    /// place its frames alike.
+    static func playlistOffsetSeconds(predictedSec: Double, rawSec: Double, titleOriginSec: Double,
+                                      cumulativeBeforeSec: Double) -> Double {
+        let span = ((rawSec - predictedSec - titleOriginSec - cumulativeBeforeSec) / wrapSeconds).rounded()
+        return predictedSec + wrapSeconds * span
     }
 }
 
