@@ -61,19 +61,18 @@ struct DisplaySignalsTests {
         #expect(DisplaySignals.startRule(controlPick: nil) == nil)
     }
 
-    /// A session starting cancels the oracle; the run must end then, not spin out its timeout on the main actor.
-    @Test("a cancelled run returns at once")
+    /// A session starting cancels the oracle; the run must end on that, not spin out its timeout on the
+    /// main actor. Asserted on why it ended, not on a wall clock: setting AVFoundation up and down and
+    /// waiting for the main actor take as long as the machine is busy, and are not what is under test.
+    @Test("a cancelled run ends on the cancellation")
     @MainActor
     func cancelledRunEnds() async {
-        let clock = ContinuousClock()
-        let started = clock.now
         let run = Task { @MainActor in
             await VariantOracle.run(DisplaySignals.Ladder.all[1], attachment: "none", timeout: .seconds(30))
         }
         run.cancel()
         let result = await run.value
-        #expect(clock.now - started < .seconds(2))
-        #expect(!result.timedOut)
+        #expect(result.ended == .cancelled)
     }
 
     /// The plumbing on this machine's AVFoundation: the custom-scheme master is taken and a variant is started on.
@@ -86,7 +85,7 @@ struct DisplaySignalsTests {
             let result = await VariantOracle.run(ladder, attachment: "none")
             lines.append("\(ladder.name): requests=\(result.requests) pick=\(result.firstPick?.rawValue ?? "-") "
                          + "status=\(result.status) error=\(result.errorDomain ?? "-")/\(result.errorCode ?? 0) "
-                         + "ms=\(result.elapsedMs) timedOut=\(result.timedOut)")
+                         + "ms=\(result.elapsedMs) ended=\(result.ended.rawValue)")
             #expect(result.requests.first == "master.m3u8", "\(ladder.name)")
         }
         print(lines.joined(separator: "\n"))
