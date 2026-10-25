@@ -121,13 +121,13 @@ struct BitmapSubtitleUpscaleTests {
 
     #if MLSubtitleUpscale
     @MainActor
-    @Test("an upscaling landing publishes the line on screen upscaled first, and the lead follows in the next tick, upscaled")
+    @Test("an upscaling landing publishes the line on screen and its successor upscaled, and the lead follows in the next tick, upscaled")
     func landingThenLead() async throws {
         let (engine, pgs) = try engine(pixelSize: CGSize(width: 3840, height: 2160))
         engine.requestSubtitleDrainTick()
         await engine.subtitleDrainTickInFlight?.value
-        // The landing: decoded to playhead + subtitleUpscaleLandingSeconds, the line on screen 2x.
-        #expect(Self.sizes(engine.subtitleCues) == [16: 16])
+        // The landing: decoded through the composition that ends the reconstruction pass (30), both lines 2x.
+        #expect(Self.sizes(engine.subtitleCues) == [16: 16, 30: 16])
         // Asked for at once, the next tick brings the rest of the lead, each set upscaled before it publishes.
         let next = try #require(engine.subtitleDrainTickInFlight)
         await next.value
@@ -147,7 +147,7 @@ struct BitmapSubtitleUpscaleTests {
         engine.bitmapSubtitleUpscaleOwed = [.primary]
         engine.resumeBitmapSubtitleUpscale()
         await engine.subtitleDrainTickInFlight?.value
-        #expect(Self.sizes(engine.subtitleCues) == [16: 16, 30: 8, 60: 8])
+        #expect(Self.sizes(engine.subtitleCues) == [16: 16, 30: 16, 60: 8])
         await engine.subtitleDrainTickInFlight?.value
         #expect(Self.sizes(engine.subtitleCues) == [16: 16, 30: 16, 60: 16])
         #expect(engine.bitmapSubtitleUpscaleOwed.isEmpty)

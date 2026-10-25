@@ -1489,9 +1489,6 @@ public final class AetherEngine: ObservableObject {
     /// cues around the playhead still land in the first batch and the rest of the 60 s lead fills
     /// over the following ticks.
     nonisolated static let subtitleDrainMaxPacketsPerTick: Int = 256
-    /// How far past the playhead an upscaling landing's batch reaches (`bitmapSubtitlePixelSize`): the line on
-    /// screen and the next few, each upscaled before the tick publishes.
-    nonisolated static let subtitleUpscaleLandingSeconds: Double = 3
     /// Phase D: the OCR worker decodes bitmap compositions to playhead + this lead so AVKit's
     /// ~240 s forward .vtt prefetch burst at selection is served populated, never cached empty.
     nonisolated static let subtitleOCRLeadSeconds: Double = 240

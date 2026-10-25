@@ -581,15 +581,6 @@ extension AetherEngine {
                 gapHoldTicksLeft = held?.harvestGapAt == cut.at
                     ? (held?.harvestGapTicksLeft ?? 0) - 1 : Self.subtitleDrainHarvestGapTicks
             }
-            // An upscaling landing decodes to just past the playhead: the tick publishes only once its cues are
-            // upscaled, so the landing line waits for one upscale rather than the whole lead's. The rest follows
-            // in the next ticks, the first asked for at once.
-            var landingCut = false
-            if isReset, work.upscale != nil,
-               let cut = entries[..<decodeEnd].firstIndex(where: { $0.ptsSeconds > playhead + Self.subtitleUpscaleLandingSeconds }) {
-                decodeEnd = cut
-                landingCut = true
-            }
             if upscale != nil, work.upscale == nil, decodeEnd > 0, EmbeddedSubtitleDecoder.isBitmapCodec(decoder.codecID) {
                 bitmapSubtitleUpscaleOwed.insert(channel)
             }
@@ -598,7 +589,7 @@ extension AetherEngine {
                 window: window, coverageStart: coverageStart, retained: retained,
                 decoder: decoder, entries: entries, batchEnd: batchEnd, decodeEnd: decodeEnd,
                 gapHoldAt: gapHoldAt, gapHoldSequence: gapHoldSequence,
-                gapHoldTicksLeft: gapHoldTicksLeft, pulled: pulls, landingCut: landingCut))
+                gapHoldTicksLeft: gapHoldTicksLeft, pulled: pulls))
         }
         return work
     }
@@ -626,7 +617,12 @@ extension AetherEngine {
             let retained = job.retained
             let entries = job.entries
             let batchEnd = job.batchEnd
-            let decodeEnd = job.decodeEnd
+            // An upscaling landing's decode stops at the composition that ends its reconstruction pass
+            // (`SubtitleDrainDecodeHandoff`), so fewer may have decoded than were handed out. The rest stay
+            // stored behind the cursor, as a capped batch's do, and the next tick, asked for at once,
+            // decodes them.
+            let decodeEnd = min(job.decodeEnd, events.count)
+            if decodeEnd < job.decodeEnd { subtitleDrainTickRequested = true }
             let gapHoldAt = job.gapHoldAt
             let gapHoldSequence = job.gapHoldSequence
             let gapHoldTicksLeft = job.gapHoldTicksLeft
@@ -704,9 +700,7 @@ extension AetherEngine {
             // remainder sits beyond a gap the harvest has not closed. Waiting for that would keep
             // the overlay dark for the whole hold budget, which is the one thing #143 exists to
             // prevent; the successor trims the published line when the hole does fill.
-            // An upscaling landing's cut is past the playhead too, so it is no partial view either.
-            if job.landingCut { subtitleDrainTickRequested = true }
-            if decodeEnd == entries.count || gapHoldAt != nil || job.landingCut,
+            if decodeEnd == entries.count || gapHoldAt != nil,
                SubtitleOverlayDrainer.shouldFinalizeReconstruction(
                 reconstructing: pgsStaleArrivalGates[channel]?.reconstructing ?? false,
                 hasCandidate: pgsStaleArrivalGates[channel]?.hasReconstructionCandidate ?? false) {
@@ -2330,8 +2324,6 @@ struct SubtitleDrainChannelWork {
     let gapHoldTicksLeft: Int
     /// The stream is pulled from the index (layer 3 step 3).
     let pulled: Bool
-    /// An upscaling landing stopped the batch just past the playhead (`subtitleUpscaleLandingSeconds`).
-    var landingCut = false
 }
 
 struct SubtitleDrainTickWork {
@@ -2344,8 +2336,12 @@ struct SubtitleDrainTickWork {
     var upscale: BitmapSubtitleUpscaling.Request?
 
     var decodeHandoff: SubtitleDrainDecodeHandoff {
-        SubtitleDrainDecodeHandoff(jobs: channels.map { ($0.decoder, $0.entries[..<$0.decodeEnd]) },
-                                   upscaling: upscale.map { ($0, channels.map(\.streamIndex)) })
+        SubtitleDrainDecodeHandoff(
+            jobs: channels.map { ($0.decoder, $0.entries[..<$0.decodeEnd]) },
+            upscaling: upscale.map { request in
+                (request, channels.map(\.streamIndex),
+                 channels.map { $0.isReset && EmbeddedSubtitleDecoder.isBitmapCodec($0.decoder.codecID) })
+            })
     }
 }
 
@@ -2355,21 +2351,36 @@ struct SubtitleDrainTickWork {
 /// never read again once its batch lands.
 struct SubtitleDrainDecodeHandoff: @unchecked Sendable {
     let jobs: [(decoder: EmbeddedSubtitleDecoder, packets: ArraySlice<StoredSubtitlePacket>)]
-    /// The overlay's upscale and each job's stream (`BitmapSubtitleUpscaling`); nil leaves the events as decoded,
-    /// as the OCR worker reads them.
-    var upscaling: (request: BitmapSubtitleUpscaling.Request, streams: [Int32])? = nil
+    /// The overlay's upscale, each job's stream, and whether the job is a bitmap landing
+    /// (`BitmapSubtitleUpscaling`); nil leaves the events as decoded, as the OCR worker reads them.
+    var upscaling: (request: BitmapSubtitleUpscaling.Request, streams: [Int32], landings: [Bool])? = nil
 
     var isEmpty: Bool { jobs.allSatisfy { $0.packets.isEmpty } }
 
+    /// One event per packet decoded, job by job. An upscaling landing stops after the composition that ends its
+    /// reconstruction pass, the first with a cue at or after the playhead (`PGSStaleArrivalGate`), and the rest
+    /// of that PTS's packets (#271): the tick publishes only once its cues are upscaled, so the landing line waits
+    /// for its own upscale and its successor's, not the whole lead's, and the pass ends as it always does.
     func decode() -> [[EmbeddedSubtitleDecoder.SubtitleEvent?]] {
-        var decoded = jobs.map { job in
-            job.packets.map { AetherEngine.decodeStoredSubtitlePacket($0, with: job.decoder) }
-        }
-        if let upscaling {
-            for k in decoded.indices {
-                BitmapSubtitleUpscaling.shared.upscale(&decoded[k], stream: upscaling.streams[k], request: upscaling.request)
+        jobs.indices.map { k in
+            let job = jobs[k]
+            guard let upscaling else {
+                return job.packets.map { AetherEngine.decodeStoredSubtitlePacket($0, with: job.decoder) }
             }
+            let playhead = upscaling.request.playhead
+            var events: [EmbeddedSubtitleDecoder.SubtitleEvent?] = []
+            var stopAfter: Double?
+            for packet in job.packets {
+                if let stop = stopAfter, packet.ptsSeconds > stop { break }
+                let event = AetherEngine.decodeStoredSubtitlePacket(packet, with: job.decoder)
+                events.append(event)
+                if upscaling.landings[k], stopAfter == nil,
+                   event?.cues.contains(where: { $0.startTime >= playhead }) == true {
+                    stopAfter = packet.ptsSeconds
+                }
+            }
+            BitmapSubtitleUpscaling.shared.upscale(&events, stream: upscaling.streams[k], request: upscaling.request)
+            return events
         }
-        return decoded
     }
 }

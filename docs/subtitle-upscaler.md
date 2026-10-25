@@ -26,9 +26,11 @@ it (`AetherEngine.OptionalComponent.mlSubtitleUpscale`). The engine re-exports t
   the decode and reads the bitmaps as decoded.
 - **Which cues**: the last display set starting at or before the playhead (the line a landing shows) and every one
   after it. Earlier sets are history the reconstruction pass reads, which nothing shows.
-- **A landing** decodes only to `subtitleUpscaleLandingSeconds` (3 s) past the playhead, so its line waits for one
-  upscale rather than the whole lead's, and asks for the next tick at once, which brings the rest of the lead,
-  upscaled. The cut is past the playhead, so the reconstruction pass finalizes on it like on a harvest hole (#362).
+- **A landing** decodes up to the composition that ends its reconstruction pass (the first with a cue at or after
+  the playhead) and stops there, so its line waits for its own upscale and its successor's rather than the whole
+  lead's, and the pass ends exactly as it always does, successor included. The rest stays stored behind the cursor,
+  as a capped batch's does (#271), and the next tick, asked for at once, decodes it, upscaled. With no such
+  composition in the window the landing decodes the whole window, as before.
   At a seek the landing arrives with `AVPlayerItemTimeJumpedNotification`, while AVPlayer still buffers towards the
   target, so the upscale normally finishes before the target's first frame.
 - **Kept** by stream, start, geometry and output size, within 180 s of the playhead: a cue decoded again (a seek
