@@ -46,7 +46,7 @@ struct ProducerDeterminismTests {
 
         let continuous = HLSVideoEngine(url: url, dvModeAvailable: false, audioBridgeMode: route.mode)
         continuous.audioDelaySeconds = route.delay
-        _ = try continuous.start()
+        let playback = try continuous.start()
         defer { continuous.stop() }
         let reference = try #require(continuous.provider)
         let count = reference.segmentCount
@@ -57,6 +57,23 @@ struct ProducerDeterminismTests {
         #expect(continuous.audioBridge != nil || !["opus.mkv", "dts.mkv", "truehd.mkv"].contains(route.clip))
         let wantTracks = Fragments(want[1]!).tracks.count
         #expect(wantTracks == 2, "video and audio: \(wantTracks) tracks")
+
+        // A segment has sound from its first picture: a packet that straddles a boundary opens the
+        // segment after it, so a seek to a segment's start is not silent until the next audio frame.
+        // From segment 1: before the timeline's start there is nothing to play.
+        var base = try #require(URLComponents(url: playback.deletingLastPathComponent(), resolvingAgainstBaseURL: false))
+        base.query = nil
+        let scales = Fragments.timescales(init: try Data(contentsOf: try #require(base.url).appendingPathComponent("init.mp4")))
+        for index in 1..<count {
+            let f = Fragments(want[index]!)
+            guard let video = f.tracks[1], let audio = f.tracks[2], let vs = scales[1], let aus = scales[2],
+                  let picture = video.samples.map(\.presentationTime).min(), let sound = audio.samples.first else {
+                Issue.record("seg\(index): no video and audio to compare")
+                continue
+            }
+            let lead = Double(picture) / Double(vs) - Double(sound.presentationTime) / Double(aus)
+            #expect(lead >= 0, "seg\(index): sound starts \(String(format: "%.1f", -lead * 1000)) ms after the picture")
+        }
 
         // A window of one counted segment, so a seek lands where nothing was cut and starts a run there.
         let seeking = HLSVideoEngine(url: url, dvModeAvailable: false, audioBridgeMode: route.mode,
@@ -201,6 +218,26 @@ private struct Fragments {
             range = box.body
         }
         return names.joined(separator: "/")
+    }
+
+    /// Each track's media timescale, from an init segment's `tkhd` and `mdhd`.
+    static func timescales(init data: Data) -> [UInt32: UInt32] {
+        var out: [UInt32: UInt32] = [:]
+        func walk(_ range: Range<Int>, track: UInt32?) {
+            var track = track
+            for box in boxes(data, range) {
+                let at = box.body.lowerBound
+                let version = data[data.startIndex + at]
+                switch box.type {
+                case "tkhd": track = u32(data, at + (version == 1 ? 20 : 12))
+                case "mdhd": if let track { out[track] = u32(data, at + (version == 1 ? 20 : 12)) }
+                case "moov", "trak", "mdia": walk(box.body, track: track)
+                default: break
+                }
+            }
+        }
+        walk(0..<data.count, track: nil)
+        return out
     }
 
     // MARK: - ISO BMFF

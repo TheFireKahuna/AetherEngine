@@ -1915,21 +1915,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
         )
     }
 
-    /// Map post-shift (item-axis) pts to absolute segment index.
-    ///
-    /// AE#268: folds back the PLAN ANCHOR, not `videoShiftPts`. The two are equal whenever the gate
-    /// opened on the boundary the restart aimed at, but a restart that landed off a random-access
-    /// point carries the whole overshoot in the shift, and folding that back routed audio into a
-    /// segment index the video cutter never opened (a 10 s GOP under a 4 s plan skewed them by up to
-    /// two segments). The anchor is what the plan's item axis is defined against, so it is what maps
-    /// an item-axis timestamp onto a plan boundary.
-    private func segmentIndex(forSourcePts pts: Int64) -> Int {
-        return baseIndex + Self.segmentOffset(
-            forAbsolutePts: pts &+ planAnchorVideoPts,
-            boundaries: segmentBoundaries
-        )
-    }
-
     /// Source-axis value of a timestamp the pump has already rebased onto the output axis
     /// (`pts -= videoShiftPts`). Anything the producer hands to a consumer that works in source
     /// PTS has to come back through here (#259). NOPTS and an unresolved shift pass through.
@@ -4476,7 +4461,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         videoShiftPts = SourceTimestampBounds.difference(firstActualVideoDts, firstTfdtPts)
                         if audioWaitForVideo, let audio = audioConfig {
                             // VOD audio starts at the run's first plan boundary, where routing puts the
-                            // start of its first segment (`segmentIndex(forSourcePts:)`, `AudioRunPlan`), so
+                            // start of its first segment (`AudioRunPlan`), so
                             // that segment opens on the audio continuous playback put in it. Not the
                             // keyframe's decode time: on a presentation-axis plan that sits a composition
                             // offset before the boundary. Live has no plan and starts at the keyframe.
@@ -4604,15 +4589,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         continue
                     }
                     if restartTargetAudioDts != Int64.min && firstActualAudioDts == Int64.min {
-                        // A copied packet plays whole from its timestamp, so it has to start at the target. A
-                        // bridge places what it decodes by each frame's own time, so a packet belongs as soon
-                        // as any of its audio reaches the target; dropping a leading one (Opus's, which carries
-                        // the pre-skip) made the decoder skip the next packet's real audio instead. A bridge
-                        // that makes each segment in a run of its own reads its pre-roll ahead of the target.
-                        let bridged = audioConfig?.bridge != nil
-                        let target = restartTargetAudioDts &- audioPreRollTicks
+                        // The routing rule (`playedAudioSegmentIndex`): a packet belongs once any of its
+                        // audio plays at or after the target, the host's audio delay in, so the run's first
+                        // segment opens on the packet that straddles its start, as continuous playback's
+                        // does. For a bridge it is also what the decoder needs: dropping a leading packet
+                        // (Opus's, which carries the pre-skip) made it skip the next packet's real audio. A
+                        // bridge that makes each segment in a run of its own reads its pre-roll ahead of
+                        // that. A packet with no stated duration is known only to start where it says.
+                        let target = restartTargetAudioDts &- audioDelaySourceTicks &- audioPreRollTicks
                         let meetsTarget = packet.pointee.dts != Int64.min
-                            && (bridged && packet.pointee.duration > 0
+                            && (packet.pointee.duration > 0
                                 ? SourceTimestampBounds.sum(packet.pointee.dts, packet.pointee.duration) > target
                                 : packet.pointee.dts >= target)
                         // Live escape: backward PCR wrap between video gate-open and first audio packet strands the target
@@ -4664,7 +4650,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             // video seam (the first audio dts against a desired audio tfdt) would compensate for a
                             // fresh muxer zero-basing each restart epoch; with tfdt continuity (frag_discont) the
                             // snap itself became the divergence: it moved audio off the source frame grid by up to
-                            // one frame per epoch and skewed the shift fold-back in segmentIndex(forSourcePts:) by
+                            // one frame per epoch and skewed the shift fold-back in audio routing (`AudioRunPlan`) by
                             // the same amount, so a restarted segment carried a different audio timeline (and a
                             // different boundary frame) than continuous production.
                             audioShiftPts = av_rescale_q(
@@ -4684,7 +4670,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         } else {
                             gapInAudioTb = restartTargetAudioDts == Int64.min
                                 ? 0
-                                : SourceTimestampBounds.difference(firstActualAudioDts, restartTargetAudioDts &- audioPreRollTicks)
+                                : SourceTimestampBounds.difference(firstActualAudioDts,
+                                                                  restartTargetAudioDts &- audioDelaySourceTicks &- audioPreRollTicks)
                         }
                         let gapMs = audioTb.den > 0
                             ? Double(gapInAudioTb) * Double(audioTb.num) * 1000.0 / Double(audioTb.den)
@@ -4943,19 +4930,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         ? liveCurrentSegmentIndex
                         : (audioFollowsVideoCut ? vodCutter.current : 0)
                     if let prev = pendingAudioPkt {
-                        let prevSeg: Int
-                        if isLive || audioFollowsVideoCut {
-                            prevSeg = pendingAudioSegIndex
-                        } else {
-                            let prevPtsInVideoTb = av_rescale_q(
-                                prev.pointee.pts,
-                                audio.inputTimeBase,
-                                sourceVideoTimeBase
-                            )
-                            prevSeg = segmentIndex(forSourcePts: prevPtsInVideoTb)
-                        }
                         pendingAudioPkt = nil
-                        if !mux(.audio, segment: prevSeg, audioWrite(prev, nextDts: packet.pointee.dts, audio: audio)) {
+                        let write = audioWrite(prev, nextDts: packet.pointee.dts, audio: audio)
+                        let prevSeg = isLive || audioFollowsVideoCut
+                            ? pendingAudioSegIndex : playedAudioSegmentIndex(prev, audio: audio)
+                        if !mux(.audio, segment: prevSeg, write) {
                             exitReason = .muxerFailed
                             break readLoop
                         }
@@ -5045,19 +5024,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
             _ = mux(.video, segment: pendingVideoSegIndex, videoWrite(prev, nextDts: nil))
         }
         if let prev = pendingAudioPkt, let audio = audioConfig {
-            let prevSeg: Int
-            if isLive || audioFollowsVideoCut {
-                prevSeg = pendingAudioSegIndex
-            } else {
-                let prevPtsInVideoTb = av_rescale_q(
-                    prev.pointee.pts,
-                    audio.inputTimeBase,
-                    sourceVideoTimeBase
-                )
-                prevSeg = segmentIndex(forSourcePts: prevPtsInVideoTb)
-            }
             pendingAudioPkt = nil
-            _ = mux(.audio, segment: prevSeg, audioWrite(prev, nextDts: nil, audio: audio))
+            let write = audioWrite(prev, nextDts: nil, audio: audio)
+            let prevSeg = isLive || audioFollowsVideoCut
+                ? pendingAudioSegIndex : playedAudioSegmentIndex(prev, audio: audio)
+            _ = mux(.audio, segment: prevSeg, write)
         }
 
         // EOF tail flush for bridge audio: drains ~100-200 ms remainder (per-feed only emits full frames).
@@ -5162,22 +5133,36 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }, free: GatedWrite.freeing(packet))
     }
 
+    /// A look-behind copied audio packet's write, its duration stated first: where the container gave
+    /// none, up to the next packet (`nextDts`), so routing reads where its last sample plays.
     private func audioWrite(_ packet: UnsafeMutablePointer<AVPacket>, nextDts: Int64?, audio: AudioConfig) -> GatedWrite {
-        GatedWrite(write: { [self] muxer in
-            finalizeAndWriteAudio(packet, nextDts: nextDts, audio: audio, muxer: muxer)
+        if packet.pointee.duration <= 0 {
+            let inferred = nextDts.map { SourceTimestampBounds.difference($0, packet.pointee.dts) } ?? 0
+            packet.pointee.duration = inferred > 0 ? inferred : audioFrameDuration
+        }
+        return GatedWrite(write: { [self] muxer in
+            finalizeAndWriteAudio(packet, audio: audio, muxer: muxer)
         }, free: GatedWrite.freeing(packet))
     }
 
     /// The segment a bridged audio packet belongs to. Live and sequential audio follow the video
-    /// cutter; everything else is routed by the packet's own time against the plan, without the audio
-    /// delay the bridge stamped in: shifted, a positive delay would open the next segment while the
-    /// video is still cutting this one. One helper for the
-    /// per-feed and the end-of-file flush, because the flush missing the sequential rule opened a plan
-    /// index the cutter never reached and cost the archive its final segment (audit SEG-103).
+    /// cutter; everything else is routed by where it plays (`playedAudioSegmentIndex`). One helper for
+    /// the per-feed and the end-of-file flush, because the flush missing the sequential rule opened a
+    /// plan index the cutter never reached and cost the archive its final segment (audit SEG-103).
     private func bridgedAudioSegmentIndex(_ packet: UnsafeMutablePointer<AVPacket>, audio: AudioConfig) -> Int {
         if isLive { return liveCurrentSegmentIndex }
         if audioFollowsVideoCut { return vodCutter.current }
-        return audioRunPlan(audio).segment(ofOutputPts: packet.pointee.pts)
+        return playedAudioSegmentIndex(packet, audio: audio)
+    }
+
+    /// VOD routed by time: the segment an audio packet's last sample plays in, copied or bridged
+    /// (`AudioRunPlan`), so a packet that straddles a boundary opens the segment after it and the
+    /// segment has sound from its first picture. Played time has the host's audio delay in: a bridge
+    /// stamps it into its output, the muxer adds it to a copied packet, so it is added here for one.
+    private func playedAudioSegmentIndex(_ packet: UnsafeMutablePointer<AVPacket>, audio: AudioConfig) -> Int {
+        let plan = audioRunPlan(audio)
+        let played = audio.bridge == nil ? packet.pointee.pts &+ plan.delayTicks : packet.pointee.pts
+        return plan.segment(ofOutputPts: played, duration: packet.pointee.duration)
     }
 
     /// This producer's segments as bridged audio is routed to them: the routing above, and the runs
@@ -5188,6 +5173,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
             videoTimeBase: sourceVideoTimeBase, outputTimeBase: audio.inputTimeBase,
             delayTicks: Int64((audioDelaySeconds * Double(audio.inputTimeBase.den)
                                / Double(max(audio.inputTimeBase.num, 1))).rounded()))
+    }
+
+    /// The host's audio delay in `AudioConfig.timeBase`: source audio at `t` plays at `t` plus this.
+    private var audioDelaySourceTicks: Int64 {
+        guard let audio = audioConfig, audio.timeBase.num > 0 else { return 0 }
+        return Int64((audioDelaySeconds * Double(audio.timeBase.den) / Double(audio.timeBase.num)).rounded())
     }
 
     /// The bridge's pre-roll (`AudioTranscodingBridge.preRollSeconds`), in `AudioConfig.timeBase`.
@@ -5409,19 +5400,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Stream-copy audio only; bridge audio bypasses this (FLAC encoder sets durations correctly).
     private func finalizeAndWriteAudio(
         _ packet: UnsafeMutablePointer<AVPacket>,
-        nextDts: Int64?,
         audio: AudioConfig,
         muxer: MP4SegmentMuxer
     ) {
-        if packet.pointee.duration <= 0 {
-            if let next = nextDts {
-                let inferred = SourceTimestampBounds.difference(next, packet.pointee.dts)
-                packet.pointee.duration = inferred > 0 ? inferred : audioFrameDuration
-            } else {
-                packet.pointee.duration = audioFrameDuration
-            }
-        }
-
         packet.pointee.stream_index = muxer.audioOutputStreamIndex
         av_packet_rescale_ts(packet, audio.inputTimeBase, muxer.muxerAudioTimeBase)
         let prime = copyAudioPrimeCandidate(packet)

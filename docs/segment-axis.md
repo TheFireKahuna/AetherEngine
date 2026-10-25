@@ -167,8 +167,12 @@ changes, and `trun` offsets are relative to their `moof`, so a box before it mov
 proved, not argued: `AVSyncTests` (click on the white frame, to the sample) pass with the box written. The
 deleted model only ever fed position, subtitles and seek targets.
 
-Outside this plan: sound can start up to one audio frame after the picture at a seek point (a gap, not an
-offset), and everything after AVPlayer (tvOS output, HDMI, the receiver).
+Audio has one routing rule (`AudioRunPlan`): a packet belongs to the segment its last sample plays in, on
+the output timeline with the audio delay in, copied or bridged. A packet that plays across a boundary
+opens the segment after it, so a segment has sound from its first picture and a seek is not silent until
+the next audio frame; with a delay, the sound that plays at a boundary is in that segment. A run reads
+from where that packet is (`producerReadStart`). Outside this plan: everything after AVPlayer (tvOS
+output, HDMI, the receiver).
 
 ## Order of work
 
@@ -184,6 +188,6 @@ offset), and everything after AVPlayer (tvOS output, HDMI, the receiver).
    The determinism test found three places a run's first segment differed from continuous playback's, each
    fixed by a rule the producer already had: the muxer now cuts once every track has reached the segment
    (`SegmentCutGate`), not when video does; a run reads from before its boundary where the container
-   stores no decode times (`producerPreRollSeconds`), so libavformat rebuilds them as it did playing
+   stores no decode times (`producerReadStart`), so libavformat rebuilds them as it did playing
    through; and a run's audio starts at its plan boundary, not at its keyframe's decode time. The moov
    flush of its own that split a run's first segment into two fragments is gone.
