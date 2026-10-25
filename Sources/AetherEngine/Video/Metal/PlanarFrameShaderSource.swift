@@ -902,23 +902,5 @@ kernel void pf_cl_correct(device const uchar*            src     [[buffer(0)]],
     pf_cl_exact(ey, epb, epr, pf_df{e.ly.x, e.ly.y}, f, words);
     pf_write_codes(out_y, out_c, p, pf_round_codes_df(words));
 }
-
-// The picture's planes with their film grain, at the source's layout and depth (`dst` laid out as `src`): AV1's
-// grained output itself, for conformance against reference decoders. One thread per sample, gid.z the plane.
-kernel void fg_planes(device const uchar*  src    [[buffer(0)]],
-                      constant PFFrame&    f      [[buffer(1)]],
-                      device const uchar*  grain  [[buffer(5)]],
-                      device uchar*        dst    [[buffer(6)]],
-                      uint3                gid    [[thread_position_in_grid]]) {
-    pf_src s = pf_src{src, grain};
-    uint plane = gid.z;
-    uint sx = plane == 0u ? 0u : FC_SRC_LOG2_W, sy = plane == 0u ? 0u : FC_SRC_LOG2_H;
-    uint w = (f.width + (1u << sx) - 1u) >> sx, h = (f.height + (1u << sy) - 1u) >> sy;
-    if (gid.x >= w || gid.y >= h) { return; }
-    uint v = pf_plane_sample(s, f, plane, gid.x, gid.y);
-    uint out = FC_GRAIN ? pf_grained(s, f, plane, v, gid.x, gid.y) : v;
-    device uchar* row = dst + f.plane_offset[plane] + gid.y * f.linesize[plane];
-    if (FC_C0_DEPTH > 8u) { ((device ushort*)row)[gid.x] = ushort(out); } else { row[gid.x] = uchar(out); }
-}
 """
 }
