@@ -29,7 +29,7 @@ struct SubtitleSourceTests {
             try data.write(to: url)
             demuxer = Demuxer()
             try demuxer.open(url: url, extraHeaders: [:],
-                             profile: .subtitleSideDemuxer(callerProbesize: nil, callerMaxAnalyzeDuration: nil))
+                             profile: .headPackets)
             cueStores = renditions
                 ? Dictionary(uniqueKeysWithValues: demuxer.subtitleStreamIndices().map { ($0, NativeSubtitleCueStore()) })
                 : [:]

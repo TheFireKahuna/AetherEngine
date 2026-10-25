@@ -231,13 +231,24 @@ before handing it over).
    eight is gone. A source the cache does not hold (a local file, a host's own reader) keeps its
    index only while it is read, for the consumers racing for it; such a source is read once per
    load, from disk.
-5. **"Parsed once" holds for the engine's parser, not for libavformat.** Every side demuxer (the
-   I-frame reader's demuxer route, the subtitle source's walk, the still extractor, the Atmos
-   confirmation and the Dolby Vision audit) parses the container header and its cues again: no
-   network now, but CPU and memory each time. A session whose subtitle streams the index lists in full
-   opens no subtitle demuxer at all.
-   - What remains (the Atmos confirmation, the DV audit) should read their few packets through the
-     index too.
+5. **"Parsed once" holds for the engine's parser, not for libavformat.** A side demuxer parses the
+   container header and its cues again: no network now, but CPU and memory each time. What is left of
+   them: the I-frame reader's demuxer route (containers only libavformat can read, and dense stills) and
+   the still extractor behind `scrubThumbnail`. The others are gone:
+   - **The subtitle walk** (layer 3 step 5): the pump reads ahead instead.
+   - **The Dolby Vision audit** (#532, AE#recordless) and the Profile 7 `el_type` probe read the first RPU
+     from the session demuxer's own first packets (`DolbyVisionRecordAudit.rpuProfile(peeking:)`,
+     `Demuxer.peekPackets`): held, so whoever reads next gets them, and nothing opens the source again. The
+     recordless audit runs at the end of every open, a host reader's and a controlled probe's included
+     (AE#567 closes), and the load no longer seeks the probe back to the head after the `el_type` probe.
+   - **The Atmos confirmation** (#214) scans each E-AC-3 track (`AtmosJOCDecoder`, the public probe's own
+     scan) from the packets the session's reader reads: `Demuxer.observe` keeps the candidates readable
+     whatever the reader keeps, hands their packets to the pass and drops the ones the reader does not
+     keep, and a stream goes back to its discard once its scan has an answer. It opens nothing, so it no
+     longer declines serial, sequential or held-connection origins, live, or a host reader that cannot
+     clone. Tests: `AtmosConfirmationTests` (a discarded candidate read for the pass alone, a kept one
+     delivered as well, a pass ended early), `DolbyVisionRecordAuditTests` (the peek leaves every packet
+     for the next reader, in order).
 6. **An indexed text stream's frames are read twice.** The source fills its rendition whole at load,
    and its loop reads the same frames again into the packet store for the overlay as the lead asks. The
    second read is a cache hit, but it is a second parse.

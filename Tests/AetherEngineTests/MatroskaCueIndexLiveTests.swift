@@ -49,7 +49,7 @@ struct MatroskaCueIndexLiveTests {
         if let streamText = ProcessInfo.processInfo.environment["AE_MKV_INDEX_TEXT_STREAM"].flatMap(Int32.init) {
             let demuxer = Demuxer()
             try demuxer.open(url: url, extraHeaders: headers,
-                             profile: DemuxerOpenProfile.subtitleSideDemuxer(callerProbesize: nil, callerMaxAnalyzeDuration: nil))
+                             profile: DemuxerOpenProfile.headPackets)
             defer { demuxer.close() }
             let streams = AetherEngine.indexedSubtitleStreams(of: demuxer)
             let mapping = index.trackNumbers(for: streams)

@@ -199,49 +199,17 @@ struct DemuxerOpenProfile: Sendable {
         return profile
     }()
 
-    /// Open profile for the embedded subtitle side-demuxer (#76, #87). `EmbeddedSubtitleDecoder`
-    /// needs only `codec_id` / `codec_type` (carried in the container header / MPEG-TS PMT,
-    /// resolved by `avformat_open_input` itself) and seeds bitmap (PGS/DVB/DVD) canvas dims
-    /// from the source video size, so the `find_stream_info` chase after sparse, never-resolving
-    /// subtitle streams is pure cost. Every PGS track keeps `has_codec_parameters` false to the
-    /// budget cap (the #75 pattern), so even the #76 5 s ceiling is paid in full on a remote URL
-    /// source, landing as a flat ~5 s startup stall when the track is selected at load (#87). So
-    /// `skipStreamInfo` opts out of the chase entirely; the side reader runs a bounded find_stream_info
-    /// on demand only if its target subtitle stream's codec is genuinely unresolved at open. The probe
-    /// ceiling still bounds that fallback pass and honors an even tighter caller budget (#68). Keeps the
-    /// playback AVIO tuning (prefetch, chunk size, per-chunk timeout): the reader does sustained paced
-    /// reads, not a one-shot still fetch.
-    static func subtitleSideDemuxer(callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?) -> DemuxerOpenProfile {
-        let probeCeiling: Int64 = 4 * 1024 * 1024
-        let analyzeCeiling: Int64 = 5 * 1_000_000
-        let probesize = min(callerProbesize ?? probeCeiling, probeCeiling)
-        let analyze = min(callerMaxAnalyzeDuration ?? analyzeCeiling, analyzeCeiling)
-        var profile = playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: analyze)
+    /// A one-shot open for a stream's first packets (the public enhancement-layer probe,
+    /// `AetherEngine.probeDolbyVisionEnhancementLayer`): the packets are wanted, not stream info, and the
+    /// `codec_id` / `codec_type` and the sample entry the framing is read from are resolved by
+    /// `avformat_open_input` from the container header, so `find_stream_info` is skipped (#87: a sparse PGS
+    /// track would chase it to the budget cap). The probe ceiling (#76) bounds what the open reads.
+    static let headPackets: DemuxerOpenProfile = {
+        var profile = playback.withProbeBudget(probesize: 4 * 1024 * 1024, maxAnalyzeDuration: 5 * 1_000_000)
         profile.skipStreamInfo = true
-        profile.readerLabel = "subs"
+        profile.readerLabel = "head"
         return profile
-    }
-
-    /// Open profile for the `LoadOptions.confirmAtmos` side demuxer (#214 follow-up). The pass needs only
-    /// `codec_id` / `codec_type` on the audio streams, which `avformat_open_input` resolves from the
-    /// container header (matroska CodecID, MP4 sample entry, MPEG-TS PMT), so `find_stream_info` would be
-    /// pure cost on a remote source for a background enrichment nobody is waiting on. Keeps the playback
-    /// AVIO tuning: the pass does sustained paced reads until it has enough audio packets, not a one-shot
-    /// fetch, and `boundedInitialFetch` stays nil because reaching the audio in an interleaved UHD remux
-    /// can span well past any header-sized bound.
-    static func atmosConfirmationDemuxer(callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?)
-        -> DemuxerOpenProfile {
-        subtitleSideDemuxer(callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration)
-    }
-
-    /// Open profile for the AE#532 Dolby Vision record audit. Same shape and the same reasoning as the
-    /// Atmos pass above: the audit wants packets, not stream info, and the sample entry the framing is
-    /// read from is already resolved by `avformat_open_input`. It reaches its answer in the first video
-    /// packet rather than deep in the interleave, so it is the cheaper of the two by construction.
-    static func dolbyVisionRecordAuditDemuxer(callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?)
-        -> DemuxerOpenProfile {
-        subtitleSideDemuxer(callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration)
-    }
+    }()
 }
 
 /// AVFormatContext wrapper. HTTP(S) uses custom AVIO via URLSession (no built-in
@@ -359,10 +327,6 @@ public final class Demuxer: @unchecked Sendable {
     }
     private var trackSnapshot = TrackSnapshot()
 
-    /// The URL and headers this demuxer was opened from, kept for the recordless Dolby Vision audit's
-    /// second open. nil for a custom reader (no second open to give) and for a live source.
-    private var auditSource: (url: URL, headers: [String: String])?
-
     /// #409: rewrites the timestamps of an MP4 whose writer dropped the composition-offset table.
     /// Lives here rather than in a playback host so that every consumer of this demuxer (the fMP4
     /// producer, the segment plan, the software decoder, the still extractor) reads the same axis;
@@ -387,6 +351,16 @@ public final class Demuxer: @unchecked Sendable {
     private var deliveredByLogical: [Int32: (stream: Int32, since: Int64)] = [:]
     /// Set by `discardAllStreamsExcept`: a stream a PMT change adds without a role is discarded too.
     private var discardsUnkeptStreams = false
+    /// The streams the reader keeps (`discardAllStreamsExcept`); nil while it keeps every one.
+    private var keptStreams: Set<Int32>?
+    /// Streams read for an observer whatever the reader keeps (`observe`). Under `accessLock`.
+    private var observation: Observation?
+
+    private struct Observation {
+        var streams: Set<Int32>
+        /// Returns true once it wants no more of that packet's stream.
+        let observer: (UnsafeMutablePointer<AVPacket>) -> Bool
+    }
     /// New streams already judged (`ProgramSuccession.adopt`), successor or not.
     private var judgedStreams: Set<Int32> = []
     /// New streams judged to take no role, judged again when the programs change: the verdict can rest
@@ -723,7 +697,6 @@ public final class Demuxer: @unchecked Sendable {
         if isCloseRequested { throw DemuxerError.openFailed(code: -1) }
         self.openProfile = profile
         beginOpenTiming()
-        self.auditSource = isLive ? nil : (url, extraHeaders)
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
         if isHTTP {
@@ -735,7 +708,6 @@ public final class Demuxer: @unchecked Sendable {
                let discInfo = try DiscReader.wrap(fileReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString,
                                                   scope: beginDiscRecognition()) {
                 adoptDiscInfo(discInfo)
-                auditSource = nil
                 let bridge = CustomIOReaderBridge(reader: discInfo.reader)
                 let inputFormat = av_find_input_format(discInfo.formatHint)
                 try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
@@ -773,6 +745,7 @@ public final class Demuxer: @unchecked Sendable {
         accessLock.unlock()
         reportOpenStage(.streamsProbed)
         promoteAlternativeTransferHLG()
+        auditRecordlessDolbyVision(isLive: false)
     }
 
     /// Open a custom `IOReader` source. `formatHint` disambiguates probing when
@@ -784,7 +757,6 @@ public final class Demuxer: @unchecked Sendable {
         if isCloseRequested { throw DemuxerError.openFailed(code: -1) }
         self.openProfile = profile
         beginOpenTiming()
-        self.auditSource = nil
         if reader.discImageProbeEnabled,
            let discInfo = try DiscReader.wrap(reader, selectTitleID: selectTitleID, cacheKey: discCacheKey,
                                               scope: beginDiscRecognition()) {
@@ -829,7 +801,6 @@ public final class Demuxer: @unchecked Sendable {
                 }
                 if let discInfo {
                     adoptDiscInfo(discInfo)
-                    auditSource = nil
                     let bridge = CustomIOReaderBridge(reader: discInfo.reader)
                     let inputFormat = av_find_input_format(discInfo.formatHint)
                     do {
@@ -984,6 +955,7 @@ public final class Demuxer: @unchecked Sendable {
         accessLock.unlock()
         reportOpenStage(.streamsProbed)     // #361
         promoteAlternativeTransferHLG()
+        auditRecordlessDolbyVision(isLive: isLive)
     }
 
     /// AE#782: a producer restart just seeked here, so the reader anchors its connection at the next
@@ -1137,13 +1109,16 @@ public final class Demuxer: @unchecked Sendable {
                 inTime0Sec: inTime0, nearRawSec: Double(ctx.pointee.start_time) / Double(AV_TIME_BASE))
         }
         armGeneratedPTSSuppression(ctx)
-        if openProfile.auditsRecordlessDolbyVision, let source = auditSource {
-            let idx = av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
-            if idx >= 0, let codecpar = ctx.pointee.streams[Int(idx)]?.pointee.codecpar {
-                DolbyVisionRecordAudit.addRecordIfProfile5(
-                    codecpar: codecpar, url: source.url, extraHeaders: source.headers)
-            }
-        }
+    }
+
+    /// The recordless Dolby Vision audit (`DolbyVisionRecordAudit.addRecordIfProfile5`) at the end of an open,
+    /// from this demuxer's own first packets, which stay held for whoever reads next. Not for live, whose
+    /// head is wherever the join landed.
+    private func auditRecordlessDolbyVision(isLive: Bool) {
+        guard openProfile.auditsRecordlessDolbyVision, !isLive, let ctx = formatContext else { return }
+        let idx = av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
+        guard idx >= 0, let codecpar = ctx.pointee.streams[Int(idx)]?.pointee.codecpar else { return }
+        DolbyVisionRecordAudit.addRecordIfProfile5(codecpar: codecpar, peeking: self, streamIndex: idx)
     }
 
     /// An audio stream this build can never resolve, named so a report can say why a source came up
@@ -2017,6 +1992,11 @@ public final class Demuxer: @unchecked Sendable {
                 stream.pointee.discard = AVDISCARD_ALL
             }
         }
+        keptStreams = keep
+        // An observed stream is read for its observer whether the reader keeps it or not.
+        for i in observation?.streams ?? [] where i >= 0 && i < Int32(ctx.pointee.nb_streams) {
+            ctx.pointee.streams[Int(i)]?.pointee.discard = AVDISCARD_DEFAULT
+        }
         // A successor is read as its role's stream, so it is discarded exactly as that one is.
         discardsUnkeptStreams = true
         for (successor, logical) in succession?.logicalBySuccessor ?? [:] {
@@ -2101,6 +2081,51 @@ public final class Demuxer: @unchecked Sendable {
               let stream = ctx.pointee.streams[Int(streamIndex)] else { return nil }
         return DemuxedSampleTable(startTime: stream.pointee.start_time,
                                   duration: stream.pointee.duration, entries: Self.indexEntries(of: stream))
+    }
+
+    /// Hands every packet of `streams` this demuxer reads to `observer`, whatever its reader keeps: a stream the
+    /// reader discards is read for the observer alone and goes no further, one it keeps is delivered as well.
+    /// So a question about a stream nobody plays (is this E-AC-3 track JOC?) is answered from the reads the
+    /// session makes anyway, not by a reader of its own. `observer` runs on the reading thread with the
+    /// demuxer's lock held, and returns true once it wants no more of that packet's stream; the stream then
+    /// goes back to what the reader asked for. An observation outlives seeks; a close or `endObservation`
+    /// ends it.
+    func observe(_ streams: Set<Int32>, _ observer: @escaping (UnsafeMutablePointer<AVPacket>) -> Bool) {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let ctx = formatContext else { return }
+        let valid = streams.filter { $0 >= 0 && $0 < Int32(ctx.pointee.nb_streams) }
+        guard !valid.isEmpty else { return }
+        observation = Observation(streams: valid, observer: observer)
+        for i in valid { ctx.pointee.streams[Int(i)]?.pointee.discard = AVDISCARD_DEFAULT }
+    }
+
+    /// Ends an observation; every observed stream goes back to what the reader asked for.
+    func endObservation() {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let streams = observation?.streams else { return }
+        observation = nil
+        for stream in streams { restoreReaderDiscardLocked(stream) }
+    }
+
+    /// Whether the reader is to get `packet` once the observer has seen it. Caller holds `accessLock`.
+    private func deliverAfterObservingLocked(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
+        let stream = packet.pointee.stream_index
+        guard var current = observation, current.streams.contains(stream) else { return true }
+        if current.observer(packet) {
+            current.streams.remove(stream)
+            observation = current.streams.isEmpty ? nil : current
+            restoreReaderDiscardLocked(stream)
+        }
+        return keptStreams?.contains(stream) ?? true
+    }
+
+    /// `stream` discarded again if the reader does not keep it. Caller holds `accessLock`.
+    private func restoreReaderDiscardLocked(_ stream: Int32) {
+        guard let kept = keptStreams, !kept.contains(stream), let ctx = formatContext,
+              stream >= 0, stream < Int32(ctx.pointee.nb_streams) else { return }
+        ctx.pointee.streams[Int(stream)]?.pointee.discard = AVDISCARD_ALL
     }
 
     /// The keyframes of a transport or program stream this demuxer has read (`recordKeyframeLocked`), as
@@ -2354,6 +2379,11 @@ public final class Demuxer: @unchecked Sendable {
                 compositionRepair?.endOfStream()
                 if let held = compositionRepair?.dequeue() { return boundTimestampsLocked(held) }
                 return nil
+            }
+            if observation != nil, !deliverAfterObservingLocked(packet) {
+                var dropped: UnsafeMutablePointer<AVPacket>? = packet
+                trackedPacketFree(&dropped)
+                continue
             }
             guard let repair = armCompositionRepairIfNeeded() else { return boundTimestampsLocked(packet) }
             if !repair.ingest(packet) { return boundTimestampsLocked(packet) }
@@ -3095,6 +3125,8 @@ public final class Demuxer: @unchecked Sendable {
         programSignature.removeAll()
         deliveredByLogical.removeAll()
         discardsUnkeptStreams = false
+        keptStreams = nil
+        observation = nil
         doviLayers = nil
         foldsBluRayDolbyVisionLayers = false
         if formatContext != nil {
