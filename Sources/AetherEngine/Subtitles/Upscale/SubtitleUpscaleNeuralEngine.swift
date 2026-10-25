@@ -3,9 +3,9 @@ import CoreVideo
 import Foundation
 import Metal
 
-/// ArtCNN on the Neural Engine through Core ML (``ArtCNNCoreMLModels``), for ``SubtitleUpscaler``'s
-/// `.neuralEngine` backend. The mask, the window gather and the composite stay on the GPU; only the network moves,
-/// which leaves the GPU to the video while a subtitle upscales.
+/// ArtCNN on the Neural Engine through Core ML (``ArtCNNCoreMLModels``), for ``SubtitleUpscaler``. The mask, the
+/// window gather and the composite are GPU passes; the network runs on the Neural Engine, which leaves the GPU to the
+/// video while a subtitle upscales.
 ///
 /// The models have fixed window shapes (``SubtitleUpscaleTilePlan`` covers the kept area with them), each window a
 /// core plus the network's 7-pixel reach, transparent beyond the picture, so every core pixel is the network's exact
