@@ -482,7 +482,7 @@ In order, each step replacing a reader rather than adding one:
    - **Logs.** `[SubtitleSource] pulled stream N a-b s (k frames, from cache m)`, the narrowed taps
      (`[HLSVideoEngine] subtitle pump tap armed for streams [...]` naming the walked ones), and no
      `subwalk` reader in `[SourceLedger]` for a source whose streams are all indexed.
-4. **The I-frame playlist from the index. Built.** `IFrameKeyframeReader`
+4. **The I-frame playlist from the index, and dense stills without one. Built.** `IFrameKeyframeReader`
    (`Video/IFrameKeyframeReader.swift`, the side reader reworked) reads each keyframe one of two ways,
    settled once per session by what the index covers:
    - **The index** (Matroska's Cues, an MP4's sample entries): the keyframe is read exactly at the
@@ -497,11 +497,31 @@ In order, each step replacing a reader rather than adding one:
    request with the cool-down, asked again after it, never the demuxer route. Both routes share the
    cool-down, interrupt, close and the P7 to 8.1 conversion. The compositor preview reads through the
    same reader. Entries, eligibility, the SDR stills tier and the fragments are unchanged.
-   - Left: MPEG-TS has no I-frame rendition at all. Its plan is a uniform grid, not keyframe-aligned
-     (`planNotKeyframeAligned`), and an I-frame playlist has to list every keyframe before the first
-     scrub, which on TS only a read of the whole file finds. To be worked out separately.
-   - Left: the demuxer route still opens on the `iframe` side demuxer profile (an `AVIOReader` over
-     the shared cache), not on the exact range reader.
+   - **The demuxer route reads exact ranges.** It opens on the exact range reader over the shared source
+     cache (`AetherEngine.indexReader`), not on a streaming `AVIOReader`: a seek reads what it lands on
+     and nothing streams ahead of it. A disc title opens as the session's (its title, its cache key)
+     and seeks by its EP maps or time map.
+   - **Blu-ray titles serve their keyframes.** Their plan is keyframe-aligned on the EP maps
+     (`19f8f4bf`), so the `discSource` exclusion is gone; each keyframe is read where the EP map seek
+     lands.
+   - **A source with no keyframe list serves dense stills.** An MPEG-TS recording (or a DVD title) plans
+     on the uniform grid, and listing its keyframes before the first scrub would mean reading the whole
+     file. RFC 8216bis lets an I-frame playlist list any subset of I-frames, but each at its own
+     presentation time (4.4.3.6), and Apple's authoring specification recommends a dedicated dense
+     rendition at one frame a second (6.2), SDR on tvOS (6.16). So such a source
+     (`IFrameRenditionEligibility.Timeline.stills`, `Demuxer.seeksToTimeWithoutIndex`) lists one SDR
+     HEVC still a second (`denseStillEntries`), each the picture at its own time: the reader collects
+     the packets from the last keyframe at or before the time to the first picture at or after it
+     (`IFrameKeyframeReader.pictureRun`), the still builder decodes them and encodes that picture as an
+     intra frame (`IFrameStillBuilder.encode(run:)`, the same decoder and encoder as the HDR session's
+     SDR tier), and the master declares the stills alone with their own codec, range and size. The
+     keyframes the session's pump has read (`Demuxer.recordedKeyframes`) are adopted into the reader's
+     index and a run opens exactly on a recorded keyframe where one covers the time; elsewhere the
+     timestamp search lands near the time, and the reader steps back (1, 2, 4, 8, 16 s) until the run
+     opens before it. Tests: `IFrameDenseStillsTests` (a real session over a TS file serves six stills
+     at their times; a run opens on the last keyframe at or before its time and ends past its picture),
+     `IFrameRenditionEligibilityTests`.
+
 5. **Unindexed containers: the pump reads ahead. Built.** A subtitle stream the index does not list in
    full (a transport stream's, a disc's, a Matroska file's without subtitle Cues, a fragmented MP4's) is
    interleaved with the video, so reading it early means reading the video early; that is now the pump's

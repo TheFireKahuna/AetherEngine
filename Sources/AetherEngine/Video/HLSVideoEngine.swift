@@ -2496,24 +2496,25 @@ public final class HLSVideoEngine: @unchecked Sendable {
             requested: iFramePlaylistRequested,
             isLive: isLiveSession,
             planBoundariesClaimRandomAccess: planBoundariesClaimRandomAccess,
+            seeksToTimeWithoutIndex: dem.seeksToTimeWithoutIndex,
             sequentialOrigin: sequentialOrigin,
             heldSourceConnection: openProfile.avioHeldConnection,
             originIsSerial: sourceReopenableByURL
                 && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
-            isDiscSource: dem.isDiscSource,
             secondReaderAvailable: sourceReopenableByURL || customIFrameReader != nil,
             stillsUnavailable: !stillsAvailable))
-        // The compositor preview reads by URL only: a custom reader's clone belongs to the rendition.
+        // The compositor preview reads by URL only: a custom reader's clone belongs to the rendition. It reads
+        // the plan's keyframes, so it needs the keyframe timeline.
         previewReadsSource = previewNeedsCompositor && IFrameRenditionEligibility.candidate(.init(
             requested: true,
             isLive: isLiveSession,
             planBoundariesClaimRandomAccess: planBoundariesClaimRandomAccess,
+            seeksToTimeWithoutIndex: false,
             sequentialOrigin: sequentialOrigin,
             heldSourceConnection: openProfile.avioHeldConnection,
             originIsSerial: sourceReopenableByURL
                 && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
-            isDiscSource: dem.isDiscSource,
-            secondReaderAvailable: sourceReopenableByURL)) == .served
+            secondReaderAvailable: sourceReopenableByURL)) == .served(.keyframes)
         let hasNativeSubs = enableNativeSubtitleTrackForSession && !nativeSubtitleCueStoresForSession.isEmpty
         // AE#187: tvOS HW HEVC needs the codec advertised in a master's CODECS attribute; a bare media
         // playlist (H.264 is fine media-direct) fails the item with tracks count=0 / -12848. Scope to
@@ -2532,7 +2533,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             frameRateKnown: frameRate != nil,
             videoCodecNeedsMasterSignaling: videoCodecNeedsMasterSignaling,
             hasAudioRendition: servedAudioLanguage != nil || servedAudioIsAtmosStreamCopy,
-            hasIFrameRendition: iFrameCandidate == .served)
+            hasIFrameRendition: iFrameCandidate.isServed)
         let resolvedURL: URL? = useMasterPlaylist
             ? srv.playlistURL
             : srv.mediaPlaylistURL
@@ -2543,8 +2544,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.servingMasterPlaylist = useMasterPlaylist
         iFrameRenditionVerdict = IFrameRenditionEligibility.resolve(
             candidate: iFrameCandidate, servingMaster: useMasterPlaylist)
-        if iFrameRenditionVerdict == .served,
-           let rendition = makeIFrameRendition(plan: plan, cache: segmentCache,
+        if case .served(let timeline) = iFrameRenditionVerdict,
+           let rendition = makeIFrameRendition(plan: plan, timeline: timeline, cache: segmentCache,
                                                sourceIsHDR: videoRange != .sdr || dvVariant != .none) {
             iFrameRendition = rendition
             prov.setIFrameSource(rendition)
@@ -2554,7 +2555,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                            + "sdrCompanion=\(rendition.companionFormat?.logName ?? "none")", category: .session)
         } else if iFramePlaylistRequested {
             closeUnusedCustomIFrameReader()
-            if iFrameRenditionVerdict == .served { iFrameRenditionVerdict = .absent(.noSecondReader) }
+            if iFrameRenditionVerdict.isServed { iFrameRenditionVerdict = .absent(.noSecondReader) }
             if case .absent(let reason) = iFrameRenditionVerdict {
                 EngineLog.emit("[HLSVideoEngine] i-frame rendition: absent reason=\(reason.rawValue)",
                                category: .session)
@@ -3341,10 +3342,54 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// The keyframes are always served with their own range, so the main player scans on them in HDR. An HDR
     /// source adds the SDR HEVC stills tvOS requires (`IFrameStillBuilder`): AVKit's scrub thumbnail player is
-    /// capped at SDR and takes the lowest video range on offer.
-    private func makeIFrameRendition(plan: [Segment], cache segmentCache: SegmentCache,
-                                     sourceIsHDR: Bool) -> IFrameRendition? {
+    /// capped at SDR and takes the lowest video range on offer. A source with no keyframe list
+    /// (`Timeline.stills`) serves those SDR stills alone, one a second, each the picture at its time.
+    private func makeIFrameRendition(plan: [Segment], timeline: IFrameRenditionEligibility.Timeline,
+                                     cache segmentCache: SegmentCache, sourceIsHDR: Bool) -> IFrameRendition? {
         guard let cfg = savedVideoConfig, !plan.isEmpty else { return nil }
+        let par = cfg.codecpar.pointee
+        // The decoder reads the samples as the session serves them: Annex B ones with the source's own
+        // extradata, length-prefixed ones with the record the muxer writes.
+        func makeStillBuilder() -> IFrameStillBuilder? {
+            guard let size = IFrameStillBuilder.size(
+                codedWidth: Int(par.width), codedHeight: Int(par.height),
+                sarNum: par.sample_aspect_ratio.num, sarDen: par.sample_aspect_ratio.den) else { return nil }
+            return IFrameStillBuilder(
+                decoder: FrameDecodeContext(streamParameters: cfg.codecpar, timeBase: cfg.timeBase,
+                                            extradata: cfg.convertsAnnexBSamples ? nil : cfg.extradataOverride),
+                width: size.width, height: size.height)
+        }
+        func stillsFormat(_ still: IFrameStillBuilder, entries: [IFrameRendition.Entry]) -> IFrameRenditionFormat {
+            let durations = entries.map(\.durationSeconds).filter { $0 > 0 }
+            let shortest = durations.min() ?? 1
+            let mean = durations.isEmpty ? 1 : durations.reduce(0, +) / Double(durations.count)
+            return .sdrStills(width: still.width, height: still.height, codecs: still.codecs,
+                              bandwidth: IFrameStillBuilder.bandwidth(shortestSegmentSeconds: shortest),
+                              averageBandwidth: IFrameStillBuilder.averageBandwidth(meanSegmentSeconds: mean))
+        }
+        // The keyframe reader owns the clone from here; `stop()` must not close it a second time.
+        let custom = customIFrameReader
+        customIFrameReader = nil
+
+        if timeline == .stills {
+            guard let still = makeStillBuilder() else {
+                custom?.reader.close()
+                return nil
+            }
+            let entries = Self.denseStillEntries(plan: plan, timeBaseSeconds: sourceVideoTbSeconds)
+            // The read is the picture's run, decoded and encoded on the rendition's queue, so what the cache
+            // keeps per entry is the still itself.
+            return makeKeyframeRendition(
+                config: cfg, entries: entries, cache: IFramePayloadCache(), format: stillsFormat(still, entries: entries),
+                read: { reader, entry in reader.pictureRun(atPts: entry.startPts).flatMap { still.encode(run: $0) } },
+                buildFragment: { sample, index, entry in
+                    let built = still.output(sample: sample, index: index, startSeconds: entry.startSeconds,
+                                             durationSeconds: entry.durationSeconds)
+                    return IFrameFragmentBuilder.Output(initSegment: built.initSegment, fragment: built.fragment)
+                },
+                custom: custom)
+        }
+
         // Fragments are muxed in memory and payloads cached in memory: nothing here is written to disk, so
         // the directory below is only the name the muxer is given, never created.
         let staging = segmentCache.sessionDir.appendingPathComponent("iframes", isDirectory: true)
@@ -3364,31 +3409,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
         var companion: (format: IFrameRenditionFormat,
                         build: (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?)?
-        let par = cfg.codecpar.pointee
-        if sourceIsHDR, let size = IFrameStillBuilder.size(
-            codedWidth: Int(par.width), codedHeight: Int(par.height),
-            sarNum: par.sample_aspect_ratio.num, sarDen: par.sample_aspect_ratio.den),
-           // The decoder reads the samples as the session serves them: Annex B ones with the source's own
-           // extradata, length-prefixed ones with the record the muxer writes.
-           let still = IFrameStillBuilder(
-            decoder: FrameDecodeContext(streamParameters: cfg.codecpar, timeBase: cfg.timeBase,
-                                        extradata: cfg.convertsAnnexBSamples ? nil : cfg.extradataOverride),
-            width: size.width, height: size.height) {
-            let durations = entries.map(\.durationSeconds).filter { $0 > 0 }
-            let shortest = durations.min() ?? 1
-            let mean = durations.isEmpty ? 1 : durations.reduce(0, +) / Double(durations.count)
-            companion = (.sdrStills(width: still.width, height: still.height, codecs: still.codecs,
-                                    bandwidth: IFrameStillBuilder.bandwidth(shortestSegmentSeconds: shortest),
-                                    averageBandwidth: IFrameStillBuilder.averageBandwidth(meanSegmentSeconds: mean)),
+        if sourceIsHDR, let still = makeStillBuilder() {
+            companion = (stillsFormat(still, entries: entries),
                          { payload, index, entry in
                              still.build(payload: payload, index: index, startSeconds: entry.startSeconds,
                                          durationSeconds: entry.durationSeconds)
                                  .map { IFrameFragmentBuilder.Output(initSegment: $0.initSegment, fragment: $0.fragment) }
                          })
         }
-        // The keyframe reader owns the clone from here; `stop()` must not close it a second time.
-        let custom = customIFrameReader
-        customIFrameReader = nil
         return makeKeyframeRendition(
             config: cfg, entries: entries,
             cache: IFramePayloadCache(),
@@ -3403,6 +3431,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         entries: [IFrameRendition.Entry],
         cache: IFramePayloadCache,
         format: IFrameRenditionFormat,
+        read: @escaping (IFrameKeyframeReader, IFrameRendition.Entry) -> Data? = { reader, entry in
+            reader.payload(startPts: entry.startPts)
+        },
         buildFragment: @escaping (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?,
         companion: (format: IFrameRenditionFormat,
                     build: (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?)? = nil,
@@ -3412,7 +3443,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             codec: cfg.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC ? .hevc : .h264,
             extradata: cfg.codecpar.pointee.extradata.map { UnsafePointer($0) },
             size: Int(cfg.codecpar.pointee.extradata_size))
-        let url = sourceURL, headers = sourceHTTPHeaders, headerStore = requestHeaders
+        let url = sourceURL, headerStore = requestHeaders
         let positions: [Int64: Int64] = demuxer.map { dem in
             Dictionary(dem.indexedKeyframeEntries(streamIndex: dem.videoStreamIndex).map { ($0.pts, $0.pos) },
                        uniquingKeysWith: { first, _ in first })
@@ -3425,15 +3456,31 @@ public final class HLSVideoEngine: @unchecked Sendable {
                                                       custom: custom?.reader)
             },
             position: { positions[$0] },
+            // Over exact range reads of the source, through the source cache: a seek reads what it lands
+            // on and nothing streams ahead of it. A disc title is opened as the session's.
             open: { dem in
+                let title = session?.selectedDiscTitleID
                 if let custom {
-                    try dem.open(reader: custom.reader, formatHint: custom.formatHint,
-                                 profile: .iFrameSideDemuxer)
-                } else {
-                    try dem.open(url: url, extraHeaders: headers,
-                                 profile: DemuxerOpenProfile.iFrameSideDemuxer.withRequestHeaders(headerStore),
-                                 isLive: false)
+                    try dem.open(reader: custom.reader, formatHint: custom.formatHint, profile: .iFrameSideDemuxer,
+                                 selectTitleID: title, discCacheKey: url.absoluteString)
+                    return {}
                 }
+                guard let reader = AetherEngine.indexReader(url: url, headers: headerStore.current, label: "iframe",
+                                                            requestTimeout: 8, maxRetries: 1) else {
+                    throw DemuxerError.openFailed(code: -1)
+                }
+                do {
+                    try dem.open(reader: reader, profile: .iFrameSideDemuxer, selectTitleID: title,
+                                 discCacheKey: url.absoluteString)
+                } catch {
+                    reader.close()
+                    throw error
+                }
+                return { reader.close() }
+            },
+            knownKeyframes: { [weak session] in
+                guard let session else { return [] }
+                return session.recordedKeyframes(streamIndex: session.videoStreamIndex)
             },
             cleanup: { custom?.reader.close() },
             convertP7ToProfile81: cfg.convertP7ToProfile81,
@@ -3442,7 +3489,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             entries: entries,
             cache: cache,
             format: format,
-            readPayload: { reader.payload(startPts: $0.startPts) },
+            readPayload: { read(reader, $0) },
             buildFragment: buildFragment,
             companion: companion,
             waitForLink: { [weak self] shouldStop in

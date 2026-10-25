@@ -1880,7 +1880,15 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         lines.append("#EXT-X-STREAM-INF:\(streamInfAttrs.joined(separator: ","))")
         lines.append("media.m3u8")
-        if provider.iFrameRenditionServed {
+        if case .sdrStills(let width, let height, let stillCodecs, let peak, let average)? = provider.iFrameRenditionFormat {
+            // A source with no keyframe list lists its dense SDR stills alone: they are not the variant's
+            // pictures, so they declare their own codec, range and size, as the companion tier below does.
+            var attrs = ["AVERAGE-BANDWIDTH=\(average)", "BANDWIDTH=\(peak)", "VIDEO-RANGE=SDR",
+                         "CODECS=\"\(stillCodecs)\"", "RESOLUTION=\(width)x\(height)"]
+            if provider.masterHDCPLevel != nil { attrs.append("HDCP-LEVEL=NONE") }
+            attrs.append("URI=\"iframe.m3u8\"")
+            lines.append("#EXT-X-I-FRAME-STREAM-INF:\(attrs.joined(separator: ","))")
+        } else if provider.iFrameRenditionServed {
             // AE#682: BANDWIDTH is the variant's, an honest ceiling (one keyframe cannot outweigh the
             // segment it opens). A value below the real peak logs -12318 on every fetch.
             var iFrameAttrs: [String] = []

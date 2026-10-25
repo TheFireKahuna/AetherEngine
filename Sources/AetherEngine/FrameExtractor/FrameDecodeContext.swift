@@ -648,30 +648,52 @@ final class FrameDecodeContext: @unchecked Sendable {
         logOpened(codecpar: codecpar, codec: codec, hardware: hardware ? "videotoolbox" : "none")
     }
 
-    /// One keyframe handed over whole (packet-fed contexts), decoded. The decoder stays open between stills and is
-    /// flushed after each. nil on a failure.
-    private func decodeKeyframe<T>(_ payload: Data, _ body: (UnsafeMutablePointer<AVFrame>) -> T?) -> T? {
-        guard isOpen, let ctx = codecContext, streamParameters != nil, !payload.isEmpty,
-              payload.count <= Int(Int32.max) else { return nil }
+    /// Packets handed over whole (packet-fed contexts), decoded in order and drained, and the picture at
+    /// `targetPts` taken from what comes out; with no target, the first. A keyframe alone is a run of one.
+    /// The decoder stays open between stills and is flushed after each. nil on a failure.
+    private func decodePicture<T>(_ run: [IFrameKeyframeReader.PictureRun.Packet], targetPts: Int64?,
+                                  _ body: (UnsafeMutablePointer<AVFrame>) -> T?) -> T? {
+        guard isOpen, let ctx = codecContext, streamParameters != nil, !run.isEmpty else { return nil }
         avcodec_flush_buffers(ctx)
         defer { avcodec_flush_buffers(ctx) }
         ctx.pointee.skip_frame = AVDISCARD_DEFAULT
-        var packet = av_packet_alloc()
-        defer { av_packet_free(&packet) }
-        guard let packet, av_new_packet(packet, Int32(payload.count)) == 0,
-              let dst = packet.pointee.data else { return nil }
-        payload.copyBytes(to: dst, count: payload.count)
-        packet.pointee.flags = AV_PKT_FLAG_KEY
-        packet.pointee.pts = 0
-        packet.pointee.dts = 0
-        guard avcodec_send_packet(ctx, packet) >= 0 else { return nil }
-        // The context is frame-threaded: a lone keyframe only comes out once the decoder is drained.
-        avcodec_send_packet(ctx, nil)
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
         defer { av_frame_free(&frame) }
-        guard let frame, avcodec_receive_frame(ctx, frame) >= 0 else { return nil }
-        colourFill.fill(frame)
-        return body(frame)
+        guard let frame else { return nil }
+        // The picture wanted: the target's, or the first out. Taken as it is received, since the next
+        // receive reuses the frame.
+        var result: T?
+        func receive() -> Bool {
+            while avcodec_receive_frame(ctx, frame) >= 0 {
+                defer { av_frame_unref(frame) }
+                if let targetPts, frame.pointee.pts != Int64.min, frame.pointee.pts != targetPts { continue }
+                colourFill.fill(frame)
+                result = body(frame)
+                return true
+            }
+            return false
+        }
+        for item in run {
+            guard !item.data.isEmpty, item.data.count <= Int(Int32.max) else { return nil }
+            var packet = av_packet_alloc()
+            defer { av_packet_free(&packet) }
+            guard let packet, av_new_packet(packet, Int32(item.data.count)) == 0,
+                  let dst = packet.pointee.data else { return nil }
+            item.data.copyBytes(to: dst, count: item.data.count)
+            packet.pointee.flags = item.isKeyframe ? AV_PKT_FLAG_KEY : 0
+            packet.pointee.pts = item.pts
+            packet.pointee.dts = item.dts
+            guard avcodec_send_packet(ctx, packet) >= 0 else { continue }
+            if receive() { return result }
+        }
+        // The context is frame-threaded: the last pictures only come out once the decoder is drained.
+        avcodec_send_packet(ctx, nil)
+        _ = receive()
+        return result
+    }
+
+    private func decodeKeyframe<T>(_ payload: Data, _ body: (UnsafeMutablePointer<AVFrame>) -> T?) -> T? {
+        decodePicture([.init(data: payload, pts: 0, dts: 0, isKeyframe: true)], targetPts: nil, body)
     }
 
     /// Packet-fed contexts, Dolby Vision profile 5 / 10.0: one keyframe to the converter's image (the I-frame tier
@@ -681,6 +703,14 @@ final class FrameDecodeContext: @unchecked Sendable {
         return decodeKeyframe(payload) { makeImage($0, mode: .thumbnail, targetWidth: targetWidth, maxSize: nil) }
     }
 
+    /// `decodeStill` for a dense still: the run's target picture.
+    func decodeStill(run: IFrameKeyframeReader.PictureRun, targetWidth: Int) -> CGImage? {
+        guard Self.yieldsStill(dolbyVisionNoBaseLayer: isDolbyVisionNoBaseLayer) else { return nil }
+        return decodePicture(run.packets, targetPts: run.targetPts) {
+            makeImage($0, mode: .thumbnail, targetWidth: targetWidth, maxSize: nil)
+        }
+    }
+
     /// Packet-fed contexts: one keyframe as the still the I-frame tier encodes, `width` x `height` in 10-bit 4:2:0
     /// mapped to `destination` (BT.709 there: an HDR picture takes Apple's own curve). The display buffer is
     /// VideoToolbox's or the finisher's; nothing touches the pixels on the CPU. nil for Dolby Vision profile 5 / 10.0,
@@ -688,11 +718,23 @@ final class FrameDecodeContext: @unchecked Sendable {
     func decodeScaledStill(keyframe payload: Data, width: Int, height: Int,
                            destination: ColorAttachments.Tags) -> CVPixelBuffer? {
         guard !isDolbyVisionNoBaseLayer else { return nil }
-        return decodeKeyframe(payload) { frame in
-            displayBuffer(frame).flatMap {
-                renderer.render($0, width: width, height: height,
-                                pixelFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, destination: destination)
-            }
+        return decodeKeyframe(payload) { scaled($0, width: width, height: height, destination: destination) }
+    }
+
+    /// `decodeScaledStill` for a dense still: the run's target picture.
+    func decodeScaledStill(run: IFrameKeyframeReader.PictureRun, width: Int, height: Int,
+                           destination: ColorAttachments.Tags) -> CVPixelBuffer? {
+        guard !isDolbyVisionNoBaseLayer else { return nil }
+        return decodePicture(run.packets, targetPts: run.targetPts) {
+            scaled($0, width: width, height: height, destination: destination)
+        }
+    }
+
+    private func scaled(_ frame: UnsafeMutablePointer<AVFrame>, width: Int, height: Int,
+                        destination: ColorAttachments.Tags) -> CVPixelBuffer? {
+        displayBuffer(frame).flatMap {
+            renderer.render($0, width: width, height: height,
+                            pixelFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, destination: destination)
         }
     }
 

@@ -2044,6 +2044,18 @@ public final class Demuxer: @unchecked Sendable {
         return mapsIndexed ? .presentation : PlanBoundaryAxis.forContainer(formatName: containerFormatName)
     }
 
+    /// Whether a seek to a time lands without the container's index: a transport or program stream
+    /// searches its timestamps (bounded by the keyframes read, `recordKeyframeLocked`), a disc title looks
+    /// its EP maps or time map up. Any other container without an index would read up to the target.
+    var seeksToTimeWithoutIndex: Bool {
+        accessLock.lock()
+        let mapped = discSeekTable != nil || dvdTimeMap != nil
+        accessLock.unlock()
+        if mapped { return true }
+        let names = containerFormatName.map { $0.split(separator: ",") } ?? []
+        return (names.contains("mpegts") || names.contains("mpegps")) && isSourceSeekable
+    }
+
     /// `indexedKeyframes` with each entry's byte position in the source (AE#783), -1 where the index
     /// has none. Matroska stores the position of the Cluster that holds the keyframe; a Blu-ray title's
     /// entries are its EP maps' (`DiscSeekTable.titleKeyframes`).
@@ -2089,6 +2101,50 @@ public final class Demuxer: @unchecked Sendable {
               let stream = ctx.pointee.streams[Int(streamIndex)] else { return nil }
         return DemuxedSampleTable(startTime: stream.pointee.start_time,
                                   duration: stream.pointee.duration, entries: Self.indexEntries(of: stream))
+    }
+
+    /// The keyframes of a transport or program stream this demuxer has read (`recordKeyframeLocked`), as
+    /// libavformat holds them (position, decode time), for another demuxer of the same source to adopt.
+    /// Empty for every other container, whose index is its own.
+    func recordedKeyframes(streamIndex: Int32) -> [DemuxedSampleTable.Entry] {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard recordsKeyframes == true, let ctx = formatContext, streamIndex >= 0,
+              streamIndex < Int32(ctx.pointee.nb_streams),
+              let stream = ctx.pointee.streams[Int(streamIndex)] else { return [] }
+        return Self.indexEntries(of: stream).filter { $0.flags & AVINDEX_KEYFRAME != 0 }
+    }
+
+    /// Repositions on a keyframe whose byte position this demuxer's index holds (`recordedKeyframes`): a
+    /// transport stream's timestamp search lands near a time, not on a keyframe, and only a recorded one
+    /// names where a keyframe begins.
+    @discardableResult
+    func seek(toRecordedKeyframeAt position: Int64) -> Bool {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let ctx = formatContext, isSourceSeekable, position >= 0 else { return false }
+        noteSeekLocked()
+        dropPeekedPacketsLocked()
+        let ret = avformat_seek_file(ctx, -1, position, position, position, AVSEEK_FLAG_BYTE)
+        avformat_flush(ctx)
+        resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
+        lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
+        return ret >= 0
+    }
+
+    /// Keyframes another demuxer of the same source read (`recordedKeyframes`), added to this one's index,
+    /// within libavformat's index budget, so a seek between two of them is bounded by them
+    /// (`ff_seek_frame_binary`) instead of searching the file.
+    func adoptRecordedKeyframes(_ entries: [DemuxedSampleTable.Entry], streamIndex: Int32) {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let ctx = formatContext, streamIndex >= 0, streamIndex < Int32(ctx.pointee.nb_streams),
+              let stream = ctx.pointee.streams[Int(streamIndex)] else { return }
+        let budget = Int(ctx.pointee.max_index_size) / MemoryLayout<AVIndexEntry>.stride
+        for entry in entries where entry.pos >= 0 {
+            guard Int(avformat_index_get_entries_count(stream)) < budget else { return }
+            av_add_index_entry(stream, entry.pos, entry.timestamp, 0, 0, AVINDEX_KEYFRAME)
+        }
     }
 
     /// libavformat's index of `stream`, entry by entry. Callers hold `accessLock`.
