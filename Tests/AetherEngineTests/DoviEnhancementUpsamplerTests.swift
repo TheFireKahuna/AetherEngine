@@ -14,9 +14,9 @@ struct DoviEnhancementUpsamplerTests {
 
     typealias H = DoviGpuCurveSweepTests
 
-    /// BL luma constant 512 (VDR 2048), EL luma `elColumn(x)` at half resolution, residual scale 2048: the
-    /// output is 2048 + floor((2|r| - 1) * 2048 / 4096) with r = el - 512, i.e. |r| - 1 for the codes used here
-    /// (|r| of 88 or more is far from the half-step rounding), and the first row is returned.
+    /// BL luma constant 512 (v = 512 << 6), EL luma `elColumn(x)` at half resolution, residual scale 2048: the
+    /// 16-bit residual is 16 r - 8 with r = el - 512 (CCM 001 5.4.3.2), so the 12-bit sample is
+    /// (2048 * 16 + 16 r - 8 + 8) >> 4 = 2048 + r for the positive r used here. The first row is returned.
     private func composeLuma(elColumn: (Int) -> Int) throws -> [Int] {
         let composer = try #require(DoviFelComposer.p010ForTesting())
         var p = DoviGpuEdgeCaseTests.params(nlqY: DoviGpuEdgeCaseTests.nlq(vdrInMax: 4095))
@@ -31,9 +31,9 @@ struct DoviEnhancementUpsamplerTests {
         return Array(DoviTestSupport.rawVDR(out)[0][0..<64])
     }
 
-    /// Residual in VDR codes for an EL code, from the DoViBaker formula (positive side): ((2r - 1) * 2048) >> 12.
+    /// The 12-bit residual for an EL code above the offset: r - 1/2, rounded half up once with the prediction.
     private func residual(_ el: Int) -> Double {
-        Double(((2 * (el - 512) - 1) * 2048) >> 12)
+        Double(el - 512)
     }
 
     @Test("a linear EL ramp is reproduced between EL texel centres, one bilinear step per base-layer pixel")
@@ -42,7 +42,7 @@ struct DoviEnhancementUpsamplerTests {
         let row = try composeLuma { 600 + 4 * $0 }
         for gx in 2..<62 {
             let elValue = 600.0 + 4.0 * (Double(gx) / 2.0 - 0.25)
-            let expected = 2048.0 + (elValue - 512.0) - 0.5     // linear in el: |r| - 1/2
+            let expected = 2048.0 + (elValue - 512.0)     // linear in el: r - 1/2, rounded half up
             #expect(abs(Double(row[gx]) - expected) <= 1.5, "gx \(gx): \(row[gx]) vs \(expected)")
         }
     }
@@ -68,8 +68,8 @@ struct DoviEnhancementUpsamplerTests {
 
         /// EL code at base chroma index n along an axis of `elCount` texels, clamped at the far edge.
         func elAt(_ n: Int, _ elCount: Int) -> Double { 600.0 + 16.0 * min(Double(n) / 2.0, Double(elCount - 1)) }
-        /// 2048 + ((2r - 1) * 2048) >> 12 = 2048 + r - 1 for the positive r used here.
-        func vdr(_ e: Double) -> Int { 2048 + Int(e.rounded()) - 512 - 1 }
+        /// 2048 + r for the positive r used here (16 r - 8 at 16 bits, rounded once).
+        func vdr(_ e: Double) -> Int { 2048 + Int(e.rounded()) - 512 }
 
         for y in 0..<8 {
             for x in 0..<32 {
@@ -95,14 +95,14 @@ struct DoviEnhancementUpsamplerTests {
     func lumaHalfRoundsUp() throws {
         // Columns alternate 602 / 600: at the 2:1 quarter weights every base pixel lands on x.5
         // (0.25 * 602 + 0.75 * 600 = 600.5, 0.75 * 602 + 0.25 * 600 = 601.5). Ties-to-even would give 600 and
-        // 602, half up gives 601 and 602. Above 512 the residual here is code - 513.
+        // 602, half up gives 601 and 602. Above 512 the residual here is code - 512.
         let column: (Int) -> Int = { $0 % 2 == 0 ? 602 : 600 }
         let row = try composeLuma(elColumn: column)
         for gx in 0..<64 {
-            let want = 2048 + exactLumaCode(gx, column) - 513
+            let want = 2048 + exactLumaCode(gx, column) - 512
             #expect(row[gx] == want, "gx \(gx): \(row[gx]) vs \(want)")
         }
-        #expect(row.contains(2048 + 601 - 513), "the 600.5 sites round up to 601")
+        #expect(row.contains(2048 + 601 - 512), "the 600.5 sites round up to 601")
     }
 
     @Test("chroma: a half-way EL code rounds up")
@@ -124,7 +124,7 @@ struct DoviEnhancementUpsamplerTests {
             let n = x / 2
             let code: Int
             if x % 2 == 0 { code = n % 2 == 0 ? 601 : 600 } else { code = n + 1 > 15 ? (n % 2 == 0 ? 601 : 600) : 601 }
-            #expect(cb[x] == 2048 + code - 513, "Cb \(x): \(cb[x]) vs \(2048 + code - 513)")
+            #expect(cb[x] == 2048 + code - 512, "Cb \(x): \(cb[x]) vs \(2048 + code - 512)")
         }
     }
 

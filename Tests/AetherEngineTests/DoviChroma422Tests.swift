@@ -56,11 +56,8 @@ struct DoviChroma422Tests {
         return out
     }
 
-    /// The model's clamped VDR as the sv22 full-precision word (`dovi_full_precision`, chroma 64...960).
-    static func word(_ vdr: Int, _ p: DoviMetalParams) -> Int {
-        let s = Int(p.vdrScale)
-        return min(max((vdr * 64 + s / 2) / s, 64 << 6), 960 << 6)
-    }
+    /// The model's 16-bit sum as the sv22 word (`dovi_full_precision`: h clamped to chroma 64...960 << 6).
+    static func word(_ h: Int) -> Int { min(max(h, 64 << 6), 960 << 6) }
 
     @Test("sv22 4:2:2-site chroma: the GPU matches the CPU model on real RPU coefficient sets",
           arguments: DoviChroma422Tests.realParams().map(\.0), DoviChroma422Tests.sitings)
@@ -79,19 +76,18 @@ struct DoviChroma422Tests {
         let blP = M.plane(bl, 0, components: 1), blUV = M.plane(bl, 1, components: 2)
         let elUV = M.plane(el, 1, components: 2), g = M.plane(out, 1, components: 2)
         var cb = M.Stat(), cr = M.Stat()
-        let unit = 64 / Int(p.vdrScale)   // full-precision word steps per VDR code
         for row in 0..<h {
             for x in 0..<(w / 2) {
-                let (mcb, mcr) = model.chroma422(bl: blP, blUV: blUV, elUV: elUV, x: x, row: row)
-                cb.add((Self.word(mcb, p) - Int(g.word(x, row, 0))) / unit)
-                cr.add((Self.word(mcr, p) - Int(g.word(x, row, 1))) / unit)
+                let (mcb, mcr) = model.chroma422Sum(bl: blP, blUV: blUV, elUV: elUV, x: x, row: row)
+                cb.add(Self.word(mcb) - Int(g.word(x, row, 0)))
+                cr.add(Self.word(mcr) - Int(g.word(x, row, 1)))
             }
         }
         print("[422] \(name) loc \(location): Cb \(cb.description)")
         print("[422] \(name) loc \(location): Cr \(cr.description)")
+        // Both sides are the spec's fixed point on the same Q20 inputs: the 16-bit words agree exactly.
         for (label, st) in [("Cb", cb), ("Cr", cr)] {
-            #expect(st.over1Pct < 0.5, "\(label): \(st.description)")
-            #expect(st.exactPct > 90, "\(label): \(st.description)")
+            #expect(st.exact == st.n, "\(label): \(st.description)")
         }
     }
 
@@ -135,9 +131,9 @@ struct DoviChroma422Tests {
             #expect(new.word(x, 16, 0) != new.word(x, 17, 0) || new.word(x, 16, 1) != new.word(x, 17, 1),
                     "x \(x): rows 16 and 17 share their chroma")
             for row in [16, 17] {
-                let (mcb, mcr) = model.chroma422(bl: blP, blUV: blUV, elUV: elUV, x: x, row: row)
-                #expect(abs(Self.word(mcb, p) - Int(new.word(x, row, 0))) <= 16, "Cb (\(x), \(row))")
-                #expect(abs(Self.word(mcr, p) - Int(new.word(x, row, 1))) <= 16, "Cr (\(x), \(row))")
+                let (mcb, mcr) = model.chroma422Sum(bl: blP, blUV: blUV, elUV: elUV, x: x, row: row)
+                #expect(Self.word(mcb) == Int(new.word(x, row, 0)), "Cb (\(x), \(row))")
+                #expect(Self.word(mcr) == Int(new.word(x, row, 1)), "Cr (\(x), \(row))")
             }
         }
         print("[422] edge: Cb words row 16 \(Int(new.word(5, 16, 0))) row 17 \(Int(new.word(5, 17, 0))), duplicated \(Int(old.word(5, 16, 0)))")
@@ -146,8 +142,8 @@ struct DoviChroma422Tests {
     @Test("top and bottom rows clamp to the edge chroma rows: exact against the model, no out-of-bounds reads",
           arguments: [16, 4], DoviChroma422Tests.allLocations)
     func edgeRowsClamp(height: Int, location: UInt32) throws {
-        // Identity curves are exact on the interpolated fraction (n / 128 codes times 4), so every sample must
-        // match exactly; an out-of-range row read as 0 would pull the edge rows far down.
+        // Identity curves are exact on the interpolated fraction (n / 128 codes, times 64 in the 16-bit sum), so
+        // every sample must match exactly; an out-of-range row read as 0 would pull the edge rows far down.
         var p = DoviGpuEdgeCaseTests.params()
         p.blChromaLocation = location
         let (bl, el) = try Self.buffers(width: 64, height: height,
@@ -159,8 +155,8 @@ struct DoviChroma422Tests {
         var mismatches = 0
         for row in 0..<height {
             for x in 0..<32 {
-                let (mcb, mcr) = model.chroma422(bl: blP, blUV: blUV, elUV: elUV, x: x, row: row)
-                if Self.word(mcb, p) != Int(out.word(x, row, 0)) || Self.word(mcr, p) != Int(out.word(x, row, 1)) {
+                let (mcb, mcr) = model.chroma422Sum(bl: blP, blUV: blUV, elUV: elUV, x: x, row: row)
+                if Self.word(mcb) != Int(out.word(x, row, 0)) || Self.word(mcr) != Int(out.word(x, row, 1)) {
                     mismatches += 1
                 }
             }
@@ -191,7 +187,7 @@ struct DoviChroma422Tests {
         #expect(differ == 0, "\(name) location \(location): \(differ) on-site samples differ from the 4:2:0 composition")
 
         // The other rows sit half way between two chroma rows: (-1, 9, 9, -1) / 16. Identity curves and no
-        // residual make the VDR code exactly 4 x the interpolated chroma, rounded to even.
+        // residual make the 16-bit sum exactly 64 x the interpolated chroma.
         var q = DoviGpuEdgeCaseTests.params(flags: [.disableResidual])
         q.blChromaLocation = location
         let ident = M.plane(try Self.sv22(bl, el, q), 1, components: 2)
@@ -203,8 +199,8 @@ struct DoviChroma422Tests {
             for x in 0..<(w / 2) {
                 for comp in 0..<2 {
                     let v = (-c(x, k - 1, comp) + 9 * c(x, k, comp) + 9 * c(x, k + 1, comp) - c(x, k + 2, comp)) / 16
-                    let vdr = Int((min(max(v, 0), 1023) * 4).rounded(.toNearestOrEven))
-                    if Self.word(vdr, q) != Int(ident.word(x, row, comp)) { wrong += 1 }
+                    let h = Int(min(max(v, 0), 1023) * 64)
+                    if Self.word(h) != Int(ident.word(x, row, comp)) { wrong += 1 }
                 }
             }
         }

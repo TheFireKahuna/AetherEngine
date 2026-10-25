@@ -239,199 +239,120 @@ static inline float dovi_dither(uint2 gid, uint frame_index, uint2 phase) {
    Reshaping curve evaluation
    ========================================================================= */
 
-// Index of the piece owning bl_val: the last pivot that bl_val reaches.
-// Deliberately last-match-wins rather than first, because adjacent pivots can
-// repeat (a zero-width piece) and the spec assigns the sample to the later one.
-static inline int dovi_select_piece(constant struct DoviPolynomialParams &curve, int bl_val) {
+// The composition arithmetic is ETSI GS CCM 001's fixed point, clause by clause:
+// - a base-layer value s enters as t = s << (20 - BL_bit_depth), Q20 of s / 2^BL_bit_depth (5.4.2.3.2's
+//   `ss << shift`, 5.4.2.3.3's tt[1..3]), and a product of two terms is taken back to Q20 with >> 20. For integer
+//   s that is the spec's own term (s0 * s1 << (20 - 2 * BL_bit_depth) is (t0 * t1) >> 20 exactly);
+// - a prediction v is the 16-bit `vv >> (4 + coefficient_log2_denom)`, negative sums 0, capped at 0xffff;
+// - the residual r is 5.4.3.2's 16-bit value (`DoviFelComposer.inverseNlq`, tabulated per EL code);
+// - v + r is kept whole until the output is written (dovi_reconstruct and the writers below).
+// The 4:2:2 kernel's interpolated base chroma is a multiple of 1/128 of a code, which Q20 holds exactly, so it
+// runs the same arithmetic on its fractional values.
+
+// Q20 shift for a base-layer code: 20 - BL_bit_depth.
+static inline uint dovi_q20_shift(uint bl_max) {
+    return 20u - (32u - clz(bl_max));
+}
+
+// Index of the piece owning t: the last pivot that t reaches. 5.4.2.2 takes the first piece whose next pivot is
+// above s, which is the same piece, a zero-width piece (two equal pivots) included: both give the later one. Past
+// the last pivot the spec's index runs one beyond the pieces; the value is clamped to that pivot anyway, so the
+// last piece is the one that applies.
+static inline int dovi_select_piece(constant struct DoviPolynomialParams &curve, long t, uint shift) {
     int last_piece = int(curve.num_pivots) - 2;
     int piece = 0;
     for (int i = 0; i <= last_piece; ++i) {
-        if (bl_val >= int(curve.pivots[i])) {
+        if (t >= (long(curve.pivots[i]) << shift)) {
             piece = i;
         }
     }
     return clamp(piece, 0, max(last_piece, 0));
 }
 
-// Polynomial piece, evaluated on the input normalised by `bl_max`. Callers pass
-// bl_max + 1 (= 2^bl_bit_depth), the same normaliser as the y/u/v inputs.
-// Returns the prediction in normalised units; dovi_denormalize clamps it to [0, vdr_max] before the
-// residual is added (DoViBaker clamps `vv`/`rr` to [0, 0xffff] there), and the sum is clamped again afterwards.
-static inline float dovi_eval_poly(
-    constant struct DoviPolynomialParams &curve,
-    int piece,
-    int bl_val,
-    uint bl_max)
-{
-    int lo = int(curve.pivots[0]);
-    int hi = int(curve.pivots[curve.num_pivots - 1]);
-    float x = float(clamp(bl_val, lo, hi)) / float(bl_max);
+// t clamped to a component's pivot range, in Q20 (5.4.2.3.2 and the s0 / s1 / s2 clamps of 5.4.2.3.3). A
+// component with no usable curve (num_pivots < 2) has no range and is left as is.
+static inline long dovi_clamp_to_pivots(constant struct DoviPolynomialParams &curve, long t, uint shift) {
+    if (curve.num_pivots < 2u) {
+        return t;
+    }
+    return clamp(t, long(curve.pivots[0]) << shift, long(curve.pivots[curve.num_pivots - 1u]) << shift);
+}
 
-    float inv = ldexp(1.0f, -int(curve.coef_shift[piece]));
-    float pred = float(curve.coef[piece][0]) * inv;
+// 5.4.2.3: the accumulated Q(20 + coefficient_log2_denom) sum to the 16-bit prediction. The shift is held below
+// 64, where a hostile coef_shift would make it undefined.
+static inline int dovi_prediction(long vv, uint coef_shift) {
+    vv = max(vv, 0l);
+    return int(min(vv >> min(4u + coef_shift, 63u), 0xffffl));
+}
+
+// 5.4.2.3.2, polynomial piece: vv = sum of poly_coef[i] * s^i at Q20, i <= 2.
+static inline int dovi_eval_poly(constant struct DoviPolynomialParams &curve, int piece, long t, uint shift) {
+    t = dovi_clamp_to_pivots(curve, t, shift);
+    long vv = long(curve.coef[piece][0]) << 20;
     uint order = curve.order[piece];
     if (order >= 1u) {
-        pred = fma(float(curve.coef[piece][1]) * inv, x, pred);
+        vv += long(curve.coef[piece][1]) * t;
     }
     if (order >= 2u) {
-        pred = fma(float(curve.coef[piece][2]) * inv, x * x, pred);
+        vv += long(curve.coef[piece][2]) * ((t * t) >> 20);
     }
-    return pred;
+    return dovi_prediction(vv, curve.coef_shift[piece]);
 }
 
-// An MMR input clamped to the pivot range of its own component (luma to poly_y's, Cb to poly_cb's,
-// Cr to poly_cr's), as DoViBaker's `mmrMapping` does before it forms the cross terms. A component with
-// no usable curve (num_pivots < 2) has no range and is left as is.
-static inline float dovi_clamp_mmr_input(constant struct DoviPolynomialParams &curve, float norm, float scale) {
-    if (curve.num_pivots < 2u) {
-        return norm;
+// 5.4.2.3.3, MMR piece: the constant and, per order, the seven terms [s0, s1, s2, s0s1, s0s2, s1s2, s0s1s2] raised
+// to that order, each product truncated back to Q20 as the spec's tt[] are. `k` is this component's slice of the
+// per-frame MMR table (`populateMmrTable`): per piece the constant then the 21 coefficients, Q(coef_shift).
+static inline int dovi_eval_mmr(device const int* k, int piece, uint order, uint coef_shift,
+                                long t0, long t1, long t2) {
+    device const int* c = k + piece * DOVI_MMR_TABLE_PIECE_STRIDE;
+    long base[7] = { t0, t1, t2, (t0 * t1) >> 20, (t0 * t2) >> 20, (t1 * t2) >> 20, 0 };
+    base[6] = (base[3] * t2) >> 20;
+    long vv = long(c[0]) << 20;
+    order = min(order, 3u);
+    long term[7];
+    for (int j = 0; j < 7; ++j) {
+        term[j] = base[j];
     }
-    float lo = float(curve.pivots[0]) / scale;
-    float hi = float(curve.pivots[curve.num_pivots - 1u]) / scale;
-    return clamp(norm, lo, hi);
-}
-
-// MMR piece: a regression over the seven cross terms of all three normalised
-// base-layer components, with order o contributing those terms raised to o + 1.
-// `k` is this component's slice of the per-frame MMR table (`populateMmrTable`): per piece the
-// constant then the 21 coefficients, each float(coef) * 2^-coef_shift computed once on the CPU. That
-// is the value this function used to form per term in the loop (a power-of-two scale is exact), so
-// the sum is unchanged bit for bit, without an int-to-float conversion and a multiply per term.
-static inline float dovi_eval_mmr(
-    constant struct DoviPolynomialParams &curve,
-    device const float* k,
-    int piece,
-    float y_norm, float u_norm, float v_norm)
-{
-    // y_norm, u_norm and v_norm are already clamped to their components' pivot ranges.
-    device const float* c = k + piece * DOVI_MMR_TABLE_PIECE_STRIDE;
-    float s = c[0];
-
-    float base[7] = {
-        y_norm,
-        u_norm,
-        v_norm,
-        y_norm * u_norm,
-        y_norm * v_norm,
-        u_norm * v_norm,
-        y_norm * u_norm * v_norm
-    };
-    float t[7];
-    for (int k = 0; k < 7; ++k) {
-        t[k] = base[k];
-    }
-
-    uint order = min(curve.order[piece], 3u);
     for (uint o = 0u; o < order; ++o) {
-        for (int k = 0; k < 7; ++k) {
-            s = fma(c[1u + o * 7u + uint(k)], t[k], s);
+        for (int j = 0; j < 7; ++j) {
+            vv += long(c[1u + o * 7u + uint(j)]) * term[j];
         }
         if (o + 1u < order) {
-            for (int k = 0; k < 7; ++k) {
-                t[k] *= base[k];
+            // tt[8..14] = (base * base) >> 20, tt[15..21] = (base * tt[8..14]) >> 20.
+            for (int j = 0; j < 7; ++j) {
+                term[j] = (term[j] * base[j]) >> 20;
             }
         }
     }
-    return s;
+    return dovi_prediction(vv, coef_shift);
 }
 
-// One component's reshaping prediction, in normalised [0, 1] units.
-// num_pivots < 2 is the parser's fail-safe for a curve it could not trust, and
-// means identity: the base layer passes through untouched.
-static inline float dovi_eval_curve(
+// One component's 16-bit prediction. `t` is the component's own value, t0 / t1 / t2 the luma (downsampled to the
+// chroma site, 5.4.2.3.3) and the two chroma values an MMR piece reads, all Q20. num_pivots < 2 is the parser's
+// fail-safe for a curve it could not trust, and means identity: the base layer passes through untouched
+// (v = s << (16 - BL_bit_depth), the identity polynomial's exact value).
+static inline int dovi_eval_curve(
     constant struct DoviPolynomialParams &curve,
-    device const float* mmr,
+    device const int* mmr,
+    uint mmr_coef_shift,
     constant struct DoviPolynomialParams &poly_y,
     constant struct DoviPolynomialParams &poly_cb,
     constant struct DoviPolynomialParams &poly_cr,
-    int bl_val,
-    float y_norm, float u_norm, float v_norm,
-    uint bl_max)
+    long t,
+    long t0, long t1, long t2,
+    uint shift)
 {
     if (curve.num_pivots < 2u) {
-        return float(bl_val) / float(bl_max);
+        return int(min(max(t, 0l) >> 4, 0xffffl));
     }
-    int piece = dovi_select_piece(curve, bl_val);
+    int piece = dovi_select_piece(curve, t, shift);
     if (curve.method[piece] == DOVI_MAPPING_MMR) {
-        float scale = float(bl_max);
-        return dovi_eval_mmr(curve, mmr, piece,
-                             dovi_clamp_mmr_input(poly_y, y_norm, scale),
-                             dovi_clamp_mmr_input(poly_cb, u_norm, scale),
-                             dovi_clamp_mmr_input(poly_cr, v_norm, scale));
+        return dovi_eval_mmr(mmr, piece, curve.order[piece], mmr_coef_shift,
+                             dovi_clamp_to_pivots(poly_y, t0, shift),
+                             dovi_clamp_to_pivots(poly_cb, t1, shift),
+                             dovi_clamp_to_pivots(poly_cr, t2, shift));
     }
-    return dovi_eval_poly(curve, piece, bl_val, bl_max);
-}
-
-// Float-input twins of dovi_select_piece / dovi_eval_poly / dovi_eval_curve, for the 4:2:2-site chroma
-// kernel, whose base-layer chroma is interpolated between rows and kept fractional: rounding it back to a
-// code would put a 10-bit step into the very value the interpolation exists to refine. The piece is the
-// last pivot the value reaches, as for an integer code, and at an integer value every result is the
-// integer path's. The integer functions above stay as they are, so the 4:2:0 kernel is unchanged.
-static inline int dovi_select_piece_f(constant struct DoviPolynomialParams &curve, float bl_val) {
-    int last_piece = int(curve.num_pivots) - 2;
-    int piece = 0;
-    for (int i = 0; i <= last_piece; ++i) {
-        if (bl_val >= float(curve.pivots[i])) {
-            piece = i;
-        }
-    }
-    return clamp(piece, 0, max(last_piece, 0));
-}
-
-static inline float dovi_eval_poly_f(
-    constant struct DoviPolynomialParams &curve,
-    int piece,
-    float bl_val,
-    uint bl_max)
-{
-    float lo = float(curve.pivots[0]);
-    float hi = float(curve.pivots[curve.num_pivots - 1]);
-    float x = clamp(bl_val, lo, hi) / float(bl_max);
-
-    float inv = ldexp(1.0f, -int(curve.coef_shift[piece]));
-    float pred = float(curve.coef[piece][0]) * inv;
-    uint order = curve.order[piece];
-    if (order >= 1u) {
-        pred = fma(float(curve.coef[piece][1]) * inv, x, pred);
-    }
-    if (order >= 2u) {
-        pred = fma(float(curve.coef[piece][2]) * inv, x * x, pred);
-    }
-    return pred;
-}
-
-static inline float dovi_eval_curve_f(
-    constant struct DoviPolynomialParams &curve,
-    device const float* mmr,
-    constant struct DoviPolynomialParams &poly_y,
-    constant struct DoviPolynomialParams &poly_cb,
-    constant struct DoviPolynomialParams &poly_cr,
-    float bl_val,
-    float y_norm, float u_norm, float v_norm,
-    uint bl_max)
-{
-    if (curve.num_pivots < 2u) {
-        return bl_val / float(bl_max);
-    }
-    int piece = dovi_select_piece_f(curve, bl_val);
-    if (curve.method[piece] == DOVI_MAPPING_MMR) {
-        float scale = float(bl_max);
-        return dovi_eval_mmr(curve, mmr, piece,
-                             dovi_clamp_mmr_input(poly_y, y_norm, scale),
-                             dovi_clamp_mmr_input(poly_cb, u_norm, scale),
-                             dovi_clamp_mmr_input(poly_cr, v_norm, scale));
-    }
-    return dovi_eval_poly_f(curve, piece, bl_val, bl_max);
-}
-
-// Normalised prediction back into VDR code units. Callers pass bl_max + 1, so the
-// scale is (bl_max + 1) * vdr_scale = 2^vdr_bit_depth rather than vdr_max, which is
-// what makes an identity curve bit-exact end to end.
-static inline int dovi_denormalize(float pred_norm, uint bl_max, uint vdr_scale, uint vdr_max) {
-    // The prediction is clamped to the VDR range before the residual is added, as DoViBaker does for both
-    // the polynomial and the MMR result, so a prediction outside it cannot be pulled back in by the
-    // residual: a negative one starts from 0, one above full scale from vdr_max.
-    return clamp(int(rint(pred_norm * float(bl_max) * float(vdr_scale))), 0, int(vdr_max));
+    return dovi_eval_poly(curve, piece, t, shift);
 }
 
 /* ============================================================================
@@ -439,34 +360,43 @@ static inline int dovi_denormalize(float pred_norm, uint bl_max, uint vdr_scale,
    ========================================================================= */
 
 // The inverse linear-deadzone quantiser depends on the 10-bit EL code alone, so the composer evaluates it
-// once per frame for all 1024 codes of each component (`DoviFelComposer.inverseNlq`, where the reading and
-// its reasons are written down) and the kernels index that table: nlq_lut[component * 1024 + code], in VDR
-// code units, Y then Cb then Cr. The 64-bit products it replaces were most of the residual's cost.
+// once per frame for all 1024 codes of each component (`DoviFelComposer.inverseNlq`, 5.4.3.2 line for line) and
+// the kernels index that table: nlq_lut[component * 1024 + code], the spec's 16-bit signed r, Y then Cb then Cr.
 static inline int dovi_inv_nlq(device const int* nlq_lut, uint component, int el_code) {
     return nlq_lut[component * 1024u + uint(clamp(el_code, 0, 1023))];
 }
 
 /* ============================================================================
-   Output quantisation
+   Reconstruction and output
    ========================================================================= */
 
-// Full-precision sample: v/vdr_scale in 10-bit codes with 6 fractional bits, clamped to the
-// video-range limits. The top 10 bits are the truncated code; the rest is what P010 leaves unused.
-static inline int dovi_full_precision(int vdr_val, uint vdr_scale, int lo, int hi) {
-    int v = (vdr_val * 64 + int(vdr_scale >> 1)) / int(vdr_scale);
-    return clamp(v, lo << 6, hi << 6);
+// h = v + r (5.4.3.3), still at 16 bits: the spec rounds it once to hdr_bit_depth, and each writer below takes it
+// from here, so no output is rounded twice.
+//
+// The spec's reconstructed sample, hdr_bit_depth bits: (h + 2^(15 - hdr_bit_depth)) >> (16 - hdr_bit_depth),
+// clipped to [0, 2^hdr_bit_depth - 1].
+static inline int dovi_reconstruct(int h, uint vdr_max) {
+    uint bits = 32u - clz(vdr_max);
+    return clamp((h + (1 << (15u - bits))) >> (16u - bits), 0, int(vdr_max));
 }
 
-// VDR code value down to the 10-bit output plane, dithered or rounded.
+// 16-bit sample: h itself, clamped to the video range (10-bit limits shifted left 6). A 10-bit code shifted
+// left 6 and a 12-bit code shifted left 4 are both h's scale (black 64 << 6 = 256 << 4 = 4096), so sv22 carries
+// the sum before the spec's rounding, from which its 12-bit sample is (h + 8) >> 4 exactly; P010's full-precision
+// mode puts the same word in P010, whose low 6 bits CoreVideo calls padding.
+static inline int dovi_full_precision(int h, int lo, int hi) {
+    return clamp(h, lo << 6, hi << 6);
+}
+
+// h down to the 10-bit output plane, dithered or rounded, in one step from the 16-bit sum.
 static inline int dovi_quantize(
-    int vdr_val,
-    uint vdr_scale,
+    int h,
     uint dither_mode,
     float dither,
     int lo,
     int hi)
 {
-    float v = float(vdr_val) / float(vdr_scale);
+    float v = float(h) * (1.0f / 64.0f);
     // Both branches have mean 0.5, so enabling dither redistributes the rounding
     // error without moving the average level.
     float bias = (dither_mode == DOVI_DITHER_NONE) ? 0.5f : dither;
@@ -592,9 +522,9 @@ kernel void dovi_compose_luma(
     texture2d<ushort, access::sample>      el_y_tex      [[texture(2)]],
     texture2d<ushort, access::write>       out_y_tex     [[texture(3)]],
     constant struct DoviMetalParams&       params        [[buffer(0)]],
-    constant float*                        luma_lut      [[buffer(1)]],
+    constant int*                          luma_lut      [[buffer(1)]],
     device const int*                      nlq_lut       [[buffer(2)]],
-    device const float*                    mmr_table     [[buffer(3)]],
+    device const int*                      mmr_table     [[buffer(3)]],
     uint2                                  gid           [[thread_position_in_grid]])
 {
     if (gid.x >= params.bl_width || gid.y >= params.bl_height) {
@@ -603,19 +533,17 @@ kernel void dovi_compose_luma(
 
     int bl_y = int(bl_y_tex.read(gid).r >> 6);
 
-    float pred;
+    int h;
     if ((params.flags & DOVI_FLAG_LUMA_MMR) == 0u) {
-        pred = luma_lut[bl_y];
+        h = luma_lut[bl_y];
     } else {
-        float y_norm = float(bl_y) / float(params.bl_max + 1u);
+        uint shift = dovi_q20_shift(params.bl_max);
         ushort4 bl_uv = bl_uv_tex.read(uint2(gid.x >> 1, gid.y >> 1));
-        float u_norm = float(int(bl_uv.r >> 6)) / float(params.bl_max + 1u);
-        float v_norm = float(int(bl_uv.g >> 6)) / float(params.bl_max + 1u);
-        pred = dovi_eval_curve(params.poly_y, mmr_table,
-                               params.poly_y, params.poly_cb, params.poly_cr, bl_y,
-                               y_norm, u_norm, v_norm, params.bl_max + 1u);
+        long t = long(bl_y) << shift;
+        h = dovi_eval_curve(params.poly_y, mmr_table, params.mmr_y.coef_shift,
+                            params.poly_y, params.poly_cb, params.poly_cr, t,
+                            t, long(bl_uv.r >> 6) << shift, long(bl_uv.g >> 6) << shift, shift);
     }
-    int vdr_y = dovi_denormalize(pred, params.bl_max + 1u, params.vdr_scale, params.vdr_max);
 
     if ((params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u &&
         dovi_residual_at(params, gid.x) &&
@@ -624,24 +552,22 @@ kernel void dovi_compose_luma(
         // Centre-aligned: luma samples sit at pixel centres on both grids.
         float el = dovi_upsample_el(el_y_tex, gid, uint2(params.bl_width, params.bl_height),
                                     uint2(params.el_width, params.el_height));
-        vdr_y += dovi_inv_nlq(nlq_lut, 0u, dovi_el_code(el));
+        h += dovi_inv_nlq(nlq_lut, 0u, dovi_el_code(el));
     }
 
-    vdr_y = clamp(vdr_y, 0, int(params.vdr_max));
     if (params.residual_split_x != 0u && uint(abs(int(gid.x) - int(params.residual_split_x))) < 2u) {
-        vdr_y = int(params.vdr_max) / 2;   // the split's divider, mid-grey in PQ
+        h = 0x8000;   // the split's divider, mid-grey in PQ
     }
 
-    int out_y = dovi_quantize(vdr_y, params.vdr_scale, params.dither_mode,
-                              dovi_dither(gid, params.frame_index, uint2(0u, 0u)), 64, 940);
     if (params.dither_mode == DOVI_DEBUG_RAW_VDR) {
-        out_y_tex.write(ushort4(ushort(vdr_y << 4), 0, 0, 0), gid);
+        out_y_tex.write(ushort4(ushort(dovi_reconstruct(h, params.vdr_max) << (16u - (32u - clz(params.vdr_max)))), 0, 0, 0), gid);
         return;
     }
     if (params.dither_mode == DOVI_DITHER_FULL_PRECISION) {
-        out_y_tex.write(ushort4(ushort(dovi_full_precision(vdr_y, params.vdr_scale, 64, 940)), 0, 0, 0), gid);
+        out_y_tex.write(ushort4(ushort(dovi_full_precision(h, 64, 940)), 0, 0, 0), gid);
         return;
     }
+    int out_y = dovi_quantize(h, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(0u, 0u)), 64, 940);
     out_y_tex.write(ushort4(ushort(out_y << 6), 0, 0, 0), gid);
 }
 
@@ -668,7 +594,7 @@ kernel void dovi_compose_chroma(
     texture2d<ushort, access::write>       out_uv_tex    [[texture(3)]],
     constant struct DoviMetalParams&       params        [[buffer(0)]],
     device const int*                      nlq_lut       [[buffer(2)]],
-    device const float*                    mmr_table     [[buffer(3)]],
+    device const int*                      mmr_table     [[buffer(3)]],
     uint2                                  gid           [[thread_position_in_grid]])
 {
     uint uv_width = params.bl_width / 2u;
@@ -701,19 +627,12 @@ kernel void dovi_compose_chroma(
     int bl_cb = int(bl_uv.r >> 6);
     int bl_cr = int(bl_uv.g >> 6);
 
-    float y_norm = float(bl_y) / float(params.bl_max + 1u);
-    float u_norm = float(bl_cb) / float(params.bl_max + 1u);
-    float v_norm = float(bl_cr) / float(params.bl_max + 1u);
-
-    float pred_cb = dovi_eval_curve(params.poly_cb, mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE,
-                                    params.poly_y, params.poly_cb, params.poly_cr, bl_cb,
-                                    y_norm, u_norm, v_norm, params.bl_max + 1u);
-    float pred_cr = dovi_eval_curve(params.poly_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE,
-                                    params.poly_y, params.poly_cb, params.poly_cr, bl_cr,
-                                    y_norm, u_norm, v_norm, params.bl_max + 1u);
-
-    int vdr_cb = dovi_denormalize(pred_cb, params.bl_max + 1u, params.vdr_scale, params.vdr_max);
-    int vdr_cr = dovi_denormalize(pred_cr, params.bl_max + 1u, params.vdr_scale, params.vdr_max);
+    uint shift = dovi_q20_shift(params.bl_max);
+    long t0 = long(bl_y) << shift, t1 = long(bl_cb) << shift, t2 = long(bl_cr) << shift;
+    int h_cb = dovi_eval_curve(params.poly_cb, mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE, params.mmr_cb.coef_shift,
+                               params.poly_y, params.poly_cb, params.poly_cr, t1, t0, t1, t2, shift);
+    int h_cr = dovi_eval_curve(params.poly_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE, params.mmr_cr.coef_shift,
+                               params.poly_y, params.poly_cb, params.poly_cr, t2, t0, t1, t2, shift);
 
     if ((params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u && dovi_residual_at(params, gid.x * 2u)) {
         bool cb_active = (params.nlq_cb.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cb.nlq_scale != 0);
@@ -732,32 +651,28 @@ kernel void dovi_compose_chroma(
             float2 el = dovi_upsample_el_uv(el_uv_tex, gid, uint2(uv_width, uv_height),
                                             uint2(params.el_width / 2u, params.el_height / 2u));
             if (cb_active) {
-                vdr_cb += dovi_inv_nlq(nlq_lut, 1u, dovi_el_code(el.x));
+                h_cb += dovi_inv_nlq(nlq_lut, 1u, dovi_el_code(el.x));
             }
             if (cr_active) {
-                vdr_cr += dovi_inv_nlq(nlq_lut, 2u, dovi_el_code(el.y));
+                h_cr += dovi_inv_nlq(nlq_lut, 2u, dovi_el_code(el.y));
             }
         }
     }
 
-    vdr_cb = clamp(vdr_cb, 0, int(params.vdr_max));
-    vdr_cr = clamp(vdr_cr, 0, int(params.vdr_max));
-
-    int out_cb = dovi_quantize(vdr_cb, params.vdr_scale, params.dither_mode,
-                               dovi_dither(gid, params.frame_index, uint2(1u, 0u)), 64, 960);
-    int out_cr = dovi_quantize(vdr_cr, params.vdr_scale, params.dither_mode,
-                               dovi_dither(gid, params.frame_index, uint2(1u, 1u)), 64, 960);
-
     if (params.dither_mode == DOVI_DEBUG_RAW_VDR) {
-        dovi_write_chroma(out_uv_tex, ushort4(ushort(vdr_cb << 4), ushort(vdr_cr << 4), 0, 0), gid, params.flags);
+        uint up = 16u - (32u - clz(params.vdr_max));
+        dovi_write_chroma(out_uv_tex, ushort4(ushort(dovi_reconstruct(h_cb, params.vdr_max) << up),
+                                              ushort(dovi_reconstruct(h_cr, params.vdr_max) << up), 0, 0), gid, params.flags);
         return;
     }
     if (params.dither_mode == DOVI_DITHER_FULL_PRECISION) {
-        dovi_write_chroma(out_uv_tex, ushort4(ushort(dovi_full_precision(vdr_cb, params.vdr_scale, 64, 960)),
-                                              ushort(dovi_full_precision(vdr_cr, params.vdr_scale, 64, 960)), 0, 0),
+        dovi_write_chroma(out_uv_tex, ushort4(ushort(dovi_full_precision(h_cb, 64, 960)),
+                                              ushort(dovi_full_precision(h_cr, 64, 960)), 0, 0),
                           gid, params.flags);
         return;
     }
+    int out_cb = dovi_quantize(h_cb, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 0u)), 64, 960);
+    int out_cr = dovi_quantize(h_cr, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 1u)), 64, 960);
     dovi_write_chroma(out_uv_tex, ushort4(ushort(out_cb << 6), ushort(out_cr << 6), 0, 0), gid, params.flags);
 }
 
@@ -800,12 +715,12 @@ static inline int dovi_chroma_422_offset_q(uint loc) {
 // half-column shift of 1 / 3 / 5); vertically it is sited from the stream (dovi_chroma_422_offset_q).
 // - luma: [1 2 1] around the even column on this row only, in integers, edges clamped;
 // - BL chroma: 4-tap Catmull-Rom over the chroma rows at the row's phase (dovi_chroma_422_taps), edge rows
-//   clamped, clamped to [0, bl_max] and kept fractional for the curve (dovi_eval_curve_f);
+//   clamped, clamped to [0, bl_max] and kept fractional for the curve (exact in its Q20 fixed point);
 // - EL chroma: bilinear at the same row coordinate (dovi_upsample_el_uv_422), rounded half up, inverse NLQ.
 //   The EL phase convention itself (base chroma row n at EL chroma row n * el / bl) is kept; the siting only
 //   moves where between the base chroma rows the output row sits, and the residual is read where the base
 //   chroma it corrects is, so at a 4:2:0 site every siting reads what dovi_compose_chroma reads;
-// then denormalisation, residual, clamps and quantisation exactly as in dovi_compose_chroma.
+// then prediction, residual and output exactly as in dovi_compose_chroma.
 // A separate kernel rather than a branch in dovi_compose_chroma, so the 4:2:0 kernel the P010 modes run is
 // untouched. It is built without the blue-noise specialisation, which sv22 (full precision) never uses.
 kernel void dovi_compose_chroma_422(
@@ -815,7 +730,7 @@ kernel void dovi_compose_chroma_422(
     texture2d<ushort, access::write>       out_uv_tex    [[texture(3)]],
     constant struct DoviMetalParams&       params        [[buffer(0)]],
     device const int*                      nlq_lut       [[buffer(2)]],
-    device const float*                    mmr_table     [[buffer(3)]],
+    device const int*                      mmr_table     [[buffer(3)]],
     uint2                                  gid           [[thread_position_in_grid]])
 {
     uint uv_width = params.bl_width / 2u;
@@ -844,19 +759,14 @@ kernel void dovi_compose_chroma_422(
     }
     bl_uv = clamp(bl_uv, 0.0f, float(params.bl_max));
 
-    float y_norm = float(bl_y) / float(params.bl_max + 1u);
-    float u_norm = bl_uv.x / float(params.bl_max + 1u);
-    float v_norm = bl_uv.y / float(params.bl_max + 1u);
-
-    float pred_cb = dovi_eval_curve_f(params.poly_cb, mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE,
-                                      params.poly_y, params.poly_cb, params.poly_cr, bl_uv.x,
-                                      y_norm, u_norm, v_norm, params.bl_max + 1u);
-    float pred_cr = dovi_eval_curve_f(params.poly_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE,
-                                      params.poly_y, params.poly_cb, params.poly_cr, bl_uv.y,
-                                      y_norm, u_norm, v_norm, params.bl_max + 1u);
-
-    int vdr_cb = dovi_denormalize(pred_cb, params.bl_max + 1u, params.vdr_scale, params.vdr_max);
-    int vdr_cr = dovi_denormalize(pred_cr, params.bl_max + 1u, params.vdr_scale, params.vdr_max);
+    // The interpolated chroma is a multiple of 1/128 of a code, so its Q20 value is exact.
+    uint shift = dovi_q20_shift(params.bl_max);
+    float q20 = float(1u << shift);
+    long t0 = long(bl_y) << shift, t1 = long(rint(bl_uv.x * q20)), t2 = long(rint(bl_uv.y * q20));
+    int h_cb = dovi_eval_curve(params.poly_cb, mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE, params.mmr_cb.coef_shift,
+                               params.poly_y, params.poly_cb, params.poly_cr, t1, t0, t1, t2, shift);
+    int h_cr = dovi_eval_curve(params.poly_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE, params.mmr_cr.coef_shift,
+                               params.poly_y, params.poly_cb, params.poly_cr, t2, t0, t1, t2, shift);
 
     if ((params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u && dovi_residual_at(params, gid.x * 2u)) {
         bool cb_active = (params.nlq_cb.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cb.nlq_scale != 0);
@@ -865,30 +775,27 @@ kernel void dovi_compose_chroma_422(
             float2 el = dovi_upsample_el_uv_422(el_uv_tex, gid, float(q - 8) * 0.25f, uint2(uv_width, uv_height),
                                                 uint2(params.el_width / 2u, params.el_height / 2u));
             if (cb_active) {
-                vdr_cb += dovi_inv_nlq(nlq_lut, 1u, dovi_el_code(el.x));
+                h_cb += dovi_inv_nlq(nlq_lut, 1u, dovi_el_code(el.x));
             }
             if (cr_active) {
-                vdr_cr += dovi_inv_nlq(nlq_lut, 2u, dovi_el_code(el.y));
+                h_cr += dovi_inv_nlq(nlq_lut, 2u, dovi_el_code(el.y));
             }
         }
     }
 
-    vdr_cb = clamp(vdr_cb, 0, int(params.vdr_max));
-    vdr_cr = clamp(vdr_cr, 0, int(params.vdr_max));
-
     if (params.dither_mode == DOVI_DEBUG_RAW_VDR) {
-        out_uv_tex.write(ushort4(ushort(vdr_cb << 4), ushort(vdr_cr << 4), 0, 0), gid);
+        uint up = 16u - (32u - clz(params.vdr_max));
+        out_uv_tex.write(ushort4(ushort(dovi_reconstruct(h_cb, params.vdr_max) << up),
+                                 ushort(dovi_reconstruct(h_cr, params.vdr_max) << up), 0, 0), gid);
         return;
     }
     if (params.dither_mode == DOVI_DITHER_FULL_PRECISION) {
-        out_uv_tex.write(ushort4(ushort(dovi_full_precision(vdr_cb, params.vdr_scale, 64, 960)),
-                                 ushort(dovi_full_precision(vdr_cr, params.vdr_scale, 64, 960)), 0, 0), gid);
+        out_uv_tex.write(ushort4(ushort(dovi_full_precision(h_cb, 64, 960)),
+                                 ushort(dovi_full_precision(h_cr, 64, 960)), 0, 0), gid);
         return;
     }
-    int out_cb = dovi_quantize(vdr_cb, params.vdr_scale, params.dither_mode,
-                               dovi_dither(gid, params.frame_index, uint2(1u, 0u)), 64, 960);
-    int out_cr = dovi_quantize(vdr_cr, params.vdr_scale, params.dither_mode,
-                               dovi_dither(gid, params.frame_index, uint2(1u, 1u)), 64, 960);
+    int out_cb = dovi_quantize(h_cb, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 0u)), 64, 960);
+    int out_cr = dovi_quantize(h_cr, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 1u)), 64, 960);
     out_uv_tex.write(ushort4(ushort(out_cb << 6), ushort(out_cr << 6), 0, 0), gid);
 }
 
