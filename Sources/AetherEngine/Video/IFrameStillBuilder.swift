@@ -3,7 +3,6 @@ import Foundation
 import CoreGraphics
 import CoreMedia
 import CoreVideo
-import VideoToolbox
 
 /// AE#682: the SDR trick-play tier an HDR session lists beside its own keyframes. One HEVC Main10 intra frame
 /// per keyframe, BT.709, 800 pixels wide: the size AVKit's 400 x 225 point scrub thumbnail fills on a 4K
@@ -26,6 +25,9 @@ import VideoToolbox
 /// picture is IPT, which only `DolbyVisionStillConverter` reads, so it takes that converter and then the same
 /// encoder. The CODECS the master declares come from a warm-up encode,
 /// so they match the `hvcC` in every init.
+///
+/// A software overlay session's scan tier is the same builder in the source's own colour (`destination`): its
+/// served pictures are placeholders, so its keyframes are stills as well.
 final class IFrameStillBuilder: @unchecked Sendable {
     static let defaultWidth = 800
     /// A still above this is not expected at this size; it bounds the declared BANDWIDTH.
@@ -37,7 +39,7 @@ final class IFrameStillBuilder: @unchecked Sendable {
     /// scrub back over ground already covered should cost nothing.
     static let cachedFragments = 1536
     private static let timescale: UInt32 = 90_000
-    private static var sdr: ColorAttachments.Tags { StillRenderer.sdr }
+    static var sdr: ColorAttachments.Tags { StillRenderer.sdr }
 
     struct Output {
         let initSegment: Data
@@ -51,57 +53,38 @@ final class IFrameStillBuilder: @unchecked Sendable {
     let initSegment: Data
 
     private let decoder: FrameDecodeContext
-    private let session: VTCompressionSession
+    private let encoder: HEVCIntraEncoder
+    private let destination: ColorAttachments.Tags
     private let lock = NSLock()
     private var built: [Int: Data] = [:]
     private var builtOrder: [Int] = []
-    private var nextPTS: Int64 = 1
     private var loggedFailure = false
 
     /// nil when no HEVC Main10 encoder can be made or the warm-up encode yields no configuration record.
-    init?(decoder: FrameDecodeContext, width: Int, height: Int) {
+    /// `destination` is the stills' colour: BT.709 SDR for the thumbnail tier, or a source's own for a scan tier.
+    init?(decoder: FrameDecodeContext, width: Int, height: Int, destination: ColorAttachments.Tags = sdr) {
         self.decoder = decoder
         self.width = width
         self.height = height
-        var made: VTCompressionSession?
-        guard VTCompressionSessionCreate(
-            allocator: nil, width: Int32(width), height: Int32(height), codecType: kCMVideoCodecType_HEVC,
-            encoderSpecification: nil, imageBufferAttributes: nil, compressedDataAllocator: nil,
-            outputCallback: nil, refcon: nil, compressionSessionOut: &made) == noErr, let made else {
-            EngineLog.emit("[IFrameStill] no HEVC encoder", category: .session)
+        self.destination = destination
+        guard let encoder = HEVCIntraEncoder(width: width, height: height, colour: destination, quality: 0.7),
+              let codecs = HLSVideoEngine.hevcCodecsString(fromConfigRecord: [UInt8](encoder.hvcC)) else {
+            EngineLog.emit("[IFrameStill] no HEVC Main10 encoder, or its warm-up encode gave no hvcC", category: .session)
             return nil
         }
-        session = made
-        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_HEVC_Main10_AutoLevel)
-        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanFalse)
-        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 1 as CFNumber)
-        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_Quality, value: 0.7 as CFNumber)
-        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_ColorPrimaries, value: Self.sdr.primaries)
-        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_TransferFunction, value: Self.sdr.transfer)
-        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_YCbCrMatrix, value: Self.sdr.matrix)
-        VTCompressionSessionPrepareToEncodeFrames(made)
-        var hardware: CFBoolean?
-        VTSessionCopyProperty(made, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
-                              allocator: nil, valueOut: &hardware)
-
-        guard let blank = Self.blankFrame(width: width, height: height),
-              let warm = Self.encode(blank, session: made, pts: 0),
-              let codecs = HLSVideoEngine.hevcCodecsString(fromConfigRecord: [UInt8](warm.hvcC)) else {
-            EngineLog.emit("[IFrameStill] warm-up encode gave no hvcC", category: .session)
-            VTCompressionSessionInvalidate(made)
-            return nil
-        }
+        self.encoder = encoder
         self.codecs = codecs
-        let colr = Self.box("colr", Self.cat([Data("nclx".utf8), Self.be16(1), Self.be16(1), Self.be16(1), Data([0x00])]))
+        let codes = ColorAttachments.description(primaries: destination.primaries, transfer: destination.transfer,
+                                                 matrix: destination.matrix, fullRange: false)
+        let colr = Self.box("colr", Self.cat([Data("nclx".utf8), Self.be16(UInt16(codes.primaries.rawValue)),
+                                              Self.be16(UInt16(codes.transfer.rawValue)),
+                                              Self.be16(UInt16(codes.matrix.rawValue)), Data([0x00])]))
         let entry = Self.visualSampleEntry("hvc1", width: width, height: height,
-                                           children: [Self.box("hvcC", warm.hvcC), colr])
+                                           children: [Self.box("hvcC", encoder.hvcC), colr])
         initSegment = Self.makeInit(width: width, height: height, sampleEntry: entry)
-        EngineLog.emit("[IFrameStill] \(width)x\(height) \(codecs) hardware=\(hardware == kCFBooleanTrue)",
+        EngineLog.emit("[IFrameStill] \(width)x\(height) \(codecs) hardware=\(encoder.isHardware)",
                        category: .session)
     }
-
-    deinit { VTCompressionSessionInvalidate(session) }
 
     /// Output size for a source of `codedWidth` x `codedHeight` with sample aspect `sar`, even on both axes.
     static func size(codedWidth: Int, codedHeight: Int, sarNum: Int32, sarDen: Int32,
@@ -135,7 +118,7 @@ final class IFrameStillBuilder: @unchecked Sendable {
         }
         guard let sample = encode(at: "idx=\(index)", picture: {
             decoder.isDolbyVisionNoBaseLayer ? converted(decoder.decodeStill(keyframe: payload, targetWidth: width))
-                : decoder.decodeScaledStill(keyframe: payload, width: width, height: height, destination: Self.sdr)
+                : decoder.decodeScaledStill(keyframe: payload, width: width, height: height, destination: destination)
         }) else { return nil }
         return output(sample: sample, index: index, startSeconds: startSeconds, durationSeconds: durationSeconds)
     }
@@ -145,7 +128,7 @@ final class IFrameStillBuilder: @unchecked Sendable {
     func encode(run: IFrameKeyframeReader.PictureRun) -> Data? {
         encode(at: "pts=\(run.targetPts)", picture: {
             decoder.isDolbyVisionNoBaseLayer ? converted(decoder.decodeStill(run: run, targetWidth: width))
-                : decoder.decodeScaledStill(run: run, width: width, height: height, destination: Self.sdr)
+                : decoder.decodeScaledStill(run: run, width: width, height: height, destination: destination)
         })
     }
 
@@ -165,16 +148,14 @@ final class IFrameStillBuilder: @unchecked Sendable {
 
     private func encode(at what: String, picture: () -> CVPixelBuffer?) -> Data? {
         do { try decoder.ensureOpen() } catch { return nil }
-        guard let picture = picture(),
-              let pts = Optional(lock.withLock { () -> Int64 in defer { nextPTS += 1 }; return nextPTS }),
-              let encoded = Self.encode(picture, session: session, pts: pts) else {
+        guard let picture = picture(), let encoded = encoder.encode(picture) else {
             if !loggedFailure {
                 loggedFailure = true
                 EngineLog.emit("[IFrameStill] no still for \(what)", category: .session)
             }
             return nil
         }
-        return encoded.data
+        return encoded
     }
 
     /// Dolby Vision profile 5's converter image drawn into a buffer the encoder takes.
@@ -196,60 +177,6 @@ final class IFrameStillBuilder: @unchecked Sendable {
         CVBufferSetAttachment(buffer, kCVImageBufferColorPrimariesKey, Self.sdr.primaries, .shouldPropagate)
         CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, Self.sdr.transfer, .shouldPropagate)
         CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, Self.sdr.matrix, .shouldPropagate)
-        return buffer
-    }
-
-    // MARK: - Encoding
-
-    private final class EncodeResult: @unchecked Sendable {
-        var data: Data?
-        var hvcC: Data?
-    }
-
-    /// One intra frame, synchronously: the sample's length-prefixed NAL units and the encoder's `hvcC`.
-    private static func encode(_ buffer: CVPixelBuffer, session: VTCompressionSession,
-                               pts: Int64) -> (data: Data, hvcC: Data)? {
-        let result = EncodeResult()
-        let properties = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary
-        let status = VTCompressionSessionEncodeFrame(
-            session, imageBuffer: buffer, presentationTimeStamp: CMTime(value: pts, timescale: 24),
-            duration: .invalid, frameProperties: properties, infoFlagsOut: nil) { status, _, sample in
-            guard status == noErr, let sample, let block = CMSampleBufferGetDataBuffer(sample),
-                  let format = CMSampleBufferGetFormatDescription(sample) else { return }
-            let length = CMBlockBufferGetDataLength(block)
-            var data = Data(count: length)
-            let copied = data.withUnsafeMutableBytes { raw -> OSStatus in
-                guard let base = raw.baseAddress else { return -1 }
-                return CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: base)
-            }
-            guard copied == kCMBlockBufferNoErr else { return }
-            let atoms = CMFormatDescriptionGetExtension(
-                format, extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms) as? [String: Any]
-            result.data = data
-            result.hvcC = atoms?["hvcC"] as? Data
-        }
-        guard status == noErr else { return nil }
-        VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
-        guard let data = result.data, !data.isEmpty, let hvcC = result.hvcC else { return nil }
-        return (data, hvcC)
-    }
-
-    /// Black in 10-bit video range, tagged as the stills are, for the warm-up encode.
-    private static func blankFrame(width: Int, height: Int) -> CVPixelBuffer? {
-        var buffer: CVPixelBuffer?
-        let attributes = [kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()] as CFDictionary
-        guard CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
-                                  attributes, &buffer) == kCVReturnSuccess, let buffer else { return nil }
-        CVPixelBufferLockBaseAddress(buffer, [])
-        for (plane, value) in [(0, UInt16(64 << 6)), (1, UInt16(512 << 6))] {
-            guard let base = CVPixelBufferGetBaseAddressOfPlane(buffer, plane) else { continue }
-            let count = CVPixelBufferGetBytesPerRowOfPlane(buffer, plane) * CVPixelBufferGetHeightOfPlane(buffer, plane) / 2
-            base.assumingMemoryBound(to: UInt16.self).update(repeating: value, count: count)
-        }
-        CVPixelBufferUnlockBaseAddress(buffer, [])
-        CVBufferSetAttachment(buffer, kCVImageBufferColorPrimariesKey, sdr.primaries, .shouldPropagate)
-        CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, sdr.transfer, .shouldPropagate)
-        CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, sdr.matrix, .shouldPropagate)
         return buffer
     }
 

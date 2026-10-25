@@ -238,7 +238,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     public private(set) var companionAudioTracks: [TrackInfo] = []
 
     var videoStreamIndex: Int32 = -1
+    /// The video stream the producer muxes: the source's on a native session, the placeholder's on an overlay one.
     var savedVideoConfig: HLSSegmentProducer.StreamConfig?
+    /// The source's own video stream, for everything that decodes its pictures (the keyframe reader, scrub stills,
+    /// the I-frame stills): `savedVideoConfig` on a native session.
+    var sourceVideoConfig: HLSSegmentProducer.StreamConfig?
     var savedAudioConfig: HLSSegmentProducer.AudioConfig?
 
     /// When true, the session exposes the native subtitle WebVTT rendition (separate from the A/V
@@ -598,6 +602,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `firstKeyframePts` in seconds; diagnostic. The authoritative clock translation is
     /// `playlistShiftSeconds` (updated dynamically per gate open).
     public private(set) var firstKeyframeSeconds: Double = 0
+
+    /// The video is decoded by the session's own decoder and shown in the software overlay, AVPlayer served a
+    /// placeholder of its format (`OverlayPlaceholder`): a stream AVPlayer cannot decode itself. Set by the engine
+    /// before `prepare()`.
+    var overlayDecodesVideo = false
+    /// That placeholder, made by `prepare()`; every producer of the session serves it in place of the source's video.
+    private(set) var overlayPlaceholder: OverlayPlaceholder?
 
     #if DualLayerDolbyVision
     /// `LoadOptions.felOverlay`: every producer of the session hands its enhancement layer to this tap, which
@@ -1435,35 +1446,34 @@ public final class HLSVideoEngine: @unchecked Sendable {
         guard videoIndex >= 0, let videoStream = dem.stream(at: videoIndex) else {
             throw HLSVideoEngineError.noVideoStream
         }
-        let codecpar = videoStream.pointee.codecpar!
-        let isHEVC = codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
-        let isH264 = codecpar.pointee.codec_id == AV_CODEC_ID_H264
-        let isAV1 = codecpar.pointee.codec_id == AV_CODEC_ID_AV1
+        let sourceCodecpar = videoStream.pointee.codecpar!
+        let isHEVC = sourceCodecpar.pointee.codec_id == AV_CODEC_ID_HEVC
+        let isH264 = sourceCodecpar.pointee.codec_id == AV_CODEC_ID_H264
+        let isAV1 = sourceCodecpar.pointee.codec_id == AV_CODEC_ID_AV1
 
         // Log codecpar for AVPlayer -11821 triage: interlaced field_order and malformed Annex-B
         // extradata are the two candidates when channels mux cleanly but VT chokes post readyToPlay.
-        let extraSize = Int(codecpar.pointee.extradata_size)
+        let extraSize = Int(sourceCodecpar.pointee.extradata_size)
         var extraHead = "none"
-        if extraSize > 0, let extra = codecpar.pointee.extradata {
+        if extraSize > 0, let extra = sourceCodecpar.pointee.extradata {
             let n = min(extraSize, 8)
             extraHead = (0..<n).map { String(format: "%02x", extra[$0]) }.joined()
         }
         EngineLog.emit(
-            "[HLSVideoEngine] video codecpar: codec=\(codecpar.pointee.codec_id.rawValue) "
-            + "\(codecpar.pointee.width)x\(codecpar.pointee.height) "
-            + "profile=\(codecpar.pointee.profile) level=\(codecpar.pointee.level) "
-            + "fieldOrder=\(codecpar.pointee.field_order.rawValue) "
+            "[HLSVideoEngine] video codecpar: codec=\(sourceCodecpar.pointee.codec_id.rawValue) "
+            + "\(sourceCodecpar.pointee.width)x\(sourceCodecpar.pointee.height) "
+            + "profile=\(sourceCodecpar.pointee.profile) level=\(sourceCodecpar.pointee.level) "
+            + "fieldOrder=\(sourceCodecpar.pointee.field_order.rawValue) "
             + "extradata=\(extraSize)B head=\(extraHead)",
             category: .session
         )
 
-        // AV1: gated on VTCapabilityProbe.av1Available (false on all current Apple TV chips;
-        // load() routes AV1 to SoftwarePlaybackHost instead). VP9: excluded despite VT HW
-        // decode capability because AVPlayer's HLS manifest parser rejects the `vp09` CODECS
-        // attribute; load() routes VP9 to SoftwarePlaybackHost.
+        // AVPlayer decodes HEVC, H.264 and, where VideoToolbox has it, AV1 (no current Apple TV chip). Everything
+        // else (VP9, whose `vp09` CODECS AVPlayer's HLS parser rejects, MPEG-2, VC-1, AV1 in software) plays in
+        // the software overlay, whatever its codec.
         let av1OK = isAV1 && VTCapabilityProbe.av1Available
-        guard isHEVC || isH264 || av1OK else {
-            throw HLSVideoEngineError.unsupportedCodec(rawCodecID: codecpar.pointee.codec_id.rawValue)
+        guard overlayDecodesVideo || isHEVC || isH264 || av1OK else {
+            throw HLSVideoEngineError.unsupportedCodec(rawCodecID: sourceCodecpar.pointee.codec_id.rawValue)
         }
 
         let videoTimeBase = videoStream.pointee.time_base
@@ -1672,6 +1682,26 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         }
 
+        // 3b. The software overlay: from here on the session describes the placeholder AVPlayer is served, and
+        //     only the packet scans below read the source's own parameters.
+        let sourceFraming = normalizeVideoFraming(demuxer: dem, videoStreamIndex: videoIndex,
+                                                  codecpar: sourceCodecpar, isLive: isLiveSession)
+        let codecpar: UnsafeMutablePointer<AVCodecParameters>
+        if overlayDecodesVideo {
+            let framing = sourceFraming.measuredFraming ?? A53SEIParser.nalFraming(
+                codec: .hevc, extradata: sourceCodecpar.pointee.extradata.map { UnsafePointer($0) },
+                size: Int(sourceCodecpar.pointee.extradata_size))
+            guard let placeholder = OverlayPlaceholder(source: sourceCodecpar, framing: framing) else {
+                throw HLSVideoEngineError.openFailed(reason: "no HEVC encoder for the overlay's placeholder")
+            }
+            let placeholderParams = try placeholder.codecParameters(source: sourceCodecpar)
+            ownedCodecParams.append(placeholderParams)
+            overlayPlaceholder = placeholder
+            codecpar = placeholderParams.ptr
+        } else {
+            codecpar = sourceCodecpar
+        }
+
         // 4. Classify DV variant; per-profile policy in `resolveCodecRoute`.
         let route = try resolveCodecRoute(codecpar: codecpar)
         let codecTagOverride = route.codecTagOverride
@@ -1705,16 +1735,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
         //       muxer reads that as "the bitstream is Annex B too" and rewrites every sample; when the
         //       packets are in fact length-prefixed it empties them. Measured on packets, then the
         //       record is converted so the muxer's own test comes out right.
-        let framingNormalization = normalizeVideoFraming(
-            demuxer: dem,
-            videoStreamIndex: videoIndex,
-            codecpar: codecpar,
-            isLive: isLiveSession
-        )
+        //    The overlay's placeholder record is the encoder's own, length-prefixed: none of this applies.
+        let framingNormalization = overlayDecodesVideo
+            ? VideoFramingNormalization(extradataOverride: nil, measuredFraming: .lengthPrefixed(size: 4))
+            : sourceFraming
         let measuredVideoNALFraming = framingNormalization.measuredFraming
 
         let hevcExtradataOverride: [UInt8]?
-        if let normalized = framingNormalization.extradataOverride {
+        if overlayDecodesVideo {
+            hevcExtradataOverride = nil
+        } else if let normalized = framingNormalization.extradataOverride {
             hevcExtradataOverride = normalized
         } else if let rebuilt = rebuildHEVCExtradataWithInBandParameterSets(
             demuxer: dem,
@@ -1748,8 +1778,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let inBandHDRMetadata = scanInBandHDRStaticMetadata(
             demuxer: dem,
             videoStreamIndex: videoIndex,
-            codecpar: codecpar,
-            framing: measuredVideoNALFraming,
+            codecpar: sourceCodecpar,
+            framing: sourceFraming.measuredFraming,
             isLive: isLiveSession,
             readsDolbyVisionRPU: codecTagOverride == "dvh1" || composesFEL
         )
@@ -1861,7 +1891,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let p5ColorOverride: MP4SegmentMuxer.ColorOverride?
         if codecTagOverride == "dvh1" {
             let sourceRange = codecpar.pointee.color_range
-            let rpuRange = inBandHDRMetadata.dolbyVisionBaseLayerFullRange.map { $0 ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG }
+            // An overlay's placeholder is its own picture, coded limited; the source RPU describes the source's.
+            let rpuRange = overlayDecodesVideo ? nil
+                : inBandHDRMetadata.dolbyVisionBaseLayerFullRange.map { $0 ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG }
             let range = rpuRange ?? parameterSetRange
                 ?? (sourceRange == AVCOL_RANGE_UNSPECIFIED ? AVCOL_RANGE_MPEG : sourceRange)
             EngineLog.emit(
@@ -1956,6 +1988,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
         self.videoStreamIndex = videoIndex
         self.savedVideoConfig = videoConfig
+        if overlayDecodesVideo {
+            guard let ownedSourceParams = OwnedCodecParameters(copying: sourceCodecpar) else {
+                throw HLSVideoEngineError.openFailed(reason: "codecpar copy failed")
+            }
+            ownedCodecParams.append(ownedSourceParams)
+            self.sourceVideoConfig = HLSSegmentProducer.StreamConfig(
+                codecpar: UnsafePointer(ownedSourceParams.ptr), timeBase: videoTimeBase, codecTagOverride: nil,
+                nalFramingOverride: sourceFraming.measuredFraming)
+        } else {
+            self.sourceVideoConfig = videoConfig
+        }
         // Fold degenerate sub-frame segments (keyframe clusters make buildKeyframeSegmentPlan emit
         // ~40 ms segments the producer cannot cut, wedging the near-EOF resume; the plan and producer
         // share these boundaries, so the merge fixes both at once).
@@ -2572,7 +2615,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             candidate: iFrameCandidate, servingMaster: useMasterPlaylist)
         if case .served(let timeline) = iFrameRenditionVerdict,
            let rendition = makeIFrameRendition(plan: plan, timeline: timeline, cache: segmentCache,
-                                               sourceIsHDR: videoRange != .sdr || dvVariant != .none) {
+                                               sourceIsHDR: videoRange != .sdr || dvVariant != .none,
+                                               servedRange: videoRange) {
             iFrameRendition = rendition
             prov.setIFrameSource(rendition)
             EngineLog.emit("[HLSVideoEngine] i-frame rendition: served segments=\(plan.count) "
@@ -3310,6 +3354,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         sourceStillTimeline = nil
         sourceStillLock.unlock()
         savedVideoConfig = nil
+        sourceVideoConfig = nil
+        overlayPlaceholder = nil
         savedAudioConfig = nil
         let ownedParams = ownedCodecParams
         ownedCodecParams = []
@@ -3380,29 +3426,42 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// The keyframes are always served with their own range, so the main player scans on them in HDR. An HDR
     /// source adds the SDR HEVC stills tvOS requires (`IFrameStillBuilder`): AVKit's scrub thumbnail player is
     /// capped at SDR and takes the lowest video range on offer. A source with no keyframe list
-    /// (`Timeline.stills`) serves those SDR stills alone, one a second, each the picture at its time.
+    /// (`Timeline.stills`) serves those SDR stills alone, one a second, each the picture at its time. A software
+    /// overlay session serves placeholder pictures, so its keyframes are stills too, in the variant's range
+    /// (`servedRange`): the main player of an HDR session drops an SDR tier, and scans on nothing then.
     private func makeIFrameRendition(plan: [Segment], timeline: IFrameRenditionEligibility.Timeline,
-                                     cache segmentCache: SegmentCache, sourceIsHDR: Bool) -> IFrameRendition? {
-        guard let cfg = savedVideoConfig, !plan.isEmpty else { return nil }
-        let par = cfg.codecpar.pointee
+                                     cache segmentCache: SegmentCache, sourceIsHDR: Bool,
+                                     servedRange: HLSVideoRange) -> IFrameRendition? {
+        guard let cfg = savedVideoConfig, let source = sourceVideoConfig, !plan.isEmpty else { return nil }
+        let par = source.codecpar.pointee
         // The decoder reads the samples as the session serves them: Annex B ones with the source's own
         // extradata, length-prefixed ones with the record the muxer writes.
-        func makeStillBuilder() -> IFrameStillBuilder? {
+        func makeStillBuilder(maxWidth: Int = IFrameStillBuilder.defaultWidth,
+                              destination: ColorAttachments.Tags = StillRenderer.sdr) -> IFrameStillBuilder? {
             guard let size = IFrameStillBuilder.size(
                 codedWidth: Int(par.width), codedHeight: Int(par.height),
-                sarNum: par.sample_aspect_ratio.num, sarDen: par.sample_aspect_ratio.den) else { return nil }
+                sarNum: par.sample_aspect_ratio.num, sarDen: par.sample_aspect_ratio.den, maxWidth: maxWidth) else { return nil }
             return IFrameStillBuilder(
-                decoder: FrameDecodeContext(streamParameters: cfg.codecpar, timeBase: cfg.timeBase,
-                                            extradata: cfg.convertsAnnexBSamples ? nil : cfg.extradataOverride),
-                width: size.width, height: size.height)
+                decoder: FrameDecodeContext(streamParameters: source.codecpar, timeBase: source.timeBase,
+                                            extradata: source.convertsAnnexBSamples ? nil : source.extradataOverride),
+                width: size.width, height: size.height, destination: destination)
         }
-        func stillsFormat(_ still: IFrameStillBuilder, entries: [IFrameRendition.Entry]) -> IFrameRenditionFormat {
+        func stillsFormat(_ still: IFrameStillBuilder, entries: [IFrameRendition.Entry],
+                          range: HLSVideoRange = .sdr) -> IFrameRenditionFormat {
             let durations = entries.map(\.durationSeconds).filter { $0 > 0 }
             let shortest = durations.min() ?? 1
             let mean = durations.isEmpty ? 1 : durations.reduce(0, +) / Double(durations.count)
-            return .sdrStills(width: still.width, height: still.height, codecs: still.codecs,
-                              bandwidth: IFrameStillBuilder.bandwidth(shortestSegmentSeconds: shortest),
-                              averageBandwidth: IFrameStillBuilder.averageBandwidth(meanSegmentSeconds: mean))
+            return .stills(width: still.width, height: still.height, codecs: still.codecs,
+                           bandwidth: IFrameStillBuilder.bandwidth(shortestSegmentSeconds: shortest),
+                           averageBandwidth: IFrameStillBuilder.averageBandwidth(meanSegmentSeconds: mean),
+                           videoRange: range)
+        }
+        func stillBuild(_ still: IFrameStillBuilder) -> (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output? {
+            { payload, index, entry in
+                still.build(payload: payload, index: index, startSeconds: entry.startSeconds,
+                            durationSeconds: entry.durationSeconds)
+                    .map { IFrameFragmentBuilder.Output(initSegment: $0.initSegment, fragment: $0.fragment) }
+            }
         }
         if timeline == .stills {
             guard let still = makeStillBuilder() else { return nil }
@@ -3419,6 +3478,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 })
         }
 
+        let entries = Self.iFrameEntries(plan: plan, keyframes: planKeyframePts,
+                                         timeBaseSeconds: sourceVideoTbSeconds)
+        var companion: (format: IFrameRenditionFormat,
+                        build: (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?)?
+        if sourceIsHDR, let still = makeStillBuilder() {
+            companion = (stillsFormat(still, entries: entries), stillBuild(still))
+        }
+        if let placeholder = overlayPlaceholder {
+            guard let scan = makeStillBuilder(maxWidth: Self.overlayScanStillWidth, destination: placeholder.tags) else { return nil }
+            return makeKeyframeRendition(
+                entries: entries, cache: IFramePayloadCache(),
+                format: stillsFormat(scan, entries: entries, range: servedRange), buildFragment: stillBuild(scan),
+                companion: companion)
+        }
         // Fragments are muxed in memory and payloads cached in memory: nothing here is written to disk, so
         // the directory below is only the name the muxer is given, never created.
         let staging = segmentCache.sessionDir.appendingPathComponent("iframes", isDirectory: true)
@@ -3430,26 +3503,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 convertsAnnexBSamples: cfg.convertsAnnexBSamples,
                 nalFramingLatch: cfg.nalFramingLatch),
             stagingDir: staging)
-        let entries = Self.iFrameEntries(plan: plan, keyframes: planKeyframePts,
-                                         timeBaseSeconds: sourceVideoTbSeconds)
         let buildKeyframe: (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output? = { payload, index, entry in
             keyframeBuilder.build(payload: payload, index: index,
                                   startSeconds: entry.startSeconds, durationSeconds: entry.durationSeconds)
-        }
-        var companion: (format: IFrameRenditionFormat,
-                        build: (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?)?
-        if sourceIsHDR, let still = makeStillBuilder() {
-            companion = (stillsFormat(still, entries: entries),
-                         { payload, index, entry in
-                             still.build(payload: payload, index: index, startSeconds: entry.startSeconds,
-                                         durationSeconds: entry.durationSeconds)
-                                 .map { IFrameFragmentBuilder.Output(initSegment: $0.initSegment, fragment: $0.fragment) }
-                         })
         }
         return makeKeyframeRendition(
             entries: entries, cache: IFramePayloadCache(),
             format: .keyframes, buildFragment: buildKeyframe, companion: companion)
     }
+
+    /// An overlay session's scan tier: the panel shows it full screen while AVPlayer scans, and 1080p is sharp
+    /// there at any scan rate, where the source's own size would cost the encoder four times as much a still.
+    static let overlayScanStillWidth = 1920
 
     /// The session's one reader of single pictures off the source (`IFrameKeyframeReader`): the I-frame
     /// rendition's, the compositor preview's and the scrub stills' past the resident window. The keyframe
@@ -3463,7 +3528,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         keyframeReaderLock.lock()
         defer { keyframeReaderLock.unlock() }
         if let keyframeReader { return keyframeReader }
-        guard let cfg = savedVideoConfig, let session = demuxer else { return nil }
+        guard let cfg = sourceVideoConfig, let session = demuxer else { return nil }
         let framing = cfg.nalFramingOverride ?? A53SEIParser.nalFraming(
             codec: cfg.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC ? .hevc : .h264,
             extradata: cfg.codecpar.pointee.extradata.map { UnsafePointer($0) },
@@ -3534,7 +3599,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         restartLock.lock()
         let plan = segmentPlan
         let keyframes = planKeyframePts.sorted()
-        let cfg = savedVideoConfig
+        let cfg = sourceVideoConfig
         restartLock.unlock()
         let tb = sourceVideoTbSeconds
         guard let cfg, tb > 0, !plan.isEmpty else { return nil }
@@ -3732,6 +3797,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         #if DualLayerDolbyVision
         prod.felTap = felTap
         #endif
+        prod.overlayPlaceholder = overlayPlaceholder
         prod.playedMediaLedger = playedMediaLedger
         prod.onFirstHDR10PlusDetected = { [weak self] in
             self?.notifyHDR10PlusOnce()
