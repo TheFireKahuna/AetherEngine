@@ -108,8 +108,7 @@ struct Issue93SlowSegmentServeTests {
     private func makeProvider(cache: SegmentCache, isLive: Bool = false,
                               slowThreshold: TimeInterval,
                               restartHandler: ((Int) -> Void)? = { _ in },
-                              restartActivity: (() -> Bool)? = { false },
-                              segmentPlacedHandler: (@Sendable (Int) -> Void)? = nil) -> VideoSegmentProvider {
+                              restartActivity: (() -> Bool)? = { false }) -> VideoSegmentProvider {
         VideoSegmentProvider(
             cache: cache, segments: segments(60), codecsString: "hvc1", supplementalCodecs: nil,
             resolution: (1920, 1080), videoRange: .sdr, frameRate: 24.0, hdcpLevel: nil,
@@ -118,14 +117,12 @@ struct Issue93SlowSegmentServeTests {
             restartActivity: restartActivity,
             repositionWaitSlice: 0.05,
             repositionRideCapSeconds: 5.0,
-            slowServeThresholdSeconds: slowThreshold,
-            segmentPlacedHandler: segmentPlacedHandler
+            slowServeThresholdSeconds: slowThreshold
         )
     }
 
-    @Test("cached bytes survive a slow notification without restarting the producer",
-          .timeLimit(.minutes(1)), arguments: [false, true])
-    func cacheHitSurvivesSlowNotification(holdServeUntilSignal: Bool) async throws {
+    @Test("cached bytes survive a slow notification without restarting the producer", .timeLimit(.minutes(1)))
+    func cacheHitSurvivesSlowNotification() async throws {
         let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)
         defer { cache.close() }
         let payload = Data(repeating: 0xAB, count: 16)
@@ -135,10 +132,7 @@ struct Issue93SlowSegmentServeTests {
         let releaseServe = DispatchSemaphore(value: 0)
         let provider = makeProvider(
             cache: cache, slowThreshold: 0.02,
-            restartHandler: { _ in restarts.bump() },
-            segmentPlacedHandler: { _ in
-                if holdServeUntilSignal { releaseServe.wait() }
-            })
+            restartHandler: { _ in restarts.bump() })
         // A resident segment can still spend the threshold waiting to be scheduled. The early
         // header is valid then too; cache residency is not a wall-clock completion guarantee.
         let data: Data? = await withTaskCancellationHandler {
@@ -159,7 +153,6 @@ struct Issue93SlowSegmentServeTests {
         #expect(data == payload)
         #expect(restarts.value == 0)
         #expect(fired.value <= 1)
-        if holdServeUntilSignal { #expect(fired.value == 1) }
     }
 
     @Test("a serve that outlives the threshold signals slow exactly once")

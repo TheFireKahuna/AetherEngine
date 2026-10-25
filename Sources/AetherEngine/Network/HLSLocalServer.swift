@@ -27,12 +27,6 @@ protocol HLSSegmentProvider: AnyObject {
     /// has gone is answered with an error response rather than the bytes the bookkeeping promised.
     func mediaSegmentURL(at index: Int) -> URL?
 
-    /// AE#418 round 7: what became of a media-segment request. `delivered` is true once the whole
-    /// response went out; false when it was refused or the write failed on a client that hung up.
-    /// The axis is a statement about bytes in AVPlayer's timeline, so a placement composed from a
-    /// request needs to know whether that request was answered. Default ignores it.
-    func didServeMediaSegment(index: Int, delivered: Bool)
-
     /// One more chunk of a progressively delivered segment left the server: the request-counting
     /// wedge watchdog's evidence that AVPlayer is still reading. Default ignores it.
     func didDeliverProgressiveChunk(index: Int)
@@ -186,7 +180,6 @@ extension HLSSegmentProvider {
         mediaSegment(at: index, onSlow: onSlow).map { .data($0) }
     }
     func mediaSegmentURL(at index: Int) -> URL? { nil }
-    func didServeMediaSegment(index: Int, delivered: Bool) {}
     func didDeliverProgressiveChunk(index: Int) {}
     var staticMasterPlaylistBody: String? { nil }
     var firstVisibleSegmentIndex: Int { 0 }
@@ -1335,16 +1328,6 @@ final class HLSLocalServer: @unchecked Sendable {
                 stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
                 let indexStr = normalizedPath.dropFirst(4).dropLast(4)
                 if let index = Int(indexStr), index >= 0 {
-                    // AE#418 round 7: every exit from this branch says what became of the request, so
-                    // a placement composed from it can tell "not delivered yet" from "never arriving".
-                    func delivered(_ ok: Bool) -> Bool {
-                        provider?.didServeMediaSegment(index: index, delivered: ok)
-                        return ok
-                    }
-                    func refused(_ responseWritten: Bool) -> Bool {
-                        provider?.didServeMediaSegment(index: index, delivered: false)
-                        return responseWritten
-                    }
                     // File-backed fast path: stream page cache -> socket without Data materialization.
                     if let url = provider?.mediaSegmentURL(at: index) {
                         let outcome = send200File(fd: fd, path: normalizedPath,
@@ -1354,8 +1337,8 @@ final class HLSLocalServer: @unchecked Sendable {
                         // A cache entry can outlive its file, and that answer is a retriable 503: the
                         // request is not answered yet, so it says nothing about the placement.
                         switch outcome.body {
-                        case .segment: return delivered(outcome.writeSucceeded)
-                        case .refusal: return refused(outcome.writeSucceeded)
+                        case .segment: return (outcome.writeSucceeded)
+                        case .refusal: return (outcome.writeSucceeded)
                         case .retry: return outcome.writeSucceeded
                         }
                     }
@@ -1381,10 +1364,10 @@ final class HLSLocalServer: @unchecked Sendable {
                         if early.markSentOnce() {
                             guard writeAll(fd: fd, parts: [Self.chunkedResponseHeader(contentType: "video/mp4")],
                                            path: "\(normalizedPath) [progressive header]") else {
-                                return refused(false)
+                                return (false)
                             }
                         }
-                        return delivered(sendProgressiveBody(fd: fd, path: normalizedPath, reader: reader))
+                        return (sendProgressiveBody(fd: fd, path: normalizedPath, reader: reader))
                     }
                     let data: Data? = {
                         if case .data(let d) = source { return d }
@@ -1398,12 +1381,12 @@ final class HLSLocalServer: @unchecked Sendable {
                                 "[HLSLocalServer] seg\(index): early-header serve missed; "
                                 + "closing connection for AVPlayer retry",
                                 category: .hlsServer)
-                            return refused(false)
+                            return (false)
                         }
-                        return delivered(sendChunkedBody(fd: fd, path: normalizedPath, data: data))
+                        return (sendChunkedBody(fd: fd, path: normalizedPath, data: data))
                     }
                     if let data, !data.isEmpty {
-                        return delivered(send200(fd: fd, path: normalizedPath, data: data,
+                        return (send200(fd: fd, path: normalizedPath, data: data,
                                                  contentType: "video/mp4"))
                     }
                     let providerCount = provider?.segmentCount ?? -1
@@ -1412,13 +1395,13 @@ final class HLSLocalServer: @unchecked Sendable {
                         index: index, segmentCount: providerCount, hasData: false) {
                     case .serve:
                         // Unreachable: hasData is false here.
-                        return refused(send404(fd: fd, path: normalizedPath, reason: reason))
+                        return (send404(fd: fd, path: normalizedPath, reason: reason))
                     case .retryLater:
                         // A 503 is retriable, so the request is not answered yet; the placement waits
                         // for the retry rather than concluding from it.
                         return send503(fd: fd, path: normalizedPath, reason: reason)
                     case .notFound:
-                        return refused(send404(fd: fd, path: normalizedPath, reason: reason))
+                        return (send404(fd: fd, path: normalizedPath, reason: reason))
                     }
                 }
                 return send404(fd: fd, path: normalizedPath,

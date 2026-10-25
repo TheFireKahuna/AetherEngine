@@ -281,6 +281,11 @@ final class NativeAVPlayerHost {
     private var loadedVideoObservation: NSKeyValueObservation?
     private var videoHealthSummaryAt: Double?
     var onVideoPresentationRecovery: ((VideoPresentationProgress.Action, Double) -> Void)?
+    /// The in-band clock of the segment AVPlayer is about to play: the item time it plays it at and
+    /// what the segment states (`InBandClock`).
+    var onInBandClock: ((Double, InBandClock.Stamp) -> Void)?
+    /// The current item's in-band clock reader; replaced with the item.
+    private var inBandClockReader: InBandClockReader?
     var pictureInPictureActive = false {
         didSet {
             // Detach BEFORE AVKit takes the layer, not on the first background polling tick.
@@ -656,6 +661,30 @@ final class NativeAVPlayerHost {
             }
         }
 
+        // docs/segment-axis.md: every VOD segment states its source time in band (`InBandClock`), and
+        // this is where AVPlayer reports the item time it played each one at. Attached with the item:
+        // attached later, the segment the mount lands in is never reported. Live states nothing.
+        if !contract.isLive {
+            let reader = InBandClockReader { [weak self] itemSeconds, stamp in
+                // A reading belongs to the item it was taken from; one in flight across a swap is dropped.
+                Task { @MainActor in
+                    guard let self, self.sessionID == sid else { return }
+                    self.onInBandClock?(itemSeconds, stamp)
+                }
+            }
+            // Every identifier, filtered here (`InBandClock.stamps`): asked for the ID3 `TXXX` identifier
+            // alone, the output stamps a group with the segment's raw `tfdt` rather than the item time
+            // AVPlayer plays it at (measured on a segment AVPlayer placed 0.225 s below its `tfdt`: 75.125
+            // filtered, 74.900 unfiltered, the picture agreeing with the second).
+            let output = AVPlayerItemMetadataOutput(identifiers: nil)
+            output.setDelegate(reader, queue: reader.queue)
+            output.advanceIntervalForDelegateInvocation = InBandClockReader.advanceSeconds
+            item.add(output)
+            inBandClockReader = reader
+        } else {
+            inBandClockReader = nil
+        }
+
         // Observe on the item's queue; do not poll a potentially wedged media server on main.
         loadedVideoObservation = item.observe(\.loadedTimeRanges, options: [.initial, .new]) { [weak self] item, change in
             let ranges = (change.newValue ?? item.loadedTimeRanges).map { value in
@@ -977,7 +1006,6 @@ final class NativeAVPlayerHost {
                 + "live=\(contract.isLive))",
                 category: .engine)
             // Load-time seek (not a user scrub): no seekInFlight needed; the async seek(to:) carries #37/#38 semantics for user seeks.
-            positionedItemSeconds = CMTime(seconds: startPosition ?? 0, preferredTimescale: 600).seconds
             avPlayer.seek(to: CMTime(seconds: startPosition ?? 0, preferredTimescale: 600),
                           toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                 guard finished else { return }
@@ -2107,11 +2135,6 @@ final class NativeAVPlayerHost {
     /// only and is NOT the witness: measured at a premature end, AVPlayer has already trimmed that
     /// range back to the exhaustion point, so it corroborates the mistake instead of refuting it.
 
-    /// Where the item was last positioned, item axis: its mount seek or the latest seek, as the
-    /// `CMTime` AVPlayer was given. A run AVPlayer starts a little way into a segment is reported
-    /// loaded from here (`HLSVideoEngine.placementRunStart`).
-    private(set) var positionedItemSeconds: Double?
-
     /// Resolve only when the seek physically lands (loopback source lands seeks seconds after the call; issue #37).
     /// seekInFlight suppresses the periodic observer across the wait; only the latest seekGeneration clears it.
     func seek(to seconds: Double) async {
@@ -2126,7 +2149,6 @@ final class NativeAVPlayerHost {
     @discardableResult
     func seek(to seconds: Double, deadlineSeconds: Double?) async -> Bool {
         let target = CMTime(seconds: seconds, preferredTimescale: 600)
-        positionedItemSeconds = target.seconds
         seekGeneration &+= 1
         let gen = seekGeneration
         seekInFlight = true
@@ -3201,5 +3223,29 @@ extension NativeAVPlayerHost {
                                      underlyingCode: code)
         }
         return PlaybackErrorInfo(kind: .nativeItemFailed, message: desc, underlying: itemError)
+    }
+}
+
+
+/// Reads the in-band clock (`InBandClock`) back out of `AVPlayerItemMetadataOutput`: each group is the
+/// `emsg` of a segment AVPlayer is about to play, stamped with the item time it plays it at.
+final class InBandClockReader: NSObject, AVPlayerItemMetadataOutputPushDelegate, @unchecked Sendable {
+    /// How far ahead of playback AVPlayer reports a segment's clock. Measured on the Apple TV with 5:
+    /// about four seconds, every segment of every run, and the segment a seek or the mount lands in at
+    /// the landing.
+    static let advanceSeconds: TimeInterval = 5
+
+    let queue = DispatchQueue(label: "aether.inbandclock", qos: .userInitiated)
+    private let deliver: @Sendable (Double, InBandClock.Stamp) -> Void
+
+    init(deliver: @escaping @Sendable (Double, InBandClock.Stamp) -> Void) {
+        self.deliver = deliver
+    }
+
+    func metadataOutput(_ output: AVPlayerItemMetadataOutput, didOutputTimedMetadataGroups groups: [AVTimedMetadataGroup],
+                        from track: AVPlayerItemTrack?) {
+        for group in groups {
+            for (itemSeconds, stamp) in InBandClock.stamps(in: group) { deliver(itemSeconds, stamp) }
+        }
     }
 }

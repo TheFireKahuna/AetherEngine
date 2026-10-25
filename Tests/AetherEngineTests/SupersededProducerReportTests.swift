@@ -67,7 +67,7 @@ struct SupersededProducerReportTests {
 
     // MARK: - The gate open of a replaced producer (SEG-104 B)
 
-    @Test("a gate open from a producer the session replaced records nothing")
+    @Test("a gate open from a producer the session replaced answers no re-cut")
     func supersededGateOpenRecordsNothing() throws {
         let session = try Session()
         let engine = session.engine
@@ -76,72 +76,44 @@ struct SupersededProducerReportTests {
         engine.producer = nil   // performRestart tears it down before building the next one
 
         session.openGate(of: stale, at: 2)
-        #expect(engine.epochAxisByIndex.opening(at: 2) == nil,
-                "the stale epoch dropped the table at and above its own index")
+        #expect(engine.gateOpenedIndex == nil, "the stale epoch answered for the session")
 
         let current = try engine.makeProducer(baseIndex: 5)
         engine.producer = current
         session.openGate(of: stale, at: 2)
+        #expect(engine.gateOpenedIndex == nil)
         session.openGate(of: current, at: 5)
-        #expect(engine.epochAxisByIndex.opening(at: 2) == nil)
-        #expect(engine.epochAxisByIndex.opening(at: 5) != nil, "the installed producer's gate still records")
+        #expect(engine.gateOpenedIndex == 5, "the installed producer's gate still answers")
     }
 
-    // MARK: - The re-cut mark (HLS-105)
+    // MARK: - The re-cut (AE#412)
 
-    @Test("a re-cut whose gate opens after the seek stopped waiting is still recorded as a re-cut",
+    @Test("a seek into a segment no random-access point opens re-cuts it from the covering one",
           .timeLimit(.minutes(1)))
-    func lateRecutGateKeepsItsMark() async throws {
+    func seekIntoBarrenSegmentRecuts() async throws {
         let session = try Session()
         let engine = session.engine
         for i in 0...4 { try session.storeWithoutSyncSample(i) }
 
-        // Nothing here ever opens a gate on its own, so the seek's wait runs out.
+        // Nothing here ever opens a gate on its own, so the seek's wait runs out and it goes out as asked.
         let landing = await Task.detached { engine.preparedSeekLanding(itemSeconds: 14) }.value
         #expect(landing == 14)
         try await waitFor { engine.producer?.anchoredBaseIndex == 3 }
         let recut = try #require(engine.producer)
-
         session.openGate(of: recut, at: 3)
-        #expect(engine.epochAxisByIndex.opening(at: 3)?.isRecut == true,
-                "the late gate open composed the re-cut's backoff into the axis")
+        #expect(engine.gateOpenedIndex == 3)
     }
 
-    @Test("a mark belongs to the restart it asked for, not to whatever restart runs next")
-    func markBindsOnlyItsOwnRestart() throws {
+    @Test("a re-cut waits for its own restart's gate, not one that opened before it")
+    func recutWaitsForItsOwnGate() throws {
         let session = try Session()
         let engine = session.engine
-
-        engine.markRecut(at: 3)
         engine.requestRestart(at: 6, authoritative: true)
         let other = try #require(engine.producer)
         session.openGate(of: other, at: 6)
-        #expect(engine.epochAxisByIndex.opening(at: 6)?.isRecut == false)
-
-        engine.requestRestart(at: 3, authoritative: true)
-        let recut = try #require(engine.producer)
-        engine.requestRestart(at: 7, authoritative: true)   // supersedes the re-cut before its gate opened
-        let next = try #require(engine.producer)
-        session.openGate(of: recut, at: 3)
-        session.openGate(of: next, at: 7)
-        #expect(engine.epochAxisByIndex.opening(at: 3) == nil)
-        #expect(engine.epochAxisByIndex.opening(at: 7)?.isRecut == false)
-    }
-
-    @Test("the mark's lifecycle: bound by its own restart, kept past others, dropped once superseded")
-    func recutMarkLifecycle() {
-        let mark = HLSVideoEngine.RecutMark(index: 3)
-        #expect(!mark.isOpened(byProducerEpoch: 7, at: 3), "unbound, no gate can claim it")
-
-        let pending = mark.installing(producerEpoch: 5, at: 6)
-        #expect(pending == mark, "a restart elsewhere ran first; the marked one is still to come")
-
-        let bound = pending?.installing(producerEpoch: 7, at: 3)
-        #expect(bound?.isOpened(byProducerEpoch: 7, at: 3) == true)
-        #expect(bound?.isOpened(byProducerEpoch: 5, at: 3) == false)
-        #expect(bound?.installing(producerEpoch: 8, at: 3)?.isOpened(byProducerEpoch: 8, at: 3) == true,
-                "a second restart at the same index re-cuts the same landing")
-        #expect(bound?.installing(producerEpoch: 9, at: 6) == nil)
+        #expect(engine.gateOpenedIndex == 6)
+        engine.markRecut(at: 3)
+        #expect(engine.gateOpenedIndex == nil)
     }
 
     // MARK: - The delayed #377 revive (HLS-104)
