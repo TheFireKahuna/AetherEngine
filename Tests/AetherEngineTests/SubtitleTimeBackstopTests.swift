@@ -32,14 +32,14 @@ struct SubtitleTimeBackstopTests {
         _ = AetherEngine.decodeStoredSubtitlePacket(infinite, with: decoder)
     }
 
-    @Test("the store unsets implausible times and zeroes implausible durations for every writer")
+    @Test("the store unsets implausible times and zeroes implausible durations for every packet")
     func harvestBoundsTimes() throws {
         let (demuxer, decoder) = try subripDecoder()
         defer { demuxer.close() }
         let store = SubtitlePacketStore()
         let payload = Data("line".utf8)
         store.harvestChunk(streamIndex: 0, ptsSeconds: 1, durationSeconds: 9.2e15, flags: 0,
-                           payload: payload, assembleSplitDisplaySets: false, writer: .prefetch)
+                           payload: payload, assembleSplitDisplaySets: false)
         store.harvestChunk(streamIndex: 0, ptsSeconds: 2, durationSeconds: .infinity, flags: 0,
                            payload: payload, assembleSplitDisplaySets: false)
         store.harvestChunk(streamIndex: 0, ptsSeconds: 3, durationSeconds: 0.5, flags: 0,

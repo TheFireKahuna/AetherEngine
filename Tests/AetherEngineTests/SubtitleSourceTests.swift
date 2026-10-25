@@ -5,8 +5,7 @@ import AetherLibavformat
 
 /// The session's one subtitle reader against real files (`MP4SampleIndexTests`' fixtures, written to
 /// disk): each stream's route, the text renditions the index fills whole, which are their streams' pull,
-/// pulls of an indexed stream on request, the walk for every other stream feeding the packet store and its
-/// cue store through the same decoder, and the walk following its consumers' demand.
+/// pulls of an indexed stream on request, and every other stream's consumers asking the pump to read ahead.
 @MainActor
 @Suite(.serialized)
 struct SubtitleSourceTests {
@@ -18,11 +17,7 @@ struct SubtitleSourceTests {
         let demuxer: Demuxer
         let packetStore = SubtitlePacketStore()
         let cueStores: [Int32: NativeSubtitleCueStore]
-        var playhead: Double = 0 { didSet { clock.set(playhead) } }
-        /// The playhead the walk paces against, as a session's clock would give it.
-        let clock = AtomicDouble(0)
-        var restarting = false
-        var endsOfFile = 0
+        let leads = SubtitleSource.Leads()
         var stops: [SubtitleDrainStopReason?] = []
         var settled: [Int32: SubtitleSource.Route]?
         var pulls: [Int32] = []
@@ -40,25 +35,19 @@ struct SubtitleSourceTests {
                 : [:]
             let demuxer = demuxer
             source = SubtitleSource(host: .init(
-                url: url, headers: [:], headerStore: nil, customReader: nil, formatHint: nil,
-                probesize: nil, maxAnalyzeDuration: nil, discTitleID: nil, isLive: false,
+                url: url, headers: [:], headerStore: nil, customReader: nil, discTitleID: nil, isLive: false,
                 packetStore: packetStore, cueStores: cueStores, demuxer: demuxer,
                 makeDecoder: { stream in
                     demuxer.withStream(at: stream) {
                         EmbeddedSubtitleDecoder(stream: $0, sourceVideoWidth: 32, sourceVideoHeight: 32)
                     } ?? nil
                 },
-                playhead: { [weak self] in self?.playhead },
-                pacingPlayhead: { [clock] in clock.get() },
                 duration: { 12 },
-                videoRestarting: { [weak self] in self?.restarting ?? false },
-                linkGate: SideReaderLinkGate(),
-                fence: { .init() },
                 cuesArrived: {},
-                endOfFile: { [weak self] in self?.endsOfFile += 1 },
                 stopped: { [weak self] in self?.stops.append($0) },
                 routesSettled: { [weak self] in self?.settled = $0 },
-                pulled: { [weak self] in self?.pulls.append($0) }))
+                pulled: { [weak self] in self?.pulls.append($0) }),
+                leads: leads)
         }
 
         var streams: Set<Int32> { Set(demuxer.subtitleStreamIndices()) }
@@ -87,17 +76,17 @@ struct SubtitleSourceTests {
     func routes() async throws {
         let whole = try Rig(MP4SampleIndexTests.movText)
         defer { whole.close() }
-        #expect(Set(await whole.source.routes().values.map { $0 == .walked }) == [false])
+        #expect(Set(await whole.source.routes().values.map { $0 == .pumped }) == [false])
 
         let cut = try Rig(MP4SampleIndexTests.movTextCut)
         defer { cut.close() }
         let cutRoutes = await cut.source.routes()
-        #expect(cutRoutes.values.filter { $0 == .walked }.count == 1)
-        #expect(cutRoutes.values.filter { $0 != .walked }.count == 1)
+        #expect(cutRoutes.values.filter { $0 == .pumped }.count == 1)
+        #expect(cutRoutes.values.filter { $0 != .pumped }.count == 1)
 
         let fragmented = try Rig(MP4SampleIndexTests.movTextFragmented)
         defer { fragmented.close() }
-        #expect(Set(await fragmented.source.routes().values) == [.walked])
+        #expect(Set(await fragmented.source.routes().values) == [.pumped])
     }
 
     @Test("an indexed text rendition is complete at once, and its frames are its stream's pull for the film")
@@ -107,8 +96,7 @@ struct SubtitleSourceTests {
         try await waitFor { rig.cueStores.values.allSatisfy(\.isFinished) }
         let counts = rig.cueStores.keys.sorted().map { rig.cues($0).count }
         #expect(counts.sorted() == [2, 3])
-        #expect(!rig.source.isReading)
-        #expect(rig.source.walkDemuxer == nil)
+        #expect(!rig.source.isReadingAhead)
         for stream in rig.cueStores.keys {
             // Every frame, the empty gap samples mov_text times its silences with included.
             #expect(rig.packetStore.entries(streamIndex: stream, from: 0, through: 20).count >= rig.cues(stream).count)
@@ -135,127 +123,74 @@ struct SubtitleSourceTests {
         rig.source.pull(stream, from: 0, through: 20, focus: 0)
         try await Task.sleep(nanoseconds: 200_000_000)
         #expect(rig.pulls == [stream])
-        #expect(!rig.source.isReading)
+        #expect(!rig.source.isReadingAhead)
     }
 
-    @Test("the walk decodes its streams into their cue stores with the decoder the index uses")
-    func walkDecodesLikeTheIndex() async throws {
-        let indexed = try Rig(MP4SampleIndexTests.movText)
-        defer { indexed.close() }
-        try await waitFor { indexed.cueStores.values.allSatisfy(\.isFinished) }
-
-        let walked = try Rig(MP4SampleIndexTests.movTextFragmented)
-        defer { walked.close() }
-        walked.source.demand(.rendition, streams: walked.streams, lead: { _ in 3600 }, from: 0)
-        try await waitFor { walked.endsOfFile == 1 }
-        #expect(walked.source.walkDemuxer != nil || !walked.source.isReading)
-        for stream in indexed.cueStores.keys.sorted() {
-            let a = indexed.cues(stream), b = walked.cues(stream)
-            #expect(!a.isEmpty)
-            #expect(a.map(\.1) == b.map(\.1))
-            // The indexed fixture puts the German track behind an empty edit of 0.75 s and the
-            // fragmented copy does not, so a stream's times may differ by one constant.
-            let offsets = zip(a, b).map { $1.0 - $0.0 }
-            #expect(offsets.allSatisfy { abs($0 - offsets[0]) < 0.001 })
-            #expect([0.0, -0.75].contains { abs(offsets[0] - $0) < 0.001 }, "\(offsets)")
-            // The walk read the whole file, so it vouches for every stretch of it.
-            #expect((walked.cueStores[stream]?.readThrough(at: 0.5) ?? 0) >= 10)
-        }
-    }
-
-    @Test("the walk reads the walked stream; the indexed one is its fill's pull, decoded once")
+    @Test("a pumped stream's consumer asks the pump to read ahead; the indexed one is its fill's pull")
     func mixedRoutes() async throws {
         let rig = try Rig(MP4SampleIndexTests.movTextCut)
         defer { rig.close() }
         let routes = await rig.source.routes()
-        let walkedStream = try #require(routes.first { $0.value == .walked }?.key)
-        let indexedStream = try #require(routes.first { $0.value != .walked }?.key)
+        let pumpedStream = try #require(routes.first { $0.value == .pumped }?.key)
+        let indexedStream = try #require(routes.first { $0.value != .pumped }?.key)
         try await waitFor { rig.cueStores[indexedStream]?.isFinished == true }
-        #expect(rig.cueStores[walkedStream]?.isFinished == false)
+        #expect(rig.cueStores[pumpedStream]?.isFinished == false)
+        #expect(rig.packetStore.isPulled(indexedStream))
+        #expect(!rig.packetStore.isPulled(pumpedStream))
 
-        rig.source.demand(.overlay, streams: rig.streams, lead: { _ in 3600 }, from: 0)
-        try await waitFor { rig.endsOfFile == 1 }
-        #expect(!rig.packetStore.entries(streamIndex: walkedStream, from: 0, through: 20).isEmpty)
-        #expect(rig.packetStore.pulledReach(streamIndex: walkedStream, from: 0) == nil)
-        #expect(!rig.packetStore.entries(streamIndex: indexedStream, from: 0, through: 20).isEmpty)
-        // The walk's own stream reached its rendition; the indexed one was not decoded twice.
-        #expect(!rig.cues(walkedStream).isEmpty)
-        #expect(rig.cues(indexedStream).count == Set(rig.cues(indexedStream).map(\.1)).count)
+        rig.source.demand(.overlay, streams: [indexedStream], lead: { _ in 75 })
+        #expect(!rig.source.isReadingAhead)
+        #expect(rig.leads.readAhead(playhead: 0) == nil)
+        rig.source.demand(.overlay, streams: rig.streams, lead: { _ in 75 })
+        #expect(rig.source.isReadingAhead)
+        #expect(rig.leads.readAhead(playhead: 0) == 75)
     }
 
-    @Test("the loop parks at the furthest lead and reads on when a lead is raised, without a move")
-    func leadIsLive() async throws {
-        let rig = try Rig(MP4SampleIndexTests.movTextFragmented)
+    @Test("before the routes settle every stream counts as the pump's")
+    func unsettledStreamsArePumped() async throws {
+        let rig = try Rig(MP4SampleIndexTests.movText)
         defer { rig.close() }
-        let stream = try #require(rig.cueStores.keys.min())
-        rig.source.demand(.overlay, streams: rig.streams, lead: { _ in 1 }, from: 0)
-        try await waitFor { (rig.packetStore.frontier(streamIndex: stream) ?? -1) >= 0 }
-        try await Task.sleep(nanoseconds: 400_000_000)
-        #expect(rig.endsOfFile == 0)
-        #expect((rig.packetStore.frontier(streamIndex: stream) ?? 0) < 6)
-        rig.source.demand(.rendition, streams: rig.streams, lead: { _ in 3600 })
-        try await waitFor { rig.endsOfFile == 1 }
-        #expect((rig.packetStore.frontier(streamIndex: stream) ?? 0) >= 6)
+        rig.source.demand(.overlay, streams: rig.streams, lead: { _ in 75 })
+        if rig.settled == nil { #expect(rig.leads.readAhead(playhead: 0) == 75) }
+        try await waitFor { rig.settled != nil }
+        // Every stream turned out to be the index's: the pump has nothing to read ahead for.
+        #expect(rig.leads.readAhead(playhead: 0) == nil)
+        try await waitFor { !rig.source.isReadingAhead }
+        #expect(rig.stops.allSatisfy { $0 == nil })
     }
 
-    @Test("the reading stops once nobody asks, with the last reason; a re-ask in the same turn keeps it")
+    @Test("the read-ahead lapses once nobody asks, with the last reason; a re-ask in the same turn keeps it")
     func demandLifecycle() async throws {
         let rig = try Rig(MP4SampleIndexTests.movTextFragmented)
         defer { rig.close() }
-        rig.restarting = true   // holds the walk before its open, so nothing races the assertions
         try await waitFor { rig.settled != nil }
-        #expect(!rig.source.isReading)
+        #expect(!rig.source.isReadingAhead)
         rig.source.demand(.ocr, streams: rig.streams, lead: { _ in 60 })
-        #expect(rig.source.isReading)
+        #expect(rig.source.isReadingAhead)
         rig.source.withdraw(.ocr)
         rig.source.demand(.ocr, streams: rig.streams, lead: { _ in 60 })
         try await Task.sleep(nanoseconds: 100_000_000)
-        #expect(rig.source.isReading)
+        #expect(rig.source.isReadingAhead)
         #expect(rig.stops.isEmpty)
 
         rig.source.demand(.overlay, streams: rig.streams, lead: { _ in 75 })
         rig.source.withdraw(.ocr)
         try await Task.sleep(nanoseconds: 100_000_000)
-        #expect(rig.source.isReading)
+        #expect(rig.source.isReadingAhead)
+        #expect(rig.leads.readAhead(playhead: 0) == 75)
         rig.source.withdraw(.overlay, reason: .subtitlesCleared)
-        try await waitFor { !rig.source.isReading }
+        try await waitFor { !rig.source.isReadingAhead }
         #expect(rig.stops == [.subtitlesCleared])
+        #expect(rig.leads.readAhead(playhead: 0) == nil)
     }
 
-    @Test("a producer restart in flight holds the walk's open until it settles", .timeLimit(.minutes(1)))
-    func walkWaitsForARestart() async throws {
+    @Test("closing the source clears the leads the pump reads, and says it stopped")
+    func closeClearsTheLeads() async throws {
         let rig = try Rig(MP4SampleIndexTests.movTextFragmented)
-        defer { rig.close() }
-        rig.restarting = true
-        rig.source.demand(.rendition, streams: rig.streams, lead: { _ in 3600 }, from: 0)
-        try await Task.sleep(nanoseconds: 700_000_000)
-        #expect(rig.source.walkDemuxer == nil)
-        #expect(rig.cueStores.values.allSatisfy { $0.cueCount == 0 })
-        rig.restarting = false
-        try await waitFor { rig.endsOfFile == 1 }
-        #expect(rig.cueStores.values.allSatisfy { $0.cueCount > 0 })
-    }
-
-    @Test("a demand for indexed streams only starts no walk")
-    func indexOnlyNeedsNoWalk() async throws {
-        let rig = try Rig(MP4SampleIndexTests.movText)
-        defer { rig.close() }
         try await waitFor { rig.settled != nil }
-        rig.source.demand(.overlay, streams: rig.streams, lead: { _ in 3600 }, from: 0)
-        try await Task.sleep(nanoseconds: 300_000_000)
-        #expect(!rig.source.isReading)
-        #expect(rig.source.walkDemuxer == nil)
-        #expect(rig.endsOfFile == 0)
-    }
-
-    @Test("a move while the session opens is taken when it is positioned")
-    func moveBeforeTheSessionIsPositioned() async throws {
-        let rig = try Rig(MP4SampleIndexTests.movTextFragmented)
-        defer { rig.close() }
-        rig.source.demand(.overlay, streams: rig.streams, lead: { _ in 3600 }, from: 0)
-        rig.source.move(to: 8)
-        try await waitFor { rig.endsOfFile == 1 }
-        let spans = rig.packetStore.harvestCoverageSpans
-        #expect(spans.contains { $0.from >= 7.9 })
+        rig.source.demand(.rendition, streams: rig.streams, lead: { _ in 300 })
+        rig.close()
+        #expect(rig.leads.readAhead(playhead: 0) == nil)
+        #expect(rig.stops == [.sessionStopped])
     }
 }

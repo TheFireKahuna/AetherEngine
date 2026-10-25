@@ -288,7 +288,7 @@ libavformat's own parsers and PMT handling are what the tests run against.
    can name the old and the new streams together, and after a seek it is corrected only at the next
    PMT cell. A new stream judged to take no role is therefore judged again when the programs change.
 
-## Layer 3: every output on request (steps 1, 2 and 4 built; the rest next)
+## Layer 3: every output on request (steps 1 to 5 built)
 
 In order, each step replacing a reader rather than adding one:
 
@@ -502,9 +502,37 @@ In order, each step replacing a reader rather than adding one:
      scrub, which on TS only a read of the whole file finds. To be worked out separately.
    - Left: the demuxer route still opens on the `iframe` side demuxer profile (an `AVIOReader` over
      the shared cache), not on the exact range reader.
-5. **Unindexed containers.** The pump records the index as it reads (layer 2, step 1); a request ahead
-   of the pump in an unindexed interleaved file is the one case where reading the video early is
-   inherent, and it goes through the pump's own read-ahead into the cache, not a second walker.
+5. **Unindexed containers: the pump reads ahead. Built.** A subtitle stream the index does not list in
+   full (a transport stream's, a disc's, a Matroska file's without subtitle Cues, a fragmented MP4's) is
+   interleaved with the video, so reading it early means reading the video early; that is now the pump's
+   own read-ahead, and the walk (`SubtitleForwardPrefetcher`, its side demuxer, the link arbitration of
+   #240, the restart budget of #231, the byte-estimate positioning of #112 and the pacing stream of #230)
+   is gone. A pumped stream's packets come only from the session's reader of the source.
+   - **Demand.** The consumers state their leads as before (`SubtitleSource.demand`); `Leads.readAhead`
+     answers, off the main actor, the furthest lead of a consumer of a stream the index does not read
+     (before the routes settle, every stream counts). The engine folds it with the playback clock
+     (`SourcePlayheadClock`) into a source time.
+   - **The native route.** Every producer asks it at its advance park (`subtitleReadAheadReach`, the
+     segment holding that time on the plan's axis, plus one) and reads on past its forward window to it;
+     the disk park (#207) still bounds the run, so a UHD remux at the 2 GiB budget reads as far as the
+     budget allows. Segments cut ahead stay in the segment cache, where the bytes the walk left in the
+     source cache used to wait for the pump, so the disk cost is the same and the second demux is gone.
+   - **The software route.** The VOD read-ahead (`SoftwarePacketReadAhead`) takes the lead as its
+     forward window and harvests subtitle packets where it reads, not where they are decoded. A local
+     file, which has no read-ahead, harvests at its read loop's pace, as before #151.
+   - **Coverage.** The pump states where it has read (`onSourceReadThrough`, the video's decode time
+     every half second, `.infinity` at the end of the source): each producer anchors its run of the
+     harvest coverage (#416) at its first read and extends it, the cue stores it decodes into are read
+     to a margin short of it, and the end of the source is `via=eof`. The #250 statement's frontier is
+     now the store's own (`harvestReach`, or `pulledReach` for an indexed stream: `via=read`), not a
+     side reader's telemetry; the store has one writer, so its writer keys are gone.
+   - **Tests.** `SubtitlePumpReadAheadTests` (the real producer over a TS fixture parks at its window
+     and reads on to the reach, then to the end; the software read-ahead reads past its window as far as
+     asked; the leads; end of source in the store and the cue stores), `SubtitleSourceTests` (routes,
+     demand lifecycle, a pumped stream asks and an indexed one does not), `Issue250`/`Issue318` on the
+     store's frontier, `Issue416` with one writer. The walk's own suites are deleted with it.
+   - **Logs.** `[SubtitleSource] the pump reads ahead for [...]`, `... read-ahead lapsed (reason=...)`,
+     and `subReadAhead=270s subRead=41.2s` in the memprobe line.
 
 When layer 3 is done the readers of a playing source are the pump, exact index reads, and nothing
 else; the ledger's per-reader lines should show exactly that.

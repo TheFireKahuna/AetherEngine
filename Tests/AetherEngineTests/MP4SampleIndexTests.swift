@@ -275,9 +275,9 @@ struct MP4SampleIndexTests {
         }
     }
 
-    /// The registry reads an MP4's index off the demuxer, and a pull then stores from it exactly what its
-    /// walk stores, read from the file through the readers a session opens for it.
-    @Test("a pull from an MP4's index stores what its walk stores")
+    /// The registry reads an MP4's index off the demuxer, and a pull then stores from it exactly what the
+    /// pump's harvest of `av_read_frame` stores, read from the file through the readers a session opens for it.
+    @Test("a pull from an MP4's index stores what the pump's harvest stores")
     func pullFromTheIndex() async throws {
         let url = FileManager.default.temporaryDirectory.appending(path: "mp4-pull-\(UUID().uuidString).mp4")
         try Self.movText.write(to: url)
@@ -304,17 +304,20 @@ struct MP4SampleIndexTests {
                                                into: fromIndex) == nil)
         }
 
-        let walker = try Self.open(Self.movText)
-        defer { walker.close() }
-        walker.discardAllStreamsExcept(subtitles)
-        let fromWalk = SubtitlePacketStore()
-        let walkSource = SubtitleForwardPrefetcher.DemuxerSource(
-            demuxer: walker, streamIndices: subtitles, assemblyIndices: [], pacingIndex: -1)
-        while try walkSource.step(into: fromWalk) != .endOfFile {}
+        let pump = try Self.open(Self.movText)
+        defer { pump.close() }
+        let fromPump = SubtitlePacketStore()
+        while let packet = try pump.readPacket() {
+            var owned: UnsafeMutablePointer<AVPacket>? = packet
+            defer { av_packet_free(&owned) }
+            let streamIndex = packet.pointee.stream_index
+            guard subtitles.contains(streamIndex), let stream = pump.stream(at: streamIndex) else { continue }
+            fromPump.harvest(streamIndex: streamIndex, packet: packet, timeBase: stream.pointee.time_base)
+        }
 
         for stream in subtitles.sorted() {
             let a = fromIndex.entries(streamIndex: stream, from: 0, through: 20)
-            let b = fromWalk.entries(streamIndex: stream, from: 0, through: 20)
+            let b = fromPump.entries(streamIndex: stream, from: 0, through: 20)
             #expect(!a.isEmpty)
             #expect(a.map(\.payload) == b.map(\.payload))
             #expect(a.map(\.ptsSeconds) == b.map(\.ptsSeconds))

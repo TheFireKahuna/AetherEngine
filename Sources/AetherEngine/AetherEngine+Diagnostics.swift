@@ -204,12 +204,10 @@ extension AetherEngine {
                 // and the #174 field crash it was built against (HTTPS origin, boringssl in
                 // the stack) was on this path. Reporting software-only hid that.
                 let pumpWin = self.pumpIOWindow
-                let prefetchWin = self.subtitleSource?.walkDemuxer?.ioWindowDiagnostics
                 let readerStr = Self.readerWindowFragment(
-                    pump: pumpWin, prefetch: prefetchWin,
+                    pump: pumpWin,
                     pumpFetchedBytes: self.softwareHost?.demuxerBytesFetched
-                        ?? self.nativeVideoSession?.demuxerBytesFetched,
-                    prefetchFetchedBytes: self.subtitleSource?.walkDemuxer?.avioBytesFetched)
+                        ?? self.nativeVideoSession?.demuxerBytesFetched)
 
                 // #303: the software path's own read-ahead, and what the display did with it.
                 // `avBufAhead` covers the AVPlayer path only, and `frameAhead` is the native
@@ -249,9 +247,11 @@ extension AetherEngine {
                     + "pktAlive=\(pktAlive) pktTotal=\(pktTotal) "
                     + "subCues=\(cueCount) "
                     + readerStr
-                    // #220: the lead is the live tell. It is visible minutes before a kill and
-                    // separates "reads fast while building its lead" from "the lead never settles".
-                    + SubtitlePrefetchTelemetry.probeFragment(playhead: self.sourceTime)
+                    // How far the subtitle consumers ask the pump to read, and how far it has.
+                    + Self.subtitleReadAheadFragment(
+                        asked: self.subtitleReadAheadLeads.readAhead(playhead: self.sourceTime),
+                        read: self.activeSubtitlePacketStore?.harvestReach(from: self.sourceTime)
+                            .map { $0 - self.sourceTime })
                     + "swFrames=\(self.softwareHostFramesEnqueued) "
                     + swStr
                     + "audioTracks=\(self.audioTracks.count) "
@@ -344,15 +344,11 @@ extension AetherEngine {
     /// fired (#310: the end replaced the suspend, so the overshoot is bounded by one
     /// delivery's in-flight amount rather than by whatever a suspended task lets through).
     ///
-    /// #240: `FetchedMB` per reader is the link attribution. The aggregate `avioFetchedMB` cannot
-    /// answer "who took the bandwidth", and the reporter of #240 had to infer a second reader from
-    /// connection-start lines that carried no identity. Two counters side by side answer it directly:
-    /// a session whose `prefFetchedMB` tracks `pumpFetchedMB` is reading the stream twice.
+    /// #240: `FetchedMB` is the pump's share of the link; the aggregate `avioFetchedMB` beside it says
+    /// whether anything else read the source.
     nonisolated static func readerWindowFragment(
         pump: (windowBytes: Int, aheadBytes: Int, parked: Bool)?,
-        prefetch: (windowBytes: Int, aheadBytes: Int, parked: Bool)?,
-        pumpFetchedBytes: Int64? = nil,
-        prefetchFetchedBytes: Int64? = nil
+        pumpFetchedBytes: Int64? = nil
     ) -> String {
         func fragment(
             _ prefix: String,
@@ -366,7 +362,15 @@ extension AetherEngine {
                 + (fetched.map { "\(prefix)FetchedMB=\($0 / 1024 / 1024) " } ?? "")
         }
         return fragment("pump", pump, pumpFetchedBytes)
-            + fragment("pref", prefetch, prefetchFetchedBytes)
+    }
+
+    /// The subtitle read-ahead: how far past the playhead the consumers of a stream only the pump reads
+    /// ask it to have read (`off` when none asks), and how far the harvest has read on from the playhead
+    /// (`none` when the playhead itself was not read).
+    nonisolated static func subtitleReadAheadFragment(asked: Double?, read: Double?) -> String {
+        let askedText = asked.map { String(format: "%.0f", $0) + "s" } ?? "off"
+        let readText = read.map { $0 == .infinity ? "eof" : String(format: "%.1f", $0) + "s" } ?? "none"
+        return "subReadAhead=\(askedText) subRead=\(readText) "
     }
 
     /// #303: the software path's read-ahead, and the display's own account of what it did with it.
@@ -443,7 +447,6 @@ extension AetherEngine {
 
     /// The playback pump reader's sliding-window snapshot, from whichever path owns the reader.
     /// nil for sources with no `AVIOReader` (disc, custom provider) and before the reader exists.
-    /// Named for the pump to keep it apart from the subtitle side reader, which has a window of its own.
     var pumpIOWindow: (windowBytes: Int, aheadBytes: Int, parked: Bool)? {
         softwareHost?.ioWindowDiagnostics ?? nativeVideoSession?.demuxer?.ioWindowDiagnostics
     }

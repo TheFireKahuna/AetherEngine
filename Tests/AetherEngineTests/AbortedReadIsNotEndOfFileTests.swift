@@ -73,12 +73,12 @@ struct AbortedReadIsNotEndOfFileTests {
         func finish(_ kind: Kind) { lock.withLock { _kind = kind } }
     }
 
-    /// The SimpleBlock boundary the Issue234 fixture's open never reads past, so the parked read
+    /// The SimpleBlock boundary `MatroskaSubRipFixture`'s open never reads past, so the parked read
     /// comes back as a clean end of file rather than a torn element.
     private static let parkOffset = 2237
 
     private func fixture() throws -> Data {
-        try #require(Data(base64Encoded: Issue234SideReaderSeekAnchorTests.fixtureBase64,
+        try #require(Data(base64Encoded: MatroskaSubRipFixture.base64,
                           options: .ignoreUnknownCharacters))
     }
 

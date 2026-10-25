@@ -13,16 +13,6 @@ public enum SubtitleChannel: Sendable {
     case secondary
 }
 
-extension SubtitleForwardPrefetcher {
-    /// #151: on the 6.60.0-atlas.1 device run, refusals fell from roughly 150 to 21, but every 429
-    /// after the pump went quiet came from this best-effort reader reopening every 4 to 10 seconds.
-    /// A paced or single-slot origin keeps the pump's tap-fed subtitles and yields the speculative
-    /// far-ahead window, the same trade already documented for serial source requests.
-    static func shouldHold(originPaced: Bool, originSerial: Bool) -> Bool {
-        originPaced || originSerial
-    }
-}
-
 extension AetherEngine {
 
     // MARK: - Channel routing
@@ -92,7 +82,7 @@ extension AetherEngine {
             }
             startSubtitleOCRWorker(ordinal: ordinal, streamIndex: Int32(stream))
         } else {
-            demandNativeRenditionSubtitles(.forcedRendition, stores: [store], startAt: sourceTime)
+            demandNativeRenditionSubtitles(.forcedRendition, stores: [store])
         }
         EngineLog.emit("[AetherEngine] forced rendition ordinal=\(ordinal) requested by the player: filling "
                        + "(\(entry.needsOCR ? "OCR, forced lines only" : "its text"))", category: .engine)
@@ -205,7 +195,7 @@ extension AetherEngine {
             startSubtitleOCRWorker(ordinal: ordinal, streamIndex: Int32(index))
         }
         startSubtitleDrainer()
-        demandOverlaySubtitles(startAt: startAt)   // #151
+        demandOverlaySubtitles()   // #151
         isLoadingSubtitles = false
         EngineLog.emit(
             "[AetherEngine] overlay fed by packet-store drainer for stream=\(index) "
@@ -281,17 +271,12 @@ extension AetherEngine {
         subtitleDrainDecoders[.secondary] = nil
         subtitleDrainCursors[.secondary] = nil
         startSubtitleDrainer()
-        demandOverlaySubtitles(startAt: startAt)   // #151
+        demandOverlaySubtitles()   // #151
         isLoadingSecondarySubtitles = false
     }
 
 
 
-
-    /// #112 round 8: wall-clock budget for one side-reader positioning seek (prewarm / lead-in / reconstruct).
-    /// A timestamp seek on an index-less remote MPEG-TS binary-searches via read_timestamp and can otherwise sit
-    /// in starved range reads for minutes while the video pipeline owns the origin.
-    nonisolated static let sideReaderSeekBudgetSeconds: TimeInterval = 8.0
 
 
 
@@ -430,7 +415,7 @@ extension AetherEngine {
         if subtitleDrainTargets.isEmpty {
             stopSubtitleDrainer(reason: reason)
         } else {
-            demandOverlaySubtitles(movingTheWalk: false)   // the remaining channel's stream only
+            demandOverlaySubtitles()   // the remaining channel's stream only
         }
     }
 
@@ -465,7 +450,7 @@ extension AetherEngine {
         // decoded behind the playhead and the playhead itself. Its lookahead beyond the playhead
         // comes from the packets it harvests, which the store notes as it takes them. The presented
         // frame's time, not a landing the picture has not reached: only the frame proves the reading.
-        store.noteHarvestReach(.pump, through: sourceTime)
+        store.noteHarvestReach(through: sourceTime)
         // #271: wall time since the previous tick, so a tick that itself ran long cannot be read as
         // a seek by the next one. See SubtitleOverlayDrainer.drainPlan.
         let tickUptime = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
@@ -474,16 +459,12 @@ extension AetherEngine {
         var work = SubtitleDrainTickWork(store: store, playhead: playhead,
                                          landingGeneration: subtitleLandingGeneration)
         for (channel, streamIndex) in subtitleDrainTargets {
-            let hadCursor = subtitleDrainCursors[channel] != nil
             let plan = SubtitleOverlayDrainer.drainPlan(
                 cursor: subtitleDrainCursors[channel],
                 playhead: playhead,
                 lead: Self.subtitleDrainLeadSeconds,
                 backscan: Self.subtitleDrainBackscanSeconds,
                 repositioning: subtitleRepositioning(elapsedSinceLastPlan: elapsed))
-            if Self.subtitleForwardPrefetchNeedsReanchor(plan: plan, hadCursor: hadCursor) {
-                work.prefetchNeedsReanchor = true
-            }
             let window: (from: Double, through: Double)
             // #250: a reset starts a fresh contiguous decoded run; a steady tick extends the one
             // already running.
@@ -573,7 +554,7 @@ extension AetherEngine {
             // The playhead catching up to the hold ends it whatever the budget says: from there on
             // the island is what the viewer is about to need, and waiting would dark the overlay
             // for content that IS stored. That, not the tick budget, is the real bound.
-            // A pulled span has no holes; the hold is the walk's and the pump's.
+            // A pulled span has no holes; the hold is the pump's.
             if !pulls, let heldAt = held?.harvestGapAt, heldAt >= playhead,
                (held?.harvestGapTicksLeft ?? 0) > 0, !isReset,
                !SubtitleOverlayDrainer.harvestGapHoldResumes(
@@ -736,7 +717,7 @@ extension AetherEngine {
             // are never decoded; their `pgsTrimAt` never runs, and the too-late end stood until the
             // session ended. Re-deriving from the store each tick needs no decode and no revisit.
             // Round 2: and it may look exactly as far as the harvest is designed to lead, no
-            // further. The prefetch parks a margin PAST the drain window precisely so the set at
+            // further. The pump reads a margin PAST the drain window precisely so the set at
             // the window's forward edge has its own clear stored (round 1), so inside that horizon
             // a stored packet is evidence the harvest was here and found this. Beyond it the store
             // holds whatever earlier runs left behind, and the first thing after a set can be the
@@ -745,7 +726,7 @@ extension AetherEngine {
             // Refusing there costs a tick or two of an open cue, which the next answer closes,
             // against an end that is wrong by a minute and that nothing downstream can tell from an
             // authored one.
-            let derivationHorizon = window.through + Self.subtitleForwardPrefetchLeadMarginSeconds
+            let derivationHorizon = window.through + Self.subtitleReadAheadMarginSeconds
             if Self.alignCueEnds(&cues, toNextPacket: {
                 // An indexed set ends where the index places the stream's next frame: known, not inferred.
                 if job.pulled { return self.subtitleSource?.nextFrameSeconds(streamIndex, after: $0) }
@@ -795,12 +776,6 @@ extension AetherEngine {
                 emitSubtitleResolutionStatement(statement, channel: channel, playhead: playhead)
             }
         }
-        // #151: a jump (seek / producer re-anchor) moves the drain window out from under the
-        // source's read position; move it to the new playhead. Once per tick, not per channel: both
-        // channels ride the same playhead and the same source.
-        if work.prefetchNeedsReanchor {
-            subtitleSource?.move(to: work.playhead, seekGeneration: currentSeekGeneration)
-        }
         // #125: the packet store is NOT time-pruned here. A trailing playhead-relative prune
         // (was: playhead - retentionSeconds) evicted packets a backward seek could still land on:
         // a backward jump into segment-cache-resident content is served without a producer restart,
@@ -817,20 +792,10 @@ extension AetherEngine {
     /// #151: the overlay's packets are read ahead for VOD sessions only (live content past the edge does
     /// not exist and the pump already rides it), and only for an embedded drain target (external/sidecar
     /// tracks hold whole files, CC is tap-fed) on a loaded source.
-    nonisolated static func shouldRunSubtitleForwardPrefetch(
+    nonisolated static func shouldReadOverlaySubtitlesAhead(
         isLive: Bool, hasEmbeddedDrainTargets: Bool, hasSource: Bool
     ) -> Bool {
         !isLive && hasEmbeddedDrainTargets && hasSource
-    }
-
-    /// #151: a drain-tick jump with an existing cursor (seek / producer re-anchor) moves the source to the
-    /// new playhead. A fresh selection (nil cursor) does not: the selection states its demand itself, with
-    /// the #73 resume anchor the tick cannot know.
-    nonisolated static func subtitleForwardPrefetchNeedsReanchor(
-        plan: SubtitleDrainPlan, hadCursor: Bool
-    ) -> Bool {
-        if case .resetAndDecode = plan { return hadCursor }
-        return false
     }
 
     /// The session's one subtitle reader (`SubtitleSource`), built once the session's packet store, cue
@@ -853,34 +818,21 @@ extension AetherEngine {
         }
         subtitleSource = SubtitleSource(host: .init(
             url: url, headers: loadedOptions.httpHeaders, headerStore: sessionRequestHeaders,
-            customReader: customReader, formatHint: customFormatHint,
-            probesize: loadedOptions.probesize, maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration,
-            discTitleID: activeDiscTitleID, isLive: isLive, packetStore: packetStore, cueStores: cueStores,
+            customReader: customReader, discTitleID: activeDiscTitleID, isLive: isLive,
+            packetStore: packetStore, cueStores: cueStores,
             demuxer: nativeVideoSession?.demuxer ?? softwareHost?.subtitleSourceDemuxer,
             makeDecoder: { [weak self] in self?.makeSubtitleDrainDecoder(streamIndex: $0) },
-            playhead: { [weak self] in self?.sourceTime },
-            pacingPlayhead: { [sourcePlayheadClock] in sourcePlayheadClock.seconds },
             duration: { [weak self] in self?.duration ?? 0 },
-            videoRestarting: { [weak self] in
-                guard let self else { return false }
-                #if DEBUG
-                if let override = self.testHookRestartInFlightOverride { return override }
-                #endif
-                return self.nativeVideoSession?.restartInFlight == true
-            },
-            linkGate: sideReaderLinkGate,
-            fence: { [weak self] in self?.subtitleResolutionFence ?? .init() },
             cuesArrived: { [weak self] in self?.nativeSubtitleRenditionAvailable = true },
-            endOfFile: { [weak self] in self?.emitSubtitleResolutionStatements(reason: .eof) },
             stopped: { [weak self] reason in
-                // #496: the stop says why, because the loop's own exit line lands whenever it next looks
-                // (seconds later, from a parked read) and reports only that it was cancelled.
+                // #496: the stop says why, so a field capture tells a track switch from a teardown.
                 if let reason { self?.lastSubtitleDrainStopReason = reason }
-                EngineLog.emit("[SubtitleSource] stopped reading (reason=\(reason?.rawValue ?? "no consumer left"))",
-                               category: .engine)
+                EngineLog.emit("[SubtitleSource] the pump's read-ahead lapsed "
+                               + "(reason=\(reason?.rawValue ?? "no consumer left"))", category: .engine)
             },
             routesSettled: { [weak self] routes in self?.subtitleRoutesSettled(routes) },
-            pulled: { [weak self] stream in self?.subtitleStreamPulled(stream) }))
+            pulled: { [weak self] stream in self?.subtitleStreamPulled(stream) }),
+            leads: subtitleReadAheadLeads)
     }
 
     /// The source's routes are in. The pump's decode tap leaves the indexed text streams, whose renditions
@@ -906,21 +858,15 @@ extension AetherEngine {
         return false
     }
 
-    /// The overlay drainer's demand on the walk, for the drain targets it walks: its window plus a margin
+    /// The overlay drainer's demand on the pump, for the drain targets it harvests: its window plus a margin
     /// (#362: the set at the window's forward edge has its own clear stored and can be closed where the
-    /// author closed it), from `startAt` (the playhead when nil), or where the walk already is when
-    /// `movingTheWalk` is false. Best effort: without it the drainer works off the pump's harvest. An
-    /// indexed target is pulled by the drain tick instead.
-    func demandOverlaySubtitles(startAt: Double? = nil, movingTheWalk: Bool = true) {
-        guard Self.shouldRunSubtitleForwardPrefetch(
+    /// author closed it). An indexed target is pulled by the drain tick instead.
+    func demandOverlaySubtitles() {
+        guard Self.shouldReadOverlaySubtitlesAhead(
             isLive: isLive, hasEmbeddedDrainTargets: !subtitleDrainTargets.isEmpty, hasSource: loadedURL != nil)
         else { return }
-        let lead = Self.subtitleDrainLeadSeconds + Self.subtitleForwardPrefetchLeadMarginSeconds
-        // #250: the seek this move serves rides along, so the read position banked after it is fenced to
-        // that seek rather than to the one the session started under.
-        subtitleSource?.demand(.overlay, streams: Set(subtitleDrainTargets.values), lead: { _ in lead },
-                               from: movingTheWalk ? max(0, startAt ?? sourceTime) : nil,
-                               seekGeneration: currentSeekGeneration)
+        let lead = Self.subtitleDrainLeadSeconds + Self.subtitleReadAheadMarginSeconds
+        subtitleSource?.demand(.overlay, streams: Set(subtitleDrainTargets.values), lead: { _ in lead })
     }
 
     /// The overlay no longer drains. Another consumer still asking keeps the reading, and then nothing
@@ -931,8 +877,7 @@ extension AetherEngine {
 
     /// A native text rendition's demand: the renditions' read-ahead, or further when the player asks the
     /// rendition for windows beyond it (AVKit reads one about four minutes ahead).
-    func demandNativeRenditionSubtitles(_ consumer: SubtitleSource.Consumer, stores: [NativeSubtitleCueStore],
-                                        startAt: Double? = nil) {
+    func demandNativeRenditionSubtitles(_ consumer: SubtitleSource.Consumer, stores: [NativeSubtitleCueStore]) {
         let streams = Set(nativeSubtitleTrackTable.indices.compactMap { ordinal -> Int32? in
             guard let store = nativeStore(atOrdinal: ordinal), stores.contains(where: { $0 === store }),
                   let stream = nativeSubtitleTrackTable[ordinal].sourceStreamIndex else { return nil }
@@ -941,7 +886,7 @@ extension AetherEngine {
         subtitleSource?.demand(consumer, streams: streams, lead: { playhead in
             Self.subtitleReadAhead(base: Self.nativeSubtitleReadAheadSeconds, playhead: playhead,
                                    requested: stores.compactMap { $0.furthestRequestedSourceSeconds() }.max())
-        }, from: startAt.map { max(0, $0) })
+        })
     }
 
     /// The text stores the native renditions read, in table order.
@@ -956,7 +901,7 @@ extension AetherEngine {
     /// Rebuild an AVPacket from a stored entry and decode it. PTS/duration ride a 1/1000
     /// time base carrying the harvested seconds; flags are restored for bitmap acquisition
     /// points. Runs on the MainActor tick; subtitle decode is a parse plus, for bitmap, a
-    /// bounded blit, the same work the side reader did per packet.
+    /// bounded blit.
     nonisolated static func decodeStoredSubtitlePacket(
         _ entry: StoredSubtitlePacket,
         with decoder: EmbeddedSubtitleDecoder
@@ -1759,7 +1704,7 @@ extension AetherEngine {
         nativeSubtitleReapplyOrdinal = ordinal
         // #15: the renditions are read ahead only while one is selected (PiP), from the playhead.
         if ordinal != nil {
-            demandNativeRenditionSubtitles(.rendition, stores: nativeTextRenditionStores, startAt: sourceTime)
+            demandNativeRenditionSubtitles(.rendition, stores: nativeTextRenditionStores)
         } else {
             subtitleSource?.withdraw(.rendition)
         }
@@ -1841,7 +1786,7 @@ extension AetherEngine {
                 let read = store.readThrough(at: from)
                 if exit == "target", read < target, !store.isFinished { exit = "deadline" }
                 let waited = Int(Date().timeIntervalSince(began) * 1000)
-                EngineLog.emit("[AetherEngine] native subtitle pre-fill done: read=\(String(format: "%.1f", read)) readMax=\(String(format: "%.1f", store.readMaxCueEnd())) target=\(String(format: "%.1f", target)) cues=\(store.cueCount) exit=\(exit) waited=\(waited)ms sourceReading=\(subtitleSource?.isReading == true)", category: .engine)
+                EngineLog.emit("[AetherEngine] native subtitle pre-fill done: read=\(String(format: "%.1f", read)) readMax=\(String(format: "%.1f", store.readMaxCueEnd())) target=\(String(format: "%.1f", target)) cues=\(store.cueCount) exit=\(exit) waited=\(waited)ms readingAhead=\(subtitleSource?.isReadingAhead == true)", category: .engine)
                 prefilledCues = store.cueCount
                 readPastPlayhead = store.isFinished || read > from
             }
@@ -2162,7 +2107,7 @@ extension AetherEngine {
     /// and wins over the snapshot).
     func restoreSubtitleSelection(from carryover: SubtitleSessionCarryover, resumeAnchor: Double?) {
         // Anchor mirrors applyPreferredSubtitleSelection: the reload's resume position (clamped
-        // when the duration is already known) so the drainer/prefetcher arm at the playhead, else
+        // when the duration is already known) so the drainer arms at the playhead, else
         // the live sourceTime.
         var anchor = max(0, resumeAnchor ?? 0)
         if duration > 0 { anchor = min(anchor, duration) }
@@ -2373,7 +2318,6 @@ struct SubtitleDrainTickWork {
     /// The landing count the tick planned against; the cursors it writes have followed that many.
     let landingGeneration: UInt64
     var channels: [SubtitleDrainChannelWork] = []
-    var prefetchNeedsReanchor = false
 
     var decodeHandoff: SubtitleDrainDecodeHandoff {
         SubtitleDrainDecodeHandoff(jobs: channels.map { ($0.decoder, $0.entries[..<$0.decodeEnd]) })

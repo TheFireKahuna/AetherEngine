@@ -9,13 +9,12 @@ import Foundation
 ///
 /// - a drain tick that decoded a post-seek reconstruction window (`reason=reconstruction`)
 /// - the 30 s memory probe (`reason=tick`)
-/// - the forward prefetcher reaching end of stream (`reason=eof`)
-/// - the frontier's source changing under a steady tick, e.g. the prefetcher dying (`reason=frontier`)
+/// - the pump reading to the end of the source (`reason=eof`)
+/// - the frontier's source changing under a steady tick, e.g. a seek past the reading (`reason=frontier`)
 /// - #318: determination first reaching the playhead after a reset (`reason=coverage`)
 extension AetherEngine {
 
-    /// The live fence. Read on the main actor, where both counters are truth; anything the side
-    /// reader banked under a different one is a position from a superseded seek or another source.
+    /// The generations a statement is made under. Read on the main actor, where both counters are truth.
     var subtitleResolutionFence: SubtitleResolutionStatement.Fence {
         .init(loadGeneration: loadGeneration, seekGeneration: currentSeekGeneration)
     }
@@ -34,13 +33,12 @@ extension AetherEngine {
             fence: fence,
             streamIndex: streamIndex,
             coveredFrom: cursor?.coverageStart ?? (playhead - Self.subtitleDrainBackscanSeconds),
-            // The DRAIN lead, not the prefetcher's: the statement is about decoded display state,
-            // and the drainer's window is fixed at `subtitleDrainLeadSeconds` even while the OCR
-            // worker has the prefetcher running 270 s ahead to feed it.
+            // The DRAIN lead, not the pump's: the statement is about decoded display state, and the
+            // drainer's window is fixed at `subtitleDrainLeadSeconds` even while the OCR worker has
+            // the pump reading 270 s ahead to feed it.
             windowThrough: playhead + Self.subtitleDrainLeadSeconds,
             decodedThrough: cursor?.lastDecodedPts ?? .nan,
-            prefetchFrontier: SubtitlePrefetchTelemetry.resolutionFrontier(matching: fence),
-            prefetchAtEndOfFile: SubtitlePrefetchTelemetry.reachedEndOfFile(matching: fence),
+            readThrough: subtitleReadThrough(streamIndex: streamIndex, from: playhead),
             // #276: the retained run's floor. Read straight off the cursor, which the drain tick
             // has already folded for this tick; nothing is recomputed here.
             retainedFrom: cursor?.retained?.from,
@@ -75,13 +73,12 @@ extension AetherEngine {
 
     /// A transition is a step change in what the engine can claim, so it is worth a line whenever it
     /// happens rather than waiting up to 30 s for the next cadence tick. Two of them can arrive
-    /// under a tick that decoded nothing, because both depend on the side reader rather than on the
-    /// drainer: the prefetcher dying mid-session (#231), which collapses determination to the pump's
-    /// few seconds of lookahead, and the frontier climbing past the playhead (#318).
+    /// under a tick that decoded nothing, because both depend on the reading rather than on the
+    /// drainer: determination collapsing to the cursor (the playhead left what was read), and the
+    /// frontier climbing past the playhead (#318).
     ///
-    /// Building the statement here costs the same two telemetry reads the frontier check alone used
-    /// to make, and it is the same decision the decoding path takes, so an idle tick cannot stay
-    /// quiet about a crossing that a decoding tick would have announced.
+    /// It is the same decision the decoding path takes, so an idle tick cannot stay quiet about a
+    /// crossing that a decoding tick would have announced.
     func emitSubtitleResolutionStatementIfTransitioned(
         channel: SubtitleChannel, streamIndex: Int32, playhead: Double
     ) {
@@ -95,7 +92,16 @@ extension AetherEngine {
         emitSubtitleResolutionStatement(statement, channel: channel, playhead: playhead)
     }
 
-    /// One line per active drain target. Used by the cadence tick and by the prefetcher's EOF.
+    /// How far `streamIndex` is known to have been read on unbroken from `from`: its pulled spans when the
+    /// index reads it, the pump's harvest coverage otherwise; `.infinity` once the pump read to the end.
+    func subtitleReadThrough(streamIndex: Int32, from: Double) -> Double? {
+        guard let store = activeSubtitlePacketStore else { return nil }
+        return subtitleStreamIsPulled(streamIndex)
+            ? store.pulledReach(streamIndex: streamIndex, from: from)
+            : store.harvestReach(from: from)
+    }
+
+    /// One line per active drain target. Used by the cadence tick and by the pump's end of source.
     func emitSubtitleResolutionStatements(reason: SubtitleResolutionStatement.Reason) {
         for (channel, streamIndex) in subtitleDrainTargets {
             emitSubtitleResolutionStatement(channel: channel, streamIndex: streamIndex,

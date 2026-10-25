@@ -928,9 +928,18 @@ extension AetherEngine {
         // LoadOptions.felOverlay: the session's own read of the source feeds the overlay's enhancement layer.
         session.felTap = felOverlayWanted ? FelEnhancementTap() : nil
         #endif
-        // #240: the pump claims the source link through this gate while it is fetching, so the
-        // subtitle side readers can stay out of its way. Set before start().
-        session.sideReaderLinkGate = sideReaderLinkGate
+        // #240: a scrub thumbnail waits out a seek in flight. Set before start().
+        session.seekInFlight = seekInFlight
+        // How far the subtitle consumers ask the pump to have read on the source axis: the playback clock
+        // plus the furthest lead of a consumer of a stream only the pump reads. Read where the pump parks.
+        let leads = subtitleReadAheadLeads, clock = sourcePlayheadClock
+        session.subtitleReadAheadThrough = {
+            guard let playhead = clock.seconds, let lead = leads.readAhead(playhead: playhead) else { return nil }
+            return playhead + lead
+        }
+        session.onSourceReadToEnd = { [weak self] in
+            Task { @MainActor [weak self] in self?.emitSubtitleResolutionStatements(reason: .eof) }
+        }
         // AE#682: set before start(), where the session decides whether it can serve the rendition.
         // A custom-IO source is not reopenable by URL, so the side reader gets a clone of its own;
         // a reader that cannot clone leaves the rendition absent.
@@ -2145,6 +2154,20 @@ extension AetherEngine {
         host.subtitleTapSink = { idx, pkt, tb, assembleSplitSets in
             packetStore.harvest(streamIndex: idx, packet: pkt, timeBase: tb,
                                 assembleSplitDisplaySets: assembleSplitSets)
+        }
+        // Layer 3 step 5: the read-ahead reads on for the subtitle consumers, and says how far it has read.
+        let leads = subtitleReadAheadLeads, clock = sourcePlayheadClock
+        host.subtitleReadAhead = {
+            guard let playhead = clock.seconds else { return nil }
+            return leads.readAhead(playhead: playhead)
+        }
+        host.subtitleReadThroughSink = { [weak self] seconds in
+            guard seconds.isFinite else {
+                packetStore.noteHarvestEnd()
+                Task { @MainActor [weak self] in self?.emitSubtitleResolutionStatements(reason: .eof) }
+                return
+            }
+            packetStore.noteHarvestProgress(through: seconds)
         }
         // SW path has no AVPlayer-clock fold; the host's synchronizer is the only clock.
         self.playlistShiftSeconds = 0

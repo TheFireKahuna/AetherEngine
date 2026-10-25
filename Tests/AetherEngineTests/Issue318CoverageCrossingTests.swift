@@ -4,7 +4,7 @@ import Testing
 
 /// #318 (cmcpherson274, raised in the #240 thread): the statement was emitted on transitions of the
 /// frontier's SOURCE, and the moment determination first reaches the playhead is not one of those.
-/// In their battery the pump-to-prefetch line landed at `resolvedThrough` 639.30 against a rendered
+/// In their battery the cursor-to-read line landed at `resolvedThrough` 639.30 against a rendered
 /// 640.00, the frontier climbed past 640 about a second later in silence, and the next admissible
 /// line was the 30 s cadence tick. Hence 29.25 s clustered across three seek targets: emission
 /// cadence, not determination latency.
@@ -27,22 +27,21 @@ struct Issue318CoverageCrossingTests {
             coveredFrom: playhead - 15,
             windowThrough: playhead + 60,
             decodedThrough: decodedThrough,
-            prefetchFrontier: frontier,
-            prefetchAtEndOfFile: atEOF,
+            readThrough: atEOF ? .infinity : frontier,
             retainedFrom: nil,
             reason: reason)
     }
 
     // MARK: - What may count as coverage
 
-    /// The reporter's rejected line, and the one the whole ask turns on. `via=pump` bounds the claim
+    /// The reporter's rejected line, and the one the whole ask turns on. `via=cursor` bounds the claim
     /// with the drain cursor, a lower bound on what was decoded rather than a contiguity claim, so a
     /// cursor sitting 4 s past the playhead still says nothing about determination there.
-    @Test("a pump-bounded statement never states coverage, however far its cursor reaches")
-    func pumpNeverStatesCoverage() {
+    @Test("a cursor-bounded statement never states coverage, however far its cursor reaches")
+    func cursorNeverStatesCoverage() {
         let s = statement(playhead: 640, frontier: nil, decodedThrough: 644.48,
                           reason: .reconstruction)
-        #expect(s.via == .pump)
+        #expect(s.via == .cursor)
         #expect(s.resolvedThrough == 644.48)
         #expect(SubtitleResolutionStatement.statesCoverage(s, playhead: 640) == false)
     }
@@ -52,7 +51,7 @@ struct Issue318CoverageCrossingTests {
     @Test("a frontier short of the playhead does not state coverage")
     func frontierShortOfThePlayheadIsNotCoverage() {
         let s = statement(playhead: 640, frontier: 639.30)
-        #expect(s.via == .prefetch)
+        #expect(s.via == .read)
         #expect(SubtitleResolutionStatement.statesCoverage(s, playhead: 640) == false)
     }
 
@@ -89,7 +88,7 @@ struct Issue318CoverageCrossingTests {
     func spanAboveThePlayheadDoesNotCoverIt() {
         let s = SubtitleResolutionStatement.Statement(
             fence: .init(loadGeneration: 2, seekGeneration: 7), streamIndex: 4,
-            coveredFrom: 700, resolvedThrough: 760, via: .prefetch, decodedThrough: 720,
+            coveredFrom: 700, resolvedThrough: 760, via: .read, decodedThrough: 720,
             retainedFrom: nil, reason: .frontier)
         #expect(SubtitleResolutionStatement.statesCoverage(s, playhead: 640) == false)
     }
@@ -121,7 +120,7 @@ struct Issue318CoverageCrossingTests {
         let s = statement(playhead: 640, frontier: 690)
         #expect(SubtitleResolutionStatement.transitionReason(
             s, playhead: 640, isReset: false, coverageStated: false,
-            lastFrontier: .pump) == .coverage)
+            lastFrontier: .cursor) == .coverage)
     }
 
     /// The #231 case, unchanged by #318: the prefetcher died, determination collapsed to the pump's
@@ -129,10 +128,10 @@ struct Issue318CoverageCrossingTests {
     @Test("a frontier collapse with no coverage still prints as frontier")
     func frontierCollapseStillPrints() {
         let s = statement(playhead: 640, frontier: nil, decodedThrough: 641)
-        #expect(s.via == .pump)
+        #expect(s.via == .cursor)
         #expect(SubtitleResolutionStatement.transitionReason(
             s, playhead: 640, isReset: false, coverageStated: true,
-            lastFrontier: .prefetch) == .frontier)
+            lastFrontier: .read) == .frontier)
     }
 
     /// The reason the line is a transition and not a cadence: once the crossing is stated, the same
@@ -142,7 +141,7 @@ struct Issue318CoverageCrossingTests {
         let s = statement(playhead: 641, frontier: 700)
         #expect(SubtitleResolutionStatement.transitionReason(
             s, playhead: 641, isReset: false, coverageStated: true,
-            lastFrontier: .prefetch) == nil)
+            lastFrontier: .read) == nil)
     }
 
     /// A tick that changed nothing prints nothing, including while determination is still short.
@@ -153,7 +152,7 @@ struct Issue318CoverageCrossingTests {
         let s = statement(playhead: 640, frontier: 639.5)
         #expect(SubtitleResolutionStatement.transitionReason(
             s, playhead: 640, isReset: false, coverageStated: false,
-            lastFrontier: .prefetch) == nil)
+            lastFrontier: .read) == nil)
     }
 
     // MARK: - The reporter's sequence, end to end
@@ -205,7 +204,7 @@ struct Issue318CoverageCrossingTests {
         s.reason = .coverage
         let line = SubtitleResolutionStatement.format(s)
         #expect(line.hasSuffix("reason=coverage"))
-        #expect(line.contains("via=prefetch "))
+        #expect(line.contains("via=read "))
         #expect(line.contains("resolvedThrough=646.10 "))
     }
 }

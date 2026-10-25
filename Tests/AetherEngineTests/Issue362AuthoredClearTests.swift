@@ -249,11 +249,11 @@ struct Issue362AuthoredClearTests {
         // open and 11 with a laundered end; with the margin, 0 and 1 (the one being a harvest hole,
         // not a window edge). The OCR lead already carries its own margin over the OCR window, which
         // is the same rule applied to the other consumer of this store.
-        #expect(AetherEngine.subtitleForwardPrefetchLeadMarginSeconds > 0)
+        #expect(AetherEngine.subtitleReadAheadMarginSeconds > 0)
         #expect(AetherEngine.subtitleDrainLeadSeconds
-                + AetherEngine.subtitleForwardPrefetchLeadMarginSeconds
+                + AetherEngine.subtitleReadAheadMarginSeconds
                 > AetherEngine.subtitleDrainLeadSeconds)
-        #expect(AetherEngine.subtitleOCRPrefetchLeadSeconds > AetherEngine.subtitleOCRLeadSeconds)
+        #expect(AetherEngine.subtitleOCRReadAheadSeconds > AetherEngine.subtitleOCRLeadSeconds)
     }
 
     @Test("the query answers per stream and reports nothing past the frontier")

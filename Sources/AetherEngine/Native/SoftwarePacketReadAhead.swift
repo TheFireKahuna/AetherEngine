@@ -36,6 +36,8 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
     private let audio: Stream?
     private let byteBudget: Int
     private let forwardSeconds: Double
+    /// Seconds past the consumer a subtitle consumer wants read (layer 3 step 5), over `forwardSeconds`.
+    private let readAheadSeconds: (@Sendable () -> Double?)?
     /// Producer thread only. See `start()` for why this is a class the producer moves itself.
     private var producerQoS: qos_class_t = QOS_CLASS_USER_INITIATED
     /// Mirror of `producerQoS` for the consumer's diagnostics, under `condition`.
@@ -101,12 +103,14 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
          initialSourceClock: Double, fifo: any SoftwarePacketStore,
          videoReorderDepth: Int? = nil,
          coverageRangeCap: Int = 4096,
+         readAheadSeconds: (@Sendable () -> Double?)? = nil,
          beforeConsumerOperation: (@Sendable () -> Void)? = nil,
          readSource: @escaping @Sendable (@Sendable () -> Bool) throws -> SoftwareStoredPacket?) {
         self.video = video
         self.audio = audio
         self.byteBudget = max(1, byteBudget)
         self.forwardSeconds = max(1, forwardSeconds)
+        self.readAheadSeconds = readAheadSeconds
         self.sourceClock = initialSourceClock
         self.fifo = fifo
         self.videoCoverage = SoftwarePacketCoverage(maximumRangeCount: coverageRangeCap)
@@ -632,8 +636,10 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         // existing there and only the disk budget still bounded the read-ahead. Measured on a
         // 10 s window: 283 packets read with clean timestamps, 1316 with a single late one, which
         // in a session is the difference between a window and the whole file.
-        if let reservoir = reservoirSecondsLocked(), reservoir >= forwardSeconds { return true }
-        return frontierLocked().map { $0 - sourceClock >= forwardSeconds } ?? false
+        // A subtitle consumer can ask for more; the byte budget above still bounds it.
+        let forward = max(forwardSeconds, readAheadSeconds?() ?? 0)
+        if let reservoir = reservoirSecondsLocked(), reservoir >= forward { return true }
+        return frontierLocked().map { $0 - sourceClock >= forward } ?? false
     }
 
     private func recordFailure(_ error: Error, token: UInt64, origin: FailureOrigin) {

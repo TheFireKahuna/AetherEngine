@@ -659,11 +659,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var firstActualVideoDts: Int64 = Int64.min
     private var firstActualAudioDts: Int64 = Int64.min
 
-    /// #240: link arbitration. The pump claims the link while it is pulling from the source and
-    /// releases it while parked, so the subtitle side readers (a second full copy of the stream on
-    /// Matroska) can tell "the video path needs the bytes" from "the buffer is full". Set once
-    /// before `start()`; nil for hosts that drive the engine without one (`aetherctl`, tests).
-    var sideReaderLinkGate: SideReaderLinkGate?
+    /// Layer 3 step 5: the highest segment index the session's subtitle consumers need this pump to have
+    /// read through, past its forward window: a stream only the pump reads (a transport stream's, a
+    /// disc's, a Matroska file's without subtitle Cues) reaches the packet store only as the pump reads
+    /// it. Asked at every advance park; nil when nobody asks. The disk budget still bounds the run.
+    var subtitleReadAheadReach: (@Sendable () -> Int?)?
+
+    /// Layer 3 step 5: how far this pump has read the source, on the source axis (the video's decode
+    /// time, every `sourceReadNoteStepSeconds`), and `.infinity` once it has read to the end. Everything
+    /// the subtitle streams carry below it has been handed to the sinks below.
+    var onSourceReadThrough: (@Sendable (Double) -> Void)?
+    private var lastSourceReadNoted = -Double.infinity
+    /// Small against every authored subtitle dwell, large against a packet.
+    static let sourceReadNoteStepSeconds: Double = 0.5
 
     /// AE#514: the session's ledger of played-stream packet bytes, which the bitrate fields read at the
     /// playhead. Set once before `start()`, like the gate above; nil for hosts that drive the engine
@@ -2146,10 +2154,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private func awaitBackpressureRelease(target: Int, head: Int, context: String) -> Bool {
         // Already broken on this session (e.g. a teardown-flush ensureMuxer call): stay broken, don't re-park.
         if isBackpressureWedgeBroken() { return false }
-        // #240: parked means the forward buffer is full and the link is free. Released here rather
-        // than at the call sites so it is balanced whatever the park returns.
-        sideReaderLinkGate?.videoFetchEnded()
-        defer { sideReaderLinkGate?.videoFetchBegan() }
         var parked = 0
         var nextLogAt = Self.backpressureWedgeLogThresholdSeconds
         // AE#528: the wait below returns on ANY cache broadcast (a consumer GET that moves the fetch
@@ -2168,6 +2172,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
             initialRenderedPosition: playbackPositionProvider?()
         )
         while !checkShouldStop() {
+            // Layer 3 step 5: a subtitle consumer of a stream only this pump reads wants it read this far.
+            if let reach = subtitleReadAheadReach?(), head <= reach {
+                retunePumpQoS()
+                return true
+            }
             if cache.awaitFetchHighWater(reaching: target, timeout: 1.0) {
                 retunePumpQoS()
                 if parked >= Self.backpressureWedgeLogThresholdSeconds {
@@ -2263,9 +2272,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // Compute a possibly-expired cap before reconciling its retained history. This is the
         // same expiry handler as the cache timer, so delayed timer delivery cannot wedge this park.
         if cache.reconcileExpiredNativeLiveDVRRetention(headroomCap: liveResidentCap()) { return true }
-        // #240: a parked pump is not using the link.
-        sideReaderLinkGate?.videoFetchEnded()
-        defer { sideReaderLinkGate?.videoFetchBegan() }
         // AE#406: nor is it reading. Inline, the watchdog could not run here at all; on a timer it
         // must not count a park as starvation, or a consumer that stopped polling would be reported
         // as a source that stopped delivering. The window re-anchors when the park releases.
@@ -2317,9 +2323,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private func awaitPrefetchDiskBudgetRelease(head: Int, context: String,
                                                 detectWedge: Bool = false) -> Bool {
         guard prefetchDiskBudgetBytes > 0 else { return true }
-        // #240: same release as the backpressure park; a parked pump is not using the link.
-        sideReaderLinkGate?.videoFetchEnded()
-        defer { sideReaderLinkGate?.videoFetchBegan() }
         var parked = 0
         var nextLogAt = Self.prefetchDiskParkLogThresholdSeconds
         // AE#528: same wakeup-is-not-a-second correction as the advance park; this loop's own doc
@@ -3712,10 +3715,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if restartTargetVideoPts > Int64.min {
             bumpRestartCount()
         }
-        // #240: a running pump is pulling from the source. Claimed for the whole loop and released
-        // on every exit path; the two park helpers hand it back for the duration of their wait.
-        sideReaderLinkGate?.videoFetchBegan()
-        defer { sideReaderLinkGate?.videoFetchEnded() }
         let pumpStart = DispatchTime.now()
         var packetsRead = 0
         var lastError: Int32 = 0
@@ -3913,6 +3912,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                    let sink = subtitlePacketSink {
                     sink(pktStreamIdx, packet,
                          subtitleTapTimeBases[pktStreamIdx] ?? AVRational(num: 1, den: 1000))
+                }
+                if isVideoPkt, let note = onSourceReadThrough, packet.pointee.dts != Int64.min,
+                   sourceVideoTbSeconds > 0 {
+                    let seconds = Double(packet.pointee.dts) * sourceVideoTbSeconds
+                    if seconds >= lastSourceReadNoted + Self.sourceReadNoteStepSeconds {
+                        lastSourceReadNoted = seconds
+                        note(seconds)
+                    }
                 }
 
                 // AE#432: learn each stream's frame stride from its GENUINE timestamps, so a run
@@ -4978,6 +4985,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if case .eof = exitReason, checkShouldStop() {
             exitReason = .stopRequested
         }
+        if case .eof = exitReason { onSourceReadThrough?(.infinity) }
 
         // muxerFailed from a backpressure break is a wedge (host re-anchors) or a stop (teardown), not a real failure.
         if case .muxerFailed = exitReason {
