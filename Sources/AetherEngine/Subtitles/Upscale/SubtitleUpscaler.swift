@@ -131,6 +131,15 @@ public final class SubtitleUpscaler: @unchecked Sendable {
     private var _configuration: Configuration
     private var workspace: Workspace
 
+    /// Wall milliseconds of the last Neural Engine pass's stages, for the profile.
+    struct NeuralEngineStages {
+        var gather = 0.0
+        var predict = 0.0
+        var composite = 0.0
+        var tiles = 0
+    }
+    var lastNeuralEngineStages = NeuralEngineStages()
+
     /// Tunables, internal so the benchmark can sweep them.
     var variant = SubtitleUpscaleKernels.defaultVariant
     /// Threadgroups a persistent (threadgroup-weights) layer dispatches.
@@ -375,9 +384,10 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         return bands
     }
 
-    /// Validates `job`, clears its destination outside the region and encodes the region's content mask (either
-    /// backend's first passes). Nil when the region is empty: the destination is then all transparent.
-    private func encodeMask(_ job: Job, encoder: MTLComputeCommandEncoder) throws -> Geometry? {
+    /// Validates `job`, clears its destination outside `kept` (picture coordinates; the region when nil, which the
+    /// GPU network's composite covers) and encodes the region's content mask (either backend's first passes). Nil
+    /// when the region is empty: the destination is then all transparent.
+    private func encodeMask(_ job: Job, encoder: MTLComputeCommandEncoder, kept: Rect? = nil) throws -> Geometry? {
         let pw = job.source.width, ph = job.source.height
         guard pw > 0, ph > 0 else { throw UpscaleError.size("empty source") }
         guard job.destination.width == 2 * pw, job.destination.height == 2 * ph else {
@@ -391,10 +401,15 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         g.width = UInt32(region.width); g.height = UInt32(region.height)
         g.straightAlpha = job.sourceAlpha == .straight ? 1 : 0
         let geometrySize = MemoryLayout<Geometry>.stride
-        if region.isEmpty || region.minX > 0 || region.minY > 0 || region.minX + region.width < pw || region.minY + region.height < ph {
+        var keep = kept ?? Rect(x: region.minX, y: region.minY, width: region.width, height: region.height)
+        if region.isEmpty || keep.width <= 0 || keep.height <= 0 { keep = Rect(x: 0, y: 0, width: 0, height: 0) }
+        if keep.width == 0 || keep.x > 0 || keep.y > 0 || keep.x + keep.width < pw || keep.y + keep.height < ph {
+            var c = g
+            c.originX = Int32(keep.x); c.originY = Int32(keep.y)
+            c.width = UInt32(keep.width); c.height = UInt32(keep.height)
             encoder.setComputePipelineState(kernels.clearOutside)
             encoder.setTexture(job.destination, index: 0)
-            encoder.setBytes(&g, length: geometrySize, index: 0)
+            encoder.setBytes(&c, length: geometrySize, index: 0)
             dispatch(encoder, kernels.clearOutside, width: pw, height: ph)
         }
         guard !region.isEmpty else { return nil }
@@ -553,94 +568,103 @@ public final class SubtitleUpscaler: @unchecked Sendable {
 
     // MARK: - Neural Engine
 
-    /// Mirrors `UpTiles` in the shader.
-    struct Tiles {
-        var keptX: Int32 = 0
-        var keptY: Int32 = 0
-        var columns: UInt32 = 0
-        var count: UInt32 = 0
-        var slots: UInt32 = 0
-        var coreWidth: UInt32 = 0
-        var coreHeight: UInt32 = 0
-        var tileWidth: UInt32 = 0
-        var tileHeight: UInt32 = 0
+    /// A rectangle in picture coordinates.
+    struct Rect: Equatable {
+        var x: Int
+        var y: Int
+        var width: Int
+        var height: Int
     }
 
-    /// The model windows over `kept` (picture coordinates): one per core, its picture position, 7 pixels before
-    /// the core (the network's reach), reading transparency wherever it leaves the picture.
-    static func tileOrigins(kept: (x: Int, y: Int, width: Int, height: Int)) -> (columns: Int, origins: [SIMD2<Int32>]) {
-        let cw = SubtitleUpscaleNeuralEngine.coreWidth, ch = SubtitleUpscaleNeuralEngine.coreHeight
-        let columns = (kept.width + cw - 1) / cw, rows = (kept.height + ch - 1) / ch
-        var origins: [SIMD2<Int32>] = []
-        for ty in 0..<rows {
-            for tx in 0..<columns { origins.append(SIMD2(Int32(kept.x + tx * cw - 7), Int32(kept.y + ty * ch - 7))) }
+    /// Mirrors `UpWindow` in the shader.
+    struct WindowRecord {
+        var x: Int32
+        var y: Int32
+        var coreX: Int32
+        var coreY: Int32
+        var coreWidth: UInt32
+        var coreHeight: UInt32
+    }
+
+    /// The kept area: the picture pixels within the support of the content bounds, which hold every output pixel
+    /// that is not exactly transparent.
+    private func keptArea(_ job: Job) -> Rect {
+        var b = CGRect(x: 0, y: 0, width: job.source.width, height: job.source.height)
+        if let bounds = job.contentBounds {
+            b = bounds.integral.insetBy(dx: -CGFloat(supportRadius), dy: -CGFloat(supportRadius)).intersection(b)
         }
-        return (columns, origins)
+        guard !b.isNull, !b.isEmpty else { return Rect(x: 0, y: 0, width: 0, height: 0) }
+        return Rect(x: Int(b.minX), y: Int(b.minY), width: Int(b.width), height: Int(b.height))
     }
 
-    /// One 2x pass with the networks on the Neural Engine: the mask and the tile windows on the GPU, the
-    /// predictions, then the composite on the GPU. Waits for each step.
+    /// One 2x pass with the networks on the Neural Engine: the mask and the window gather on the GPU, a prediction
+    /// per window and plane, then the composite on the GPU, each window's planes shared between them through its
+    /// IOSurfaces. Waits for each step.
     private func neuralEngineLocked(_ job: Job) throws {
         let config = _configuration
+        let kept = keptArea(job)
+        let plan = SubtitleUpscaleTilePlan.plan(
+            kept: (kept.x, kept.y, kept.width, kept.height),
+            nanosecondsPerPixel: SubtitleUpscaleTilePlan.nanosecondsPerPixel(config.alphaModel)
+                + SubtitleUpscaleTilePlan.nanosecondsPerPixel(config.lumaModel),
+            nanosecondsPerCall: 2 * SubtitleUpscaleTilePlan.nanosecondsPerCall)
+        let surfaces = try workspace.surfaces.surfaces(for: plan.windows)
+        let records = plan.windows.map { w in
+            let core = CGRect(x: w.x + SubtitleUpscaleTilePlan.reach, y: w.y + SubtitleUpscaleTilePlan.reach,
+                              width: w.width - 2 * SubtitleUpscaleTilePlan.reach, height: w.height - 2 * SubtitleUpscaleTilePlan.reach)
+                .intersection(CGRect(x: kept.x, y: kept.y, width: kept.width, height: kept.height))
+            return WindowRecord(x: Int32(w.x), y: Int32(w.y), coreX: Int32(core.minX), coreY: Int32(core.minY),
+                                coreWidth: UInt32(core.width), coreHeight: UInt32(core.height))
+        }
         var g = Geometry()
-        var tiles = Tiles()
-        var count = 0
-        var slots = 0
+        var stages = NeuralEngineStages()
+        var mark = DispatchTime.now().uptimeNanoseconds
+        func lap() -> Double {
+            let now = DispatchTime.now().uptimeNanoseconds
+            defer { mark = now }
+            return Double(now - mark) / 1e6
+        }
+        defer { lastNeuralEngineStages = stages }
+        var empty = false
         try run { commandBuffer in
             guard let encoder = commandBuffer.makeComputeCommandEncoder(dispatchType: .serial) else { throw UpscaleError.gpu("no compute encoder") }
             defer { encoder.endEncoding() }
-            guard let made = try encodeMask(job, encoder: encoder) else { return }
+            guard let made = try encodeMask(job, encoder: encoder, kept: kept) else { empty = true; return }
             g = made
-            // The kept area: the picture pixels within the support of the content bounds.
-            let pw = job.source.width, ph = job.source.height
-            var b = CGRect(x: 0, y: 0, width: pw, height: ph)
-            if let bounds = job.contentBounds {
-                b = bounds.integral.insetBy(dx: -CGFloat(supportRadius), dy: -CGFloat(supportRadius)).intersection(b)
-            }
-            let kept = (x: Int(b.minX), y: Int(b.minY), width: Int(b.width), height: Int(b.height))
-            let layout = Self.tileOrigins(kept: kept)
-            count = layout.origins.count
-            let batch = ArtCNNCoreMLModels.batch
-            slots = (count + batch - 1) / batch * batch
-            tiles = Tiles(keptX: Int32(kept.x), keptY: Int32(kept.y), columns: UInt32(layout.columns), count: UInt32(count), slots: UInt32(slots),
-                          coreWidth: UInt32(SubtitleUpscaleNeuralEngine.coreWidth), coreHeight: UInt32(SubtitleUpscaleNeuralEngine.coreHeight),
-                          tileWidth: UInt32(ArtCNNCoreMLModels.tileWidth), tileHeight: UInt32(ArtCNNCoreMLModels.tileHeight))
-            try workspace.reserveTiles(slots)
-            let ws = workspace
-            layout.origins.withUnsafeBytes { ws.origins.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
             encoder.setComputePipelineState(kernels.tileGather)
             encoder.setTexture(job.source, index: 0)
-            encoder.setBuffer(ws.tileInput, offset: 0, index: 0)
-            encoder.setBuffer(ws.origins, offset: 0, index: 1)
-            encoder.setBytes(&g, length: MemoryLayout<Geometry>.stride, index: 2)
-            encoder.setBytes(&tiles, length: MemoryLayout<Tiles>.stride, index: 3)
-            encoder.dispatchThreads(MTLSize(width: ArtCNNCoreMLModels.tileWidth, height: ArtCNNCoreMLModels.tileHeight, depth: count),
-                                    threadsPerThreadgroup: MTLSize(width: 32, height: 8, depth: 1))
+            encoder.setBytes(&g, length: MemoryLayout<Geometry>.stride, index: 0)
+            for (k, var record) in records.enumerated() {
+                encoder.setTexture(surfaces[k].alphaIn.texture, index: 1)
+                encoder.setTexture(surfaces[k].lumaIn.texture, index: 2)
+                encoder.setBytes(&record, length: MemoryLayout<WindowRecord>.stride, index: 1)
+                encoder.dispatchThreads(MTLSize(width: plan.windows[k].width, height: plan.windows[k].height, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: 32, height: 8, depth: 1))
+            }
         }
-        guard count > 0 else { return }
-        let ws = workspace
-        // The slots past `count` hold stale windows; their outputs are never read.
-        if config.alphaModel == config.lumaModel, slots == count {
-            try SubtitleUpscaleNeuralEngine.predict(try SubtitleUpscaleNeuralEngine.model(config.alphaModel), input: ws.tileInput,
-                                                    output: ws.tileOutput, first: 0, count: 2 * slots)
-        } else {
-            try SubtitleUpscaleNeuralEngine.predict(try SubtitleUpscaleNeuralEngine.model(config.alphaModel), input: ws.tileInput,
-                                                    output: ws.tileOutput, first: 0, count: count)
-            try SubtitleUpscaleNeuralEngine.predict(try SubtitleUpscaleNeuralEngine.model(config.lumaModel), input: ws.tileInput,
-                                                    output: ws.tileOutput, first: slots, count: count)
+        stages.gather = lap()
+        stages.tiles = records.count
+        guard !empty, !records.isEmpty else { return }
+        for s in surfaces {
+            try SubtitleUpscaleNeuralEngine.predict(try SubtitleUpscaleNeuralEngine.model(config.alphaModel, s.shape), input: s.alphaIn, output: s.alphaOut)
+            try SubtitleUpscaleNeuralEngine.predict(try SubtitleUpscaleNeuralEngine.model(config.lumaModel, s.shape), input: s.lumaIn, output: s.lumaOut)
         }
+        stages.predict = lap()
+        defer { stages.composite = lap() }
         try run { commandBuffer in
             guard let encoder = commandBuffer.makeComputeCommandEncoder(dispatchType: .serial) else { throw UpscaleError.gpu("no compute encoder") }
             defer { encoder.endEncoding() }
             encoder.setComputePipelineState(kernels.compositeTiles)
             encoder.setTexture(job.source, index: 0)
             encoder.setTexture(job.destination, index: 1)
-            encoder.setBuffer(ws.tileOutput, offset: 0, index: 0)
-            encoder.setBuffer(ws.square, offset: 0, index: 1)
-            encoder.setBytes(&g, length: MemoryLayout<Geometry>.stride, index: 2)
-            encoder.setBytes(&tiles, length: MemoryLayout<Tiles>.stride, index: 3)
-            encoder.setBuffer(ws.origins, offset: 0, index: 4)
-            dispatch(encoder, kernels.compositeTiles, width: Int(g.width), height: Int(g.height))
+            encoder.setBuffer(workspace.square, offset: 0, index: 0)
+            encoder.setBytes(&g, length: MemoryLayout<Geometry>.stride, index: 1)
+            for (k, var record) in records.enumerated() where record.coreWidth > 0 && record.coreHeight > 0 {
+                encoder.setTexture(surfaces[k].alphaOut.texture, index: 2)
+                encoder.setTexture(surfaces[k].lumaOut.texture, index: 3)
+                encoder.setBytes(&record, length: MemoryLayout<WindowRecord>.stride, index: 2)
+                dispatch(encoder, kernels.compositeTiles, width: Int(record.coreWidth), height: Int(record.coreHeight))
+            }
         }
     }
 
@@ -665,12 +689,8 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         private(set) var bits: MTLBuffer!
         private(set) var rows: MTLBuffer!
         private(set) var square: MTLBuffer!
-        /// The Neural Engine backend's model input and output (both planes, `slots` tiles each) and the window
-        /// origins, shared with the CPU, which hands them to Core ML.
-        private(set) var tileInput: MTLBuffer!
-        private(set) var tileOutput: MTLBuffer!
-        private(set) var origins: MTLBuffer!
-        private var tileCapacity = 0
+        /// The Neural Engine backend's window surfaces, shared by Metal and Core ML.
+        let surfaces: SubtitleUpscaleNeuralEngine.Surfaces.Pool
         let counts: MTLBuffer
         let arguments: MTLBuffer
         private var pixelCapacity = 0
@@ -681,6 +701,7 @@ public final class SubtitleUpscaler: @unchecked Sendable {
 
         init(device: MTLDevice) {
             self.device = device
+            surfaces = SubtitleUpscaleNeuralEngine.Surfaces.Pool(device: device)
             counts = device.makeBuffer(length: 32, options: .storageModePrivate)!
             arguments = device.makeBuffer(length: 21 * 12, options: .storageModePrivate)!
         }
@@ -705,19 +726,6 @@ public final class SubtitleUpscaler: @unchecked Sendable {
                 self.lists = try make(7 * lists * 4)
                 listCapacity = lists
             }
-        }
-
-        func reserveTiles(_ slots: Int) throws {
-            guard slots > tileCapacity else { return }
-            let window = ArtCNNCoreMLModels.tileWidth * ArtCNNCoreMLModels.tileHeight
-            func shared(_ length: Int) throws -> MTLBuffer {
-                guard let b = device.makeBuffer(length: length, options: .storageModeShared) else { throw UpscaleError.unavailable("no \(length)-byte buffer") }
-                return b
-            }
-            tileInput = try shared(2 * slots * window * 2)
-            tileOutput = try shared(2 * slots * 4 * window * 2)
-            origins = try shared(slots * 8)
-            tileCapacity = slots
         }
 
         func reserveMask(height: Int, wordsX: Int) throws {

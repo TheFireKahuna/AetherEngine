@@ -98,7 +98,8 @@ final class SubtitleUpscaleKernels: @unchecked Sendable {
         return options
     }
 
-    private init() throws {
+    /// A fresh set: ``get()`` makes the shared one; the benchmark makes its own to time the compile.
+    init() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { throw KernelError.unavailable("no Metal device") }
         // simdgroup_matrix needs Apple7 (A14) or later.
         guard device.supportsFamily(.apple7) else { throw KernelError.unavailable("GPU lacks simdgroup_matrix (needs Apple7)") }

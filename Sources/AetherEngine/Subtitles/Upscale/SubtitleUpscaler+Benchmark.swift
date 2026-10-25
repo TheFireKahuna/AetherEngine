@@ -1,3 +1,4 @@
+import CoreML
 import Foundation
 import Metal
 
@@ -19,36 +20,83 @@ extension SubtitleUpscaler {
         ]
     }
 
-    /// Steady-state time per picture for each benchmark picture and configuration, median of `iterations` after
-    /// warm-up. GPU backend: GPU time from command-buffer timestamps, "single" one picture per command buffer,
-    /// "batch" `batch` pictures in one, and "wall" the caller's time for one picture through ``upscale(_:)``. Neural
-    /// Engine backend (`neuralEngine`): "wall" only, which covers its two GPU command buffers and the predictions.
-    /// With `sweep`, also the GPU time of each layer-kernel variant and threadgroup size on the 1400x120 strip (the
-    /// defaults were tuned on an M4 Pro; this says whether they hold on the device). For a probe app to call on a
-    /// device; it builds its own upscalers and blocks for some seconds (the first Neural Engine run also compiles the
-    /// models, and the sweep compiles every variant).
-    public static func benchmark(iterations: Int = 15, batch: Int = 8, neuralEngine: Bool = true, sweep: Bool = false) -> String {
+    /// Percentiles of a set of samples, nearest rank.
+    struct Spread {
+        var p50 = 0.0
+        var p95 = 0.0
+        var p99 = 0.0
+        var max = 0.0
+
+        init(_ samples: [Double]) {
+            guard !samples.isEmpty else { return }
+            let s = samples.sorted()
+            func rank(_ p: Double) -> Double { s[Swift.min(s.count - 1, Int((p * Double(s.count)).rounded(.up)) - 1)] }
+            p50 = rank(0.5); p95 = rank(0.95); p99 = rank(0.99); max = s.last!
+        }
+
+        var text: String { String(format: "p50 %6.2f  p95 %6.2f  p99 %6.2f  max %6.2f", p50, p95, p99, max) }
+    }
+
+    /// The upscaler's costs on this device, in wall milliseconds unless marked, for a probe app to call (it blocks
+    /// for some seconds). Three phases kept apart, because only the last is paid per subtitle:
+    ///
+    /// 1. App open: what ``prewarm(neuralEngine:)`` does, timed as it does it. The GPU pipelines' compile; then the
+    ///    Neural Engine models cold (compiled models deleted, as after an install, an OS update or a purged cache)
+    ///    and warm (compiled models on disk, nothing loaded, as on a later launch), each split into the package
+    ///    compile, the function loads and the first predictions.
+    /// 2. The first picture on a new upscaler after the prewarm: its surfaces and buffers, made on first use.
+    /// 3. Steady state: `iterations` pictures on that upscaler, as percentiles, per backend; for the Neural Engine
+    ///    also per stage (GPU gather, predictions, GPU composite).
+    ///
+    /// Then each window shape's prediction time (``SubtitleUpscaleTilePlan``'s estimates come from it) and, with
+    /// `sweep`, the GPU time of each layer-kernel variant on the 1400x120 strip (the defaults were tuned on an M4 Pro).
+    public static func benchmark(iterations: Int = 40, sweep: Bool = false) -> String {
+        func ms(_ t0: UInt64) -> Double { Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6 }
+        var lines: [String] = []
         do {
-            let kernels = try SubtitleUpscaleKernels.get()
-            var lines = ["SubtitleUpscaler benchmark on \(kernels.device.name), ms per picture (median of \(iterations))"]
+            // 1. App open.
+            var t0 = DispatchTime.now().uptimeNanoseconds
+            let fresh = try SubtitleUpscaleKernels()
+            let kernelCompile = ms(t0)
+            lines.append("SubtitleUpscaler benchmark on \(fresh.device.name), wall ms")
+            lines.append("1. app open (prewarm)")
+            lines.append(String(format: "  GPU pipelines: %.1f", kernelCompile))
+            try SubtitleUpscaleNeuralEngine.removeCompiledModels()
+            let cold = try SubtitleUpscaleNeuralEngine.prewarm()
+            SubtitleUpscaleNeuralEngine.unloadModels()
+            let warm = try SubtitleUpscaleNeuralEngine.prewarm()
+            for (name, t) in [("cold", cold), ("warm", warm)] {
+                lines.append(String(format: "  Neural Engine %@: total %.1f = package compile %.1f + %d function loads %.1f + first predictions %.1f",
+                                    name as NSString, t.total, t.compile, t.functions, t.load, t.firstPrediction))
+            }
+
+            // 2 and 3. Per picture, after the prewarm.
+            _ = try SubtitleUpscaleKernels.get()
+            lines.append("2. first picture on a new upscaler | 3. steady state over \(iterations) pictures")
             let configurations: [(String, Configuration)] = [("C4F16", .c4f16), ("C4F32", .c4f32), ("balanced", .balanced)]
-            if neuralEngine { try SubtitleUpscaleNeuralEngine.prewarm() }
             for c in benchmarkCases() {
                 for (name, configuration) in configurations {
-                    let upscaler = try SubtitleUpscaler(configuration: configuration)
-                    let r = try upscaler.measure(c.picture, iterations: iterations, batch: batch)
-                    let wall = try upscaler.measureWall(c.picture, iterations: iterations)
-                    var line = String(format: "%@  %-8@  GPU: single %6.2f  batch(%d) %6.2f  wall %6.2f", c.name as NSString,
-                                      name as NSString, r.single, batch, r.batched, wall)
-                    if neuralEngine {
-                        var ane = configuration
-                        ane.backend = .neuralEngine
-                        let neural = try SubtitleUpscaler(configuration: ane).measureWall(c.picture, iterations: iterations)
-                        line += String(format: "  |  Neural Engine: wall %6.2f", neural)
+                    for backend in [Backend.gpu, .neuralEngine] {
+                        var config = configuration
+                        config.backend = backend
+                        let upscaler = try SubtitleUpscaler(configuration: config)
+                        let run = try upscaler.measureRun(c.picture, iterations: iterations)
+                        lines.append(String(format: "  %@ %-8@ %@: first %6.2f | %@", c.name as NSString, name as NSString,
+                                            backend == .gpu ? "GPU          " : "Neural Engine", run.first, run.wall.text))
+                        if backend == .neuralEngine {
+                            lines.append("      gather    \(run.gather.text)")
+                            lines.append("      predict   \(run.predict.text)   (\(run.windows) windows, 2 planes)")
+                            lines.append("      composite \(run.composite.text)")
+                        } else {
+                            lines.append(String(format: "      GPU time p50 %6.2f", try upscaler.measure(c.picture, iterations: iterations / 2, batch: 1).single))
+                        }
                     }
-                    lines.append(line)
                 }
             }
+
+            lines.append("4. one prediction per window shape, p50 (ns per window pixel)")
+            for m in ArtCNNModel.allCases { lines.append(try SubtitleUpscaleNeuralEngine.calibrationLine(m, iterations: iterations / 2)) }
+
             if sweep {
                 let strip = benchmarkCases()[0].picture
                 lines.append("variants, 1400x120 strip, GPU ms single (default: \(SubtitleUpscaleKernels.defaultVariant), \(SubtitleUpscaleKernels.defaultSimdgroupsPerGroup) simdgroups)")
@@ -58,7 +106,7 @@ extension SubtitleUpscaler {
                             let upscaler = try SubtitleUpscaler(configuration: model)
                             upscaler.variant = variant
                             upscaler.simdgroupsPerGroup = simdgroups
-                            let r = try upscaler.measure(strip, iterations: max(iterations / 2, 3), batch: 1)
+                            let r = try upscaler.measure(strip, iterations: max(iterations / 4, 3), batch: 1)
                             lines.append(String(format: "  %@ units %d %@ acc %@ weights, %d simdgroups: %6.2f", model.alphaModel.rawValue,
                                                 variant.unitsPerSimdgroup, variant.halfAccumulator ? "half" : "float",
                                                 variant.threadgroupWeights ? "threadgroup" : "device", simdgroups, r.single))
@@ -68,12 +116,15 @@ extension SubtitleUpscaler {
             }
             return lines.joined(separator: "\n")
         } catch {
-            return "SubtitleUpscaler benchmark failed: \(error)"
+            lines.append("SubtitleUpscaler benchmark failed: \(error)")
+            return lines.joined(separator: "\n")
         }
     }
 
-    /// Median wall-clock milliseconds for one picture through ``upscale(_:)`` (bounded, as ``measure``).
-    func measureWall(_ picture: SubtitleUpscaleFixtures.Picture, iterations: Int) throws -> Double {
+    /// One picture through ``upscale(_:)`` (bounded, as a caller with its display set's object rectangles passes
+    /// them): the first call on this upscaler, then `iterations` more, wall time and, on the Neural Engine, stages.
+    func measureRun(_ picture: SubtitleUpscaleFixtures.Picture, iterations: Int)
+        throws -> (first: Double, wall: Spread, gather: Spread, predict: Spread, composite: Spread, windows: Int) {
         guard let source = SubtitleUpscaleFixtures.texture(picture, device: device) else { throw UpscaleError.unavailable("no texture") }
         let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 2 * picture.width, height: 2 * picture.height,
                                                          mipmapped: false)
@@ -83,13 +134,19 @@ extension SubtitleUpscaler {
         let bounds = picture.rgba.withUnsafeBytes {
             Self.contentBounds($0.baseAddress!, width: picture.width, height: picture.height, bytesPerRow: picture.width * 4, alphaOffset: 3) ?? .zero
         }
-        var samples: [Double] = []
-        for i in 0..<(iterations + 3) {
-            let start = DispatchTime.now().uptimeNanoseconds
-            try upscale([Job(source: source, destination: destination, contentBounds: bounds)])
-            if i >= 3 { samples.append(Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6) }
+        let job = Job(source: source, destination: destination, contentBounds: bounds)
+        var t0 = DispatchTime.now().uptimeNanoseconds
+        try upscale([job])
+        let first = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+        var wall: [Double] = [], gather: [Double] = [], predict: [Double] = [], composite: [Double] = []
+        for _ in 0..<iterations {
+            t0 = DispatchTime.now().uptimeNanoseconds
+            try upscale([job])
+            wall.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6)
+            let s = lastNeuralEngineStages
+            gather.append(s.gather); predict.append(s.predict); composite.append(s.composite)
         }
-        return samples.sorted()[samples.count / 2]
+        return (first, Spread(wall), Spread(gather), Spread(predict), Spread(composite), lastNeuralEngineStages.tiles)
     }
 
     /// Median GPU milliseconds per picture, alone and batched.
@@ -121,5 +178,29 @@ extension SubtitleUpscaler {
             return samples.sorted()[samples.count / 2]
         }
         return (try time(1), try time(max(batch, 1)))
+    }
+}
+
+extension SubtitleUpscaleNeuralEngine {
+    /// Each window shape's synchronous prediction time for `m`, median, with the time per window pixel.
+    static func calibrationLine(_ m: ArtCNNModel, iterations: Int) throws -> String {
+        var line = "  \(m.rawValue)"
+        for shape in shapes {
+            let model = try model(m, shape)
+            let x = try MLMultiArray(shape: [1, 1, shape.height, shape.width].map { NSNumber(value: $0) }, dataType: .float16)
+            let p = x.dataPointer.assumingMemoryBound(to: Float16.self)
+            // A subtitle-like input: sparse strokes, so a value-dependent path would show.
+            for i in 0..<(shape.height * shape.width) { p[i] = (i * 7919) % 97 > 80 ? 1 : 0 }
+            let features = try MLDictionaryFeatureProvider(dictionary: ["x": MLFeatureValue(multiArray: x)])
+            var samples: [Double] = []
+            for i in 0..<(iterations + 3) {
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                _ = try model.prediction(from: features)
+                if i >= 3 { samples.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6) }
+            }
+            let t = SubtitleUpscaler.Spread(samples).p50
+            line += String(format: "  %@ %5.2f (%4.1f)", shape.function as NSString, t, t * 1e6 / Double(shape.height * shape.width))
+        }
+        return line
     }
 }

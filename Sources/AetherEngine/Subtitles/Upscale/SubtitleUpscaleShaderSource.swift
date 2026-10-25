@@ -489,64 +489,60 @@ kernel void up_composite(texture2d<float, access::read> src [[texture(0)]],
 
 // MARK: - Neural Engine tiles
 
-// The tiling of the kept area (content bounds grown by the support) into the Core ML model's fixed tiles: cores of
-// coreWidth x coreHeight, each read through a tileWidth x tileHeight window (the core plus the 7-pixel reach of the
-// network, transparent where it leaves the picture).
-struct UpTiles {
-    int keptX;           // picture position of the kept area
-    int keptY;
-    uint columns;        // cores per row
-    uint count;          // cores
-    uint slots;          // tile slots per plane in the model buffers: count rounded up to the model's batch
+// One window of the kept area's grid (SubtitleUpscaleTilePlan): its picture position, and the part of its core the
+// composite writes (the core within the kept area), in picture coordinates. The window is the core plus the
+// network's 7-pixel reach, transparent where it leaves the picture.
+struct UpWindow {
+    int x;
+    int y;
+    int coreX;
+    int coreY;
     uint coreWidth;
     uint coreHeight;
-    uint tileWidth;
-    uint tileHeight;
 };
 
-// The model input, Float16 [plane * slots + tile][row][column]: alpha (plane 0) and premultiplied luma (plane 1) of
-// each tile's window, transparent outside the picture. `origins` holds each window's picture position.
+// One window's model input, alpha and premultiplied luma, into its two IOSurface textures. Dispatched over the window.
 kernel void up_tile_gather(texture2d<float, access::read> src [[texture(0)]],
-                           device half* input [[buffer(0)]],
-                           device const int2* origins [[buffer(1)]],
-                           constant UpGeom& g [[buffer(2)]],
-                           constant UpTiles& t [[buffer(3)]],
-                           uint3 gid [[thread_position_in_grid]]) {
-    if (gid.x >= t.tileWidth || gid.y >= t.tileHeight || gid.z >= t.count) return;
-    const int2 p = origins[gid.z] + int2(gid.xy);
+                           texture2d<half, access::write> alpha [[texture(1)]],
+                           texture2d<half, access::write> luma [[texture(2)]],
+                           constant UpGeom& g [[buffer(0)]],
+                           constant UpWindow& w [[buffer(1)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= alpha.get_width() || gid.y >= alpha.get_height()) return;
+    const int2 p = int2(w.x, w.y) + int2(gid);
     float4 c = 0.0f;
     if (p.x >= 0 && p.y >= 0 && p.x < int(g.pictureWidth) && p.y < int(g.pictureHeight))
         c = up_premultiplied(src.read(uint2(p)), g);
-    const uint plane = t.tileWidth * t.tileHeight;
-    const uint i = gid.z * plane + gid.y * t.tileWidth + gid.x;
-    input[i] = half(c.a);
-    input[t.slots * plane + i] = half(dot(c.rgb, UP_LUMA));
+    alpha.write(half4(half(c.a)), gid);
+    luma.write(half4(half(dot(c.rgb, UP_LUMA))), gid);
 }
 
-// The composite from the model's outputs, Float16 [plane * slots + tile][2 * row][2 * column].
+// One window's composite over its core: the models' outputs are its two IOSurface textures, the four sub-pixel
+// channels stacked, channel 2 * j + i (output pixel (2x + i, 2y + j)) from row (2 * j + i) * window height.
 kernel void up_composite_tiles(texture2d<float, access::read> src [[texture(0)]],
                                texture2d<float, access::write> dst [[texture(1)]],
-                               device const half* outputs [[buffer(0)]],
-                               device const uint* support [[buffer(1)]],
-                               constant UpGeom& g [[buffer(2)]],
-                               constant UpTiles& t [[buffer(3)]],
-                               device const int2* origins [[buffer(4)]],
+                               texture2d<half, access::read> alpha [[texture(2)]],
+                               texture2d<half, access::read> luma [[texture(3)]],
+                               device const uint* support [[buffer(0)]],
+                               constant UpGeom& g [[buffer(1)]],
+                               constant UpWindow& w [[buffer(2)]],
                                uint2 gid [[thread_position_in_grid]]) {
-    const uint x = gid.x, y = gid.y;
-    if (x >= g.width || y >= g.height || !up_in_picture(g, x, y)) return;
-    // Kept pixels lie in the kept area, which the cores cover.
+    if (gid.x >= w.coreWidth || gid.y >= w.coreHeight) return;
+    const int px = w.coreX + int(gid.x), py = w.coreY + int(gid.y);
+    const uint x = uint(px - g.originX), y = uint(py - g.originY);
     if (!up_supported(support, g, x, y)) return up_write_clear(dst, g, x, y);
-    const int px = int(x) + g.originX, py = int(y) + g.originY;
-    const uint tile = uint((py - t.keptY) / int(t.coreHeight)) * t.columns + uint((px - t.keptX) / int(t.coreWidth));
-    const int2 o = 2 * (int2(px, py) - origins[tile]);
-    const uint w = 2 * t.tileWidth;
-    const uint plane = w * 2 * t.tileHeight;
-    device const half* a = outputs + tile * plane + uint(o.y) * w + uint(o.x);
-    device const half* l = a + t.slots * plane;
-    up_write_block(src, dst, g, x, y, half4(a[0], a[1], a[w], a[w + 1]), half4(l[0], l[1], l[w], l[w + 1]));
+    const uint2 t = uint2(uint(px - w.x), uint(py - w.y));
+    const uint h = alpha.get_height() / 4;
+    half4 a, l;
+    for (uint k = 0; k < 4; k++) {
+        a[k] = alpha.read(t + uint2(0, k * h)).r;
+        l[k] = luma.read(t + uint2(0, k * h)).r;
+    }
+    up_write_block(src, dst, g, x, y, a, l);
 }
 
-// Transparency for the destination outside the region: one thread per 2x2 output block.
+// Transparency for the destination outside the rectangle `g` names (origin and size; the region, or the Neural Engine
+// backend's kept area): one thread per 2x2 output block.
 kernel void up_clear_outside(texture2d<float, access::write> dst [[texture(0)]],
                              constant UpGeom& g [[buffer(0)]],
                              uint2 gid [[thread_position_in_grid]]) {
