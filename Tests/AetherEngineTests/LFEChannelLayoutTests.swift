@@ -87,11 +87,8 @@ struct LFEChannelLayoutTests {
         #expect(AudioBridge.eac3LayoutName(channels: 6, hasLFE: true, sourceIs: sourceIs("5.1")) == nil)
     }
 
-    /// PCM goes out as `ipcm`, whose `chnl` names every channel's speaker, so the bridge has no layout of
-    /// its own to impose: every layout up to 8 channels, LFE or not, comes out as the source's.
-    @Test("PCM output keeps the source's own layout", arguments: ["2.1", "3.0", "quad", "4.0", "3.1", "4.1",
-                                                                  "FL+FR+LFE+BC", "FL+FR+LFE+BL+BR", "5.1", "5.1(side)", "7.1"])
-    func pcmKeepsTheSourceLayout(name: String) throws {
+    /// A bridge in `mode` for 48 kHz 24-bit PCM in the layout `name`: its output, and whether that keeps the layout.
+    private func bridged(_ name: String, mode: AudioBridgeMode) throws -> (output: AudioBridge.Output, keepsLayout: Bool) {
         let par = try #require(avcodec_parameters_alloc())
         var p: UnsafeMutablePointer<AVCodecParameters>? = par
         defer { avcodec_parameters_free(&p) }
@@ -100,25 +97,26 @@ struct LFEChannelLayoutTests {
         par.pointee.sample_rate = 48_000
         par.pointee.format = AV_SAMPLE_FMT_S32.rawValue
         try #require(av_channel_layout_from_string(&par.pointee.ch_layout, name) >= 0)
-        let bridge = try AudioBridge(srcCodecpar: par, srcTimeBase: AVRational(num: 1, den: 48_000), mode: .lossless)
+        let bridge = try AudioBridge(srcCodecpar: par, srcTimeBase: AVRational(num: 1, den: 48_000), mode: mode)
         defer { bridge.close() }
-        #expect(bridge.output == .pcm)
         let out = try #require(bridge.encoderCodecpar)
-        #expect(av_channel_layout_compare(&out.pointee.ch_layout, &par.pointee.ch_layout) == 0, "\(name)")
+        return (bridge.output, av_channel_layout_compare(&out.pointee.ch_layout, &par.pointee.ch_layout) == 0)
     }
 
-    @Test("FFmpeg's E-AC-3 encoder takes every layout the bridge keeps for it")
-    func eac3TakesExactLayouts() throws {
-        let codec = try #require(avcodec_find_encoder(AV_CODEC_ID_EAC3))
-        for name in AudioBridge.exactEAC3Layouts {
-            let ctx = try #require(avcodec_alloc_context3(codec))
-            var c: UnsafeMutablePointer<AVCodecContext>? = ctx
-            defer { avcodec_free_context(&c) }
-            ctx.pointee.sample_rate = 48_000
-            ctx.pointee.sample_fmt = AV_SAMPLE_FMT_FLTP
-            ctx.pointee.bit_rate = 512_000
-            #expect(av_channel_layout_from_string(&ctx.pointee.ch_layout, name) >= 0)
-            #expect(avcodec_open2(ctx, codec, nil) >= 0, "\(name)")
-        }
+    /// PCM goes out as `ipcm`, whose `chnl` names every channel's speaker, so the bridge has no layout of
+    /// its own to impose: every layout up to 8 channels, LFE or not, comes out as the source's.
+    @Test("PCM output keeps the source's own layout", arguments: ["2.1", "3.0", "quad", "4.0", "3.1", "4.1",
+                                                                  "FL+FR+LFE+BC", "FL+FR+LFE+BL+BR", "5.1", "5.1(side)", "7.1"])
+    func pcmKeepsTheSourceLayout(name: String) throws {
+        let out = try bridged(name, mode: .lossless)
+        #expect(out.output == .pcm)
+        #expect(out.keepsLayout)
+    }
+
+    @Test("the E-AC-3 bridge opens its encoder on every layout it keeps", arguments: AudioBridge.exactEAC3Layouts)
+    func eac3TakesExactLayouts(name: String) throws {
+        let out = try bridged(name, mode: .surroundCompat)
+        #expect(out.output == .eac3)
+        #expect(out.keepsLayout)
     }
 }
