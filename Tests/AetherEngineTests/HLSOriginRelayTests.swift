@@ -342,7 +342,9 @@ struct HLSOriginRelayAddressingTests {
         // this test's own, which is what keeps the counter this test's own.
         let snapshot = try #require(OriginRequestBudget.shared.snapshot(for: origin))
         #expect(snapshot.refusals == 1, "a 429 through the relay was charged \(snapshot.refusals) times")
-        #expect(snapshot.limit == 1, "the refusal did not bring the origin's concurrency down")
+        // One request refused on its own is rate limiting (RFC 6585), not a statement about how many
+        // may be open: it paces the origin and leaves concurrency where it was.
+        #expect(snapshot.limit == nil, "a lone 429 lowered the origin's concurrency")
     }
 
     @Test("An origin that says the resource is gone is not rewritten into a playlist")
