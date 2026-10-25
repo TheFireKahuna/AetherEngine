@@ -1,6 +1,6 @@
 import Foundation
 
-/// How the Neural Engine backend covers a picture's kept area with the models' fixed windows
+/// How the upscaler covers a picture's kept area with the models' fixed windows
 /// (``ArtCNNCoreMLModels/windowHeights`` x ``ArtCNNCoreMLModels/windowWidths``). Each window is a core plus the
 /// network's 7-pixel reach on every side, so a core's outputs are exact. The cores form a grid: rows of chosen core
 /// heights down the kept area, columns of chosen core widths across it, every row with the same columns.

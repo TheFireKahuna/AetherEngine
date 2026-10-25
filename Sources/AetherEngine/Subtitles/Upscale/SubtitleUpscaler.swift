@@ -3,20 +3,19 @@ import CoreVideo
 import Foundation
 import Metal
 
-/// Upscales a bitmap subtitle (PGS, DVB, DVD, a display set's RGBA picture) 2x with ArtCNN, on the GPU or the
-/// Neural Engine (``Backend``).
+/// Upscales a bitmap subtitle (PGS, DVB, DVD, a display set's RGBA picture) 2x with ArtCNN on the Neural Engine,
+/// leaving the GPU to the video (``SubtitleUpscaleNeuralEngine``; GPU passes prepare its input and composite its output).
 ///
 /// ArtCNN is a single-channel model, so the picture is split into its alpha and its premultiplied luma, each plane is
 /// run through the network, and the colour comes back as the source's chroma interpolated bilinearly (subtitle
 /// colour is near-constant across a glyph: the shape lives in alpha and luma) and scaled by the new alpha. The result
 /// is premultiplied, alpha clamped to [0, 1] and colour to [0, alpha], so the network's overshoot cannot paint a halo.
-/// Output pixels farther than 5 source pixels from any non-transparent pixel are exactly transparent; the GPU network
-/// skips them (and the units only they depend on), which on a subtitle strip is much of the picture.
+/// Output pixels farther than 5 source pixels from any non-transparent pixel are exactly transparent, so the
+/// network runs only on the content bounds grown by that support (``SubtitleUpscaleTilePlan``).
 ///
-/// One process-wide device, queue and pipeline set (``prewarm()``); each upscaler keeps its working buffers between
-/// calls and grows them only for a larger picture, so the steady state allocates nothing. An instance runs one
-/// picture at a time (calls are serialised). ``upscale(_:)`` runs a burst and waits, on either backend; on the GPU
-/// several pictures can also share a caller's command buffer (``encode(_:into:)``).
+/// One process-wide device, queue, pipeline set and model set (``prewarm()``); each upscaler keeps its
+/// working buffers and window surfaces between calls, so the steady state allocates nothing. An instance runs one
+/// picture at a time (calls are serialised); ``upscale(_:)`` runs a burst and waits.
 public final class SubtitleUpscaler: @unchecked Sendable {
 
     /// How the source's colour relates to its alpha. The engine's bitmap subtitles are premultiplied.
@@ -31,17 +30,10 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         /// The network on the premultiplied luma plane: the fill's edge against the outline, the highest-contrast
         /// edge of a light subtitle with a dark outline.
         public var lumaModel: ArtCNNModel
-        /// Skip the units the output does not depend on (GPU). Off, every unit is computed; the output is identical.
-        public var skipsTransparent: Bool
-        /// Where the networks run. The mask and composite are GPU passes either way.
-        public var backend: Backend
 
-        public init(alphaModel: ArtCNNModel = .c4f32, lumaModel: ArtCNNModel = .c4f32, skipsTransparent: Bool = true,
-                    backend: Backend = .gpu) {
+        public init(alphaModel: ArtCNNModel = .c4f32, lumaModel: ArtCNNModel = .c4f32) {
             self.alphaModel = alphaModel
             self.lumaModel = lumaModel
-            self.skipsTransparent = skipsTransparent
-            self.backend = backend
         }
 
         /// C4F32 on both planes.
@@ -53,14 +45,6 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         /// C4F16 everywhere does, because the fill edge is where a subtitle's contrast is.
         public static let balanced = Configuration(alphaModel: .c4f16, lumaModel: .c4f32)
         public static let c4f16 = Configuration(alphaModel: .c4f16, lumaModel: .c4f16)
-    }
-
-    public enum Backend: Sendable, Hashable {
-        /// Metal `simdgroup_matrix` kernels, skipping transparent units; can join a caller's command buffer.
-        case gpu
-        /// Core ML on the Neural Engine over fixed tiles (``SubtitleUpscaleNeuralEngine``), leaving the GPU to the
-        /// video. Synchronous: ``upscale(_:)`` and the conveniences only.
-        case neuralEngine
     }
 
     public enum UpscaleError: Error, CustomStringConvertible {
@@ -77,7 +61,7 @@ public final class SubtitleUpscaler: @unchecked Sendable {
     }
 
     /// One picture to upscale: `source` (any float-readable colour texture: BGRA8, RGBA8, RGBA16F) into
-    /// `destination` (writable, twice the size for ``encode(_:into:)``).
+    /// `destination` (writable, any size; see ``upscale(_:)``).
     public struct Job {
         public var source: MTLTexture
         public var destination: MTLTexture
@@ -131,7 +115,7 @@ public final class SubtitleUpscaler: @unchecked Sendable {
     private var _configuration: Configuration
     private var workspace: Workspace
 
-    /// Wall milliseconds of the last Neural Engine pass's stages, for the profile.
+    /// Wall milliseconds of the last pass's stages, for the benchmark.
     struct NeuralEngineStages {
         var gather = 0.0
         var predict = 0.0
@@ -140,27 +124,19 @@ public final class SubtitleUpscaler: @unchecked Sendable {
     }
     var lastNeuralEngineStages = NeuralEngineStages()
 
-    /// Tunables, internal so the benchmark can sweep them.
-    var variant = SubtitleUpscaleKernels.defaultVariant
-    /// Threadgroups a persistent (threadgroup-weights) layer dispatches.
-    var persistentGroups = 64
-    var simdgroupsPerGroup = SubtitleUpscaleKernels.defaultSimdgroupsPerGroup
-    /// Upper bound on the two feature maps (both planes, ping and pong) of one band. A picture whose maps would
-    /// exceed it runs in row bands, each with 6 rows of overlap per side; the default fits a 1920-wide strip of
-    /// 190 rows (or any cropped display set up to about 196,000 pixels) in one band.
-    var featureBudgetBytes = 48 << 20
     /// Output pixels farther than this many source pixels from content are transparent (1...7; see the shader's
-    /// notes on the cut). Each pixel less shrinks every layer's work by a pixel of dilation around the content.
+    /// notes on the cut).
     var supportRadius = 5 {
         didSet { precondition((1...7).contains(supportRadius)) }
     }
 
-    /// Compiles the shared pipelines on a background queue, so the first picture does not wait for them; with
-    /// `neuralEngine`, also loads the Core ML models and has the Neural Engine compile them.
-    public static func prewarm(neuralEngine: Bool = false) {
+    /// Compiles the shared pipelines, compiles and loads the Core ML models and has the Neural Engine compile each
+    /// function, on a background queue, so the first picture waits for none of it. For app open: a few seconds
+    /// after an install, an OS update or a purged cache, under a second otherwise.
+    public static func prewarm() {
         DispatchQueue.global(qos: .utility).async {
             _ = try? SubtitleUpscaleKernels.get()
-            if neuralEngine { try? SubtitleUpscaleNeuralEngine.prewarm() }
+            try? SubtitleUpscaleNeuralEngine.prewarm()
         }
     }
 
@@ -170,45 +146,15 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         workspace = Workspace(device: kernels.device)
     }
 
-    // MARK: - Encoding
-
-    /// Encodes the 2x upscale of each job into `commandBuffer`, one after another on this upscaler's buffers (GPU
-    /// backend). Each destination must be exactly twice its source.
-    public func encode(_ jobs: [Job], into commandBuffer: MTLCommandBuffer) throws {
-        try lock.withLock {
-            guard _configuration.backend == .gpu else { throw UpscaleError.unavailable("the Neural Engine backend runs through upscale(_:)") }
-            guard let encoder = commandBuffer.makeComputeCommandEncoder(dispatchType: .serial) else {
-                throw UpscaleError.gpu("no compute encoder")
-            }
-            defer { encoder.endEncoding() }
-            for job in jobs { try encodeLocked(job, encoder: encoder) }
-        }
-    }
-
-    /// Encodes `job` at any destination size into `commandBuffer` (GPU backend): see ``upscale(_:)``.
-    public func encodeScaled(_ job: Job, into commandBuffer: MTLCommandBuffer) throws {
-        try lock.withLock {
-            guard _configuration.backend == .gpu else { throw UpscaleError.unavailable("the Neural Engine backend runs through upscale(_:)") }
-            try encodeScaledLocked(job, into: commandBuffer)
-        }
-    }
-
     /// Upscales each job and waits. A destination twice its source takes one 2x pass; any other size takes 2x passes
     /// (one, or two when the destination is at least 4x) then a Lanczos-3 resample to the exact size, antialiased
-    /// when it reduces. On the GPU the whole burst is one command buffer.
+    /// when it reduces.
     public func upscale(_ jobs: [Job]) throws {
         try lock.withLock {
-            switch _configuration.backend {
-            case .gpu:
-                try run { commandBuffer in
-                    for job in jobs { try encodeScaledLocked(job, into: commandBuffer) }
-                }
-            case .neuralEngine:
-                for job in jobs {
-                    let plan = try scalePlan(job)
-                    for pass in plan.passes { try neuralEngineLocked(pass) }
-                    if let (src, dst) = plan.resample { try run { try encodeResample(src, dst, into: $0) } }
-                }
+            for job in jobs {
+                let plan = try scalePlan(job)
+                for pass in plan.passes { try passLocked(pass) }
+                if let (src, dst) = plan.resample { try run { try encodeResample(src, dst, into: $0) } }
             }
         }
     }
@@ -234,14 +180,6 @@ public final class SubtitleUpscaler: @unchecked Sendable {
             bounds = bounds.map { $0.isEmpty ? $0 : $0.applying(CGAffineTransform(scaleX: 2, y: 2)).insetBy(dx: -grow, dy: -grow) }
         }
         return (passes, (current, job.destination))
-    }
-
-    private func encodeScaledLocked(_ job: Job, into commandBuffer: MTLCommandBuffer) throws {
-        let plan = try scalePlan(job)
-        guard let encoder = commandBuffer.makeComputeCommandEncoder(dispatchType: .serial) else { throw UpscaleError.gpu("no compute encoder") }
-        for pass in plan.passes { try encodeLocked(pass, encoder: encoder) }
-        encoder.endEncoding()
-        if let (src, dst) = plan.resample { try encodeResample(src, dst, into: commandBuffer) }
     }
 
     private func encodeResample(_ src: MTLTexture, _ dst: MTLTexture, into commandBuffer: MTLCommandBuffer) throws {
@@ -334,17 +272,7 @@ public final class SubtitleUpscaler: @unchecked Sendable {
     struct Geometry {
         var width: UInt32 = 0
         var height: UInt32 = 0
-        var wp: UInt32 = 0
-        var unitsX: UInt32 = 0
-        var row0: Int32 = 0
-        var rows: UInt32 = 0
-        var outRow0: UInt32 = 0
-        var outRow1: UInt32 = 0
-        var featureStride: UInt32 = 0
-        var pixelStride: UInt32 = 0
         var wordsX: UInt32 = 0
-        var listCapacity: UInt32 = 0
-        var skip: UInt32 = 0
         var straightAlpha: UInt32 = 0
         var originX: Int32 = 0
         var originY: Int32 = 0
@@ -353,68 +281,30 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         var support: UInt32 = 0
     }
 
-    /// The rectangle the network runs on: the content (`bounds` within the picture, integral; the whole picture
-    /// without bounds) grown by `support` + 6 pixels, the deepest a kept output pixel's features reach (the support
-    /// plus 6 of feature dependency). It may extend past the picture: the picture is a crop of a transparent canvas,
-    /// so the output depends on the content alone, never on how tightly the bitmap was cropped. Beyond the region
-    /// everything is transparent, and the zero padding at its edges reaches only pixels the composite discards.
-    static func region(bounds: CGRect?, width: Int, height: Int, support: Int) -> (minX: Int, minY: Int, width: Int, height: Int, isEmpty: Bool) {
-        let reach = support + 6
-        var b = CGRect(x: 0, y: 0, width: width, height: height)
-        if let bounds { b = bounds.integral.intersection(b) }
-        guard !b.isNull, !b.isEmpty else { return (0, 0, 0, 0, true) }
-        return (Int(b.minX) - reach, Int(b.minY) - reach, Int(b.width) + 2 * reach, Int(b.height) + 2 * reach, false)
-    }
-
-    /// Row bands of a `height`-row picture whose padded rows are `pitch` pixels: (first band row, band rows, first
-    /// output row, output rows). Bands overlap by 6 rows per side, the deepest a kept pixel's feature dependency
-    /// reaches beyond its own row (layer 0 reads the picture itself).
-    static func bands(height: Int, pitch: Int, maxPixels: Int) -> [(row0: Int, rows: Int, out0: Int, out1: Int)] {
-        let maxRows = max(maxPixels / pitch - 2, 13)
-        if height <= maxRows { return [(0, height, 0, height)] }
-        var bands: [(Int, Int, Int, Int)] = []
-        var out0 = 0
-        while out0 < height {
-            let row0 = max(out0 - 6, 0)
-            let row1 = min(row0 + maxRows, height)
-            let out1 = row1 == height ? height : row1 - 6
-            bands.append((row0, row1 - row0, out0, out1))
-            out0 = out1
-        }
-        return bands
-    }
-
-    /// Validates `job`, clears its destination outside `kept` (picture coordinates; the region when nil, which the
-    /// GPU network's composite covers) and encodes the region's content mask (either backend's first passes). Nil
-    /// when the region is empty: the destination is then all transparent.
-    private func encodeMask(_ job: Job, encoder: MTLComputeCommandEncoder, kept: Rect? = nil) throws -> Geometry? {
+    /// Validates `job`, clears its destination outside the kept area and encodes the kept area's content mask (the
+    /// support the composite keeps). Nil when the kept area is empty: the destination is then all transparent.
+    private func encodeMask(_ job: Job, kept: Rect, encoder: MTLComputeCommandEncoder) throws -> Geometry? {
         let pw = job.source.width, ph = job.source.height
         guard pw > 0, ph > 0 else { throw UpscaleError.size("empty source") }
         guard job.destination.width == 2 * pw, job.destination.height == 2 * ph else {
             throw UpscaleError.size("destination \(job.destination.width)x\(job.destination.height) is not 2x \(pw)x\(ph)")
         }
-        let region = Self.region(bounds: job.contentBounds, width: pw, height: ph, support: supportRadius)
         var g = Geometry()
         g.support = UInt32(supportRadius)
-        g.originX = Int32(region.minX); g.originY = Int32(region.minY)
+        g.originX = Int32(kept.x); g.originY = Int32(kept.y)
         g.pictureWidth = UInt32(pw); g.pictureHeight = UInt32(ph)
-        g.width = UInt32(region.width); g.height = UInt32(region.height)
+        g.width = UInt32(kept.width); g.height = UInt32(kept.height)
         g.straightAlpha = job.sourceAlpha == .straight ? 1 : 0
         let geometrySize = MemoryLayout<Geometry>.stride
-        var keep = kept ?? Rect(x: region.minX, y: region.minY, width: region.width, height: region.height)
-        if region.isEmpty || keep.width <= 0 || keep.height <= 0 { keep = Rect(x: 0, y: 0, width: 0, height: 0) }
-        if keep.width == 0 || keep.x > 0 || keep.y > 0 || keep.x + keep.width < pw || keep.y + keep.height < ph {
-            var c = g
-            c.originX = Int32(keep.x); c.originY = Int32(keep.y)
-            c.width = UInt32(keep.width); c.height = UInt32(keep.height)
+        if kept.width == 0 || kept.x > 0 || kept.y > 0 || kept.x + kept.width < pw || kept.y + kept.height < ph {
             encoder.setComputePipelineState(kernels.clearOutside)
             encoder.setTexture(job.destination, index: 0)
-            encoder.setBytes(&c, length: geometrySize, index: 0)
+            encoder.setBytes(&g, length: geometrySize, index: 0)
             dispatch(encoder, kernels.clearOutside, width: pw, height: ph)
         }
-        guard !region.isEmpty else { return nil }
-        let h = region.height
-        let wordsX = (region.width + 31) / 32
+        guard kept.width > 0 else { return nil }
+        let h = kept.height
+        let wordsX = (kept.width + 31) / 32
         g.wordsX = UInt32(wordsX)
         try workspace.reserveMask(height: h, wordsX: wordsX)
         let ws = workspace
@@ -431,142 +321,13 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         dispatch(encoder, kernels.maskRows, width: wordsX, height: h)
         encoder.setComputePipelineState(kernels.maskColumns)
         encoder.setBuffer(ws.rows, offset: 0, index: 0)
-        encoder.setBuffer(ws.square, offset: 0, index: 1)
+        encoder.setBuffer(ws.support, offset: 0, index: 1)
         encoder.setBytes(&g, length: geometrySize, index: 2)
-        encoder.dispatchThreads(MTLSize(width: wordsX, height: h, depth: 7), threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
+        dispatch(encoder, kernels.maskColumns, width: wordsX, height: h)
         return g
     }
 
-    private func encodeLocked(_ job: Job, encoder: MTLComputeCommandEncoder) throws {
-        let config = _configuration
-        guard var g = try encodeMask(job, encoder: encoder) else { return }
-        let geometrySize = MemoryLayout<Geometry>.stride
-        let w = Int(g.width), h = Int(g.height)
-        let unitsX = (w + 7) / 8
-        guard unitsX <= 0xffff else { throw UpscaleError.size("source wider than \(0xffff * 8)") }
-        let pitch = 8 + unitsX * 8 + 8
-        let maxPixels = featureBudgetBytes / (2 * 2 * 32 * 2)
-        let bands = Self.bands(height: h, pitch: pitch, maxPixels: maxPixels)
-        guard bands.allSatisfy({ $0.rows <= 0xffff }) else { throw UpscaleError.size("band taller than 65535 rows") }
-        let bandRows = bands.map(\.rows).max()!
-        let pixelStride = pitch * (bandRows + 2)
-        let listCapacity = bandRows * unitsX
-        try workspace.reserveFeatures(pixelStride: pixelStride, listCapacity: listCapacity)
-        let ws = workspace
-
-        g.wp = UInt32(pitch); g.unitsX = UInt32(unitsX)
-        g.featureStride = UInt32(pixelStride * 32); g.pixelStride = UInt32(pixelStride)
-        g.listCapacity = UInt32(listCapacity); g.skip = config.skipsTransparent ? 1 : 0
-
-        let alpha = kernels.buffers(config.alphaModel)
-        let luma = kernels.buffers(config.lumaModel)
-        let shared = config.alphaModel == config.lumaModel
-        let variant = self.variant
-        let mb = variant.unitsPerSimdgroup
-        let sgs = simdgroupsPerGroup
-        var unitsPerGroup = [UInt32](repeating: 0, count: 21)
-        for layer in 0..<7 {
-            for (k, model) in [alpha, alpha, luma].enumerated() {
-                unitsPerGroup[layer * 3 + k] = UInt32(layer == 0 ? SubtitleUpscaleKernels.firstLayerThreads / model.features : sgs * mb)
-            }
-        }
-        let featureBytes = pixelStride * 32 * 2
-
-        for band in bands {
-            g.row0 = Int32(band.row0); g.rows = UInt32(band.rows)
-            g.outRow0 = UInt32(band.out0); g.outRow1 = UInt32(band.out1)
-
-            encoder.setComputePipelineState(kernels.bandReset)
-            encoder.setBuffer(ws.counts, offset: 0, index: 0)
-            encoder.dispatchThreads(MTLSize(width: 8, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 1, depth: 1))
-
-            encoder.setComputePipelineState(kernels.bandLists)
-            encoder.setBuffer(ws.square, offset: 0, index: 0)
-            encoder.setBuffer(ws.lists, offset: 0, index: 1)
-            encoder.setBuffer(ws.counts, offset: 0, index: 2)
-            encoder.setBytes(&g, length: geometrySize, index: 3)
-            encoder.dispatchThreads(MTLSize(width: band.rows * unitsX, height: 1, depth: 1),
-                                    threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-
-            encoder.setComputePipelineState(kernels.bandArguments)
-            encoder.setBuffer(ws.counts, offset: 0, index: 0)
-            encoder.setBuffer(ws.arguments, offset: 0, index: 1)
-            encoder.setBytes(&unitsPerGroup, length: 21 * 4, index: 2)
-            encoder.dispatchThreads(MTLSize(width: 21, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-
-            encoder.setComputePipelineState(kernels.planes)
-            encoder.setTexture(job.source, index: 0)
-            encoder.setBuffer(ws.planes, offset: 0, index: 0)
-            encoder.setBytes(&g, length: geometrySize, index: 1)
-            dispatch(encoder, kernels.planes, width: pitch, height: band.rows + 2)
-
-            encoder.setComputePipelineState(kernels.clearPads)
-            var channels = SIMD2<UInt32>(UInt32(alpha.features), UInt32(luma.features))
-            encoder.setBuffer(ws.maps, offset: 0, index: 0)
-            encoder.setBytes(&g, length: geometrySize, index: 1)
-            encoder.setBytes(&channels, length: 8, index: 2)
-            encoder.dispatchThreads(MTLSize(width: 2 * pitch + 2 * band.rows, height: 4, depth: 1),
-                                    threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
-
-            // (plane base, argument slot, model) per dispatch of a layer.
-            let groups: [(UInt32, Int, SubtitleUpscaleKernels.ModelBuffers)] = shared ? [(0, 0, alpha)] : [(0, 1, alpha), (1, 2, luma)]
-            // Ping-pong: layer L reads map (L + 1) % 2 and writes L % 2; map 0 is P (offset 0), map 1 is Q.
-            func map(_ index: Int) -> Int { index * 2 * featureBytes }
-
-            for (base, slot, model) in groups {
-                var planeBase = base
-                encoder.setComputePipelineState(kernels.first(features: model.features))
-                encoder.setBuffer(ws.planes, offset: 0, index: 0)
-                encoder.setBuffer(ws.maps, offset: map(0), index: 1)
-                encoder.setBuffer(model.first, offset: 0, index: 2)
-                encoder.setBuffer(ws.lists, offset: 0, index: 3)
-                encoder.setBuffer(ws.counts, offset: 0, index: 4)
-                encoder.setBytes(&g, length: geometrySize, index: 5)
-                encoder.setBytes(&planeBase, length: 4, index: 6)
-                encoder.dispatchThreadgroups(indirectBuffer: ws.arguments, indirectBufferOffset: slot * 12,
-                                             threadsPerThreadgroup: MTLSize(width: SubtitleUpscaleKernels.firstLayerThreads, height: 1, depth: 1))
-            }
-            for layer in 1...6 {
-                let mode = layer <= 4 ? 0 : (layer == 5 ? 1 : 2)
-                for (base, slot, model) in groups {
-                    var planeBase = base
-                    let pipeline = try kernels.convolution(features: model.features, mode: mode, variant: variant)
-                    encoder.setComputePipelineState(pipeline)
-                    encoder.setBuffer(ws.maps, offset: map((layer + 1) % 2), index: 0)
-                    if mode == 2 {
-                        encoder.setBuffer(ws.outputs, offset: 0, index: 1)
-                    } else {
-                        encoder.setBuffer(ws.maps, offset: map(layer % 2), index: 1)
-                    }
-                    encoder.setBuffer(model.blocks[layer - 1], offset: 0, index: 2)
-                    encoder.setBuffer(model.bias[layer - 1], offset: 0, index: 3)
-                    encoder.setBuffer(ws.lists, offset: layer * listCapacity * 4, index: 4)
-                    encoder.setBuffer(ws.counts, offset: layer * 4, index: 5)
-                    encoder.setBytes(&g, length: geometrySize, index: 6)
-                    encoder.setBytes(&planeBase, length: 4, index: 7)
-                    encoder.setBuffer(ws.planes, offset: 0, index: 8)
-                    encoder.setBuffer(model.first, offset: 0, index: 9)
-                    if variant.threadgroupWeights {
-                        encoder.dispatchThreadgroups(MTLSize(width: persistentGroups, height: shared ? 2 : 1, depth: 1),
-                                                     threadsPerThreadgroup: MTLSize(width: sgs * 32, height: 1, depth: 1))
-                    } else {
-                        encoder.dispatchThreadgroups(indirectBuffer: ws.arguments, indirectBufferOffset: (layer * 3 + slot) * 12,
-                                                     threadsPerThreadgroup: MTLSize(width: sgs * 32, height: 1, depth: 1))
-                    }
-                }
-            }
-
-            encoder.setComputePipelineState(kernels.composite)
-            encoder.setTexture(job.source, index: 0)
-            encoder.setTexture(job.destination, index: 1)
-            encoder.setBuffer(ws.outputs, offset: 0, index: 0)
-            encoder.setBuffer(ws.square, offset: 0, index: 1)
-            encoder.setBytes(&g, length: geometrySize, index: 2)
-            dispatch(encoder, kernels.composite, width: w, height: band.out1 - band.out0)
-        }
-    }
-
-    // MARK: - Neural Engine
+    // MARK: - One pass
 
     /// A rectangle in picture coordinates.
     struct Rect: Equatable {
@@ -586,21 +347,25 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         var coreHeight: UInt32
     }
 
-    /// The kept area: the picture pixels within the support of the content bounds, which hold every output pixel
-    /// that is not exactly transparent.
+    /// The kept area: the picture pixels within the support of the content bounds (the whole picture without
+    /// bounds), which hold every output pixel that is not exactly transparent.
     private func keptArea(_ job: Job) -> Rect {
-        var b = CGRect(x: 0, y: 0, width: job.source.width, height: job.source.height)
+        let picture = CGRect(x: 0, y: 0, width: job.source.width, height: job.source.height)
+        var b = picture
         if let bounds = job.contentBounds {
-            b = bounds.integral.insetBy(dx: -CGFloat(supportRadius), dy: -CGFloat(supportRadius)).intersection(b)
+            // Content first: empty bounds hold nothing to grow.
+            let content = bounds.integral.intersection(picture)
+            guard !content.isNull, !content.isEmpty else { return Rect(x: 0, y: 0, width: 0, height: 0) }
+            b = content.insetBy(dx: -CGFloat(supportRadius), dy: -CGFloat(supportRadius)).intersection(picture)
         }
         guard !b.isNull, !b.isEmpty else { return Rect(x: 0, y: 0, width: 0, height: 0) }
         return Rect(x: Int(b.minX), y: Int(b.minY), width: Int(b.width), height: Int(b.height))
     }
 
-    /// One 2x pass with the networks on the Neural Engine: the mask and the window gather on the GPU, a prediction
-    /// per window and plane, then the composite on the GPU, each window's planes shared between them through its
-    /// IOSurfaces. Waits for each step.
-    private func neuralEngineLocked(_ job: Job) throws {
+    /// One 2x pass: the mask and the window gather on the GPU, a prediction per window and plane on the Neural
+    /// Engine, then the composite on the GPU, each window's planes shared between them through its IOSurfaces. Waits
+    /// for each step.
+    private func passLocked(_ job: Job) throws {
         let config = _configuration
         let kept = keptArea(job)
         let plan = SubtitleUpscaleTilePlan.plan(
@@ -629,7 +394,7 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         try run { commandBuffer in
             guard let encoder = commandBuffer.makeComputeCommandEncoder(dispatchType: .serial) else { throw UpscaleError.gpu("no compute encoder") }
             defer { encoder.endEncoding() }
-            guard let made = try encodeMask(job, encoder: encoder, kept: kept) else { empty = true; return }
+            guard let made = try encodeMask(job, kept: kept, encoder: encoder) else { empty = true; return }
             g = made
             encoder.setComputePipelineState(kernels.tileGather)
             encoder.setTexture(job.source, index: 0)
@@ -657,7 +422,7 @@ public final class SubtitleUpscaler: @unchecked Sendable {
             encoder.setComputePipelineState(kernels.compositeTiles)
             encoder.setTexture(job.source, index: 0)
             encoder.setTexture(job.destination, index: 1)
-            encoder.setBuffer(workspace.square, offset: 0, index: 0)
+            encoder.setBuffer(workspace.support, offset: 0, index: 0)
             encoder.setBytes(&g, length: MemoryLayout<Geometry>.stride, index: 1)
             for (k, var record) in records.enumerated() where record.coreWidth > 0 && record.coreHeight > 0 {
                 encoder.setTexture(surfaces[k].alphaOut.texture, index: 2)
@@ -680,21 +445,13 @@ public final class SubtitleUpscaler: @unchecked Sendable {
     /// The buffers one picture's passes use, grown to the largest picture seen and kept.
     final class Workspace {
         let device: MTLDevice
-        private(set) var planes: MTLBuffer!
-        private(set) var maps: MTLBuffer!
-        private(set) var outputs: MTLBuffer!
-        private(set) var lists: MTLBuffer!
-        /// The content mask, one bit per pixel: `bits`, its row dilations `rows` and its square dilations `square`
-        /// (seven planes each, distances S...S + 6).
+        /// The content mask, one bit per pixel of the kept area: `bits`, its row dilation `rows` and its square
+        /// dilation `support`, by S.
         private(set) var bits: MTLBuffer!
         private(set) var rows: MTLBuffer!
-        private(set) var square: MTLBuffer!
-        /// The Neural Engine backend's window surfaces, shared by Metal and Core ML.
+        private(set) var support: MTLBuffer!
+        /// The window surfaces, shared by Metal and Core ML.
         let surfaces: SubtitleUpscaleNeuralEngine.Surfaces.Pool
-        let counts: MTLBuffer
-        let arguments: MTLBuffer
-        private var pixelCapacity = 0
-        private var listCapacity = 0
         private var maskCapacity = 0
         private var textures: [Int: MTLTexture] = [:]
         private var textureCache: CVMetalTextureCache?
@@ -702,8 +459,6 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         init(device: MTLDevice) {
             self.device = device
             surfaces = SubtitleUpscaleNeuralEngine.Surfaces.Pool(device: device)
-            counts = device.makeBuffer(length: 32, options: .storageModePrivate)!
-            arguments = device.makeBuffer(length: 21 * 12, options: .storageModePrivate)!
         }
 
         private func make(_ length: Int) throws -> MTLBuffer {
@@ -713,33 +468,18 @@ public final class SubtitleUpscaler: @unchecked Sendable {
             return b
         }
 
-        func reserveFeatures(pixelStride: Int, listCapacity lists: Int) throws {
-            if pixelStride > pixelCapacity {
-                // Whatever a skipped unit holds reaches only pixels the composite discards: a matrix product's
-                // output row depends on its own input row alone, so not even a NaN crosses into a kept pixel.
-                planes = try make(2 * pixelStride * 2)
-                maps = try make(4 * pixelStride * 32 * 2)
-                outputs = try make(2 * pixelStride * 4 * 2)
-                pixelCapacity = pixelStride
-            }
-            if lists > listCapacity {
-                self.lists = try make(7 * lists * 4)
-                listCapacity = lists
-            }
-        }
-
         func reserveMask(height: Int, wordsX: Int) throws {
             let mask = height * wordsX
             if mask > maskCapacity {
                 bits = try make(mask * 4)
-                rows = try make(7 * mask * 4)
-                square = try make(7 * mask * 4)
+                rows = try make(mask * 4)
+                support = try make(mask * 4)
                 maskCapacity = mask
             }
         }
 
-        /// Scratch RGBA16F textures for ``encodeScaled(_:into:)``: slots 0 and 1 the 2x passes, 2 the resample's
-        /// first axis.
+        /// Scratch RGBA16F textures for ``upscale(_:)`` at other sizes: slots 0 and 1 the 2x passes, 2 the
+        /// resample's first axis.
         func intermediate(_ slot: Int, width: Int, height: Int) throws -> MTLTexture {
             try texture(slot, width: width, height: height, format: .rgba16Float, storage: .private)
         }

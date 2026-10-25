@@ -1,12 +1,6 @@
 import Accelerate
 import Foundation
-
-/// The ArtCNN line-art models ``SubtitleUpscaler`` runs. Both are the neutral 2x luma models (not the `_DS`
-/// sharpening or `_DN` denoising variants); C4F32 has twice the channels and four times the work of C4F16.
-public enum ArtCNNModel: String, Sendable, CaseIterable {
-    case c4f16
-    case c4f32
-}
+@testable import AetherEngine
 
 /// ArtCNN C4Fxx as ArtCNN defines it (`ArtCNN_C` in the repository's Keras notebook, shipped as the mpv hooks
 /// ``ArtCNNWeights`` was read from): seven 3x3 convolutions at the input resolution with zero padding,
