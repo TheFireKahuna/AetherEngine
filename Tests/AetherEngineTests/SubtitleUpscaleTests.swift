@@ -229,7 +229,7 @@ struct SubtitleUpscaleTests {
 
     @Test("a picture covered with mixed window shapes matches the Float32 reference")
     func mixedGrid() throws {
-        let upscaler = try SubtitleUpscaler(configuration: .c4f16)
+        let upscaler = try SubtitleUpscaler(configuration: .balanced)
         // Text, and blocks in the corners, so the kept area is the whole picture: wider than the widest core and taller
         // than the tallest, its cover mixes core sizes on both axes and reaches every edge.
         let w = 2120, h = 150
@@ -239,10 +239,10 @@ struct SubtitleUpscaleTests {
             for y in y0..<(y0 + 9) { for x in x0..<(x0 + 12) { picture.rgba[(y * w + x) * 4 ..< (y * w + x) * 4 + 4] = [255, 255, 255, 255] } }
         }
         let content = Self.content(picture)
-        let plan = SubtitleUpscaleTilePlan.plan(content: content, width: w, height: h, support: 5, alpha: .c4f16, luma: .c4f16)
+        let plan = SubtitleUpscaleTilePlan.plan(content: content, width: w, height: h, support: 5, alpha: .c4f16, luma: .c4f32)
         #expect(Set(plan.windows.map(\.height)).count > 1 && Set(plan.windows.map(\.width)).count > 1, "plan \(plan.windows)")
-        let e = Self.error(try Self.run(picture, upscaler, content: content), Self.reference(picture, configuration: .c4f16))
-        print("[upscale] C4F16 \(w)x\(h) (\(plan.windows.count) windows) vs fp32: \(e)")
+        let e = Self.error(try Self.run(picture, upscaler, content: content), Self.reference(picture, configuration: .balanced))
+        print("[upscale] balanced \(w)x\(h) (\(plan.windows.count) windows) vs fp32: \(e)")
         #expect(e.maxAlpha < 0.005 && e.maxColour < 0.005, "\(e)")
     }
 

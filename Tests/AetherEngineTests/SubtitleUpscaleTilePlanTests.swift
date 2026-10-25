@@ -81,8 +81,7 @@ struct SubtitleUpscaleTilePlanTests {
     @Test("lines of different lengths, and lines far apart, cost less planned per band than as their rectangle")
     func perBand() {
         func cost(_ plan: SubtitleUpscaleTilePlan) -> Double {
-            plan.windows.reduce(0) { $0 + SubtitleUpscaleTilePlan.milliseconds(.c4f16, height: $1.height, width: $1.width)
-                + SubtitleUpscaleTilePlan.milliseconds(.c4f32, height: $1.height, width: $1.width) }
+            plan.windows.reduce(0) { $0 + SubtitleUpscaleTilePlan.milliseconds(alpha: .c4f16, luma: .c4f32, height: $1.height, width: $1.width) }
         }
         for name in ["uneven lines", "lines far apart"] {
             let p = Self.pictures.first { $0.name == name }!
