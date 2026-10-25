@@ -13,7 +13,7 @@ struct BluRayLPCMTests {
 
     /// A packet of `frames` frames: the header, then every stored channel's samples, each a value
     /// of its own (channel c, frame f), big-endian; an odd layout's unused channel carries junk.
-    private func packet(assignment: UInt8, depth: UInt8, frames: Int, stored: Int, bytes: Int) -> [UInt8] {
+    static func packet(assignment: UInt8, depth: UInt8, frames: Int, stored: Int, bytes: Int) -> [UInt8] {
         var p: [UInt8] = [0, 0, assignment << 4 | 1, depth << 6]
         for f in 0..<frames {
             for c in 0..<stored {
@@ -30,7 +30,7 @@ struct BluRayLPCMTests {
 
     /// What libavcodec's `pcm_bluray` decoder puts out for `bytes`, per speaker, and the codec
     /// parameters its context ends up with.
-    private func reference(_ bytes: [UInt8]) throws -> (bySpeaker: [AVChannel: [Int32]], codecpar: UnsafeMutablePointer<AVCodecParameters>) {
+    static func reference(_ bytes: [UInt8]) throws -> (bySpeaker: [AVChannel: [Int32]], codecpar: UnsafeMutablePointer<AVCodecParameters>) {
         let codec = try #require(avcodec_find_decoder(AV_CODEC_ID_PCM_BLURAY))
         var ctx = avcodec_alloc_context3(codec)
         defer { avcodec_free_context(&ctx) }
@@ -66,12 +66,12 @@ struct BluRayLPCMTests {
                       (3, 3, 2, 2, 3), (1, 1, 1, 2, 2)])
     func samplesMatchTheDecoder(assignment: UInt8, depth: UInt8, channels: Int, stored: Int, bytes: Int) throws {
         let frames = 240
-        let bd = packet(assignment: assignment, depth: depth, frames: frames, stored: stored, bytes: bytes)
+        let bd = Self.packet(assignment: assignment, depth: depth, frames: frames, stored: stored, bytes: bytes)
         let format = try #require(bd.withUnsafeBytes { BluRayLPCM(header: $0) })
         #expect(format.speakers.count == channels && format.storedChannels == stored)
         #expect(format.bytesPerSample == bytes)
 
-        let (bySpeaker, par) = try reference(bd)
+        let (bySpeaker, par) = try Self.reference(bd)
         var p: UnsafeMutablePointer<AVCodecParameters>? = par
         defer { avcodec_parameters_free(&p) }
         #expect(BluRayLPCM(codecpar: par) == format, "the probed parameters name the same format")
@@ -93,7 +93,7 @@ struct BluRayLPCMTests {
 
     @Test("the muxer is told big-endian samples, the stored speaker order, and 20-bit as its 24-bit words")
     func describesTheMuxerInput() throws {
-        let bd = packet(assignment: 9, depth: 2, frames: 4, stored: 6, bytes: 3)
+        let bd = Self.packet(assignment: 9, depth: 2, frames: 4, stored: 6, bytes: 3)
         let format = try #require(bd.withUnsafeBytes { BluRayLPCM(header: $0) })
         var par: UnsafeMutablePointer<AVCodecParameters>? = avcodec_parameters_alloc()
         defer { avcodec_parameters_free(&par) }
@@ -107,8 +107,8 @@ struct BluRayLPCMTests {
 
     @Test("a packet of another format is refused")
     func otherFormatRefused() throws {
-        let stereo = packet(assignment: 3, depth: 1, frames: 8, stored: 2, bytes: 2)
-        let surround = packet(assignment: 9, depth: 1, frames: 8, stored: 6, bytes: 2)
+        let stereo = Self.packet(assignment: 3, depth: 1, frames: 8, stored: 2, bytes: 2)
+        let surround = Self.packet(assignment: 9, depth: 1, frames: 8, stored: 6, bytes: 2)
         let format = try #require(stereo.withUnsafeBytes { BluRayLPCM(header: $0) })
         #expect(surround.withUnsafeBytes { format.samples($0) } == nil)
         #expect(Array(stereo.dropLast()).withUnsafeBytes { format.samples($0) } == nil, "not whole frames")
