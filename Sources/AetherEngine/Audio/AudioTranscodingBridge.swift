@@ -76,6 +76,11 @@ protocol AudioTranscodingBridge: AnyObject, Sendable {
     var runEncoderMemory: Int { get }
     /// Frames per output packet: the grid every run starts on.
     var runPacketFrames: Int { get }
+    /// How far before its timestamp AVFoundation presents an output packet's audio, encoder ticks:
+    /// the encoder's padding, which AVFoundation trims on decode (`AppleAudioDecoderDelay`; APAC's
+    /// priming, which it counts as part of the stream). The first sound a segment plays is its first
+    /// packet's timestamp less this.
+    var presentationDelay: Int64 { get }
     func close()
 
     var feedStats: AudioBridge.FeedStats { get }
@@ -94,6 +99,7 @@ extension AudioBridge: AudioTranscodingBridge {
     var runSpan: AudioStageSpan? { span }
     var runEncoderMemory: Int { encoderSpan.memory }
     var runPacketFrames: Int { Int(packetFrames) }
+    var presentationDelay: Int64 { Int64(encoderCodecpar?.pointee.initial_padding ?? 0) }
     var peakOutputBitRate: Int64 {
         guard let cp = encoderCodecpar else { return 0 }
         return Self.peakBitRate(bitRate: cp.pointee.bit_rate,

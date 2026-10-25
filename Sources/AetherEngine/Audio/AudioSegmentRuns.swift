@@ -195,6 +195,7 @@ final class AudioSegmentRuns: AudioTranscodingBridge, @unchecked Sendable {
     var runSpan: AudioStageSpan? { template.runSpan }
     var runEncoderMemory: Int { template.runEncoderMemory }
     var runPacketFrames: Int { template.runPacketFrames }
+    var presentationDelay: Int64 { template.presentationDelay }
 
     // MARK: Runs
 

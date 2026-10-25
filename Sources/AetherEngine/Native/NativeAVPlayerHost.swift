@@ -977,6 +977,7 @@ final class NativeAVPlayerHost {
                 + "live=\(contract.isLive))",
                 category: .engine)
             // Load-time seek (not a user scrub): no seekInFlight needed; the async seek(to:) carries #37/#38 semantics for user seeks.
+            positionedItemSeconds = CMTime(seconds: startPosition ?? 0, preferredTimescale: 600).seconds
             avPlayer.seek(to: CMTime(seconds: startPosition ?? 0, preferredTimescale: 600),
                           toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                 guard finished else { return }
@@ -2106,6 +2107,11 @@ final class NativeAVPlayerHost {
     /// only and is NOT the witness: measured at a premature end, AVPlayer has already trimmed that
     /// range back to the exhaustion point, so it corroborates the mistake instead of refuting it.
 
+    /// Where the item was last positioned, item axis: its mount seek or the latest seek, as the
+    /// `CMTime` AVPlayer was given. A run AVPlayer starts a little way into a segment is reported
+    /// loaded from here (`HLSVideoEngine.placementRunStart`).
+    private(set) var positionedItemSeconds: Double?
+
     /// Resolve only when the seek physically lands (loopback source lands seeks seconds after the call; issue #37).
     /// seekInFlight suppresses the periodic observer across the wait; only the latest seekGeneration clears it.
     func seek(to seconds: Double) async {
@@ -2120,6 +2126,7 @@ final class NativeAVPlayerHost {
     @discardableResult
     func seek(to seconds: Double, deadlineSeconds: Double?) async -> Bool {
         let target = CMTime(seconds: seconds, preferredTimescale: 600)
+        positionedItemSeconds = target.seconds
         seekGeneration &+= 1
         let gen = seekGeneration
         seekInFlight = true

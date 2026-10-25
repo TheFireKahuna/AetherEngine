@@ -128,6 +128,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
         /// One coded frame in `timeBase`: how far a packet that states no duration, or no timestamp at
         /// all, is taken to reach.
         let frameDuration: Int64
+        /// How far before its timestamp AVFoundation presents a muxed packet's audio, in
+        /// `inputTimeBase`: a copy's decoder delay (`CopiedAudioTiming`), a bridge's encoder padding
+        /// (`AudioTranscodingBridge.presentationDelay`).
+        let presentationDelay: Int64
 
         /// A stream-copied track. `codecpar` is what the muxer is given, which can differ from the
         /// stream's own (an LATM stream's AAC, a Blu-ray LPCM stream's PCM).
@@ -148,6 +152,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.sourceStart = nil
             self.copiedTiming = timing
             self.frameDuration = Self.codedFrameSamples(codecpar)
+            self.presentationDelay = Int64(timing.decoderDelay ?? 0)
         }
 
         /// A bridged track: `bridge` is fed the stream's packets as demuxed, and `codecpar` describes
@@ -168,6 +173,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.language = language
             self.sourceStart = stream.pointee.start_time == Int64.min ? nil : stream.pointee.start_time
             self.copiedTiming = nil
+            self.presentationDelay = bridge.presentationDelay
             let rate = stream.pointee.codecpar.pointee.sample_rate
             self.frameDuration = rate > 0
                 ? max(1, av_rescale_q(Self.codedFrameSamples(stream.pointee.codecpar), AVRational(num: 1, den: rate), tb))
@@ -1375,6 +1381,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// `firstItemTfdtPts` is this producer's planned first tfdt, i.e. the item-axis position (same TB) from which
     /// its shift applies. Everything below it on the item axis was muxed by an earlier producer under an earlier
     /// shift and may still be in AVPlayer's buffer, so a consumer needs the pair, not the shift alone (#260).
+    /// VOD: how far after its first picture a finalized segment's first sound plays, seconds
+    /// (`recordSegmentOpening`); negative where the sound starts first.
+    var onSegmentSoundLag: (@Sendable (_ index: Int, _ seconds: Double) -> Void)?
     var onVideoShiftKnown: (@Sendable (_ shiftPts: Int64, _ firstItemTfdtPts: Int64, _ normalizationShiftPts: Int64) -> Void)?
 
     /// Fires at live program boundary with updated videoShiftPts and seamOutputSeconds (AVPlayer clock position of the seam).
@@ -2657,12 +2666,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // AE#286: per-epoch head. cache.highestStoredIndex is monotonic across restarts and would
             // credit this pump with the previous epoch's production.
             pumpEpochHighestStored = max(pumpEpochHighestStored, currentMuxerSegmentIndex)
+            recordSegmentOpening(muxer, index: currentMuxerSegmentIndex)
             if isLive {
-                let tb = muxer.muxerAudioTimeBase
-                let tick = tb.den > 0 ? Double(tb.num) / Double(tb.den) : 0
-                liveSegmentSoundByIndex.updateValue(
-                    muxer.takeSegmentSoundSpan().map { (Double($0.first) * tick, Double($0.last) * tick) },
-                    forKey: currentMuxerSegmentIndex)
                 reportLiveSegmentFinalized(index: currentMuxerSegmentIndex,
                                            nextIndex: newIdx)
             } else if onSequentialSegmentFinalized != nil {
@@ -2891,6 +2896,27 @@ final class HLSSegmentProducer: @unchecked Sendable {
         cache.abandonInProgress(index: index)
     }
 
+    /// What the segment just cut at `index` opened with. Live keeps its sound span (AE#684); VOD
+    /// reports how far its first sound plays after its first picture, both as AVFoundation presents
+    /// them, which is where AVPlayer's loaded range for a run it opens there begins
+    /// (`HLSVideoEngine.placementRunStart`).
+    private func recordSegmentOpening(_ muxer: MP4SegmentMuxer, index: Int) {
+        let opening = muxer.takeSegmentOpening()
+        let atb = muxer.muxerAudioTimeBase
+        if isLive {
+            let tick = atb.den > 0 ? Double(atb.num) / Double(atb.den) : 0
+            liveSegmentSoundByIndex.updateValue(
+                opening.sound.map { (Double($0.first) * tick, Double($0.last) * tick) }, forKey: index)
+            return
+        }
+        let vtb = muxer.muxerVideoTimeBase
+        guard let picture = opening.pictureFirstPts, let sound = opening.sound, let audio = audioConfig,
+              atb.num > 0, atb.den > 0, vtb.num > 0, vtb.den > 0 else { return }
+        let presented = sound.first - av_rescale_q(audio.presentationDelay, audio.inputTimeBase, atb)
+        onSegmentSoundLag?(index, Double(presented) * Double(atb.num) / Double(atb.den)
+                                  - Double(picture) * Double(vtb.num) / Double(vtb.den))
+    }
+
     private func finalizeSessionMuxerAndAdopt() {
         guard let muxer = currentMuxer else { return }
         let idx = currentMuxerSegmentIndex
@@ -2902,6 +2928,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             cache.adopt(index: idx, stagingPath: result.path,
                         byteCount: result.bytesWritten,
                         videoReach: takeVideoReach(forSegmentIndex: idx))
+            recordSegmentOpening(muxer, index: idx)
             if isLive {
                 reportLiveSegmentFinalized(index: idx, nextIndex: nil)
             } else if onSequentialSegmentFinalized != nil {
