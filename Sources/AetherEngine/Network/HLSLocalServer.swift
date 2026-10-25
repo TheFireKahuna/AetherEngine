@@ -1880,14 +1880,24 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         lines.append("#EXT-X-STREAM-INF:\(streamInfAttrs.joined(separator: ","))")
         lines.append("media.m3u8")
-        if case .sdrStills(let width, let height, let stillCodecs, let peak, let average)? = provider.iFrameRenditionFormat {
-            // A source with no keyframe list lists its dense SDR stills alone: they are not the variant's
-            // pictures, so they declare their own codec, range and size, as the companion tier below does.
-            var attrs = ["AVERAGE-BANDWIDTH=\(average)", "BANDWIDTH=\(peak)", "VIDEO-RANGE=SDR",
+        // A stills tier declares its own codec, size and range: its pictures are not the variant's. One that is not
+        // SDR is an overlay session's scan tier, which stands where the variant's keyframes would and declares what
+        // they would beside that: the variant's Dolby Vision brand and protection level.
+        func stillsLine(_ format: IFrameRenditionFormat?, uri: String, hdcp: String?) -> String? {
+            guard case .stills(let width, let height, let stillCodecs, let peak, let average, let range)? = format else { return nil }
+            var attrs = ["AVERAGE-BANDWIDTH=\(average)", "BANDWIDTH=\(peak)", "VIDEO-RANGE=\(range.rawValue)",
                          "CODECS=\"\(stillCodecs)\"", "RESOLUTION=\(width)x\(height)"]
-            if provider.masterHDCPLevel != nil { attrs.append("HDCP-LEVEL=NONE") }
-            attrs.append("URI=\"iframe.m3u8\"")
-            lines.append("#EXT-X-I-FRAME-STREAM-INF:\(attrs.joined(separator: ","))")
+            if range != .sdr, variant == .primary, let supplemental = provider.masterSupplementalCodecs {
+                attrs.append("SUPPLEMENTAL-CODECS=\"\(supplemental)\"")
+            }
+            // An SDR still needs no protection level; stated only when the variant states one.
+            if let hdcp { attrs.append("HDCP-LEVEL=\(range == .sdr ? "NONE" : hdcp)") }
+            attrs.append("URI=\"\(uri)\"")
+            return "#EXT-X-I-FRAME-STREAM-INF:\(attrs.joined(separator: ","))"
+        }
+        let hdcp = provider.masterHDCPLevel
+        if let line = stillsLine(provider.iFrameRenditionFormat, uri: "iframe.m3u8", hdcp: hdcp) {
+            lines.append(line)
         } else if provider.iFrameRenditionServed {
             // AE#682: BANDWIDTH is the variant's, an honest ceiling (one keyframe cannot outweigh the
             // segment it opens). A value below the real peak logs -12318 on every fetch.
@@ -1906,22 +1916,17 @@ final class HLSLocalServer: @unchecked Sendable {
                 iFrameAttrs.append("VIDEO-RANGE=\(range.rawValue)")
             }
             // Same HDCP-LEVEL as the variant whose keyframes these are.
-            let hdcp = provider.masterHDCPLevel
             if let hdcp { iFrameAttrs.append("HDCP-LEVEL=\(hdcp)") }
             iFrameAttrs.append("URI=\"iframe.m3u8\"")
             lines.append("#EXT-X-I-FRAME-STREAM-INF:\(iFrameAttrs.joined(separator: ","))")
-            // An HDR session's SDR trick-play tier, Apple's own layout and a tvOS MUST of the HLS Authoring
-            // Specification (6.16): AVKit's scrub thumbnail player is capped at SDR and takes the lowest range
-            // on offer, while the main player scans on the keyframes above. Attribute order as the
-            // specification's examples give it.
-            if case .sdrStills(let width, let height, let stillCodecs, let peak, let average)? = provider.iFrameCompanionFormat {
-                var attrs = ["AVERAGE-BANDWIDTH=\(average)", "BANDWIDTH=\(peak)", "VIDEO-RANGE=SDR",
-                             "CODECS=\"\(stillCodecs)\"", "RESOLUTION=\(width)x\(height)"]
-                // An 800-pixel SDR picture needs no protection level; stated only when the variant states one.
-                if hdcp != nil { attrs.append("HDCP-LEVEL=NONE") }
-                attrs.append("URI=\"iframe_sdr.m3u8\"")
-                lines.append("#EXT-X-I-FRAME-STREAM-INF:\(attrs.joined(separator: ","))")
-            }
+        }
+        // An HDR session's SDR trick-play tier, Apple's own layout and a tvOS MUST of the HLS Authoring
+        // Specification (6.16): AVKit's scrub thumbnail player is capped at SDR and takes the lowest range
+        // on offer, while the main player scans on the tier above. Attribute order as the specification's
+        // examples give it.
+        if provider.iFrameRenditionServed,
+           let line = stillsLine(provider.iFrameCompanionFormat, uri: "iframe_sdr.m3u8", hdcp: hdcp) {
+            lines.append(line)
         }
         return lines.joined(separator: "\n") + "\n"
     }

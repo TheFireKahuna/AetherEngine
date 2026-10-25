@@ -61,7 +61,7 @@ struct IFrameDenseStillsTests {
         try #require(!engine.planBoundariesClaimRandomAccess, "a transport stream plans on the uniform grid")
         #expect(engine.iFrameRenditionVerdict == .served(.stills))
         let prov = try #require(engine.provider)
-        guard case .sdrStills(let width, _, let codecs, _, _) = prov.iFrameRenditionFormat else {
+        guard case .stills(let width, _, let codecs, _, _, .sdr) = prov.iFrameRenditionFormat else {
             Issue.record("expected SDR stills, got \(String(describing: prov.iFrameRenditionFormat))")
             return
         }

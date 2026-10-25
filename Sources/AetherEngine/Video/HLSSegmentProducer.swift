@@ -642,6 +642,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// overlay instead of dropping them. Set before the pump starts, on every producer of the session.
     var felTap: FelEnhancementTap?
     #endif
+    /// A software overlay session (`HLSVideoEngine.overlayDecodesVideo`): every video packet is served as this
+    /// placeholder's sample for its picture. Set before the pump starts, on every producer of the session.
+    var overlayPlaceholder: OverlayPlaceholder?
     private var loggedFirstDtsBump = false
     private var loggedFirstDtsDrop = false
 
@@ -4752,6 +4755,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             + "(fallback=\(videoFallbackDurationPts) in srcVideoTb)",
                             category: .session
                         )
+                    }
+                    if let overlayPlaceholder, !overlayPlaceholder.substitute(packet) {
+                        exitReason = .muxerFailed
+                        break readLoop
                     }
                     if convertP7Active {
                         // Probe the enhancement-layer type once (latching on the first RPU seen, before

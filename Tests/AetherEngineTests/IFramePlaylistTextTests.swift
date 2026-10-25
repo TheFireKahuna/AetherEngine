@@ -60,8 +60,8 @@ struct IFramePlaylistTextTests {
     @Test("an HDR session keeps its Dolby Vision keyframe tier and adds the 10-bit SDR HEVC tier")
     func masterLineForSDRStills() {
         let p = IFrameMockProvider(served: true, supplemental: "dvh1.08.06/db1p",
-                                   companion: .sdrStills(width: 800, height: 450, codecs: "hvc1.2.4.L90.B0",
-                                                         bandwidth: 1_050_000, averageBandwidth: 50_000))
+                                   companion: .stills(width: 800, height: 450, codecs: "hvc1.2.4.L90.B0",
+                                                      bandwidth: 1_050_000, averageBandwidth: 50_000, videoRange: .sdr))
         let tag = HLSLocalServer.buildMasterPlaylistText(provider: p)
             .split(separator: "\n").map(String.init)
             .filter { $0.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:") }

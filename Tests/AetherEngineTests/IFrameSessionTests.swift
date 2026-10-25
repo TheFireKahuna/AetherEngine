@@ -97,7 +97,7 @@ struct IFrameSessionTests {
         defer { engine.stop() }
         try #require(engine.iFrameRenditionVerdict == .served(.keyframes))
         let prov = try #require(engine.provider)
-        guard case .sdrStills(let width, let height, let codecs, _, _) = prov.iFrameCompanionFormat else {
+        guard case .stills(let width, let height, let codecs, _, _, .sdr) = prov.iFrameCompanionFormat else {
             Issue.record("expected an SDR stills tier, got \(String(describing: prov.iFrameCompanionFormat))")
             return
         }

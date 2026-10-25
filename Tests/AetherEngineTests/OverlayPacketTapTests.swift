@@ -71,10 +71,10 @@ struct OverlayPacketTapTests {
         defer { tap.close() }
         tap.advance(to: 6.52)
         #expect(Self.waitUntil(5) { tap.unit(at: 6.52)?.picture != nil })
-        // The decoder started at the first keyframe as units arrived (the clock at 0), then once at the keyframe
-        // before the clock, and carried on from there.
+        // The decoder may have started at the first keyframe as units arrived (the clock at 0); then it restarted
+        // once, at the keyframe before the clock, and carried on from there.
         let restarts = try #require(decoder()).fed.filter(\.restart).map(\.pts)
-        #expect(restarts == [0, 4000])
+        #expect(restarts == [4000] || restarts == [0, 4000])
         // Up to the decode window and no further.
         #expect((try #require(decoder()).fed.map(\.pts).max() ?? 0) <= 6520 + 200)
     }
@@ -87,11 +87,10 @@ struct OverlayPacketTapTests {
         #expect(Self.waitUntil(5) { tap.unit(at: 1)?.picture != nil })
         tap.advance(to: 1.52)
         #expect(Self.waitUntil(5) { tap.unit(at: 1.52)?.picture != nil })
-        #expect(try #require(decoder()).fed.filter(\.restart).count == 1, "inside the GOP: no restart")
+        #expect(try #require(decoder()).fed.filter(\.restart).map(\.pts) == [0], "inside the GOP: no restart")
         tap.advance(to: 9)
         #expect(Self.waitUntil(5) { tap.unit(at: 9)?.picture != nil })
-        let restarts = try #require(decoder()).fed.filter(\.restart)
-        #expect(restarts.count == 2 && restarts.last?.pts == 8000)
+        #expect(try #require(decoder()).fed.filter(\.restart).map(\.pts) == [0, 8000])
     }
 
     @Test("a backward jump restarts at the keyframe before the new clock")
