@@ -5,10 +5,11 @@ import os
 import Dovi
 
 /// The RPU NAL every composed FEL frame carries in place of its own (`AetherEngine.felComposedRpuOverride`), on
-/// both routes that compose: the software host's `DualLayerVideoDecoder` and the native route's
-/// `FelOverlayRenderer`. A display-path experiment, process-wide like `DoviFelComposer.outputMode`: read once per
-/// composed frame, so it takes effect from the next one. A frame delivered as its raw base layer keeps the RPU with
-/// its mapping, override or not: its pixels were never reshaped.
+/// both routes that compose. The software host's `DualLayerVideoDecoder` attaches it to each composed frame, read
+/// once per frame; a frame delivered as its raw base layer keeps the RPU with its mapping, override or not, since
+/// its pixels were never reshaped. On the native route the TV applies the RPU in the stream AVPlayer plays, so
+/// `FelEnhancementTap` writes it into every base-layer packet the segment producer cuts, read once per packet:
+/// segments already cut keep theirs. A display-path experiment, process-wide like `DoviFelComposer.outputMode`.
 enum DoviComposedRpuOverride {
     private static let value = OSAllocatedUnfairLock<[UInt8]?>(initialState: nil)
 

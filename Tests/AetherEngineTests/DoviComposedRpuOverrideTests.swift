@@ -84,6 +84,22 @@ struct DoviComposedRpuOverrideTests {
         return payloads.all.first ?? nil
     }
 
+    @Test("Every packet AVPlayer plays under the FEL overlay carries the override, and the results still describe its own RPU")
+    func overlayPacketCarriesOverride() throws {
+        typealias R = DoviComposedFrameRpuTests
+        let (composed, _, override) = try Self.fixtureRpus()
+        let own = R.overlayPacket([R.slice, R.felNAL, R.enhancement], fallback: nil, override: override)
+        #expect(own.result.success)
+        #expect(own.nals == [R.slice, override])
+        #expect(own.result.convertedRpu == composed)
+        #expect(own.result.rpuParams != nil)
+        // A failed RPU and a missing one carry it too, not the fallback.
+        let failed = R.overlayPacket([R.slice, R.corruptNAL, R.enhancement], fallback: composed, override: override)
+        #expect(!failed.result.success)
+        #expect(failed.nals == [R.slice, override])
+        #expect(R.overlayPacket([R.slice, R.enhancement], fallback: composed, override: override).nals == [R.slice, override])
+    }
+
     @Test("A composed frame carries the override, in exactly the form the converted RPU is attached in")
     func composedFrameCarriesOverride() async throws {
         let (composed, baseLayer, override) = try Self.fixtureRpus()

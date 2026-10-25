@@ -11,7 +11,7 @@ import AetherLibavutil
 ///
 /// The segment producer already splits every video packet into its layers to serve the base layer
 /// (`separateDualLayers`); with a tap it keeps the rest instead of dropping it: the compressed enhancement
-/// layer, the composer parameters and the composed-form Profile 8.1 RPU, keyed by the packet's output
+/// layer and the composer parameters, keyed by the packet's output
 /// presentation time, which is AVPlayer's item time. The producer cuts ahead of AVPlayer, so a frame's
 /// parameters exist before AVPlayer can show it, and a seek restarts the producer at the target, so the tap
 /// follows seeks with no logic of its own.
@@ -27,8 +27,6 @@ final class FelEnhancementTap: @unchecked Sendable {
     struct Frame: @unchecked Sendable {
         let enhancement: CVPixelBuffer?
         let params: DoviMetalParams
-        /// Profile 8.1 with both curves set to no-op: describes a picture the composer has already reshaped.
-        let composedRpu: [UInt8]?
     }
 
     static let decodeAheadSeconds = 0.75
@@ -44,7 +42,6 @@ final class FelEnhancementTap: @unchecked Sendable {
         let ptsMs: Int64
         let isKey: Bool
         let params: DoviMetalParams
-        let rpu: [UInt8]?
         var el: UnsafeMutablePointer<AVPacket>?
     }
 
@@ -97,7 +94,8 @@ final class FelEnhancementTap: @unchecked Sendable {
     /// The TV applies the RPU in AVPlayer's stream to the overlay's picture, which is composed, so the packet's
     /// RPU is the composed form for every `el_type` (a residual-off or MEL-like RPU in mode 2 form would keep
     /// its curves and reshape the composed picture again). A packet whose own RPU is missing or failed to
-    /// convert carries the last composed one, the RPU of the parameters it borrows.
+    /// convert carries the last composed one, the RPU of the parameters it borrows. With
+    /// `AetherEngine.felComposedRpuOverride` set, every packet cut from then on carries the override instead.
     func rewrite(_ packet: UnsafeMutablePointer<AVPacket>, framing: VideoNALFraming, timeBase: AVRational,
                  chromaLocation: UInt32) -> Bool {
         let pts = packet.pointee.pts
@@ -116,20 +114,19 @@ final class FelEnhancementTap: @unchecked Sendable {
         if let data = packet.pointee.data, pts != Int64.min {
             elPTS = alignment.enhancementPTS(data, Int(packet.pointee.size), framing: framing, pts: pts)
         }
-        let layers = DoviRpuConverter.separateDualLayers(packet, framing: framing, packetRpu: .composed(fallback: lastRpu))
+        let layers = DoviRpuConverter.separateDualLayers(packet, framing: framing, packetRpu: .composed(fallback: lastRpu, override: DoviComposedRpuOverride.current))
 
         // The resolution `DualLayerVideoDecoder.recordSideData` applies.
         var params = layers.rpuParams
-        var rpu = layers.convertedRpu
         if params != nil {
-            lastParams = params; lastRpu = rpu; borrowedRun = 0
+            lastParams = params; lastRpu = layers.convertedRpu; borrowedRun = 0
         } else if var last = lastParams {
             if layers.usesPreviousMapping {
                 if layers.disableResidual { last.flags.insert(.disableResidual) } else { last.flags.remove(.disableResidual) }
-                params = last; rpu = rpu ?? lastRpu
+                params = last
             } else if borrowedRun < DualLayerVideoDecoder.maxBorrowedParamsRun {
                 borrowedRun += 1
-                params = last; rpu = rpu ?? lastRpu
+                params = last
             }
         }
         guard pts != Int64.min, var params else {
@@ -150,7 +147,7 @@ final class FelEnhancementTap: @unchecked Sendable {
         nextSeq += 1
         // The same access unit cut again (a producer restart over a region): the new cut replaces it.
         if let stale = seqByPts[ptsMs], var old = entries.removeValue(forKey: stale) { trackedPacketFree(&old.el) }
-        entries[seq] = Entry(seq: seq, run: run, ptsMs: ptsMs, isKey: isKey, params: params, rpu: rpu, el: layers.elPacket)
+        entries[seq] = Entry(seq: seq, run: run, ptsMs: ptsMs, isKey: isKey, params: params, el: layers.elPacket)
         seqByPts[ptsMs] = seq
         if entries.count > Self.maxEntries { trimLocked() }
         state.broadcast()
@@ -167,7 +164,7 @@ final class FelEnhancementTap: @unchecked Sendable {
         defer { state.unlock() }
         for key in [ms, ms - 1, ms + 1] {
             if let seq = seqByPts[key], let entry = entries[seq] {
-                return Frame(enhancement: decoded[key], params: entry.params, composedRpu: entry.rpu)
+                return Frame(enhancement: decoded[key], params: entry.params)
             }
         }
         return nil

@@ -320,10 +320,11 @@ struct DoviComposedFrameRpuTests {
     }()
 
     /// The overlay's packet (`FelEnhancementTap.rewrite`): rebuilt, with the composed form asked for.
-    static func overlayPacket(_ nals: [[UInt8]], fallback: [UInt8]?) -> (result: DoviRpuConverter.DualLayerPacketResult, nals: [[UInt8]]) {
+    static func overlayPacket(_ nals: [[UInt8]], fallback: [UInt8]?, override: [UInt8]? = nil)
+        -> (result: DoviRpuConverter.DualLayerPacketResult, nals: [[UInt8]]) {
         let pkt = avcc(nals)
         defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
-        let r = DoviRpuConverter.separateDualLayers(pkt, packetRpu: .composed(fallback: fallback))
+        let r = DoviRpuConverter.separateDualLayers(pkt, packetRpu: .composed(fallback: fallback, override: override))
         var el = r.elPacket
         trackedPacketFree(&el)
         return (r, Self.nals(of: pkt))
@@ -337,12 +338,12 @@ struct DoviComposedFrameRpuTests {
         #expect(out.count == 2)
         #expect(out.first == Self.slice)
         let inStream = try #require(out.last)
-        #expect(inStream == r.convertedRpu)   // the same RPU the overlay attaches
+        #expect(inStream == r.convertedRpu)
         Self.expectPinned(source: try #require(Self.snapshot(ofNAL: nal)),
                           attached: try #require(Self.snapshot(ofNAL: inStream)), label: "overlay packet, residual off")
     }
 
-    @Test("The overlay's packet carries a FEL RPU in the same composed form as the attachment")
+    @Test("The overlay's packet carries a FEL RPU in the composed form")
     func overlayPacketCarriesComposedFel() throws {
         let (r, out) = Self.overlayPacket([Self.slice, Self.felNAL, Self.enhancement], fallback: nil)
         #expect(r.success)

@@ -164,7 +164,7 @@ struct FelOverlayRealFileTests {
 }
 extension FelOverlayTests {
 
-    @Test("every packet the tap serves carries the RPU the overlay attaches to the picture shown over it")
+    @Test("every packet the tap serves carries a composed-form RPU, a borrowing one the last it served")
     func servedRpuIsTheComposedOne() throws {
         typealias R = DoviComposedFrameRpuTests
         let tap = FelEnhancementTap()
@@ -172,6 +172,7 @@ extension FelOverlayTests {
         let noResidual = try #require(R.felNoResidualNAL)
         // A residual-off RPU, then one that fails to convert, then none: the last two borrow the first's parameters.
         let units: [[[UInt8]]] = [[R.slice, noResidual, R.enhancement], [R.slice, R.corruptNAL, R.enhancement], [R.slice, R.enhancement]]
+        var first: [UInt8]?
         for (i, nals) in units.enumerated() {
             let pkt = R.avcc(nals)
             defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
@@ -179,11 +180,13 @@ extension FelOverlayTests {
             pkt.pointee.dts = Int64(i * 40)
             if i == 0 { pkt.pointee.flags |= AV_PKT_FLAG_KEY }
             _ = tap.rewrite(pkt, framing: .lengthPrefixed(size: 4), timeBase: AVRational(num: 1, den: 1000), chromaLocation: 0)
+            #expect(tap.frame(at: Double(i) * 0.04) != nil, "unit \(i)")
             let served = R.nals(of: pkt)
-            let attached = try #require(tap.frame(at: Double(i) * 0.04)?.composedRpu, "unit \(i)")
-            #expect(served == [R.slice, attached], "unit \(i)")
-            let snapshot = try #require(R.snapshot(ofNAL: attached))
+            #expect(served.count == 2 && served.first == R.slice, "unit \(i)")
+            let rpu = try #require(served.last, "unit \(i)")
+            let snapshot = try #require(R.snapshot(ofNAL: rpu))
             #expect(snapshot.isIdentityMapping, "unit \(i)")
+            if let first { #expect(rpu == first, "unit \(i) borrows the first unit's RPU") } else { first = rpu }
         }
     }
 }

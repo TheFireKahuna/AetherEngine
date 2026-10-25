@@ -292,10 +292,11 @@ extension AetherEngine {
     /// (dolby-vision-fel.md, "Composed-frame RPU override"). The bytes are what `dovi_write_unspec62_nalu`
     /// writes: the `0x7C 0x01` NAL header, emulation prevention in place, no start code or length prefix; a
     /// payload without the header is accepted too. Bytes libdovi cannot parse are refused with a log line and
-    /// leave the override off. A frame shown as its raw base layer keeps its own RPU. Applies on both routes
-    /// that compose FEL: the software host and the native route's FEL overlay (`LoadOptions.felOverlay`).
-    /// Takes effect from the next composed frame and applies to every session in the process; nil restores
-    /// the converted RPU.
+    /// leave the override off. Applies on both routes that compose FEL and to every session in the process. On
+    /// the software host it is each composed frame's attachment, from the next frame on; a frame shown as its raw
+    /// base layer keeps its own RPU. On the native route's FEL overlay (`LoadOptions.felOverlay`) it is the RPU in
+    /// the base-layer packets AVPlayer plays, the one the TV applies, from the next segment cut on: set it before
+    /// the load. nil restores the converted RPU.
     @_spi(Diagnostics)
     public nonisolated static var felComposedRpuOverride: Data? {
         get { DoviComposedRpuOverride.current.map { Data($0) } }
