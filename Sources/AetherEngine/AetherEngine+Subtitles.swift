@@ -427,7 +427,11 @@ extension AetherEngine {
         subtitleResolutionCoverageStated.remove(channel)   // #318
         subtitleDeliveryLastOutcome[channel] = nil   // #357
         refreshSubtitleStoreProtection()   // #166
-        if subtitleDrainTargets.isEmpty { stopSubtitleDrainer(reason: reason) }
+        if subtitleDrainTargets.isEmpty {
+            stopSubtitleDrainer(reason: reason)
+        } else {
+            demandOverlaySubtitles(movingTheWalk: false)   // the remaining channel's stream only
+        }
     }
 
     /// #166: keep the store's aggregate-eviction protected set in sync with the active drain
@@ -537,8 +541,17 @@ extension AetherEngine {
                     tally: tally, isReset: isReset)
                 continue
             }
-            let entries = store.entries(streamIndex: streamIndex,
-                                        from: window.from, through: window.through)
+            // Layer 3 step 3: an indexed stream pulls the window and decodes what the pulls have brought,
+            // so a stretch not yet pulled waits for its pull instead of reading as silence.
+            let pulls = subtitleStreamIsPulled(streamIndex)
+            var decodableThrough = window.through
+            if pulls {
+                subtitleSource?.pull(streamIndex, from: window.from, through: window.through, focus: playhead)
+                decodableThrough = min(window.through,
+                                       store.pulledReach(streamIndex: streamIndex, from: window.from) ?? -.infinity)
+            }
+            let entries = decodableThrough >= window.from
+                ? store.entries(streamIndex: streamIndex, from: window.from, through: decodableThrough) : []
             // #271: bound the batch, on a PTS boundary. The window is bounded in seconds of
             // content, so on a dense track it is thousands of packets and this loop has no
             // suspension point.
@@ -560,7 +573,8 @@ extension AetherEngine {
             // The playhead catching up to the hold ends it whatever the budget says: from there on
             // the island is what the viewer is about to need, and waiting would dark the overlay
             // for content that IS stored. That, not the tick budget, is the real bound.
-            if let heldAt = held?.harvestGapAt, heldAt >= playhead,
+            // A pulled span has no holes; the hold is the walk's and the pump's.
+            if !pulls, let heldAt = held?.harvestGapAt, heldAt >= playhead,
                (held?.harvestGapTicksLeft ?? 0) > 0, !isReset,
                !SubtitleOverlayDrainer.harvestGapHoldResumes(
                 firstSequence: entries.first?.sequence,
@@ -570,7 +584,7 @@ extension AetherEngine {
                 gapHoldAt = heldAt
                 gapHoldSequence = held?.harvestGapSequence ?? 0
                 gapHoldTicksLeft = (held?.harvestGapTicksLeft ?? 0) - 1
-            } else if let cut = SubtitleOverlayDrainer.harvestGapCut(
+            } else if !pulls, let cut = SubtitleOverlayDrainer.harvestGapCut(
                 count: batchEnd,
                 ptsAt: { entries[$0].ptsSeconds },
                 sequenceAt: { entries[$0].sequence },
@@ -587,7 +601,7 @@ extension AetherEngine {
                 window: window, coverageStart: coverageStart, retained: retained,
                 decoder: decoder, entries: entries, batchEnd: batchEnd, decodeEnd: decodeEnd,
                 gapHoldAt: gapHoldAt, gapHoldSequence: gapHoldSequence,
-                gapHoldTicksLeft: gapHoldTicksLeft))
+                gapHoldTicksLeft: gapHoldTicksLeft, pulled: pulls))
         }
         return work
     }
@@ -648,7 +662,8 @@ extension AetherEngine {
                     // A cue-less event still matters: a PGS clear composition carries only
                     // pgsTrimAt and is what removes the line during silence.
                     if !event.cues.isEmpty || event.pgsTrimAt != nil {
-                        let applied = applySubtitleEvent(event, to: &cues, channel: channel, playhead: playhead)
+                        let applied = applySubtitleEvent(event, to: &cues, channel: channel, playhead: playhead,
+                                                         groundIsPulled: job.pulled)
                         tally.admitted += applied.admitted
                         tally.published += applied.published
                         tally.landingWithheld += applied.landingWithheld   // #416
@@ -732,6 +747,8 @@ extension AetherEngine {
             // authored one.
             let derivationHorizon = window.through + Self.subtitleForwardPrefetchLeadMarginSeconds
             if Self.alignCueEnds(&cues, toNextPacket: {
+                // An indexed set ends where the index places the stream's next frame: known, not inferred.
+                if job.pulled { return self.subtitleSource?.nextFrameSeconds(streamIndex, after: $0) }
                 guard let pts = store.firstPTS(streamIndex: streamIndex, after: $0) else { return nil }
                 guard pts <= derivationHorizon else {
                     tally.endsWithheld += 1
@@ -860,20 +877,48 @@ extension AetherEngine {
                 if let reason { self?.lastSubtitleDrainStopReason = reason }
                 EngineLog.emit("[SubtitleSource] stopped reading (reason=\(reason?.rawValue ?? "no consumer left"))",
                                category: .engine)
-            }))
+            },
+            routesSettled: { [weak self] routes in self?.subtitleRoutesSettled(routes) },
+            pulled: { [weak self] stream in self?.subtitleStreamPulled(stream) }))
     }
 
-    /// The overlay drainer's demand: its window plus a margin (#362: the set at the window's forward edge
-    /// has its own clear stored and can be closed where the author closed it), from `startAt` (the
-    /// playhead when nil). Best effort: without it the drainer works off the pump's harvest.
-    func demandOverlaySubtitles(startAt: Double? = nil) {
+    /// The source's routes are in. The pump's decode tap leaves the indexed text streams, whose renditions
+    /// the index fills whole, and a drain waiting on the routes runs.
+    func subtitleRoutesSettled(_ routes: [Int32: SubtitleSource.Route]) {
+        let indexed = Set(routes.compactMap { stream, route -> Int32? in
+            if case .indexed = route { return stream }
+            return nil
+        })
+        nativeVideoSession?.excludeFromSubtitleTap(indexed)
+        if !subtitleDrainTargets.isEmpty { requestSubtitleDrainTick() }
+    }
+
+    /// A pull of `stream` landed: a channel draining it decodes what it brought.
+    func subtitleStreamPulled(_ stream: Int32) {
+        if subtitleDrainTargets.values.contains(stream) { requestSubtitleDrainTick() }
+    }
+
+    /// Whether `stream` is read from the index on request, so the store holds what was pulled and nothing
+    /// else: no harvest holes, ends from the index, ground read by construction.
+    func subtitleStreamIsPulled(_ stream: Int32) -> Bool {
+        if case .indexed = subtitleSource?.route(of: stream) { return true }
+        return false
+    }
+
+    /// The overlay drainer's demand on the walk, for the drain targets it walks: its window plus a margin
+    /// (#362: the set at the window's forward edge has its own clear stored and can be closed where the
+    /// author closed it), from `startAt` (the playhead when nil), or where the walk already is when
+    /// `movingTheWalk` is false. Best effort: without it the drainer works off the pump's harvest. An
+    /// indexed target is pulled by the drain tick instead.
+    func demandOverlaySubtitles(startAt: Double? = nil, movingTheWalk: Bool = true) {
         guard Self.shouldRunSubtitleForwardPrefetch(
             isLive: isLive, hasEmbeddedDrainTargets: !subtitleDrainTargets.isEmpty, hasSource: loadedURL != nil)
         else { return }
         let lead = Self.subtitleDrainLeadSeconds + Self.subtitleForwardPrefetchLeadMarginSeconds
         // #250: the seek this move serves rides along, so the read position banked after it is fenced to
         // that seek rather than to the one the session started under.
-        subtitleSource?.demand(.overlay, lead: { _ in lead }, from: max(0, startAt ?? sourceTime),
+        subtitleSource?.demand(.overlay, streams: Set(subtitleDrainTargets.values), lead: { _ in lead },
+                               from: movingTheWalk ? max(0, startAt ?? sourceTime) : nil,
                                seekGeneration: currentSeekGeneration)
     }
 
@@ -887,7 +932,12 @@ extension AetherEngine {
     /// rendition for windows beyond it (AVKit reads one about four minutes ahead).
     func demandNativeRenditionSubtitles(_ consumer: SubtitleSource.Consumer, stores: [NativeSubtitleCueStore],
                                         startAt: Double? = nil) {
-        subtitleSource?.demand(consumer, lead: { playhead in
+        let streams = Set(nativeSubtitleTrackTable.indices.compactMap { ordinal -> Int32? in
+            guard let store = nativeStore(atOrdinal: ordinal), stores.contains(where: { $0 === store }),
+                  let stream = nativeSubtitleTrackTable[ordinal].sourceStreamIndex else { return nil }
+            return Int32(stream)
+        })
+        subtitleSource?.demand(consumer, streams: streams, lead: { playhead in
             Self.subtitleReadAhead(base: Self.nativeSubtitleReadAheadSeconds, playhead: playhead,
                                    requested: stores.compactMap { $0.furthestRequestedSourceSeconds() }.max())
         }, from: startAt.map { max(0, $0) })
@@ -958,7 +1008,8 @@ extension AetherEngine {
     private func applySubtitleEvent(_ event: EmbeddedSubtitleDecoder.SubtitleEvent,
                                     to cues: inout [SubtitleCue],
                                     channel: SubtitleChannel,
-                                    playhead: Double) -> SubtitleDeliveryStatement.Application {
+                                    playhead: Double,
+                                    groundIsPulled: Bool) -> SubtitleDeliveryStatement.Application {
         guard isSubtitleActive(for: channel) else { return .init() }
 
         // #357: primary-only, and budgeted per seek generation rather than per load, so a seek
@@ -983,7 +1034,8 @@ extension AetherEngine {
             )
         }
 
-        return applyEventMutations(event, to: &cues, channel: channel, playhead: playhead)
+        return applyEventMutations(event, to: &cues, channel: channel, playhead: playhead,
+                                   groundIsPulled: groundIsPulled)
     }
 
     /// PGS clear-event trim + sorted insert. Native mov_text stores (#55) are NOT fed here; those are owned by the multi-decode reader.
@@ -992,7 +1044,8 @@ extension AetherEngine {
     @MainActor
     @discardableResult
     private func applyEventMutations(_ event: EmbeddedSubtitleDecoder.SubtitleEvent, to cues: inout [SubtitleCue],
-                                     channel: SubtitleChannel, playhead: Double) -> SubtitleDeliveryStatement.Application {
+                                     channel: SubtitleChannel, playhead: Double,
+                                     groundIsPulled: Bool) -> SubtitleDeliveryStatement.Application {
         var applied = SubtitleDeliveryStatement.Application()
         if let trimAt = event.pgsTrimAt {
             for i in 0..<cues.count {
@@ -1031,7 +1084,8 @@ extension AetherEngine {
         // whether it ever read that stretch before reading its silence as an answer.
         // Asked for bitmap events only: a text cue carries its own duration, so it claims nothing
         // about the ground behind it, and a dense text track would pay the lookup per packet.
-        let groundIsRead = event.isPGS
+        // A pulled stream's store holds every frame of what was pulled, so its silence is an answer.
+        let groundIsRead = event.isPGS && !groundIsPulled
             ? subtitleLandingGroundIsRead(cues: event.cues, playhead: playhead)
             : true
         // A false answer here means an actual refusal: the helper returns true when the event
@@ -2308,6 +2362,8 @@ struct SubtitleDrainChannelWork {
     let gapHoldAt: Double?
     let gapHoldSequence: UInt64
     let gapHoldTicksLeft: Int
+    /// The stream is pulled from the index (layer 3 step 3).
+    let pulled: Bool
 }
 
 struct SubtitleDrainTickWork {

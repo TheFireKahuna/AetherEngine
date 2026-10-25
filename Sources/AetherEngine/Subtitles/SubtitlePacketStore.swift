@@ -116,6 +116,13 @@ final class SubtitlePacketStore: @unchecked Sendable {
     private var protectedStreams: Set<Int32> = []
     private var lastTouchByStream: [Int32: UInt64] = [:]
     private var touchCounter: UInt64 = 0
+    /// Layer 3 step 3: the streams the subtitle source reads from the container's index on request
+    /// (`SubtitleSource.pull`). Their packets come from the pulls alone, so a harvest of one is passed
+    /// over; what was pulled is recorded per stream (`pulled`), and eviction keeps what lies nearest the
+    /// last pull (`pullFocus`), since anything evicted can be pulled again.
+    private var pulledStreams: Set<Int32> = []
+    private var pulled: [Int32: PulledSpans] = [:]
+    private var pullFocus: [Int32: Double] = [:]
 
     init(perStreamByteCap: Int = SubtitlePacketStore.perStreamByteCap,
          aggregateByteCap: Int = SubtitlePacketStore.aggregateByteCap) {
@@ -186,6 +193,40 @@ final class SubtitlePacketStore: @unchecked Sendable {
         return coverage.sortedSpans()
     }
 
+    // MARK: - Pulled streams (layer 3 step 3)
+
+    /// The streams read from the index on request. A harvest of any of them is passed over from here on.
+    func setPulledStreams(_ indices: Set<Int32>) {
+        lock.lock(); defer { lock.unlock() }
+        pulledStreams = indices
+    }
+
+    func isPulled(_ streamIndex: Int32) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return pulledStreams.contains(streamIndex)
+    }
+
+    /// Every frame of `streamIndex` timed from `from` through `through` is stored (an empty span: the
+    /// index lists none there). `focus` is where the reader stands, which eviction keeps nearest.
+    func notePulled(streamIndex: Int32, from: Double, through: Double, focus: Double) {
+        guard through >= from else { return }
+        lock.lock(); defer { lock.unlock() }
+        pulled[streamIndex, default: PulledSpans()].insert(from: from, through: through)
+        pullFocus[streamIndex] = focus
+    }
+
+    /// How far the pulled spans run on unbroken from `from`; nil when `from` was never pulled.
+    func pulledReach(streamIndex: Int32, from: Double) -> Double? {
+        lock.lock(); defer { lock.unlock() }
+        return pulled[streamIndex]?.reach(from: from)
+    }
+
+    /// Introspection for tests and diagnostics.
+    func pulledSpans(streamIndex: Int32) -> [PulledSpans.Span] {
+        lock.lock(); defer { lock.unlock() }
+        return pulled[streamIndex]?.spans ?? []
+    }
+
     func append(streamIndex: Int32, ptsSeconds: Double, durationSeconds: Double,
                 flags: Int32 = 0, payload: Data, webvttSettings: String? = nil) {
         lock.lock(); defer { lock.unlock() }
@@ -232,12 +273,16 @@ final class SubtitlePacketStore: @unchecked Sendable {
             // Audit SUB-103: evict to a low-water mark in one move. Dropping just enough made every
             // append at the cap shift the whole array for one packet.
             let lowWater = perStreamCap - perStreamCap / 10
-            var dropped = 0
-            while bytes > lowWater, dropped < entries.count - 1 {
-                bytes -= entries[dropped].payload.count
-                dropped += 1
+            if pulledStreams.contains(streamIndex), let focus = pullFocus[streamIndex] {
+                evictFarthestLocked(streamIndex, &entries, &bytes, lowWater: lowWater, focus: focus)
+            } else {
+                var dropped = 0
+                while bytes > lowWater, dropped < entries.count - 1 {
+                    bytes -= entries[dropped].payload.count
+                    dropped += 1
+                }
+                entries.removeFirst(dropped)
             }
-            entries.removeFirst(dropped)
             payloadHashesByRun[streamIndex] = nil
         }
         entriesByStream[streamIndex] = entries
@@ -246,6 +291,27 @@ final class SubtitlePacketStore: @unchecked Sendable {
         touchCounter &+= 1
         lastTouchByStream[streamIndex] = touchCounter
         enforceAggregateCapLocked(justTouched: streamIndex)
+    }
+
+    /// A pulled stream over its cap gives up whichever end lies farther from where its reader stands, and
+    /// its pulled spans stop short of what went, so a later pull reads it again rather than a drain reading
+    /// the gap as silence.
+    private func evictFarthestLocked(_ streamIndex: Int32, _ entries: inout [StoredSubtitlePacket], _ bytes: inout Int,
+                                     lowWater: Int, focus: Double) {
+        var head = 0
+        var tail = entries.count
+        while bytes > lowWater, tail - head > 1 {
+            if abs(entries[head].ptsSeconds - focus) >= abs(entries[tail - 1].ptsSeconds - focus) {
+                bytes -= entries[head].payload.count
+                head += 1
+            } else {
+                tail -= 1
+                bytes -= entries[tail].payload.count
+            }
+        }
+        if head > 0 { pulled[streamIndex]?.clip(above: entries[head - 1].ptsSeconds) }
+        if tail < entries.count { pulled[streamIndex]?.clip(below: entries[tail].ptsSeconds) }
+        entries = Array(entries[head..<tail])
     }
 
     /// Index within `run` of the packet `payload` duplicates, nil when it is new. A long run is
@@ -335,11 +401,13 @@ final class SubtitlePacketStore: @unchecked Sendable {
                 totalBytes -= removed
                 dropped += 1
             }
+            if dropped > 0 { pulled[idx]?.clip(above: entries[dropped - 1].ptsSeconds) }
             entries.removeFirst(dropped)
             payloadHashesByRun[idx] = nil
             if entries.isEmpty {
                 bytesByStream[idx] = nil
                 lastTouchByStream[idx] = nil
+                pulled[idx] = nil
             } else {
                 entriesByStream[idx] = entries
                 bytesByStream[idx] = bytes
@@ -403,6 +471,8 @@ final class SubtitlePacketStore: @unchecked Sendable {
         // it. This is what gives the pump the forward lookahead its playhead-based note cannot
         // state, which is the region a backward seek into already-produced content lands in.
         if let ptsSeconds { coverage.noteReach(writer, through: ptsSeconds) }
+        // A pulled stream is the pulls' alone (`setPulledStreams`): one writer per route.
+        guard !pulledStreams.contains(streamIndex) else { return }
         guard assembleSplitDisplaySets else {
             guard let ptsSeconds else { return }
             appendLocked(streamIndex: streamIndex, ptsSeconds: ptsSeconds,
@@ -538,6 +608,7 @@ final class SubtitlePacketStore: @unchecked Sendable {
         for (idx, entries) in entriesByStream {
             let kept = entries.drop { $0.ptsSeconds < cutoff }
             if kept.count != entries.count {
+                pulled[idx]?.clip(above: entries[entries.count - kept.count - 1].ptsSeconds)
                 let newBytes = kept.reduce(0) { $0 + $1.payload.count }
                 totalBytes += newBytes - (bytesByStream[idx] ?? 0)
                 entriesByStream[idx] = Array(kept)
@@ -559,5 +630,61 @@ final class SubtitlePacketStore: @unchecked Sendable {
         touchCounter = 0
         appendCounter = 0
         coverage = SubtitleHarvestCoverage()
+        pulledStreams.removeAll()
+        pulled.removeAll()
+        pullFocus.removeAll()
+    }
+}
+
+/// Layer 3 step 3: the spans of one stream whose frames are all stored, as the subtitle source pulled
+/// them. Sorted and disjoint; two spans that touch are one. A span with no packet in it is a stretch the
+/// index lists nothing in, which is an answer, unlike a stretch nobody pulled.
+struct PulledSpans: Sendable, Equatable {
+    struct Span: Sendable, Equatable {
+        var from: Double
+        var through: Double
+    }
+
+    private(set) var spans: [Span] = []
+
+    mutating func insert(from: Double, through: Double) {
+        var merged = Span(from: from, through: through)
+        var out: [Span] = []
+        out.reserveCapacity(spans.count + 1)
+        var placed = false
+        for span in spans {
+            if span.through < merged.from {
+                out.append(span)
+            } else if span.from > merged.through {
+                if !placed { out.append(merged); placed = true }
+                out.append(span)
+            } else {
+                merged.from = min(merged.from, span.from)
+                merged.through = max(merged.through, span.through)
+            }
+        }
+        if !placed { out.append(merged) }
+        spans = out
+    }
+
+    /// The end of the span holding `from`; nil when no span does.
+    func reach(from: Double) -> Double? {
+        spans.first { $0.from <= from && from <= $0.through }?.through
+    }
+
+    /// Nothing at or below `seconds` is held any more.
+    mutating func clip(above seconds: Double) {
+        spans = spans.compactMap { span in
+            guard span.through > seconds else { return nil }
+            return Span(from: max(span.from, seconds.nextUp), through: span.through)
+        }
+    }
+
+    /// Nothing at or above `seconds` is held any more.
+    mutating func clip(below seconds: Double) {
+        spans = spans.compactMap { span in
+            guard span.from < seconds else { return nil }
+            return Span(from: span.from, through: min(span.through, seconds.nextDown))
+        }
     }
 }

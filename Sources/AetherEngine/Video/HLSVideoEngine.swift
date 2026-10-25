@@ -359,6 +359,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Guarded by subtitleTapLock: an abandoned wedged producer's final packets can race the replacement
     /// producer's tap.
     private var subtitleTapRoutes: [Int32: (decoder: EmbeddedSubtitleDecoder, store: NativeSubtitleCueStore)] = [:]
+    /// Streams the tap leaves alone: the ones the session's subtitle source reads from the index, whose
+    /// renditions the index fills whole at load. Under `subtitleTapLock`.
+    private var subtitleTapExcludedStreams: Set<Int32> = []
     private let subtitleTapLock = NSLock()
 
     /// #112 rework: session-lifetime retention of every embedded subtitle stream's packets,
@@ -463,7 +466,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         subtitleTapRoutes.removeAll()
         guard demuxer != nil else { return }
         for (ordinal, sidx) in nativeSubtitleSourceStreamIndicesForSession.enumerated() {
-            guard let sidx, ordinal < nativeSubtitleCueStoresForSession.count,
+            guard let sidx, !subtitleTapExcludedStreams.contains(sidx), ordinal < nativeSubtitleCueStoresForSession.count,
                   let decoder = makeOverlayDecoder(streamIndex: sidx) else { continue }
             subtitleTapRoutes[sidx] = (decoder, nativeSubtitleCueStoresForSession[ordinal])
         }
@@ -485,6 +488,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let prod = producer
         restartLock.unlock()
         guard hasRoutes else { return }
+        rebuildSubtitleTapRoutes()
+        armSubtitleTap(on: prod)
+    }
+
+    /// Layer 3 step 3: the subtitle source's routes are settled, and `streams` are read from the index. The
+    /// tap stops decoding them, on this producer and every later one.
+    func excludeFromSubtitleTap(_ streams: Set<Int32>) {
+        subtitleTapLock.lock()
+        subtitleTapExcludedStreams = streams
+        subtitleTapLock.unlock()
+        restartLock.lock()
+        let prod = producer
+        restartLock.unlock()
         rebuildSubtitleTapRoutes()
         armSubtitleTap(on: prod)
     }
@@ -3170,6 +3186,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // instead of decoding into stores being torn down.
         subtitleTapLock.lock()
         subtitleTapRoutes.removeAll()
+        subtitleTapExcludedStreams.removeAll()
         subtitleTapLock.unlock()
         // Snapshot resources under the lock, then clear instance state and hand them to a
         // detached cleanup task (#10: SwiftUI releases @State on main; detach avoids a 3 s freeze

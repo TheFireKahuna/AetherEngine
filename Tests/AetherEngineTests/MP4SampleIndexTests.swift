@@ -275,28 +275,34 @@ struct MP4SampleIndexTests {
         }
     }
 
-    /// The registry reads an MP4's index off the demuxer, and the forward prefetch then stores from it
-    /// exactly what its walk stores.
-    @Test("the prefetch from an MP4's index stores what its walk stores")
-    func prefetchFromTheIndex() async throws {
+    /// The registry reads an MP4's index off the demuxer, and a pull then stores from it exactly what its
+    /// walk stores, read from the file through the readers a session opens for it.
+    @Test("a pull from an MP4's index stores what its walk stores")
+    func pullFromTheIndex() async throws {
+        let url = FileManager.default.temporaryDirectory.appending(path: "mp4-pull-\(UUID().uuidString).mp4")
+        try Self.movText.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
         let demuxer = try Self.open(Self.movText)
         defer { demuxer.close() }
-        let reader = DataIOReader(data: Self.movText)
+        let reader = try #require(AetherEngine.indexReader(url: url, headers: [:], label: "test"))
+        defer { reader.close() }
         let cache = SourceByteCache(directory: FileManager.default.temporaryDirectory
             .appending(path: "mp4-index-\(UUID().uuidString)", directoryHint: .isDirectory), budget: .fixed(0),
             removesDirectory: true)
         let outcome = await SourceIndexRegistry(cache: cache).index(
-            of: URL(string: "https://media.example.com/a.mp4")!, headers: [:], demuxer: demuxer, through: reader)
+            of: url, headers: [:], demuxer: demuxer, through: reader)
         let index = try #require(outcome.index)
         let subtitles = demuxer.subtitleStreamIndices()
-        let plan = SubtitleForwardPrefetcher.IndexSource.plan(
+        let plan = SubtitleSource.plan(
             index: index, listed: AetherEngine.indexedSubtitleStreams(of: demuxer), streams: subtitles)
         #expect(plan.refused.isEmpty, "\(plan.refused)")
         let fromIndex = SubtitlePacketStore()
-        let indexSource = SubtitleForwardPrefetcher.IndexSource(
-            index: index, bytes: IOReaderByteSource(reader, closesReader: false), streams: plan.streams,
-            assemblyIndices: [], from: 0)
-        while case .harvested = try indexSource.step(into: fromIndex) {}
+        for stream in plan.streams {
+            let frames = SubtitleSource.readFrames(stream.blocks, track: stream.track, index: index,
+                                                   readers: .url(url, headers: [:]), stop: .init())
+            #expect(SubtitleSource.storeFrames(frames, of: stream.blocks, stream: stream, index: index,
+                                               into: fromIndex) == nil)
+        }
 
         let walker = try Self.open(Self.movText)
         defer { walker.close() }
