@@ -1978,6 +1978,9 @@ public final class AetherEngine: ObservableObject {
     /// #65: thread-safe mirror of AVPlayer's rendered (playlist-axis) position, updated on the main actor by
     /// the $renderedTime sink. Read off-main by the producer when it re-anchors on a backpressure wedge.
     let renderedPositionMirror = AtomicDouble(0)
+    /// A live session whose engine writes the display criteria: the first HDR programme moves the panel up, once
+    /// (`LiveDisplayRangeLatch`). nil otherwise.
+    var liveDisplayRange: LiveDisplayRangeLatch?
 
     /// AE#520 round 2: thread-safe mirror of how long the consumer can keep playing out of what it
     /// already holds (the loaded range the playhead is inside), written by `LiveTelemetrySampler` at
@@ -4528,6 +4531,7 @@ public final class AetherEngine: ObservableObject {
         // don't keep publishing the predecessor's values (e.g. Live TV after an HDR10 film kept reporting .hdr10).
         videoFormat = .sdr
         sourceVideoFormat = .sdr
+        liveDisplayRange = nil
         sourceDVProfile = nil
         dolbyVisionConversion = nil
         sourceCarriesHDR10PlusMetadata = false
@@ -5176,6 +5180,7 @@ public final class AetherEngine: ObservableObject {
         }
         switch Self.loadDisplayCriteriaAction(engineWritesCriteria: options.engineWritesDisplayCriteria, audioOnlyPath: false) {
         case .applyFresh:
+            if options.isLive { liveDisplayRange = LiveDisplayRangeLatch(openedIn: effectiveFormat, frameRate: snappedRate) }
             let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
             switch displayCriteria.apply(
                 format: effectiveFormat,
@@ -7014,6 +7019,7 @@ public final class AetherEngine: ObservableObject {
         mediaChapters = []
         videoFormat = .sdr
         sourceVideoFormat = .sdr
+        liveDisplayRange = nil
         sourceDVProfile = nil
         dolbyVisionConversion = nil
         sourceCarriesHDR10PlusMetadata = false

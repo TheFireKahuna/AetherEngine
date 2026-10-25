@@ -745,6 +745,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Fires on live program-boundary rebase: `(newShiftSeconds, seamOutputSeconds)`. AetherEngine
     /// defers applying the shift until playback crosses `seamOutputSeconds` so the clock doesn't jump.
     var onPlaylistShiftRebased: (@Sendable (Double, Double) -> Void)?
+    /// A live programme's video colour from the item time it starts at (`HLSSegmentProducer.onLiveVideoColour`).
+    var onLiveVideoColour: (@Sendable (_ itemSeconds: Double, _ colour: ColorDescription) -> Void)?
     /// Fires when a longer finalized segment requires a new live playlist URL.
     var onLivePlaylistRenewal: (@Sendable () -> Void)?
     func renewedLivePlaylistURL(replacing url: URL) -> URL? {
@@ -3547,6 +3549,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: seamOutputSeconds,
                                            producerEpoch: producerEpoch)
         }
+        prod.onLiveVideoColour = { [weak self] startSeconds, colour in self?.onLiveVideoColour?(startSeconds, colour) }
         prod.onPumpFinished = { [weak self, weak prod] reason in
             guard let self, let prod else { return }
             self.handlePumpFinished(prod, reason: reason)
