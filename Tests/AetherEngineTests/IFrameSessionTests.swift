@@ -62,7 +62,7 @@ struct IFrameSessionTests {
         let playbackURL = try engine.start()
         defer { engine.stop() }
         try #require(engine.planBoundariesClaimRandomAccess, "fixture must plan on its keyframe index")
-        #expect(engine.iFrameRenditionVerdict == .served)
+        #expect(engine.iFrameRenditionVerdict == .served(.keyframes))
         #expect(playbackURL.lastPathComponent == "master.m3u8")
         let prov = try #require(engine.provider)
         #expect(prov.iFrameRenditionServed)
@@ -95,7 +95,7 @@ struct IFrameSessionTests {
         engine.requestIFramePlaylist()
         _ = try engine.start()
         defer { engine.stop() }
-        try #require(engine.iFrameRenditionVerdict == .served)
+        try #require(engine.iFrameRenditionVerdict == .served(.keyframes))
         let prov = try #require(engine.provider)
         guard case .sdrStills(let width, let height, let codecs, _, _) = prov.iFrameCompanionFormat else {
             Issue.record("expected an SDR stills tier, got \(String(describing: prov.iFrameCompanionFormat))")
@@ -221,8 +221,8 @@ struct IFrameSessionTests {
     func liveSessionServesNoRendition() {
         let verdict = IFrameRenditionEligibility.candidate(.init(
             requested: true, isLive: true, planBoundariesClaimRandomAccess: true,
-            sequentialOrigin: false, heldSourceConnection: false, originIsSerial: false,
-            isDiscSource: false, secondReaderAvailable: true))
+            seeksToTimeWithoutIndex: true, sequentialOrigin: false, heldSourceConnection: false,
+            originIsSerial: false, secondReaderAvailable: true))
         #expect(verdict == .absent(.live))
     }
 

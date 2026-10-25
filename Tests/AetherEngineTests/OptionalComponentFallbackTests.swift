@@ -114,8 +114,8 @@ struct OptionalComponentFallbackTests {
     @Test("an I-frame rendition is not served for a source whose stills cannot be made")
     func iFrameRenditionIsAbsent() {
         let verdict = IFrameRenditionEligibility.candidate(.init(
-            requested: true, isLive: false, planBoundariesClaimRandomAccess: true, sequentialOrigin: false,
-            heldSourceConnection: false, originIsSerial: false, isDiscSource: false, secondReaderAvailable: true,
+            requested: true, isLive: false, planBoundariesClaimRandomAccess: true, seeksToTimeWithoutIndex: false,
+            sequentialOrigin: false, heldSourceConnection: false, originIsSerial: false, secondReaderAvailable: true,
             stillsUnavailable: !FrameDecodeContext.yieldsStill(dolbyVisionNoBaseLayer: true)))
         #expect(verdict == .absent(.dolbyVisionStillsNotBuiltIn))
     }

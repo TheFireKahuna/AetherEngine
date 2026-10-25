@@ -133,19 +133,28 @@ final class IFrameStillBuilder: @unchecked Sendable {
         if let hit = lock.withLock({ built[index] }) {
             return Output(initSegment: initSegment, fragment: hit)
         }
-        do { try decoder.ensureOpen() } catch { return nil }
-        let picture = decoder.isDolbyVisionNoBaseLayer ? converted(payload)
-            : decoder.decodeScaledStill(keyframe: payload, width: width, height: height, destination: Self.sdr)
-        guard let picture,
-              let pts = Optional(lock.withLock { () -> Int64 in defer { nextPTS += 1 }; return nextPTS }),
-              let encoded = Self.encode(picture, session: session, pts: pts) else {
-            if !loggedFailure {
-                loggedFailure = true
-                EngineLog.emit("[IFrameStill] no still for idx=\(index)", category: .session)
-            }
-            return nil
+        guard let sample = encode(at: "idx=\(index)", picture: {
+            decoder.isDolbyVisionNoBaseLayer ? converted(decoder.decodeStill(keyframe: payload, targetWidth: width))
+                : decoder.decodeScaledStill(keyframe: payload, width: width, height: height, destination: Self.sdr)
+        }) else { return nil }
+        return output(sample: sample, index: index, startSeconds: startSeconds, durationSeconds: durationSeconds)
+    }
+
+    /// A dense still: the run's picture, encoded. The sample is what the rendition caches for the entry, so a
+    /// scrub back over it costs neither a read nor a decode. On the rendition's serial queue.
+    func encode(run: IFrameKeyframeReader.PictureRun) -> Data? {
+        encode(at: "pts=\(run.targetPts)", picture: {
+            decoder.isDolbyVisionNoBaseLayer ? converted(decoder.decodeStill(run: run, targetWidth: width))
+                : decoder.decodeScaledStill(run: run, width: width, height: height, destination: Self.sdr)
+        })
+    }
+
+    /// An encoded still's fragment at the plan time, kept for the next request.
+    func output(sample: Data, index: Int, startSeconds: Double, durationSeconds: Double) -> Output {
+        if let hit = lock.withLock({ built[index] }) {
+            return Output(initSegment: initSegment, fragment: hit)
         }
-        let fragment = Self.makeFragment(sample: encoded.data, sequence: UInt32(truncatingIfNeeded: index + 1),
+        let fragment = Self.makeFragment(sample: sample, sequence: UInt32(truncatingIfNeeded: index + 1),
                                          startSeconds: startSeconds, durationSeconds: durationSeconds)
         lock.withLock {
             if built.updateValue(fragment, forKey: index) == nil { builtOrder.append(index) }
@@ -154,9 +163,23 @@ final class IFrameStillBuilder: @unchecked Sendable {
         return Output(initSegment: initSegment, fragment: fragment)
     }
 
+    private func encode(at what: String, picture: () -> CVPixelBuffer?) -> Data? {
+        do { try decoder.ensureOpen() } catch { return nil }
+        guard let picture = picture(),
+              let pts = Optional(lock.withLock { () -> Int64 in defer { nextPTS += 1 }; return nextPTS }),
+              let encoded = Self.encode(picture, session: session, pts: pts) else {
+            if !loggedFailure {
+                loggedFailure = true
+                EngineLog.emit("[IFrameStill] no still for \(what)", category: .session)
+            }
+            return nil
+        }
+        return encoded.data
+    }
+
     /// Dolby Vision profile 5's converter image drawn into a buffer the encoder takes.
-    private func converted(_ payload: Data) -> CVPixelBuffer? {
-        guard let image = decoder.decodeStill(keyframe: payload, targetWidth: width) else { return nil }
+    private func converted(_ image: CGImage?) -> CVPixelBuffer? {
+        guard let image else { return nil }
         var buffer: CVPixelBuffer?
         let attributes = [kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()] as CFDictionary
         guard CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, attributes, &buffer) == kCVReturnSuccess,

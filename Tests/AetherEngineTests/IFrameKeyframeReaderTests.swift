@@ -174,7 +174,7 @@ struct IFrameKeyframeReaderTests {
                                                          custom: DataIOReader(data: data))
             },
             position: { positions[$0] },
-            open: { dem in try dem.open(reader: DataIOReader(data: data), profile: .iFrameSideDemuxer) },
+            open: { dem in try dem.open(reader: DataIOReader(data: data), profile: .iFrameSideDemuxer); return {} },
             now: now)
     }
 
@@ -242,7 +242,7 @@ struct IFrameKeyframeReaderTests {
 
     private static func demuxed(_ clock: Clock, open: @escaping (Demuxer) throws -> Void) -> IFrameKeyframeReader {
         IFrameKeyframeReader(resolveIndex: { .notIndexed("test") }, position: { _ in nil },
-                             open: { dem in clock.open(); try open(dem) }, now: { clock.now })
+                             open: { dem in clock.open(); try open(dem); return {} }, now: { clock.now })
     }
 
     @Test("an index that cannot be read is a failure that cools down, never the demuxer")
@@ -250,7 +250,7 @@ struct IFrameKeyframeReaderTests {
         let clock = Clock()
         let reader = IFrameKeyframeReader(
             resolveIndex: { clock.resolve(); return .failed("a range dropped") }, position: { _ in 0 },
-            open: { _ in clock.open() }, now: { clock.now })
+            open: { _ in clock.open(); return {} }, now: { clock.now })
         defer { reader.interrupt(); reader.close() }
         #expect(reader.payload(startPts: 0) == nil)
         #expect(reader.payload(startPts: 0) == nil)
@@ -303,7 +303,7 @@ struct IFrameKeyframeReaderTests {
         final class Count: @unchecked Sendable { var n = 0 }
         let untouched = Count()
         let never = IFrameKeyframeReader(resolveIndex: { .notIndexed("test") }, position: { _ in nil },
-                                         open: { _ in }, cleanup: { untouched.n += 1 })
+                                         open: { _ in {} }, cleanup: { untouched.n += 1 })
         never.interrupt(); never.close(); never.close()
         #expect(untouched.n == 1)
     }
@@ -324,7 +324,7 @@ struct IFrameKeyframeReaderTests {
     func interruptEndsTheIndexWait() {
         let r = IFrameKeyframeReader(
             resolveIndex: { try? await Task.sleep(for: .seconds(30)); return .notIndexed("late") },
-            position: { _ in nil }, open: { _ in })
+            position: { _ in nil }, open: { _ in {} })
         let done = DispatchSemaphore(value: 0)
         Thread.detachNewThread { _ = r.payload(startPts: 0); done.signal() }
         Thread.sleep(forTimeInterval: 0.2)
@@ -351,6 +351,7 @@ struct IFrameKeyframeReaderTests {
         let r = IFrameKeyframeReader(resolveIndex: { .notIndexed("test") }, position: { _ in nil }, open: { dem in
             entered.signal()
             try dem.open(reader: parked, formatHint: "mp4", profile: .iFrameSideDemuxer)
+            return {}
         })
         let done = DispatchSemaphore(value: 0)
         // A thread of its own: a loaded runner starves the global pool for seconds.

@@ -11,13 +11,32 @@ import AetherLibavcodec
 /// - The index (`SourceIndex`: Matroska's Cues, an MP4's sample entries) places each keyframe, which
 ///   is read exactly, at the position libavformat's own index gave the segment plan, through the bytes
 ///   the source cache already shares. No demuxer.
-/// - Any other container (AVI, FLV, ASF, ...) wraps its packets in framing only libavformat takes apart
-///   (a chunk header, a tag, a multiplexed payload), so a demuxer of its own reads the keyframe there,
-///   seeking to its time.
+/// - Any other container (AVI, FLV, ASF, MPEG-TS, a disc title, ...) wraps its packets in framing only
+///   libavformat takes apart (a chunk header, a tag, a multiplexed payload), so a demuxer of its own reads
+///   the keyframe there, seeking to its time over exact range reads of the source. A disc title seeks by
+///   its EP maps or its time map; a transport or program stream by a timestamp search, bounded by the
+///   keyframes the session's pump has already read (`knownKeyframes`).
 ///
 /// An index that could not be read is a failed request, not the other way: it is asked again after
 /// the cool-down. Either way the packet gets the P7 conversion the playing samples get.
+///
+/// A dense still (a source with no keyframe list, `pictureRun`) is the picture at a time rather than a
+/// keyframe: the packets from the keyframe at or before it to that picture, for the still builder to decode.
 final class IFrameKeyframeReader: @unchecked Sendable {
+
+    /// The packets that end on the picture a dense still shows, in decode order: from the keyframe at or
+    /// before the still's time on, up to the first picture at or after it (`targetPts`), and far enough past
+    /// it that no later packet can present between the two.
+    struct PictureRun: Sendable {
+        struct Packet: Sendable {
+            let data: Data
+            let pts: Int64
+            let dts: Int64
+            let isKeyframe: Bool
+        }
+        let packets: [Packet]
+        let targetPts: Int64
+    }
 
     /// A source whose index places its keyframes.
     struct IndexedSource {
@@ -45,7 +64,8 @@ final class IFrameKeyframeReader: @unchecked Sendable {
 
     private let resolveIndex: @Sendable () async -> Resolution
     private let position: (Int64) -> Int64?
-    private let open: (Demuxer) throws -> Void
+    private let open: (Demuxer) throws -> (@Sendable () -> Void)
+    private let knownKeyframes: () -> [DemuxedSampleTable.Entry]
     private let cleanup: () -> Void
     private let convertP7ToProfile81: Bool
     private let nalFraming: VideoNALFraming
@@ -57,7 +77,11 @@ final class IFrameKeyframeReader: @unchecked Sendable {
     private var resolving = false
     private var delivered: Resolution?
     private var demuxer: Demuxer?
+    /// Closes what the open read the demuxer through.
+    private var closeSource: (@Sendable () -> Void)?
     private var isOpen = false
+    /// Recorded keyframes already added to the demuxer's index, by decode time.
+    private var adoptedKeyframes: Set<Int64> = []
     private var videoIndex: Int32 = -1
     private var interrupted = false
     private var cleanedUp = false
@@ -67,6 +91,8 @@ final class IFrameKeyframeReader: @unchecked Sendable {
     /// A keyframe sits at the seek target or right behind it; this bounds a source that claims an
     /// index entry no keyframe backs.
     private static let maxPacketsPerRead = 256
+    /// A picture run spans at most a GOP and its reorder tail: ten seconds at 60 frames.
+    private static let maxPacketsPerRun = 640
 
     /// How long the reader refuses to touch the source after a failed open or read. Requests are
     /// served one at a time and AVKit sends five at once, so without this a stalled connection
@@ -78,11 +104,14 @@ final class IFrameKeyframeReader: @unchecked Sendable {
     /// `resolveIndex` says whether the source's index places its keyframes, asked at the first request
     /// and again after one that failed. `position` is libavformat's index position for a plan
     /// keyframe's time. `open` opens the demuxer route's demuxer, and receives one that `interrupt()`
-    /// can already reach, so a slow open is abortable. `cleanup` runs once, from `close()`, whether or
-    /// not anything was ever opened.
+    /// can already reach, so a slow open is abortable; it hands back what closes the source it opened.
+    /// `knownKeyframes` are the keyframes the session's own demuxer has read, adopted into the demuxer
+    /// route's index before each seek. `cleanup` runs once, from `close()`, whether or not anything was
+    /// ever opened.
     init(resolveIndex: @escaping @Sendable () async -> Resolution,
          position: @escaping (Int64) -> Int64?,
-         open: @escaping (Demuxer) throws -> Void,
+         open: @escaping (Demuxer) throws -> (@Sendable () -> Void),
+         knownKeyframes: @escaping () -> [DemuxedSampleTable.Entry] = { [] },
          cleanup: @escaping () -> Void = {},
          convertP7ToProfile81: Bool = false,
          nalFraming: VideoNALFraming = .lengthPrefixed(size: 4),
@@ -91,6 +120,7 @@ final class IFrameKeyframeReader: @unchecked Sendable {
         self.resolveIndex = resolveIndex
         self.position = position
         self.open = open
+        self.knownKeyframes = knownKeyframes
         self.cleanup = cleanup
         self.convertP7ToProfile81 = convertP7ToProfile81
         self.nalFraming = nalFraming
@@ -239,13 +269,18 @@ final class IFrameKeyframeReader: @unchecked Sendable {
 
     private func drop(_ dem: Demuxer) {
         lock.lock()
+        var closer: (@Sendable () -> Void)?
         if demuxer === dem {
             demuxer = nil
             isOpen = false
+            closer = closeSource
+            closeSource = nil
+            adoptedKeyframes = []
         }
         lock.unlock()
         dem.markClosed()
         dem.close()
+        closer?()
     }
 
     private func noteFailure(_ what: String) {
@@ -270,7 +305,10 @@ final class IFrameKeyframeReader: @unchecked Sendable {
 
         let started = DispatchTime.now()
         do {
-            try open(dem)
+            let closer = try open(dem)
+            lock.lock()
+            if demuxer === dem { closeSource = closer } else { lock.unlock(); closer(); return nil }
+            lock.unlock()
         } catch {
             drop(dem)
             noteFailure("open failed: \(error)")
@@ -297,17 +335,32 @@ final class IFrameKeyframeReader: @unchecked Sendable {
         return dem
     }
 
+    /// The keyframes the session's demuxer has read since the last seek, added to this one's index so the
+    /// seek is bounded by them.
+    private func adoptKnownKeyframes(_ dem: Demuxer) {
+        let known = knownKeyframes()
+        lock.lock()
+        let fresh = known.filter { !adoptedKeyframes.contains($0.timestamp) }
+        adoptedKeyframes.formUnion(fresh.map(\.timestamp))
+        lock.unlock()
+        if !fresh.isEmpty { dem.adoptRecordedKeyframes(fresh, streamIndex: videoIndex) }
+    }
+
+    /// Positions `dem` for a read at `startPts` on the video stream's axis: at or before it, a disc title by
+    /// its maps.
+    private func position(_ dem: Demuxer, at startPts: Int64, atOrBefore: Bool) -> Bool {
+        adoptKnownKeyframes(dem)
+        if !dem.isDiscSource, dem.seek(to: startPts, streamIndex: videoIndex, atOrBefore: atOrBefore) { return true }
+        guard let stream = dem.stream(at: videoIndex) else { return false }
+        let tb = stream.pointee.time_base
+        return tb.den > 0 && dem.seek(to: Double(startPts) * Double(tb.num) / Double(tb.den))
+    }
+
     /// The first keyframe at or after the seek to `startPts`. A failed open already counted itself.
     private func read(_ dem: Demuxer, startPts: Int64) -> UnsafeMutablePointer<AVPacket>? {
         dem.beginReadDeadline(secondsFromNow: readDeadlineSeconds)
         defer { dem.endReadDeadline() }
-        if dem.isDiscSource || !dem.seek(to: startPts, streamIndex: videoIndex) {
-            guard let stream = dem.stream(at: videoIndex) else { return nil }
-            let tb = stream.pointee.time_base
-            guard tb.den > 0, dem.seek(to: Double(startPts) * Double(tb.num) / Double(tb.den)) else {
-                return nil
-            }
-        }
+        guard position(dem, at: startPts, atOrBefore: false) else { return nil }
         for _ in 0..<Self.maxPacketsPerRead {
             if isInterrupted { return nil }
             guard let packet = try? dem.readPacket() else { return nil }
@@ -320,6 +373,100 @@ final class IFrameKeyframeReader: @unchecked Sendable {
             return packet
         }
         return nil
+    }
+
+    // MARK: - Dense stills
+
+    /// The packets from the keyframe at or before `targetPts` to the first picture at or after it, read by
+    /// the demuxer route. The read stops once a packet's decode time reaches that picture's time: every
+    /// later packet presents at or after its own decode time, so none can come between. nil on a failure,
+    /// which counts toward the cool-down as a keyframe's does.
+    func pictureRun(atPts targetPts: Int64) -> PictureRun? {
+        lock.lock()
+        let held = interrupted || now() < blockedUntil
+        lock.unlock()
+        if held { return nil }
+        guard readyRoute() != nil, let dem = readyDemuxer() else { return nil }
+        if let run = readRun(dem, targetPts: targetPts) {
+            lock.lock(); consecutiveFailures = 0; lock.unlock()
+            return run
+        }
+        guard !isInterrupted else { return nil }
+        drop(dem)
+        noteFailure("picture read failed at pts=\(targetPts)")
+        return nil
+    }
+
+    /// How far before a still's time the first positioning reads, doubled for each one that lands past the
+    /// keyframe the picture needs, in seconds: a timestamp search lands near a time, not on a keyframe.
+    static let runBackoffSeconds: [Double] = [1, 2, 4, 8, 16]
+
+    /// A recorded keyframe at or before the target opens the run where it begins, if it is no further back
+    /// than a GOP is long; otherwise the run is positioned a little before the target, further each time the
+    /// first keyframe read turns out to be past it.
+    private func readRun(_ dem: Demuxer, targetPts: Int64) -> PictureRun? {
+        dem.beginReadDeadline(secondsFromNow: readDeadlineSeconds)
+        defer { dem.endReadDeadline() }
+        adoptKnownKeyframes(dem)
+        guard let stream = dem.stream(at: videoIndex) else { return nil }
+        let tb = stream.pointee.time_base
+        guard tb.num > 0, tb.den > 0 else { return nil }
+        let ticksPerSecond = Double(tb.den) / Double(tb.num)
+        let reach = Int64((Self.runBackoffSeconds.last ?? 16) * ticksPerSecond)
+        if !dem.isDiscSource,
+           let keyframe = dem.recordedKeyframes(streamIndex: videoIndex)
+               .last(where: { $0.timestamp <= targetPts && targetPts - $0.timestamp <= reach }),
+           dem.seek(toRecordedKeyframeAt: keyframe.pos),
+           case .run(let run) = collectRun(dem, targetPts: targetPts) {
+            return run
+        }
+        for backoff in Self.runBackoffSeconds {
+            if isInterrupted { return nil }
+            let from = targetPts - Int64(backoff * ticksPerSecond)
+            guard position(dem, at: from, atOrBefore: true) else { return nil }
+            switch collectRun(dem, targetPts: targetPts) {
+            case .run(let run): return run
+            case .openedPastTarget: continue
+            case .failed: return nil
+            }
+        }
+        return nil
+    }
+
+    private enum RunRead {
+        case run(PictureRun)
+        /// The first keyframe read was already past the target: position further back.
+        case openedPastTarget
+        case failed
+    }
+
+    /// Reads from where `dem` stands: from its first keyframe on, up to the first picture at or after
+    /// `targetPts` and on until a packet's decode time reaches it.
+    private func collectRun(_ dem: Demuxer, targetPts: Int64) -> RunRead {
+        var packets: [PictureRun.Packet] = []
+        var target: Int64?
+        for _ in 0..<Self.maxPacketsPerRun {
+            if isInterrupted { return .failed }
+            guard let packet = try? dem.readPacket() else { break }
+            var owned: UnsafeMutablePointer<AVPacket>? = packet
+            defer { av_packet_free(&owned) }
+            guard packet.pointee.stream_index == videoIndex, let data = packet.pointee.data,
+                  packet.pointee.size > 0 else { continue }
+            let isKeyframe = packet.pointee.flags & AV_PKT_FLAG_KEY != 0
+            // A run opens on a keyframe; whatever the seek landed before one is not decodable from here.
+            if packets.isEmpty, !isKeyframe { continue }
+            let pts = packet.pointee.pts, dts = packet.pointee.dts == Int64.min ? pts : packet.pointee.dts
+            if packets.isEmpty, dts != Int64.min, dts > targetPts { return .openedPastTarget }
+            // A later keyframe still at or before the target opens the run instead: the pictures that
+            // lean on the one before it present before it, so none of them can be the target.
+            if isKeyframe, target == nil, pts != Int64.min, pts <= targetPts { packets.removeAll() }
+            packets.append(.init(data: Data(bytes: data, count: Int(packet.pointee.size)), pts: pts, dts: dts,
+                                 isKeyframe: isKeyframe))
+            if pts != Int64.min, pts >= targetPts { target = min(target ?? pts, pts) }
+            if let target, dts != Int64.min, dts >= target { break }
+        }
+        guard let target, !packets.isEmpty else { return .failed }
+        return .run(PictureRun(packets: packets, targetPts: target))
     }
 
     // MARK: - Lifetime
@@ -342,6 +489,8 @@ final class IFrameKeyframeReader: @unchecked Sendable {
         let dem = demuxer
         demuxer = nil
         isOpen = false
+        let closer = closeSource
+        closeSource = nil
         let route = route
         let unread = delivered
         delivered = nil
@@ -349,6 +498,7 @@ final class IFrameKeyframeReader: @unchecked Sendable {
         cleanedUp = true
         lock.unlock()
         dem?.close()
+        closer?()
         if case .indexed(let source)? = unread { source.bytes.close() }
         if runCleanup {
             if case .index(let source) = route { source.bytes.close() }
