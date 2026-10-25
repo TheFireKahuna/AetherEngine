@@ -10,10 +10,14 @@ import AetherLibavutil
 /// clock for ``DecodedPictureSource``.
 ///
 /// The segment producer hands over every video packet before the placeholder takes its place, with output
-/// (item-axis) timestamps, in decode order. One `SoftwareVideoDecoder` serves the session: a seek or a new run
-/// flushes it and never reopens it, so its slabs, the finisher's pipelines and its buffer pool stay warm, and the
-/// pictures between the keyframe and the clock are decoded as references only. Its pictures come out in
-/// presentation order on the item axis, deinterlaced, film-matched or retimed as the load decided.
+/// (item-axis) timestamps, in decode order. One decoder serves the session: VideoToolbox for an HEVC stream it opens
+/// a hardware session for (`VTCapabilityProbe`), as on every other route, and `SoftwareVideoDecoder` otherwise. A seek
+/// or a new run flushes it and never reopens it, so its sessions, slabs, the finisher's pipelines and its buffer
+/// pool stay warm, and the pictures between the keyframe and the clock are decoded as references only. Its
+/// pictures are on the item axis, deinterlaced, film-matched or retimed as the load decided.
+///
+/// Captions: an H.264 or HEVC source's are read off its packets by the producer, as on the native route
+/// (VideoToolbox surfaces none); any other codec's come from libavcodec's decode, `onCaptions`.
 final class OverlayDecodeTap: @unchecked Sendable {
 
     /// A few pictures at any frame rate: the decoder only has to stay ahead of the refresh that shows them, and a
@@ -22,6 +26,8 @@ final class OverlayDecodeTap: @unchecked Sendable {
 
     /// Each unit's run shift (item axis to source axis, in seconds), for the decoder's captions.
     private let units: OverlayPacketTap<Double>
+    /// The source decodes on VideoToolbox.
+    let decodesInHardware: Bool
 
     /// A clock the player moved within this long is AVPlayer's; otherwise the producer's run start stands in for it.
     static let playerClockSeconds = 0.5
@@ -38,13 +44,19 @@ final class OverlayDecodeTap: @unchecked Sendable {
          deinterlace: DeinterlaceConfig,
          onCaptions: @escaping @Sendable ([CCDataParser.CCTriplet], Double) -> Void) {
         let shifts = UnitShifts()
+        let codec = parameters.pointee.codec_id
+        let hardware = codec == AV_CODEC_ID_HEVC && VTCapabilityProbe.opensHardwareDecoder(codecpar: parameters)
+        decodesInHardware = hardware
+        let captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)? = codec == AV_CODEC_ID_H264 || codec == AV_CODEC_ID_HEVC
+            ? nil : { @Sendable triplets, itemSeconds in onCaptions(triplets, itemSeconds + (shifts.shift(at: itemSeconds) ?? 0)) }
         units = OverlayPacketTap(decodeAheadSeconds: Self.decodeAheadSeconds) { deliver in
-            SoftwareTapDecoder(parameters: parameters, timeBase: timeBase, containerSAR: containerSAR,
-                               deinterlace: deinterlace, deliver: deliver) { triplets, itemSeconds in
-                onCaptions(triplets, itemSeconds + (shifts.shift(at: itemSeconds) ?? 0))
-            }
+            PictureTapDecoder(hardware ? HardwareVideoDecoder() : SoftwareVideoDecoder(),
+                              parameters: parameters, timeBase: timeBase, containerSAR: containerSAR,
+                              deinterlace: deinterlace, deliver: deliver, onCaptions: captions)
         }
         shifts.units = units
+        EngineLog.emit("[OverlayDecodeTap] \(avcodec_get_name(codec).map { String(cString: $0) } ?? "?") on "
+                       + (hardware ? "VideoToolbox" : "libavcodec"), category: .swPlayback)
     }
 
     func close() { units.close() }
@@ -75,7 +87,7 @@ final class OverlayDecodeTap: @unchecked Sendable {
         guard let start = clock.withLock({ $0.runStart }),
               abs(units.clockSeconds - start) < Self.runStartNearClockSeconds else { return true }
         let deadline = Date().addingTimeInterval(timeout)
-        while !units.hasPicture(near: start, toleranceSeconds: SoftwareTapDecoder.shownBeforeClockSeconds) {
+        while !units.hasPicture(near: start, toleranceSeconds: PictureTapDecoder.shownBeforeClockSeconds) {
             if shouldStop() || Date() > deadline { return false }
             Thread.sleep(forTimeInterval: 0.005)
         }
@@ -102,13 +114,13 @@ final class OverlayDecodeTap: @unchecked Sendable {
     }
 }
 
-/// `SoftwareVideoDecoder` as an ``OverlayTapDecoder``: opened on the first unit, flushed on a restart.
-private final class SoftwareTapDecoder: OverlayTapDecoder {
+/// A session decoder as an ``OverlayTapDecoder``: opened on the first unit, flushed on a restart.
+private final class PictureTapDecoder: OverlayTapDecoder {
     /// How far before the clock a restart still converts pictures: the picture on screen at the clock is the one at
     /// or before it, up to a frame earlier.
     static let shownBeforeClockSeconds = 0.1
 
-    private let decoder = SoftwareVideoDecoder()
+    private let decoder: any VideoDecodingPipeline
     /// The tap's own copy: the decoder opens on the tap's thread, whenever the first unit comes.
     private let parameters: HLSVideoEngine.OwnedCodecParameters?
     private let timeBase: AVRational
@@ -117,14 +129,16 @@ private final class SoftwareTapDecoder: OverlayTapDecoder {
     private var opened = false
     private var failed = false
 
-    init(parameters: UnsafePointer<AVCodecParameters>, timeBase: AVRational, containerSAR: AVRational,
-         deinterlace: DeinterlaceConfig, deliver: @escaping @Sendable (CVPixelBuffer, CMTime) -> Void,
-         onCaptions: @escaping @Sendable ([CCDataParser.CCTriplet], Double) -> Void) {
+    init(_ decoder: any VideoDecodingPipeline, parameters: UnsafePointer<AVCodecParameters>, timeBase: AVRational,
+         containerSAR: AVRational, deinterlace: DeinterlaceConfig,
+         deliver: @escaping @Sendable (CVPixelBuffer, CMTime) -> Void,
+         onCaptions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?) {
+        self.decoder = decoder
         self.parameters = HLSVideoEngine.OwnedCodecParameters(copying: parameters)
         self.timeBase = timeBase
         self.containerSAR = containerSAR
         self.deliver = deliver
-        decoder.deinterlaceConfig = deinterlace
+        (decoder as? SoftwareVideoDecoder)?.deinterlaceConfig = deinterlace
         decoder.onA53Captions = onCaptions
     }
 
@@ -133,8 +147,14 @@ private final class SoftwareTapDecoder: OverlayTapDecoder {
             do {
                 guard let parameters else { throw VideoDecoderError.noCodecParameters }
                 let deliver = deliver
-                try decoder.open(parameters: parameters.ptr, timeBase: self.timeBase, containerSAR: containerSAR) { picture, pts, _ in
-                    deliver(picture, pts)
+                let handler: DecodedFrameHandler = { picture, pts, _ in deliver(picture, pts) }
+                switch decoder {
+                case let hardware as HardwareVideoDecoder:
+                    try hardware.open(parameters: parameters.ptr, timeBase: self.timeBase, containerSAR: containerSAR, onFrame: handler)
+                case let software as SoftwareVideoDecoder:
+                    try software.open(parameters: parameters.ptr, timeBase: self.timeBase, containerSAR: containerSAR, onFrame: handler)
+                default:
+                    throw VideoDecoderError.noCodecParameters
                 }
                 opened = true
             } catch {
@@ -145,7 +165,9 @@ private final class SoftwareTapDecoder: OverlayTapDecoder {
         guard opened else { return }
         if let clock {
             decoder.flush()
-            decoder.skipUntilPTS = CMTime(seconds: clock - Self.shownBeforeClockSeconds, preferredTimescale: 90_000)
+            let skip = CMTime(seconds: clock - Self.shownBeforeClockSeconds, preferredTimescale: 90_000)
+            (decoder as? SoftwareVideoDecoder)?.skipUntilPTS = skip
+            (decoder as? HardwareVideoDecoder)?.skipUntilPTS = skip
         }
         decoder.decode(packet: packet, epoch: nil)
     }

@@ -7,15 +7,20 @@ import AetherLibavcodec
 import AetherLibavutil
 @testable import AetherEngine
 
-/// The software overlay's decode (`OverlayDecodeTap`) on a real AV1 stream: the picture it gives for a clock is
-/// the one a plain decode shows at that time, through jumps either way, with only a few pictures held.
-/// Needs `Fixtures/av1.mp4` (Scripts/fetch-fixtures.sh).
+/// The software overlay's decode (`OverlayDecodeTap`) on real streams, AV1 on libavcodec and HEVC on VideoToolbox:
+/// the picture it gives for a clock is the one a plain decode by the same decoder shows at that time, through jumps
+/// either way, with only a few pictures held. Needs `Fixtures/av1.mp4` and `Fixtures/hdr10-hevc.mp4`
+/// (Scripts/fetch-fixtures.sh).
 @Suite("Overlay decode tap", .serialized)
 struct OverlayDecodeTapTests {
-    static let fixture = URL(fileURLWithPath: #filePath)
-        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        .appendingPathComponent("Fixtures/av1.mp4")
-    static var hasFixture: Bool { FileManager.default.fileExists(atPath: fixture.path) }
+    static func fixture(_ name: String) -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Fixtures").appendingPathComponent(name)
+    }
+    static var hasFixtures: Bool {
+        ["av1.mp4", "hdr10-hevc.mp4"].allSatisfy { FileManager.default.fileExists(atPath: fixture($0).path) }
+    }
 
     static func waitUntil(_ seconds: Double, _ condition: () -> Bool) -> Bool {
         let deadline = Date().addingTimeInterval(seconds)
@@ -41,16 +46,17 @@ struct OverlayDecodeTapTests {
         }
     }
 
-    @Test("the picture for a clock is a plain decode's at that time, forward and back", .enabled(if: hasFixture))
-    func picturesMatchAPlainDecode() throws {
+    @Test("the picture for a clock is a plain decode's at that time, forward and back", .enabled(if: hasFixtures),
+          arguments: [("av1.mp4", false), ("hdr10-hevc.mp4", true)])
+    func picturesMatchAPlainDecode(clip: String, hardware: Bool) throws {
         let demuxer = Demuxer()
-        try demuxer.open(url: Self.fixture)
+        try demuxer.open(url: Self.fixture(clip))
         defer { demuxer.close() }
         let index = demuxer.videoStreamIndex
         let stream = try #require(demuxer.stream(at: index))
         let tb = stream.pointee.time_base
 
-        let reference = SoftwareVideoDecoder()
+        let reference: any VideoDecodingPipeline = hardware ? HardwareVideoDecoder() : SoftwareVideoDecoder()
         let referencePictures = OSAllocatedUnfairLock(initialState: [Int64: [[UInt8]]]())
         try reference.open(stream: stream) { buffer, pts, _ in
             let ms = Int64((pts.seconds * 1000).rounded())
@@ -63,6 +69,7 @@ struct OverlayDecodeTapTests {
         let tap = OverlayDecodeTap(parameters: stream.pointee.codecpar, timeBase: tb,
                                    containerSAR: stream.pointee.sample_aspect_ratio, deinterlace: DeinterlaceConfig()) { _, _ in }
         defer { tap.close() }
+        #expect(tap.decodesInHardware == hardware)
         while let packet = try demuxer.readPacket() {
             var owned: UnsafeMutablePointer<AVPacket>? = packet
             defer { trackedPacketFree(&owned) }

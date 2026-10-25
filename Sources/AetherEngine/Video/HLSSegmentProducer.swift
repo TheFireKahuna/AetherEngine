@@ -3025,6 +3025,25 @@ final class HLSSegmentProducer: @unchecked Sendable {
         onSegmentWritten?(index, Double(videoShiftPts) * sourceVideoTbSeconds)
     }
 
+    /// An overlay session's H.264 / HEVC A53 captions, read off the source packet as `finalizeAndWriteVideo` reads a
+    /// native session's, on the same terms: the packets this producer muxes are the placeholder's.
+    private func observeOverlaySourceCaptions(_ packet: UnsafeMutablePointer<AVPacket>) {
+        guard let placeholder = overlayPlaceholder, let observe = a53CaptionObserver,
+              let data = packet.pointee.data, packet.pointee.pts != Int64.min else { return }
+        let kind: A53SEIParser.CodecKind
+        switch placeholder.sourceCodecID {
+        case AV_CODEC_ID_H264: kind = .h264
+        case AV_CODEC_ID_HEVC: kind = .hevc
+        default: return
+        }
+        let size = Int(packet.pointee.size)
+        guard A53SEIParser.mayContainA53(data, size) else { return }
+        let triplets = A53SEIParser.triplets(in: data, size: size, codec: kind, framing: placeholder.sourceFraming)
+        guard !triplets.isEmpty else { return }
+        observe(triplets, Self.foldingShiftBack(packet.pointee.pts, shift: videoShiftPts),
+                Self.foldingShiftBack(packet.pointee.dts, shift: videoShiftPts), sourceVideoTimeBase)
+    }
+
     /// An overlay session: the run's first segment waits for the overlay's decode to have the run's first picture.
     /// AVPlayer prerolls the placeholder at once and starts its clock as soon as it has the segment, so this is the
     /// one point where it has to wait for a decoder it does not own; after it the decoder only has to keep pace.
@@ -4784,8 +4803,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             category: .session
                         )
                     }
-                    overlayDecodeTap?.keep(packet, timeBase: videoConfig.timeBase,
-                                           shiftSeconds: Double(videoShiftPts == Int64.min ? 0 : videoShiftPts) * sourceVideoTbSeconds)
+                    if let overlayDecodeTap {
+                        overlayDecodeTap.keep(packet, timeBase: videoConfig.timeBase,
+                                              shiftSeconds: Double(videoShiftPts == Int64.min ? 0 : videoShiftPts) * sourceVideoTbSeconds)
+                        observeOverlaySourceCaptions(packet)
+                    }
                     if let overlayPlaceholder, !overlayPlaceholder.substitute(packet) {
                         exitReason = .muxerFailed
                         break readLoop
