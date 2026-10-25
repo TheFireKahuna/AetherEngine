@@ -141,12 +141,12 @@ struct DoviRpuGuardTests {
     /// `pivotCount` replaces luma's `num_pivots_minus2` (the pivots written stay the real ones),
     /// `firstMappingIdc` the encoding of luma's first `mapping_idc`, `vdrRpuId` the mapping's id and `dm`
     /// appends a display-management payload after the mapping and NLQ.
-    /// `fullRange` sets `bl_video_full_range_flag`, `partitions` the two `num_*_partitions_minus1` and
-    /// `nlqPivots` the two delta-coded `nlq_pred_pivot_value`s of a residual RPU.
+    /// `partitions` sets the two `num_*_partitions_minus1` and `nlqPivots` the two delta-coded
+    /// `nlq_pred_pivot_value`s of a residual RPU.
     static func craft(pieces: [[Piece]], residual: Residual = .none, coefficientDataType: Int = 0,
                       pivotCount: UInt64? = nil, firstMappingIdc: ((inout BitWriter) -> Void)? = nil,
                       vdrRpuId: ((inout BitWriter) -> Void)? = nil, dm: DMPayload? = nil,
-                      fullRange: Bool = false, partitions: (UInt64, UInt64) = (0, 0),
+                      partitions: (UInt64, UInt64) = (0, 0),
                       nlqPivots: (UInt64, UInt64) = (0, 1023)) -> [UInt8] {
         precondition(coefficientDataType == 0 || residual == .none)
         var w = BitWriter()
@@ -155,7 +155,7 @@ struct DoviRpuGuardTests {
         w.put(1, 1)                          // vdr_seq_info_present
         w.put(0, 1); w.put(UInt64(coefficientDataType), 2)   // chroma filter flag, coefficient_data_type
         if coefficientDataType == 0 { w.ue(23) }             // denom
-        w.put(0, 2); w.put(fullRange ? 1 : 0, 1)   // normalized idc, full range
+        w.put(0, 2); w.put(0, 1)             // normalized idc, full range
         w.ue(2); w.ue(2); w.ue(4)            // bl, el, vdr depth - 8
         w.put(0, 1)                          // spatial resampling flag
         w.put(dm?.compressed == true ? 1 : 0, 3)   // reserved_zero_3bits, 1 selects compressed DM data
@@ -641,10 +641,10 @@ extension DoviRpuGuardTests {
         let pieces: [[Piece]] = [[.polynomial], [.polynomial], [.polynomial]]
         // The defaults log nothing.
         _ = try #require(Self.parameters(Self.craft(pieces: pieces, residual: .fel)))
-        let markers = ["bl_video_full_range_flag = 1", "nlq_pred_pivot_value = 16...1023", "num_x_partitions_minus1 = 1"]
+        let markers = ["nlq_pred_pivot_value = 16...1023", "num_x_partitions_minus1 = 1"]
         for m in markers { #expect(capture.matching(m).isEmpty, "\(m) logged for a default RPU") }
         // libdovi 3.4 refuses pivots whose deltas do not sum to the BL maximum, so only the first can differ.
-        let odd = Self.craft(pieces: pieces, residual: .fel, fullRange: true, partitions: (1, 2), nlqPivots: (16, 1007))
+        let odd = Self.craft(pieces: pieces, residual: .fel, partitions: (1, 2), nlqPivots: (16, 1007))
         _ = try #require(Self.parameters(odd))
         _ = try #require(Self.parameters(odd))
         for m in markers { #expect(capture.matching(m).count == 1, "\(m): \(capture.matching(m).count) lines") }

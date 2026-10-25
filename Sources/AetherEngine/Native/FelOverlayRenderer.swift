@@ -78,6 +78,7 @@ public final class FelOverlayRenderer: @unchecked Sendable {
     private var frameSteps: (sum: Double, count: Int) = (0, 0)
     private var frameDuration: Double? { frameSteps.count > 0 ? frameSteps.sum / Double(frameSteps.count) : nil }
     private var frameIndex: UInt32 = 0
+    private let requestedFormat: OSType
     private var lastRefresh: CFTimeInterval?
     private var blankEnhancement: CVPixelBuffer?
     private var lastLog = CACurrentMediaTime()
@@ -86,14 +87,16 @@ public final class FelOverlayRenderer: @unchecked Sendable {
 
     public var counters: Counters { countersLock.withLock { _counters } }
 
-    /// Nil when the composer cannot be built (no Metal device).
-    init?(item: AVPlayerItem, tap: FelEnhancementTap) {
+    /// Nil when the composer cannot be built (no Metal device). `baseLayerFullRange` is the range the base layer's
+    /// SPS states: asking for the matching format hands over its own codes, where the other would convert them.
+    init?(item: AVPlayerItem, tap: FelEnhancementTap, baseLayerFullRange: Bool) {
         guard let composer = DoviFelComposer() else { return nil }
         self.composer = composer
         self.item = item
         self.tap = tap
+        requestedFormat = HardwareVideoDecoder.pixelFormat(tenBit: true, fullRange: baseLayerFullRange)
         output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelBufferPixelFormatTypeKey as String: requestedFormat,
             kCVPixelBufferMetalCompatibilityKey as String: true,
             kCVPixelBufferIOSurfacePropertiesKey as String: [String: any Sendable](),
         ])
@@ -410,9 +413,10 @@ public final class FelOverlayRenderer: @unchecked Sendable {
     }
 
     /// Logs, once, the format AVPlayer's decoder produces on its own (an output asking for nothing), beside the
-    /// `x420` this renderer asks for: when they differ, AVPlayer converts every frame to hand it over.
+    /// format this renderer asks for: when they differ, AVPlayer converts every frame to hand it over.
     private func logDecoderFormat(item: AVPlayerItem) {
         let probe = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
+        let requested = Self.fourCC(requestedFormat)
         item.add(probe)
         queue.asyncAfter(deadline: .now() + 2) { [weak item] in
             defer { item?.remove(probe) }
@@ -424,7 +428,7 @@ public final class FelOverlayRenderer: @unchecked Sendable {
             let surface = CVPixelBufferGetIOSurface(buffer) != nil
             EngineLog.emit("[FelOverlayRenderer] decoder format \(Self.fourCC(CVPixelBufferGetPixelFormatType(buffer))) "
                            + "\(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer)) iosurface=\(surface); "
-                           + "the overlay asks for x420", category: .swPlayback)
+                           + "the overlay asks for \(requested)", category: .swPlayback)
         }
     }
 
