@@ -242,7 +242,7 @@ struct IFrameSessionTests {
         let clone = try CountingFileReader(url: fixtureURL(Self.fixture))
         let engine = HLSVideoEngine(url: fixtureURL(Self.fixture), dvModeAvailable: false)
         engine.requestIFramePlaylist()
-        engine.customIFrameReader = (reader: clone, formatHint: "mp4")
+        engine.customKeyframeReader = (reader: clone, formatHint: "mp4")
         _ = try engine.start()
         let prov = try #require(engine.provider)
         let fragment = try #require(prov.iFrameSegment(at: 1))
@@ -260,23 +260,24 @@ struct IFrameSessionTests {
         let clone = try CountingFileReader(url: fixtureURL(Self.fixture))
         let engine = HLSVideoEngine(url: fixtureURL(Self.fixture), dvModeAvailable: false)
         engine.requestIFramePlaylist()
-        engine.customIFrameReader = (reader: clone, formatHint: "mp4")
+        engine.customKeyframeReader = (reader: clone, formatHint: "mp4")
         _ = try engine.start()
         engine.stop()
         try await waitFor { clone.closes == 1 }
     }
 
-    @Test("a clone handed to a session that cannot serve the rendition is closed at once",
+    @Test("a clone handed to a session that can read no picture off the source is closed at once",
           .enabled(if: fixtureExists("sdr-h264.mp4")), .timeLimit(.minutes(2)))
     func cloneOfAnAbsentRenditionIsClosed() throws {
         // One IRAP in the whole file: no keyframe-aligned plan, so the rendition stays absent.
         let clone = try CountingFileReader(url: fixtureURL("sdr-h264.mp4"))
         let engine = HLSVideoEngine(url: fixtureURL("sdr-h264.mp4"), dvModeAvailable: false)
         engine.requestIFramePlaylist()
-        engine.customIFrameReader = (reader: clone, formatHint: "mp4")
+        engine.customKeyframeReader = (reader: clone, formatHint: "mp4")
         _ = try engine.start()
         defer { engine.stop() }
         #expect(engine.iFrameRenditionVerdict == .absent(.planNotKeyframeAligned))
+        #expect(engine.sourceStillTimeline == nil)
         #expect(clone.closes == 1)
     }
 }

@@ -941,13 +941,12 @@ extension AetherEngine {
             Task { @MainActor [weak self] in self?.emitSubtitleResolutionStatements(reason: .eof) }
         }
         // AE#682: set before start(), where the session decides whether it can serve the rendition.
-        // A custom-IO source is not reopenable by URL, so the side reader gets a clone of its own;
-        // a reader that cannot clone leaves the rendition absent.
-        if loadedOptions.serveIFramePlaylist {
-            session.requestIFramePlaylist()
-            if isCustomSource, let clone = customReader?.makeIndependentReader() {
-                session.customIFrameReader = (reader: clone, formatHint: customFormatHint)
-            }
+        if loadedOptions.serveIFramePlaylist { session.requestIFramePlaylist() }
+        // A custom-IO source is not reopenable by URL, so the session's keyframe reader (the I-frame
+        // rendition, scrub stills past the resident window) reads a clone of its own; a reader that
+        // cannot clone leaves both without one.
+        if isCustomSource, let clone = customReader?.makeIndependentReader() {
+            session.customKeyframeReader = (reader: clone, formatHint: customFormatHint)
         }
         // #260: an observer installed before load has to reach this session's producers too.
         session.setNativeVideoFrameTimeObserver(nativeVideoFrameTimeObserver)

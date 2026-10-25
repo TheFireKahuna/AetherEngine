@@ -73,6 +73,9 @@ final class IFrameKeyframeReader: @unchecked Sendable {
     private let now: () -> Date
 
     private let lock = NSLock()
+    /// One request at a time, whoever asks (the I-frame rendition, the compositor preview, a scrub still): a
+    /// demuxer route's seek and the reads after it belong to one request. Not taken by `interrupt()`.
+    private let requestLock = NSLock()
     private var route: Route?
     private var resolving = false
     private var delivered: Resolution?
@@ -144,6 +147,8 @@ final class IFrameKeyframeReader: @unchecked Sendable {
     }
 
     func payload(startPts: Int64) -> Data? {
+        requestLock.lock()
+        defer { requestLock.unlock() }
         lock.lock()
         let held = interrupted || now() < blockedUntil
         lock.unlock()
@@ -382,6 +387,8 @@ final class IFrameKeyframeReader: @unchecked Sendable {
     /// later packet presents at or after its own decode time, so none can come between. nil on a failure,
     /// which counts toward the cool-down as a keyframe's does.
     func pictureRun(atPts targetPts: Int64) -> PictureRun? {
+        requestLock.lock()
+        defer { requestLock.unlock() }
         lock.lock()
         let held = interrupted || now() < blockedUntil
         lock.unlock()
