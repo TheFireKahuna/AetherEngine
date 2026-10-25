@@ -366,7 +366,7 @@ struct SourceByteCacheTests {
         SourceByteCache.shared.drainWritesForTesting()
         #expect(try Self.readAll(url, label: "second", size: size, prefetch: persistent) == body)
 
-        let books = try #require(SourceByteLedger.shared.snapshot(url))
+        let books = try #require(SourceByteLedger.shared.snapshot(.init(url)))
         let second = books.byReader["second"] ?? .init()
         #expect(second.fromCache >= Int64(size) - 64 * 1024)
         #expect(second.duplicate == 0)
@@ -391,7 +391,7 @@ struct SourceByteCacheTests {
         SourceByteCache.shared.drainWritesForTesting()
 
         #expect(try Self.readAll(url, label: "pump", size: size, prefetch: true) == body)
-        let books = try #require(SourceByteLedger.shared.snapshot(url))
+        let books = try #require(SourceByteLedger.shared.snapshot(.init(url)))
         let pump = books.byReader["pump"] ?? .init()
         #expect(pump.fromCache >= Int64(held.count))
         #expect(pump.duplicate == 0)
@@ -441,7 +441,7 @@ struct SourceByteCacheTests {
         #expect(reader.readRange(at: 1000, count: 568) == body.subdata(in: 1000..<1568))
         cache.drainWritesForTesting()
         #expect(reader.readRange(at: 1200, count: 600) == body.subdata(in: 1200..<1800))
-        let books = try #require(SourceByteLedger.shared.snapshot(url))
+        let books = try #require(SourceByteLedger.shared.snapshot(.init(url)))
         let lane = books.byReader["subindex"] ?? .init()
         #expect(lane.fetched == 568 + 232)
         #expect(lane.fromCache == 368)

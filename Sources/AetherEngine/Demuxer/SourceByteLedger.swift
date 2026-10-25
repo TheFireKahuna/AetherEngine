@@ -42,7 +42,20 @@ final class SourceByteLedger: @unchecked Sendable {
         var duplicate: Int64 { fetched - unique - discarded }
     }
 
-    private struct Source {
+    /// A source as the books name it: its credential-free key and its display form, worked out once
+    /// per reader rather than once per delivery (a delivery arrives hundreds of times a second, and
+    /// the key parses the URL).
+    struct Source: Sendable, Hashable {
+        let key: String
+        let display: String
+
+        init(_ url: URL) {
+            key = SourceIdentity.key(url)
+            display = SourceIdentity.display(url)
+        }
+    }
+
+    private struct Books {
         var spans = ByteSpanSet()
         var unique: Int64 = 0
         var byReader: [String: Tally] = [:]
@@ -53,20 +66,20 @@ final class SourceByteLedger: @unchecked Sendable {
     }
 
     private let lock = NSLock()
-    private var sources: [String: Source] = [:]
+    private var sources: [String: Books] = [:]
     private var clock: UInt64 = 0
 
-    func readerOpened(_ url: URL) {
-        let key = Self.sourceKey(url)
+    func readerOpened(_ source: Source) {
+        let key = source.key
         lock.lock()
         mutate(key) { $0.openReaders += 1 }
         lock.unlock()
     }
 
-    /// Bytes `reader` received for `url` at `offset`, kept or not by the reader itself.
-    func record(_ url: URL, reader: String, offset: Int64, count: Int) {
+    /// Bytes `reader` received for `source` at `offset`, kept or not by the reader itself.
+    func record(_ source: Source, reader: String, offset: Int64, count: Int) {
         guard count > 0, offset >= 0 else { return }
-        let key = Self.sourceKey(url)
+        let key = source.key
         lock.lock()
         mutate(key) { source in
             let added = source.spans.insert(start: offset, end: offset + Int64(count))
@@ -77,10 +90,10 @@ final class SourceByteLedger: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Bytes that crossed the wire for `url` and were dropped without being served.
-    func discard(_ url: URL, reader: String, count: Int) {
+    /// Bytes that crossed the wire for `source` and were dropped without being served.
+    func discard(_ source: Source, reader: String, count: Int) {
         guard count > 0 else { return }
-        let key = Self.sourceKey(url)
+        let key = source.key
         lock.lock()
         mutate(key) { source in
             source.byReader[reader, default: Tally()].fetched += Int64(count)
@@ -89,37 +102,37 @@ final class SourceByteLedger: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Bytes `reader` was served from `SourceByteCache` for `url`.
-    func servedFromCache(_ url: URL, reader: String, count: Int) {
+    /// Bytes `reader` was served from `SourceByteCache` for `source`.
+    func servedFromCache(_ source: Source, reader: String, count: Int) {
         guard count > 0 else { return }
-        let key = Self.sourceKey(url)
+        let key = source.key
         lock.lock()
         mutate(key) { $0.byReader[reader, default: Tally()].fromCache += Int64(count) }
         lock.unlock()
     }
 
-    func readerClosed(_ url: URL, reader: String) {
-        let key = Self.sourceKey(url)
+    func readerClosed(_ source: Source, reader: String) {
+        let key = source.key
         lock.lock()
-        guard var source = sources[key] else { lock.unlock(); return }
-        source.openReaders = max(0, source.openReaders - 1)
-        let last = source.openReaders == 0
-        let snapshot = Self.snapshot(of: source)
-        let changed = snapshot.fetched + snapshot.fromCache != source.reportedFetched
-        source.reportedFetched = snapshot.fetched + snapshot.fromCache
-        if last { sources[key] = nil } else { sources[key] = source }
+        guard var books = sources[key] else { lock.unlock(); return }
+        books.openReaders = max(0, books.openReaders - 1)
+        let last = books.openReaders == 0
+        let snapshot = Self.snapshot(of: books)
+        let changed = snapshot.fetched + snapshot.fromCache != books.reportedFetched
+        books.reportedFetched = snapshot.fetched + snapshot.fromCache
+        if last { sources[key] = nil } else { sources[key] = books }
         lock.unlock()
         guard snapshot.fetched + snapshot.fromCache > 0, last || changed else { return }
         EngineLog.emit(
-            "[SourceLedger] \(Self.display(url)) \(reader) closed"
-            + (last ? ", source done" : ", \(source.openReaders) reader(s) still open")
+            "[SourceLedger] \(source.display) \(reader) closed"
+            + (last ? ", source done" : ", \(books.openReaders) reader(s) still open")
             + ": \(Self.describe(snapshot))",
             category: .demux)
     }
 
-    func snapshot(_ url: URL) -> Snapshot? {
+    func snapshot(_ source: Source) -> Snapshot? {
         lock.lock(); defer { lock.unlock() }
-        return sources[Self.sourceKey(url)].map(Self.snapshot(of:))
+        return sources[source.key].map(Self.snapshot(of:))
     }
 
     func resetForTesting() {
@@ -130,12 +143,11 @@ final class SourceByteLedger: @unchecked Sendable {
     // MARK: - Books
 
     /// Caller holds `lock`.
-    private func mutate(_ key: String, _ body: (inout Source) -> Void) {
+    private func mutate(_ key: String, _ body: (inout Books) -> Void) {
         clock &+= 1
-        var source = sources[key] ?? Source()
-        body(&source)
-        source.touched = clock
-        sources[key] = source
+        // Mutated in place: a copy out and back would copy the span set on every delivery.
+        body(&sources[key, default: Books()])
+        sources[key]?.touched = clock
         guard sources.count > Self.maxSources,
               let evict = sources.filter({ $0.value.openReaders == 0 && $0.key != key })
                 .min(by: { $0.value.touched < $1.value.touched })?.key
@@ -143,7 +155,7 @@ final class SourceByteLedger: @unchecked Sendable {
         sources[evict] = nil
     }
 
-    private static func snapshot(of source: Source) -> Snapshot {
+    private static func snapshot(of source: Books) -> Snapshot {
         let fetched = source.byReader.values.reduce(0) { $0 + $1.fetched }
         let discarded = source.byReader.values.reduce(0) { $0 + $1.discarded }
         let fromCache = source.byReader.values.reduce(0) { $0 + $1.fromCache }
@@ -152,10 +164,6 @@ final class SourceByteLedger: @unchecked Sendable {
     }
 
     // MARK: - Naming
-
-    static func sourceKey(_ url: URL) -> String { SourceIdentity.key(url) }
-
-    static func display(_ url: URL) -> String { SourceIdentity.display(url) }
 
     static func describe(_ snapshot: Snapshot) -> String {
         let percent = snapshot.fetched > 0
