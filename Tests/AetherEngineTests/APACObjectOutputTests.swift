@@ -178,6 +178,27 @@ struct APACObjectOutputTests {
         #expect(abs(db) < 0.25, "\(db) dB against the bed encoder")
     }
 
+    /// Every bed channel of a 7.1.4 presentation, the centre among them, plays from its own speaker at the
+    /// level the channel bed gives that channel: the renderer attenuates by distance from the room's
+    /// centre (the corners 3 dB, the tops 1.8, the centre none), and the object carrying each bed
+    /// channel undoes it (`distanceCompensation`), so no channel moves against the dialogue.
+    @Test("each 7.1.4 bed channel plays on its speaker at the channel bed's level",
+          arguments: SpatialSpeakerLayout.l714.speakers.filter { !$0.isLFE })
+    func bedChannelLevel(_ speaker: SpatialSpeaker) throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let roles = SpatialSpeakerLayout.l714.speakers.map { $0.isLFE ? ObjectAudioRole.lfe : .bed($0) }
+        let channel = SpatialSpeakerLayout.l714.speakers.firstIndex(of: speaker)!
+        let out = try render(roles: roles, signalOn: channel, frames: 48_000, updates: [], tone: true)
+        let reference = try bedReference(frames: 48_000, channel: channel)
+        let (from, to) = (8192, 48_000 - 4096)
+        let db = 10 * log10(Self.power(out[channel], from, to) / Self.power(reference[channel], from, to))
+        let share = Self.shares(out, from: from, to: to)[channel]
+        print(String(format: "[bedChannelLevel] %@ %+.2f dB against the channel bed, %.1f%% on its speaker",
+                     speaker.rawValue, db, share * 100))
+        #expect(abs(db) < 0.25, "\(db) dB against the channel bed")
+        #expect(share > 0.99, "shares \(Self.describe(Self.shares(out, from: from, to: to)))")
+    }
+
     /// The same 1 kHz tone on the left channel of a 7.1.4 bed through `APACEncoder`, decoded alike.
     @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
     private func bedReference(frames: Int, channel: Int = 0) throws -> [[Float]] {
@@ -539,8 +560,8 @@ struct APACObjectOutputTests {
 
         for (name, decoded, kbps) in [("objects", objects, objectRate), ("bed    ", bedDecoded, bedRate)] {
             let q = Self.quality(decoded, against: reference, frames: frames)
-            print(String(format: "[sceneQuality] %@ %6.0f kbps  SNR %5.1f dB  segmental median %5.1f p10 %5.1f  bands %@  per speaker %@",
-                         name, kbps / 1000, q.snr, q.segmentalMedian, q.segmentalP10, q.bands, q.perSpeaker))
+            print(String(format: "[sceneQuality] %@ %6.0f kbps  SNR %5.1f dB  segmental median %5.1f p10 %5.1f  bands %@  per speaker %@  level %@",
+                         name, kbps / 1000, q.snr, q.segmentalMedian, q.segmentalP10, q.bands, q.perSpeaker, q.levels))
         }
     }
 
@@ -564,7 +585,8 @@ struct APACObjectOutputTests {
         return reference
     }
 
-    struct Quality { var snr, segmentalMedian, segmentalP10: Double; var bands, perSpeaker: String }
+    /// `levels`: each speaker's energy against the reference's, in dB (L R C Ls Rs Lrs Rrs Vhl Vhr Ltr Rtr).
+    struct Quality { var snr, segmentalMedian, segmentalP10: Double; var bands, perSpeaker, levels: String }
 
     /// `decoded` against `reference` (12 channels, LFE left out), after finding the codec's delay.
     static func quality(_ decoded: [[Float]], against reference: [[Float]], frames: Int) -> Quality {
@@ -582,12 +604,16 @@ struct APACObjectOutputTests {
         let count = min(frames, decoded[0].count - lag)
         func error(_ c: Int, _ i: Int) -> Double { Double(decoded[c][i + lag]) - Double(reference[c][i]) }
         var signal = 0.0, noise = 0.0
-        var perSpeaker: [String] = []
+        var perSpeaker: [String] = [], levels: [String] = []
         for c in speakers {
-            var s = 0.0, n = 0.0
-            for i in 0..<count { s += Double(reference[c][i] * reference[c][i]); let e = error(c, i); n += e * e }
+            var s = 0.0, n = 0.0, d = 0.0
+            for i in 0..<count {
+                s += Double(reference[c][i] * reference[c][i]); let e = error(c, i); n += e * e
+                d += Double(decoded[c][i + lag] * decoded[c][i + lag])
+            }
             signal += s; noise += n
             perSpeaker.append(String(format: "%.0f", 10 * log10(s / max(n, 1e-30))))
+            levels.append(String(format: "%+.2f", 10 * log10(max(d, 1e-30) / max(s, 1e-30))))
         }
         var segments: [Double] = []
         for w in stride(from: 0, to: count - 1024, by: 1024) {
@@ -629,7 +655,8 @@ struct APACObjectOutputTests {
         return Quality(snr: 10 * log10(signal / max(noise, 1e-30)),
                        segmentalMedian: segments.isEmpty ? 0 : segments[segments.count / 2],
                        segmentalP10: segments.isEmpty ? 0 : segments[segments.count / 10],
-                       bands: "[" + bands + "]", perSpeaker: "[" + perSpeaker.joined(separator: " ") + "]")
+                       bands: "[" + bands + "]", perSpeaker: "[" + perSpeaker.joined(separator: " ") + "]",
+                       levels: "[" + levels.joined(separator: " ") + "]")
     }
 
     // MARK: - Outputs
