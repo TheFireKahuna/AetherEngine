@@ -207,22 +207,18 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         if position >= totalSize { return 0 }
 
         if position < bufferStart || position >= bufferStart + Int64(buffer.count) {
-            let chunk = readAhead.size(forReadAt: position, requested: Int(n))
-            // Stop where a span the source cache holds begins: another reader of this source, a clone
-            // of this one or a host's warm (#647) fetched it already.
-            let limit = sourceCache?.nextHeldStart(
-                cacheKey, after: position, before: totalSize, expectedSize: totalSize) ?? totalSize
-            let want = Int(min(Int64(chunk), limit - position))
-            let held = sourceCache?.read(cacheKey, at: position, maxLength: chunk,
-                                         expectedSize: totalSize)
-            if let held { SourceByteLedger.shared.servedFromCache(ledgerSource, reader: label, count: held.count) }
-            guard want > 0 || held != nil,
-                  let data = held ?? fetchWithRetry(offset: position, length: want), !data.isEmpty else {
-                return -1
+            let data: Data
+            if let ahead = takeReadAhead(at: position) {
+                data = ahead
+            } else {
+                let chunk = readAhead.size(forReadAt: position, requested: Int(n))
+                guard let fetched = fetchBlock(at: position, chunk: chunk) else { return -1 }
+                data = fetched
             }
             bufferStart = position
             buffer = data
             readAhead.fetched(at: position, count: buffer.count)
+            startReadAhead(after: position + Int64(data.count), requested: Int(n))
         }
 
         let bufOffset = Int(position - bufferStart)
@@ -233,6 +229,74 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         buffer.copyBytes(to: UnsafeMutableBufferPointer(start: out, count: toCopy), from: lower..<(lower + toCopy))
         position += Int64(toCopy)
         return Int32(toCopy)
+    }
+
+    /// One block at `offset`: what the source cache holds there, or a fetch that stops where a
+    /// held span begins (another reader of this source, a clone of this one or a host's warm (#647)
+    /// fetched it already). nil when neither has a byte.
+    private func fetchBlock(at offset: Int64, chunk: Int) -> Data? {
+        let limit = sourceCache?.nextHeldStart(
+            cacheKey, after: offset, before: totalSize, expectedSize: totalSize) ?? totalSize
+        let want = Int(min(Int64(chunk), limit - offset))
+        if let held = sourceCache?.read(cacheKey, at: offset, maxLength: chunk, expectedSize: totalSize) {
+            SourceByteLedger.shared.servedFromCache(ledgerSource, reader: label, count: held.count)
+            return held
+        }
+        guard want > 0, let data = fetchWithRetry(offset: offset, length: want), !data.isEmpty else {
+            return nil
+        }
+        return data
+    }
+
+    // MARK: - Read-ahead
+
+    /// The next block of a sequential walk, fetched while the demuxer consumes the current one, so
+    /// the link is not idle between refills. One block, one at a time; a read anywhere else leaves
+    /// it unused.
+    private let readAheadCondition = NSCondition()
+    private var readAheadOffset: Int64?
+    private var readAheadInFlight = false
+    private var readAheadData: Data?
+    private lazy var readAheadQueue = DispatchQueue(
+        label: "com.aetherengine.disc.readahead.\(label)", qos: .userInitiated)
+
+    /// Starts fetching the block at `offset` once reads have turned sequential (the window has grown
+    /// past its floor), the source has more, and no read-ahead is outstanding. Caller holds `lock`.
+    private func startReadAhead(after offset: Int64, requested: Int) {
+        guard offset < totalSize, readAhead.current > readAhead.floor else { return }
+        readAheadCondition.lock()
+        guard !readAheadInFlight else { readAheadCondition.unlock(); return }
+        let chunk = readAhead.size(forReadAt: offset, requested: requested)
+        readAheadOffset = offset
+        readAheadInFlight = true
+        readAheadData = nil
+        readAheadCondition.unlock()
+        readAheadQueue.async { [weak self] in
+            guard let self else { return }
+            let data = self.fetchBlock(at: offset, chunk: chunk)
+            self.readAheadCondition.lock()
+            self.readAheadData = data
+            self.readAheadInFlight = false
+            self.readAheadCondition.broadcast()
+            self.readAheadCondition.unlock()
+        }
+    }
+
+    /// The read-ahead block when it starts at `offset`, waiting for it if it is still on its way;
+    /// nil (and the block dropped) for a read anywhere else. Caller holds `lock`.
+    private func takeReadAhead(at offset: Int64) -> Data? {
+        readAheadCondition.lock()
+        defer { readAheadCondition.unlock() }
+        guard readAheadOffset == offset else {
+            if !readAheadInFlight { readAheadOffset = nil; readAheadData = nil }
+            return nil
+        }
+        while readAheadInFlight { readAheadCondition.wait() }
+        let data = readAheadData
+        readAheadOffset = nil
+        readAheadData = nil
+        guard let data, !data.isEmpty else { return nil }
+        return data
     }
 
     func seek(offset: Int64, whence: Int32) -> Int64 {
