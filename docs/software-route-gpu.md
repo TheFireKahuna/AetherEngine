@@ -5,7 +5,7 @@ picture reaches the display, and every still, in one GPU pass with no CPU pass o
 finisher and H.273 colour) and 3 (AV1 into the slabs) are built; parts 4 (bwdif on the GPU) and 6 (film in
 interlaced carriage) are built and verified on device; part 5 (AV1 film grain) is built and bit exact on the Argon
 streams; part 7 (stills) is built, its device check open. Part 8 records the mid-stream colour fixes part 5's
-conformance run led to. Part 1 (the software route inside AVPlayer) is open. The colour equations are in
+conformance run led to. Part 1 (one overlay for every picture AVPlayer cannot show) is open. The colour equations are in
 [colour-representation.md](colour-representation.md).
 
 What still passes over pixels on the CPU, each on purpose:
@@ -28,72 +28,129 @@ copied twice more.
 The goal is one architecture: **software-decoded pictures shown inside the native player**, and **no CPU pass over
 the pixels after decode**.
 
-## Part 1. The software route inside AVPlayer (open)
+## Part 1. One overlay for every picture AVPlayer cannot show (open)
 
 ### The idea
 
-AVPlayer plays a **placeholder** video track in the source's real format, with its rendering suppressed
-(`AVPlayerItemVideoOutput.suppressesPlayerRendering`), and the source's real audio. Our decoder's pictures are drawn
-on a sample-buffer layer inside AVKit's player layer, under the subtitles, timed by the item's clock. This is the
-FEL overlay route (`FelOverlayRenderer`) without the base layer: AVPlayer owns the clock, audio, transport, subtitles,
-seeking and the display mode; we own the picture.
+AVPlayer plays a **placeholder** video track carrying the source's real format: size, colour, HDR metadata and the
+Dolby Vision RPU. Its rendering is suppressed (`AVPlayerItemVideoOutput.suppressesPlayerRendering`), and it plays the
+source's real audio. Our own pictures are drawn on a sample-buffer layer inside AVKit's player layer, under the
+subtitles, and timed by the item's clock. AVPlayer owns the clock, audio, transport, subtitles, seeking and the display
+mode. We own the picture.
+
+The FEL overlay already works this way, with the base layer standing in for the placeholder. It becomes the general
+**software overlay**: one presenter with two frame sources.
+
+This is a hard cutover. Every source the software host played moves to the overlay, with no second path and no
+fallback. `SoftwarePlaybackHost` and its files go back to upstream's version.
 
 ### What the device probes established (LG G5, Apple TV 4K 3rd gen, tvOS 27.2)
 
-Probe: `Probes/DolbyVisionPulse`, `SEQ=placeholder` (`Scripts/build_placeholder.sh`, `Device/Host/PulsePlaceholder.swift`;
-not committed yet).
+Probe: `Probes/DolbyVisionPulse`, `SEQ=placeholder` (`Scripts/build_placeholder.sh`, `Device/Host/PulsePlaceholder.swift`,
+`2edac71f`).
 
 - The display mode follows the placeholder: a `dvh1` placeholder puts the TV in Dolby Vision, `hvc1` HDR10 in HDR10.
 - **The Dolby Vision metadata that reaches the panel is always the RPU in the stream AVPlayer plays, never the overlay
-  layer's `DolbyVisionRPUData` attachment.** Arms GD (placeholder constant RPU, overlay pulsing RPU) and GV
-  (HDR10 placeholder, DV criteria set by the host) stayed steady; GX (placeholder pulsing, overlay constant) pulsed.
-- The FEL overlay works because `DoviRpuConverter.separateDualLayers` writes the composed-form 8.1 RPU into the
-  packets AVPlayer plays (`out = thisFEL ? forms.composed : forms.baseLayer`); the overlay's own attachment is
-  redundant.
-- **Arm GE, the intended design, worked:** a `dvh1` placeholder carrying the source's per-frame RPU (`ph_dv_l2`),
-  AVKit setting the mode, the overlay showing the source's frames (`pulse_l2`): Dolby Vision, the pulse in step.
+  layer's `DolbyVisionRPUData` attachment.**
+  - Arm GD (placeholder RPU constant, overlay RPU pulsing) stayed steady.
+  - Arm GV (HDR10 placeholder, DV criteria set by the host) stayed steady.
+  - Arm GX (placeholder RPU pulsing, overlay RPU constant) pulsed.
+
+  The FEL overlay therefore puts its composed-form RPU, and the amplifier override, into AVPlayer's packets and
+  attaches none (`ff0cbd3d`).
+- **Arm GE, the intended design, worked.** A `dvh1` placeholder carried the source's per-frame RPU (`ph_dv_l2`), and
+  the overlay showed the source's frames (`pulse_l2`). The TV was in Dolby Vision with the pulse in step.
+
+### Why AVPlayer needs no help with buffering
+
+The source, container and HLS are the same as on the hardware route. Only the picture's decoder changes. AVPlayer
+buffers placeholder segments as freely as real ones. The tap holds the real packets compressed, and the decoder runs
+just ahead of the clock, as AVPlayer's own decoder does.
+
+The one thing AVPlayer cannot do is wait for a decoder it does not own. It prerolls the placeholder, which is
+instant, and starts the clock. So after a start or a seek, the first fragment is held until our decoder has the
+target picture. After that the decoder only has to keep pace. A picture that misses its refresh is counted, as the
+FEL overlay counts late frames today.
 
 ### Design
 
-- **The placeholder** is built on device per source, with VideoToolbox's hardware encoder (a flat picture encoded
-  once, then stamped with the source's timestamps; no hand-written bitstream). It matches the source in coded and
-  display size (crop, aspect), Main10 or the source's profile, colour primaries, transfer and matrix in the VUI, and
-  frame rate. Its keyframes and segments are ours to choose (short, about 1 s, each starting on a keyframe): scrub
-  thumbnails come from the separate SDR I-frame tier built from source keyframes, not from the placeholder.
-- **Metadata rides in the placeholder bitstream, with the source's values**, in the packet with the matching
-  timestamp: the Dolby Vision RPU as an unspec62 NAL (for AV1 profile 10 moved from its T.35 OBU), HDR10+ as SEI,
-  mastering display and content light level as SEI and in the init segment (`mdcv` / `clli`) from the source, none if
-  the source has none.
-- **Readiness is the segment server's.** AVPlayer waits only for decoders it owns. The engine serves the HLS, so it
-  holds the placeholder segment for time T until our decoder has frames past T plus a margin: after a seek AVPlayer
-  waits for the segment at the target, and a decoder falling behind stalls AVPlayer at a segment boundary with its
-  own spinner. Decoded frames held ahead: about a second at 4K (P010, a few hundred MB), tuned by segment length.
-- **Timing follows what the FEL overlay follows.** The FEL overlay presents against
-  `AVPlayerItemVideoOutput.itemTime(forHostTime:)` with display-link stamping and measured picture against audio at
-  -23.7 ms, steady. The placeholder probe's child-of-`item.timebase` layer read about +170 ms against `item.timebase`;
-  that probe did not time frames the way the FEL overlay does, so the overlay generalises `FelOverlayRenderer`'s
-  presentation instead.
-- **The overlay generalises `FelOverlayRenderer`** from "compose the FEL residual" to "present the frame source
-  attached": FEL composition and software decode become two frame sources for one presenter.
+1. **`SoftwareOverlayRenderer`** (`Native/`) is today's `FelOverlayRenderer` with the picture step behind a frame
+   source. It is built outside the `DualLayerDolbyVision` trait; the FEL source stays inside it.
+   - **FEL source:** pairs AVPlayer's base-layer frame with the enhancement layer, as today.
+   - **Decode source:** the latest decoded picture at or before the item time of the target refresh. The output
+     timeline is not the packet timeline: field-rate bwdif doubles it, decimation drops one picture in five, and
+     soft telecine retimes it. So the clock chooses the picture, and the placeholder's frames only signal that
+     frames are coming.
+   - **At scan rates** (rate other than 0 or 1), AVPlayer plays the I-frame tier and the renderer shows the frames
+     its video output decodes.
+   - **PiP** takes the overlay layer itself, with lossless pixels
+     (`AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer:playbackDelegate:)`).
+2. **`OverlayPacketTap`** (`Video/`) is `FelEnhancementTap`'s store, runs, keyframe restarts and decode loop, shared
+   by both sources.
+   - **FEL tap:** keeps the enhancement-layer packets and the composer parameters.
+   - **Decode tap:** keeps whole source packets, about a minute behind the clock, and decodes them with
+     `SoftwareVideoDecoder`, configured as the software host configures it (`DeinterlaceConfig`, the film carriage
+     from the load probe).
+   - **One decoder per session.** A seek flushes it and never reopens it, so the slab allocator, the finisher's
+     pipelines and plan cache, the buffer pool and the grain tables all stay warm. Pictures before the target are
+     decoded as references only (`skipUntilPTS`).
+   - A seek back into resident segments restarts from a keyframe the tap already holds. A short forward seek inside
+     the decoded window restarts nothing.
+   - The decoder is reopened only when the stream changes.
+   - **The decode lead** is a few pictures, not the FEL tap's 0.75 s, which is about 450 MB at 4K24.
+   - **Captions** come from the decoder's `onA53Captions`, because the producer's A53 scan sees only placeholder
+     bytes.
+3. **The placeholder.** One flat picture is encoded at load as an HEVC Main10 IDR by `VTCompressionSession`, at the
+   source's coded size with the source's colour in the VUI.
+   - Every video packet's payload becomes that IDR plus the source's metadata for that picture. The packet keeps its
+     pts, dts, duration and key flag.
+   - Every sample is an independent IDR, so any order the source decodes and presents in is valid.
+   - **Metadata per packet:**
+     - the Dolby Vision RPU as an unspec62 NAL (AV1 profile 10 moves it from its T.35 metadata OBU);
+     - HDR10+ as a T.35 SEI (the same payload as AV1's metadata OBU).
+   - **The init** has the placeholder's own `hvcC`. Its `colr`, `mdcv` / `clli` and `dvcC` come from the source,
+     derived as the native route derives them. CODECS come from the placeholder's record.
+   - **Where:** `prepare()` accepts every codec the decoder takes. The substitution happens where the FEL tap's
+     rewrite runs, before `finalizeAndWriteVideo`'s HDR10+ and A53 scans.
+4. **The I-frame tiers.**
+   - **Scan tier:** the source's keyframes encoded by the hardware encoder in their own range, HDR10 or Dolby Vision
+     8.1 with the keyframe's RPU, at up to 1080p (`IFrameStillBuilder` without its tone map). The main player of an
+     HDR session drops an SDR tier, so the scan tier cannot be SDR.
+   - **Thumbnail tier:** the SDR stills tier, unchanged. It already decodes every codec through
+     `FrameDecodeContext`.
+5. **Readiness and routing.**
+   - Overlay sessions serve progressively. After a start or a seek, the first fragment waits for the decode tap's
+     target picture.
+   - The display criteria take the output rate: the field rate for bwdif, the film rate for film.
+   - Everything `VideoRoutingPolicy.requiresSoftwarePath` sent to the software host goes to the overlay, live
+     included. That covers:
+     - codecs outside AVPlayer;
+     - AV1 without hardware;
+     - MVC;
+     - interlaced H.264;
+     - formats VideoToolbox cannot decode;
+     - forward-only sources;
+     - the `.software` preference.
+   - The escalations do the same. The placeholder's init never changes, and the decoder takes in-band
+     parameter-set changes.
+   - AV1 profile 10.0 (IPT, Profile 5's equivalent) stays refused: its reshaping happens in the system compositor,
+     which overlay pixels never pass through. AV1 10.1 and 10.4 play.
 
 ### Order of work
 
-1. Commit the placeholder probe (the files above, `run_tv.sh`'s `SEQ=placeholder`, `PH_ARMS`).
-2. Placeholder builder (VideoToolbox, per source, at load) with per-packet RPU / HDR10+ injection in
-   `HLSSegmentProducer`.
-3. Segment gating by decoder readiness in the segment server.
-4. `FelOverlayRenderer` generalised to any frame source; software decoders feed it.
-5. A device check per arm the probe already has (DV, HDR10, HLG, Atmos, transport bar, pause, scrub, seek), then a
-   lip-sync check with a flash-and-beep clip filmed by phone.
+1. Rename and split, with no behaviour change: `SoftwareOverlayRenderer` plus the FEL source, and `OverlayPacketTap`
+   plus the FEL tap.
+2. The placeholder, metadata carriage, `prepare()` for every codec, the scan tier.
+3. The decode source, captions, scan rates, PiP.
+4. Readiness, then the routing cutover. `SoftwarePlaybackHost` and its files go back to upstream.
+5. Device checks per source class: AV1 HDR10 / HDR10+ / Dolby Vision 10.1, MPEG-2 1080i, film, VC-1. Then the
+   transport bar, pause, scrub, scan timing, seek, PiP and Atmos. Then a lip-sync check with a flash-and-beep clip
+   filmed by phone.
 
-### SoftwarePlaybackHost
-
-Once the overlay plays every software codec, the software host is dead code for this fork. Decision pending: revert
-our fork's edits to the software host to upstream's version and leave it in place (merges stay clean), or delete it.
-Our edits there total about 2.1k lines (`AudioOutput`, `AudioRendererIO`, `VideoRendererIO`, `DualLayerVideoDecoder`,
-`SoftwarePlaybackHost`, `SampleBufferRenderer`, the APAC keep-alive pieces). Shared files need per-file care:
-`AtmosOutputActivator` is used by the native route, `AudioOutput` by the audio-only host, `DoviComposedRpuOverride`
-by the overlay. `aetherctl play --fel` and the pulse probe's soak arm use the software route on purpose.
+Our fork's edits to the software host total about 2.1k lines (`AudioOutput`, `AudioRendererIO`, `VideoRendererIO`,
+`DualLayerVideoDecoder`, `SoftwarePlaybackHost`, `SampleBufferRenderer`, the APAC keep-alive pieces). Files the
+native route shares need per-file care: `AtmosOutputActivator` (native route), `AudioOutput` (the audio-only host),
+`DoviComposedRpuOverride` (the overlay).
 
 ## Part 2. Zero-copy decode and the GPU finisher (built)
 
@@ -489,10 +546,8 @@ CODECS stay as the master declared them at load.
 
 ## Open questions
 
-- **The FEL overlay's 12-bit result.** The `cardov` arms OR / OS put the amplifier RPU override
-  (`DoviComposedRpuOverride`) on the overlay layer's frames only. By the placeholder findings that attachment never
-  reaches the panel, so "the overlay kept the sub-10-bit steps" (`61c7412f`) is unproven on the native route until the
-  override is written into the segment producer's packets and the card test is repeated.
+- **The FEL overlay's 12-bit result.** The amplifier override now rides in AVPlayer's packets (`ff0cbd3d`); the
+  `cardov` card test has to be repeated to show the sub-10-bit steps reach the panel on the native route.
 - **dav1d throughput on the A15** at 4K 10-bit (with and without film grain) is unmeasured; it sets the decode-ahead
   the segment gating needs.
 - **The finisher's speed on the Apple TV** is unmeasured (all figures are M4 Pro), and so is the grain's cost
