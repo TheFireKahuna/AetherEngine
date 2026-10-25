@@ -282,17 +282,29 @@ final class MP4SegmentMuxer {
     private var fragmentWindowFirstVideoDts: Int64 = Int64.min
 
     /// AE#684: the sound handed to the segment being cut, first and last packet, in
-    /// `muxerAudioTimeBase`. A segment opens on a video keyframe and carries whatever audio the
-    /// source interleaved up to there, so where its sound begins against its picture is a property
-    /// of the source's mux, and it is what an item placed in that segment starts its audio from.
+    /// `muxerAudioTimeBase`, and the earliest picture, in `muxerVideoTimeBase`, as written. A segment
+    /// opens on a video keyframe and carries whatever audio the source interleaved up to there, so
+    /// where its sound begins against its picture is a property of the source's mux, and it is what
+    /// an item placed in that segment starts its audio from.
+    struct SegmentOpening {
+        let pictureFirstPts: Int64?
+        let sound: (first: Int64, last: Int64)?
+    }
+    private var segmentPictureFirstPts: Int64 = Int64.min
     private var segmentSoundFirstPts: Int64 = Int64.min
     private var segmentSoundLastPts: Int64 = Int64.min
 
-    /// The span since the last call, nil when the segment carried no audio packet. Consumes it.
-    func takeSegmentSoundSpan() -> (first: Int64, last: Int64)? {
-        defer { segmentSoundFirstPts = Int64.min; segmentSoundLastPts = Int64.min }
-        guard segmentSoundFirstPts != Int64.min else { return nil }
-        return (segmentSoundFirstPts, segmentSoundLastPts)
+    /// What the segment written since the last call opened with. Consumes it, so it is taken at
+    /// every cut.
+    func takeSegmentOpening() -> SegmentOpening {
+        defer {
+            segmentPictureFirstPts = Int64.min
+            segmentSoundFirstPts = Int64.min
+            segmentSoundLastPts = Int64.min
+        }
+        return SegmentOpening(
+            pictureFirstPts: segmentPictureFirstPts == Int64.min ? nil : segmentPictureFirstPts,
+            sound: segmentSoundFirstPts == Int64.min ? nil : (segmentSoundFirstPts, segmentSoundLastPts))
     }
 
     let videoOutputStreamIndex: Int32 = 0
@@ -805,6 +817,10 @@ final class MP4SegmentMuxer {
         // routing/placement is untouched, so no audio dropouts. The proactive flush is scoped to
         // AC-3/E-AC-3/TrueHD (audioNeedsParsedPacketForMoov): AAC (and every other codec) never wedges and
         // must keep the exact stock code path, no extra early fragment flush, so nothing perturbs its audio.
+        if streamIndex == videoOutputStreamIndex, rc >= 0, clean.pts != Int64.min,
+           segmentPictureFirstPts == Int64.min || clean.pts < segmentPictureFirstPts {
+            segmentPictureFirstPts = clean.pts
+        }
         if streamIndex == audioOutputStreamIndex {
             audioPacketWritten = true
             if rc >= 0, clean.pts != Int64.min {

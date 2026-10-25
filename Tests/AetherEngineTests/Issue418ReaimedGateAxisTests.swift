@@ -523,7 +523,7 @@ struct Issue418PlacementIdentityTests {
         // and the baseline still holds [65.083-84.974] from before. Round 4 refused this for moving
         // downward against an overlapping baseline range.
         #expect(HLSVideoEngine.placementRunStart(
-            ranges: [(53.083, 70.035)], predictedSeam: 53.0)?.start == 53.083)
+            ranges: [(53.083, 70.035)], predictedSeam: 53.0, rawSeam: nil, soundLag: 0, positionedAt: nil)?.start == 53.083)
     }
 
     @Test("the fixture's own correction is still read the same way")
@@ -531,7 +531,7 @@ struct Issue418PlacementIdentityTests {
         // `tc-bf-cues-lie.mkv`, second placement: seam 61.000 predicted, AVPlayer opens [61.083-82.052]
         // and the residual -0.083 is the lead this source's compositions land below.
         #expect(HLSVideoEngine.placementRunStart(
-            ranges: [(61.083, 82.052)], predictedSeam: 61.0)?.start == 61.083)
+            ranges: [(61.083, 82.052)], predictedSeam: 61.0, rawSeam: nil, soundLag: 0, positionedAt: nil)?.start == 61.083)
     }
 
     @Test("a placement that merges into the run it extends still opens at its seam")
@@ -540,7 +540,7 @@ struct Issue418PlacementIdentityTests {
         // the seam to the millisecond ([66.166-83.118] for a predicted 66.166), so there was a reading
         // all along; it was refused for sitting below a baseline of [78.166-94.057].
         #expect(HLSVideoEngine.placementRunStart(
-            ranges: [(66.166, 83.118)], predictedSeam: 66.166)?.start == 66.166)
+            ranges: [(66.166, 83.118)], predictedSeam: 66.166, rawSeam: nil, soundLag: 0, positionedAt: nil)?.start == 66.166)
     }
 
     @Test("a run seconds away from the seam is another segment's")
@@ -548,13 +548,13 @@ struct Issue418PlacementIdentityTests {
         // Sample 5 of the same arm. A segment is seconds long, so nothing that belongs to this
         // placement can be 21 s from where it said it would land.
         #expect(HLSVideoEngine.placementRunStart(
-            ranges: [(74.208, 86.099)], predictedSeam: 53.0, rawSeam: 44.0) == nil)
+            ranges: [(74.208, 86.099)], predictedSeam: 53.0, rawSeam: 44.0, soundLag: 0, positionedAt: nil) == nil)
     }
 
     @Test("the closest run to the seam is the one read")
     func closestRunWins() {
         #expect(HLSVideoEngine.placementRunStart(
-            ranges: [(52.0, 60.0), (61.083, 82.052)], predictedSeam: 61.0)?.start == 61.083)
+            ranges: [(52.0, 60.0), (61.083, 82.052)], predictedSeam: 61.0, rawSeam: nil, soundLag: 0, positionedAt: nil)?.start == 61.083)
     }
 
     @Test("the tolerance covers a couple of leads and nothing else")
@@ -563,6 +563,36 @@ struct Issue418PlacementIdentityTests {
         // second is already past every geometry measured and still far inside one segment.
         #expect(HLSVideoEngine.placementSeamToleranceSeconds > 0.166)
         #expect(HLSVideoEngine.placementSeamToleranceSeconds < 1.0)
+    }
+
+    // MARK: - What the loaded range's start is
+
+    @Test("a run held from where the item was positioned is AVPlayer's seek clamp, not an opening")
+    func seekClampIsNotAReading() {
+        // `tc-drought.mkv`, resume at 75.3 into a segment advertised at 75.125: AVPlayer holds
+        // [75.300-87.167] for the whole run, and reading it published a base of -0.175 against a
+        // picture that sat on its axis.
+        #expect(HLSVideoEngine.placementRunStart(
+            ranges: [(75.3, 87.167)], predictedSeam: 75.125, rawSeam: 75.125,
+            soundLag: 0, positionedAt: 75.3) == nil)
+        // The same range on an item positioned elsewhere is a reading.
+        #expect(HLSVideoEngine.placementRunStart(
+            ranges: [(75.3, 87.167)], predictedSeam: 75.125, rawSeam: 75.125,
+            soundLag: 0, positionedAt: 76.0)?.start == 75.3)
+    }
+
+    @Test("sound that starts after the picture opens the run that much late, and is taken off")
+    func soundLagIsTakenOff() {
+        // The same fixture at 75.8: picture at 75.125, its first AAC sound 14.8 ms later, the run
+        // held from 75.140. Read raw that taught the session a 0.015 s distance it never had.
+        let run = HLSVideoEngine.placementRunStart(
+            ranges: [(75.140, 87.167)], predictedSeam: 75.125, rawSeam: 75.125,
+            soundLag: 0.0148, positionedAt: 75.8)
+        #expect(abs((run?.start ?? .nan) - 75.1252) < 1e-9)
+        // Sound before the picture moves nothing: the run starts with the picture.
+        #expect(HLSVideoEngine.placementRunStart(
+            ranges: [(75.125, 87.167)], predictedSeam: 75.125, rawSeam: 75.125,
+            soundLag: -0.02, positionedAt: 75.8)?.start == 75.125)
     }
 
     // MARK: - The timeline AVPlayer rebuilt
@@ -574,7 +604,7 @@ struct Issue418PlacementIdentityTests {
         // and opened [52.000-75.969] for an advertised 52.000, base 0.000. The reading is 10.3 s from
         // the prediction and it is right: the picture reads -12.000 for the rest of the run.
         let run = HLSVideoEngine.placementRunStart(
-            ranges: [(52.0, 75.969)], predictedSeam: 62.333, rawSeam: 52.0)
+            ranges: [(52.0, 75.969)], predictedSeam: 62.333, rawSeam: 52.0, soundLag: 0, positionedAt: nil)
         #expect(run?.start == 52.0)
         #expect(run?.source == .rebuiltTimeline)
     }
@@ -586,13 +616,13 @@ struct Issue418PlacementIdentityTests {
         // how round 4's baseline test admitted it and published a 41.667 s residual for a segment
         // whose bytes were nowhere near it.
         #expect(HLSVideoEngine.placementRunStart(
-            ranges: [(92.0, 109.3)], predictedSeam: 50.333, rawSeam: 40.0) == nil)
+            ranges: [(92.0, 109.3)], predictedSeam: 50.333, rawSeam: 40.0, soundLag: 0, positionedAt: nil) == nil)
     }
 
     @Test("the composed seam is the first answer, the rebuilt one the fallback")
     func composedSeamWinsOverRaw() {
         let run = HLSVideoEngine.placementRunStart(
-            ranges: [(52.0, 60.0), (61.083, 82.052)], predictedSeam: 61.0, rawSeam: 52.0)
+            ranges: [(52.0, 60.0), (61.083, 82.052)], predictedSeam: 61.0, rawSeam: 52.0, soundLag: 0, positionedAt: nil)
         #expect(run?.start == 61.083)
         #expect(run?.source == .ownRun)
     }
@@ -600,7 +630,7 @@ struct Issue418PlacementIdentityTests {
     @Test("a resume composes onto nothing, so both answers are the same one")
     func firstPlacementOfTheSession() {
         let run = HLSVideoEngine.placementRunStart(
-            ranges: [(52.0, 64.958)], predictedSeam: 52.0, rawSeam: 52.0)
+            ranges: [(52.0, 64.958)], predictedSeam: 52.0, rawSeam: 52.0, soundLag: 0, positionedAt: nil)
         #expect(run?.start == 52.0)
         #expect(run?.source == .ownRun)
     }
@@ -609,8 +639,8 @@ struct Issue418PlacementIdentityTests {
 
     @Test("bytes held at the seam are a placement that happened")
     func heldSeamIsAPlacement() {
-        #expect(HLSVideoEngine.placementIsHeld(ranges: [(66.166, 83.118)], seam: 66.166))
-        #expect(HLSVideoEngine.placementIsHeld(ranges: [(52.0, 75.969)], seam: 62.333))
+        #expect(HLSVideoEngine.placementIsHeld(ranges: [(66.166, 83.118)], seam: 66.166, soundLag: 0, positionedAt: nil))
+        #expect(HLSVideoEngine.placementIsHeld(ranges: [(52.0, 75.969)], seam: 62.333, soundLag: 0, positionedAt: nil))
     }
 
     @Test("a seam no range covers is a placement that never reached the timeline")
@@ -618,8 +648,25 @@ struct Issue418PlacementIdentityTests {
         // The reporter's run 1: seg735 composed -28.028 s onto -12.889, was unmeasurable, and was
         // kept. The producer that opened for it was torn down with its segment discarded, and the next
         // measurable placement 4.5 s later found the axis 33 ms from where it stood before.
-        #expect(!HLSVideoEngine.placementIsHeld(ranges: [(3743.7, 3780.5)], seam: 2953.3))
-        #expect(!HLSVideoEngine.placementIsHeld(ranges: [], seam: 66.166))
+        #expect(!HLSVideoEngine.placementIsHeld(ranges: [(3743.7, 3780.5)], seam: 2953.3, soundLag: 0, positionedAt: nil))
+        #expect(!HLSVideoEngine.placementIsHeld(ranges: [], seam: 66.166, soundLag: 0, positionedAt: nil))
+    }
+
+    @Test("a run held from the seek target, or from its late sound, holds the placement")
+    func clampedOrLateRunIsHeld() {
+        // `tc-late.mkv`, resume at 75.0 into a segment advertised at 74.900: [75.000-...] and nothing
+        // below it, for the whole run.
+        #expect(HLSVideoEngine.placementIsHeld(
+            ranges: [(75.0, 87.167)], seam: 74.9, soundLag: 0, positionedAt: 75.0))
+        // The same range not on the seek target is a run that starts after the seam: not this one.
+        #expect(!HLSVideoEngine.placementIsHeld(
+            ranges: [(75.0, 87.167)], seam: 74.9, soundLag: 0, positionedAt: 76.0))
+        // Sound 15 ms behind the picture holds the run from 15 ms above the seam.
+        #expect(HLSVideoEngine.placementIsHeld(
+            ranges: [(75.140, 87.167)], seam: 75.125, soundLag: 0.015, positionedAt: nil))
+        // A clamp a whole segment above the seam belongs to another segment.
+        #expect(!HLSVideoEngine.placementIsHeld(
+            ranges: [(80.0, 87.167)], seam: 74.9, soundLag: 0, positionedAt: 80.0))
     }
 
 }

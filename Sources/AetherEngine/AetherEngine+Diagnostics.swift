@@ -184,7 +184,8 @@ extension AetherEngine {
                 // axis at all. Asked as "which run is new here", a later seek's run answers for it
                 // (measured against the picture: 21 s of error, and 41.667 s on the wide fixture).
                 if let run = HLSVideoEngine.placementRunStart(
-                    ranges: ranges, predictedSeam: pending.seam, rawSeam: pending.rawSeam) {
+                    ranges: ranges, predictedSeam: pending.seam, rawSeam: pending.rawSeam,
+                    soundLag: pending.soundLag, positionedAt: self.nativeHost?.positionedItemSeconds) {
                     session.reconcileAxisWithObservedPlacement(
                         observedItemStart: run.start, itemClock: self.nativeClockSeconds,
                         source: run.source)
@@ -201,9 +202,11 @@ extension AetherEngine {
                 }
                 if samplesSinceAnswered >= Self.placementVerificationAttempts { break }
             }
-            guard !Task.isCancelled, let session, let pending = session.pendingPlacement else { return }
+            guard !Task.isCancelled, let self, let session, let pending = session.pendingPlacement else { return }
             session.resolveUnreadablePlacement(
-                heldInBuffer: HLSVideoEngine.placementIsHeld(ranges: lastRanges, seam: pending.seam),
+                heldInBuffer: HLSVideoEngine.placementIsHeld(
+                    ranges: lastRanges, seam: pending.seam, soundLag: pending.soundLag,
+                    positionedAt: self.nativeHost?.positionedItemSeconds),
                 answered: session.pendingPlacementDelivery != nil)
         }
     }

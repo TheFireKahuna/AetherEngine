@@ -49,9 +49,32 @@ struct Issue481LandingAxisTests {
             openingSegmentStart: 72.0,
             worth: 600.0,
             assumedBase: -9.0,
-            standingAxis: 591.0)
+            standingAxis: 591.0, soundLag: 0)
         #expect(reading?.axis == 600.0)
         #expect(reading?.runStart == 72.0)
+    }
+
+    @Test("a run held from the landing itself is the seek clamp and carries no reading")
+    func landingClampIsNotAReading() {
+        // The arm above, landing 0.3 s into the segment that opens the run: AVPlayer holds the run
+        // from the landing and never lowers it, which matches neither the composed seam nor the
+        // segment's own position except by the distance the landing happens to be from it.
+        #expect(HLSVideoEngine.landingAxisReading(
+            landingItemSeconds: 75.425,
+            ranges: [(75.425, 119.958)],
+            openingSegmentStart: 75.125,
+            worth: 0, assumedBase: -9.0, standingAxis: -9.0, soundLag: 0) == nil)
+    }
+
+    @Test("sound behind the picture is taken off the run's start before it is read")
+    func landingTakesTheSoundLagOff() {
+        let reading = HLSVideoEngine.landingAxisReading(
+            landingItemSeconds: 84.917,
+            ranges: [(75.140, 119.958)],
+            openingSegmentStart: 75.125,
+            worth: 0, assumedBase: -9.0, standingAxis: -9.0, soundLag: 0.015)
+        #expect(reading?.axis == 0.0)
+        #expect(abs((reading?.runStart ?? .nan) - 75.125) < 1e-9)
     }
 
     /// The measured arm. The session maps with -9.000, the run holding the landing opens at the
@@ -65,7 +88,7 @@ struct Issue481LandingAxisTests {
             openingSegmentStart: 75.125,
             worth: 0,
             assumedBase: -9.0,
-            standingAxis: -9.0)
+            standingAxis: -9.0, soundLag: 0)
         #expect(reading?.axis == 0.0)
         #expect(reading?.runStart == 75.125)
     }
@@ -80,7 +103,7 @@ struct Issue481LandingAxisTests {
             openingSegmentStart: 75.125,
             worth: 0,
             assumedBase: -9.0,
-            standingAxis: -9.0) == nil)
+            standingAxis: -9.0, soundLag: 0) == nil)
     }
 
     /// The false positive this rule was rewritten to exclude, measured before it was: asking the whole
@@ -96,7 +119,7 @@ struct Issue481LandingAxisTests {
             openingSegmentStart: 143.75,
             worth: 0,
             assumedBase: -27.875,
-            standingAxis: -27.875) == nil)
+            standingAxis: -27.875, soundLag: 0) == nil)
     }
 
     @Test("no run holds the landing, so there is nothing to read")
@@ -107,7 +130,7 @@ struct Issue481LandingAxisTests {
             openingSegmentStart: 52.0,
             worth: -9.0,
             assumedBase: 0,
-            standingAxis: -9.0) == nil)
+            standingAxis: -9.0, soundLag: 0) == nil)
     }
 
     /// A run opens where its segment's content begins, which is a frame or two off the boundary on
@@ -120,7 +143,7 @@ struct Issue481LandingAxisTests {
             openingSegmentStart: 75.125,
             worth: 0,
             assumedBase: -9.0,
-            standingAxis: -9.0)
+            standingAxis: -9.0, soundLag: 0)
         // The run opens a frame ABOVE the position, so its content sits a frame below it, which is the
         // same arithmetic a placement reading does with its residual.
         #expect(abs((reading?.axis ?? .nan) + 0.042) < 0.0005)
@@ -136,7 +159,7 @@ struct Issue481LandingAxisTests {
             openingSegmentStart: 52.0,
             worth: -9.0,
             assumedBase: -14.0,
-            standingAxis: -14.0)
+            standingAxis: -14.0, soundLag: 0)
         #expect(reading?.axis == -9.0)
     }
 
@@ -151,7 +174,7 @@ struct Issue481LandingAxisTests {
             openingSegmentStart: 52.0,
             worth: -9.0,
             assumedBase: 0,
-            standingAxis: 0) == nil)
+            standingAxis: 0, soundLag: 0) == nil)
     }
 
     /// Reading back what is already standing is not a correction, and republishing it would re-arm the
@@ -164,6 +187,6 @@ struct Issue481LandingAxisTests {
             openingSegmentStart: 75.125,
             worth: 0,
             assumedBase: -9.0,
-            standingAxis: 0) == nil)
+            standingAxis: 0, soundLag: 0) == nil)
     }
 }

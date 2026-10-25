@@ -3535,6 +3535,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         prod.onFirstHDR10PlusDetected = { [weak self] in
             self?.notifyHDR10PlusOnce()
         }
+        prod.onSegmentSoundLag = { [weak self] index, seconds in
+            self?.recordSoundLag(seconds, at: index)
+        }
         prod.onVideoShiftKnown = { [weak self] shiftPts, firstItemTfdtPts, normalizationShiftPts in
             self?.handleVideoShiftKnown(
                 shiftPts, firstItemTfdtPts: firstItemTfdtPts,
@@ -3955,17 +3958,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// half-second tolerance, and measured on the #418 chain it wrote a 0.000 axis into a timeline
     /// carrying -27.875 s, taking `capErr` from +0.092 to -27.883 in one tick. A wrong candidate now
     /// costs silence rather than an axis: neither answer matches and nothing is published.
+    ///
+    /// `soundLag` is how far after the opening segment's first picture its first sound plays
+    /// (`placementRunStart`). A run that holds the landing from the landing itself is AVPlayer's seek
+    /// clamp, not a run's opening, and says nothing.
     static func landingAxisReading(
         landingItemSeconds: Double,
         ranges: [(Double, Double)],
         openingSegmentStart: Double,
         worth: Double,
         assumedBase: Double,
-        standingAxis: Double
+        standingAxis: Double,
+        soundLag: Double
     ) -> (axis: Double, runStart: Double)? {
-        guard let holding = ranges.first(where: {
+        guard let held = ranges.first(where: {
             $0.0.isFinite && $0.1.isFinite && $0.0 <= landingItemSeconds && landingItemSeconds <= $0.1
-        }) else { return nil }
+        }), !isSeekClamp(rangeStart: held.0, positionedAt: landingItemSeconds) else { return nil }
+        let holding = (held.0 - max(0, soundLag), held.1)
         let predicted = seamItemSeconds(advertisedStart: openingSegmentStart, currentShift: assumedBase)
         // Round 7's two admissible answers, asked at a landing instead of at a placement: a run opens
         // where the timeline this session knows would put this segment, or at the segment's own
@@ -3994,6 +4003,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let displacement = lastPlacementDisplacement
         let standingOffset = placementOffsetSeconds
         let opening = firstDeliveredIndexSinceSeek
+        let openingSoundLag = opening.flatMap { soundLagByIndex[$0] } ?? 0
         anchorShiftLock.unlock()
         // A placement awaiting measurement has the more specific reading (round 7) and measures the
         // same ranges; two writers on one axis would race, and the placement knows what it composed.
@@ -4014,7 +4024,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             landingItemSeconds: landingItemSeconds, ranges: ranges,
             openingSegmentStart: advertisedStart, worth: openingSourceShift,
             assumedBase: Self.placementBase(offset: standingOffset, displacement: displacement),
-            standingAxis: standing)
+            standingAxis: standing, soundLag: openingSoundLag)
         else { return false }
         EngineLog.emit(
             "[HLSVideoEngine] #481 the run holding the landing at item "
@@ -4095,14 +4105,34 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// which is new by every baseline test, and adopting it published a 21 s error against a picture
     /// that read -10.125. The same burst on the wide fixture adopted a run 41.667 s away by the
     /// disjoint-from-the-baseline test, for a segment whose bytes were nowhere near it.
+    ///
+    /// The run's start is where AVPlayer holds both tracks from, so it is the segment's first picture
+    /// only where the sound starts no later. Where it starts `soundLag` after it (a copied track's
+    /// first packet after the keyframe, a bridged run's first packet on its grid past the boundary),
+    /// the run opens that much late, and its picture starts that much before; measured on
+    /// `tc-drought.mkv`, a run held from 75.140 for a picture at 75.125 under sound 15 ms behind it.
+    /// A run held from exactly where the item was last positioned (`positionedAt`, a mount seek or a
+    /// seek) is not an opening at all: AVPlayer reports a run it started a little way into a segment
+    /// from the seek target and never lowers it (a resume at 75.3 into a segment at 75.125 held
+    /// `[75.300-87.167]` for the whole run), so it says nothing about where the segment sits.
     static func placementRunStart(
-        ranges: [(Double, Double)], predictedSeam: Double, rawSeam: Double? = nil
+        ranges: [(Double, Double)], predictedSeam: Double, rawSeam: Double?,
+        soundLag: Double, positionedAt: Double?
     ) -> (start: Double, source: ReadingSource)? {
-        if let own = runOpening(at: predictedSeam, in: ranges) { return (own, .ownRun) }
-        if let raw = rawSeam, let rebuilt = runOpening(at: raw, in: ranges) {
-            return (rebuilt, .rebuiltTimeline)
+        let lag = max(0, soundLag)
+        let readable = ranges.filter { !isSeekClamp(rangeStart: $0.0, positionedAt: positionedAt) }
+        if let own = runOpening(at: predictedSeam + lag, in: readable) { return (own - lag, .ownRun) }
+        if let raw = rawSeam, let rebuilt = runOpening(at: raw + lag, in: readable) {
+            return (rebuilt - lag, .rebuiltTimeline)
         }
         return nil
+    }
+
+    /// Whether a loaded range begins where the item was positioned, which is AVPlayer's clamp of a
+    /// run it started from there. A seek is a 1/600 s `CMTime`, and the range starts on it exactly.
+    static func isSeekClamp(rangeStart: Double, positionedAt: Double?) -> Bool {
+        guard let positionedAt else { return false }
+        return abs(rangeStart - positionedAt) < 0.001
     }
 
     private static func runOpening(at seam: Double, in ranges: [(Double, Double)]) -> Double? {
@@ -4124,8 +4154,22 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// nobody holds never moved the axis. The reporter's run 1 kept a composition of -28.028 s for a
     /// placement whose producer was torn down with its segment discarded: unmeasurable, kept, and
     /// 4.5 s later the next measurable placement found the axis 33 ms from where it stood before it.
-    static func placementIsHeld(ranges: [(Double, Double)], seam: Double) -> Bool {
-        return ranges.contains { $0.0.isFinite && $0.1.isFinite && $0.0 <= seam && seam <= $0.1 }
+    ///
+    /// Held is asked of the range as `placementRunStart` reads it: a run whose sound starts after its
+    /// picture is held from `soundLag` above the seam, and one AVPlayer started from the seek target
+    /// is held from there (`isSeekClamp`), its head hidden below. Asked of the seam alone, the clamp
+    /// of a resume at 75.0 into a segment advertised at 74.900 rolled a composition the picture
+    /// confirmed back to nothing, 0.225 s off for the rest of the run.
+    static func placementIsHeld(
+        ranges: [(Double, Double)], seam: Double, soundLag: Double, positionedAt: Double?
+    ) -> Bool {
+        let lag = max(0, soundLag)
+        return ranges.contains { range in
+            guard range.0.isFinite, range.1.isFinite, seam <= range.1 else { return false }
+            if range.0 <= seam + lag { return true }
+            return isSeekClamp(rangeStart: range.0, positionedAt: positionedAt)
+                && range.0 - seam <= placementSeamToleranceSeconds
+        }
     }
 
     /// What a placement measured out of AVPlayer's own buffer says the axis is.
@@ -4390,11 +4434,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// Where the placement being checked says its bytes begin: through the base the composition
     /// assumed, and through no base at all for a timeline AVPlayer rebuilt.
-    var pendingPlacement: (seam: Double, rawSeam: Double)? {
+    var pendingPlacement: (seam: Double, rawSeam: Double, soundLag: Double)? {
         anchorShiftLock.lock()
         defer { anchorShiftLock.unlock() }
         guard let placement = lastPublishedPlacement else { return nil }
-        return (placement.advertisedStart - placement.assumedBase, placement.advertisedStart)
+        return (placement.advertisedStart - placement.assumedBase, placement.advertisedStart,
+                soundLagByIndex[placement.index] ?? 0)
+    }
+
+    /// How far after its first picture each finalized VOD segment's first sound plays
+    /// (`HLSSegmentProducer.onSegmentSoundLag`), under `anchorShiftLock`. A segment is the same
+    /// whichever run produced it, so a later report replaces an earlier one with the same value.
+    private var soundLagByIndex: [Int: Double] = [:]
+
+    func recordSoundLag(_ seconds: Double, at index: Int) {
+        anchorShiftLock.lock()
+        soundLagByIndex[index] = seconds
+        anchorShiftLock.unlock()
     }
 
     /// Whether a placement is waiting to be measured. Nothing to verify means nothing to sample for.
