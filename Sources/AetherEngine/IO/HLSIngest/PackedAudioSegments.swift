@@ -22,10 +22,14 @@ enum PackedAudioID3 {
 
     static let appleTimestampOwner = "com.apple.streaming.transportStreamTimestamp"
 
+    /// How much of a first segment classification reads: the PRIV timestamp has to lie inside it.
+    static let classificationBytes = 4096
+
     /// Returns 90 kHz program-clock timestamp (33-bit) from the first segment. Handles ID3v2.3 and v2.4. Returns nil if the tag is absent, malformed, unsynchronised, or has no matching PRIV frame.
     static func transportStreamTimestamp90k(in segment: Data) -> Int64? {
-        // Apple writes ~73 bytes; 4 KB is a generous cap that avoids copying the whole segment.
-        let b = [UInt8](segment.prefix(4096))
+        // Apple writes ~73 bytes; `classificationBytes` is a generous cap that avoids copying the
+        // whole segment.
+        let b = [UInt8](segment.prefix(classificationBytes))
         guard b.count >= 10, b[0] == 0x49, b[1] == 0x44, b[2] == 0x33 else { return nil }
         let major = b[3]
         guard major == 3 || major == 4 else { return nil } // v2.2 uses 3-byte IDs/sizes and never appears in HLS packed audio

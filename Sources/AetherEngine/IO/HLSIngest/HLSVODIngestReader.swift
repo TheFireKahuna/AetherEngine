@@ -394,53 +394,63 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             return
         }
 
-        try await withThrowingTaskGroup(of: (Int, Data).self) { group in
-            var nextToSpawn = 0
-            var nextToCommit = 0
-            var ready: [Int: Data] = [:]
-
-            func spawn(_ index: Int) {
-                let item = resolvedSegments[index]
-                group.addTask {
-                    let bytes = try await self.fetch(
-                        item.1, limit: BoundedFetch.segmentLimit(forDuration: item.0.duration))
-                    guard let crypt = item.0.crypt else { return (index, bytes) }
-                    return (
-                        index,
-                        try await self.decrypt(bytes, crypt: crypt, baseURL: mediaURL)
-                    )
-                }
-            }
-
-            var window = Self.maxConcurrentSegmentFetches
-            while nextToSpawn < resolvedSegments.count, nextToSpawn < window {
-                spawn(nextToSpawn)
-                nextToSpawn += 1
-            }
-            while nextToCommit < resolvedSegments.count {
-                try Task.checkCancellation()
-                guard let (index, bytes) = try await group.next() else { break }
-                ready[index] = bytes
-                while let head = ready.removeValue(forKey: nextToCommit) {
-                    if nextToCommit == 0 {
-                        guard LiveSegmentFormat.classify(head) == .mpegts else {
+        var window = Self.maxConcurrentSegmentFetches
+        var checked = false
+        var firstSegmentBytes = 0
+        _ = try await SegmentPipeline.run(
+            count: resolvedSegments.count,
+            window: { window },
+            canStream: { resolvedSegments[$0].0.crypt == nil },
+            fetchWhole: { [self] index in
+                let (segment, url) = resolvedSegments[index]
+                let bytes = try await fetch(url, limit: BoundedFetch.segmentLimit(forDuration: segment.duration))
+                guard let crypt = segment.crypt else { return bytes }
+                return try await decrypt(bytes, crypt: crypt, baseURL: mediaURL)
+            },
+            stream: { [self] index, deliver in
+                let (segment, url) = resolvedSegments[index]
+                return try await streamSegment(
+                    url, limit: BoundedFetch.segmentLimit(forDuration: segment.duration), into: deliver)
+            },
+            deliver: { [self] index, bytes, isLast in
+                if index == 0 {
+                    if !checked, !bytes.isEmpty {
+                        guard LiveSegmentFormat.classify(bytes) == .mpegts else {
                             throw HLSIngestError.unsupportedSegmentFormat
                         }
-                        window = Self.prefetchWindow(forSegmentBytes: head.count)
+                        checked = true
                     }
-                    nextToCommit += 1
-                    guard append(head, generation: generation) else {
-                        group.cancelAll()
-                        return
-                    }
-                    while nextToSpawn < resolvedSegments.count,
-                          nextToSpawn < nextToCommit + window {
-                        spawn(nextToSpawn)
-                        nextToSpawn += 1
-                    }
+                    firstSegmentBytes += bytes.count
+                    if isLast { window = Self.prefetchWindow(forSegmentBytes: firstSegmentBytes) }
                 }
-            }
+                return bytes.isEmpty || append(bytes, generation: generation)
+            })
+    }
+
+    /// One segment's body handed to `deliver` as it arrives. False when `deliver` stopped it.
+    private func streamSegment(
+        _ url: URL, limit: Int, into deliver: (Data) async throws -> Bool
+    ) async throws -> Bool {
+        let body: BoundedFetch.BodyStream
+        do {
+            body = try await BoundedFetch.stream(for: makeRequest(url), session: session, limit: limit,
+                                                 owner: requests)
+        } catch is BoundedFetch.Exceeded {
+            throw HLSIngestError.playlistInvalid(reason: "body exceeds \(limit) bytes")
         }
+        let status = (body.response as? HTTPURLResponse)?.statusCode ?? -1
+        guard (200..<300).contains(status) else { throw HLSIngestError.playlistUnreachable(status: status) }
+        var total = 0
+        do {
+            for try await chunk in body.chunks {
+                total += chunk.count
+                guard try await deliver(chunk) else { return false }
+            }
+        } catch is BoundedFetch.Exceeded {
+            throw HLSIngestError.playlistInvalid(reason: "body exceeds \(limit) bytes")
+        }
+        guard total > 0 else { throw HLSIngestError.playlistUnreachable(status: status) }
+        return true
     }
 
     /// AE#732: one segment at a time, so the persistent connection carries them back to back. The FIFO

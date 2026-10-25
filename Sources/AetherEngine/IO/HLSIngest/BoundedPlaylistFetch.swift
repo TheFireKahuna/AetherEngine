@@ -84,7 +84,51 @@ enum BoundedFetch {
         }
         switch outcome {
         case .body(let data, let response): return (data, response)
-        case .refused(let response): return (Data(), response)
+        case .refused(let response), .streaming(let response): return (Data(), response)
+        case .exceeded: throw Exceeded(limit: limit)
+        case .failed(let error):
+            if expired.isSet { throw URLError(.timedOut) }
+            throw error
+        }
+    }
+
+    /// A body read as it arrives (`stream`). For a non-2xx answer `chunks` is empty and finished.
+    struct BodyStream: Sendable {
+        let response: URLResponse
+        let chunks: AsyncThrowingStream<Data, Error>
+    }
+
+    /// `data(for:)`, but the body is handed out in the pieces the session delivers rather than held
+    /// until it ends, so a consumer can start on a large body (a transport-stream segment) while the
+    /// rest of it is still on the wire. Returns once the response head is in. The same head checks
+    /// apply (a declared length over `limit` throws `Exceeded` here), and a body that runs past
+    /// `limit` ends the stream throwing `Exceeded`. Stopping the iteration, or cancelling the task
+    /// iterating, ends the transfer.
+    static func stream(for request: URLRequest, session: URLSession, limit: Int,
+                       resourceTimeout: TimeInterval? = nil, owner: EngineHTTPRequests? = nil) async throws
+        -> BodyStream
+    {
+        let expired = ExpiryFlag()
+        let (chunks, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
+        let delegate = BoundedBodyDelegate(limit: limit, chunks: continuation, expired: expired)
+        let task = session.dataTask(with: request)
+        task.delegate = delegate
+        owner?.track(task)
+        continuation.onTermination = { _ in task.cancel() }
+        EngineHTTP.armResourceDeadline(task, seconds: resourceTimeout) { expired.set() }
+        let outcome: BoundedBodyDelegate.Outcome = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { head in
+                delegate.installOutcomeHandler { head.resume(returning: $0) }
+                task.resume()
+            }
+        } onCancel: {
+            task.cancel()
+        }
+        switch outcome {
+        case .streaming(let response): return BodyStream(response: response, chunks: chunks)
+        case .refused(let response), .body(_, let response):
+            continuation.finish()
+            return BodyStream(response: response, chunks: chunks)
         case .exceeded: throw Exceeded(limit: limit)
         case .failed(let error):
             if expired.isSet { throw URLError(.timedOut) }
@@ -93,7 +137,7 @@ enum BoundedFetch {
     }
 
     /// Set once by a resource deadline, read after the transfer ends.
-    private final class ExpiryFlag: @unchecked Sendable {
+    fileprivate final class ExpiryFlag: @unchecked Sendable {
         private let lock = NSLock()
         private var value = false
         func set() { lock.lock(); value = true; lock.unlock() }
@@ -106,6 +150,8 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
 {
     enum Outcome {
         case body(Data, URLResponse)
+        /// Streaming mode: the head is in and the body follows on `chunks`.
+        case streaming(URLResponse)
         case refused(URLResponse)
         case exceeded
         case failed(Error)
@@ -120,6 +166,10 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
     private var buffer = Data()
     private var response: URLResponse?
     private var verdict: Verdict?
+    /// Streaming mode: the body goes here as it arrives instead of into `buffer`.
+    private let chunks: AsyncThrowingStream<Data, Error>.Continuation?
+    private let expired: BoundedFetch.ExpiryFlag?
+    private var streamed = 0
 
     /// Guards the handoff between the caller, which installs the handler, and the session's delegate
     /// queue, which produces the outcome. Either can be first.
@@ -127,8 +177,11 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
     private var onOutcome: ((Outcome) -> Void)?
     private var landed: Outcome?
 
-    init(limit: Int) {
+    init(limit: Int, chunks: AsyncThrowingStream<Data, Error>.Continuation? = nil,
+         expired: BoundedFetch.ExpiryFlag? = nil) {
         self.limit = limit
+        self.chunks = chunks
+        self.expired = expired
         super.init()
     }
 
@@ -180,12 +233,27 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
         // A stated length is within `limit` (checked above), so the whole body is reserved at once:
         // growing a 100 MB segment by doubling would copy it several times over, on the session's
         // one delegate queue that every other engine fetch delivers on too.
-        if declared > 0 { buffer.reserveCapacity(Int(declared)) }
+        if chunks != nil {
+            deliver(.streaming(response))
+        } else if declared > 0 {
+            buffer.reserveCapacity(Int(declared))
+        }
         completionHandler(.allow)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard verdict == nil else { return }
+        if let chunks {
+            streamed += data.count
+            guard streamed <= limit else {
+                verdict = .exceeded
+                chunks.finish(throwing: BoundedFetch.Exceeded(limit: limit))
+                dataTask.cancel()
+                return
+            }
+            chunks.yield(data)
+            return
+        }
         guard buffer.count + data.count <= limit else {
             verdict = .exceeded
             buffer = Data()
@@ -196,6 +264,15 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let chunks, verdict == nil, response != nil {
+            // The head went out already; what is left to say is how the body ended.
+            if let error {
+                chunks.finish(throwing: expired?.isSet == true ? URLError(.timedOut) : error)
+            } else {
+                chunks.finish()
+            }
+            return
+        }
         switch verdict {
         case .refused?:
             if let response { deliver(.refused(response)) } else { deliver(.failed(URLError(.badServerResponse))) }

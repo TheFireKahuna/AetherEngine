@@ -394,13 +394,11 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         }
     }
 
-    /// #177: bounded prefetch pipeline over one batch of fresh segments. Up to
-    /// `maxConcurrentSegmentFetches` fetches (and decrypts) run concurrently; results are committed
-    /// to the FIFO strictly in playlist order, so every downstream ordering contract (first-segment
-    /// classification before any FIFO byte, discontinuity logging, demuxer pacing via the blocking
-    /// FIFO write) is unchanged. In-flight bytes are held in memory, decoupled from FIFO
-    /// backpressure; the window is anchored at the commit point, bounding buffered segments to the
-    /// window size even when the head segment is slow. Returns false when the FIFO was closed.
+    /// #177: the batch's segments go to the FIFO strictly in playlist order (`SegmentPipeline`): the
+    /// one the demuxer is waiting for as its bytes arrive, up to `maxConcurrentSegmentFetches` after
+    /// it fetched (and decrypted) whole alongside. Every downstream ordering contract holds:
+    /// first-segment classification before any FIFO byte, discontinuity logging, demuxer pacing via the
+    /// blocking FIFO write. Returns false when the FIFO was closed.
     private func ingestSegmentBatch(_ segments: [HLSMediaSegment], mediaURL: URL) async throws -> Bool {
         // Resolve every URI upfront so an unresolvable one throws before any fetch is spawned.
         let resolved: [(segment: HLSMediaSegment, url: URL)] = try segments.map { segment in
@@ -411,62 +409,48 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         }
         let window = Self.segmentFetchConcurrency(
             budgetLimit: OriginRequestBudget.shared.limit(for: mediaURL))
-        return try await withThrowingTaskGroup(of: (Int, Data).self) { group -> Bool in
-            var nextToSpawn = 0
-            var nextToCommit = 0
-            var ready: [Int: Data] = [:]
-
-            while nextToSpawn < resolved.count,
-                  nextToSpawn < nextToCommit + window {
-                spawnFetch(into: &group, index: nextToSpawn, item: resolved[nextToSpawn], mediaURL: mediaURL)
-                nextToSpawn += 1
-            }
-            while nextToCommit < resolved.count {
-                guard let (index, bytes) = try await group.next() else { break }
-                ready[index] = bytes
-                while let head = ready.removeValue(forKey: nextToCommit) {
-                    let segment = resolved[nextToCommit].segment
-                    nextToCommit += 1
+        var startedIndex = -1
+        var sniffBuffer = Data()
+        return try await SegmentPipeline.run(
+            count: resolved.count,
+            window: { window },
+            canStream: { resolved[$0].segment.crypt == nil },
+            fetchWhole: { [self] index in
+                let item = resolved[index]
+                let fetched = try await fetchSegment(item.url, duration: item.segment.duration)
+                guard !fetched.isEmpty, let crypt = item.segment.crypt else { return fetched }
+                return try await decryptSegment(fetched, crypt: crypt, against: mediaURL)
+            },
+            stream: { [self] index, deliver in
+                let item = resolved[index]
+                return try await streamSegment(item.url, duration: item.segment.duration, into: deliver)
+            },
+            deliver: { [self] index, bytes, isLast in
+                if index != startedIndex {
+                    startedIndex = index
+                    let segment = resolved[index].segment
                     if segment.discontinuityBefore {
                         // Phase 1 decision (design spec): the seam is logged, the actual
                         // timestamp handling rides on the producer's PTS-leap rebase
                         // heuristic downstream; a deterministic force-cut hint is a P2 item.
                         EngineLog.emit("[HLSIngest] discontinuity seam before segment \(segment.uri)", category: .engine)
                     }
-                    if head.isEmpty { continue } // 404: slid out of the provider window
-                    if !sniffedFirstSegment {
-                        sniffedFirstSegment = true
-                        try classifyFirstSegment(head)
-                    }
-                    guard fifo.write(head) else { // closed underneath us
-                        group.cancelAll()
-                        return false
-                    }
                 }
-                while nextToSpawn < resolved.count,
-                      nextToSpawn < nextToCommit + window {
-                    spawnFetch(into: &group, index: nextToSpawn, item: resolved[nextToSpawn], mediaURL: mediaURL)
-                    nextToSpawn += 1
+                guard sniffedFirstSegment else {
+                    // The first bytes are held until there are enough to classify (a packed-audio
+                    // ID3 tag runs to a few KB), or the segment ended. An empty segment is a 404: it
+                    // slid out of the provider window, and the next one is classified instead.
+                    sniffBuffer.append(bytes)
+                    guard sniffBuffer.count >= PackedAudioID3.classificationBytes || isLast else { return true }
+                    guard !sniffBuffer.isEmpty else { return true }
+                    sniffedFirstSegment = true
+                    try classifyFirstSegment(sniffBuffer)
+                    let held = sniffBuffer
+                    sniffBuffer = Data()
+                    return fifo.write(held)
                 }
-            }
-            return true
-        }
-    }
-
-    /// One in-flight prefetch: fetch plus (for AES-128 sources) inline decrypt. Decrypting in
-    /// flight is safe because the key cache tolerates concurrent misses; classification stays on
-    /// the ordered commit path (TS sync byte is only visible in plaintext).
-    private func spawnFetch(
-        into group: inout ThrowingTaskGroup<(Int, Data), Error>,
-        index: Int,
-        item: (segment: HLSMediaSegment, url: URL),
-        mediaURL: URL
-    ) {
-        group.addTask {
-            let fetched = try await self.fetchSegment(item.url, duration: item.segment.duration)
-            guard !fetched.isEmpty, let crypt = item.segment.crypt else { return (index, fetched) }
-            return (index, try await self.decryptSegment(fetched, crypt: crypt, against: mediaURL))
-        }
+                return bytes.isEmpty || fifo.write(bytes)
+            })
     }
 
     /// Classify the first segment and publish format + PRIV timestamp before any byte is written to the FIFO (ordering contract). Companion packed audio without a parsable PRIV timestamp goes terminal: no way to align side audio without risking silent A/V desync.
@@ -729,9 +713,9 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// so the host's declared ceiling, and a ceiling or pacer learned from another path's refusal, bind
     /// this path too. Its own refusals are not charged (see below). The slot wait blocks, so it runs off
     /// the cooperative pool; no ticket is ever held across another acquire.
-    private func budgeted(
-        _ url: URL, label: String, _ fetch: () async throws -> (Data, URLResponse)
-    ) async throws -> (Data, URLResponse) {
+    private func budgeted<Body>(
+        _ url: URL, label: String, _ fetch: () async throws -> (Body, URLResponse)
+    ) async throws -> (Body, URLResponse) {
         let ticket: OriginRequestBudget.Ticket? = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 continuation.resume(returning: OriginRequestBudget.shared.acquire(
@@ -830,6 +814,113 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             attempt += 1
             // Two quick retries for a blip, as before; then the steady pace of a refused refresh,
             // within the same budget the refresh would get for this failure.
+            let delay = attempt <= 2 ? 0.5 * Double(attempt) : Self.retryWait(retryAfter: retryAfter)
+            budget = max(budget, Self.retryBudget(forStatus: status))
+            guard Date().addingTimeInterval(delay) < startedAt.addingTimeInterval(budget) else {
+                throw HLSIngestError.playlistUnreachable(status: lastStatus)
+            }
+            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        }
+    }
+
+    /// `fetchSegment` with the body handed to `deliver` as it arrives, under the same retry contract
+    /// (a 404 is a segment that slid out of the window and delivers nothing; other 4xx but 429 are
+    /// final; the rest is retried within the same budget). A transfer that fails after bytes went to
+    /// `deliver` resumes with a Range from the first byte not delivered, so nothing reaches the
+    /// FIFO twice; an origin that answers the resume with the whole body has the delivered prefix
+    /// skipped. False when `deliver` stopped it.
+    private func streamSegment(
+        _ url: URL, duration: Double, into deliver: (Data) async throws -> Bool
+    ) async throws -> Bool {
+        enum Pass { case done, stopped, status(Int, retryAfter: TimeInterval?), interrupted }
+        var lastStatus = -1
+        let limit = BoundedFetch.segmentLimit(forDuration: duration)
+        let startedAt = Date()
+        var budget = Self.unreachableRetryBudget
+        var attempt = 0
+        var delivered = 0
+        while true {
+            if Task.isCancelled { throw CancellationError() }
+            var request = makeRequest(url)
+            let resumeAt = delivered
+            if resumeAt > 0 { request.setValue("bytes=\(resumeAt)-", forHTTPHeaderField: "Range") }
+            let pass: Pass
+            do {
+                (pass, _) = try await budgeted(url, label: "ingest-segment") { () -> (Pass, URLResponse) in
+                    let body = try await BoundedFetch.stream(
+                        for: request, session: self.session, limit: limit,
+                        resourceTimeout: Self.resourceTimeoutSeconds, owner: self.requests)
+                    let http = body.response as? HTTPURLResponse
+                    let status = http?.statusCode ?? -1
+                    guard (200..<300).contains(status) else {
+                        let retryAfter = http?.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+                        return (.status(status, retryAfter: retryAfter), body.response)
+                    }
+                    // Where this body starts in the segment: the resume offset for a 206 that honours
+                    // it, zero for a 200 that ignored it.
+                    var skip = 0
+                    if resumeAt > 0 {
+                        if status == 206 {
+                            guard let range = http?.value(forHTTPHeaderField: "Content-Range"),
+                                  HTTPDiscIOReader.parseContentRangeStart(range) == Int64(resumeAt) else {
+                                throw HLSIngestError.playlistInvalid(reason: "segment resume answered another range")
+                            }
+                        } else {
+                            skip = resumeAt
+                        }
+                    }
+                    do {
+                        for try await chunk in body.chunks {
+                            var piece = chunk
+                            if skip > 0 {
+                                let dropped = min(skip, piece.count)
+                                piece = piece.dropFirst(dropped)
+                                skip -= dropped
+                                if piece.isEmpty { continue }
+                            }
+                            delivered += piece.count
+                            guard try await deliver(piece) else { return (.stopped, body.response) }
+                        }
+                    } catch let error as BoundedFetch.Exceeded {
+                        throw error
+                    } catch let error as HLSIngestError {
+                        throw error
+                    } catch {
+                        if Task.isCancelled { throw CancellationError() }
+                        return (.interrupted, body.response)
+                    }
+                    return (.done, body.response)
+                }
+            } catch is BoundedFetch.Exceeded {
+                // Audit NET-112: an endless body is the origin's answer, not a blip to retry.
+                throw HLSIngestError.playlistInvalid(reason: "segment exceeds \(limit) bytes")
+            } catch let error as HLSIngestError {
+                throw error
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                pass = .interrupted  // transport blip before the head: retry
+            }
+            var retryAfter: TimeInterval?
+            var status: Int?
+            switch pass {
+            case .done: return true
+            case .stopped: return false
+            case .interrupted: break
+            case .status(let code, let after):
+                lastStatus = code
+                status = code
+                // Slid out of the provider window; the tracker advances regardless. A resume that
+                // finds the segment gone ends it where it stopped.
+                if code == 404 { return true }
+                if (400..<500).contains(code) && code != 429 {
+                    throw HLSIngestError.playlistUnreachable(status: code)
+                }
+                retryAfter = after
+            }
+            attempt += 1
+            // Two quick retries for a blip; then the steady pace of a refused refresh, within the
+            // same budget the refresh would get for this failure.
             let delay = attempt <= 2 ? 0.5 * Double(attempt) : Self.retryWait(retryAfter: retryAfter)
             budget = max(budget, Self.retryBudget(forStatus: status))
             guard Date().addingTimeInterval(delay) < startedAt.addingTimeInterval(budget) else {
