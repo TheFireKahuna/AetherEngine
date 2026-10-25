@@ -618,7 +618,10 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
 
     private let condition = NSCondition()
     private var head: HTTPURLResponse?
-    private var pending = Data()
+    /// Deliveries not yet written, as they arrived: the consumer writes each one as it stands, so
+    /// a byte is copied once, into the socket.
+    private var pending: [Data] = []
+    private var pendingBytes = 0
     private var finished = false
     private var failure: Error?
     private var consumerGaveUp = false
@@ -660,13 +663,14 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
         while true {
             condition.lock()
             while pending.isEmpty && !finished { condition.wait() }
-            let chunk = pending
-            pending.removeAll(keepingCapacity: true)
+            var chunks: [Data] = []
+            swap(&chunks, &pending)
+            pendingBytes = 0
             let ended = finished
             condition.broadcast()
             condition.unlock()
 
-            if !chunk.isEmpty, !write(chunk) {
+            for chunk in chunks where !write(chunk) {
                 abandon()
                 return false
             }
@@ -712,12 +716,13 @@ private final class UpstreamPump: NSObject, URLSessionDataDelegate, @unchecked S
         var stop = consumerGaveUp || capped
         var newlyCapped = false
         if !stop {
-            if pending.count + data.count > hardCapBytes {
+            if pendingBytes + data.count > hardCapBytes {
                 capped = true
                 newlyCapped = true
                 stop = true
             } else {
                 pending.append(data)
+                pendingBytes += data.count
                 condition.broadcast()
             }
         }

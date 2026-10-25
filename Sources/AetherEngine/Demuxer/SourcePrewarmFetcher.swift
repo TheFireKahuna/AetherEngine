@@ -338,6 +338,7 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
             return
         }
         contentRange = parsed
+        buffer.reserveCapacity(Int(servedLength))
         // `http.url` is the URL that answered, redirects followed, which is the one a later load
         // should start at instead of resolving the chain again (#551 round 2).
         respondedURL = http.url

@@ -827,6 +827,11 @@ final class HLSLocalServer: @unchecked Sendable {
             var on: Int32 = 1
             _ = setsockopt(clientFd, SOL_SOCKET, SO_NOSIGPIPE, &on,
                            socklen_t(MemoryLayout<Int32>.size))
+            // Every response goes out as whole vectored writes, so Nagle has nothing to coalesce,
+            // and on a LAN peer (an AirPlay receiver) it would hold a response's last partial
+            // segment for the receiver's delayed ACK.
+            _ = setsockopt(clientFd, IPPROTO_TCP, TCP_NODELAY, &on,
+                           socklen_t(MemoryLayout<Int32>.size))
             let acceptedAt = Self.uptimeSeconds()
 
             stateLock.lock()
@@ -1110,12 +1115,12 @@ final class HLSLocalServer: @unchecked Sendable {
                     EngineLog.emit(
                         "[HLSLocalServer] -> \(status) relay stream bytes=\(contentLength) "
                             + "type=\(contentType)", category: .hlsServer, level: .verbose)
-                    return self.writeAll(fd: fd, data: Data(header.utf8),
+                    return self.writeAll(fd: fd, parts: [Data(header.utf8)],
                                          path: "\(normalizedPath) [header]")
                 },
                 body: { [weak self] chunk in
                     guard let self else { return false }
-                    return self.writeAll(fd: fd, data: chunk, path: normalizedPath)
+                    return self.writeAll(fd: fd, parts: [chunk], path: normalizedPath)
                 })
             switch relay.respond(
                 query: query,
@@ -1365,8 +1370,7 @@ final class HLSLocalServer: @unchecked Sendable {
                         EngineLog.emit(
                             "[HLSLocalServer] seg\(index): slow serve, sending early chunked header",
                             category: .hlsServer)
-                        _ = self.writeAll(fd: fd,
-                                          data: Self.chunkedResponseHeader(contentType: "video/mp4"),
+                        _ = self.writeAll(fd: fd, parts: [Self.chunkedResponseHeader(contentType: "video/mp4")],
                                           path: "\(normalizedPath) [early header]")
                     })
                     // A segment being written: commit the chunked header (unless the slow-serve
@@ -1375,7 +1379,7 @@ final class HLSLocalServer: @unchecked Sendable {
                     // than taking the partial bytes for a whole segment.
                     if case .progressive(let reader) = source {
                         if early.markSentOnce() {
-                            guard writeAll(fd: fd, data: Self.chunkedResponseHeader(contentType: "video/mp4"),
+                            guard writeAll(fd: fd, parts: [Self.chunkedResponseHeader(contentType: "video/mp4")],
                                            path: "\(normalizedPath) [progressive header]") else {
                                 return refused(false)
                             }
@@ -1471,9 +1475,8 @@ final class HLSLocalServer: @unchecked Sendable {
         while true {
             switch reader.next() {
             case .bytes(let data):
-                guard writeAll(fd: fd, data: Self.chunkFrameHeader(size: data.count), path: "\(path) [chunk size]"),
-                      writeAll(fd: fd, data: data, path: path),
-                      writeAll(fd: fd, data: Self.chunkFrameTrailer, path: "\(path) [chunk trailer]") else {
+                guard writeAll(fd: fd, parts: [Self.chunkFrameHeader(size: data.count), data, Self.chunkFrameTrailer],
+                               path: path) else {
                     return false
                 }
                 sent += data.count
@@ -1482,7 +1485,7 @@ final class HLSLocalServer: @unchecked Sendable {
                 EngineLog.emit(
                     "[HLSLocalServer] -> 200 \(path) bytes=\(sent) type=video/mp4 [progressive]",
                     category: .hlsServer, level: .verbose)
-                return writeAll(fd: fd, data: Self.chunkedFinal, path: "\(path) [chunk final]")
+                return writeAll(fd: fd, parts: [Self.chunkedFinal], path: "\(path) [chunk final]")
             case .abandoned:
                 EngineLog.emit(
                     "[HLSLocalServer] \(path): the producer abandoned this segment after \(sent) B sent; "
@@ -1493,22 +1496,20 @@ final class HLSLocalServer: @unchecked Sendable {
         }
     }
 
-    /// Body for an early-header serve: the whole segment as one chunk. Four separate send()
-    /// calls so mmap-backed segment Data is never copied into a Swift heap buffer.
+    /// Body for an early-header serve: the whole segment as one chunk, framing and all in one
+    /// vectored write, so mmap-backed segment Data is never copied into a Swift heap buffer.
     private func sendChunkedBody(fd: Int32, path: String, data: Data) -> Bool {
         EngineLog.emit(
             "[HLSLocalServer] -> 200 \(path) bytes=\(data.count) type=video/mp4 [chunked, early header]",
             category: .hlsServer, level: .verbose)
-        guard writeAll(fd: fd, data: Self.chunkFrameHeader(size: data.count), path: "\(path) [chunk size]"),
-              writeAll(fd: fd, data: data, path: path),
-              writeAll(fd: fd, data: Self.chunkFrameTrailer, path: "\(path) [chunk trailer]"),
-              writeAll(fd: fd, data: Self.chunkedFinal, path: "\(path) [chunk final]") else {
+        guard writeAll(fd: fd, parts: [Self.chunkFrameHeader(size: data.count), data, Self.chunkFrameTrailer,
+                                       Self.chunkedFinal], path: path) else {
             return false
         }
         return true
     }
 
-    /// Shared response-header builder. Header and body are sent in two separate send() calls: data may be mmap-backed and must NOT be copied via Data.append (would materialize segment into Swift heap, defeating the BSD-socket rewrite).
+    /// Shared response-header builder. Header and body go out as two vectors of one `writev`: data may be mmap-backed and must NOT be copied via Data.append (would materialize segment into Swift heap, defeating the BSD-socket rewrite).
     private static func responseHeader(
         status: String, contentLength: Int, contentType: String?
     ) -> Data {
@@ -1531,10 +1532,7 @@ final class HLSLocalServer: @unchecked Sendable {
         EngineLog.emit("[HLSLocalServer] -> 200 \(path) bytes=\(data.count) type=\(contentType)",
                        category: .hlsServer, level: .verbose)
 
-        guard writeAll(fd: fd, data: headerData, path: "\(path) [header]") else {
-            return false
-        }
-        return writeAll(fd: fd, data: data, path: path)
+        return writeAll(fd: fd, parts: [headerData, data], path: path)
     }
 
     /// What a file-backed serve answered with, alongside whether the write went through. AE#418
@@ -1566,10 +1564,7 @@ final class HLSLocalServer: @unchecked Sendable {
         EngineLog.emit("[HLSLocalServer] -> 200 \(path) bytes=\(fileSize) type=\(contentType) [filestream]",
                        category: .hlsServer, level: .verbose)
 
-        guard writeAll(fd: fd, data: headerData, path: "\(path) [header]") else {
-            return (.segment, false)
-        }
-        return (.segment, streamFileToSocket(fileURL: fileURL, socketFd: fd, path: path,
+        return (.segment, streamFileToSocket(fileURL: fileURL, socketFd: fd, head: headerData, path: path,
                                              expectedLength: fileSize))
     }
 
@@ -1592,10 +1587,7 @@ final class HLSLocalServer: @unchecked Sendable {
         EngineLog.emit(
             "[HLSLocalServer] -> \(answer.status) relay bytes=\(answer.body.count) "
                 + "type=\(answer.contentType)", category: .hlsServer, level: .verbose)
-        guard writeAll(fd: fd, data: Data(header.utf8), path: "\(path) [header]") else {
-            return false
-        }
-        return answer.body.isEmpty ? true : writeAll(fd: fd, data: answer.body, path: path)
+        return writeAll(fd: fd, parts: [Data(header.utf8), answer.body], path: path)
     }
 
     /// The response head for a relayed answer, whether it is written whole or streamed. One writer,
@@ -1645,7 +1637,7 @@ final class HLSLocalServer: @unchecked Sendable {
             EngineLog.emit("[HLSLocalServer] -> 404 \(path) reason=\(reason)",
                            category: .hlsServer)
         }
-        return writeAll(fd: fd, data: response, path: path)
+        return writeAll(fd: fd, parts: [response], path: path)
     }
 
     /// 503 for an in-range segment not yet produced (#50). AVPlayer treats a 404 on a VOD segment as terminal loadFailed; 503+Retry-After keeps it recoverable so VideoSegmentProvider.serveSegment can nudge the producer back.
@@ -1657,7 +1649,7 @@ final class HLSLocalServer: @unchecked Sendable {
         header += "Connection: keep-alive\r\n\r\n"
         EngineLog.emit("[HLSLocalServer] -> 503 \(path) reason=\(reason)",
                        category: .hlsServer)
-        return writeAll(fd: fd, data: Data(header.utf8), path: path)
+        return writeAll(fd: fd, parts: [Data(header.utf8)], path: path)
     }
 
     /// How to answer a `/seg{N}.mp4` request, given whether the provider
@@ -1680,45 +1672,70 @@ final class HLSLocalServer: @unchecked Sendable {
         return .notFound
     }
 
-    /// Blocking send loop. Uses withUnsafeBytes so mmap-backed Data stays mmap-backed (kernel page-faults in only the bytes copied to the socket send buffer, no heap accumulation).
-    private func writeAll(fd: Int32, data: Data, path: String) -> Bool {
-        var written = 0
-        let total = data.count
-        if total == 0 { return true }
-        while written < total {
-            let result = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int in
-                guard let base = raw.baseAddress else { return -1 }
-                let remaining = total - written
-                return send(fd, base.advanced(by: written), remaining, 0)
+    /// Blocking send of `parts` back to back, as one `writev` per kernel turn rather than one `send`
+    /// each, so a response head never leaves as a packet of its own ahead of its body. The bytes are
+    /// read where they are (mmap-backed segment Data stays mmap-backed, nothing is joined into a
+    /// heap buffer first).
+    private func writeAll(fd: Int32, parts: [Data], path: String) -> Bool {
+        func pin(_ index: Int, _ buffers: inout [UnsafeRawBufferPointer]) -> Bool {
+            guard index < parts.count else { return sendVectors(fd: fd, buffers, path: path) }
+            return parts[index].withUnsafeBytes { raw -> Bool in
+                if raw.count > 0 { buffers.append(raw) }
+                return pin(index + 1, &buffers)
             }
-            if result < 0 {
+        }
+        var buffers: [UnsafeRawBufferPointer] = []
+        buffers.reserveCapacity(parts.count)
+        return pin(0, &buffers)
+    }
+
+    /// The vectored send loop under `writeAll` and the file path: resumes a partial write where the
+    /// kernel stopped, retries EINTR, and counts what went out.
+    private func sendVectors(fd: Int32, _ buffers: [UnsafeRawBufferPointer], path: String) -> Bool {
+        var vectors = buffers.map { iovec(iov_base: UnsafeMutableRawPointer(mutating: $0.baseAddress), iov_len: $0.count) }
+        let total = buffers.reduce(0) { $0 + $1.count }
+        if total == 0 { return true }
+        var first = 0
+        while first < vectors.count {
+            let count = Int32(min(vectors.count - first, Int(IOV_MAX)))
+            let n = vectors[first...].withUnsafeBufferPointer { writev(fd, $0.baseAddress, count) }
+            if n < 0 {
                 let err = errno
                 if err == EINTR { continue }
                 EngineLog.emit("[HLSLocalServer] send failed for \(path): errno=\(err)",
                                category: .hlsServer)
                 return false
             }
-            if result == 0 {
+            if n == 0 {
                 EngineLog.emit("[HLSLocalServer] send returned 0 for \(path)",
                                category: .hlsServer)
                 return false
             }
-            written += result
+            var left = n
+            while first < vectors.count, left >= vectors[first].iov_len {
+                left -= vectors[first].iov_len
+                first += 1
+            }
+            if left > 0 {
+                vectors[first].iov_base = vectors[first].iov_base?.advanced(by: left)
+                vectors[first].iov_len -= left
+            }
         }
         bumpBytesSent(total)
         return true
     }
 
-    /// File -> socket straight out of the page cache: the file is mapped and `send` copies from the
-    /// mapping, so the bytes are copied into the socket once and never through a user buffer
+    /// File -> socket straight out of the page cache: the file is mapped and `writev` copies from the
+    /// mapping, `head` (the response head) riding in front of it in the same call, so the bytes are
+    /// copied into the socket once and never through a user buffer
     /// (sendfile(2) would skip even that copy, but the tvOS sandbox SIGSYS's it). expectedLength must
     /// match Content-Length exactly: a file that changed size between stat and open would shift HTTP
     /// framing on the keep-alive connection, so a shorter file fails the response (closes the
     /// connection) and a longer one sends only expectedLength. Mapping is safe against the cache's own
     /// lifecycle: a served segment is adopted whole and only ever unlinked, never truncated, and a
     /// mapping outlives the unlink.
-    private func streamFileToSocket(fileURL: URL, socketFd: Int32, path: String,
-                             expectedLength: Int) -> Bool {
+    private func streamFileToSocket(fileURL: URL, socketFd: Int32, head: Data, path: String,
+                                    expectedLength: Int) -> Bool {
         let fileFd = Darwin.open(fileURL.path, O_RDONLY | O_CLOEXEC)
         guard fileFd >= 0 else {
             EngineLog.emit("[HLSLocalServer] file open failed \(path): errno=\(errno)",
@@ -1742,26 +1759,13 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         defer { munmap(mapping, expectedLength) }
 
-        var totalSent = 0
-        while totalSent < expectedLength {
-            let n = send(socketFd, mapping.advanced(by: totalSent), expectedLength - totalSent, 0)
-            if n < 0 {
-                let err = errno
-                if err == EINTR { continue }
-                EngineLog.emit("[HLSLocalServer] send failed \(path): errno=\(err) sent=\(totalSent)",
-                               category: .hlsServer)
-                return false
-            }
-            if n == 0 {
-                EngineLog.emit("[HLSLocalServer] send returned 0 \(path) sent=\(totalSent)",
-                               category: .hlsServer)
-                return false
-            }
-            totalSent += n
+        let sent = head.withUnsafeBytes { headBytes in
+            sendVectors(fd: socketFd,
+                        [headBytes, UnsafeRawBufferPointer(start: mapping, count: expectedLength)],
+                        path: path)
         }
-        bumpBytesSent(totalSent)
-        bumpSendfileBytes(totalSent)
-        return true
+        if sent { bumpSendfileBytes(expectedLength) }
+        return sent
     }
 
     // MARK: - Playlist construction

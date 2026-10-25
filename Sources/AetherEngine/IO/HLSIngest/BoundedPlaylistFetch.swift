@@ -177,7 +177,10 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
             completionHandler(.cancel)
             return
         }
-        if declared > 0 { buffer.reserveCapacity(Int(min(declared, 8 * 1024 * 1024))) }
+        // A stated length is within `limit` (checked above), so the whole body is reserved at once:
+        // growing a 100 MB segment by doubling would copy it several times over, on the session's
+        // one delegate queue that every other engine fetch delivers on too.
+        if declared > 0 { buffer.reserveCapacity(Int(declared)) }
         completionHandler(.allow)
     }
 
