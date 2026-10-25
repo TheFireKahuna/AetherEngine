@@ -1,9 +1,42 @@
 import AetherLibavcodec
-import AetherLibavformat
 import AetherLibavutil
 import Foundation
 import Testing
 @testable import AetherEngine
+
+/// A clip under Fixtures/decmem/: 12 s of music-like audio in one codec the bridge decodes, read as the engine reads a
+/// file.
+struct DecmemClip {
+    let packets: [UnsafeMutablePointer<AVPacket>]
+    let codecpar: UnsafeMutablePointer<AVCodecParameters>
+    let timeBase: AVRational
+    let start: Int64?
+
+    func free() {
+        for p in packets { var q: UnsafeMutablePointer<AVPacket>? = p; trackedPacketFree(&q) }
+        var c: UnsafeMutablePointer<AVCodecParameters>? = codecpar
+        avcodec_parameters_free(&c)
+    }
+
+    static func read(_ name: String) throws -> DecmemClip {
+        let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appending(path: "Fixtures/decmem/\(name)")
+        try #require(FileManager.default.fileExists(atPath: url.path), "run Scripts/fetch-fixtures.sh to generate Fixtures/decmem/")
+        let demuxer = Demuxer()
+        try demuxer.open(url: url)
+        defer { demuxer.close() }
+        let index = demuxer.audioStreamIndex
+        let stream = try #require(demuxer.stream(at: index))
+        let par = avcodec_parameters_alloc()!
+        avcodec_parameters_copy(par, stream.pointee.codecpar)
+        var packets: [UnsafeMutablePointer<AVPacket>] = []
+        while let pkt = try demuxer.readPacket() {
+            if pkt.pointee.stream_index == index { packets.append(pkt) } else { var q: UnsafeMutablePointer<AVPacket>? = pkt; trackedPacketFree(&q) }
+        }
+        return DecmemClip(packets: packets, codecpar: par, timeBase: stream.pointee.time_base,
+                          start: stream.pointee.start_time == Int64.min ? nil : stream.pointee.start_time)
+    }
+}
 
 /// A segment's bridged audio comes out the same however playback reached it (`AudioSegmentRuns`):
 /// a seek, which reads the source from its pre-roll before the segment, makes the segments that
@@ -11,41 +44,6 @@ import Testing
 /// segments follow one another a packet at a time across every run's handoff.
 @Suite("Segment runs: a seek makes continuous playback's segments")
 struct AudioSegmentRunsTests {
-
-    private struct Clip {
-        let packets: [UnsafeMutablePointer<AVPacket>]
-        let codecpar: UnsafeMutablePointer<AVCodecParameters>
-        let timeBase: AVRational
-        let start: Int64?
-        func free() {
-            for p in packets { var q: UnsafeMutablePointer<AVPacket>? = p; av_packet_free(&q) }
-            var c: UnsafeMutablePointer<AVCodecParameters>? = codecpar
-            avcodec_parameters_free(&c)
-        }
-    }
-
-    private func read(_ name: String) throws -> Clip {
-        let path = decmemFixture(name)
-        try #require(FileManager.default.fileExists(atPath: path), "run Scripts/fetch-fixtures.sh to generate Fixtures/decmem/")
-        var fmt: UnsafeMutablePointer<AVFormatContext>?
-        try #require(avformat_open_input(&fmt, path, nil, nil) == 0)
-        defer { avformat_close_input(&fmt) }
-        try #require(avformat_find_stream_info(fmt, nil) >= 0)
-        let index = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nil, 0)
-        try #require(index >= 0)
-        let stream = fmt!.pointee.streams[Int(index)]!
-        let par = avcodec_parameters_alloc()!
-        avcodec_parameters_copy(par, stream.pointee.codecpar)
-        var packets: [UnsafeMutablePointer<AVPacket>] = []
-        var pkt = av_packet_alloc()
-        defer { av_packet_free(&pkt) }
-        while av_read_frame(fmt, pkt) >= 0 {
-            if pkt!.pointee.stream_index == index, let c = av_packet_clone(pkt) { packets.append(c) }
-            av_packet_unref(pkt)
-        }
-        return Clip(packets: packets, codecpar: par, timeBase: stream.pointee.time_base,
-                    start: stream.pointee.start_time == Int64.min ? nil : stream.pointee.start_time)
-    }
 
     /// Two-second segments from 0, on a 90 kHz video axis.
     private func plan(from base: Int, bridge: any AudioTranscodingBridge, seconds: Int, delay: Double) -> AudioRunPlan {
@@ -61,7 +59,7 @@ struct AudioSegmentRunsTests {
     }
 
     /// Every packet the runs hand on from `first` on, by segment.
-    private func produce(_ clip: Clip, mode: AudioBridgeMode, from first: Int, base: Int, seconds: Int,
+    private func produce(_ clip: DecmemClip, mode: AudioBridgeMode, from first: Int, base: Int, seconds: Int,
                          delay: Double = 0) throws
         -> (segments: [Int: [Out]], packetFrames: Int64, preRoll: Double) {
         let make = { try AudioBridge(srcCodecpar: clip.codecpar, srcTimeBase: clip.timeBase, mode: mode) as any AudioTranscodingBridge }
@@ -103,7 +101,7 @@ struct AudioSegmentRunsTests {
     }
 
     private func check(_ name: String, _ mode: AudioBridgeMode, delay: Double) throws {
-        let clip = try read(name)
+        let clip = try DecmemClip.read(name)
         defer { clip.free() }
         let seconds = 12
         let continuous = try produce(clip, mode: mode, from: 0, base: 0, seconds: seconds, delay: delay)
@@ -137,7 +135,7 @@ struct AudioSegmentRunsTests {
 
     @Test("a producer a restart abandoned feeds only its own session, not the new producer's")
     func abandonedProducerCannotFeedTheNewOne() throws {
-        let clip = try read("dts-51.mkv")
+        let clip = try DecmemClip.read("dts-51.mkv")
         defer { clip.free() }
         let make = { try AudioBridge(srcCodecpar: clip.codecpar, srcTimeBase: clip.timeBase, mode: .surroundCompat)
             as any AudioTranscodingBridge }
@@ -182,7 +180,7 @@ struct AudioSegmentRunsTests {
 
     @Test("an MP3 run starts where the stream's own reservoir says, short of the format's worst case")
     func mp3RunStartsAtItsReservoir() throws {
-        let clip = try read("mp3-lsf.mp3")
+        let clip = try DecmemClip.read("mp3-lsf.mp3")
         defer { clip.free() }
         let buffers = clip.packets.map { UnsafeRawBufferPointer(start: $0.pointee.data, count: Int($0.pointee.size)) }
         // 32 kbps at 24 kHz: the format allows 255 bytes, 85 frames' worth at 8 kbps.
@@ -196,4 +194,5 @@ struct AudioSegmentRunsTests {
         #expect(furthest >= 1, "a reservoir that never reaches back is not one")
         #expect(Int64(furthest) < bound, "\(furthest) frames back against the format's \(bound)")
     }
+
 }
