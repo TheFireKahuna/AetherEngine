@@ -299,6 +299,9 @@ extension AetherEngine {
             tap?.ingestA53(triplets, ptsSeconds: Double(pts) * scale,
                            dtsSeconds: dts != Int64.min ? Double(dts) * scale : nil)
         }
+        session.overlayCaptionObserverForSession = { [weak tap] triplets, sourceSeconds in
+            tap?.ingestA53Ordered(triplets, ptsSeconds: sourceSeconds)
+        }
         EngineLog.emit("[AetherEngine] A53 SEI caption tap armed (synthetic id \(Self.a53ClosedCaptionTrackID))",
                        category: .engine)
     }

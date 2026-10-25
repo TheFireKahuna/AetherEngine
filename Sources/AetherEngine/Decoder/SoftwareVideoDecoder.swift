@@ -274,13 +274,19 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var loggedFinishFailure = false
 
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
-        self.onFrame = onFrame
-
         guard let codecpar = stream.pointee.codecpar else {
             throw VideoDecoderError.noCodecParameters
         }
+        try open(parameters: codecpar, timeBase: stream.pointee.time_base,
+                 containerSAR: stream.pointee.sample_aspect_ratio, onFrame: onFrame)
+    }
 
-        timeBase = stream.pointee.time_base
+    /// `open(stream:)` from the stream's parts, for a caller that keeps them past the demuxer's life: the codec
+    /// parameters, the time base packets are stamped in, and the container's sample aspect ratio.
+    func open(parameters codecpar: UnsafePointer<AVCodecParameters>, timeBase: AVRational, containerSAR: AVRational,
+              onFrame: @escaping DecodedFrameHandler) throws {
+        self.onFrame = onFrame
+        self.timeBase = timeBase
 
         // Container SAR fallback; see streamSAR. Frames usually carry their own (MPEG-2 seq header, from frame 1).
         //
@@ -293,7 +299,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // stream, which is every DVD remuxed to MKV in a codec whose bitstream cannot carry SAR.
         streamSAR = Self.declaredStreamSAR(
             bitstream: codecpar.pointee.sample_aspect_ratio,
-            container: stream.pointee.sample_aspect_ratio
+            container: containerSAR
         )
 
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {

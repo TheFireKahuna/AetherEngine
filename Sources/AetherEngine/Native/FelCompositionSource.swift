@@ -42,11 +42,17 @@ final class FelCompositionSource: OverlayFrameSource, @unchecked Sendable {
     func followRenderer(_ attributes: [String: Any]) {
         composer.rendererRecommendedAttributesOverride = attributes
         EngineLog.emit("[SoftwareOverlay] output pool follows the renderer's recommendation \(attributes.keys.sorted()); "
-                       + "the composer delivers \(SoftwareOverlayRenderer.fourCC(DoviFelComposer.outputMode.pixelFormat))",
+                       + "the composer delivers \(SoftwareOverlayRenderer.fourCC(DoviFelComposer.outputMode.pixelFormat(fullRange: false))) "
+                       + "(xf20 for a full-range picture)",
                        category: .swPlayback)
     }
 
     func advance(to itemSeconds: Double) { tap.advance(to: itemSeconds) }
+
+    /// The base layer is half the picture, whatever the rate.
+    func pacing(atRate rate: Double) -> OverlayPacing { .outputFrames }
+
+    func picture(at itemSeconds: Double) -> (picture: CVPixelBuffer, seconds: Double)? { nil }
 
     func makePicture(from base: CVPixelBuffer, at frameTime: CMTime,
                      done: @escaping @Sendable (CVPixelBuffer?) -> Void) -> Bool {

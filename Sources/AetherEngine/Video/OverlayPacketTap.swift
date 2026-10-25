@@ -7,9 +7,10 @@ import AetherLibavutil
 /// The decoder an ``OverlayPacketTap`` drives, on the tap's own thread. It hands each picture it decodes to the
 /// `deliver` it was made with, with the picture's item time.
 protocol OverlayTapDecoder: AnyObject {
-    /// Decodes `packet`, the tap's own copy, freed after the call. `restart` first drops what the decoder holds: a
-    /// seek, a new run, a decoder that fell behind.
-    func decode(_ packet: UnsafeMutablePointer<AVPacket>, restart: Bool, timeBase: AVRational)
+    /// Decodes `packet`, the tap's own copy, freed after the call. `restartingAt`, the clock in item seconds, first
+    /// drops what the decoder holds (a seek, a new run, a decoder that fell behind): the pictures before it are
+    /// references the decode passes through, not pictures anyone will show.
+    func decode(_ packet: UnsafeMutablePointer<AVPacket>, restartingAt clock: Double?, timeBase: AVRational)
     func close()
 }
 
@@ -39,6 +40,9 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
     static var maxEntries: Int { 6000 }
 
     let decodeAheadSeconds: Double
+    /// A clock this far behind the decode window has jumped back: the decode is past where it is needed. More than a
+    /// reordered GOP's lead, so a stream with B-frames does not read as one.
+    static var behindDecodeMs: Int64 { 500 }
 
     private struct Entry {
         let seq: Int
@@ -144,6 +148,16 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         state.unlock()
     }
 
+    /// The newest decoded picture at or before `seconds` (item time), with its own time: the picture on screen
+    /// then, when pictures do not follow the units one for one (a field-rate deinterlace, decimation, a cadence
+    /// retimed onto the film grid).
+    func picture(atOrBefore seconds: Double) -> (picture: CVPixelBuffer, seconds: Double)? {
+        let ms = Int64((seconds * 1000).rounded())
+        state.lock()
+        defer { state.unlock() }
+        return decoded.filter { $0.key <= ms }.max { $0.key < $1.key }.map { ($0.value, Double($0.key) / 1000) }
+    }
+
     var held: (units: Int, decoded: Int) {
         state.lock(); defer { state.unlock() }
         return (entries.count, decoded.count)
@@ -158,9 +172,10 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
             let next = nextPacketLocked()
             if next == nil { state.wait(until: Date().addingTimeInterval(0.05)) }
             let tb = timeBase
+            let clock = Double(clockMs) / 1000
             state.unlock()
             guard let (packet, restart) = next else { continue }
-            decoder?.decode(packet, restart: restart, timeBase: tb)
+            decoder?.decode(packet, restartingAt: restart ? clock : nil, timeBase: tb)
             var copy: UnsafeMutablePointer<AVPacket>? = packet
             trackedPacketFree(&copy)
         }
@@ -172,7 +187,8 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         let aheadMs = Int64(decodeAheadSeconds * 1000)
         let entry: Entry
         let restart: Bool
-        if let fed = lastFed, clockMs >= runFirstPtsMs - 50, !keyframePastDecodeLocked() {
+        if let fed = lastFed, clockMs >= runFirstPtsMs - 50, clockMs >= runLastPtsMs - aheadMs - Self.behindDecodeMs,
+           !keyframePastDecodeLocked() {
             // What was fed leads to the clock: carry on along the run, up to the decode window. A decode still
             // short of the clock carries on too, unless a keyframe past everything fed is nearer to it.
             guard runLastPtsMs < clockMs + aheadMs else { return nil }
@@ -185,7 +201,8 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
                 entry = key; restart = true
             }
         } else {
-            // A backward seek, the first unit, or a keyframe nearer the clock than the decode: start there.
+            // A backward seek (before the run, or behind its decode), the first unit, or a keyframe nearer the clock
+            // than the decode: start there.
             guard let key = keyframeLocked(beforeOrAt: clockMs) else { return nil }
             entry = key; restart = true
         }
@@ -223,14 +240,22 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
     private func store(_ picture: CVPixelBuffer, at time: CMTime) {
         let ms = Int64((time.seconds * 1000).rounded())
         state.lock()
-        if ms >= clockMs - 250 { decoded[ms] = picture }
+        decoded[ms] = picture
+        trimDecodedLocked()
         state.unlock()
+    }
+
+    /// Keeps the decoded pictures from the one on screen at the clock (the newest at or before it) on. Caller holds
+    /// `state`.
+    private func trimDecodedLocked() {
+        guard let shown = decoded.keys.filter({ $0 <= clockMs }).max() else { return }
+        decoded = decoded.filter { $0.key >= shown }
     }
 
     /// Drops decoded pictures the clock has passed, units further behind than `keepBehindSeconds`, and over the
     /// ceiling those furthest from the clock. Caller holds `state`.
     private func trimLocked() {
-        decoded = decoded.filter { $0.key >= clockMs - 250 }
+        trimDecodedLocked()
         let floor = clockMs - Int64(Self.keepBehindSeconds * 1000)
         var drop = entries.values.filter { $0.ptsMs < floor }.map(\.seq)
         let excess = entries.count - drop.count - Self.maxEntries

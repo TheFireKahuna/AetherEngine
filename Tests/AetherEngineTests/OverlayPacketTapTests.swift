@@ -25,8 +25,8 @@ struct OverlayPacketTapTests {
             picture = buffer!
         }
 
-        func decode(_ packet: UnsafeMutablePointer<AVPacket>, restart: Bool, timeBase: AVRational) {
-            lock.withLock { _fed.append((packet.pointee.pts, restart)) }
+        func decode(_ packet: UnsafeMutablePointer<AVPacket>, restartingAt clock: Double?, timeBase: AVRational) {
+            lock.withLock { _fed.append((packet.pointee.pts, clock != nil)) }
             deliver(picture, CMTime(value: packet.pointee.pts, timescale: timeBase.den))
         }
 
@@ -91,6 +91,17 @@ struct OverlayPacketTapTests {
         tap.advance(to: 9)
         #expect(Self.waitUntil(5) { tap.unit(at: 9)?.picture != nil })
         #expect(try #require(decoder()).fed.filter(\.restart).map(\.pts) == [0, 8000])
+    }
+
+    @Test("a jump back inside the run, behind its decode, restarts at the keyframe before the clock")
+    func backwardJumpInsideTheRun() throws {
+        let (tap, decoder) = Self.makeTap(seconds: 12, gop: 4)
+        defer { tap.close() }
+        tap.advance(to: 7)
+        #expect(Self.waitUntil(5) { tap.unit(at: 7)?.picture != nil })
+        tap.advance(to: 5)
+        #expect(Self.waitUntil(5) { tap.unit(at: 5)?.picture != nil })
+        #expect(try #require(decoder()).fed.filter(\.restart).last?.pts == 4000)
     }
 
     @Test("a backward jump restarts at the keyframe before the new clock")
