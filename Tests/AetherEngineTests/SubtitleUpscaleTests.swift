@@ -93,16 +93,18 @@ struct SubtitleUpscaleTests {
         return Image(width: t.width, height: t.height, pixels: pixels)
     }
 
-    static func bounds(_ p: SubtitleUpscaleFixtures.Picture) -> CGRect? {
-        p.rgba.withUnsafeBytes { SubtitleUpscaler.contentBounds($0.baseAddress!, width: p.width, height: p.height, bytesPerRow: p.width * 4, alphaOffset: 3) }
+    static func content(_ p: SubtitleUpscaleFixtures.Picture) -> SubtitleUpscaler.Content {
+        p.rgba.withUnsafeBytes {
+            SubtitleUpscaler.Content.scan($0.baseAddress!, width: p.width, height: p.height, bytesPerRow: p.width * 4, alphaOffset: 3)
+        } ?? .empty
     }
 
     /// Upscales 2x through ``SubtitleUpscaler/upscale(_:)`` into a Float32 texture.
-    static func run(_ picture: SubtitleUpscaleFixtures.Picture, _ upscaler: SubtitleUpscaler, bounds: CGRect? = nil,
+    static func run(_ picture: SubtitleUpscaleFixtures.Picture, _ upscaler: SubtitleUpscaler, content: SubtitleUpscaler.Content? = nil,
                     straight: Bool = false) throws -> Image {
         let job = SubtitleUpscaler.Job(source: SubtitleUpscaleFixtures.texture(picture, device: upscaler.device)!,
                                        destination: floatTexture(upscaler.device, 2 * picture.width, 2 * picture.height),
-                                       sourceAlpha: straight ? .straight : .premultiplied, contentBounds: bounds)
+                                       sourceAlpha: straight ? .straight : .premultiplied, content: content)
         try upscaler.upscale([job])
         return read(job.destination)
     }
@@ -143,12 +145,14 @@ struct SubtitleUpscaleTests {
     ])
     func matchesReference(_ name: String, _ configuration: SubtitleUpscaler.Configuration) throws {
         let upscaler = try SubtitleUpscaler(configuration: configuration)
-        // A strip smaller than one window, one wider than a core, and a canvas run on its bounds.
+        // A strip smaller than one window, one wider than a core, two lines of different lengths (bands of their own
+        // widths, the gap between them cleared), and a canvas run on its content.
         let wide = SubtitleUpscaleFixtures.glyphs(width: 712, height: 132, lines: ["Wider than one core", "and taller"], fontSize: 44)
+        let uneven = SubtitleUpscaleFixtures.glyphs(width: 900, height: 150, lines: ["The first line is the long one,", "short"], fontSize: 52)
         var canvas = SubtitleUpscaleFixtures.glyphs(width: 320, height: 200, lines: ["Bottom line"], fontSize: 30, baselineFromBottom: 20)
         for y in 10..<30 { for x in 290..<320 { canvas.rgba[(y * 320 + x) * 4 ..< (y * 320 + x) * 4 + 4] = [200, 200, 200, 255] } }
-        for picture in [Self.strip, Self.coloured, wide, canvas] {
-            let e = Self.error(try Self.run(picture, upscaler, bounds: Self.bounds(picture)), Self.reference(picture, configuration: configuration))
+        for picture in [Self.strip, Self.coloured, wide, uneven, canvas] {
+            let e = Self.error(try Self.run(picture, upscaler, content: Self.content(picture)), Self.reference(picture, configuration: configuration))
             print("[upscale] \(name) \(picture.width)x\(picture.height) vs fp32: \(e)")
             #expect(e.maxAlpha < 0.005 && e.maxColour < 0.005, "\(picture.width)x\(picture.height): \(e)")
             #expect(e.meanAlpha < 0.0005 && e.meanColour < 0.0005, "\(picture.width)x\(picture.height): \(e)")
@@ -160,7 +164,7 @@ struct SubtitleUpscaleTests {
         let upscaler = try SubtitleUpscaler(configuration: .c4f32)
         let empty = SubtitleUpscaleFixtures.Picture(width: 50, height: 20, rgba: [UInt8](repeating: 0, count: 50 * 20 * 4))
         #expect(try Self.run(empty, upscaler).pixels.allSatisfy { $0 == .zero })
-        #expect(try Self.run(empty, upscaler, bounds: Self.bounds(empty)).pixels.allSatisfy { $0 == .zero })
+        #expect(try Self.run(empty, upscaler, content: Self.content(empty)).pixels.allSatisfy { $0 == .zero })
         var solid = empty
         for i in 0..<(50 * 20) { solid.rgba[4 * i ..< 4 * i + 4] = [200, 120, 40, 255] }
         let e = Self.error(try Self.run(solid, upscaler), Self.reference(solid, configuration: .c4f32))
@@ -193,22 +197,24 @@ struct SubtitleUpscaleTests {
         for y in 140..<320 { for x in 0..<960 { #expect(image.pixels[y * 960 + x] == .zero) } }
     }
 
-    @Test("content bounds confine the network without changing the output")
-    func contentBounds() throws {
+    @Test("the content confines the network without changing the output")
+    func contentConfines() throws {
         var picture = SubtitleUpscaleFixtures.glyphs(width: 480, height: 270, lines: ["Lower third"], fontSize: 30, baselineFromBottom: 30)
         for y in 0..<12 { for x in 0..<20 { picture.rgba[(y * 480 + x) * 4 ..< (y * 480 + x) * 4 + 4] = [90, 0, 0, 180] } }
-        let bounds = try #require(Self.bounds(picture))
-        #expect(bounds.minX == 0 && bounds.minY == 0 && bounds.maxY > 230)
+        let content = Self.content(picture)
+        #expect(content.bounds.minX == 0 && content.bounds.minY == 0 && content.bounds.maxY > 230)
         let upscaler = try SubtitleUpscaler()
         let whole = try Self.run(picture, upscaler)
-        #expect(try Self.run(picture, upscaler, bounds: bounds) == whole)
-        // The text alone, the corner block left out of the bounds: the block's output vanishes, the text's stays.
-        let text = CGRect(x: 0, y: 200, width: 480, height: 70)
-        let partial = try Self.run(picture, upscaler, bounds: text)
+        // Row by row, as a rectangle, or the whole picture: one output.
+        #expect(try Self.run(picture, upscaler, content: content) == whole)
+        #expect(try Self.run(picture, upscaler, content: SubtitleUpscaler.Content(bounds: content.bounds)) == whole)
+        // The text alone, the corner block left out: the block's output vanishes, the text's stays.
+        let text = SubtitleUpscaler.Content(bounds: CGRect(x: 0, y: 200, width: 480, height: 70))
+        let partial = try Self.run(picture, upscaler, content: text)
         for y in 0..<540 { for x in 0..<960 where y >= 2 * 200 - 20 { #expect(partial.pixels[y * 960 + x] == whole.pixels[y * 960 + x]) } }
         #expect(partial.pixels[0] == .zero && whole.pixels[0] != .zero)
-        // Empty bounds: all transparent.
-        #expect(try Self.run(picture, upscaler, bounds: .zero).pixels.allSatisfy { $0 == .zero })
+        // No content: all transparent.
+        #expect(try Self.run(picture, upscaler, content: .empty).pixels.allSatisfy { $0 == .zero })
     }
 
     @Test("small and odd sizes match the reference", arguments: [(1, 1), (9, 5), (37, 23), (257, 31), (8, 8), (33, 2)])
@@ -232,14 +238,11 @@ struct SubtitleUpscaleTests {
         for (x0, y0) in [(0, 0), (w - 12, 0), (0, h - 9), (w - 12, h - 9)] {
             for y in y0..<(y0 + 9) { for x in x0..<(x0 + 12) { picture.rgba[(y * w + x) * 4 ..< (y * w + x) * 4 + 4] = [255, 255, 255, 255] } }
         }
-        let bounds = try #require(Self.bounds(picture))
-        let kept = bounds.integral.insetBy(dx: -5, dy: -5).intersection(CGRect(x: 0, y: 0, width: w, height: h))
-        let plan = SubtitleUpscaleTilePlan.plan(kept: (Int(kept.minX), Int(kept.minY), Int(kept.width), Int(kept.height)),
-                                                nanosecondsPerPixel: 2 * SubtitleUpscaleTilePlan.nanosecondsPerPixel(.c4f16),
-                                                nanosecondsPerCall: 2 * SubtitleUpscaleTilePlan.nanosecondsPerCall)
-        #expect(Set(plan.rows).count > 1 && Set(plan.columns).count > 1, "plan \(plan.rows) x \(plan.columns)")
-        let e = Self.error(try Self.run(picture, upscaler, bounds: bounds), Self.reference(picture, configuration: .c4f16))
-        print("[upscale] C4F16 \(w)x\(h) (\(plan.rows) x \(plan.columns)) vs fp32: \(e)")
+        let content = Self.content(picture)
+        let plan = SubtitleUpscaleTilePlan.plan(content: content, width: w, height: h, support: 5, alpha: .c4f16, luma: .c4f16)
+        #expect(Set(plan.windows.map(\.height)).count > 1 && Set(plan.windows.map(\.width)).count > 1, "plan \(plan.windows)")
+        let e = Self.error(try Self.run(picture, upscaler, content: content), Self.reference(picture, configuration: .c4f16))
+        print("[upscale] C4F16 \(w)x\(h) (\(plan.windows.count) windows) vs fp32: \(e)")
         #expect(e.maxAlpha < 0.005 && e.maxColour < 0.005, "\(e)")
     }
 
@@ -267,8 +270,8 @@ struct SubtitleUpscaleTests {
                             decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
         let twice = try upscaler.upscale(image)
         #expect(twice.width == 240 && twice.height == 80)
-        // The 8-bit result is the Float32 result (on the same content bounds) rounded.
-        let exact = try Self.run(picture, upscaler, bounds: Self.bounds(picture))
+        // The 8-bit result is the Float32 result (on the same content) rounded.
+        let exact = try Self.run(picture, upscaler, content: Self.content(picture))
         let bytes = Array(twice.dataProvider!.data! as Data)
         var worst = 0
         for (i, p) in exact.pixels.enumerated() {

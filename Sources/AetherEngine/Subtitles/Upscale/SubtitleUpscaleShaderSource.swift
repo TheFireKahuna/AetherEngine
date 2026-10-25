@@ -177,15 +177,15 @@ kernel void up_composite_tiles(texture2d<float, access::read> src [[texture(0)]]
     up_write_block(src, dst, g, x, y, a, l);
 }
 
-// Transparency for the destination outside the kept area (`g`'s origin and size): one thread per 2x2 output block.
-kernel void up_clear_outside(texture2d<float, access::write> dst [[texture(0)]],
-                             constant UpGeom& g [[buffer(0)]],
-                             uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= g.pictureWidth || gid.y >= g.pictureHeight) return;
-    const int x = int(gid.x) - g.originX, y = int(gid.y) - g.originY;
-    if (x >= 0 && y >= 0 && x < int(g.width) && y < int(g.height)) return;
+// Transparency for the 2x2 output blocks of a rectangle of source pixels (x, y, width, height): the pixels no
+// window covers. One thread per source pixel.
+kernel void up_clear_rect(texture2d<float, access::write> dst [[texture(0)]],
+                          constant int4& r [[buffer(0)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= uint(r.z) || gid.y >= uint(r.w)) return;
+    const uint2 o = 2 * (uint2(r.xy) + gid);
     for (uint j = 0; j < 2; j++)
-        for (uint i = 0; i < 2; i++) dst.write(float4(0.0f), 2 * gid + uint2(i, j));
+        for (uint i = 0; i < 2; i++) dst.write(float4(0.0f), o + uint2(i, j));
 }
 
 // MARK: - Resample

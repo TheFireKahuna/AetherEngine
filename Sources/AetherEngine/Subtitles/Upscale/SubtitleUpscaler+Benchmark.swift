@@ -17,6 +17,10 @@ extension SubtitleUpscaler {
             BenchmarkCase(name: "1920x200 strip", picture: SubtitleUpscaleFixtures.glyphs(width: 1920, height: 200, lines: two, fontSize: 64)),
             BenchmarkCase(name: "1920x1080 canvas", picture: SubtitleUpscaleFixtures.glyphs(width: 1920, height: 1080, lines: two, fontSize: 56,
                                                                                             baselineFromBottom: 70)),
+            // As a PGS object is cropped: two centred lines of different lengths, and one line.
+            BenchmarkCase(name: "1500x150 uneven lines", picture: SubtitleUpscaleFixtures.glyphs(width: 1500, height: 150,
+                                                                                                 lines: [two[0], "Then who did?"], fontSize: 56)),
+            BenchmarkCase(name: "900x80 one line", picture: SubtitleUpscaleFixtures.glyphs(width: 900, height: 80, lines: ["Then who did?"], fontSize: 56)),
         ]
     }
 
@@ -110,10 +114,10 @@ extension SubtitleUpscaler {
         d.usage = [.shaderRead, .shaderWrite]
         d.storageMode = .private
         guard let destination = device.makeTexture(descriptor: d) else { throw UpscaleError.unavailable("no texture") }
-        let bounds = picture.rgba.withUnsafeBytes {
-            Self.contentBounds($0.baseAddress!, width: picture.width, height: picture.height, bytesPerRow: picture.width * 4, alphaOffset: 3) ?? .zero
+        let content = picture.rgba.withUnsafeBytes {
+            Content.scan($0.baseAddress!, width: picture.width, height: picture.height, bytesPerRow: picture.width * 4, alphaOffset: 3) ?? .empty
         }
-        let job = Job(source: source, destination: destination, contentBounds: bounds)
+        let job = Job(source: source, destination: destination, content: content)
         var t0 = DispatchTime.now().uptimeNanoseconds
         try upscale([job])
         let first = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
