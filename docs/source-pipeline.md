@@ -399,8 +399,17 @@ In order, each step replacing a reader rather than adding one:
      the item's timebase, paused once near-term playback is covered.
    - **The pull.** `SubtitleSource.pull(stream, from:through:)` reads the index's blocks in that span
      on the fill's parallel lanes (`readFrames`), through the exact range reader over the shared source
-     cache, so a span the pump has already read is served from disk and the origin is asked only for
-     what nobody fetched; it stores them and records the span as pulled for that stream. Pulls of one
+     cache: each frame is a ranged read of its own few bytes, kept by the cache as a positional read
+     (`Retention.always`, `d03c96e7`), so a pull asked again after the store evicted it is served from
+     disk. It does not lean on the pump's bytes, which a lone reader's stream no longer leaves in the
+     cache away from the source's ends; it stores the frames and records the span as pulled for that
+     stream.
+   - **No session-long reader of the source.** The cache keeps a streamed delivery whenever another
+     reader of the source is open (`openReaders < 2`), so the index reader the subtitle source holds
+     for the session (`Resolution.root`, `subindex`) turns the pump's whole film back into flash
+     writes. The pull opens its lanes for the pull and closes them after; and a positional reader
+     should not count as one that comes back for a stream at all (the cache's own rule, to settle with
+     its owner). Pulls of one
      stream are coalesced (a span already pulled or in flight is not asked again) and a newer landing
      cancels an older one's unread remainder.
    - **The drainer asks for its own window, nothing more.** Each tick it pulls `[playhead - backscan,
@@ -420,9 +429,11 @@ In order, each step replacing a reader rather than adding one:
      ones included, on the main queue with the seek's completion and the item time already at the
      target, and for each step of a reverse scan (about four a second); the legible output's
      `outputSequenceWasFlushed:` arrives with it, but only on an item with legible media, so the
-     notification is the one used. Since `d2a6df05` a VOD run's item time is source time less the plan
-     anchor in every run, and live's pin keeps its timeline continuous, so on this route the source-axis
-     playhead moves discontinuously only at a stated landing. The jump threshold (#271) and #93's
+     notification is the one used. The other way the source-axis playhead moves is the axis moving under
+     it: since `b85e7ed0` each VOD run's axis is read in band, and the landing segment's clock arrives at
+     or after the landing it corrects (by 9 s on the AE#418 chain); a live program boundary rebases
+     source PTS. `setPresentationAxis`, which every change passes, counts such a move as a landing at
+     the corrected position. The jump threshold (#271) and #93's
      60 s rendered-time rule are gone from it; the threshold stays the software route's, which has no
      AVPlayer. The landing pull (above) will start here.
    - **Pacing reads the item's timebase.** The pull's lead is judged against `AVPlayerItem.timebase`

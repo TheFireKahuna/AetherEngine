@@ -2363,8 +2363,16 @@ public final class AetherEngine: ObservableObject {
     var softwareVideoFrameTimeObserver: SoftwareVideoFrameTimeObserver?
 
     func setPresentationAxis(_ map: PresentationAxisMap) {
+        let before = nativeVideoSession != nil ? nativeSourceSeconds(atItemSeconds: nativeClockSeconds) : nil
         presentationAxis = map
         presentationAxisMirror.set(map)
+        // The axis moved under the playhead: the same item time is now another source time. No item states
+        // that one (the landing segment's in-band clock, docs/segment-axis.md, arrives at or after the
+        // landing it corrects; a live program boundary rebases the source PTS), so the subtitle drain is
+        // told here, at the corrected position.
+        if let before, nativeSourceSeconds(atItemSeconds: nativeClockSeconds) != before {
+            subtitleLanded(atItemSeconds: nativeClockSeconds)
+        }
     }
 
     /// 1 Hz live-window updater, independent of the periodic time observer (which only fires while playing).
