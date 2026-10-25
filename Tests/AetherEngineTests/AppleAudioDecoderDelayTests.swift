@@ -14,17 +14,6 @@ import Testing
 @Suite("Apple's implicit audio decoder delay")
 struct AppleAudioDecoderDelayTests {
 
-    @Test("whole source ticks, rounded down, and the remainder in seconds")
-    func split() {
-        let ms = AppleAudioDecoderDelay.split(samples: 256, sampleRate: 48_000, timeBase: AVRational(num: 1, den: 1000))
-        #expect(ms.ticks == 5)
-        #expect(abs(ms.residualSeconds - 1.0 / 3000) < 1e-12, "the 16 samples a Matroska tick cannot hold")
-        let aac = AppleAudioDecoderDelay.split(samples: 2112, sampleRate: 48_000, timeBase: AVRational(num: 1, den: 1000))
-        #expect(aac.ticks == 44 && abs(aac.residualSeconds) < 1e-12)
-        let ts = AppleAudioDecoderDelay.split(samples: 256, sampleRate: 48_000, timeBase: AVRational(num: 1, den: 90_000))
-        #expect(ts.ticks == 480 && abs(ts.residualSeconds) < 1e-12)
-    }
-
     @Test("codecs without priming move nothing; unmeasured ones are not guessed")
     func table() {
         #expect(AppleAudioDecoderDelay.samples(codecID: AV_CODEC_ID_FLAC, profile: -99) == 0)

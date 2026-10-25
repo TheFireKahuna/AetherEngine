@@ -42,14 +42,4 @@ enum AppleAudioDecoderDelay {
             return nil
         }
     }
-
-    /// `samples` split for a track whose timestamps are in `timeBase`: whole ticks to move each packet
-    /// by, rounded down, and the remainder in seconds, which the muxer adds sample-exactly at the
-    /// output rate (a Matroska tick is 1 ms; 256 samples at 48 kHz is 5.333 ms).
-    static func split(samples: Int, sampleRate: Int32, timeBase: AVRational) -> (ticks: Int64, residualSeconds: Double) {
-        guard samples > 0, sampleRate > 0, timeBase.num > 0, timeBase.den > 0 else { return (0, 0) }
-        let ticks = av_rescale_q_rnd(Int64(samples), AVRational(num: 1, den: sampleRate), timeBase, AV_ROUND_DOWN)
-        let residual = Double(samples) / Double(sampleRate) - Double(ticks) * Double(timeBase.num) / Double(timeBase.den)
-        return (ticks, residual)
-    }
 }

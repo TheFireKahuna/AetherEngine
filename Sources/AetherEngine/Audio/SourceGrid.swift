@@ -35,7 +35,11 @@ struct SourceGrid {
     /// against a timestamp's rounding alone, `DTSX Emulator.mkv` (start 53 ms, timestamps up to a
     /// tick either side of their frames) left the lattice about 700 times a minute and was placed
     /// anew each time. On a run placed on every frame the origin cancels out.
-    private var latticeTolerance: Int64 { step > 1 ? 2 * tolerance - 1 : tolerance }
+    private var latticeTolerance: Int64 { Self.latticeTolerance(step: step, tolerance: tolerance) }
+
+    private static func latticeTolerance(step: Int64, tolerance: Int64) -> Int64 {
+        step > 1 ? 2 * tolerance - 1 : tolerance
+    }
 
     /// The run's relative position of its first frame, and the grid offsets (in steps, from the
     /// point `origin` puts that frame on) still consistent with every timestamp the run has seen.
@@ -117,6 +121,21 @@ struct SourceGrid {
             ?? steps.lowerBound + (steps.upperBound - steps.lowerBound) / 2
         chosen = placed
         return (.position(origin + placed * step + (relative - first)), restarted)
+    }
+
+    /// Where a coded frame whose own container timestamp is `estimate` starts, for a stream whose
+    /// every frame carries one (a stream-copied packet): the lattice point that timestamp names. A
+    /// lattice longer than the span a rounded timestamp can name (`latticeTolerance` either side)
+    /// leaves one point in it, so the timestamp alone decides, and every packet is placed by itself,
+    /// the same way whichever packet a run began at. Where the lattice is no longer than that span
+    /// (none of the codecs stream-copied: they are 256 frames or more, the Matroska span 194 at
+    /// 48 kHz) or is every frame, the timestamp names no single point and is the position; so is one
+    /// with no point in its span, a frame cut off the lattice (`place`'s rule for the same).
+    static func position(estimate: Int64, origin: Int64, lattice: Int64, tolerance: Int64) -> Int64 {
+        let window = latticeTolerance(step: lattice, tolerance: tolerance)
+        guard lattice > 2 * window else { return estimate }
+        let point = origin + floorDiv(estimate - origin + lattice / 2, lattice) * lattice
+        return abs(point - estimate) <= window ? point : estimate
     }
 
     /// The first coded frame, in frames at `sampleRate`: the stream's start (`AVStream.start_time`)
