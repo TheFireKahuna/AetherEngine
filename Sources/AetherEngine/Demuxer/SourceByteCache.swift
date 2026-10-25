@@ -27,6 +27,10 @@ import Foundation
 /// Whatever else is kept per source goes with it: `observeReleases` tells the source's index
 /// (`SourceIndexRegistry`) when the source is let go.
 ///
+/// What a reader streams through is kept only where someone can come back for it (`Retention`): a
+/// lone reader playing a film from start to end never reads the middle again, and keeping it wrote
+/// the whole film to flash once per viewing.
+///
 /// A reader uses the cache only when it is handed one (`AVIOReader(sourceCache:)`,
 /// `HTTPDiscIOReader(sourceCache:)`): the engine's own construction sites pass `shared`, and a reader
 /// built without it fetches everything itself, as every reader did before.
@@ -49,6 +53,21 @@ final class SourceByteCache: @unchecked Sendable {
     static let maxPendingWriteBytes = 64 << 20
     /// Most the shared cache claims, whatever the volume has free.
     static let budgetCeilingBytes: Int64 = 4 << 30
+    /// How far from either end of a source a streamed delivery is kept whoever else is reading: the
+    /// head holds what the parse returns to and what a later open replays (Matroska header and
+    /// attachments, a front `moov`), the end holds the trailing index (cues, a rear `moov`).
+    static let streamEdgeBytes: Int64 = 64 << 20
+
+    /// Which deliveries are kept.
+    enum Retention: Sendable {
+        /// Bytes a reader asked for by position (a detour, the tail, a chunk): kept.
+        case always
+        /// A reader's sequential stream: kept within `streamEdgeBytes` of either end of the source,
+        /// or while another reader of it is open to come back for the bytes (the subtitle walk ahead
+        /// of the pump, the pump behind it). Otherwise passed over, which costs only a fetch if a
+        /// later reader does want them.
+        case streamed
+    }
 
     /// How big the cache may grow.
     enum Budget: Sendable {
@@ -101,6 +120,8 @@ final class SourceByteCache: @unchecked Sendable {
         var release: DispatchWorkItem?
         var servedBytes: Int64 = 0
         var storedBytes: Int64 = 0
+        /// Streamed by a lone reader and not kept (`Retention.streamed`).
+        var passedOverBytes: Int64 = 0
         /// How long this source's readers held a request for the disk (`waitForWriteRoom`).
         var writeWaitNanos: UInt64 = 0
 
@@ -126,6 +147,8 @@ final class SourceByteCache: @unchecked Sendable {
     private let allowance: Allowance?
     private let claim: RetentionClaims.Claim?
     private let pendingWriteBound: Int
+    /// `streamEdgeBytes`, unless a test sizes it to its file.
+    private let streamEdge: Int64
     /// The cache's one lock, and the condition a reader waiting for the disk waits on.
     private let lock = NSCondition()
     private var sources: [SourceCacheKey: Source] = [:]
@@ -156,8 +179,10 @@ final class SourceByteCache: @unchecked Sendable {
     }
 
     init(directory: URL, budget: Budget, releaseGrace: TimeInterval = SourceByteCache.releaseGraceSeconds,
-         pendingWriteBound: Int = SourceByteCache.maxPendingWriteBytes, removesDirectory: Bool = false) {
+         pendingWriteBound: Int = SourceByteCache.maxPendingWriteBytes,
+         streamEdge: Int64 = SourceByteCache.streamEdgeBytes, removesDirectory: Bool = false) {
         self.directory = directory
+        self.streamEdge = streamEdge
         self.removesDirectory = removesDirectory
         self.releaseGrace = releaseGrace
         self.pendingWriteBound = pendingWriteBound
@@ -304,8 +329,10 @@ final class SourceByteCache: @unchecked Sendable {
     /// delivery from another body than the recorded one is not kept: it came on a connection answered
     /// before the file behind the request was replaced. Never blocks and never drops: it is called
     /// from delivery callbacks, which have no flow control to push back with (#174), so the bound
-    /// is kept where readers send their next request (`waitForWriteRoom`).
-    func store(_ data: Data, at offset: Int64, version: SourceVersion, for key: SourceCacheKey) {
+    /// is kept where readers send their next request (`waitForWriteRoom`). `retention` says whether a
+    /// streamed delivery is worth keeping (`Retention`).
+    func store(_ data: Data, at offset: Int64, version: SourceVersion, for key: SourceCacheKey,
+               retention: Retention = .always) {
         guard !data.isEmpty, offset >= 0 else { return }
         lock.lock()
         guard byteBudget > 0, let source = sourceLocked(key, create: true),
@@ -314,6 +341,13 @@ final class SourceByteCache: @unchecked Sendable {
             return
         }
         source.version = source.version.merged(with: version)
+        if retention == .streamed, source.openReaders < 2,
+           !Self.nearEdge(offset: offset, count: Int64(data.count), size: source.version.size, edge: streamEdge) {
+            source.passedOverBytes += Int64(data.count)
+            scheduleReleaseLocked(key, source)
+            lock.unlock()
+            return
+        }
         pendingWriteBytes += data.count
         source.pending.append((offset, data))
         source.visible.insert(start: offset, end: offset + Int64(data.count))
@@ -323,6 +357,13 @@ final class SourceByteCache: @unchecked Sendable {
         drainScheduled = true
         lock.unlock()
         if schedule { writeQueue.async { [self] in drainWrites() } }
+    }
+
+    /// Whether `count` bytes at `offset` reach within `edge` of either end. An unknown size has no
+    /// middle to pass over.
+    static func nearEdge(offset: Int64, count: Int64, size: Int64?, edge: Int64) -> Bool {
+        guard let size else { return true }
+        return offset < edge || offset + count > size - edge
     }
 
     /// Writes whatever has queued, until nothing has. On `writeQueue`.
@@ -619,12 +660,14 @@ final class SourceByteCache: @unchecked Sendable {
             self.sources[key] = nil
             self.heldBytes -= source.spans.totalBytes
             let stored = source.storedBytes, served = source.servedBytes, waited = source.writeWaitNanos
+            let passedOver = source.passedOverBytes
             let observers = self.releaseObservers
             self.lock.unlock()
-            if stored > 0 {
+            if stored > 0 || passedOver > 0 {
                 EngineLog.emit(
                     "[SourceCache] \(display) released: stored \(Self.mb(stored)), "
                     + "served \(Self.mb(served)) back to readers"
+                    + (passedOver > 0 ? ", passed over \(Self.mb(passedOver)) a lone reader streamed" : "")
                     + (waited > 0 ? ", requests waited \(waited / 1_000_000) ms for the disk" : ""),
                     category: .demux)
             }

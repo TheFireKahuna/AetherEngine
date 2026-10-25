@@ -320,6 +320,58 @@ struct SourceByteCacheTests {
         #expect(cache.heldBytesForTesting(playing) == 100)
     }
 
+    @Test("A lone reader's stream is kept near either end and passed over in the middle")
+    func loneStreamKeepsOnlyTheEdges() {
+        let cache = Self.freshCache(budget: 1 << 30)
+        let size: Int64 = 1 << 30
+        let edge = SourceByteCache.streamEdgeBytes
+        cache.readerOpened(Self.source)
+        cache.noteVersion(SourceVersion(size: size), for: Self.source)
+        let chunk = Self.pattern(1000)
+        for offset in [0, edge - 1, size / 2, edge + 999, size - edge - 1000, size - edge - 999] {
+            cache.store(chunk, at: offset, version: SourceVersion(), for: Self.source, retention: .streamed)
+        }
+        cache.drainWritesForTesting()
+        #expect(cache.heldLength(Self.source, at: 0, expectedSize: size) == 1000)
+        #expect(cache.heldLength(Self.source, at: edge - 1, expectedSize: size) == 1000)
+        #expect(cache.heldLength(Self.source, at: size / 2, expectedSize: size) == 0)
+        #expect(cache.heldLength(Self.source, at: edge + 999, expectedSize: size) == 0)
+        #expect(cache.heldLength(Self.source, at: size - edge - 1000, expectedSize: size) == 0)
+        #expect(cache.heldLength(Self.source, at: size - edge - 999, expectedSize: size) == 1000)
+    }
+
+    @Test("Bytes asked for by position are kept wherever they are, and a stream of unknown size is kept")
+    func positionalAndUnsizedAreKept() {
+        let cache = Self.freshCache(budget: 1 << 30)
+        let sized = Self.key("https://media.example.com/sized")
+        let unsized = Self.key("https://media.example.com/unsized")
+        let middle: Int64 = 512 << 20
+        cache.readerOpened(sized)
+        cache.readerOpened(unsized)
+        cache.noteVersion(SourceVersion(size: 1 << 30), for: sized)
+        cache.store(Self.pattern(1000), at: middle, version: SourceVersion(), for: sized)
+        cache.store(Self.pattern(1000), at: middle, version: SourceVersion(), for: unsized, retention: .streamed)
+        cache.drainWritesForTesting()
+        #expect(cache.heldLength(sized, at: middle, expectedSize: 1 << 30) == 1000)
+        #expect(cache.heldLength(unsized, at: middle, expectedSize: nil) == 1000)
+    }
+
+    @Test("A stream is kept while another reader of the source is open, and passed over once it closes")
+    func streamIsKeptWhileShared() {
+        let cache = Self.freshCache(budget: 1 << 30)
+        let size: Int64 = 1 << 30
+        let middle: Int64 = 512 << 20
+        cache.readerOpened(Self.source)
+        cache.readerOpened(Self.source)
+        cache.noteVersion(SourceVersion(size: size), for: Self.source)
+        cache.store(Self.pattern(1000), at: middle, version: SourceVersion(), for: Self.source, retention: .streamed)
+        cache.readerClosed(Self.source)
+        cache.store(Self.pattern(1000), at: middle + 1000, version: SourceVersion(), for: Self.source, retention: .streamed)
+        cache.drainWritesForTesting()
+        #expect(cache.heldLength(Self.source, at: middle, expectedSize: size) == 1000)
+        #expect(cache.heldLength(Self.source, at: middle + 1000, expectedSize: size) == 0)
+    }
+
     @Test("A redirect target is kept per source and forgotten only while it is still the recorded one")
     func resolvedTargetIsForgottenOnlyIfCurrent() throws {
         let cache = Self.freshCache()
@@ -396,6 +448,49 @@ struct SourceByteCacheTests {
         #expect(pump.fromCache >= Int64(held.count))
         #expect(pump.duplicate == 0)
         #expect(pump.fetched <= Int64(size - held.count))
+    }
+
+    /// The whole pump through a real reader: alone, it keeps the head and the end and passes over the
+    /// middle; beside another reader of the source, it keeps everything. The edge is sized to the file.
+    @Test("A lone pump keeps only the ends of what it streams; beside another reader it keeps it all",
+          .timeLimit(.minutes(1)), arguments: [false, true])
+    func pumpKeepsTheMiddleOnlyWhenShared(shared: Bool) throws {
+        let size = 6 * 1024 * 1024
+        let edge: Int64 = 1024 * 1024
+        let body = Self.pattern(size, seed: shared ? 13 : 17)
+        let origin = try #require(KeepAliveRangeOrigin(data: body))
+        defer { origin.stop() }
+        let url = URL(string: "http://127.0.0.1:\(origin.port)/edges-\(UUID().uuidString).bin")!
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "source-cache-tests-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let cache = SourceByteCache(directory: dir, budget: .fixed(64 << 20), streamEdge: edge)
+        let hold = shared ? AVIOReader(url: url, label: "hold", prefetchEnabled: false, sourceCache: cache) : nil
+        defer { hold?.close() }
+
+        let reader = AVIOReader(url: url, label: "pump", prefetchEnabled: true, sourceCache: cache)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 64 * 1024)
+        defer { buf.deallocate() }
+        var played = Data()
+        while played.count < size {
+            let n = reader.read(into: buf, size: Int32(64 * 1024))
+            if n <= 0 { break }
+            played.append(buf, count: Int(n))
+        }
+        #expect(played == body)
+        cache.drainWritesForTesting()
+
+        let key = SourceCacheKey(url: url, headers: [:])
+        let total = Int64(size)
+        #expect(cache.heldLength(key, at: 0, expectedSize: total) >= edge)
+        #expect(cache.heldLength(key, at: total - edge, expectedSize: total) == edge)
+        let middle = cache.heldLength(key, at: total / 2, expectedSize: total)
+        if shared {
+            #expect(middle > 0)
+        } else {
+            #expect(middle == 0)
+        }
     }
 
     /// A file replaced behind the same URL at the same size: the held span the pump would replay

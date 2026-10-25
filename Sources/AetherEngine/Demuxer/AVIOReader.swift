@@ -445,15 +445,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     /// `offset` is where the delivery sits in the source: the duplicate-traffic ledger counts the
     /// span, and the source cache keeps the bytes for whichever reader asks for them next, as the
-    /// body `version` (the response the bytes came on) says they are. Live has no stable byte
-    /// addresses, so its bytes are counted and not kept.
-    private func addBytesFetched(_ data: Data, at offset: Int64, version: SourceVersion) {
+    /// body `version` (the response the bytes came on) says they are, as far as `retention` says
+    /// someone can come back for them. Live has no stable byte addresses, so its bytes are counted
+    /// and not kept.
+    private func addBytesFetched(_ data: Data, at offset: Int64, version: SourceVersion,
+                                 retention: SourceByteCache.Retention) {
         let n = data.count
         counterLock.lock()
         _cumulativeBytesFetched &+= Int64(n)
         counterLock.unlock()
         SourceByteLedger.shared.record(ledgerSource, reader: label, offset: offset, count: n)
-        if !isLive { sourceCache.store(data, at: offset, version: version, for: cacheKey) }
+        if !isLive { sourceCache.store(data, at: offset, version: version, for: cacheKey, retention: retention) }
         // #392: every network delivery this reader makes passes through here (pump, chunk, tail
         // prefetch, detour fetch, streaming), which is why the idle clock is stamped here and not
         // in one of them. A serve out of memory does not reach this call, and must not: memory is
@@ -3028,7 +3030,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             }
             let version = (response as? HTTPURLResponse)
                 .map { noteResponseVersion($0, requestedOffset: offset) } ?? SourceVersion()
-            addBytesFetched(data, at: offset, version: version)
+            addBytesFetched(data, at: offset, version: version, retention: .always)
             return .ok(data)
         } catch {
             return .failed
@@ -3174,7 +3176,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // from the source cache, so the bytes have to be there when it looks.
             if case .span(let start, let data, let http) = outcome, !self.isFullyClosed {
                 self.addBytesFetched(data, at: start,
-                                     version: self.noteResponseVersion(http, requestedOffset: start))
+                                     version: self.noteResponseVersion(http, requestedOffset: start),
+                                     retention: .always)
             }
             self.winCond.lock()
             self.tailPrefetchInFlight = false
@@ -4038,7 +4041,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if fromCache {
             SourceByteLedger.shared.servedFromCache(ledgerSource, reader: label, count: count)
         } else if !isFullyClosed {
-            addBytesFetched(data, at: deliveredAt, version: deliveredVersion)
+            addBytesFetched(data, at: deliveredAt, version: deliveredVersion, retention: .streamed)
         }
         if let overDeliveredTransfer {
             EngineLog.emit(
@@ -4398,7 +4401,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             } else {
                 toSuspend?.suspend()
             }
-            self.addBytesFetched(data, at: deliveredAt, version: version)
+            self.addBytesFetched(data, at: deliveredAt, version: version, retention: .streamed)
             self.streamDataReady.signal()
         } onComplete: { [weak self] error in
             lease.release()
@@ -4936,7 +4939,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 }
                 let version = (response as? HTTPURLResponse)
                     .map { noteResponseVersion($0, requestedOffset: offset) } ?? SourceVersion()
-                addBytesFetched(data, at: offset, version: version)
+                addBytesFetched(data, at: offset, version: version, retention: .always)
                 return data
             } catch {
                 // Superseded / closed / past the read deadline: this read is disposable,
