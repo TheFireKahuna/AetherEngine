@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/TheFireKahuna/LibDovi",
       "state" : {
-        "revision" : "d4162ddd28a5d3e93d7533316c4eb6326e91b88e",
-        "version" : "2.2.0-fire.2"
+        "revision" : "0173d6c9825497edecbb4fc756be4958032fa101",
+        "version" : "2.2.0-fire.3"
       }
     },
     {

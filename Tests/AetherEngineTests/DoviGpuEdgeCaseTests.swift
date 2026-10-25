@@ -171,28 +171,28 @@ struct DoviGpuEdgeCaseTests {
 
     // MARK: - Output range
 
-    @Test("GPU clamps to video range: luma 64...940, chroma 64...960")
-    func outputClamps() throws {
+    @Test("GPU clips to the code space, not to video range: footroom and headroom pass")
+    func outputClips() throws {
         let composer = try #require(DoviFelComposer.p010ForTesting())
         let p = Self.params(flags: [.disableResidual])
         let low = try Self.composeConstant(composer, bl: (0, 0, 0), el: (512, 512, 512), params: p)
         let high = try Self.composeConstant(composer, bl: (1023, 1023, 1023), el: (512, 512, 512), params: p)
-        #expect(Self.lumaValues(low) == [64])
-        #expect(Set(Self.allSamples(low, plane: 1, components: 2).flatMap { $0 }) == [64])
-        #expect(Self.lumaValues(high) == [940])
-        #expect(Set(Self.allSamples(high, plane: 1, components: 2).flatMap { $0 }) == [960])
+        #expect(Self.lumaValues(low) == [0])
+        #expect(Set(Self.allSamples(low, plane: 1, components: 2).flatMap { $0 }) == [0])
+        #expect(Self.lumaValues(high) == [1023])
+        #expect(Set(Self.allSamples(high, plane: 1, components: 2).flatMap { $0 }) == [1023])
     }
 
     @Test("GPU residual pushing past the VDR range saturates instead of wrapping")
     func residualSaturates() throws {
         let composer = try #require(DoviFelComposer.p010ForTesting())
         let p = Self.params()
-        // BL 1023 + 511 residual -> 4092 + 511 > 4095 -> clamp -> out 1024 -> luma cap 940.
+        // BL 1023 + 511 residual -> 4092 + 511 > 4095 -> clipped to the top code, 1023.
         let hi = try Self.composeConstant(composer, bl: (1023, 512, 512), el: (1023, 512, 512), params: p)
-        // BL 0 - 512 residual -> negative -> clamp 0 -> luma floor 64.
+        // BL 0 - 512 residual -> negative -> clipped to 0.
         let lo = try Self.composeConstant(composer, bl: (0, 512, 512), el: (0, 512, 512), params: p)
-        #expect(Self.lumaValues(hi) == [940])
-        #expect(Self.lumaValues(lo) == [64])
+        #expect(Self.lumaValues(hi) == [1023])
+        #expect(Self.lumaValues(lo) == [0])
     }
 
     // MARK: - Geometry
@@ -273,7 +273,7 @@ struct DoviGpuEdgeCaseTests {
         let out = try #require(composer.compose(baseBuffer: bl, enhancementBuffer: el, params: p))
         let row = H.readPlane(out, plane: 0, components: 1, row: 0).map { $0[0] }
         for code in [100, 499, 500, 501, 900] {
-            #expect(row[code] == min(max(code, 64), 940), "code \(code)")
+            #expect(row[code] == code, "code \(code)")
         }
     }
 
