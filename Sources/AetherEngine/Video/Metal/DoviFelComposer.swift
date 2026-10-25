@@ -950,6 +950,11 @@ final class DoviFelComposer: @unchecked Sendable {
         // retired — nothing reads `dst` early just because its attachments
         // are set before the GPU has written its pixels.
         propagateColorAttachments(from: baseBuffer, to: dst)
+        // The composed picture is the master: its HDR10 static metadata is the RPU's L6, not the base layer's grade
+        // the propagation just copied (`DolbyVisionLevel6`).
+        if let level6 = params.masterLevel6 {
+            level6.describingMaster(HDRStaticMetadata(buffer: dst)).attach(to: dst)
+        }
 
         var keepAliveTextures: [CVMetalTexture] = []
 
@@ -1543,6 +1548,7 @@ final class DoviFelComposer: @unchecked Sendable {
             params.flags.insert(.lumaMmr)
         }
 
+        params.masterLevel6 = DolbyVisionLevel6(rpu: rpu)
         return params
     }
 

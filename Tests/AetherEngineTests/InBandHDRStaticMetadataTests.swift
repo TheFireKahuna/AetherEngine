@@ -360,7 +360,7 @@ extension InBandHDRStaticMetadataTests {
         func read(_ au: [UInt8]) -> Bool? {
             var m = InBandHDRStaticMetadata()
             au.withUnsafeBufferPointer {
-                m.collectDolbyVisionRange(from: $0.baseAddress!, size: $0.count, framing: .lengthPrefixed(size: 4))
+                m.collectDolbyVisionRPU(from: $0.baseAddress!, size: $0.count, framing: .lengthPrefixed(size: 4))
             }
             return m.dolbyVisionBaseLayerFullRange
         }

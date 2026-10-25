@@ -216,6 +216,9 @@ struct DoviMetalParams: Sendable {
     /// Luma column from which the residual is left out (FEL left, MEL right); 0 = no split. Set by the
     /// composer from ``DoviFelComposer/residualSplit``.
     var residualSplitX: UInt32 = 0
+    /// The RPU's L6, for the HDR10 static metadata a composed frame states (the master's). Swift side only: not
+    /// part of the serialized block.
+    var masterLevel6: DolbyVisionLevel6?
 
     init() {}
 
