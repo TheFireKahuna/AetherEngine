@@ -21,8 +21,9 @@ final class OverlayPlaceholder: @unchecked Sendable {
     let tags: ColorAttachments.Tags
     /// The same, as the init's `colr` states it.
     let colour: ColorDescription
-    private let sourceCodecID: AVCodecID
-    private let sourceFraming: A53SEIParser.NALFraming
+    /// The source stream the overlay decodes, and how its packets are framed (HEVC and H.264).
+    let sourceCodecID: AVCodecID
+    let sourceFraming: A53SEIParser.NALFraming
 
     /// `source` is the stream the overlay decodes; `framing` how its packets are framed (HEVC only). nil when no
     /// HEVC Main10 encoder can be made.

@@ -240,13 +240,19 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     // MARK: - Lifecycle
 
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
-        self.onFrame = onFrame
-
         guard let codecpar = stream.pointee.codecpar else {
             throw VideoDecoderError.noCodecParameters
         }
+        try open(parameters: codecpar, timeBase: stream.pointee.time_base,
+                 containerSAR: stream.pointee.sample_aspect_ratio, onFrame: onFrame)
+    }
 
-        timeBase = stream.pointee.time_base
+    /// `open(stream:)` from the stream's parts, for a caller that keeps them past the demuxer's life: the codec
+    /// parameters, the time base packets are stamped in, and the container's sample aspect ratio.
+    func open(parameters codecpar: UnsafePointer<AVCodecParameters>, timeBase: AVRational, containerSAR: AVRational,
+              onFrame: @escaping DecodedFrameHandler) throws {
+        self.onFrame = onFrame
+        self.timeBase = timeBase
         width = codecpar.pointee.width
         height = codecpar.pointee.height
 
@@ -255,7 +261,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // DisplayWidth quotient, MP4's `pasp`), which is where every DVD remuxed to MKV carries it.
         pixelAspectRatio = Self.resolvePixelAspectRatio(
             bitstream: codecpar.pointee.sample_aspect_ratio,
-            container: stream.pointee.sample_aspect_ratio,
+            container: containerSAR,
             width: width,
             height: height
         )
@@ -264,8 +270,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 "[HWDecoder] SAR \(sar.num):\(sar.den) on \(width)x\(height) "
                 + "(bitstream=\(codecpar.pointee.sample_aspect_ratio.num):"
                 + "\(codecpar.pointee.sample_aspect_ratio.den) "
-                + "container=\(stream.pointee.sample_aspect_ratio.num):"
-                + "\(stream.pointee.sample_aspect_ratio.den))",
+                + "container=\(containerSAR.num):\(containerSAR.den))",
                 category: .swPlayback
             )
         }
