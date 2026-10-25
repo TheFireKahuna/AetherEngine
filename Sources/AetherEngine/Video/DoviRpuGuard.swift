@@ -97,7 +97,7 @@ enum DoviRpuGuard {
     ///   an out-of-bounds panic in `dovi_write_unspec62_nalu`. Mode 2 conversion drops the mapping only
     ///   for an FEL stream, so a MEL or residual-free RPU reaches the writer with the mix intact;
     /// - a pivot or block count the payload cannot hold (an allocation abort), and a level 8, 9 or 10
-    ///   block of a length the spec does not define (`unreachable!()` in `required_bits`).
+    ///   block of a length libdovi does not define (`unreachable!()` in `required_bits`).
     ///
     /// An Exp-Golomb code with 32 or more leading zeros anywhere the scan reads one is hostile (see
     /// `Bits.hostile`) and answers true.
@@ -216,9 +216,9 @@ enum DoviRpuGuard {
     /// far enough to see every block's level and length.
     ///
     /// A level outside a list's own set (reserved, or defined only for the other list) is walked past by its
-    /// length: this fork's libdovi carries such a block as its bytes, as ETSI TS 103 572 / ATSC A/341 /
-    /// ETSI GS CCM 001 require ("shall be ignored"), so the blocks behind it still reach the parser and still
-    /// need checking (TheFireKahuna/dovi_tool libdovi-3.4.0-fire.1, in LibDovi 2.2.0-fire.2).
+    /// length: this fork's libdovi carries such a block as its bytes, as a reserved block is to be ignored, not
+    /// refused, so the blocks behind it still reach the parser and still need checking
+    /// (TheFireKahuna/dovi_tool libdovi-3.4.0-fire.1, in LibDovi 2.2.0-fire.2).
     private static func reachesInvalidDmBlock(_ r: inout Bits, compressed: Bool) -> Bool {
         guard r.ue() != nil, r.ue() != nil, r.ue() != nil else { return false }
         if !compressed {   // fixed fields of VdrDmData::parse
