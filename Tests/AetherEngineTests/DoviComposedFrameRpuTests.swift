@@ -48,9 +48,9 @@ struct DoviComposedFrameRpuTests {
 
     // MARK: - Production path
 
-    private static func hevcNAL(type: UInt8, payload: [UInt8]) -> [UInt8] { [UInt8(type << 1), 0x01] + payload }
+    static func hevcNAL(type: UInt8, payload: [UInt8]) -> [UInt8] { [UInt8(type << 1), 0x01] + payload }
 
-    private static func avcc(_ nals: [[UInt8]]) -> UnsafeMutablePointer<AVPacket> {
+    static func avcc(_ nals: [[UInt8]]) -> UnsafeMutablePointer<AVPacket> {
         var bytes: [UInt8] = []
         for n in nals {
             let c = n.count
@@ -292,6 +292,79 @@ struct DoviComposedFrameRpuTests {
         #expect(rewritten == Self.converted(nal, mode: 2))
         let s = try #require(Self.snapshot(ofNAL: rewritten))
         #expect(!s.isIdentityMapping)
+    }
+
+    // MARK: - FEL overlay: the RPU in AVPlayer's stream
+
+    /// The NAL units of a length-prefixed packet, in order.
+    static func nals(of pkt: UnsafeMutablePointer<AVPacket>) -> [[UInt8]] {
+        let bytes = Array(UnsafeBufferPointer(start: pkt.pointee.data, count: Int(pkt.pointee.size)))
+        var out: [[UInt8]] = []
+        var at = 0
+        while at + 4 <= bytes.count {
+            let len = Int(bytes[at]) << 24 | Int(bytes[at + 1]) << 16 | Int(bytes[at + 2]) << 8 | Int(bytes[at + 3])
+            out.append(Array(bytes[(at + 4)..<(at + 4 + len)]))
+            at += 4 + len
+        }
+        return out
+    }
+
+    static let slice = hevcNAL(type: 1, payload: [0xAA, 0xBB])
+    static let enhancement = hevcNAL(type: 63, payload: [0xCC, 0xDD])
+
+    /// `felNAL` with a payload byte flipped: its CRC no longer matches, so the guard refuses it.
+    static let corruptNAL: [UInt8] = {
+        var nal = felNAL
+        nal[nal.count / 2] ^= 0x40
+        return nal
+    }()
+
+    /// The overlay's packet (`FelEnhancementTap.rewrite`): rebuilt, with the composed form asked for.
+    static func overlayPacket(_ nals: [[UInt8]], fallback: [UInt8]?) -> (result: DoviRpuConverter.DualLayerPacketResult, nals: [[UInt8]]) {
+        let pkt = avcc(nals)
+        defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
+        let r = DoviRpuConverter.separateDualLayers(pkt, packetRpu: .composed(fallback: fallback))
+        var el = r.elPacket
+        trackedPacketFree(&el)
+        return (r, Self.nals(of: pkt))
+    }
+
+    @Test("The overlay's packet carries a residual-off RPU without its mapping: the TV does not reshape the composed picture again")
+    func overlayPacketUnmapsResidualOffRpu() throws {
+        let nal = try #require(Self.felNoResidualNAL)
+        let (r, out) = Self.overlayPacket([Self.slice, nal, Self.enhancement], fallback: nil)
+        #expect(r.success)
+        #expect(out.count == 2)
+        #expect(out.first == Self.slice)
+        let inStream = try #require(out.last)
+        #expect(inStream == r.convertedRpu)   // the same RPU the overlay attaches
+        Self.expectPinned(source: try #require(Self.snapshot(ofNAL: nal)),
+                          attached: try #require(Self.snapshot(ofNAL: inStream)), label: "overlay packet, residual off")
+    }
+
+    @Test("The overlay's packet carries a FEL RPU in the same composed form as the attachment")
+    func overlayPacketCarriesComposedFel() throws {
+        let (r, out) = Self.overlayPacket([Self.slice, Self.felNAL, Self.enhancement], fallback: nil)
+        #expect(r.success)
+        #expect(out == [Self.slice, try #require(r.convertedRpu)])
+    }
+
+    @Test("An overlay packet whose RPU fails to convert carries the fallback, last, and still reports the failure")
+    func overlayPacketFailedRpuTakesFallback() throws {
+        let fallback = try #require(Self.composedFrameRpu(source: Self.felNAL)?.attached)
+        #expect(DoviRpuGuard.parse(Self.corruptNAL, Self.corruptNAL.count) == nil)
+        let (r, out) = Self.overlayPacket([Self.slice, Self.corruptNAL, Self.enhancement], fallback: fallback)
+        #expect(!r.success)
+        #expect(r.convertedRpu == nil)
+        #expect(out == [Self.slice, fallback])
+    }
+
+    @Test("An overlay packet with no RPU of its own carries the fallback; without one it carries none")
+    func overlayPacketWithoutRpu() throws {
+        let fallback = try #require(Self.composedFrameRpu(source: Self.felNAL)?.attached)
+        #expect(Self.overlayPacket([Self.slice, Self.enhancement], fallback: fallback).nals == [Self.slice, fallback])
+        #expect(Self.overlayPacket([Self.slice], fallback: fallback).nals == [Self.slice, fallback])
+        #expect(Self.overlayPacket([Self.slice, Self.corruptNAL], fallback: nil).nals == [Self.slice])
     }
 
     // MARK: - Raw base layer: the mapping stays

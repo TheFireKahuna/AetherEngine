@@ -91,8 +91,13 @@ final class FelEnhancementTap: @unchecked Sendable {
 
     // MARK: - Producer
 
-    /// Rewrites `packet` to its Profile 8.1 base layer, the way `convertPacketToProfile81` does, and keeps the
-    /// enhancement layer and parameters. `packet` carries output (item-axis) timestamps, in decode order.
+    /// Rewrites `packet` to its Profile 8.1 base layer and keeps the enhancement layer and parameters. `packet`
+    /// carries output (item-axis) timestamps, in decode order.
+    ///
+    /// The TV applies the RPU in AVPlayer's stream to the overlay's picture, which is composed, so the packet's
+    /// RPU is the composed form for every `el_type` (a residual-off or MEL-like RPU in mode 2 form would keep
+    /// its curves and reshape the composed picture again). A packet whose own RPU is missing or failed to
+    /// convert carries the last composed one, the RPU of the parameters it borrows.
     func rewrite(_ packet: UnsafeMutablePointer<AVPacket>, framing: VideoNALFraming, timeBase: AVRational,
                  chromaLocation: UInt32) -> Bool {
         let pts = packet.pointee.pts
@@ -111,7 +116,7 @@ final class FelEnhancementTap: @unchecked Sendable {
         if let data = packet.pointee.data, pts != Int64.min {
             elPTS = alignment.enhancementPTS(data, Int(packet.pointee.size), framing: framing, pts: pts)
         }
-        let layers = DoviRpuConverter.separateDualLayers(packet, framing: framing)
+        let layers = DoviRpuConverter.separateDualLayers(packet, framing: framing, packetRpu: .composed(fallback: lastRpu))
 
         // The resolution `DualLayerVideoDecoder.recordSideData` applies.
         var params = layers.rpuParams
