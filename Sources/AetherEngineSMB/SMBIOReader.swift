@@ -65,12 +65,19 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
         guard let buffer, size > 0 else { return 0 }
         if position >= source.byteSize { return 0 }
         if position < blockStart || position >= blockStart + Int64(block.count) {
-            let length = readAhead.size(forReadAt: position, requested: Int(size))
-            guard let data = fetch(at: position, length: length) else { return -1 }
+            let data: Data
+            if let ahead = takeNextBlock(at: position) {
+                data = ahead
+            } else {
+                let length = readAhead.size(forReadAt: position, requested: Int(size))
+                guard let fetched = fetch(at: position, length: length) else { return -1 }
+                data = fetched
+            }
             if data.isEmpty { return 0 } // EOF
             blockStart = position
             block = data
             readAhead.fetched(at: position, count: data.count)
+            startNextBlock(after: position + Int64(data.count), requested: Int(size))
         }
         // #243 (same family as the file and HTTP disc readers): this runs on FFmpeg's read
         // callback, i.e. on a demux pump thread that never returns from its dispatch block and
@@ -85,6 +92,65 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
             position += Int64(n)
             return Int32(n)
         }
+    }
+
+    // MARK: - Read-ahead
+
+    /// The next block of a sequential walk, read while the demuxer consumes the current one, so the
+    /// round trip overlaps the consumption instead of following it. One block at a time.
+    private final class NextBlock: @unchecked Sendable {
+        let offset: Int64
+        let task: Task<Data?, Never>
+        init(offset: Int64, task: Task<Data?, Never>) {
+            self.offset = offset
+            self.task = task
+        }
+    }
+    private let nextBlockLock = OSAllocatedUnfairLock<NextBlock?>(initialState: nil)
+
+    /// Starts reading the block at `offset` once reads have turned sequential (the block has grown
+    /// past its floor) and the file has more. Demux thread.
+    private func startNextBlock(after offset: Int64, requested: Int) {
+        guard offset < source.byteSize, readAhead.current > readAhead.floor else { return }
+        let length = readAhead.size(forReadAt: offset, requested: requested)
+        let task = Task { [source] () -> Data? in
+            try? await source.read(at: offset, length: length)
+        }
+        let replaced = nextBlockLock.withLock { state -> NextBlock? in
+            defer { state = NextBlock(offset: offset, task: task) }
+            return state
+        }
+        replaced?.task.cancel()
+    }
+
+    /// The read-ahead block when it starts at `offset`, waiting for it if it is still on its way;
+    /// nil (and the block dropped) for a read anywhere else, a failed read or a cancel. Demux thread.
+    private func takeNextBlock(at offset: Int64) -> Data? {
+        guard let next = nextBlockLock.withLock({ state -> NextBlock? in
+            defer { state = nil }
+            return state
+        }) else { return nil }
+        guard next.offset == offset else {
+            next.task.cancel()
+            return nil
+        }
+        let semaphore = DispatchSemaphore(value: 0)
+        let outcome = ReadOutcome()
+        let waiter = Task {
+            if let data = await next.task.value { outcome.result = .success(data) }
+            else { outcome.result = .failure(CancellationError()) }
+            semaphore.signal()
+        }
+        inFlightLock.withLock { $0 = Inflight(task: waiter, semaphore: semaphore) }
+        semaphore.wait()
+        let wasCancelled = inFlightLock.withLock { state -> Bool in
+            let c = state?.cancelled ?? false
+            state = nil
+            return c
+        }
+        if wasCancelled { next.task.cancel(); return nil }
+        guard case .success(let data) = outcome.result else { return nil }
+        return data
     }
 
     /// One round trip for `length` bytes at `offset`, blocking the demux thread on it. nil on an
@@ -136,6 +202,10 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
     }
 
     public func cancel() {
+        nextBlockLock.withLock { state in
+            state?.task.cancel()
+            state = nil
+        }
         inFlightLock.withLock { state in
             state?.cancelled = true
             state?.task.cancel()
@@ -156,6 +226,10 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
     public func close() {
         guard !didClose else { return }
         didClose = true
+        nextBlockLock.withLock { state in
+            state?.task.cancel()
+            state = nil
+        }
         if ownsSource { source.close() }
     }
 }
