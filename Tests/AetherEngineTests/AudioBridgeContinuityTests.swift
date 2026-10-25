@@ -15,7 +15,7 @@ struct AudioBridgeContinuityTests {
     static let packetSamples = 1024
     static let timeBase = AVRational(num: 1, den: 48_000)
 
-    private func makeBridge() throws -> (AudioBridge, UnsafeMutablePointer<AVCodecParameters>) {
+    private func makeBridge(followsSourceContinuity: Bool = true) throws -> (AudioBridge, UnsafeMutablePointer<AVCodecParameters>) {
         let par = avcodec_parameters_alloc()!
         par.pointee.codec_type = AVMEDIA_TYPE_AUDIO
         par.pointee.codec_id = AV_CODEC_ID_PCM_S16LE
@@ -24,7 +24,8 @@ struct AudioBridgeContinuityTests {
         av_channel_layout_default(&par.pointee.ch_layout, 2)
         par.pointee.bits_per_coded_sample = 16
         par.pointee.block_align = 4
-        let bridge = try AudioBridge(srcCodecpar: par, srcTimeBase: Self.timeBase, mode: .lossless)
+        let bridge = try AudioBridge(srcCodecpar: par, srcTimeBase: Self.timeBase, mode: .lossless,
+                                     followsSourceContinuity: followsSourceContinuity)
         bridge.setSourceStart(0)
         return (bridge, par)
     }
@@ -138,6 +139,28 @@ struct AudioBridgeContinuityTests {
         expectSeamless(try run(bridge, unbroken), from: max(samples, 0), to: 100 * 1024 + samples)
         let s = bridge.feedStats
         #expect(s.continuityGaps == 0 && s.continuityOverlaps == 0 && s.continuityJumps == 0)
+    }
+
+    @Test("a live splice overlap comes off the audio that follows: one seamless track, never stamped back over itself")
+    func liveSpliceOverlapIsTrimmed() throws {
+        let (bridge, par) = try makeBridge(followsSourceContinuity: false)
+        defer { bridge.close(); var p: UnsafeMutablePointer<AVCodecParameters>? = par; avcodec_parameters_free(&p) }
+        var out: [(Int64, Int64)] = []
+        func take(_ packets: [UnsafeMutablePointer<AVPacket>]) {
+            for p in packets {
+                out.append((p.pointee.pts, p.pointee.duration))
+                var pp: UnsafeMutablePointer<AVPacket>? = p
+                trackedPacketFree(&pp)
+            }
+        }
+        for (i, stamp) in unbroken.enumerated() {
+            if i == 50 { bridge.noteTimelineJump(deltaSeconds: -0.1) }
+            var pkt: UnsafeMutablePointer<AVPacket>? = packet(pts: stamp.pts)
+            take(try bridge.feed(packet: pkt!))
+            av_packet_free(&pkt)
+        }
+        take(bridge.flush())
+        expectSeamless(out, from: 0, to: 100 * 1024 - 4800)
     }
 
     @Test("the rule: within a source tick and a sample it is rounding; past it, the frame is placed")

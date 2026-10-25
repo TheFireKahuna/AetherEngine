@@ -4223,7 +4223,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             } else {
                                 // Stream-copy: apply candidate verbatim (absolute, not clamped to lastOutputDts).
                                 // Delta handoff accumulated A/V drift across SSAI pod creatives (device symptom: seconds late by content return).
-                                // Sub-frame overlap at the seam left to OutputTimestampSanitizer; > 0.5 s re-anchors.
+                                // An overlap at the seam is audio the muxer already holds: it drops those packets
+                                // (`OutputTimestampSanitizer`) rather than squash them, so audio lands on the video's
+                                // timeline. More than 0.5 s of it says the waiting video seam is not this boundary's
+                                // (audio ran on past it), so audio carries on contiguously for now and the boundary is
+                                // kept as an audio-first one: a video rebase inside the pairing window still moves
+                                // audio onto the video-derived shift.
                                 let firstOutputDts = SourceTimestampBounds.difference(packet.pointee.dts, candidate)
                                 let overlapTicks = lastOutputDts - firstOutputDts
                                 let maxOverlapTicks = audio.timeBase.num > 0
@@ -4232,16 +4237,17 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                     : Int64.max
                                 if overlapTicks > maxOverlapTicks {
                                     newShift = SourceTimestampBounds.difference(SourceTimestampBounds.difference(packet.pointee.dts, lastOutputDts), 1)
+                                    lastIndependentAudioRebase = (packet.pointee.dts, Date())
                                     EngineLog.emit(
                                         "[HLSSegmentProducer] audio rebase inherit re-anchored: "
                                         + "candidate=\(candidate) overlap=\(overlapTicks) ticks "
-                                        + "exceeds \(maxOverlapTicks) (implausible reset)",
+                                        + "exceeds \(maxOverlapTicks) (implausible reset); a later video rebase can still correct it",
                                         category: .session
                                     )
                                 } else {
                                     newShift = candidate
+                                    inherited = true
                                 }
-                                inherited = true
                             }
                         } else {
                             // Audio-first boundary: record srcDts for video rebase to re-derive shift from.
@@ -4279,8 +4285,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                     category: .session
                                 )
                             } else {
-                                // Stream-copy: apply seam-derived shift; sub-frame overlap left to OutputTimestampSanitizer;
-                                // only > 0.5 s overlap re-anchors.
+                                // Stream-copy: apply seam-derived shift; a sub-0.5 s overlap's packets are dropped by
+                                // the muxer as audio it already holds (`OutputTimestampSanitizer`); only a > 0.5 s
+                                // overlap re-anchors.
                                 let lastOutputDts = SourceTimestampBounds.difference(lastAudioSourceDts, audioShiftPts)
                                 let firstOutputDts = SourceTimestampBounds.difference(override_.boundarySrcDts, derivedShift)
                                 let overlapTicks = lastOutputDts - firstOutputDts
