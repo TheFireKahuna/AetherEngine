@@ -10,6 +10,7 @@
 #     `level253` pointer.
 #   - three slices only: tvos-arm64, tvos-arm64-simulator, macos-arm64_x86_64 (fat). iOS and visionOS
 #     builds of the engine need the published LibDovi.
+#   - the local patches in patches/ are applied on top of the pinned commit, in name order (see README.md).
 #
 # Requires Rust stable with the targets below and cargo-c (cargo-c 0.10.25 is the last for rustc 1.96).
 
@@ -61,6 +62,18 @@ case "$(git -C "$DOVI_REPO_DIR" rev-parse HEAD)" in
     "$DOVI_COMMIT"*) ;;
     *) echo "ERROR: dovi_tool tag $DOVI_TAG is not commit $DOVI_COMMIT (moved upstream?)" >&2; exit 1 ;;
 esac
+
+# A patch the checkout already carries is skipped, so a rebuild over an existing clone is a no-op; one that neither
+# reverses nor applies cleanly stops the build rather than building something in between.
+for patch in "$SCRIPT_DIR"/patches/*.patch; do
+    [ -e "$patch" ] || continue
+    if git -C "$DOVI_REPO_DIR" apply --reverse --check "$patch" 2>/dev/null; then
+        echo "==> $(basename "$patch") already applied"
+    else
+        echo "==> Applying $(basename "$patch")"
+        git -C "$DOVI_REPO_DIR" apply "$patch"
+    fi
+done
 
 CRATE_DIR="$DOVI_REPO_DIR/dolby_vision"
 if [ ! -f "$CRATE_DIR/Cargo.toml" ]; then

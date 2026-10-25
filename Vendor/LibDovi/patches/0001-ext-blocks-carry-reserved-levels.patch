@@ -1,0 +1,492 @@
+diff --git a/dolby_vision/src/capi.rs b/dolby_vision/src/capi.rs
+index 619492a..cceca1f 100644
+--- a/dolby_vision/src/capi.rs
++++ b/dolby_vision/src/capi.rs
+@@ -176,16 +176,18 @@ pub unsafe extern "C" fn dovi_write_unspec62_nalu(ptr: *mut RpuOpaque) -> *const
+ 
+ /// # Safety
+ /// The struct pointer must be valid.
+-/// The mode must be between 0 and 4.
++/// The mode must be between 0 and 4; any other value is treated as 0.
+ ///
+ /// Converts the RPU to be compatible with a different Dolby Vision profile.
+-/// Possible modes:
++/// Possible modes (as `ConversionMode::from(u8)` maps them):
+ ///     - 0: Don't modify the RPU
+ ///     - 1: Converts the RPU to be MEL compatible
+-///     - 2: Converts the RPU to be profile 8.1 compatible. Both luma and chroma mapping curves are set to no-op.
++///     - 2 and 3: Converts the RPU to be profile 8.1 compatible. The mapping curves are set to no-op only when
++///          the RPU's own `el_type` is FEL; a MEL RPU, or a FEL stream's RPU with `disable_residual_flag` set,
++///          keeps its curves (use `dovi_rpu_remove_mapping` to neutralise them).
+ ///          This mode handles source profiles 5, 7 and 8.
+-///     - 3: Converts to static profile 8.4
+-///     - 4: Converts to profile 8.1 preserving luma and chroma mapping. Old mode 2 behaviour.
++///     - 4: Converts to static profile 8.4
++///     The mapping-preserving 8.1 conversion has no mode number here.
+ ///
+ /// If an error occurs, it is logged to RpuOpaque.error.
+ /// Returns 0 if successful, -1 otherwise.
+diff --git a/dolby_vision/src/rpu/dovi_rpu.rs b/dolby_vision/src/rpu/dovi_rpu.rs
+index b6ff697..b0f9b00 100644
+--- a/dolby_vision/src/rpu/dovi_rpu.rs
++++ b/dolby_vision/src/rpu/dovi_rpu.rs
+@@ -340,15 +340,15 @@ impl DoviRpu {
+             .unwrap_or(None)
+     }
+ 
+-    /// Modes:
++    /// Modes, as `ConversionMode::from(u8)` maps them:
+     ///     - 0: Don't modify the RPU
+     ///     - 1: Converts the RPU to be MEL compatible
+-    ///     - 2: Converts the RPU to be profile 8.1 compatible.
+-    ///          Both luma and chroma mapping curves are set to no-op.
++    ///     - 2 and 3: Converts the RPU to be profile 8.1 compatible. The mapping curves are set to no-op only
++    ///          when the RPU's own `el_type` is FEL; a MEL RPU, or a FEL stream's RPU with
++    ///          `disable_residual_flag` set (no NLQ, so no `el_type`), keeps its curves.
+     ///          This mode handles source profiles 5, 7 and 8.
+-    ///     - 3: Converts to static profile 8.4
+-    ///     - 4: Converts to profile 8.1 preserving luma and chroma mapping.
+-    ///          Old mode 2 behaviour.
++    ///     - 4: Converts to static profile 8.4
++    ///     - any other value: Lossless (no conversion). `To81MappingPreserved` has no mode number.
+     ///
+     /// noop when profile 8 and mode 2 is used
+     pub fn convert_with_mode<T: Into<ConversionMode>>(&mut self, mode: T) -> Result<()> {
+diff --git a/dolby_vision/src/rpu/extension_metadata/blocks/level4.rs b/dolby_vision/src/rpu/extension_metadata/blocks/level4.rs
+index e49cc32..102944d 100644
+--- a/dolby_vision/src/rpu/extension_metadata/blocks/level4.rs
++++ b/dolby_vision/src/rpu/extension_metadata/blocks/level4.rs
+@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
+ 
+ use super::{ExtMetadataBlock, ExtMetadataBlockInfo, MAX_12_BIT_VALUE};
+ 
+-/// Something about temporal stability
++/// Level 4, "Temporally Filtered Image Level" (ETSI TS 103 572 Table 3 / 4.3): `anchor_pq` is the spec's
++/// `TF_PQ_mean` and `anchor_power` its `TF_PQ_stdev`, the temporally filtered mean and standard deviation of the
++/// frame's maxRGB in 12-bit PQ.
+ #[repr(C)]
+ #[derive(Debug, Default, Clone)]
+ #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
+diff --git a/dolby_vision/src/rpu/extension_metadata/blocks/mod.rs b/dolby_vision/src/rpu/extension_metadata/blocks/mod.rs
+index 9a12f5c..60e0da7 100644
+--- a/dolby_vision/src/rpu/extension_metadata/blocks/mod.rs
++++ b/dolby_vision/src/rpu/extension_metadata/blocks/mod.rs
+@@ -190,6 +190,11 @@ impl ExtMetadataBlock {
+     }
+ 
+     pub fn validate_correct_dm_data<T: WithExtMetadataBlocks>(&self) -> Result<()> {
++        // A reserved block is carried, not interpreted, in whichever list it was found.
++        if matches!(self, ExtMetadataBlock::Reserved(_)) {
++            return Ok(());
++        }
++
+         let level = self.level();
+ 
+         ensure!(
+diff --git a/dolby_vision/src/rpu/extension_metadata/blocks/reserved.rs b/dolby_vision/src/rpu/extension_metadata/blocks/reserved.rs
+index a44a3aa..e7f8088 100644
+--- a/dolby_vision/src/rpu/extension_metadata/blocks/reserved.rs
++++ b/dolby_vision/src/rpu/extension_metadata/blocks/reserved.rs
+@@ -1,4 +1,4 @@
+-use anyhow::{Result, bail};
++use anyhow::{Result, ensure};
+ 
+ use bitvec_helpers::{
+     bitstream_io_reader::BsIoSliceReader, bitstream_io_writer::BitstreamIoWriter,
+@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
+ 
+ use super::{ExtMetadataBlock, ExtMetadataBlockInfo};
+ 
++/// A block this crate does not interpret: a level reserved in this version, or a level defined only for the other
++/// CM version's list. ETSI TS 103 572 (clause 4.3), ATSC A/341 (Annex E) and ETSI GS CCM 001 (6.2.2) say blocks
++/// using reserved levels "shall be ignored", so the block is kept as its payload bytes (padding included) and
++/// written back unchanged, instead of failing the whole RPU.
+ #[derive(Debug, Default, Clone)]
+ #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
+ pub struct ReservedExtMetadataBlock {
+@@ -25,6 +29,13 @@ impl ReservedExtMetadataBlock {
+         ext_block_level: u8,
+         reader: &mut BsIoSliceReader,
+     ) -> Result<ExtMetadataBlock> {
++        // The length is an unbounded ue(v) from the stream: check it against what is left before allocating, so a
++        // corrupt length is an error rather than an allocation failure (which aborts a panic=abort build).
++        ensure!(
++            ext_block_length <= reader.available()? / 8,
++            "Reserved metadata block level {ext_block_level}: length {ext_block_length} exceeds the remaining data"
++        );
++
+         let mut data = vec![0; ext_block_length as usize];
+         reader.read_bytes(&mut data)?;
+ 
+@@ -35,14 +46,16 @@ impl ReservedExtMetadataBlock {
+         }))
+     }
+ 
+-    pub fn write(&self, _writer: &mut BitstreamIoWriter) -> Result<()> {
+-        bail!("Cannot write reserved block");
++    pub fn write(&self, writer: &mut BitstreamIoWriter) -> Result<()> {
++        writer.write_bytes(&self.data)?;
++
++        Ok(())
+     }
+ }
+ 
+ impl ExtMetadataBlockInfo for ReservedExtMetadataBlock {
+     fn level(&self) -> u8 {
+-        0
++        self.ext_block_level
+     }
+ 
+     fn bytes_size(&self) -> u64 {
+diff --git a/dolby_vision/src/rpu/extension_metadata/cmv29.rs b/dolby_vision/src/rpu/extension_metadata/cmv29.rs
+index 0fcce27..c2f35cf 100644
+--- a/dolby_vision/src/rpu/extension_metadata/cmv29.rs
++++ b/dolby_vision/src/rpu/extension_metadata/cmv29.rs
+@@ -1,4 +1,4 @@
+-use anyhow::{Result, bail, ensure};
++use anyhow::{Result, ensure};
+ use bitvec_helpers::bitstream_io_reader::BsIoSliceReader;
+ 
+ #[cfg(feature = "serde")]
+@@ -52,23 +52,16 @@ impl WithExtMetadataBlocks for CmV29DmData {
+             5 => level5::ExtMetadataBlockLevel5::parse(reader)?,
+             6 => level6::ExtMetadataBlockLevel6::parse(reader)?,
+             255 => level255::ExtMetadataBlockLevel255::parse(reader)?,
+-            3 | 8 | 9 | 10 | 11 | 254 => bail!("Disallowed block level {}", ext_block_level),
+-            _ => {
+-                // FIXME: This returns early so the parsing doesn't actually take place
+-                ensure!(
+-                    false,
+-                    format!(
+-                        "Unknown metadata block found: Level {}, length {}, please open an issue.",
+-                        ext_block_level, ext_block_length
+-                    )
+-                );
+-
+-                reserved::ReservedExtMetadataBlock::parse(
+-                    ext_block_length,
+-                    ext_block_level,
+-                    reader,
+-                )?
+-            }
++            // Levels this list does not define (the CM v4.0 levels, reserved ones): ignored as the specifications
++            // require, which here means carried through unchanged rather than failing the RPU. That includes L3,
++            // which ETSI TS 103 572 (Table 4) does define in the ST 2094-10 block set this list carries: this
++            // crate files L3 under CM v4.0 (`ALLOWED_BLOCK_LEVELS` routes blocks between the lists), so an L3
++            // arriving here keeps its bytes and is not interpreted.
++            _ => reserved::ReservedExtMetadataBlock::parse(
++                ext_block_length,
++                ext_block_level,
++                reader,
++            )?,
+         };
+ 
+         ext_metadata_block.validate_and_read_remaining::<Self>(reader, ext_block_length)?;
+@@ -106,6 +99,7 @@ impl CmV29DmData {
+ 
+         let invalid_blocks_count = blocks
+             .iter()
++            .filter(|b| !matches!(b, ExtMetadataBlock::Reserved(_)))
+             .filter(|b| !Self::ALLOWED_BLOCK_LEVELS.contains(&b.level()))
+             .count();
+ 
+@@ -130,9 +124,10 @@ impl CmV29DmData {
+             level1_count <= 1,
+             "There must be at most one L1 metadata block"
+         );
++        // ATSC A/341 6.3.2.2: "less than or equal to 16".
+         ensure!(
+-            level2_count <= 8,
+-            "There must be at most 8 L2 metadata blocks"
++            level2_count <= 16,
++            "There must be at most 16 L2 metadata blocks"
+         );
+         ensure!(
+             level255_count <= 1,
+diff --git a/dolby_vision/src/rpu/extension_metadata/cmv40.rs b/dolby_vision/src/rpu/extension_metadata/cmv40.rs
+index 602e71d..98429c9 100644
+--- a/dolby_vision/src/rpu/extension_metadata/cmv40.rs
++++ b/dolby_vision/src/rpu/extension_metadata/cmv40.rs
+@@ -1,4 +1,4 @@
+-use anyhow::{Result, bail, ensure};
++use anyhow::{Result, ensure};
+ use bitvec_helpers::bitstream_io_reader::BsIoSliceReader;
+ 
+ #[cfg(feature = "serde")]
+@@ -53,23 +53,13 @@ impl WithExtMetadataBlocks for CmV40DmData {
+             11 => level11::ExtMetadataBlockLevel11::parse(reader)?,
+             253 => level253::ExtMetadataBlockLevel253::parse(reader, ext_block_length)?,
+             254 => level254::ExtMetadataBlockLevel254::parse(reader)?,
+-            1 | 2 | 4 | 5 | 6 | 255 => bail!("Disallowed block level {}", ext_block_level),
+-            _ => {
+-                // FIXME: This returns early so the parsing doesn't actually take place
+-                ensure!(
+-                    false,
+-                    format!(
+-                        "Unknown metadata block found: Level {}, length {}, please open an issue.",
+-                        ext_block_level, ext_block_length
+-                    )
+-                );
+-
+-                reserved::ReservedExtMetadataBlock::parse(
+-                    ext_block_length,
+-                    ext_block_level,
+-                    reader,
+-                )?
+-            }
++            // Levels this list does not define (CM v2.9 levels, reserved ones): ignored as the specifications
++            // require, which here means carried through unchanged rather than failing the RPU.
++            _ => reserved::ReservedExtMetadataBlock::parse(
++                ext_block_length,
++                ext_block_level,
++                reader,
++            )?,
+         };
+ 
+         ext_metadata_block.validate_and_read_remaining::<Self>(reader, ext_block_length)?;
+@@ -124,6 +114,7 @@ impl CmV40DmData {
+ 
+         let invalid_blocks_count = blocks
+             .iter()
++            .filter(|b| !matches!(b, ExtMetadataBlock::Reserved(_)))
+             .filter(|b| !Self::ALLOWED_BLOCK_LEVELS.contains(&b.level()))
+             .count();
+ 
+diff --git a/dolby_vision/src/rpu/extension_metadata/mod.rs b/dolby_vision/src/rpu/extension_metadata/mod.rs
+index 86940ac..5c4fa19 100644
+--- a/dolby_vision/src/rpu/extension_metadata/mod.rs
++++ b/dolby_vision/src/rpu/extension_metadata/mod.rs
+@@ -13,6 +13,9 @@ pub mod cmv40;
+ pub mod primaries;
+ pub use primaries::*;
+ 
++#[cfg(test)]
++mod tests;
++
+ pub use cmv29::CmV29DmData;
+ pub use cmv40::CmV40DmData;
+ 
+diff --git a/dolby_vision/src/rpu/extension_metadata/tests.rs b/dolby_vision/src/rpu/extension_metadata/tests.rs
+new file mode 100644
+index 0000000..5635d9f
+--- /dev/null
++++ b/dolby_vision/src/rpu/extension_metadata/tests.rs
+@@ -0,0 +1,168 @@
++use anyhow::Result;
++
++use super::blocks::*;
++use super::{CmV29DmData, CmV40DmData, DmData, WithExtMetadataBlocks};
++use crate::rpu::dovi_rpu::DoviRpu;
++
++const FEL_ORIG: &[u8] = include_bytes!("../../../../assets/tests/fel_orig.bin");
++const CMV40_FULL: &[u8] = include_bytes!("../../../../assets/tests/cmv40_full_rpu.bin");
++const ST2094_10_L3: &[u8] = include_bytes!("../../../../assets/tests/st2094_10_level3.bin");
++
++fn cmv29(rpu: &mut DoviRpu) -> &mut CmV29DmData {
++    match rpu.vdr_dm_data.as_mut().unwrap().cmv29_metadata.as_mut().unwrap() {
++        DmData::V29(m) => m,
++        DmData::V40(_) => panic!("CM v4.0 data in the CM v2.9 slot"),
++    }
++}
++
++fn cmv40(rpu: &mut DoviRpu) -> &mut CmV40DmData {
++    match rpu.vdr_dm_data.as_mut().unwrap().cmv40_metadata.as_mut().unwrap() {
++        DmData::V40(m) => m,
++        DmData::V29(_) => panic!("CM v2.9 data in the CM v4.0 slot"),
++    }
++}
++
++fn reserved(level: u8, data: &[u8]) -> ExtMetadataBlock {
++    ExtMetadataBlock::Reserved(ReservedExtMetadataBlock {
++        ext_block_length: data.len() as u64,
++        ext_block_level: level,
++        data: data.to_vec(),
++    })
++}
++
++/// The assets are `extract-rpu` output: a start code, then the unspec62 payload with emulation prevention bytes.
++fn parse(source: &[u8]) -> Result<DoviRpu> {
++    DoviRpu::parse_unspec62_nalu(source)
++}
++
++/// Appends `block` to a list as it would arrive in a stream (no re-sorting), writes, and parses the result back.
++fn written_with<T: WithExtMetadataBlocks>(
++    source: &[u8],
++    list: fn(&mut DoviRpu) -> &mut T,
++    block: ExtMetadataBlock,
++) -> Result<(Vec<u8>, DoviRpu)> {
++    let mut rpu = parse(source)?;
++    let blocks = list(&mut rpu);
++    blocks.blocks_mut().push(block);
++    let count = blocks.blocks_ref().len() as u64;
++    blocks.set_num_ext_blocks(count);
++    rpu.modified = true;
++    let written = rpu.write_hevc_unspec62_nalu()?;
++    let reparsed = parse(&written)?;
++    Ok((written, reparsed))
++}
++
++fn last_reserved<T: WithExtMetadataBlocks>(list: &T) -> Option<&ReservedExtMetadataBlock> {
++    match list.blocks_ref().last() {
++        Some(ExtMetadataBlock::Reserved(b)) => Some(b),
++        _ => None,
++    }
++}
++
++#[test]
++fn unknown_level_is_carried_not_rejected() -> Result<()> {
++    let (written, mut reparsed) = written_with(FEL_ORIG, cmv29, reserved(7, &[0xAB, 0xCD, 0xEF]))?;
++
++    let block = last_reserved(cmv29(&mut reparsed)).expect("level 7 kept as a reserved block");
++    assert_eq!(block.ext_block_level, 7);
++    assert_eq!(block.data, [0xAB, 0xCD, 0xEF]);
++    assert_eq!(reparsed.write_hevc_unspec62_nalu()?, written);
++
++    Ok(())
++}
++
++#[test]
++fn cmv40_level_in_cmv29_list_is_carried() -> Result<()> {
++    // A one-byte L9 payload (source primaries index) where only the CM v4.0 list defines L9.
++    let (written, mut reparsed) = written_with(FEL_ORIG, cmv29, reserved(9, &[0x02]))?;
++
++    let block = last_reserved(cmv29(&mut reparsed)).expect("L9 in the v2.9 list kept as a reserved block");
++    assert_eq!(block.ext_block_level, 9);
++    assert_eq!(block.data, [0x02]);
++    assert_eq!(reparsed.write_hevc_unspec62_nalu()?, written);
++
++    Ok(())
++}
++
++#[test]
++fn unknown_level_in_cmv40_list_is_carried() -> Result<()> {
++    let (written, mut reparsed) = written_with(CMV40_FULL, cmv40, reserved(200, &[0x11, 0x22]))?;
++
++    let block = last_reserved(cmv40(&mut reparsed)).expect("level 200 kept as a reserved block");
++    assert_eq!(block.ext_block_level, 200);
++    assert_eq!(block.data, [0x11, 0x22]);
++    assert_eq!(reparsed.write_hevc_unspec62_nalu()?, written);
++
++    Ok(())
++}
++
++#[test]
++fn st2094_10_level3_in_cmv29_list_is_carried_byte_exact() -> Result<()> {
++    let mut rpu = parse(ST2094_10_L3)?;
++
++    let l3 = cmv29(&mut rpu)
++        .blocks_ref()
++        .iter()
++        .find_map(|b| match b {
++            ExtMetadataBlock::Reserved(r) if r.ext_block_level == 3 => Some(r.clone()),
++            _ => None,
++        })
++        .expect("the L3 in the CM v2.9 list is kept");
++    assert_eq!(l3.ext_block_length, 5, "ETSI TS 103 572: L3 is 5 bytes");
++
++    // The writer puts the 0x7C 0x01 NAL header in front; the asset starts with a 4-byte start code.
++    let written = rpu.write_hevc_unspec62_nalu()?;
++    let source = &ST2094_10_L3[4..];
++    let source = &source[..source.len() - source.iter().rev().take_while(|b| **b == 0).count()];
++    assert_eq!(&written[2..], source);
++
++    Ok(())
++}
++
++#[test]
++fn sixteen_l2_targets_accepted_seventeen_rejected() -> Result<()> {
++    let mut rpu = parse(FEL_ORIG)?;
++    let list = cmv29(&mut rpu);
++    let mut target = 100;
++    while list.blocks_ref().iter().filter(|b| b.level() == 2).count() < 16 {
++        list.replace_level2_block(&ExtMetadataBlockLevel2 {
++            target_max_pq: target,
++            ..Default::default()
++        });
++        target += 100;
++    }
++    rpu.modified = true;
++    let written = rpu.write_hevc_unspec62_nalu()?;
++    let reparsed = parse(&written)?;
++    assert_eq!(reparsed.write_hevc_unspec62_nalu()?, written);
++
++    cmv29(&mut rpu).replace_level2_block(&ExtMetadataBlockLevel2 {
++        target_max_pq: 4000,
++        ..Default::default()
++    });
++    assert!(rpu.write_hevc_unspec62_nalu().is_err(), "A/341 allows at most 16 L2 blocks");
++
++    Ok(())
++}
++
++#[test]
++fn reserved_length_past_the_payload_is_an_error_not_an_abort() -> Result<()> {
++    // A corrupt ue(v) length on a block this crate carries without interpreting: the writer emits what it is
++    // given, the parser has to refuse it before allocating.
++    let mut rpu = parse(FEL_ORIG)?;
++    let blocks = cmv29(&mut rpu);
++    blocks.blocks_mut().push(ExtMetadataBlock::Reserved(ReservedExtMetadataBlock {
++        ext_block_length: 1 << 40,
++        ext_block_level: 7,
++        data: vec![0xAB, 0xCD],
++    }));
++    let count = blocks.blocks_ref().len() as u64;
++    blocks.set_num_ext_blocks(count);
++    rpu.modified = true;
++    let written = rpu.write_hevc_unspec62_nalu()?;
++
++    let err = parse(&written).expect_err("a length past the payload must not parse");
++    assert!(format!("{err:#}").contains("exceeds the remaining data"), "{err:#}");
++
++    Ok(())
++}
+diff --git a/src/tests/rpu.rs b/src/tests/rpu.rs
+index d3a9e29..4c84475 100644
+--- a/src/tests/rpu.rs
++++ b/src/tests/rpu.rs
+@@ -392,10 +392,15 @@ fn profile5_to_p81_2() -> Result<()> {
+     Ok(())
+ }
+ 
++/// An L3 block in the CM v2.9 list: ETSI TS 103 572 defines L3 in that block set, and blocks outside this crate's
++/// lists "shall be ignored", so the RPU parses and the block is written back unchanged.
+ #[test]
+-fn st2094_10_level3_invalid() -> Result<()> {
+-    let res = _parse_file(PathBuf::from("./assets/tests/st2094_10_level3.bin"));
+-    assert!(res.is_err());
++fn st2094_10_level3_carried() -> Result<()> {
++    let (original_data, dovi_rpu) =
++        _parse_file(PathBuf::from("./assets/tests/st2094_10_level3.bin"))?;
++    let parsed_data = dovi_rpu.write_hevc_unspec62_nalu()?;
++
++    assert_eq!(&original_data[4..], &parsed_data[2..]);
+ 
+     Ok(())
+ }
+diff --git a/tests/rpu/info.rs b/tests/rpu/info.rs
+index abed39b..100fdfa 100644
+--- a/tests/rpu/info.rs
++++ b/tests/rpu/info.rs
+@@ -85,19 +85,16 @@ fn summary_p8() -> Result<()> {
+     Ok(())
+ }
+ 
++/// An L3 block in the CM v2.9 list is carried, not rejected (see `st2094_10_level3_carried`).
+ #[test]
+-fn invalid_l3_error() -> Result<()> {
++fn l3_in_cmv29_list_is_carried() -> Result<()> {
+     let mut cmd = cargo::cargo_bin_cmd!();
+ 
+     let input_rpu = Path::new("assets/tests/st2094_10_level3.bin");
+ 
+     let assert = cmd.arg(SUBCOMMAND).arg(input_rpu).arg("-s").assert();
+ 
+-    assert.failure().stderr(
+-        predicate::str::contains("Error: Found invalid RPU: Index 0").and(
+-            predicate::str::contains("CM v2.9: Disallowed block level 3"),
+-        ),
+-    );
++    assert.success();
+ 
+     Ok(())
+ }

@@ -471,6 +471,42 @@ struct DoviRpuGuardTests {
         Self.expectRejected(Self.craftUsePrev(cmv29Block: (5, 1), cmv40Block: (11, 8), compressed: false), "same, uncompressed")
     }
 
+    @Test("a block libdovi carries without interpreting is walked past, and a bad block behind it is still caught",
+          arguments: [(3, 7), (5, 3), (1, 8)])
+    func carriedCmv29BlockWalk(length: Int, level: Int) {
+        // In the CM v2.9 list: a reserved level, ETSI TS 103 572's L3 (libdovi files L3 under CM v4.0) and a CM v4.0
+        // level. The vendored libdovi keeps each as its bytes instead of failing the RPU.
+        let block = (UInt64(length), UInt64(level))
+        Self.expectAccepted(Self.craftUsePrev(cmv29Block: block, cmv40Block: (10, 8)), "level \(level) in the v2.9 list")
+        Self.expectRejected(Self.craftUsePrev(cmv29Block: block, cmv40Block: (11, 8)),
+                            "level 8 length 11 behind a carried level \(level)")
+    }
+
+    @Test("a block outside the CM v4.0 set is carried there too, and the walk continues past it")
+    func carriedCmv40BlockWalk() {
+        Self.expectAccepted(Self.craftUsePrev(cmv40Block: (10, 8), cmv40Lead: (2, 200)), "reserved level 200")
+        Self.expectAccepted(Self.craftUsePrev(cmv40Block: (10, 8), cmv40Lead: (5, 1)), "a CM v2.9 level")
+        Self.expectRejected(Self.craftUsePrev(cmv40Block: (11, 8), cmv40Lead: (2, 200)),
+                            "level 8 length 11 behind a carried level 200")
+    }
+
+    @Test("a carried block survives the Profile 8.1 rewrite: the block count is unchanged")
+    func carriedBlockSurvivesConversion() throws {
+        let nal = Self.craftUsePrev(cmv29Block: (3, 7), cmv40Block: (10, 8), cmv40Lead: (2, 200))
+        let rpu = try #require(nal.withUnsafeBufferPointer { DoviRpuGuard.parse($0.baseAddress!, $0.count) })
+        defer { dovi_rpu_free(rpu) }
+        let out = try #require(DoviRpuConverter.convertedUnspec62(rpu))
+        defer { dovi_data_free(out) }
+        let bytes = [UInt8](UnsafeBufferPointer(start: out.pointee.data, count: out.pointee.len))
+        let again = try #require(bytes.withUnsafeBufferPointer { DoviRpuGuard.parse($0.baseAddress!, $0.count) })
+        defer { dovi_rpu_free(again) }
+        let dm = try #require(dovi_rpu_get_vdr_dm_data(again))
+        defer { dovi_rpu_free_vdr_dm_data(dm) }
+        // One CM v2.9 block (level 7), three CM v4.0 blocks (level 200, level 8, the required level 254).
+        #expect(dm.pointee.dm_data.num_ext_blocks == 4)
+        #expect(dm.pointee.dm_data.level8.len == 1)
+    }
+
     @Test("level 9 and level 10 blocks of an undefined length are rejected, the defined ones are not",
           arguments: [(1, 9, true), (17, 9, true), (0, 9, false), (2, 9, false), (16, 9, false), (18, 9, false),
                       (5, 10, true), (21, 10, true), (0, 10, false), (4, 10, false), (6, 10, false), (20, 10, false)])

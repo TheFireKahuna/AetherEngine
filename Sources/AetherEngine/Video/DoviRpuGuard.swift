@@ -107,8 +107,8 @@ enum DoviRpuGuard {
     /// scan mirrors its read order), a value libdovi's header or mapping parser rejects with `ensure!`
     /// or `bail!` (`rpu_type`, `coefficient_data_type`, the bit depths and denominator checked by
     /// `RpuDataHeader::validate`, `mapping_idc` other than 0 or 1, `poly_order_minus1` above 1,
-    /// `mmr_order_minus1` above 2, a non-zero `nlq_method_idc`), or a DM block level the CM version
-    /// does not allow.
+    /// `mmr_order_minus1` above 2, a non-zero `nlq_method_idc`), or a DM block whose length runs past the
+    /// payload.
     static func reachesUnimplementedPath(_ u: [UInt8]) -> Bool {
         // libdovi's reader runs to the end of the trimmed data, CRC and final byte included, so a mutated
         // piece count can make it read the linear flag out of the CRC bytes. Mirror that bound.
@@ -214,6 +214,11 @@ enum DoviRpuGuard {
     /// spec does not define, and the parser only checks the length against itself, so a CRC-valid RPU
     /// with such a block aborts the process. Walks the DM payload (CM v2.9 list, then CM v4.0 list)
     /// far enough to see every block's level and length.
+    ///
+    /// A level outside a list's own set (reserved, or defined only for the other list) is walked past by its
+    /// length: the vendored libdovi carries such a block as its bytes, as ETSI TS 103 572 / ATSC A/341 /
+    /// ETSI GS CCM 001 require ("shall be ignored"), so the blocks behind it still reach the parser and still
+    /// need checking (Vendor/LibDovi/patches/0001-ext-blocks-carry-reserved-levels.patch).
     private static func reachesInvalidDmBlock(_ r: inout Bits, compressed: Bool) -> Bool {
         guard r.ue() != nil, r.ue() != nil, r.ue() != nil else { return false }
         if !compressed {   // fixed fields of VdrDmData::parse
@@ -233,10 +238,10 @@ enum DoviRpuGuard {
                     case 9: if ![1, 17].contains(length) { return true }
                     case 10: if ![5, 21].contains(length) { return true }
                     case 253: if length > 66 { return false }   // libdovi errors past LEVEL253_MAX_LENGTH
-                    case 3, 11, 254: break
-                    default: return false   // libdovi errors on the rest
+                    default: break   // 3, 11, 254 parsed; every other level carried as its bytes
                     }
-                } else if ![1, 2, 4, 5, 6, 255].contains(level) { return false }
+                }
+                // Past the payload is a libdovi parse error (the reserved-block bound included), not an abort.
                 guard length < 1 << 20, r.pos + Int(length) * 8 <= r.end else { return false }
                 r.pos += Int(length) * 8
             }
