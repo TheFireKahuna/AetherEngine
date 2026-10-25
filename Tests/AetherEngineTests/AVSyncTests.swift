@@ -133,45 +133,52 @@ struct AVSyncTests {
                 AVLinearPCMIsNonInterleaved: false, AVSampleRateKey: 48_000])
             reader.add(out)
             reader.startReading()
-            var mono: [Float] = []
-            var start: Double?
-            while let buffer = out.copyNextSampleBuffer() {
-                guard let format = CMSampleBufferGetFormatDescription(buffer),
-                      let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee else { continue }
-                let channels = Int(asbd.mChannelsPerFrame)
-                if start == nil { start = CMSampleBufferGetPresentationTimeStamp(buffer).seconds }
-                var block: CMBlockBuffer?
-                var list = AudioBufferList()
-                _ = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-                    buffer, bufferListSizeNeededOut: nil, bufferListOut: &list,
-                    bufferListSize: MemoryLayout<AudioBufferList>.size, blockBufferAllocator: nil,
-                    blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: &block)
-                guard let samples = list.mBuffers.mData?.assumingMemoryBound(to: Float.self) else { continue }
-                for f in 0..<CMSampleBufferGetNumSamples(buffer) {
-                    var loudest: Float = 0
-                    for c in 0..<channels where abs(samples[f * channels + c]) > abs(loudest) { loudest = samples[f * channels + c] }
-                    mono.append(loudest)
-                }
-            }
-            if let start, mono.count > 288 {
-                let burst = (0..<144).map { 0.8 * sinf(2 * .pi * 1000 * Float($0) / 48_000) }
-                var corr = [Float](repeating: 0, count: mono.count - 144)
-                var best = 0
-                for lag in corr.indices {
-                    var acc: Float = 0
-                    for k in 0..<144 { acc += mono[lag + k] * burst[k] }
-                    corr[lag] = acc
-                    if acc > corr[best] { best = lag }
-                }
-                var fraction = 0.0
-                if best > 0, best + 1 < corr.count {
-                    let a = Double(corr[best - 1]), b = Double(corr[best]), c = Double(corr[best + 1])
-                    fraction = 0.5 * (a - c) / (a - 2 * b + c)
-                }
-                click = start + (Double(best) + fraction) / 48_000
+            var buffers: [CMSampleBuffer] = []
+            while let buffer = out.copyNextSampleBuffer() { buffers.append(buffer) }
+            if let first = buffers.first, let lag = clickLag(buffers) {
+                click = CMSampleBufferGetPresentationTimeStamp(first).seconds + lag / 48_000
             }
         }
         return (flash, click)
+    }
+
+    /// Where the click starts in `buffers` (48 kHz float PCM, the loudest channel of each frame), in samples from the
+    /// first: cross-correlated against the 144-sample burst, refined to a fraction of a sample.
+    static func clickLag(_ buffers: [CMSampleBuffer]) -> Double? {
+        var mono: [Float] = []
+        for buffer in buffers {
+            guard let format = CMSampleBufferGetFormatDescription(buffer),
+                  let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee else { continue }
+            let channels = Int(asbd.mChannelsPerFrame)
+            var block: CMBlockBuffer?
+            var list = AudioBufferList()
+            _ = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+                buffer, bufferListSizeNeededOut: nil, bufferListOut: &list,
+                bufferListSize: MemoryLayout<AudioBufferList>.size, blockBufferAllocator: nil,
+                blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: &block)
+            guard let samples = list.mBuffers.mData?.assumingMemoryBound(to: Float.self) else { continue }
+            for f in 0..<CMSampleBufferGetNumSamples(buffer) {
+                var loudest: Float = 0
+                for c in 0..<channels where abs(samples[f * channels + c]) > abs(loudest) { loudest = samples[f * channels + c] }
+                mono.append(loudest)
+            }
+        }
+        guard mono.count > 288 else { return nil }
+        let burst = (0..<144).map { 0.8 * sinf(2 * .pi * 1000 * Float($0) / 48_000) }
+        var corr = [Float](repeating: 0, count: mono.count - 144)
+        var best = 0
+        for lag in corr.indices {
+            var acc: Float = 0
+            for k in 0..<144 { acc += mono[lag + k] * burst[k] }
+            corr[lag] = acc
+            if acc > corr[best] { best = lag }
+        }
+        var fraction = 0.0
+        if best > 0, best + 1 < corr.count {
+            let a = Double(corr[best - 1]), b = Double(corr[best]), c = Double(corr[best + 1])
+            fraction = 0.5 * (a - c) / (a - 2 * b + c)
+        }
+        return Double(best) + fraction
     }
 
     /// Each track's first `tfdt`, in seconds of its own timescale.
