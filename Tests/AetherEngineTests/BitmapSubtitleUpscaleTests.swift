@@ -134,5 +134,24 @@ struct BitmapSubtitleUpscaleTests {
         #expect(Self.sizes(engine.subtitleCues) == [16: 16, 30: 16, 60: 16])
         withExtendedLifetime(pgs) {}
     }
+
+    @MainActor
+    @Test("cues that published as decoded are re-landed on the return to the foreground and replaced by their upscales")
+    func owedCuesAreRelanded() async throws {
+        let (engine, pgs) = try engine(pixelSize: nil)
+        engine.requestSubtitleDrainTick()
+        await engine.subtitleDrainTickInFlight?.value
+        #expect(Self.sizes(engine.subtitleCues) == [16: 8, 30: 8, 60: 8])
+        // As a background tick leaves it: the pixel size stands, the channel's cues are owed.
+        engine.bitmapSubtitlePixelSize = CGSize(width: 3840, height: 2160)
+        engine.bitmapSubtitleUpscaleOwed = [.primary]
+        engine.resumeBitmapSubtitleUpscale()
+        await engine.subtitleDrainTickInFlight?.value
+        #expect(Self.sizes(engine.subtitleCues) == [16: 16, 30: 8, 60: 8])
+        await engine.subtitleDrainTickInFlight?.value
+        #expect(Self.sizes(engine.subtitleCues) == [16: 16, 30: 16, 60: 16])
+        #expect(engine.bitmapSubtitleUpscaleOwed.isEmpty)
+        withExtendedLifetime(pgs) {}
+    }
     #endif
 }

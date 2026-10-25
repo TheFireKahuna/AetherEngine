@@ -36,7 +36,12 @@ it (`AetherEngine.OptionalComponent.mlSubtitleUpscale`). The engine re-exports t
 - **Playback start**: a session with a bitmap track starts playing once the upscaler is ready
   (`awaitBitmapSubtitleUpscaler`, before the autostart's play), which waits only when a session starts within a
   second or two of an install or an OS update. Readying starts when the load does.
-- A failed upscale is logged once, and the cue publishes as decoded.
+- **In the background** (Picture in Picture, background audio), where the GPU is refused, a tick does not try: its
+  bitmap cues publish as decoded and the channel is owed. A failed upscale (logged once) owes its channel too. On
+  the return to the foreground each owed channel is re-landed (`resumeBitmapSubtitleUpscale`): the drain decodes its
+  window again in place, the landing line first, and each re-decoded cue replaces its decoded copy, which the store
+  matches on start and position alone (the pixel size is what the upscale changes). A failed preparation is not
+  kept, so the next tick tries again.
 
 ## Not yet measured
 

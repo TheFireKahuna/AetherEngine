@@ -458,14 +458,17 @@ extension AetherEngine {
         subtitleDrainLastTickUptime = tickUptime
         var work = SubtitleDrainTickWork(store: store, playhead: playhead,
                                          landingGeneration: subtitleLandingGeneration)
-        work.upscale = bitmapSubtitleUpscaleRequest(playhead: playhead)
+        let upscale = bitmapSubtitleUpscaleRequest(playhead: playhead)
+        // In the background the GPU is refused, so nothing is upscaled; what decodes there is owed.
+        work.upscale = isBackgrounded ? nil : upscale
         for (channel, streamIndex) in subtitleDrainTargets {
             let plan = SubtitleOverlayDrainer.drainPlan(
                 cursor: subtitleDrainCursors[channel],
                 playhead: playhead,
                 lead: Self.subtitleDrainLeadSeconds,
                 backscan: Self.subtitleDrainBackscanSeconds,
-                repositioning: subtitleRepositioning(elapsedSinceLastPlan: elapsed))
+                repositioning: subtitleRepositioning(elapsedSinceLastPlan: elapsed),
+                relanding: bitmapSubtitleRelanding.remove(channel) != nil)
             let window: (from: Double, through: Double)
             // #250: a reset starts a fresh contiguous decoded run; a steady tick extends the one
             // already running.
@@ -587,6 +590,9 @@ extension AetherEngine {
                 decodeEnd = cut
                 landingCut = true
             }
+            if upscale != nil, work.upscale == nil, decodeEnd > 0, EmbeddedSubtitleDecoder.isBitmapCodec(decoder.codecID) {
+                bitmapSubtitleUpscaleOwed.insert(channel)
+            }
             work.channels.append(SubtitleDrainChannelWork(
                 channel: channel, streamIndex: streamIndex, plan: plan, isReset: isReset,
                 window: window, coverageStart: coverageStart, retained: retained,
@@ -604,6 +610,9 @@ extension AetherEngine {
                                  events decodedByChannel: [[EmbeddedSubtitleDecoder.SubtitleEvent?]]) {
         let store = work.store
         let playhead = work.playhead
+        if work.upscale != nil, BitmapSubtitleUpscaling.shared.takeFailures() {
+            bitmapSubtitleUpscaleOwed.formUnion(work.channels.map(\.channel))
+        }
         guard activeSubtitlePacketStore === store else { return }
         for (job, events) in zip(work.channels, decodedByChannel) {
             let channel = job.channel
@@ -1109,10 +1118,11 @@ extension AetherEngine {
     /// unique start PTS, so a same-start same-geometry image cue is the same object re-decoded (the audio-switch
     /// preserved placeholder vs its reconstruction), and a duplicate would render the bitmap twice until the next
     /// composition trims it. #146: the start PTS is unique per COMPOSITION, not per composition OBJECT; N objects
-    /// of one display set (forced sign + dialogue) legitimately share a start and differ in geometry (position and
-    /// pixel size, both deterministic across re-decodes via the alpha-bounding-box crop), so geometry is part of
-    /// the replacement key and sibling objects are all kept. Text cues at the same start are distinct simultaneous
-    /// speakers and are both kept.
+    /// of one display set (forced sign + dialogue) legitimately share a start and differ in geometry (the position,
+    /// the alpha-bounding-box crop's rect on the canvas, deterministic across re-decodes), so geometry is part of
+    /// the replacement key and sibling objects are all kept. The bitmap's pixel size is not: the position fixes the
+    /// source's, and an upscaled copy (`bitmapSubtitlePixelSize`) differs from its decoded self in pixels alone.
+    /// Text cues at the same start are distinct simultaneous speakers and are both kept.
     ///
     /// #121: `nextID` stamps every materialized cue with a session-monotonic id and de-dupes a non-image cue
     /// (text or rich text) already present with the same window + content. On a seek the overlay decoder is
@@ -1152,9 +1162,7 @@ extension AetherEngine {
         if case .image(let stampedImage) = stamped.body {
             for i in lower..<upper {
                 guard case .image(let otherImage) = cues[i].body else { continue }
-                if otherImage.position == stampedImage.position
-                    && otherImage.cgImage.width == stampedImage.cgImage.width
-                    && otherImage.cgImage.height == stampedImage.cgImage.height {
+                if otherImage.position == stampedImage.position {
                     cues[i] = stamped
                     return true
                 }

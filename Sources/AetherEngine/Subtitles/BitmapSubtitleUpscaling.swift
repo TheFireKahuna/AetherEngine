@@ -9,6 +9,10 @@ import Foundation
 /// `AetherEngine.bitmapSubtitlePixelSize`, inside the drain tick's decode half, so a cue enters `subtitleCues` sharp
 /// and the main actor never waits for it. Without the trait, or with no pixel size, cues publish as decoded.
 ///
+/// What cannot be upscaled publishes as decoded and is owed: in the background, where the GPU is refused, a tick
+/// does not try, and a failed upscale is reported (`takeFailures`); either way the channel is re-landed on the return
+/// to the foreground (`AetherEngine.resumeBitmapSubtitleUpscale`), which decodes it again, upscaled.
+///
 /// One upscaler serves the process, used by one tick at a time (`subtitleDrainTickInFlight`). Results are kept by
 /// stream, start, geometry and output size, so a cue the drain decodes again (a seek back into the retained window,
 /// an audio switch) costs a lookup.
@@ -30,9 +34,12 @@ final class BitmapSubtitleUpscaling: @unchecked Sendable {
 
     #if MLSubtitleUpscale
     private let lock = NSLock()
-    private var upscaler: Result<SubtitleUpscaler, Error>?
+    /// Made and prepared once; a failed preparation is not kept, so the next cue tries again (a GPU refused in the
+    /// background works again in the foreground).
+    private var upscaler: SubtitleUpscaler?
     private var kept: [Key: CGImage] = [:]
     private var reportedFailure = false
+    private var failed = false
 
     private struct Key: Hashable {
         let stream: Int32
@@ -98,6 +105,18 @@ final class BitmapSubtitleUpscaling: @unchecked Sendable {
                       height: (CGFloat(image.cgImage.height) * scale).rounded())
     }
 
+    /// Whether an upscale failed since the last call, so the tick that ran it can owe its channels a redo.
+    func takeFailures() -> Bool {
+        #if MLSubtitleUpscale
+        lock.withLock {
+            defer { failed = false }
+            return failed
+        }
+        #else
+        false
+        #endif
+    }
+
     #if MLSubtitleUpscale
     private func upscaled(_ image: SubtitleImage, size: CGSize, stream: Int32, start: Double) -> CGImage? {
         let p = image.position
@@ -110,11 +129,12 @@ final class BitmapSubtitleUpscaling: @unchecked Sendable {
             return made
         } catch {
             let first = lock.withLock { () -> Bool in
+                failed = true
                 defer { reportedFailure = true }
                 return !reportedFailure
             }
             if first {
-                EngineLog.emit("[BitmapSubtitleUpscaling] upscale failed, cues publish as decoded: \(error)", category: .engine)
+                EngineLog.emit("[BitmapSubtitleUpscaling] upscale failed; the cue publishes as decoded until the foreground re-lands it: \(error)", category: .engine)
             }
             return nil
         }
@@ -122,14 +142,11 @@ final class BitmapSubtitleUpscaling: @unchecked Sendable {
 
     private func upscalerLocked() throws -> SubtitleUpscaler {
         try lock.withLock {
-            if let made = upscaler { return try made.get() }
-            let made = Result { () throws -> SubtitleUpscaler in
-                let upscaler = try SubtitleUpscaler(configuration: .balanced)
-                try upscaler.prepare()
-                return upscaler
-            }
+            if let made = upscaler { return made }
+            let made = try SubtitleUpscaler(configuration: .balanced)
+            try made.prepare()
             upscaler = made
-            return try made.get()
+            return made
         }
     }
     #endif

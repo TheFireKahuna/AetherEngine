@@ -80,9 +80,12 @@ enum SubtitleOverlayDrainer {
     /// the playhead backwards, so a backward delta is a seek at any tick duration. Rate is not modelled:
     /// above 1x a pathologically slow tick can still trip the threshold, which costs a redundant window
     /// decode, not correctness.
+    /// `relanding` resets as a landing does whatever the playhead did: a window to decode again in place
+    /// (`AetherEngine.resumeBitmapSubtitleUpscale`).
     static func drainPlan(cursor: SubtitleDrainCursor?, playhead: Double,
                           lead: Double, backscan: Double,
-                          repositioning: SubtitleRepositioning) -> SubtitleDrainPlan {
+                          repositioning: SubtitleRepositioning,
+                          relanding: Bool = false) -> SubtitleDrainPlan {
         let through = playhead + lead
         guard let cursor else {
             return .resetAndDecode(from: playhead - backscan, through: through)
@@ -96,7 +99,7 @@ enum SubtitleOverlayDrainer {
             let allowance = delta > 0 ? jumpThreshold + max(0, elapsedSinceLastPlan) : jumpThreshold
             repositioned = abs(delta) > allowance
         }
-        if repositioned {
+        if repositioned || relanding {
             return .resetAndDecode(from: playhead - backscan, through: through)
         }
         guard through - cursor.lastDecodedPts >= minimumScanWindowSeconds else {
