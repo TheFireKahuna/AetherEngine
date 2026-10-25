@@ -56,7 +56,7 @@ final class FrameDecodeContext: @unchecked Sendable {
     private var streamSAR = AVRational(num: 1, den: 1)
     private(set) var isOpen = false
     /// AE#499: the container's colour declaration, captured at open, for a frame whose VUI says nothing.
-    private var containerColor = ColorDescription.unspecified
+    private var colourFill = ColourBackfill(container: .unspecified)
 
     /// True for Dolby Vision Profile 5 / Profile 10.0 (no base layer): the decoded planes are
     /// IPT-PQ-C2, not standard YCbCr, so they route through DolbyVisionStillConverter (#103).
@@ -303,7 +303,7 @@ final class FrameDecodeContext: @unchecked Sendable {
     }
 
     private func openDecoder(codecpar: UnsafeMutablePointer<AVCodecParameters>) throws {
-        containerColor = ColorDescription(codecpar: codecpar)
+        colourFill = ColourBackfill(container: ColorDescription(codecpar: codecpar))
         isDolbyVisionNoBaseLayer = Self.isDVNoBaseLayer(codecpar: codecpar)
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
             throw FrameDecodeError.unsupportedCodec
@@ -572,7 +572,7 @@ final class FrameDecodeContext: @unchecked Sendable {
                 }
 
                 // AE#499: before the Dolby Vision converter or the display buffer reads it.
-                ColorDescription.backfill(frame: f, container: containerColor)
+                colourFill.fill(f)
 
                 // Skip frames before targetPTS for frame-accuracy. No-PTS frames
                 // (AV_NOPTS_VALUE == Int64.min) are accepted, so PTS-less streams
@@ -670,7 +670,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
         defer { av_frame_free(&frame) }
         guard let frame, avcodec_receive_frame(ctx, frame) >= 0 else { return nil }
-        ColorDescription.backfill(frame: frame, container: containerColor)
+        colourFill.fill(frame)
         return body(frame)
     }
 

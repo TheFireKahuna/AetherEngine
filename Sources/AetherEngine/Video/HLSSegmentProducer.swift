@@ -412,7 +412,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var pendingReinitIsAdCreative: Bool = false
 
     /// Ad creative's video config from in-band SPS/PPS (mid-stream demuxer codecpar has width/height == 0).
-    private var pendingAdVideoConfig: (width: Int32, height: Int32, extradata: [UInt8])?
+    private var pendingAdVideoConfig: InBandVideoConfig?
 
     /// The pending rotation goes back to the stream chosen at open: its init is built from the open's own
     /// configuration, not from in-band parameter sets (`pendingAdVideoConfig` is nil then).
@@ -449,7 +449,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// #133: initial live-join video config reconstructed from the gating IDR's in-band SPS/PPS. Set when a
     /// mid-stream MPEG-TS join left the probed codecpar at 0x0 (probe joined before any SPS); consumed by the
     /// FIRST allocateMuxer so avformat_write_header gets real dimensions instead of failing -22 (dead channel).
-    private var pendingJoinVideoConfig: (width: Int32, height: Int32, extradata: [UInt8])?
+    private var pendingJoinVideoConfig: InBandVideoConfig?
 
     /// Cross-stream rebase pairing. Video rebase is master; audio derives its shift from its OWN boundary
     /// srcDts and the shared seam OUTPUT position (not the video shift) so differing audio source bases
@@ -2027,7 +2027,35 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// The keyframe a program switch opens on, with its in-band SPS/PPS where it has them.
     private struct ProgramSwitchOpening {
-        var config: (width: Int32, height: Int32, extradata: [UInt8])?
+        var config: InBandVideoConfig?
+    }
+
+    /// An H.264 video configuration read from a keyframe's in-band parameter sets (a live join whose probe saw no
+    /// SPS, an SSAI creative, a same-PID parameter-set change): what an init built from it says. Its colour is the
+    /// new SPS's VUI and, over a backward-compatible declaration, the keyframe's alternative transfer SEI (HLG, as
+    /// the demuxer promotes it at open, AE#839), so the versioned init's `colr` describes the new program.
+    struct InBandVideoConfig: Equatable {
+        var width: Int32
+        var height: Int32
+        var extradata: [UInt8]
+        var colour: ColorDescription
+
+        init?(annexB buf: UnsafeBufferPointer<UInt8>, requiresRandomAccess: Bool) {
+            guard let (sps, pps) = H264SPS.extractSPSandPPS(fromAnnexB: buf),
+                  !requiresRandomAccess || H264SPS.isRandomAccessEntry(fromAnnexB: buf),
+                  let dim = H264SPS.dimensions(fromNAL: sps) else { return nil }
+            width = Int32(dim.width)
+            height = Int32(dim.height)
+            extradata = H264SPS.annexBExtradata(sps: sps, pps: pps)
+            colour = H264SPS.colour(fromNAL: sps) ?? .unspecified
+            if AlternativeTransferSEI.declaredTransferMayHideHLG(codecID: AV_CODEC_ID_H264, primaries: colour.primaries,
+                                                                 transfer: colour.transfer),
+               let base = buf.baseAddress,
+               AlternativeTransferSEI.preferredTransfer(in: base, size: buf.count, codec: .h264, framing: .annexB)
+                == AlternativeTransferSEI.hlgTransfer {
+                colour.transfer = AVCOL_TRC_ARIB_STD_B67
+            }
+        }
     }
 
     /// The keyframe a program switch can open on, or nil to hold the packet out: on the stream chosen at
@@ -2042,13 +2070,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     /// Extract H.264 ad video config from in-band Annex-B SPS/PPS. nil on mid-GOP join (no parameter sets).
-    private func extractAdVideoConfig(_ packet: UnsafeMutablePointer<AVPacket>) -> (width: Int32, height: Int32, extradata: [UInt8])? {
+    private func extractAdVideoConfig(_ packet: UnsafeMutablePointer<AVPacket>) -> InBandVideoConfig? {
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return nil }
-        let buf = UnsafeBufferPointer(start: data, count: Int(packet.pointee.size))
-        guard let (sps, pps) = H264SPS.extractSPSandPPS(fromAnnexB: buf),
-              let dim = H264SPS.dimensions(fromNAL: sps) else { return nil }
-        return (Int32(dim.width), Int32(dim.height),
-                H264SPS.annexBExtradata(sps: sps, pps: pps))
+        return InBandVideoConfig(annexB: UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)),
+                                 requiresRandomAccess: false)
     }
 
     /// #133: whether the stricter live-join gate engages (withhold the video gate until a decodable IDR
@@ -2072,14 +2097,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// entry point, an IDR or an immediate intra recovery point (AE#627, see `isRandomAccessEntry`). Returns
     /// the reconstructed (width, height, Annex-B extradata) so a zero-dimension probe codecpar can be
     /// backfilled into the first muxer. nil until such an AU arrives.
-    private func extractJoinVideoConfig(_ packet: UnsafeMutablePointer<AVPacket>) -> (width: Int32, height: Int32, extradata: [UInt8])? {
+    private func extractJoinVideoConfig(_ packet: UnsafeMutablePointer<AVPacket>) -> InBandVideoConfig? {
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return nil }
-        let buf = UnsafeBufferPointer(start: data, count: Int(packet.pointee.size))
-        guard let (sps, pps) = H264SPS.extractSPSandPPS(fromAnnexB: buf),
-              H264SPS.isRandomAccessEntry(fromAnnexB: buf),
-              let dim = H264SPS.dimensions(fromNAL: sps) else { return nil }
-        return (Int32(dim.width), Int32(dim.height),
-                H264SPS.annexBExtradata(sps: sps, pps: pps))
+        return InBandVideoConfig(annexB: UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)),
+                                 requiresRandomAccess: true)
     }
 
     /// Pump-side backpressure wait. Returns true on release, false when stop was requested.
@@ -2345,7 +2366,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     ///   True only for an SSAI ad creative on a new PID; a same-PID parameter-set change stays in the same program
     ///   and KEEPS the overrides (an HDR-live encoder restart must not lose its color signaling).
     private func allocateMuxer(initialSegmentIndex: Int,
-                               reconstructedVideoConfig: (width: Int32, height: Int32, extradata: [UInt8])? = nil,
+                               reconstructedVideoConfig: InBandVideoConfig? = nil,
                                versionedInit: Bool = false,
                                isAdCreative: Bool = false) -> MP4SegmentMuxer? {
         // #93 residual: the FIRST alloc of a producer (its base segment) must not gate on the
@@ -2372,6 +2393,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
             par.pointee.codec_id = AV_CODEC_ID_H264
             par.pointee.width = reconstructedVideoConfig.width
             par.pointee.height = reconstructedVideoConfig.height
+            // The init's `colr` (movenc writes it from these) describes the parameter sets it is built from.
+            par.pointee.color_primaries = reconstructedVideoConfig.colour.primaries
+            par.pointee.color_trc = reconstructedVideoConfig.colour.transfer
+            par.pointee.color_space = reconstructedVideoConfig.colour.matrix
+            par.pointee.color_range = reconstructedVideoConfig.colour.range
             let ed = reconstructedVideoConfig.extradata
             let pad = Int(AV_INPUT_BUFFER_PADDING_SIZE)
             if let raw = av_malloc(ed.count + pad) {

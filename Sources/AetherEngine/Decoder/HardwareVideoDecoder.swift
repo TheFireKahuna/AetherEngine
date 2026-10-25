@@ -58,12 +58,23 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var width: Int32 = 0
     private var height: Int32 = 0
 
-    /// Color metadata from codecpar, re-applied to every CVPixelBuffer.
-    /// VTDecompressionSession should propagate these from SPS+hvcC but has been observed not to;
-    /// without them an HDR buffer renders as desaturated SDR on AVSampleBufferDisplayLayer.
+    /// Color metadata from codecpar, re-applied to every CVPixelBuffer that carries no colour of its own
+    /// (a session opened from parameter sets). VTDecompressionSession should propagate these from
+    /// SPS+hvcC but has been observed not to; without them an HDR buffer renders as desaturated SDR on
+    /// AVSampleBufferDisplayLayer.
     private var colorPrimaries: CFString?
     private var colorTransfer: CFString?
     private var colorMatrix: CFString?
+
+    /// A stream session's in-band colour, per picture: what each SPS and alternative transfer SEI states, so a
+    /// later SPS's colour (or its silence) reaches the buffers. Fed on the feed thread; made in `open(stream:)`.
+    private var inBandColour: HEVCInBandColour?
+
+    /// One picture's colour, handed to VideoToolbox as its frame refCon and back with the decoded picture.
+    final class FrameColour {
+        let tags: HEVCInBandColour.Tags
+        init(_ tags: HEVCInBandColour.Tags) { self.tags = tags }
+    }
 
     /// HDR10 static metadata the container declared (Matroska MasteringMetadata, MP4 `mdcv` / `clli`),
     /// filled onto a buffer VideoToolbox delivered without its own. VT attaches the bitstream's SEI
@@ -302,20 +313,17 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         containerHDRStatic = HDRStaticMetadata(codecpar: codecpar)
         streamCodecID = codecpar.pointee.codec_id
         streamProfile = codecpar.pointee.profile
-        self.colorPrimaries = ColorAttachments.primaries(codecpar.pointee.color_primaries)
-        self.colorTransfer = ColorAttachments.transfer(codecpar.pointee.color_trc)
-        self.colorMatrix = ColorAttachments.matrix(codecpar.pointee.color_space)
-        // #6: an SD stream that declares neither matrix nor primaries gets the software route's BT.601
-        // guess here too. Left untagged, VideoToolbox reads it as BT.709, so one untagged file showed in
-        // two colours depending on which decoder the route picked.
-        if colorPrimaries == nil, colorMatrix == nil {
-            let guessed = ColorAttachments.presented(
-                streamColor, frameSize: (codecpar.pointee.width, codecpar.pointee.height))
-            if guessed.matrix == kCVImageBufferYCbCrMatrix_ITU_R_601_4 {
-                colorPrimaries = guessed.primaries
-                colorMatrix = guessed.matrix
-            }
-        }
+        let declared = HEVCInBandColour.Tags(primaries: ColorAttachments.primaries(codecpar.pointee.color_primaries),
+                                             transfer: ColorAttachments.transfer(codecpar.pointee.color_trc),
+                                             matrix: ColorAttachments.matrix(codecpar.pointee.color_space))
+        inBandColour = HEVCInBandColour(
+            framing: A53SEIParser.nalFraming(codec: .hevc, extradata: codecpar.pointee.extradata,
+                                             size: Int(codecpar.pointee.extradata_size)),
+            container: declared)
+        let presented = Self.guessingSD(declared, width: codecpar.pointee.width, height: codecpar.pointee.height)
+        self.colorPrimaries = presented.primaries
+        self.colorTransfer = presented.transfer
+        self.colorMatrix = presented.matrix
         let pixelFormat: OSType = use10Bit
             ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
             : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
@@ -635,15 +643,24 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             awaitingKeyframe = false
             recoveredAfterDropping = droppedAwaitingKeyframe
         }
-        // Async decode with temporal queueing; callback fires on VT's internal queue.
+        // Async decode with temporal queueing; callback fires on VT's internal queue. The picture's colour
+        // rides along as its frame refCon; VT calls back for every frame it accepted, and for none it refused.
+        var colour: FrameColour?
+        if let tags = inBandColour?.tags(forAccessUnit: data, size: size) {
+            colour = FrameColour(Self.guessingSD(tags, width: width, height: height))
+        }
+        let colourRefCon = colour.map { Unmanaged.passRetained($0).toOpaque() }
         var infoFlags = VTDecodeInfoFlags()
         let decodeStatus = VTDecompressionSessionDecodeFrame(
             session,
             sampleBuffer: sb,
             flags: [._EnableAsynchronousDecompression, ._EnableTemporalProcessing],
-            frameRefcon: nil,
+            frameRefcon: colourRefCon,
             infoFlagsOut: &infoFlags
         )
+        if decodeStatus != noErr, let colourRefCon {
+            Unmanaged<FrameColour>.fromOpaque(colourRefCon).release()
+        }
         // AE#739: permanent for this session. Still under the hold that fed it, so a rebuild cannot
         // land between the call and the verdict and have the new session condemned for the old one.
         let lostNow = decodeStatus == kVTInvalidSessionErr && !sessionLost
@@ -687,6 +704,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             epochLock.lock(); _feedEpoch &+= 1; epochLock.unlock()
         }
         let session = self.session
+        // Decoding restarts at a random access point, which starts a coded video sequence (a CRA included).
+        inBandColour?.restart()
         lock.unlock()
         guard let session else { return }
         // Drain in-flight frames then signal a discontinuity so VT drops its reference picture state.
@@ -732,9 +751,20 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     // MARK: - Callback handling (called from VT's queue)
 
     /// Invoked by `hwDecoderOutputCallback`; delivers CVPixelBuffer+PTS, honouring `skipUntilPTS` for seek-pre-roll.
+    /// #6: an SD stream that declares neither matrix nor primaries gets the software route's BT.601 guess here
+    /// too. Left untagged, VideoToolbox reads it as BT.709, so one untagged file showed in two colours depending
+    /// on which decoder the route picked.
+    static func guessingSD(_ tags: HEVCInBandColour.Tags, width: Int32, height: Int32) -> HEVCInBandColour.Tags {
+        guard tags.primaries == nil, tags.matrix == nil else { return tags }
+        let guessed = ColorAttachments.presented(.unspecified, frameSize: (width, height))
+        guard guessed.matrix == kCVImageBufferYCbCrMatrix_ITU_R_601_4 else { return tags }
+        return HEVCInBandColour.Tags(primaries: guessed.primaries, transfer: tags.transfer, matrix: guessed.matrix)
+    }
+
     fileprivate func handleDecodedFrame(
         imageBuffer: CVImageBuffer,
-        pts: CMTime
+        pts: CMTime,
+        colour: HEVCInBandColour.Tags? = nil
     ) {
         if let threshold = skipUntilPTS {
             if CMTimeCompare(pts, threshold) < 0 {
@@ -745,14 +775,26 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
 
         // Attach color metadata; without it HDR PQ content shows as desaturated SDR on AVSampleBufferDisplayLayer.
-        if let primaries = colorPrimaries {
-            CVBufferSetAttachment(imageBuffer, kCVImageBufferColorPrimariesKey, primaries, .shouldPropagate)
-        }
-        if let transfer = colorTransfer {
-            CVBufferSetAttachment(imageBuffer, kCVImageBufferTransferFunctionKey, transfer, .shouldPropagate)
-        }
-        if let matrix = colorMatrix {
-            CVBufferSetAttachment(imageBuffer, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
+        // A picture's own colour (its SPS, its coded video sequence's alternative transfer) is set field by field and
+        // a field it leaves unstated is removed: VT's own attachment is the format description's, the stream's at
+        // open, which a later SPS may not share.
+        if let colour {
+            for (key, value) in [(kCVImageBufferColorPrimariesKey, colour.primaries),
+                                 (kCVImageBufferTransferFunctionKey, colour.transfer),
+                                 (kCVImageBufferYCbCrMatrixKey, colour.matrix)] {
+                if let value { CVBufferSetAttachment(imageBuffer, key, value, .shouldPropagate) }
+                else { CVBufferRemoveAttachment(imageBuffer, key) }
+            }
+        } else {
+            if let primaries = colorPrimaries {
+                CVBufferSetAttachment(imageBuffer, kCVImageBufferColorPrimariesKey, primaries, .shouldPropagate)
+            }
+            if let transfer = colorTransfer {
+                CVBufferSetAttachment(imageBuffer, kCVImageBufferTransferFunctionKey, transfer, .shouldPropagate)
+            }
+            if let matrix = colorMatrix {
+                CVBufferSetAttachment(imageBuffer, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
+            }
         }
         containerHDRStatic.attachWhereAbsent(to: imageBuffer)
 
@@ -802,13 +844,16 @@ private func hwDecoderOutputCallback(
     presentationTimeStamp: CMTime,
     presentationDuration: CMTime
 ) {
+    // The picture's colour, retained at submission: released here whatever the outcome.
+    let colour = sourceFrameRefCon.map { Unmanaged<HardwareVideoDecoder.FrameColour>.fromOpaque($0).takeRetainedValue() }
     guard status == noErr, let imageBuffer = imageBuffer else { return }
     guard let refCon = decompressionOutputRefCon else { return }
     let box = Unmanaged<HardwareVideoDecoder.RefConBox>
         .fromOpaque(refCon).takeUnretainedValue()
     box.decoder?.handleDecodedFrame(
         imageBuffer: imageBuffer,
-        pts: presentationTimeStamp
+        pts: presentationTimeStamp,
+        colour: colour?.tags
     )
 }
 
