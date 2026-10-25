@@ -604,6 +604,21 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var firstSyncItemPtsBySegment: [Int: Int64] = [:]
     private var pendingAudioSegIndex: Int = 0
 
+    /// A packet routed to its segment, muxed once the cut gate lets it through: `write` muxes it into
+    /// that segment's muxer and frees it, `free` frees it unwritten.
+    private struct GatedWrite {
+        let write: (MP4SegmentMuxer) -> Void
+        let free: () -> Void
+
+        static func freeing(_ packet: UnsafeMutablePointer<AVPacket>) -> () -> Void {
+            { var p: UnsafeMutablePointer<AVPacket>? = packet; trackedPacketFree(&p) }
+        }
+    }
+    /// VOD routed by time: the muxer moves on to a segment once every track has reached it
+    /// (`SegmentCutGate`), so a segment holds the same packets whichever run cut it. Nil where audio
+    /// follows the video cutter (live, sequential origins). Set at the pump's start, pump thread only.
+    private var cutGate: SegmentCutGate<GatedWrite>?
+
     /// A sequential origin's playlist advertises a segment from the VIDEO cut ledger (its EXTINF is
     /// the distance between two keyframe-gated opens, and a plan index no keyframe opened is a hole
     /// with no URI). Audio routed by time against the plan would open that hole on its own wherever
@@ -3742,6 +3757,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if isLive { startNoCutWatchdog() }
         defer { stopNoCutWatchdog() }
         var vodLedgerLastRoutedSeg = Int.min  // #65 ledger: last VOD segment index logged at the routing site
+        cutGate = isLive || audioFollowsVideoCut ? nil
+            : SegmentCutGate(tracks: audioConfig == nil ? [.video] : [.video, .audio], segment: baseIndex)
 
         do {
             readLoop: while true {
@@ -4458,10 +4475,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             isLive: isLive)
                         videoShiftPts = SourceTimestampBounds.difference(firstActualVideoDts, firstTfdtPts)
                         if audioWaitForVideo, let audio = audioConfig {
+                            // VOD audio starts at the run's first plan boundary, where routing puts the
+                            // start of its first segment (`segmentIndex(forSourcePts:)`, `AudioRunPlan`), so
+                            // that segment opens on the audio continuous playback put in it. Not the
+                            // keyframe's decode time: on a presentation-axis plan that sits a composition
+                            // offset before the boundary. Live has no plan and starts at the keyframe.
                             // Rescale into SOURCE audio TB (not encoder TB): a bridge exposes this mismatch;
                             // using inputTimeBase landed the target 48x too far for bridged DTS sources.
                             restartTargetAudioDts = av_rescale_q(
-                                firstActualVideoDts,
+                                isLive ? firstActualVideoDts : (segmentBoundaries.first ?? firstActualVideoDts),
                                 sourceVideoTimeBase,
                                 audio.timeBase
                             )
@@ -4785,11 +4807,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     // Live: keyframe cutter uses shifted pts. VOD: unused; routing uses prev.dts at look-behind site.
                     let isVideoKeyframe = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
                     // #731: a bridge that encodes on its own queue hands packets back a feed or more
-                    // late, and they are routed by the cutter (sequential origins) and the open muxer
-                    // (the `max` in `ensureMuxer`). Settle it before this packet advances the cutter
-                    // or the look-behind write below cuts, so every packet is routed where a
-                    // synchronous encode routed it. A cut the audio starts itself writes in order.
-                    if !isLive, let audio = audioConfig, let bridge = audio.bridge {
+                    // late. Where audio follows the video cutter (sequential origins) they are routed
+                    // by the cutter and the open muxer (the `max` in `ensureMuxer`), so settle it
+                    // before this packet advances the cutter or the look-behind write below cuts.
+                    // Routed by time, the cut gate waits for them instead.
+                    if !isLive, cutGate == nil, let audio = audioConfig, let bridge = audio.bridge {
                         let advancesCutter = audioFollowsVideoCut && isVideoKeyframe
                             && vodCutter.peekIndex(
                                 pts: planBoundaryAxis.timestamp(dts: packet.pointee.dts, pts: packet.pointee.pts),
@@ -4879,29 +4901,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                 category: .session
                             )
                         }
-                        if let muxer = ensureMuxer(forSegmentIndex: prevSeg) {
-                            // AE#412: a cold arrival can only start a decode run on a random-access
-                            // point, so what a segment is worth to one is where its first sync sample
-                            // sits. Recorded here, against the muxer's own index, because that is the
-                            // segment these bytes are actually in.
-                            if !isLive, (prev.pointee.flags & AV_PKT_FLAG_KEY) != 0 {
-                                let openIdx = muxer.currentSegmentIndex
-                                if firstSyncItemPtsBySegment[openIdx] == nil {
-                                    // AE#561: measured against a plan boundary, so stamped on the
-                                    // plan's axis. On the wrong one the reach is off by the frame's
-                                    // composition offset, which is the distance this very number
-                                    // exists to report.
-                                    firstSyncItemPtsBySegment[openIdx] =
-                                        planBoundaryAxis.timestamp(dts: prev.pointee.dts,
-                                                                   pts: prev.pointee.pts)
-                                }
-                            }
-                            finalizeAndWriteVideo(prev, nextDts: packet.pointee.dts, muxer: muxer)
-                            bumpPacketsWritten()
-                        } else {
-                            var pkt: UnsafeMutablePointer<AVPacket>? = prev
-                            trackedPacketFree(&pkt)
-                            pendingVideoPkt = nil
+                        pendingVideoPkt = nil
+                        if !mux(.video, segment: prevSeg, videoWrite(prev, nextDts: packet.pointee.dts)) {
                             exitReason = .muxerFailed
                             break readLoop
                         }
@@ -4953,12 +4954,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             )
                             prevSeg = segmentIndex(forSourcePts: prevPtsInVideoTb)
                         }
-                        if let muxer = ensureMuxer(forSegmentIndex: prevSeg) {
-                            finalizeAndWriteAudio(prev, nextDts: packet.pointee.dts, audio: audio, muxer: muxer)
-                        } else {
-                            var pkt: UnsafeMutablePointer<AVPacket>? = prev
-                            trackedPacketFree(&pkt)
-                            pendingAudioPkt = nil
+                        pendingAudioPkt = nil
+                        if !mux(.audio, segment: prevSeg, audioWrite(prev, nextDts: packet.pointee.dts, audio: audio)) {
                             exitReason = .muxerFailed
                             break readLoop
                         }
@@ -5043,15 +5040,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
             _ = writeBridgedAudio(bridge.settle(), audio: audio)
         }
         if let prev = pendingVideoPkt {
-            let prevSeg = pendingVideoSegIndex   // unified: live + VOD both carry the routed index
-            if let muxer = ensureMuxer(forSegmentIndex: prevSeg) {
-                finalizeAndWriteVideo(prev, nextDts: nil, muxer: muxer)
-                bumpPacketsWritten()
-            } else {
-                var pkt: UnsafeMutablePointer<AVPacket>? = prev
-                trackedPacketFree(&pkt)
-            }
             pendingVideoPkt = nil
+            // unified: live + VOD both carry the routed index
+            _ = mux(.video, segment: pendingVideoSegIndex, videoWrite(prev, nextDts: nil))
         }
         if let prev = pendingAudioPkt, let audio = audioConfig {
             let prevSeg: Int
@@ -5065,26 +5056,23 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 )
                 prevSeg = segmentIndex(forSourcePts: prevPtsInVideoTb)
             }
-            if let muxer = ensureMuxer(forSegmentIndex: prevSeg) {
-                finalizeAndWriteAudio(prev, nextDts: nil, audio: audio, muxer: muxer)
-            } else {
-                var pkt: UnsafeMutablePointer<AVPacket>? = prev
-                trackedPacketFree(&pkt)
-            }
             pendingAudioPkt = nil
+            _ = mux(.audio, segment: prevSeg, audioWrite(prev, nextDts: nil, audio: audio))
         }
 
         // EOF tail flush for bridge audio: drains ~100-200 ms remainder (per-feed only emits full frames).
         if case .eof = exitReason, let audio = audioConfig, let bridge = audio.bridge {
-            for fp in bridge.flush() {
-                let fpSeg = bridgedAudioSegmentIndex(fp, audio: audio)
-                if let muxer = ensureMuxer(forSegmentIndex: fpSeg) {
-                    fp.pointee.stream_index = muxer.audioOutputStreamIndex
-                    av_packet_rescale_ts(fp, audio.inputTimeBase, muxer.muxerAudioTimeBase)
-                    _ = muxer.writePacket(fp)
-                }
-                var fpVar: UnsafeMutablePointer<AVPacket>? = fp
-                trackedPacketFree(&fpVar)
+            _ = writeBridgedAudio(bridge.flush(), audio: audio)
+        }
+        // What the gate still holds: muxed at the source's end, where no track has more to come, and
+        // freed on any other exit, whose open segment is not adopted.
+        if var gate = cutGate {
+            cutGate = nil
+            let held = gate.drain()
+            if case .eof = exitReason {
+                _ = muxReleased(held)
+            } else {
+                held.forEach { $0.item.free() }
             }
         }
 
@@ -5116,21 +5104,68 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private func writeBridgedAudio(_ packets: [UnsafeMutablePointer<AVPacket>], audio: AudioConfig) -> Bool {
         var muxerGone = false
         for fp in packets {
-            var fpVar: UnsafeMutablePointer<AVPacket>? = fp
-            defer { trackedPacketFree(&fpVar) }
-            if muxerGone { continue }
-            guard let muxer = ensureMuxer(forSegmentIndex: bridgedAudioSegmentIndex(fp, audio: audio)) else {
+            let free = GatedWrite.freeing(fp)
+            if muxerGone { free(); continue }
+            let write = GatedWrite(write: { [self] muxer in
+                fp.pointee.stream_index = muxer.audioOutputStreamIndex
+                av_packet_rescale_ts(fp, audio.inputTimeBase, muxer.muxerAudioTimeBase)
+                let prime = copyAudioPrimeCandidate(fp)
+                if muxer.writePacket(fp).rc >= 0, let prime {
+                    audioMoovPrimeFrame = prime
+                }
+                free()
+            }, free: free)
+            if !mux(.audio, segment: bridgedAudioSegmentIndex(fp, audio: audio), write) { muxerGone = true }
+        }
+        return !muxerGone
+    }
+
+    // MARK: - The cut gate
+
+    /// Muxes `item` into `segment`: through the cut gate, which may hold it for another track, or at once
+    /// where there is none. False when the muxer is gone; every packet released is then freed.
+    private func mux(_ track: SegmentCutGate<GatedWrite>.Track, segment: Int, _ item: GatedWrite) -> Bool {
+        guard cutGate != nil else { return muxReleased([(segment, item)]) }
+        return muxReleased(cutGate!.submit(item, track: track, segment: segment))
+    }
+
+    private func muxReleased(_ entries: [(segment: Int, item: GatedWrite)]) -> Bool {
+        var muxerGone = false
+        for entry in entries {
+            if !muxerGone, let muxer = ensureMuxer(forSegmentIndex: entry.segment) {
+                entry.item.write(muxer)
+            } else {
                 muxerGone = true
-                continue
-            }
-            fp.pointee.stream_index = muxer.audioOutputStreamIndex
-            av_packet_rescale_ts(fp, audio.inputTimeBase, muxer.muxerAudioTimeBase)
-            let prime = copyAudioPrimeCandidate(fp)
-            if muxer.writePacket(fp).rc >= 0, let prime {
-                audioMoovPrimeFrame = prime
+                entry.item.free()
             }
         }
         return !muxerGone
+    }
+
+    /// A look-behind video packet's write. AE#412: a cold arrival can only start a decode run on a
+    /// random-access point, so what a segment is worth to one is where its first sync sample sits,
+    /// recorded against the muxer's own index because that is the segment these bytes are in.
+    private func videoWrite(_ packet: UnsafeMutablePointer<AVPacket>, nextDts: Int64?) -> GatedWrite {
+        GatedWrite(write: { [self] muxer in
+            if !isLive, (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0 {
+                let openIdx = muxer.currentSegmentIndex
+                if firstSyncItemPtsBySegment[openIdx] == nil {
+                    // AE#561: measured against a plan boundary, so stamped on the plan's axis. On the
+                    // wrong one the reach is off by the frame's composition offset, which is the
+                    // distance this very number exists to report.
+                    firstSyncItemPtsBySegment[openIdx] =
+                        planBoundaryAxis.timestamp(dts: packet.pointee.dts, pts: packet.pointee.pts)
+                }
+            }
+            finalizeAndWriteVideo(packet, nextDts: nextDts, muxer: muxer)
+            bumpPacketsWritten()
+        }, free: GatedWrite.freeing(packet))
+    }
+
+    private func audioWrite(_ packet: UnsafeMutablePointer<AVPacket>, nextDts: Int64?, audio: AudioConfig) -> GatedWrite {
+        GatedWrite(write: { [self] muxer in
+            finalizeAndWriteAudio(packet, nextDts: nextDts, audio: audio, muxer: muxer)
+        }, free: GatedWrite.freeing(packet))
     }
 
     /// The segment a bridged audio packet belongs to. Live and sequential audio follow the video
