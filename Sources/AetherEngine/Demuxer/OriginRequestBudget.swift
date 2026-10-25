@@ -19,8 +19,11 @@ import Foundation
 /// immediately and only tallies, so a healthy origin sees exactly the behaviour it saw before this
 /// existed. A limit arrives one of two ways: the host names it (`LoadOptions.maxConcurrentSourceRequests`),
 /// or the origin does, by answering 429/503/509, after which the budget halves from the concurrency
-/// it had actually reached. There is no automatic increase: an origin that has metered us once is
-/// treated as metering for the rest of the process, which costs some parallelism and no correctness.
+/// it had actually reached. A learned ceiling is lifted after `learnedLimitLiftSeconds` without a
+/// refusal: one 503 from a server restarting its transcoder would otherwise switch the speculative
+/// paths off (detour blocks, the tail prefetch, the I-frame reader) for as long as the app runs. An
+/// origin that still meters says so with its next refusal, which learns the ceiling again from the
+/// concurrency reached since.
 /// A refusal also arms a request-rate pacer for that origin. It is deliberately learned rather than
 /// host-configured: the measured CDN served eight parallel 32 MB reads but first refused a run of
 /// 256 KB reads after 36 requests in 10 seconds, so concurrency and request rate are separate limits.
@@ -51,6 +54,9 @@ final class OriginRequestBudget: @unchecked Sendable {
     private static let firstQuietPeriod: TimeInterval = 2
     private static let maximumQuietPeriod: TimeInterval = 15
     private static let quietSecondsToDisarm: TimeInterval = 60
+    /// How long a learned concurrency ceiling outlives the last refusal. Ten times the pacer's quiet
+    /// disarm, so a ceiling outlasts the refusal window it was learned in and a lift is rare.
+    static let learnedLimitLiftSeconds: TimeInterval = 600
     /// Longest single wait a paced caller takes before re-reading the books. Only an injected clock
     /// needs this to be shorter than the whole debt: a clock that moves without the wall clock
     /// cannot shorten a wait that has already been entered.
@@ -290,11 +296,25 @@ final class OriginRequestBudget: @unchecked Sendable {
         state.refusalStreak = 0
     }
 
-    private func disarmPacerIfQuietLocked(_ state: inout OriginState, at instant: DispatchTime) {
-        guard state.quietUntil != nil, let refusedAt = state.lastRefusalAt,
-              Self.elapsedSeconds(from: refusedAt, to: instant) >= Self.quietSecondsToDisarm
-        else { return }
-        disarmPacerLocked(&state)
+    /// Disarms the pacer after `quietSecondsToDisarm`, and lifts a learned (not host-set) ceiling
+    /// after `learnedLimitLiftSeconds`, both measured from the last refusal.
+    private func relaxIfQuietLocked(_ state: inout OriginState, at instant: DispatchTime) {
+        guard let refusedAt = state.lastRefusalAt else { return }
+        let quiet = Self.elapsedSeconds(from: refusedAt, to: instant)
+        if state.quietUntil != nil, quiet >= Self.quietSecondsToDisarm {
+            disarmPacerLocked(&state)
+        }
+        if state.hostLimit == nil, state.limit != nil, quiet >= Self.learnedLimitLiftSeconds {
+            state.limit = nil
+            state.peakInflight = state.inflight
+            // Waiters were parked behind the ceiling that is gone: they all go now.
+            for waiter in state.waiters {
+                state.inflight += 1
+                waiter.signal()
+            }
+            state.peakInflight = max(state.peakInflight, state.inflight)
+            state.waiters.removeAll()
+        }
     }
 
     private func refillPacerLocked(_ state: inout OriginState, at instant: DispatchTime) {
@@ -336,7 +356,7 @@ final class OriginRequestBudget: @unchecked Sendable {
             lock.lock()
             let key = headLocked(raw)
             var state = origins[key] ?? OriginState()
-            disarmPacerIfQuietLocked(&state, at: instant)
+            relaxIfQuietLocked(&state, at: instant)
 
             guard let quietUntil = state.quietUntil else {
                 origins[key] = state
@@ -537,7 +557,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         let key = headLocked(raw)
         var state = origins[key] ?? OriginState()
         let instant = now()
-        disarmPacerIfQuietLocked(&state, at: instant)
+        relaxIfQuietLocked(&state, at: instant)
         guard state.inflight < (state.limit ?? Int.max) else {
             origins[key] = state
             return nil
@@ -604,7 +624,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         lock.lock()
         let key = headLocked(raw)
         var state = origins[key] ?? OriginState()
-        disarmPacerIfQuietLocked(&state, at: instant)
+        relaxIfQuietLocked(&state, at: instant)
         state.refusals += 1
         state.lastRefusalAt = instant
         state.refusalStreak += 1
@@ -757,7 +777,11 @@ final class OriginRequestBudget: @unchecked Sendable {
     func limit(for url: URL) -> Int? {
         guard let raw = Self.originKey(for: url) else { return nil }
         lock.lock(); defer { lock.unlock() }
-        return origins[headLocked(raw)]?.limit
+        let key = headLocked(raw)
+        guard var state = origins[key] else { return nil }
+        relaxIfQuietLocked(&state, at: now())
+        origins[key] = state
+        return state.limit
     }
 
     /// True when this origin is down to one request at a time. The reader asks this to switch OFF
@@ -778,7 +802,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         let key = headLocked(raw)
         guard var state = origins[key] else { return false }
-        disarmPacerIfQuietLocked(&state, at: now())
+        relaxIfQuietLocked(&state, at: now())
         origins[key] = state
         return state.quietUntil != nil
     }
@@ -789,7 +813,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         let key = headLocked(raw)
         guard var state = origins[key] else { return nil }
         let instant = now()
-        disarmPacerIfQuietLocked(&state, at: instant)
+        relaxIfQuietLocked(&state, at: instant)
         origins[key] = state
         let since = state.lastRefusalAt.map {
             Self.elapsedSeconds(from: $0, to: instant)

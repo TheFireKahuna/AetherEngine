@@ -1179,6 +1179,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// off for every reader whose caller did not ask (the subtitle side reader included, whose
     /// deliberate multi-minute parks are the shape a held connection must not take).
     private let heldConnectionEnabled: Bool
+    /// On a multiplexed origin (h2/h3) every reader of the source shares one connection, so the
+    /// playback reader's requests go ahead of the side readers' (subtitles, I-frames, stills, probes).
+    private var taskPriority: Float {
+        label == DemuxerOpenProfile.playback.readerLabel ? URLSessionTask.highPriority : URLSessionTask.lowPriority
+    }
     private var throttleVClockNs: UInt64 = 0
     private let throttleLock = NSLock()
 
@@ -3165,6 +3170,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         let task = EngineHTTP.session.dataTask(with: request)
         task.delegate = delegate
+        task.priority = taskPriority
         EngineHTTP.armResourceDeadline(task, seconds: Self.boundedResourceSeconds)
         winCond.lock()
         tailPrefetchTask = task
@@ -3510,7 +3516,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 originURL: requestURLForBudget
             )
             let task = EngineHTTP.session.dataTask(with: request)
-            task.priority = URLSessionTask.highPriority
+            task.priority = taskPriority
             task.delegate = delegate
             transfer = task
         }
@@ -4877,6 +4883,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let delegate = ChunkFetchDelegate(extraHeaders: headers(for: request.url),
                                           bodyLimit: Self.expectedBodyBytes(for: request))
         let task = (probeRequestSession ?? EngineHTTP.session).dataTask(with: request)
+        task.priority = taskPriority
         if probeRequestSession == nil {
             EngineHTTP.armResourceDeadline(task, seconds: Self.boundedResourceSeconds)
         }
