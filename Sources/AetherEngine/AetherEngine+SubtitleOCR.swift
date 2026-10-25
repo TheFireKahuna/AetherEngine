@@ -2,8 +2,8 @@ import Foundation
 
 // Phase D: selection-armed worker feeding a bitmap track's native WebVTT rendition with
 // OCR-recognized text cues, so PGS/DVB/DVD subtitles survive PiP / AirPlay / external display
-// on the native path. Packet source is the session SubtitlePacketStore, which the worker's demand on
-// the subtitle source keeps ahead of its window (from the container's index or the walk alike); the tick
+// on the native path. Packet source is the session SubtitlePacketStore: an indexed stream's window is
+// pulled by the tick itself, a walked one's kept ahead by the worker's demand on the walk; the tick
 // plans and resolves on the MainActor, decodes off it (AE#628), and Vision runs on a dedicated thread.
 extension AetherEngine {
 
@@ -12,9 +12,10 @@ extension AetherEngine {
         cancelSubtitleOCRWorker()
         guard let store = nativeStore(atOrdinal: ordinal) else { return }
         subtitleOCRArmedOrdinal = ordinal
-        // The packet store has to hold the worker's window before the worker gets there: the source reads
-        // a margin past it, as far as the player asks the rendition.
-        subtitleSource?.demand(.ocr, lead: { playhead in
+        // A walked stream has to be in the packet store before the worker gets there: the walk reads a
+        // margin past the window, as far as the player asks the rendition. An indexed one is pulled by each
+        // tick.
+        subtitleSource?.demand(.ocr, streams: [streamIndex], lead: { playhead in
             Self.subtitleReadAhead(base: Self.subtitleOCRPrefetchLeadSeconds, playhead: playhead,
                                    requested: store.furthestRequestedSourceSeconds())
         })
@@ -107,7 +108,8 @@ extension AetherEngine {
         switch plan {
         case .idle:
             subtitleOCRCursors[ordinal]?.lastPlayhead = playhead
-            return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, landingGeneration: landingGeneration,
+            return SubtitleOCRTickPlan(ordinal: ordinal, streamIndex: streamIndex, pulled: false,
+                                       playhead: playhead, landingGeneration: landingGeneration,
                                        plan: plan, window: (playhead, playhead), decoder: nil, batch: [])
         case .decode(let from, let through):
             window = (from, through)
@@ -119,11 +121,20 @@ extension AetherEngine {
             subtitleOCRDecoder = makeSubtitleDrainDecoder(streamIndex: streamIndex)
         }
         guard let decoder = subtitleOCRDecoder else {
-            return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, landingGeneration: landingGeneration,
+            return SubtitleOCRTickPlan(ordinal: ordinal, streamIndex: streamIndex, pulled: false,
+                                       playhead: playhead, landingGeneration: landingGeneration,
                                        plan: .idle, window: window, decoder: nil, batch: [])
         }
-        let entries = packetStore.entries(streamIndex: streamIndex,
-                                          from: window.from, through: window.through)
+        // Layer 3 step 3: an indexed stream is pulled, and decodes what the pulls have brought.
+        let pulls = subtitleStreamIsPulled(streamIndex)
+        var decodableThrough = window.through
+        if pulls {
+            subtitleSource?.pull(streamIndex, from: window.from, through: window.through, focus: playhead)
+            decodableThrough = min(window.through,
+                                   packetStore.pulledReach(streamIndex: streamIndex, from: window.from) ?? -.infinity)
+        }
+        let entries = decodableThrough >= window.from
+            ? packetStore.entries(streamIndex: streamIndex, from: window.from, through: decodableThrough) : []
         // #271: the cap has to fall on a PTS boundary. The cursor is a bare PTS advanced by
         // `lastDecodedPts.nextUp`, so a cut inside a same-PTS run skips its remainder instead of
         // resuming it next tick. One composition per PTS is the norm on a bitmap track, but a
@@ -132,13 +143,14 @@ extension AetherEngine {
         let batchEnd = SubtitleOverlayDrainer.batchEnd(
             count: entries.count, cap: Self.subtitleOCRMaxPacketsPerTick,
             ptsAt: { entries[$0].ptsSeconds })
-        return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, landingGeneration: landingGeneration,
+        return SubtitleOCRTickPlan(ordinal: ordinal, streamIndex: streamIndex, pulled: pulls,
+                                   playhead: playhead, landingGeneration: landingGeneration,
                                    plan: plan, window: window, decoder: decoder, batch: entries[..<batchEnd],
                                    windowComplete: batchEnd == entries.count)
     }
 
     /// The stretch a finished tick has read for its rendition: from where this run of the worker began
-    /// through the end of what it decoded, cut back to where the harvest's own reading stops (a packet
+    /// through the end of what it decoded, cut back to where the reading stops, the pulls' or the harvest's (a packet
     /// not yet harvested is a line not yet seen) and to the earliest composition still open (its line
     /// reaches the store only when its end is known). Nil for a tick that read nothing or was dropped.
     fileprivate func subtitleOCRReadSpan(_ tick: SubtitleOCRTickPlan) -> (from: Double, through: Double)? {
@@ -152,8 +164,11 @@ extension AetherEngine {
         case .resetAndDecode: isReset = true
         }
         if isReset || subtitleOCRReadStarts[ordinal] == nil { subtitleOCRReadStarts[ordinal] = tick.window.from }
-        guard let start = subtitleOCRReadStarts[ordinal],
-              let reach = packetStore.harvestReach(from: tick.window.from) else { return nil }
+        // What was read: for a pulled stream the pulls themselves, for a walked one the harvest's reading.
+        let reach = tick.pulled
+            ? packetStore.pulledReach(streamIndex: tick.streamIndex, from: tick.window.from)
+            : packetStore.harvestReach(from: tick.window.from)
+        guard let start = subtitleOCRReadStarts[ordinal], let reach else { return nil }
         var through = min(tick.window.through, reach)
         if !tick.windowComplete, let last = tick.batch.last?.ptsSeconds { through = min(through, last) }
         if let open = subtitleOCRPendingStates[ordinal]?.earliestPendingStart { through = min(through, open) }
@@ -215,6 +230,9 @@ extension AetherEngine {
 /// decodes nothing (idle, or no decoder could be built), which still expires pending cues.
 fileprivate struct SubtitleOCRTickPlan: @unchecked Sendable {
     let ordinal: Int
+    let streamIndex: Int32
+    /// The stream is pulled from the index (layer 3 step 3).
+    let pulled: Bool
     let playhead: Double
     /// The landing count the tick planned against (`SubtitleRepositioning.signalled`).
     let landingGeneration: UInt64

@@ -2,24 +2,25 @@ import Foundation
 import AetherLibavcodec
 import AetherLibavutil
 
-/// The session's one reader of its embedded subtitle streams. Every consumer that wants subtitle packets
-/// ahead of the pump states how far ahead it wants them (`demand`); the source reads to the furthest of
-/// those leads and no further, and stops reading when nobody wants anything.
+/// The session's one reader of its embedded subtitle streams.
 ///
 /// Each stream is read one of two ways, settled once per session (`Route`):
 ///
 /// - **The index** (`SourceIndex`, through `SourceIndexRegistry`): a stream the container lists in full,
-///   in a codec whose frame is its packet, is read exactly where the index places each frame. Its text
-///   rendition's cue store is filled whole as soon as the route is known, which is what AVKit needs (it
-///   reads a rendition minutes ahead and keeps what it gets), and its packets reach the packet store as
-///   the lead asks.
+///   in a codec whose frame is its packet, is read exactly where the index places each frame, and only
+///   when asked (`pull`): the overlay drainer and the OCR worker pull the window they are about to
+///   decode, and the packet store is a cache of what was pulled. Its text rendition's cue store is filled
+///   whole as soon as the route is known, which is what AVKit needs (it reads a rendition minutes ahead
+///   and keeps what it gets), and the frames that fill reads are the stream's pull, for the whole film.
+///   Nothing else writes such a stream (`SubtitlePacketStore.setPulledStreams`).
 /// - **The walk**: every other stream, read by one side demuxer for all of them, which harvests into the
-///   packet store and decodes each text stream into its cue store as it goes.
+///   packet store and decodes each text stream into its cue store as it goes. A consumer reading a walked
+///   stream states how far ahead it wants it (`demand`); the walk reads to the furthest of those leads and
+///   no further, and stops when no consumer of a walked stream asks any more. The pump's tap also writes
+///   these, as far as it plays.
 ///
-/// One loop reads both (`SubtitleForwardPrefetcher.CompositeSource`), so the session has one park, one
-/// anchor and one coverage frontier. The consumers are the overlay drainer and the OCR worker, which read
-/// the packet store, and the native text renditions, which read their cue stores. The pump keeps its own
-/// tap; this is everything ahead of it.
+/// No reader of the source is held between reads: a pull opens its readers and closes them, so the source
+/// cache sees no second reader the pump's stream would have to be kept for (`SourceByteCache.Retention`).
 @MainActor
 final class SubtitleSource {
 
@@ -74,11 +75,23 @@ final class SubtitleSource {
         let endOfFile: @MainActor @Sendable () -> Void
         /// The reading stopped because nobody asks any more, with the reason the last consumer gave.
         let stopped: @MainActor @Sendable (SubtitleDrainStopReason?) -> Void
+        /// The routes are settled; the indexed streams are the pulls' from now on.
+        let routesSettled: @MainActor @Sendable ([Int32: Route]) -> Void
+        /// A pull of the stream stored what it read.
+        let pulled: @MainActor @Sendable (Int32) -> Void
     }
 
     let host: Host
     private let leads = Leads()
     private var resolution: Task<Resolution, Never>!
+    /// The resolution once it is in, read synchronously by the drainer and the pulls.
+    private var settled: Resolution?
+    /// Where a demand that came before the routes asked the walk to start.
+    private var pendingAnchor: SubtitleForwardPrefetcher.SideReaderReanchor.Anchor?
+    /// Per stream, the pull being read and the flag that ends it.
+    private var pullInFlight: [Int32: (from: Double, through: Double, stop: StopFlag)] = [:]
+    /// Per stream, a block that failed to read and how often in a row.
+    private var pullFailures: [Int32: (block: Int, attempts: Int)] = [:]
     private var wholeFill: Task<Void, Never>?
     private var loop: (task: Task<Void, Never>, generation: Int)?
     private var loopGeneration = 0
@@ -99,45 +112,88 @@ final class SubtitleSource {
                                       indexable: indexable, customClone: host.customReader?())
         let resolving = BlockingWork.detached(priority: .utility) { await Self.resolve(inputs) }
         resolution = resolving
+        Task { @MainActor [weak self] in
+            let resolved = await resolving.value
+            self?.settle(resolved)
+        }
         wholeFill = BlockingWork.detached(priority: .utility) { [host] in
             await Self.fillIndexedRenditions(await resolving.value, host: host)
         }
     }
 
-    /// Whether the loop is running.
+    /// Whether the walk is running.
     var isReading: Bool { loop != nil }
 
     /// The routes, once settled.
     func routes() async -> [Int32: Route] { await resolution.value.routes }
 
-    /// `consumer` wants packets to `lead(playhead)` seconds past the playhead. Starts the loop at `anchor`
-    /// (the playhead when nil) if it is not running; a running loop moves to `anchor` in place when one is
-    /// given, and otherwise reads on to the raised lead without a move.
-    func demand(_ consumer: Consumer, lead: @escaping @Sendable (_ playhead: Double) -> Double,
-                from anchor: Double? = nil, seekGeneration: UInt64 = 0) {
+    /// A stream's route once the routes are settled; nil before, and for a stream the session never listed.
+    func route(of stream: Int32) -> Route? { settled?.routes[stream] }
+
+    /// The routes are in: the indexed streams become the pulls' alone, and a demand that came first is
+    /// taken now.
+    private func settle(_ resolved: Resolution) {
         guard !closed else { return }
-        leads.set(consumer, lead)
-        stopReason = nil
-        guard loop != nil else {
-            start(at: max(0, anchor ?? host.playhead() ?? 0))
-            return
-        }
-        if let anchor { move(to: anchor, seekGeneration: seekGeneration) }
+        settled = resolved
+        host.packetStore.setPulledStreams(Set(resolved.indexedStreams.map(\.streamIndex)))
+        host.routesSettled(resolved.routes)
+        let anchor = pendingAnchor
+        pendingAnchor = nil
+        reconsiderWalk(anchor: anchor)
     }
 
-    /// `consumer` no longer wants anything. The loop stops once nobody asks, judged after the current
-    /// turn of the main actor, so a consumer that withdraws and asks again in one change (a re-arm, a
-    /// track switch) moves the reading instead of closing and reopening it.
+    /// Whether a stream is the walk's: everything the index does not read, a stream the session never
+    /// listed included.
+    private func isWalked(_ stream: Int32) -> Bool {
+        if case .indexed = settled?.routes[stream] { return false }
+        return true
+    }
+
+    /// `consumer` reads `streams` and wants the walked ones read to `lead(playhead)` seconds past the playhead.
+    /// The walk starts at `anchor` (the playhead when nil) if one of them is walked and it is not running; a
+    /// running walk moves to `anchor` in place when one is given, and otherwise reads on to the raised lead
+    /// without a move. An indexed stream needs no demand: its consumer pulls what it is about to decode.
+    func demand(_ consumer: Consumer, streams: Set<Int32>, lead: @escaping @Sendable (_ playhead: Double) -> Double,
+                from anchor: Double? = nil, seekGeneration: UInt64 = 0) {
+        guard !closed else { return }
+        leads.set(consumer, lead, streams: streams)
+        stopReason = nil
+        let anchor = anchor.map {
+            SubtitleForwardPrefetcher.SideReaderReanchor.Anchor(seconds: max(0, $0), seekGeneration: seekGeneration)
+        }
+        guard settled != nil else {
+            if let anchor { pendingAnchor = anchor }
+            return
+        }
+        reconsiderWalk(anchor: anchor)
+    }
+
+    /// `consumer` no longer wants anything. The walk stops once no consumer of a walked stream asks, judged
+    /// after the current turn of the main actor, so a consumer that withdraws and asks again in one change
+    /// (a re-arm, a track switch) moves the reading instead of closing and reopening it.
     func withdraw(_ consumer: Consumer, reason: SubtitleDrainStopReason? = nil) {
-        leads.set(consumer, nil)
-        guard leads.isEmpty, loop != nil else { return }
-        if let reason { stopReason = reason }
-        guard !stopPending else { return }
+        leads.set(consumer, nil, streams: [])
+        if let reason, loop != nil { stopReason = reason }
+        reconsiderWalk(anchor: nil)
+    }
+
+    /// Starts, moves or stops the walk for what the consumers now ask.
+    private func reconsiderWalk(anchor: SubtitleForwardPrefetcher.SideReaderReanchor.Anchor?) {
+        guard !closed, settled != nil else { return }
+        if leads.demandsAny(where: isWalked) {
+            guard loop != nil else {
+                start(at: anchor?.seconds ?? max(0, host.playhead() ?? 0))
+                return
+            }
+            if let anchor { move(to: anchor.seconds, seekGeneration: anchor.seekGeneration) }
+            return
+        }
+        guard loop != nil, !stopPending else { return }
         stopPending = true
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.stopPending = false
-            guard self.leads.isEmpty, self.loop != nil, !self.closed else { return }
+            guard !self.leads.demandsAny(where: self.isWalked), self.loop != nil, !self.closed else { return }
             let reason = self.stopReason
             self.stopReason = nil
             self.stopLoop()
@@ -145,14 +201,18 @@ final class SubtitleSource {
         }
     }
 
-    /// The playhead jumped (a seek, a producer re-anchor): the reading goes on from `seconds`. A loop
-    /// that already ended (the end of the file, a spent restart budget) starts again there while anyone
-    /// still asks.
+    /// The playhead jumped (a seek, a producer re-anchor): the walk goes on from `seconds`. A walk that
+    /// already ended (the end of the file, a spent restart budget) starts again there while a consumer of a
+    /// walked stream still asks.
     func move(to seconds: Double, seekGeneration: UInt64 = 0) {
         let anchor = SubtitleForwardPrefetcher.SideReaderReanchor.Anchor(seconds: max(0, seconds),
                                                                          seekGeneration: seekGeneration)
+        guard settled != nil else {
+            pendingAnchor = anchor
+            return
+        }
         guard loop != nil else {
-            if !closed, !leads.isEmpty { start(at: anchor.seconds) }
+            if !closed, leads.demandsAny(where: isWalked) { start(at: anchor.seconds) }
             return
         }
         if let reanchor {
@@ -173,12 +233,14 @@ final class SubtitleSource {
         let fill = wholeFill
         fill?.cancel()
         wholeFill = nil
+        for pull in pullInFlight.values { pull.stop.raise() }
+        pullInFlight.removeAll()
         resolution.cancel()
         let resolution = resolution!
-        // The fill's lanes read through the root; it closes once they are done.
+        // A host clone serves the fill's lanes; it closes once they are done.
         BlockingWork.detached(priority: .utility) {
             await fill?.value
-            await resolution.value.root?.close()
+            if case .clone(let reader)? = await resolution.value.frames { reader.close() }
         }
     }
 
@@ -193,28 +255,54 @@ final class SubtitleSource {
 
     // MARK: - Resolution
 
-    /// What the routes were settled with: the index, what its frames are read through, and every stream.
+    /// What the routes were settled with: the index, how its frames are read, and every stream.
     struct Resolution: @unchecked Sendable {
         let index: (any SourceIndex)?
-        /// What the index's frames are read through; closed with the source.
-        let root: IOReader?
+        let frames: FrameReaders?
         let routes: [Int32: Route]
-        /// The streams the index reads, as the loop reads them.
-        let indexedStreams: [SubtitleForwardPrefetcher.IndexSource.Stream]
+        /// The streams the index reads.
+        let indexedStreams: [IndexedStream]
         let listed: [IndexedSubtitleStream]
         let assembly: Set<Int32>
+    }
 
-        /// A reader of the index's frames for one lane of work, closed by the caller. A root that reads
-        /// exact ranges serves every lane itself (one reader, one session, one connection); any other gets
-        /// a reader of its own per lane, since its one cursor would serialise them.
-        func laneSource() -> IOReaderByteSource? {
-            guard let root else { return nil }
-            if root is RangeReadableIOReader { return IOReaderByteSource(root, closesReader: false) }
-            return root.makeIndependentReader().map { IOReaderByteSource($0) }
+    /// A stream the index reads: its track and every frame's block, in time order.
+    struct IndexedStream: Sendable {
+        let streamIndex: Int32
+        let track: UInt64
+        let blocks: [SourceIndexBlock]
+    }
+
+    /// Where a read of the index's frames gets its readers.
+    enum FrameReaders: @unchecked Sendable {
+        /// A URL: readers opened for the read and closed after it, so no reader of the source outlives a
+        /// read (a second open reader is what makes the source cache keep the pump's whole stream).
+        case url(URL, headers: [String: String])
+        /// A host's own source, outside the source cache: the clone it was resolved through, held for the
+        /// session.
+        case clone(IOReader)
+
+        /// Byte sources for up to `count` lanes, each closed by the caller. A reader of exact ranges serves
+        /// every lane itself (one reader, one connection); any other gives each lane a reader of its own,
+        /// since its one cursor would serialise them.
+        func lanes(_ count: Int, label: String) -> [IOReaderByteSource] {
+            guard count > 0 else { return [] }
+            switch self {
+            case .url(let url, let headers):
+                guard let first = AetherEngine.indexReader(url: url, headers: headers, label: label) else { return [] }
+                guard first is RangeReadableIOReader else {
+                    return [IOReaderByteSource(first)] + (1..<count).compactMap { _ in
+                        AetherEngine.indexReader(url: url, headers: headers, label: label).map { IOReaderByteSource($0) }
+                    }
+                }
+                return [IOReaderByteSource(first)] + (1..<count).map { _ in IOReaderByteSource(first, closesReader: false) }
+            case .clone(let root):
+                if root is RangeReadableIOReader {
+                    return (0..<count).map { _ in IOReaderByteSource(root, closesReader: false) }
+                }
+                return (0..<count).compactMap { _ in root.makeIndependentReader().map { IOReaderByteSource($0) } }
+            }
         }
-
-        /// The walk is needed: some stream is walked, or no stream could be listed at all.
-        var needsWalk: Bool { routes.isEmpty || routes.values.contains(.walked) }
     }
 
     private struct ResolutionInputs: @unchecked Sendable {
@@ -241,7 +329,7 @@ final class SubtitleSource {
             if !streams.isEmpty {
                 EngineLog.emit("[SubtitleSource] every stream walked (\(why)): \(streams.sorted())", category: .engine)
             }
-            return Resolution(index: nil, root: nil, routes: Dictionary(uniqueKeysWithValues: streams.map { ($0, .walked) }),
+            return Resolution(index: nil, frames: nil, routes: Dictionary(uniqueKeysWithValues: streams.map { ($0, .walked) }),
                               indexedStreams: [], listed: listed, assembly: assembly)
         }
         guard inputs.indexable, let demuxer = inputs.demuxer, !streams.isEmpty else {
@@ -252,11 +340,19 @@ final class SubtitleSource {
                 ?? AetherEngine.indexReader(url: inputs.url, headers: inputs.headers, label: "subindex") else {
             return allWalked("the source cannot be read by range")
         }
+        // A stream is indexed only where its frames can be pulled: a host's reader has to read exact ranges
+        // itself or hand each lane a reader of its own (`FrameReaders.lanes`).
+        if inputs.customClone != nil, !(root is RangeReadableIOReader) {
+            guard let lane = root.makeIndependentReader() else {
+                return allWalked("the host's reader cannot read frames by position", root: root)
+            }
+            lane.close()
+        }
         let began = Date()
         let outcome = await SourceIndexRegistry.shared.index(of: inputs.url, headers: inputs.headers,
                                                              demuxer: demuxer, through: root)
         guard let index = outcome.index else { return allWalked("no usable index: \(outcome)", root: root) }
-        let plan = SubtitleForwardPrefetcher.IndexSource.plan(index: index, listed: listed, streams: streams)
+        let plan = Self.plan(index: index, listed: listed, streams: streams)
         var routes: [Int32: Route] = [:]
         for stream in streams { routes[stream] = .walked }
         for stream in plan.streams { routes[stream.streamIndex] = .indexed(track: stream.track) }
@@ -264,12 +360,47 @@ final class SubtitleSource {
                        + "\(plan.streams.map(\.streamIndex))"
                        + (plan.refused.isEmpty ? "" : ", walked \(plan.refused.joined(separator: ", "))"),
                        category: .engine)
-        guard !plan.streams.isEmpty else {
+        // The parse is the only read through this reader. A URL's frames are read by readers of their own
+        // per read; a host's clone is the one reader its source has.
+        let frames: FrameReaders
+        if inputs.customClone != nil {
+            frames = .clone(root)
+        } else {
             root.close()
-            return Resolution(index: nil, root: nil, routes: routes, indexedStreams: [], listed: listed, assembly: assembly)
+            frames = .url(inputs.url, headers: inputs.headers)
         }
-        return Resolution(index: index, root: root, routes: routes, indexedStreams: plan.streams,
+        guard !plan.streams.isEmpty else {
+            if case .clone(let reader) = frames { reader.close() }
+            return Resolution(index: nil, frames: nil, routes: routes, indexedStreams: [], listed: listed, assembly: assembly)
+        }
+        return Resolution(index: index, frames: frames, routes: routes, indexedStreams: plan.streams,
                           listed: listed, assembly: assembly)
+    }
+
+    /// Which of `streams` the index can stand in for: a stream it pairs with a track, of a codec whose frame
+    /// is its packet, listed in full. Each refused stream is named with the reason, and is the walk's.
+    nonisolated static func plan(index: any SourceIndex, listed: [IndexedSubtitleStream],
+                                 streams: Set<Int32>) -> (streams: [IndexedStream], refused: [String]) {
+        let tracks = index.trackNumbers(for: listed)
+        var plan: [IndexedStream] = []
+        var refused: [String] = []
+        for streamIndex in streams.sorted() {
+            guard let entry = listed.first(where: { $0.streamIndex == streamIndex }) else {
+                refused.append("\(streamIndex): not listed")
+                continue
+            }
+            guard let track = tracks[streamIndex] else { refused.append("\(streamIndex): no track"); continue }
+            guard index.packetCodecs.contains(entry.codecName) else {
+                refused.append("\(streamIndex): \(entry.codecName)")
+                continue
+            }
+            guard index.isComplete(track: track, frameCount: entry.frames) else {
+                refused.append("\(streamIndex): incomplete")
+                continue
+            }
+            plan.append(IndexedStream(streamIndex: streamIndex, track: track, blocks: index.blocks(track: track)))
+        }
+        return (plan, refused)
     }
 
     // MARK: - Indexed renditions, whole
@@ -289,12 +420,19 @@ final class SubtitleSource {
                   let listed = resolved.listed.first(where: { $0.streamIndex == stream.streamIndex }),
                   let decoder = await MainActor.run(body: { host.makeDecoder(stream.streamIndex).map(DecoderHandoff.init) })?.decoder,
                   !EmbeddedSubtitleDecoder.isBitmapCodec(decoder.codecID) else { continue }
+            guard let readers = resolved.frames else { return }
             let began = Date()
             let stop = StopFlag()
             let frames = await withTaskCancellationHandler {
-                readFrames(stream.blocks, track: stream.track, index: index, resolved: resolved, stop: stop)
+                readFrames(stream.blocks, track: stream.track, index: index, readers: readers, stop: stop)
             } onCancel: { stop.raise() }
             guard !Task.isCancelled else { return }
+            // The frames are the stream's pull for the whole film: the overlay reads them from the packet
+            // store and never reads a text frame a second time.
+            let firstMissing = storeFrames(frames, of: stream.blocks, stream: stream, index: index,
+                                           into: host.packetStore)
+            notePulled(stream, from: -.infinity, through: .infinity, blocks: stream.blocks, firstMissing: firstMissing,
+                       index: index, focus: 0, into: host.packetStore)
             var cues: [SubtitleCue] = []
             var missing = 0
             for i in stream.blocks.indices {
@@ -319,6 +457,148 @@ final class SubtitleSource {
                            + "\(stream.blocks.count) frames, \(cues.count) cues in "
                            + "\(Int(Date().timeIntervalSince(began) * 1000)) ms", category: .engine)
         }
+    }
+
+    // MARK: - Pulls (layer 3 step 3)
+
+    /// How far past what was asked a pull reads, so the window moving on with the playhead costs a read
+    /// about every half minute rather than one per drain tick.
+    nonisolated static let pullAheadSeconds: Double = 30
+
+    /// Times a block may fail to read in a row before a pull passes over it (a block the index misplaced);
+    /// until then each drain tick asks again.
+    nonisolated static let pullBlockAttempts = 3
+
+    /// Every frame of the indexed `stream` timed `from` through `through` goes into the packet store, read
+    /// where the index places it; returns at once, and `Host.pulled` says when the read is stored. What is
+    /// already pulled is not read again, nor what the pull in flight is reading; a pull asked for where that
+    /// one will not reach (a landing elsewhere) ends its unread remainder. `focus` is where the reader stands,
+    /// which the store keeps nearest when it has to evict.
+    func pull(_ stream: Int32, from: Double, through: Double, focus: Double) {
+        guard !closed, through >= from, let resolved = settled, let index = resolved.index,
+              let readers = resolved.frames,
+              let indexed = resolved.indexedStreams.first(where: { $0.streamIndex == stream }) else { return }
+        let store = host.packetStore
+        let reach = store.pulledReach(streamIndex: stream, from: from)
+        if let reach, reach >= through { return }
+        let start = reach ?? from
+        if let inFlight = pullInFlight[stream] {
+            if inFlight.from <= start, start <= inFlight.through { return }
+            inFlight.stop.raise()
+        }
+        let end = through + Self.pullAheadSeconds
+        let blocks = indexed.blocks
+        let seconds = { (block: SourceIndexBlock) in index.seconds(ticks: block.ticks, track: indexed.track) }
+        let lo = Self.firstBlock(blocks, after: start, inclusive: reach == nil, seconds: seconds)
+        let hi = Self.firstBlock(blocks, after: end, inclusive: false, seconds: seconds)
+        let toRead = lo < hi ? Array(blocks[lo..<hi]) : []
+        let stop = StopFlag()
+        pullInFlight[stream] = (start, end, stop)
+        let began = Date()
+        BlockingWork.detached(priority: .userInitiated) { [weak self] in
+            let frames = Self.readFrames(toRead, track: indexed.track, index: index, readers: readers, stop: stop)
+            let firstMissing = Self.storeFrames(frames, of: toRead, stream: indexed, index: index, into: store)
+            Self.notePulled(indexed, from: start, through: end, blocks: toRead, firstMissing: firstMissing,
+                            index: index, focus: focus, into: store)
+            let milliseconds = Int(Date().timeIntervalSince(began) * 1000)
+            await MainActor.run {
+                self?.pullLanded(indexed, stop: stop, from: start, through: end, read: frames.count,
+                                 failedBlock: firstMissing.map { lo + $0 }, milliseconds: milliseconds)
+            }
+        }
+    }
+
+    /// The time of the indexed `stream`'s first frame after `seconds`: where a bitmap set ends, since the next
+    /// display set closes it. Nil past the last frame, and for a stream the index does not read.
+    func nextFrameSeconds(_ stream: Int32, after seconds: Double) -> Double? {
+        guard let resolved = settled, let index = resolved.index,
+              let indexed = resolved.indexedStreams.first(where: { $0.streamIndex == stream }) else { return nil }
+        let blocks = indexed.blocks
+        let next = Self.firstBlock(blocks, after: seconds, inclusive: false) {
+            index.seconds(ticks: $0.ticks, track: indexed.track)
+        }
+        return next < blocks.count ? index.seconds(ticks: blocks[next].ticks, track: indexed.track) : nil
+    }
+
+    private func pullLanded(_ stream: IndexedStream, stop: StopFlag, from: Double, through: Double, read: Int,
+                            failedBlock: Int?, milliseconds: Int) {
+        if pullInFlight[stream.streamIndex]?.stop === stop { pullInFlight[stream.streamIndex] = nil }
+        guard !closed else { return }
+        if let failedBlock, !stop.isRaised {
+            let attempts = pullFailures[stream.streamIndex]?.block == failedBlock
+                ? (pullFailures[stream.streamIndex]?.attempts ?? 0) + 1 : 1
+            pullFailures[stream.streamIndex] = (failedBlock, attempts)
+            if attempts >= Self.pullBlockAttempts, let index = settled?.index {
+                // Passed over: the stretch through it is known, less one frame nobody can read.
+                let at = index.seconds(ticks: stream.blocks[failedBlock].ticks, track: stream.track)
+                host.packetStore.notePulled(streamIndex: stream.streamIndex, from: from, through: at,
+                                            focus: at)
+                pullFailures[stream.streamIndex] = nil
+                EngineLog.emit("[SubtitleSource] stream \(stream.streamIndex): frame at "
+                               + "\(String(format: "%.2f", at))s unreadable \(attempts) times; passed over",
+                               category: .engine)
+            }
+        } else if failedBlock == nil {
+            pullFailures[stream.streamIndex] = nil
+        }
+        if read > 0 {
+            EngineLog.emit("[SubtitleSource] pulled stream \(stream.streamIndex) "
+                           + "\(String(format: "%.2f", from))-\(String(format: "%.2f", through))s: "
+                           + "\(read) frames in \(milliseconds) ms"
+                           + (failedBlock == nil ? "" : ", stopped at an unreadable frame")
+                           + (stop.isRaised ? ", cut short by a newer pull" : ""),
+                           category: .engine)
+        }
+        host.pulled(stream.streamIndex)
+    }
+
+    /// The first block timed after `seconds` (at or after it when `inclusive`), by binary search: blocks are in
+    /// time order.
+    nonisolated static func firstBlock(_ blocks: [SourceIndexBlock], after seconds: Double, inclusive: Bool,
+                                       seconds time: (SourceIndexBlock) -> Double) -> Int {
+        var low = 0, high = blocks.count
+        while low < high {
+            let mid = (low + high) / 2
+            let t = time(blocks[mid])
+            if inclusive ? t < seconds : t <= seconds { low = mid + 1 } else { high = mid }
+        }
+        return low
+    }
+
+    /// Every frame read goes into the packet store as libavformat would hand it over. Returns the position of
+    /// the first block that was not read, nil when all were.
+    @discardableResult
+    nonisolated static func storeFrames(_ frames: [Int: SourceIndexFrame], of blocks: [SourceIndexBlock],
+                                        stream: IndexedStream, index: any SourceIndex,
+                                        into store: SubtitlePacketStore) -> Int? {
+        var firstMissing: Int?
+        for position in blocks.indices {
+            guard let frame = frames[position] else {
+                if firstMissing == nil { firstMissing = position }
+                continue
+            }
+            // A frame libavformat drops (an empty payload) the walk would never have seen.
+            guard !frame.payload.isEmpty else { continue }
+            store.append(streamIndex: stream.streamIndex,
+                         ptsSeconds: index.seconds(ticks: frame.ticks, track: stream.track),
+                         durationSeconds: frame.durationTicks.map { index.seconds(ticks: $0, track: stream.track) } ?? 0,
+                         flags: AV_PKT_FLAG_KEY, payload: Data(frame.payload), webvttSettings: frame.webVTTSettings)
+        }
+        return firstMissing
+    }
+
+    /// Records a read of `blocks` from `from` through `through` as pulled: all of it when every block read,
+    /// otherwise up to the first block that did not.
+    nonisolated static func notePulled(_ stream: IndexedStream, from: Double, through: Double,
+                                       blocks: [SourceIndexBlock], firstMissing: Int?, index: any SourceIndex,
+                                       focus: Double, into store: SubtitlePacketStore) {
+        guard let firstMissing else {
+            store.notePulled(streamIndex: stream.streamIndex, from: from, through: through, focus: focus)
+            return
+        }
+        let stopAt = index.seconds(ticks: blocks[firstMissing].ticks, track: stream.track).nextDown
+        guard stopAt >= from else { return }
+        store.notePulled(streamIndex: stream.streamIndex, from: from, through: stopAt, focus: focus)
     }
 
     // MARK: - Forced lines of an indexed bitmap stream
@@ -349,14 +629,15 @@ final class SubtitleSource {
     }
 
     nonisolated private static func forcedLines(
-        _ stream: SubtitleForwardPrefetcher.IndexSource.Stream, index: any SourceIndex, timeBase: AVRational,
+        _ stream: IndexedStream, index: any SourceIndex, timeBase: AVRational,
         resolved: Resolution, host: Host
     ) async -> ForcedLines? {
         let began = Date()
         let blocks = stream.blocks
         let stop = StopFlag()
+        guard let readers = resolved.frames else { return nil }
         let prefixes = await withTaskCancellationHandler {
-            readFrames(blocks, track: stream.track, index: index, resolved: resolved, prefix: 512, stop: stop)
+            readFrames(blocks, track: stream.track, index: index, readers: readers, prefix: 512, stop: stop)
         } onCancel: { stop.raise() }
         guard !Task.isCancelled else { return nil }
         let headers: [PGSCompositionHeader?] = blocks.indices.map { i in
@@ -382,7 +663,7 @@ final class SubtitleSource {
             else { return nil }
             let runBlocks = run.map { blocks[$0] }
             let frames = await withTaskCancellationHandler {
-                readFrames(runBlocks, track: stream.track, index: index, resolved: resolved, stop: stop)
+                readFrames(runBlocks, track: stream.track, index: index, readers: readers, stop: stop)
             } onCancel: { stop.raise() }
             for (offset, i) in run.enumerated() {
                 guard let frame = frames[offset],
@@ -412,10 +693,10 @@ final class SubtitleSource {
     /// `blocks` read on parallel lanes, by their position in the array. With `prefix`, at most that many
     /// payload bytes of each (enough for a PGS composition header).
     nonisolated static func readFrames(_ blocks: [SourceIndexBlock], track: UInt64, index: any SourceIndex,
-                                       resolved: Resolution, prefix: Int? = nil,
+                                       readers: FrameReaders, prefix: Int? = nil,
                                        stop: StopFlag) -> [Int: SourceIndexFrame] {
         guard !blocks.isEmpty else { return [:] }
-        let sources = (0..<min(readLanes, blocks.count)).compactMap { _ in resolved.laneSource() }
+        let sources = readers.lanes(min(readLanes, blocks.count), label: "subpull")
         defer { sources.forEach { $0.close() } }
         guard !sources.isEmpty else { return [:] }
         final class Frames: @unchecked Sendable {
@@ -541,7 +822,7 @@ final class SubtitleSource {
             }
         }
         let engineDuration = await MainActor.run { host.duration() }
-        if resolved.needsWalk {
+        do {
             // #93, #240: a walk opened during a producer restart, or the seek it serves, competes with it
             // for the link, and its open costs the container header, the cue prewarm and the positioning
             // seek. Bounded: a source that never leaves the seek state ends up with a walk that opened
@@ -622,23 +903,7 @@ final class SubtitleSource {
                     cueRoutes: routes, cuesArrived: routes.isEmpty ? nil : announce)
             }
         }
-        // The index's frames through a reader of the loop's own, so a cancel can end a read in flight.
-        var indexReader: IOReader?
-        var indexSource: SubtitleForwardPrefetcher.IndexSource?
-        if let index = resolved.index, !resolved.indexedStreams.isEmpty,
-           let reader = resolved.root?.makeIndependentReader() {
-            indexReader = reader
-            indexSource = .init(index: index, bytes: IOReaderByteSource(reader, closesReader: false),
-                                streams: resolved.indexedStreams, assemblyIndices: resolved.assembly, from: startAt)
-        }
-        defer { indexReader?.close() }
-        let source: SubtitleForwardPrefetcher.Source
-        switch (indexSource, walk) {
-        case let (index?, walk?): source = SubtitleForwardPrefetcher.CompositeSource(index: index, walk: walk, from: startAt)
-        case let (index?, nil): source = index
-        case let (nil, walk?): source = walk
-        case (nil, nil): return .init(exit: .openFailed, harvested: 0)
-        }
+        guard let walk else { return .init(exit: .openFailed, harvested: 0) }
         // #416: this session reads forwards from here, and nothing below it is this reader's to claim.
         store.noteHarvestAnchor(.prefetch, at: startAt)
         // #240: the running loop's own anchor box, so a jump moves the cursor instead of rebuilding the
@@ -659,20 +924,14 @@ final class SubtitleSource {
             return host.fence()
         }
         guard let fence = adopted else { return .init(exit: .cancelled, harvested: 0) }
-        EngineLog.emit("[SubtitleSource] reading from \(String(format: "%.2f", startAt))s: indexed "
-                       + "\(resolved.indexedStreams.map(\.streamIndex)) walked \(walked.sorted()) pacing=\(pacing)",
-                       category: .engine)
-        let outcome = await withTaskCancellationHandler {
-            await SubtitleForwardPrefetcher.run(
-                source: source, store: store, lead: { leads.furthest(playhead: $0) },
-                parkPollNanoseconds: AetherEngine.subtitleForwardPrefetchParkPollNanoseconds,
-                link: link, reanchor: reanchor, fence: fence,
-                playhead: { await MainActor.run(body: { host.playhead() }) })
-        } onCancel: {
-            // A block read in flight is a ranged GET; teardown must not wait out its timeout. The walk's
-            // demuxer is ended by `stopLoop` (`markClosed`).
-            indexReader?.cancel()
-        }
+        EngineLog.emit("[SubtitleSource] walking from \(String(format: "%.2f", startAt))s: "
+                       + "\(walked.sorted()) pacing=\(pacing)", category: .engine)
+        // The walk's demuxer is ended by `stopLoop` (`markClosed`), which ends a read in flight.
+        let outcome = await SubtitleForwardPrefetcher.run(
+            source: walk, store: store, lead: { leads.furthest(playhead: $0, where: { !indexedStreams.contains($0) }) },
+            parkPollNanoseconds: AetherEngine.subtitleForwardPrefetchParkPollNanoseconds,
+            link: link, reanchor: reanchor, fence: fence,
+            playhead: { await MainActor.run(body: { host.playhead() }) })
         EngineLog.emit("[SubtitleSource] session exited (reason=\(outcome.exit) cancelled=\(Task.isCancelled)) "
                        + "harvested=\(outcome.harvested)", category: .engine)
         // #250: EOF is the one exit that strengthens the claim: everything ahead of the playhead is read.
@@ -680,14 +939,14 @@ final class SubtitleSource {
         return outcome
     }
 
-    /// The consumers' leads, read by the loop at every park decision.
+    /// The consumers' leads and the streams each reads, read by the walk at every park decision.
     final class Leads: @unchecked Sendable {
         private let lock = NSLock()
-        private var leads: [Consumer: @Sendable (Double) -> Double] = [:]
+        private var leads: [Consumer: (lead: @Sendable (Double) -> Double, streams: Set<Int32>)] = [:]
 
-        func set(_ consumer: Consumer, _ lead: (@Sendable (Double) -> Double)?) {
+        func set(_ consumer: Consumer, _ lead: (@Sendable (Double) -> Double)?, streams: Set<Int32>) {
             lock.lock(); defer { lock.unlock() }
-            leads[consumer] = lead
+            leads[consumer] = lead.map { ($0, streams) }
         }
 
         func clear() {
@@ -695,22 +954,26 @@ final class SubtitleSource {
             leads.removeAll()
         }
 
-        var isEmpty: Bool {
-            lock.lock(); defer { lock.unlock() }
-            return leads.isEmpty
-        }
-
         var consumers: Set<Consumer> {
             lock.lock(); defer { lock.unlock() }
             return Set(leads.keys)
         }
 
-        /// The furthest any consumer asks for; 0 with none, which parks the loop at the playhead.
-        func furthest(playhead: Double) -> Double {
+        /// Whether a consumer reads a stream `matches` picks.
+        func demandsAny(where matches: (Int32) -> Bool) -> Bool {
             lock.lock()
             let all = Array(leads.values)
             lock.unlock()
-            return all.map { $0(playhead) }.max() ?? 0
+            return all.contains { $0.streams.contains(where: matches) }
+        }
+
+        /// The furthest any consumer of a stream `matches` picks asks for; 0 with none, which parks the walk
+        /// at the playhead.
+        func furthest(playhead: Double, where matches: (Int32) -> Bool) -> Double {
+            lock.lock()
+            let all = Array(leads.values)
+            lock.unlock()
+            return all.filter { $0.streams.contains(where: matches) }.map { $0.lead(playhead) }.max() ?? 0
         }
     }
 

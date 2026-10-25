@@ -11,10 +11,11 @@ import Testing
 /// the reading is the session's subtitle source and the overlay is one of its consumers.
 struct Issue496PrefetchCancelReasonTests {
 
-    /// An engine whose subtitle source is reading for the overlay. The source's walk is held before its
-    /// open (a producer restart in flight), so nothing is read and nothing races the assertions.
+    /// An engine whose subtitle source is reading for the overlay, once its routes are settled. The source's
+    /// walk is held before its open (a producer restart in flight), so nothing is read and nothing races the
+    /// assertions.
     @MainActor
-    private func engineWithLivePrefetcher() throws -> AetherEngine {
+    private func engineWithLivePrefetcher() async throws -> AetherEngine {
         let engine = try AetherEngine()
         engine.loadedURL = URL(string: "https://s/movie.mov")!
         engine.softwareSubtitlePacketStore = SubtitlePacketStore()
@@ -22,6 +23,11 @@ struct Issue496PrefetchCancelReasonTests {
         engine.startSubtitleSource()
         engine.subtitleDrainTargets[.primary] = 2
         engine.demandOverlaySubtitles()
+        let deadline = Date().addingTimeInterval(10)
+        while engine.subtitleSource?.isReading != true, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        try #require(engine.subtitleSource?.isReading == true)
         return engine
     }
 
@@ -34,7 +40,7 @@ struct Issue496PrefetchCancelReasonTests {
     @MainActor
     @Test("a sidecar taking over the primary names itself, not the mechanism it shares with teardown")
     func sidecarSelectionNamesItself() async throws {
-        let engine = try engineWithLivePrefetcher()
+        let engine = try await engineWithLivePrefetcher()
         defer { engine.subtitleSource?.close() }
         #expect(engine.subtitleSource?.isReading == true)
         engine.clearSubtitleDrainTarget(channel: .primary, reason: .sidecarSelected)
@@ -46,7 +52,7 @@ struct Issue496PrefetchCancelReasonTests {
     @MainActor
     @Test("session teardown is distinguishable from a track switch, which is the whole ambiguity")
     func sessionStopIsADifferentReason() async throws {
-        let engine = try engineWithLivePrefetcher()
+        let engine = try await engineWithLivePrefetcher()
         defer { engine.subtitleSource?.close() }
         engine.stopSubtitleDrainer(reason: .sessionStopped)
         try await settle()
@@ -55,8 +61,8 @@ struct Issue496PrefetchCancelReasonTests {
 
     @MainActor
     @Test("closing the session's source while it reads is a session stop")
-    func closeIsASessionStop() throws {
-        let engine = try engineWithLivePrefetcher()
+    func closeIsASessionStop() async throws {
+        let engine = try await engineWithLivePrefetcher()
         engine.subtitleSource?.close()
         #expect(engine.lastSubtitleDrainStopReason == .sessionStopped)
     }
@@ -64,7 +70,7 @@ struct Issue496PrefetchCancelReasonTests {
     @MainActor
     @Test("clearing the secondary while the primary still drains cancels nothing and claims nothing")
     func secondaryClearLeavesTheRunningPrefetcherAlone() async throws {
-        let engine = try engineWithLivePrefetcher()
+        let engine = try await engineWithLivePrefetcher()
         defer { engine.subtitleSource?.close() }
         engine.subtitleDrainTargets[.secondary] = 3
         engine.clearSubtitleDrainTarget(channel: .secondary, reason: .secondarySidecarSelected)
@@ -76,9 +82,9 @@ struct Issue496PrefetchCancelReasonTests {
     @MainActor
     @Test("another consumer still asking keeps the reading, and the overlay's stop claims nothing")
     func anotherConsumerKeepsTheReading() async throws {
-        let engine = try engineWithLivePrefetcher()
+        let engine = try await engineWithLivePrefetcher()
         defer { engine.subtitleSource?.close() }
-        engine.subtitleSource?.demand(.rendition, lead: { _ in 300 })
+        engine.subtitleSource?.demand(.rendition, streams: [2], lead: { _ in 300 })
         engine.clearSubtitleDrainTarget(channel: .primary, reason: .sidecarSelected)
         try await settle()
         #expect(engine.lastSubtitleDrainStopReason == nil)

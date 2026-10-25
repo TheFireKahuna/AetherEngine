@@ -2,13 +2,11 @@ import Foundation
 import AetherLibavcodec
 import AetherLibavutil
 
-/// The read loop of the session's `SubtitleSource`: every subtitle packet from the anchor forward into
-/// the session `SubtitlePacketStore`, up to the furthest lead any consumer asks for, independently of the
-/// producer's forward park (#102, #151). Packets come from the container's index where it lists a stream
-/// in full (`IndexSource`) and from one walk of the stream otherwise (`DemuxerSource`); a session with
-/// both reads them through one loop (`CompositeSource`), so there is one park, one anchor and one
-/// coverage frontier whatever mix of streams it has. The walk also decodes each text stream into its
-/// native cue store. A packet the pump already harvested collapses onto its entry in the store on a
+/// The walk of the session's `SubtitleSource`: every packet of its walked subtitle streams from the anchor
+/// forward into the session `SubtitlePacketStore`, up to the furthest lead a consumer of those streams asks
+/// for, independently of the producer's forward park (#102, #151), through one side demuxer
+/// (`DemuxerSource`). A stream the container's index lists in full is not walked: its consumers pull it
+/// (`SubtitleSource.pull`). The walk also decodes each text stream into its native cue store. A packet the pump already harvested collapses onto its entry in the store on a
 /// byte-identical payload (#235: not on the PTS, which distinct cues share); split-PES PGS sets assemble
 /// under the `.prefetch` writer key so the pump's in-flight set is never corrupted.
 ///
@@ -234,9 +232,7 @@ enum SubtitleForwardPrefetcher {
     /// Read/harvest until EOF, error, cancellation, or a nil playhead (engine gone). Returns why it
     /// stopped and how many routed subtitle packets it harvested (#231: a read error is not an EOF
     /// and the caller has to be able to tell them apart). The source must be positioned by the
-    /// caller. One loop whatever the packets come from (`Source`): the stream walk and the
-    /// container's index differ in how a packet is read and how a jump moves the reader, and in
-    /// nothing this loop decides.
+    /// caller.
     /// Harvest-then-park: the packet whose PTS crosses `playhead + lead(playhead)` is stored before
     /// the loop parks, so the store may hold one packet past the lead edge (harmless; the drainer
     /// window decides what decodes). The lead is asked at every park decision, so a consumer that
@@ -244,7 +240,7 @@ enum SubtitleForwardPrefetcher {
     /// start and refreshed only inside the park loop: no MainActor hop per packet during a backfill
     /// burst.
     static func run(
-        source: Source,
+        source: DemuxerSource,
         store: SubtitlePacketStore,
         lead: @escaping @Sendable (_ playhead: Double) -> Double,
         parkPollNanoseconds: UInt64,
@@ -276,11 +272,11 @@ enum SubtitleForwardPrefetcher {
         readLoop: while !Task.isCancelled {
             // #240: leave the link to the video path while it needs it. Asked before the read
             // because the read is what pulls bytes, and on a Matroska walk it pulls the video and
-            // audio bytes too; a read from the index costs a few hundred bytes and is never held. The
+            // audio bytes too. The
             // lead is measured from the last read position, which is what the reader has actually
             // banked; a session that has read nothing yet counts as lead 0 and is let through by the
             // floor rule, so positioning is never blocked behind a busy pump forever.
-            if let link, source.readsTheLink, valveGrantedUntil.map({ DispatchTime.now() > $0 }) ?? true {
+            if let link, valveGrantedUntil.map({ DispatchTime.now() > $0 }) ?? true {
                 var yielded: Double = 0
                 while !Task.isCancelled,
                       link.shouldYield(
@@ -416,17 +412,6 @@ extension SubtitleForwardPrefetcher {
         case endOfFile
     }
 
-    /// Where `run` gets its packets: the stream itself, the container's own index, or both.
-    protocol Source: AnyObject {
-        /// One read. Throws for a transport failure (#231), which the caller restarts.
-        func step(into store: SubtitlePacketStore) throws -> Step
-        /// Move to `seconds` for an in-place re-anchor (#240); the answer is for the log line.
-        func reposition(to seconds: Double, reanchor: SideReaderReanchor) -> String
-        /// Whether the next read pulls the stream's interleave over the link, so it yields to the video
-        /// path (#240).
-        var readsTheLink: Bool { get }
-    }
-
     /// A text stream the walk decodes into its native rendition's cue store as it reads.
     struct CueRoute {
         let decoder: EmbeddedSubtitleDecoder
@@ -435,7 +420,7 @@ extension SubtitleForwardPrefetcher {
 
     /// The stream walk: every packet the demuxer delivers, the targets harvested, the pacing stream
     /// placed (#230), and each text stream with a rendition decoded into its cue store.
-    final class DemuxerSource: Source {
+    final class DemuxerSource {
         private let demuxer: Demuxer
         private let streamIndices: Set<Int32>
         private let assemblyIndices: Set<Int32>
@@ -456,8 +441,6 @@ extension SubtitleForwardPrefetcher {
             self.cueRoutes = cueRoutes
             self.cuesArrived = cuesArrived
         }
-
-        var readsTheLink: Bool { true }
 
         func step(into store: SubtitlePacketStore) throws -> Step {
             guard let pkt = try demuxer.readPacket() else { return .endOfFile }
@@ -523,188 +506,6 @@ extension SubtitleForwardPrefetcher {
                 demuxer: demuxer, to: seconds, anchorStreamIndex: reanchor.anchorStreamIndex,
                 fallbackDuration: reanchor.fallbackDuration, timeout: reanchor.seekTimeout)
             return "\(landed)"
-        }
-    }
-
-    /// The container's index (`SourceIndex`): every subtitle frame of the streams it lists in full, read
-    /// where the index says it is, as the packet libavformat would hand over, in one time order across the
-    /// streams, and nothing else of the file. The walk reads the interleave to find these packets: on
-    /// Matroska the video too (libavformat reads every block off the wire before honouring a discard), on
-    /// an MP4 every video keyframe of its pacing stream, so a lead cost that much film; here it costs its
-    /// cues. No pacing stream is needed: frames come in time order, so every step is a read position.
-    final class IndexSource: Source {
-        struct Stream: Sendable {
-            let streamIndex: Int32
-            let track: UInt64
-            let blocks: [SourceIndexBlock]
-        }
-
-        /// Consecutive unreadable blocks that end the session as a read failure (a dropped
-        /// connection); a single block the index misplaced is skipped.
-        static let readFailureLimit = 8
-
-        private let index: any SourceIndex
-        private let bytes: RandomAccessByteSource
-        private let streams: [Stream]
-        private let assemblyIndices: Set<Int32>
-        private var cursor: [Int]
-        private var failures = 0
-
-        init(index: any SourceIndex, bytes: RandomAccessByteSource, streams: [Stream],
-             assemblyIndices: Set<Int32>, from seconds: Double) {
-            self.index = index
-            self.bytes = bytes
-            self.streams = streams
-            self.assemblyIndices = assemblyIndices
-            cursor = []
-            cursor = cursors(at: seconds)
-        }
-
-        /// Which of `streams` the index can stand in for: a stream it pairs with a track, of a codec
-        /// whose frame is its packet, listed in full. Each refused stream is named with the reason, and
-        /// is the walk's.
-        static func plan(index: any SourceIndex, listed: [IndexedSubtitleStream],
-                         streams: Set<Int32>) -> (streams: [Stream], refused: [String]) {
-            let tracks = index.trackNumbers(for: listed)
-            var plan: [Stream] = []
-            var refused: [String] = []
-            for streamIndex in streams.sorted() {
-                guard let entry = listed.first(where: { $0.streamIndex == streamIndex }) else {
-                    refused.append("\(streamIndex): not listed")
-                    continue
-                }
-                guard let track = tracks[streamIndex] else { refused.append("\(streamIndex): no track"); continue }
-                guard index.packetCodecs.contains(entry.codecName) else {
-                    refused.append("\(streamIndex): \(entry.codecName)")
-                    continue
-                }
-                guard index.isComplete(track: track, frameCount: entry.frames) else {
-                    refused.append("\(streamIndex): incomplete")
-                    continue
-                }
-                plan.append(Stream(streamIndex: streamIndex, track: track, blocks: index.blocks(track: track)))
-            }
-            return (plan, refused)
-        }
-
-        var readsTheLink: Bool { false }
-
-        /// When the next frame read is, on the source axis; nil once every stream is read.
-        var nextSeconds: Double? { next()?.seconds }
-
-        func step(into store: SubtitlePacketStore) throws -> Step {
-            guard let next = next() else { return .endOfFile }
-            let stream = streams[next.stream]
-            let block = stream.blocks[cursor[next.stream]]
-            cursor[next.stream] += 1
-            guard let frame = index.readFrame(block, track: stream.track, from: bytes) else {
-                failures += 1
-                if failures >= Self.readFailureLimit { throw IndexReadFailure(consecutive: failures) }
-                return .skipped
-            }
-            failures = 0
-            // A frame libavformat drops (an empty payload) the walk would never have seen.
-            guard !frame.payload.isEmpty else { return .skipped }
-            store.harvestChunk(
-                streamIndex: stream.streamIndex,
-                ptsSeconds: index.seconds(ticks: frame.ticks, track: stream.track),
-                durationSeconds: frame.durationTicks.map { index.seconds(ticks: $0, track: stream.track) } ?? 0,
-                flags: AV_PKT_FLAG_KEY,
-                payload: Data(frame.payload),
-                assembleSplitDisplaySets: assemblyIndices.contains(stream.streamIndex),
-                writer: .prefetch,
-                webvttSettings: frame.webVTTSettings)
-            return .harvested(at: next.seconds)
-        }
-
-        func reposition(to seconds: Double, reanchor: SideReaderReanchor) -> String {
-            cursor = cursors(at: seconds)
-            return "index"
-        }
-
-        /// The stream whose next frame comes first, and that frame's time.
-        private func next() -> (stream: Int, seconds: Double)? {
-            var next: (stream: Int, seconds: Double)?
-            for (position, stream) in streams.enumerated() where cursor[position] < stream.blocks.count {
-                let seconds = index.seconds(ticks: stream.blocks[cursor[position]].ticks, track: stream.track)
-                if next == nil || seconds < next!.seconds { next = (position, seconds) }
-            }
-            return next
-        }
-
-        /// Per stream, the first block at or after `seconds` less the walk's own backscan.
-        private func cursors(at seconds: Double) -> [Int] {
-            let from = seconds - anchorBackscanSeconds
-            return streams.map { stream in
-                var low = 0, high = stream.blocks.count
-                while low < high {
-                    let mid = (low + high) / 2
-                    if index.seconds(ticks: stream.blocks[mid].ticks, track: stream.track) < from { low = mid + 1 } else { high = mid }
-                }
-                return low
-            }
-        }
-
-        struct IndexReadFailure: Error, CustomStringConvertible {
-            let consecutive: Int
-            var description: String { "\(consecutive) index blocks unreadable in a row" }
-        }
-    }
-
-    /// The index and the walk read as one: each step reads from whichever is behind, so both advance
-    /// together, every position stepped is one both have read to, and the loop parks and re-anchors them
-    /// as one reader.
-    final class CompositeSource: Source {
-        private let index: IndexSource
-        private let walk: DemuxerSource
-        /// The walk's read position: the anchor less the backscan until its first placed packet.
-        private var walkPosition: Double
-        private var indexDone = false
-        private var walkDone = false
-
-        init(index: IndexSource, walk: DemuxerSource, from seconds: Double) {
-            self.index = index
-            self.walk = walk
-            walkPosition = seconds - anchorBackscanSeconds
-        }
-
-        var readsTheLink: Bool { nextIsWalk }
-
-        private var nextIsWalk: Bool {
-            if walkDone { return false }
-            if indexDone { return true }
-            return (index.nextSeconds ?? .infinity) > walkPosition
-        }
-
-        func step(into store: SubtitlePacketStore) throws -> Step {
-            if indexDone, walkDone { return .endOfFile }
-            if nextIsWalk {
-                let step = try walk.step(into: store)
-                switch step {
-                case .endOfFile:
-                    walkDone = true
-                    return indexDone ? .endOfFile : .skipped
-                case .harvested(let at?), .paced(let at):
-                    walkPosition = max(walkPosition, at)
-                default:
-                    break
-                }
-                return step
-            }
-            let step = try index.step(into: store)
-            if step == .endOfFile {
-                indexDone = true
-                return walkDone ? .endOfFile : .skipped
-            }
-            return step
-        }
-
-        func reposition(to seconds: Double, reanchor: SideReaderReanchor) -> String {
-            indexDone = false
-            walkDone = false
-            walkPosition = seconds - anchorBackscanSeconds
-            _ = index.reposition(to: seconds, reanchor: reanchor)
-            return "index, \(walk.reposition(to: seconds, reanchor: reanchor))"
         }
     }
 }

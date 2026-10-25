@@ -387,7 +387,7 @@ In order, each step replacing a reader rather than adding one:
        (Sodalite's subtitle style menu; nothing in the engine).
      - *Authoring 5.8* (a language's regular rendition also contains its forced lines) holds whenever
        the source's regular track carries them, which is the authored norm; nothing is synthesised.
-3. **The PGS overlay pulls. Next.** The drainer and the OCR worker ask the subtitle source for their
+3. **The PGS overlay pulls. Built, but for pacing the walk against the timebase.** The drainer and the OCR worker ask the subtitle source for their
    windows around the playhead; for an indexed stream the packet store becomes a cache of what was
    pulled, not a buffer filled ahead.
    - **Why the engine still draws.** tvOS 27.2 offers no native route for a bitmap subtitle:
@@ -407,17 +407,22 @@ In order, each step replacing a reader rather than adding one:
    - **No session-long reader of the source.** The cache keeps a streamed delivery whenever another
      reader of the source is open (`openReaders < 2`), so the index reader the subtitle source holds
      for the session (`Resolution.root`, `subindex`) turns the pump's whole film back into flash
-     writes. The pull opens its lanes for the pull and closes them after; and a positional reader
-     should not count as one that comes back for a stream at all (the cache's own rule, to settle with
-     its owner). Pulls of one
+     writes. Built: the index is parsed through that reader and it is closed; every read of frames
+     (the fill, the forced lines, a pull) opens its lanes for the read and closes them after
+     (`FrameReaders.url`). A host's own reader, outside the cache, is held as the one clone; one that can
+     neither read exact ranges nor hand out independent readers cannot be pulled, so its streams are all
+     walked. Left: a positional reader should not count as one that comes back for a stream at all (the
+     cache's own rule, to settle with its owner). Pulls of one
      stream are coalesced (a span already pulled or in flight is not asked again) and a newer landing
      cancels an older one's unread remainder.
    - **The drainer asks for its own window, nothing more.** Each tick it pulls `[playhead - backscan,
-     playhead + lead]` and decodes what is pulled; on a landing the landing span (backscan through a few
-     seconds past the playhead) is pulled first and the lead after it, so the line on screen at a seek
-     costs one read round, usually from disk. The overlay's 15 s margin past the window is gone: it
-     existed so the set at the window's edge had its clear stored, and an indexed set's end comes from
-     the index (below).
+     playhead + lead]` and decodes only as far as the pulls reach (`pulledReach`), so a stretch not yet
+     pulled waits for its pull rather than reading as silence. A pull reads 30 s past what it was asked
+     (`pullAheadSeconds`), so the window moving with the playhead costs a read about every half minute;
+     a window of PGS is a few dozen frames over twelve lanes, so a landing costs a few round trips. A
+     frame that fails to read three times running is passed over. The overlay's 15 s margin past the
+     window is the walk's only: it existed so the set at the window's edge had its clear stored, and an
+     indexed set's end comes from the index (below).
    - **Landings are signalled natively. Built.** On the HLS route every item the host attaches
      (`NativeAVPlayerHost.onDidAttachItem`, so the in-place swaps' items too, which used to miss step 2's
      legible output and selection observer) is observed for `AVPlayerItemTimeJumpedNotification`, and
@@ -436,16 +441,21 @@ In order, each step replacing a reader rather than adding one:
      the corrected position. The jump threshold (#271) and #93's
      60 s rendered-time rule are gone from it; the threshold stays the software route's, which has no
      AVPlayer. The landing pull (above) will start here.
-   - **Pacing reads the item's timebase.** The pull's lead is judged against `AVPlayerItem.timebase`
-     (readable off the main actor), not a main-actor hop for `sourceTime` at every park.
+   - **Pacing reads the item's timebase. Not built.** The walk's lead is judged against the playhead on
+     the source axis read off the main actor: on the software route the synchronizer's
+     (`softwarePresentationTimebase`), on the native route `AVPlayerItem.timebase` as a child timebase
+     offset by the seam shift and re-anchored when the axis moves, as `AudioOutput.sourceTimebase` does;
+     not a main-actor hop for `sourceTime` at every park.
    - **What the index makes exact.** A bitmap set's end is the next block's time in the index, known
      without reading it, so `firstPTS(after:)` and its derivation horizon (#362 round 2) are the walk's
      only; a pulled span has no holes, so the harvest-gap hold (#362) is the walk's only; a pulled span
      is read by construction, so the landing-ground check (#416) is the walk's only.
-   - **One writer per route.** Once the routes settle, the pump's packet sink
-     (`subtitlePacketStreamIndices`) and its decode tap (`subtitleTapRoutes`, Sodalite#32, which today
-     decodes every text stream although an indexed stream's rendition is complete at load) narrow to
-     the walked streams, on both hosts. `IndexSource`'s forward stepping and `CompositeSource` are
+   - **One writer per route.** Once the routes settle, the store passes over a harvest of an indexed
+     stream (`setPulledStreams`), whichever host's pump or tap it comes from, and the pump's decode tap
+     (`subtitleTapRoutes`, Sodalite#32, which decoded every text stream although an indexed stream's
+     rendition is complete at load) leaves the indexed streams (`excludeFromSubtitleTap`). Until the routes
+     settle every stream is drained as walked, from the pump's harvest. A consumer's demand names its
+     streams, and the walk runs only while one of them is walked. `IndexSource`'s forward stepping and `CompositeSource` are
      deleted; the loop is the walk alone and runs only while a walked stream is demanded. A walked
      stream keeps the walk and the pump, with #362 and #416 as they are; live, which has no source at
      all, keeps the pump alone.
