@@ -15,8 +15,7 @@ import os
 /// of the base layer, before any reshaping). The overlay is driven the way that output is documented to be
 /// used, by a display link: at each refresh it asks which frame belongs at the refresh after next
 /// (`itemTime(forHostTime:)`, the item's clock, which is the audio clock), pairs it by item time with its
-/// enhancement picture and parameters from the session's ``FelEnhancementTap``, composes it with its
-/// composed-form RPU, and enqueues it on ``layer`` stamped for that refresh on a host-clock timebase, the
+/// enhancement picture and parameters from the session's ``FelEnhancementTap``, composes it, and enqueues it on ``layer`` stamped for that refresh on a host-clock timebase, the
 /// clock the display link reports in. Every frame shows on the refresh chosen for it, and the picture
 /// follows the audio by construction: there is no second clock to correct.
 ///
@@ -291,7 +290,6 @@ public final class FelOverlayRenderer: @unchecked Sendable {
             frameIndex &+= 1
             let generation = self.generation
             let shownTime = frameTime
-            let rpu = DoviComposedRpuOverride.rpu(forComposed: frame.composedRpu)
             let composeStart = CACurrentMediaTime()
             // Stamped half a refresh before the refresh it was chosen for: that refresh, and no other, shows it.
             let presentation = CMTime(seconds: presentAt - duration / 2, preferredTimescale: 1_000_000_000)
@@ -305,7 +303,6 @@ public final class FelOverlayRenderer: @unchecked Sendable {
                     self.countersLock.withLock { self._counters.composeFailed += 1 }
                     return
                 }
-                DoviDisplayMetadata.attach(rpuNAL: rpu, to: composed)
                 if let surface = CVPixelBufferGetIOSurface(composed)?.takeUnretainedValue() {
                     let id = IOSurfaceGetID(surface)
                     self.surfaceTimes.withLock { $0[id] = shownTime.seconds }

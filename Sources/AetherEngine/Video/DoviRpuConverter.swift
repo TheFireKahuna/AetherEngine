@@ -187,8 +187,10 @@ public enum DoviRpuConverter {
         /// The composed form (no mapping) whatever the RPU's `el_type`, for a packet whose picture is replaced
         /// by a composed one before it is shown (the FEL overlay: the TV applies the RPU in AVPlayer's stream
         /// to the overlay's picture). A packet whose own RPU is missing or failed to convert carries
-        /// `fallback`, so every access unit still has the RPU for the picture shown over it.
-        case composed(fallback: [UInt8]?)
+        /// `fallback`, so every access unit still has the RPU for the picture shown over it. `override`, when
+        /// set, is the RPU every packet carries in place of its own (`DoviComposedRpuOverride`); the results
+        /// still describe the packet's own.
+        case composed(fallback: [UInt8]?, override: [UInt8]? = nil)
     }
 
     /// Splits a Profile 7 packet into its layers in one walk.
@@ -222,9 +224,9 @@ public enum DoviRpuConverter {
         var rewritten: [UnsafePointer<DoviData>] = []
         defer { for buffer in rewritten { dovi_data_free(buffer) } }
         let keepRpuBytes = extractEL || extractParams
-        let (composesPacket, composedFallback): (Bool, [UInt8]?) = switch packetRpu {
-        case .mode2: (false, nil)
-        case .composed(let fallback): (true, fallback)
+        let (composesPacket, composedFallback, composedOverride): (Bool, [UInt8]?, [UInt8]?) = switch packetRpu {
+        case .mode2: (false, nil, nil)
+        case .composed(let fallback, let override): (true, fallback, override)
         }
         var rawRpuBytes: [UInt8]?
         var convertedRpuBytes: [UInt8]?
@@ -305,7 +307,7 @@ public enum DoviRpuConverter {
                     degraded = true
                     return
                 }
-                if !useCustomBlockSource {
+                if !useCustomBlockSource, composedOverride == nil {
                     pieces.append(Piece(base: outData, count: out.pointee.len))
                 }
                 converted = true
@@ -366,11 +368,12 @@ public enum DoviRpuConverter {
 
         // Rebuild the base layer (not with a custom block source: the FEL decoder needs the original
         // packet untouched so VT can skip unspec62/63 NALs via the base-layer format description).
-        // A composed packet without an RPU of its own takes the fallback, last, where an access unit's RPU goes.
-        let fallback = composesPacket && !converted && !useCustomBlockSource ? composedFallback : nil
+        // A composed packet carries the override, or without an RPU of its own the fallback, last, where an access
+        // unit's RPU goes.
+        let carried = composesPacket && !useCustomBlockSource ? composedOverride ?? (converted ? nil : composedFallback) : nil
         // Degenerate: all NALs were RPU/EL. Leave the packet untouched rather than emit a video packet with no picture.
-        if (converted || hadEL || degraded || fallback != nil), !useCustomBlockSource, !pieces.isEmpty {
-            (fallback ?? []).withUnsafeBufferPointer { extra in
+        if (converted || hadEL || degraded || carried != nil), !useCustomBlockSource, !pieces.isEmpty {
+            (carried ?? []).withUnsafeBufferPointer { extra in
                 var all = pieces
                 if let base = extra.baseAddress, extra.count > 0 { all.append(Piece(base: base, count: extra.count)) }
                 let total = framedSize(all)
