@@ -382,6 +382,13 @@ final class SourceByteCache: @unchecked Sendable {
         }
     }
 
+    /// Whether a reader of `key` may send its next request now without `waitForWriteRoom` holding
+    /// it. Never blocks.
+    func hasWriteRoom(for key: SourceCacheKey) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return pendingWriteBytes <= pendingWriteBound
+    }
+
     /// The held bytes from `offset` on, up to `maxLength`, or nil when `offset` is not held or the
     /// cache knows the source under a different size than `expectedSize`. Stitched from what is
     /// pending (in memory) and what is on disk, so a run that crosses from one to the other is one

@@ -204,7 +204,7 @@ enum RangeFetch {
                     OriginRequestBudget.shared.release(ticket)
                     switch outcome {
                     case .body(let result):
-                        SourceByteLedger.shared.record(url, reader: label, offset: result.range.start,
+                        SourceByteLedger.shared.record(SourceByteLedger.Source(url), reader: label, offset: result.range.start,
                                                        count: result.body.count)
                         cache.noteVersion(result.version, for: cacheKey)
                         cache.store(result.body, at: result.range.start, version: result.version, for: cacheKey)

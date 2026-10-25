@@ -452,7 +452,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         counterLock.lock()
         _cumulativeBytesFetched &+= Int64(n)
         counterLock.unlock()
-        SourceByteLedger.shared.record(url, reader: label, offset: offset, count: n)
+        SourceByteLedger.shared.record(ledgerSource, reader: label, offset: offset, count: n)
         if !isLive { sourceCache.store(data, at: offset, version: version, for: cacheKey) }
         // #392: every network delivery this reader makes passes through here (pump, chunk, tail
         // prefetch, detour fetch, streaming), which is why the idle clock is stamped here and not
@@ -572,10 +572,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     // MARK: - Persistent Mode (single forward-streaming connection, playback path)
 
-    // Backpressure: END the connection above highWater and re-request at the frontier once
-    // the consumer drains below lowWater. Nothing is discarded and nothing is re-fetched:
-    // every delivered byte stays in the window, and the next range starts exactly where
-    // delivery stopped.
+    // Backpressure: a VOD range asks for no more than the window has room for, so it ends on
+    // its own at highWater and the read loop re-requests at the frontier once the consumer
+    // drains below lowWater. A range that completes leaves its connection reusable, where a
+    // cancelled HTTP/1.1 response takes its socket with it and the next range pays a fresh
+    // connect, TLS handshake and slow start. Past highWater the connection is ENDED, which only
+    // an open-ended request (live, an unsized source) or an origin answering wider than asked
+    // still reaches. Nothing is discarded and nothing is re-fetched: every delivered byte stays
+    // in the window, and the next range starts exactly where delivery stopped.
     //
     // This is the third design here, and the history is load-bearing. #174 replaced
     // delegate-blocking (no flow-control contract: TLS/H2 transports keep reading at line
@@ -595,7 +599,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // process keep working. Ending the connection instead means the reader either has an
     // ACTIVELY delivering flow or NO flow: there is no parked state for the substrate to
     // rot in, and a paused player holds no connection at all. The price is one extra range
-    // request per drain cycle (every ~100 s at 1 Mbps; connects measure ~2 ms on LAN). The
+    // request per drain cycle (every ~100 s at 1 Mbps), on a kept connection. The
     // window peak is now bounded by construction at highWater plus one delivery's in-flight
     // overshoot, which subsumes the former winHardCap escape hatch and the realloc-doubling
     // peak it had to be sized against.
@@ -614,16 +618,29 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // source that sustainedly outruns realtime (a misdeclared VOD). 64 MB matches
     // streamHighWater, the forward bound the engine already accepts for the other reader
     // that cannot bound by range request.
-    private static let winHighWaterDefault = 16 * 1024 * 1024
+    static let winHighWaterDefault = 16 * 1024 * 1024
     private static let liveWinHighWaterDefault = 64 * 1024 * 1024
     private static let winLowWater = 8 * 1024 * 1024
-    // #220: how much the persistent reader asks for at a time. Bounds a single request's
-    // exposure: `appendPersistentData` drops anything past the requested end and ends the
-    // transfer (audit DMX-1), so an origin that ignores Range or answers wider than asked
-    // cannot grow the window past it. It also keeps the request cadence modest on a healthy link:
-    // one request per range boundary while the consumer keeps up, one per
-    // highWater-to-lowWater drain cycle when the origin outruns it.
+    // #220: the most the persistent reader asks for at a time; a range asks for less when the
+    // window has less room (`rangeAskBytes`). Bounds a single request's exposure:
+    // `appendPersistentData` drops anything past the requested end and ends the transfer (audit
+    // DMX-1), so an origin that ignores Range or answers wider than asked cannot grow the window
+    // past it. It also keeps the request cadence modest on a healthy link: one request per range
+    // boundary while the consumer keeps up, one per highWater-to-lowWater drain cycle when the
+    // origin outruns it.
     static let persistentRangeBytes: Int64 = 32 * 1024 * 1024
+    /// The least a sized range asks for, so a window that is nearly full still gets a request worth
+    /// its round trip. The refill only fires at low water, where the room is far above this.
+    static let minimumRangeAskBytes: Int64 = 1 * 1024 * 1024
+
+    /// What a VOD range starting now asks for: what the window has room for under the high water,
+    /// within `minimumRangeAskBytes...persistentRangeBytes`. Asking for the room rather than the
+    /// ceiling is what lets the range end on its own at the high water. `ahead` is what the window
+    /// holds past the read position.
+    static func rangeAskBytes(highWater: Int, ahead: Int) -> Int64 {
+        let room = Int64(highWater) - Int64(max(0, ahead))
+        return min(persistentRangeBytes, max(minimumRangeAskBytes, room))
+    }
 
     /// #377: the smallest window room worth a read on a held connection, and therefore the length
     /// of a dormant stretch in the steady state (this over media rate). #310's dose is that
@@ -966,16 +983,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     /// #220: winCond-guarded snapshot of the sliding window for the periodic memprobe.
     /// `ahead` is the undrained forward extent, the quantity `appendPersistentData` gates the
-    /// backpressure end on. `parked` is true while the connection has been deliberately ended
-    /// at high water and the low-water refill has not fired yet (#310), so a long-lived
-    /// `parked` with `ahead` holding above lowWater reads as a stalled consumer, not a
-    /// transport fault.
+    /// backpressure end on. `parked` is true while no flow is installed or starting because the
+    /// last one ended on purpose (its range delivered in full, or a high-water end) and the
+    /// low-water refill has not fired yet (#310). A long-lived `parked` with `ahead` holding above
+    /// lowWater reads as a stalled consumer, not a transport fault.
     var windowDiagnostics: (windowBytes: Int, aheadBytes: Int, parked: Bool) {
         winCond.lock()
         defer { winCond.unlock() }
-        return (window.count,
-                window.count - max(0, Int(position - winStart)),
-                connEndedByBackpressure)
+        let parked = activeTransfer == nil && !connStartingLocked
+            && (connEndedByBackpressure || connEndedAtRangeEnd)
+        return (window.count, windowAheadLocked(), parked)
     }
     // #93 restart latency diagnostics (winCond-guarded): bytes dropped by the stale-generation
     // guard, plus per-generation time-to-first-data tracking.
@@ -1174,6 +1191,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// reader without one, and no second way of keeping bytes.
     private let sourceCache: SourceByteCache
     private let cacheKey: SourceCacheKey
+    /// This source in the duplicate-traffic ledger, worked out once.
+    private let ledgerSource: SourceByteLedger.Source
     private let sourceOpenPolicy: SourceOpenPolicy
     private let openDiagnosticID = String(UUID().uuidString.prefix(8))
     /// Only static controlled probes use this; playback retains its existing transport policy.
@@ -1185,6 +1204,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil, backoffScale: Double = 1, pinIdleSeconds: TimeInterval = AVIOReader.pinIdleRepinSecondsDefault, liveRefusalRetryBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget, sourceCache: SourceByteCache? = nil) {
         self.sourceCache = sourceCache ?? .scoped()
         self.cacheKey = SourceCacheKey(url: url, headers: extraHeaders)
+        self.ledgerSource = SourceByteLedger.Source(url)
         self.sourceOpenPolicy = sourceOpenPolicy
         self.probeControl = probeControl
         self.probeRequestSession = probeControl == nil ? nil : probeRequestSession
@@ -1210,14 +1230,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.streamHighWater = max(1, streamHighWater ?? Self.streamHighWaterDefault)
         self.detourFetchBudget = detourFetchBudget ?? Self.detourFetchBudgetSeconds
         self.heldConnectionEnabled = heldConnection
-        SourceByteLedger.shared.readerOpened(url)
+        SourceByteLedger.shared.readerOpened(ledgerSource)
         self.sourceCache.readerOpened(cacheKey)
     }
 
     /// A reader released without `close()` still closes its ledger books and its cache hold.
     deinit {
         if !isFullyClosed {
-            SourceByteLedger.shared.readerClosed(url, reader: label)
+            SourceByteLedger.shared.readerClosed(ledgerSource, reader: label)
             sourceCache.readerClosed(cacheKey)
         }
     }
@@ -1900,7 +1920,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         guard !isFullyClosed else { return }
         isFullyClosed = true
         defer {
-            SourceByteLedger.shared.readerClosed(url, reader: label)
+            SourceByteLedger.shared.readerClosed(ledgerSource, reader: label)
             sourceCache.readerClosed(cacheKey)
         }
         isClosed = true
@@ -2333,7 +2353,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // generation that delivered at least one byte keeps the fast path.
             let endedInError = connEnded && !connEndedAtRangeEnd && !connEndedByBackpressure
                 && !connFirstDataSeen
-            if activeTransfer == nil, !connEndedByBackpressure, !windowCanServe, !endedInError {
+            if activeTransfer == nil, !connStartingLocked, !connEndedByBackpressure, !windowCanServe,
+               !endedInError {
                 let target = position
                 winCond.unlock()
                 timedReconnect(seek: true, at: target)
@@ -2485,7 +2506,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 var refillRetryAfter: TimeInterval = 0
                 let undrained = window.count - max(0, Int(position - winStart))
                 let frontier = winStart + Int64(window.count)
-                if activeTransfer == nil, undrained <= Self.winLowWater,
+                if activeTransfer == nil, !connStartingLocked, undrained <= Self.winLowWater,
                    isLive || fileSize <= 0 || frontier < fileSize {
                     if connEndedAtRangeEnd || connEndedByBackpressure {
                         refillFrom = frontier
@@ -3228,7 +3249,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
               let held = sourceCache.read(cacheKey, at: offset, maxLength: maxLength,
                                                      expectedSize: expectedSize)
         else { return nil }
-        SourceByteLedger.shared.servedFromCache(url, reader: label, count: held.count)
+        SourceByteLedger.shared.servedFromCache(ledgerSource, reader: label, count: held.count)
         return held
     }
 
@@ -3248,13 +3269,30 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// request construction below). Bumps generation so late callbacks from the old
     /// connection are ignored.
     private func startPersistentConnection(at offset: Int64, boundedTo: Int64? = nil, openEnded: Bool = false) {
-        waitForCacheWriteRoom()
         winCond.lock()
         connGeneration &+= 1
         let generation = connGeneration
         connHeaderRevision = requestHeaderStore?.revision ?? 0
-        // #220: VOD asks for a fixed amount at a time, and anything an origin delivers past it is
-        // dropped at the append (audit DMX-1), so the window is bounded by the ask. Two
+        // #295: a request that begins inside the resident window, or exactly at its end, is a
+        // CONTINUATION rather than a reposition. Resetting `winStart` to it dropped every byte
+        // below it, which for the #220 frontier refill is up to `winLowWater` of already delivered,
+        // still undrained data: the very next read then sat below `winStart`, took the backward
+        // branch, and pulled those same bytes back over the network 4 MB at a time on the demux
+        // read thread. Keeping them costs nothing (the new range covers only what follows) and the
+        // window stays bounded by `trimWindowLocked` and the high-water end exactly as before.
+        // The truncating case is the narrow race where the old connection appended past the
+        // frontier the read loop computed before it unlocked; those bytes are re-delivered by the
+        // new range, which is correct if slightly wasteful, and never leaves a hole.
+        if offset >= winStart, offset <= winStart + Int64(window.count) {
+            let keep = Int(offset - winStart)
+            if keep < window.count { window.truncate(to: keep) }
+        } else {
+            winStart = offset
+            window.removeAll()
+        }
+        // #220: VOD asks for what the window has room for (`rangeAskBytes`), and anything an origin
+        // delivers past it is dropped at the append (audit DMX-1), so the window is bounded by the
+        // ask and a range ends on its own at the high water instead of being cancelled. Two
         // cases keep the open-ended form: live, where the material is produced in real time so
         // the origin cannot outrun media rate and the end is moving, and a source whose total
         // size is not resolved yet, where there is nothing to clamp the last range against. An
@@ -3275,8 +3313,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // needs the START past the end, which cannot happen here), and necessary because
             // waiting for a resolved size would leave the first connection, the one that reads
             // from byte zero, open-ended.
-            if fileSize > offset { return min(Self.persistentRangeBytes, fileSize - offset) }
-            return fileSize <= 0 ? Self.persistentRangeBytes : nil
+            let ask = Self.rangeAskBytes(highWater: winHighWater, ahead: windowAheadLocked())
+            if fileSize > offset { return min(ask, fileSize - offset) }
+            return fileSize <= 0 ? ask : nil
         }()
         // The source cache plans the range: bytes another reader already fetched are replayed from
         // disk as a range of their own, and a network range stops where such a span begins, so the
@@ -3304,23 +3343,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         expectedSize: planSize) {
                 resolvedBound = next - offset
             }
-        }
-        // #295: a request that begins inside the resident window, or exactly at its end, is a
-        // CONTINUATION rather than a reposition. Resetting `winStart` to it dropped every byte
-        // below it, which for the #220 frontier refill is up to `winLowWater` of already delivered,
-        // still undrained data: the very next read then sat below `winStart`, took the backward
-        // branch, and pulled those same bytes back over the network 4 MB at a time on the demux
-        // read thread. Keeping them costs nothing (the new range covers only what follows) and the
-        // window stays bounded by `trimWindowLocked` and the high-water end exactly as before.
-        // The truncating case is the narrow race where the old connection appended past the
-        // frontier the read loop computed before it unlocked; those bytes are re-delivered by the
-        // new range, which is correct if slightly wasteful, and never leaves a hole.
-        if offset >= winStart, offset <= winStart + Int64(window.count) {
-            let keep = Int(offset - winStart)
-            if keep < window.count { window.truncate(to: keep) }
-        } else {
-            winStart = offset
-            window.removeAll()
         }
         connRequestedOffset = offset
         let askAsJoin = isLive && liveOffsetsUnsatisfiable
@@ -3387,23 +3409,92 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         request.timeoutInterval = 0  // long-lived; stalls handled by the reader
         applyExtraHeaders(&request)
 
-        // #377: take the origin slot before the connection goes on the link. The pump is the one
-        // path that must never be refused a slot for long: it is the main line, and everything
-        // else holding a slot is short (a 4 MB detour block, a probe). A generous budget here
-        // means "wait for the short thing to finish", not "give up".
         let requestURLForBudget = request.url ?? url
-        let ticket = OriginRequestBudget.shared.acquire(
-            for: requestURLForBudget, label: "\(label)#\(openDiagnosticID) pump", timeout: Self.pumpSlotWaitSeconds,
-            shouldAbort: { [weak self] in self?.isClosed ?? true })
-        // Audit DMX-112: a pump torn down while parked for its slot leaves without a transfer.
-        if ticket == nil, isClosed { return }
+        let range = NetworkRange(request: request, offset: offset, generation: generation,
+                                 resolvedBound: resolvedBound, logGate: skippedConnStarts)
+        // The common case starts here and now: the source cache can take the bytes and the origin
+        // has a slot free. Otherwise the waits go to `connectQueue`, because this runs on the demux
+        // thread and a refill is issued with up to `winLowWater` still to read: blocking here for
+        // the disk or for a slot would stop the demuxer reading bytes it already has.
+        if isLive || sourceCache.hasWriteRoom(for: cacheKey),
+           let ticket = OriginRequestBudget.shared.tryAcquire(
+               for: requestURLForBudget, label: "\(label)#\(openDiagnosticID) pump") {
+            launch(range, ticket: ticket)
+            return
+        }
+        winCond.lock()
+        connStartingGeneration = generation
+        winCond.unlock()
+        connectQueue.async { [weak self] in
+            guard let self else { return }
+            self.waitForCacheWriteRoom()
+            // #377: the pump is the one path that must never be refused a slot for long: it is
+            // the main line, and everything else holding a slot is short (a 4 MB detour block, a
+            // probe). A generous budget here means "wait for the short thing to finish", not "give
+            // up". A start superseded while it waits (a seek, a close) leaves at once, so the
+            // start that replaced it is not queued behind it.
+            let ticket = OriginRequestBudget.shared.acquire(
+                for: requestURLForBudget, label: "\(self.label)#\(self.openDiagnosticID) pump",
+                timeout: Self.pumpSlotWaitSeconds,
+                shouldAbort: { [weak self] in self?.isSuperseded(generation) ?? true })
+            // Audit DMX-112: a pump torn down or superseded while parked for its slot leaves
+            // without a transfer.
+            if ticket == nil, self.isSuperseded(generation) {
+                self.endStart(generation)
+                return
+            }
+            self.launch(range, ticket: ticket)
+        }
+    }
 
+    /// A network range `startPersistentConnection` planned, carried to wherever it is launched.
+    private struct NetworkRange {
+        let request: URLRequest
+        let offset: Int64
+        let generation: Int
+        let resolvedBound: Int64?
+        let logGate: Int?
+    }
+
+    /// Where a range start that has to wait (for the source cache's disk or an origin slot) waits,
+    /// off the demux thread. Serial: one reader has one range starting at a time, and a superseded
+    /// start leaves its wait at once.
+    private lazy var connectQueue = DispatchQueue(
+        label: "com.aetherengine.avio.connect.\(label)", qos: .userInitiated)
+
+    /// The generation whose start is waiting on `connectQueue`, if any. While it is the current
+    /// one there is a flow on its way, which the read loop must not replace. winCond-guarded.
+    private var connStartingGeneration: Int?
+
+    /// Caller holds `winCond`.
+    private var connStartingLocked: Bool { connStartingGeneration == connGeneration }
+
+    private func isSuperseded(_ generation: Int) -> Bool {
+        if isClosed { return true }
+        winCond.lock()
+        defer { winCond.unlock() }
+        return generation != connGeneration
+    }
+
+    private func endStart(_ generation: Int) {
+        winCond.lock()
+        if connStartingGeneration == generation { connStartingGeneration = nil }
+        winCond.broadcast()
+        winCond.unlock()
+    }
+
+    /// Puts a planned range on the link with the slot it holds, unless its generation was
+    /// superseded meanwhile.
+    private func launch(_ range: NetworkRange, ticket: OriginRequestBudget.Ticket?) {
+        let request = range.request
+        let generation = range.generation
+        let requestURLForBudget = request.url ?? url
         let transfer: any PersistentTransfer
         if heldConnectionEnabled {
             transfer = HeldSourceConnection(
-                url: request.url ?? requestURLForBudget,
-                offset: offset,
-                extraHeaders: headers(for: request.url ?? requestURLForBudget),
+                url: requestURLForBudget,
+                offset: range.offset,
+                extraHeaders: headers(for: requestURLForBudget),
                 userAgent: nil,
                 label: label,
                 generation: generation,
@@ -3419,34 +3510,40 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 originURL: requestURLForBudget
             )
             let task = EngineHTTP.session.dataTask(with: request)
+            task.priority = URLSessionTask.highPriority
             task.delegate = delegate
             transfer = task
         }
 
         winCond.lock()
+        if connStartingGeneration == generation { connStartingGeneration = nil }
         // A close() that raced in bumped the generation; don't install a stale connection.
         guard generation == connGeneration, !isClosed else {
+            winCond.broadcast()
             winCond.unlock()
             transfer.cancelTransfer()
             transfer.releaseOriginTicket()   // never started, so no completion callback will free it
             return
         }
         activeTransfer = transfer
+        // The gap the watchdog judges starts with the request on the link, not with a wait for a
+        // slot or the disk before it.
+        lastDeliveryAt = DispatchTime.now()
         winCond.unlock()
 
         transfer.startTransfer()
         // #309: from here the generation is watched on wall-clock time, not on consumer cadence.
         armDeliveryGapWatchdog(generation: generation, after: connStallTimeout)
         armFirstByteWitness(generation: generation, originURL: requestURLForBudget)
-        // #240: not DEBUG-only any more, and it names its reader. This is the line a field report
-        // needs to answer "who is on the link": with bounded ranges every 32 MiB refill starts a
-        // generation, so an unlabelled sequence of them reads like several concurrent connections
-        // when it is one reader walking forward. On a fast link that walk is a range every few
-        // hundred milliseconds, so contiguous ranges are summarised (see ConnStartLogGate).
-        guard let skippedConnStarts else { return }
+        // #240: it names its reader. This is the line a field report needs to answer "who is on
+        // the link": with bounded ranges every refill starts a generation, so an unlabelled
+        // sequence of them reads like several concurrent connections when it is one reader walking
+        // forward. On a fast link that walk is a range every few hundred milliseconds, so
+        // contiguous ranges are summarised (see ConnStartLogGate).
+        guard let skippedConnStarts = range.logGate else { return }
         EngineLog.emit(
-            "[AVIOReader] \(label) conn start gen=\(generation) offset=\(offset)"
-            + (resolvedBound.map { " len=\($0 / 1024 / 1024)MB" } ?? " open-ended")
+            "[AVIOReader] \(label) conn start gen=\(generation) offset=\(range.offset)"
+            + (range.resolvedBound.map { " len=\($0 / 1024 / 1024)MB" } ?? " open-ended")
             + " reader=\(openDiagnosticID) slot_ms=\(Int(ticket?.waitedMs ?? 0))"
             + (heldConnectionEnabled ? " held" : "")
             + (skippedConnStarts > 0 ? " (+\(skippedConnStarts) contiguous ranges since the last line)" : "")
@@ -3619,12 +3716,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             category: .demux)
     }
 
-    /// Force-copies `data` into the sliding window and applies backpressure by ENDING the
-    /// connection once the window exceeds winHighWater (#310); readPersistent re-requests at
-    /// the frontier when the consumer drains below winLowWater. Never blocks: parking this
-    /// delegate callback has no flow-control contract (TLS/H2 transports keep reading at
-    /// line rate into unbounded internal buffers, the #174 EXC_RESOURCE). Force-copy
-    /// releases source dispatch_data per delivery (same leak control as the chunk path).
+    /// Appends `data` to the sliding window as delivered, without copying it, and applies
+    /// backpressure by ENDING the connection once the window exceeds winHighWater (#310);
+    /// readPersistent re-requests at the frontier when the consumer drains below winLowWater.
+    /// Never blocks: parking this delegate callback has no flow-control contract (TLS/H2
+    /// transports keep reading at line rate into unbounded internal buffers, the #174
+    /// EXC_RESOURCE). The ledger and the source cache are told after `winCond` is released, so the
+    /// demux thread's reads never wait on their locks.
     ///
     /// `fromCache` marks a `CachedSpanTransfer` delivery: the same window data, but no evidence
     /// about the origin, so it moves neither the round-trip estimate nor the fault ladder, and the
@@ -3636,7 +3734,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // guard discarded while the read waited.
             staleGenDroppedBytes += Int64(delivered.count)
             winCond.unlock()
-            if !fromCache { SourceByteLedger.shared.discard(url, reader: label, count: delivered.count) }
+            if !fromCache { SourceByteLedger.shared.discard(ledgerSource, reader: label, count: delivered.count) }
             return
         }
         // Audit DMX-1: the range is the bound only if bytes past its end are refused. A 200 that
@@ -3651,7 +3749,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             if Int64(data.count) > room {
                 data = data.prefix(Int(max(0, room)))
                 overDelivered = true
-                SourceByteLedger.shared.discard(url, reader: label, count: delivered.count - data.count)
             }
         }
         lastDeliveryAt = DispatchTime.now()   // #309: the delivery-gap watchdog's only input
@@ -3687,13 +3784,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 overshootToLog = postEndDeliveryBytes
             }
         }
-        let base = window.count
+        let deliveredAt = winStart + Int64(window.count)
+        let deliveredVersion = connVersion
         window.append(data)
-        if fromCache {
-            SourceByteLedger.shared.servedFromCache(url, reader: label, count: count)
-        } else {
-            addBytesFetched(data, at: winStart + Int64(base), version: connVersion)
-        }
         // #220: the requested range has been delivered in full. That ends the connection on
         // purpose; the read loop re-requests at the frontier once the consumer has drawn down.
         var overDeliveredTransfer: (any PersistentTransfer)?
@@ -3732,6 +3825,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             winCond.broadcast()
         }
         winCond.unlock()
+        if overDelivered {
+            SourceByteLedger.shared.discard(ledgerSource, reader: label, count: delivered.count - count)
+        }
+        if fromCache {
+            SourceByteLedger.shared.servedFromCache(ledgerSource, reader: label, count: count)
+        } else if !isFullyClosed {
+            addBytesFetched(data, at: deliveredAt, version: deliveredVersion)
+        }
         if let overDeliveredTransfer {
             EngineLog.emit(
                 "[AVIOReader] \(label) gen=\(generation) origin delivered past the requested range "

@@ -26,6 +26,8 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     /// neighbouring blocks serve each other instead of fetching the same 64 KB windows twelve times.
     private let sourceCache: SourceByteCache?
     private let cacheKey: SourceCacheKey
+    /// This source in the duplicate-traffic ledger, worked out once.
+    private let ledgerSource: SourceByteLedger.Source
     /// Who this reader is in the duplicate-traffic ledger: "disc" for a disc image, the indexed
     /// subtitle fill names itself.
     private let label: String
@@ -138,6 +140,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         self.sourceCache = sourceCache
         self.label = label
         self.cacheKey = SourceCacheKey(url: url, headers: extraHeaders)
+        self.ledgerSource = SourceByteLedger.Source(url)
         self.url = url
         self.extraHeaders = extraHeaders
         self.baseChunkSize = max(64 * 1024, baseChunkSize)
@@ -149,7 +152,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         self.session = session
         self.ownsSession = session !== EngineHTTP.session
         self.totalSize = totalSize
-        SourceByteLedger.shared.readerOpened(url)
+        SourceByteLedger.shared.readerOpened(ledgerSource)
         sourceCache?.readerOpened(cacheKey)
         sourceCache?.noteVersion(version, for: cacheKey)
     }
@@ -212,7 +215,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
             let want = Int(min(Int64(chunk), limit - position))
             let held = sourceCache?.read(cacheKey, at: position, maxLength: chunk,
                                          expectedSize: totalSize)
-            if let held { SourceByteLedger.shared.servedFromCache(url, reader: label, count: held.count) }
+            if let held { SourceByteLedger.shared.servedFromCache(ledgerSource, reader: label, count: held.count) }
             guard want > 0 || held != nil,
                   let data = held ?? fetchWithRetry(offset: position, length: want), !data.isEmpty else {
                 return -1
@@ -254,7 +257,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         ledgerClosed = true
         cancelLock.unlock()
         if first {
-            SourceByteLedger.shared.readerClosed(url, reader: label)
+            SourceByteLedger.shared.readerClosed(ledgerSource, reader: label)
             sourceCache?.readerClosed(cacheKey)
         }
     }
@@ -302,14 +305,14 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                let contentRange = r.contentRange,
                Self.parseContentRangeStart(contentRange) == offset {
                 let kept = r.body.count > length ? r.body.prefix(length) : r.body
-                SourceByteLedger.shared.record(url, reader: label, offset: offset, count: kept.count)
+                SourceByteLedger.shared.record(ledgerSource, reader: label, offset: offset, count: kept.count)
                 sourceCache?.noteVersion(r.version, for: cacheKey)
                 sourceCache?.store(kept, at: offset, version: r.version, for: cacheKey)
-                SourceByteLedger.shared.discard(url, reader: label, count: r.body.count - kept.count)
+                SourceByteLedger.shared.discard(ledgerSource, reader: label, count: r.body.count - kept.count)
                 return kept
             }
             if let response {
-                SourceByteLedger.shared.discard(url, reader: label, count: response.body.count)
+                SourceByteLedger.shared.discard(ledgerSource, reader: label, count: response.body.count)
             }
             attempt += 1
             if attempt > maxRetries { return nil }
@@ -526,7 +529,7 @@ extension HTTPDiscIOReader: RangeReadableIOReader {
         while cursor < end {
             if let held = sourceCache?.read(cacheKey, at: cursor, maxLength: Int(end - cursor),
                                             expectedSize: totalSize) {
-                SourceByteLedger.shared.servedFromCache(url, reader: label, count: held.count)
+                SourceByteLedger.shared.servedFromCache(ledgerSource, reader: label, count: held.count)
                 out.append(held)
                 cursor += Int64(held.count)
                 continue

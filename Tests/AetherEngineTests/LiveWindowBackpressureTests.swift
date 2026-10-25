@@ -75,7 +75,7 @@ struct LiveWindowBackpressureTests {
         #expect(!reader.hasLiveConnectionForTesting,
                 "the live backstop must still end a connection that outruns the consumer")
         #expect(reader.windowDiagnostics.parked,
-                "the backstop end must be recorded as backpressure so the refill owns it")
+                "the backstop end must be recorded as a planned end so the refill owns it")
         #expect(server.rangeRequestCount == 1,
                 "the refill must not fire while nothing drains: \(server.requestedRanges)")
         #expect(server.bytesWritten < 24 * 1024 * 1024,

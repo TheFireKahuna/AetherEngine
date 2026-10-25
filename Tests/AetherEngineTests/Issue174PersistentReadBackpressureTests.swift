@@ -11,9 +11,10 @@ import Foundation
 ///   bounded ranges and a hard cap ended a connection the suspend failed to park.
 /// - #310: a task that DID park held a dormant established flow whose closed receive window
 ///   starves every Network.framework flow in the process on user-space-networking OSes
-///   (tvOS/iOS). The suspend is gone: at winHighWater the connection is ENDED and the read
-///   loop re-requests at the frontier once the consumer drains below winLowWater. A stalled
-///   or paused consumer therefore holds NO connection at all — which is what these tests pin.
+///   (tvOS/iOS). The suspend is gone: a range asks for what the window has room for, so it
+///   ends on its own at winHighWater (anything past it is ENDED), and the read loop re-requests
+///   at the frontier once the consumer drains below winLowWater. A stalled or paused consumer
+///   therefore holds NO connection at all — which is what these tests pin.
 ///
 /// They run a loopback HTTP/1.1 origin that counts every body byte it manages to write and
 /// records every Range it is asked for.
@@ -46,7 +47,7 @@ struct Issue174PersistentReadBackpressureTests {
                 "a stalled consumer must hold no connection")
         let diag = reader.windowDiagnostics
         #expect(diag.parked,
-                "the end must be recorded as backpressure so the refill path owns it")
+                "the end must be recorded as a planned high-water end so the refill path owns it")
         #expect(diag.aheadBytes < 32 * 1024 * 1024,
                 "window held \(diag.aheadBytes / (1024 * 1024)) MB against a 16 MB high water")
         #expect(server.requestedRanges.filter { $0.start == 0 }.count == 1,
