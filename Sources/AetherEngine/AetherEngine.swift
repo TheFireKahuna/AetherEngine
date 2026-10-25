@@ -1071,7 +1071,7 @@ public final class AetherEngine: ObservableObject {
     public var nativePlayerLayer: AVPlayerLayer? { nativeHost?.playerLayer }
     /// True between didEnterBackground and didBecomeActive; gates the pause-while-backgrounded teardown
     /// (iOS) and the PiP-closed-while-backgrounded teardown (tvOS). Never set on macOS.
-    private var isBackgrounded = false
+    private(set) var isBackgrounded = false
     /// Audit CORE-2: didEnterBackground (or a background PiP close) ran while a load or seek was in flight.
     private var backgroundActionOwed = false
     /// Audit LIF-101: the generation of the `load()` or `reloadWithAudioOverride` still running. A
@@ -1389,6 +1389,11 @@ public final class AetherEngine: ObservableObject {
     /// the upscaler is ready. Applies to cues decoded after it is set. nil (default), or without the trait: cues as
     /// decoded.
     public var bitmapSubtitlePixelSize: CGSize?
+    /// Channels whose bitmap cues published as decoded because the upscale could not run (the app in the
+    /// background, where the GPU is refused, or a failed upscale), and the channels a return to the foreground
+    /// re-lands so the drain decodes them again, upscaled (`resumeBitmapSubtitleUpscale`).
+    var bitmapSubtitleUpscaleOwed: Set<SubtitleChannel> = []
+    var bitmapSubtitleRelanding: Set<SubtitleChannel> = []
     /// #100: per-channel holdback for PGS cues arriving behind the playhead (catch-up bursts after
     /// side-reader starvation). Reset wherever the cue arrays reset (track switch, seek re-anchor,
     /// clear, load/stop) so a hold can never leak across subtitle sessions.
@@ -8221,7 +8226,10 @@ public final class AetherEngine: ObservableObject {
                 // reached the output format in that gap, so only a real return forgets the refusal.
                 let returnedFromBackground = self.isBackgrounded
                 self.isBackgrounded = false
-                if returnedFromBackground { Self.clearPanelRefusalOnForegroundReturn() }
+                if returnedFromBackground {
+                    Self.clearPanelRefusalOnForegroundReturn()
+                    self.resumeBitmapSubtitleUpscale()
+                }
                 self.backgroundActionOwed = false
             }
         }

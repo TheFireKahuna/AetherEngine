@@ -20,6 +20,16 @@ extension AetherEngine {
         _ = BlockingWork.detached(priority: .userInitiated) { try? BitmapSubtitleUpscaling.shared.ready() }
     }
 
+    /// Back in the foreground, re-lands each channel that published bitmap cues as decoded while the upscale could
+    /// not run: the drain decodes its window again in place, the landing line first, and each re-decoded cue
+    /// replaces its own copy (same start, same geometry), upscaled. What was upscaled before is a lookup.
+    func resumeBitmapSubtitleUpscale() {
+        guard !bitmapSubtitleUpscaleOwed.isEmpty else { return }
+        bitmapSubtitleRelanding.formUnion(bitmapSubtitleUpscaleOwed.intersection(subtitleDrainTargets.keys))
+        bitmapSubtitleUpscaleOwed = []
+        requestSubtitleDrainTick()
+    }
+
     /// The playback-start gate: a session with a bitmap track starts once the upscaler is ready, so its first
     /// subtitle publishes upscaled like every other. A ready upscaler returns at once; a failed one is logged when a
     /// cue first needs it, and the session starts regardless.
