@@ -61,8 +61,8 @@ struct DoviChroma422Tests {
         return M.plane(try #require(composer.compose(baseBuffer: bl, enhancementBuffer: el, params: p, frameIndex: 0)), 1, components: 2)
     }
 
-    /// The model's 16-bit sum as the sv22 word (`dovi_full_precision`: h clamped to chroma 64...960 << 6).
-    static func word(_ h: Int) -> Int { min(max(h, 64 << 6), 960 << 6) }
+    /// The model's 16-bit sum as the sv22 word (`dovi_full_precision`: h clipped as the 12-bit reconstruction is).
+    static func word(_ h: Int) -> Int { min(max(h, 0), M.Model.sumMax(vdrMax: 4095)) }
 
     @Test("sv22 4:2:2-site chroma: the GPU matches the CPU model on real RPU coefficient sets",
           arguments: DoviChroma422Tests.realParams().map(\.0), DoviChroma422Tests.sitings)

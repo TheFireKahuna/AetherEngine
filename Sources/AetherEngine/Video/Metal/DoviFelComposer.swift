@@ -934,8 +934,9 @@ final class DoviFelComposer: @unchecked Sendable {
 
         guard blW > 0, blH > 0, elW > 0, elH > 0 else { return nil }
         // Read once per frame, so a switch mid-stream never pairs one mode's pool with another's kernels.
-        let outputMode = outputModeOverride ?? Self.outputMode
-        guard let pool = ensurePool(width: blW, height: blH, pixelFormat: outputMode.pixelFormat) else { return nil }
+        let outputMode = (outputModeOverride ?? Self.outputMode).forRange(fullRange: params.outputFullRange)
+        guard let pool = ensurePool(width: blW, height: blH,
+                                    pixelFormat: outputMode.pixelFormat(fullRange: params.outputFullRange)) else { return nil }
 
         // A base-layer frame is NOT close to the composed one on real titles: measured on the three
         // real FEL files its 10-bit luma differs by a mean of ~8 codes (p99 up to 230) on two and ~79
@@ -1599,7 +1600,29 @@ final class DoviFelComposer: @unchecked Sendable {
         }
 
         params.masterLevel6 = DolbyVisionLevel6(rpu: rpu)
+        params.outputFullRange = outputFullRange(rpu: rpu)
         return params
+    }
+
+    /// The RPU's luma `ycc_to_rgb_offset`, over 2^28, for a video-range picture: black at 1/16 of the code space.
+    static let videoRangeLumaOffset: UInt32 = 1 << 24
+
+    /// Whether the picture this RPU composes is full range. Its colour conversion states it: `ycc_to_rgb_offset0` is
+    /// the luma black subtracted before the matrix, 0 for a full-range picture (Profile 5's IPT, black at code 0) and
+    /// 1/16 for video range. An RPU that does not carry the conversion (no display-management data, or a compressed
+    /// payload, which leaves the fields out and libdovi's at zero) takes the default offsets, which are video range.
+    /// Any other offset is logged once and composed as video range.
+    static func outputFullRange(rpu: OpaquePointer) -> Bool {
+        guard let dm = dovi_rpu_get_vdr_dm_data(rpu) else { return false }
+        defer { dovi_rpu_free_vdr_dm_data(dm) }
+        guard !dm.pointee.compressed else { return false }
+        let offset = dm.pointee.ycc_to_rgb_offset0
+        if offset == 0 { return true }
+        if offset != videoRangeLumaOffset {
+            logAssumptionOnce("ycc_to_rgb_offset0", "[DoviFelComposer] ycc_to_rgb_offset0 = \(offset), neither full "
+                + "range (0) nor video range (\(videoRangeLumaOffset)); composed as video range")
+        }
+        return false
     }
 
     /// Combines an RPU coefficient's signed integer part and unsigned fraction

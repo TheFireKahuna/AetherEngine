@@ -72,6 +72,8 @@ struct DoviRpuGuardTests {
         /// A block written ahead of `cmv40Block` in the CM v4.0 list (only with one). A level 253 lead carries
         /// 0x55 filler bytes, as real ones do; any other level, zeros.
         var cmv40Lead: (length: UInt64, level: UInt64)?
+        /// `ycc_to_rgb_offset[0...2]` of an uncompressed payload, over 2^28; video range by default.
+        var yccToRgbOffsets: (UInt64, UInt64, UInt64) = (1 << 24, 1 << 27, 1 << 27)
     }
 
     static func writeDM(_ w: inout BitWriter, _ dm: DMPayload) {
@@ -80,7 +82,7 @@ struct DoviRpuGuardTests {
         w.ue(0)                                  // scene_refresh_flag
         if !dm.compressed {                      // 509 bits, valid per libdovi's validate
             for _ in 0..<9 { w.put(0, 16) }      // ycc_to_rgb_coef
-            for _ in 0..<3 { w.put(0, 32) }      // ycc_to_rgb_offset
+            w.put(dm.yccToRgbOffsets.0, 32); w.put(dm.yccToRgbOffsets.1, 32); w.put(dm.yccToRgbOffsets.2, 32)
             for _ in 0..<9 { w.put(0, 16) }      // rgb_to_lms_coef
             w.put(65535, 16); w.put(0, 16); w.put(0, 16); w.put(0, 32)   // signal_eotf (65535 with no params)
             w.put(10, 5); w.put(0, 2); w.put(0, 2); w.put(0, 2)          // depth, color space, chroma, range

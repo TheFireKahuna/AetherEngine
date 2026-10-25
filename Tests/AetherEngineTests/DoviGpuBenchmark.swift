@@ -310,8 +310,8 @@ struct DoviGpuBenchmark {
     ]
     static let chromaNoQuantize: [(String, String)] = [
         ("""
-    int out_cb = dovi_quantize(h_cb, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 0u)), 64, 960);
-    int out_cr = dovi_quantize(h_cr, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 1u)), 64, 960);
+    int out_cb = dovi_quantize(h_cb, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 0u)));
+    int out_cr = dovi_quantize(h_cr, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 1u)));
 """, """
     int out_cb = h_cb >> 6;
     int out_cr = h_cr >> 6;

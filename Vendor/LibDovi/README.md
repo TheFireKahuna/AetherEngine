@@ -23,8 +23,21 @@ header changed.
   crate tests (`extension_metadata/tests.rs`); the two upstream tests that asserted the L3 rejection now assert
   the byte-exact round trip. Not yet upstream.
 
-To change a patch: edit `build/dovi_tool`, then `git -C build/dovi_tool diff > patches/<name>.patch` (with
-`git add -N` for new files first).
+- `0002-p7-to-81-keeps-dm-coefficients.patch`: the 8.1 conversion of a profile 7 or 8 RPU (modes 2 and 3, and the
+  mapping-preserving form) keeps the DM data's `YCCtoRGB` / `RGBtoLMS` coefficients and offsets. Upstream replaced
+  them with the 8.1 defaults (limited BT.2020 YCbCr), which describe a different picture whenever the source states
+  another range or matrix: a full-range output (luma offset 0) would be described as video range. They describe the
+  output picture, which that conversion leaves as it is, so the source's are the right ones; on every disc measured
+  they equal the defaults anyway. A profile 5 source, whose representation the conversion does change, and 8.4 still
+  get the defaults. Tests: `rpu/conversion_tests.rs` (P7 full-range offsets survive both 8.1 forms and the write;
+  P5 to 8.1 and 8.4 get the defaults). Not yet upstream.
+
+The patches are one series: `build.sh` stages the checkout into a scratch index and reverses them there, newest first;
+landing exactly on the pinned commit means the series is applied and the rebuild is a no-op. Otherwise it applies the
+series to a clean checkout, and refuses a checkout carrying anything else.
+
+To change a patch: edit `build/dovi_tool`, then write the diff of that patch's own change (on top of the patches before
+it) to `patches/<name>.patch`.
 
 ## Build
 

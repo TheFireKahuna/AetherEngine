@@ -1,0 +1,137 @@
+diff --git a/dolby_vision/src/capi.rs b/dolby_vision/src/capi.rs
+index cceca1f..e79fda6 100644
+--- a/dolby_vision/src/capi.rs
++++ b/dolby_vision/src/capi.rs
+@@ -185,6 +185,8 @@ pub unsafe extern "C" fn dovi_write_unspec62_nalu(ptr: *mut RpuOpaque) -> *const
+ ///     - 2 and 3: Converts the RPU to be profile 8.1 compatible. The mapping curves are set to no-op only when
+ ///          the RPU's own `el_type` is FEL; a MEL RPU, or a FEL stream's RPU with `disable_residual_flag` set,
+ ///          keeps its curves (use `dovi_rpu_remove_mapping` to neutralise them).
++///          A profile 7 or 8 RPU keeps its DM coefficients and offsets (the output picture's representation and
++///          range); a profile 5 RPU gets the 8.1 ones.
+ ///          This mode handles source profiles 5, 7 and 8.
+ ///     - 4: Converts to static profile 8.4
+ ///     The mapping-preserving 8.1 conversion has no mode number here.
+diff --git a/dolby_vision/src/rpu/conversion_tests.rs b/dolby_vision/src/rpu/conversion_tests.rs
+new file mode 100644
+index 0000000..0705813
+--- /dev/null
++++ b/dolby_vision/src/rpu/conversion_tests.rs
+@@ -0,0 +1,68 @@
++use anyhow::Result;
++
++use super::ConversionMode;
++use super::dovi_rpu::DoviRpu;
++use super::vdr_dm_data::VdrDmData;
++
++const FEL_ORIG: &[u8] = include_bytes!("../../../assets/tests/fel_orig.bin");
++const PROFILE5: &[u8] = include_bytes!("../../../assets/tests/profile5.bin");
++
++/// The coefficients and offsets an 8.1 conversion writes for a profile 5 source and for 8.4.
++fn p81_coeffs() -> VdrDmData {
++    let mut dm = VdrDmData::default();
++    dm.set_p81_coeffs();
++    dm
++}
++
++fn coeffs(dm: &VdrDmData) -> ([i16; 9], [u32; 3], [i16; 9]) {
++    (
++        [
++            dm.ycc_to_rgb_coef0, dm.ycc_to_rgb_coef1, dm.ycc_to_rgb_coef2,
++            dm.ycc_to_rgb_coef3, dm.ycc_to_rgb_coef4, dm.ycc_to_rgb_coef5,
++            dm.ycc_to_rgb_coef6, dm.ycc_to_rgb_coef7, dm.ycc_to_rgb_coef8,
++        ],
++        [dm.ycc_to_rgb_offset0, dm.ycc_to_rgb_offset1, dm.ycc_to_rgb_offset2],
++        [
++            dm.rgb_to_lms_coef0, dm.rgb_to_lms_coef1, dm.rgb_to_lms_coef2,
++            dm.rgb_to_lms_coef3, dm.rgb_to_lms_coef4, dm.rgb_to_lms_coef5,
++            dm.rgb_to_lms_coef6, dm.rgb_to_lms_coef7, dm.rgb_to_lms_coef8,
++        ],
++    )
++}
++
++/// A profile 7 RPU whose DM data states a full-range output (luma offset 0) and coefficients of its own.
++fn full_range_fel() -> Result<DoviRpu> {
++    let mut rpu = DoviRpu::parse_unspec62_nalu(FEL_ORIG)?;
++    let dm = rpu.vdr_dm_data.as_mut().unwrap();
++    dm.ycc_to_rgb_offset0 = 0;
++    dm.ycc_to_rgb_coef0 = 8192;
++    dm.ycc_to_rgb_coef3 = 8192;
++    dm.ycc_to_rgb_coef6 = 8192;
++    Ok(rpu)
++}
++
++#[test]
++fn to_81_keeps_a_profile_7_rpus_coefficients_and_offsets() -> Result<()> {
++    for mode in [ConversionMode::To81, ConversionMode::To81MappingPreserved] {
++        let mut rpu = full_range_fel()?;
++        let before = coeffs(rpu.vdr_dm_data.as_ref().unwrap());
++        rpu.convert_with_mode(mode)?;
++        let written = DoviRpu::parse_unspec62_nalu(&rpu.write_hevc_unspec62_nalu()?)?;
++        assert_eq!(written.dovi_profile, 8);
++        assert_eq!(coeffs(written.vdr_dm_data.as_ref().unwrap()), before);
++    }
++    Ok(())
++}
++
++#[test]
++fn to_81_of_a_profile_5_rpu_and_to_84_write_the_81_coefficients() -> Result<()> {
++    let mut p5 = DoviRpu::parse_unspec62_nalu(PROFILE5)?;
++    assert_ne!(coeffs(p5.vdr_dm_data.as_ref().unwrap()), coeffs(&p81_coeffs()));
++    p5.convert_with_mode(ConversionMode::To81)?;
++    assert_eq!(coeffs(p5.vdr_dm_data.as_ref().unwrap()), coeffs(&p81_coeffs()));
++
++    let mut p84 = full_range_fel()?;
++    p84.convert_with_mode(ConversionMode::To84)?;
++    assert_eq!(coeffs(p84.vdr_dm_data.as_ref().unwrap()), coeffs(&p81_coeffs()));
++    Ok(())
++}
+diff --git a/dolby_vision/src/rpu/dovi_rpu.rs b/dolby_vision/src/rpu/dovi_rpu.rs
+index b0f9b00..2f5f154 100644
+--- a/dolby_vision/src/rpu/dovi_rpu.rs
++++ b/dolby_vision/src/rpu/dovi_rpu.rs
+@@ -429,6 +429,9 @@ impl DoviRpu {
+         Ok(())
+     }
+ 
++    /// The DM data's `YCCtoRGB` / `RGBtoLMS` coefficients and offsets are kept: they describe the output picture,
++    /// which an 8.1 conversion of a profile 7 or 8 RPU leaves in the same colour representation and range. A
++    /// profile 5 source, whose output representation does change, sets the 8.1 values itself, as 8.4 does.
+     fn convert_to_p81(&mut self) {
+         self.modified = true;
+ 
+@@ -448,10 +451,6 @@ impl DoviRpu {
+ 
+             mapping.nlq = None;
+         }
+-
+-        if let Some(vdr_dm_data) = self.vdr_dm_data.as_mut() {
+-            vdr_dm_data.set_p81_coeffs();
+-        }
+     }
+ 
+     fn convert_to_p81_remove_mapping(&mut self) {
+@@ -573,6 +572,10 @@ impl DoviRpu {
+     fn convert_to_p84(&mut self) {
+         self.convert_to_p81();
+ 
++        if let Some(vdr_dm_data) = self.vdr_dm_data.as_mut() {
++            vdr_dm_data.set_p81_coeffs();
++        }
++
+         self.header = RpuDataHeader::p8_default();
+         self.rpu_data_mapping = Some(Profile84::rpu_data_mapping());
+     }
+diff --git a/dolby_vision/src/rpu/mod.rs b/dolby_vision/src/rpu/mod.rs
+index 574343d..700ca64 100644
+--- a/dolby_vision/src/rpu/mod.rs
++++ b/dolby_vision/src/rpu/mod.rs
+@@ -9,6 +9,9 @@ pub mod rpu_data_mapping;
+ pub mod rpu_data_nlq;
+ pub mod vdr_dm_data;
+ 
++#[cfg(test)]
++mod conversion_tests;
++
+ pub mod utils;
+ 
+ static CRC32_INSTANCE: Crc<u32, Table<16>> = Crc::<u32, Table<16>>::new(&CRC_32_MPEG_2);

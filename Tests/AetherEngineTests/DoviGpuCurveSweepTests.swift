@@ -206,7 +206,7 @@ struct DoviGpuCurveSweepTests {
             let x = Double(code) / Double(blMax)
             let expected = Self.quantize(
                 predNorm: reference.map(x, (x, 0.5, 0.5)),
-                blMax: blMax, vdrScale: 4, vdrMax: 4095, lo: 64, hi: 940
+                blMax: blMax, vdrScale: 4, vdrMax: 4095, lo: 0, hi: 1023
             )
             let diff = abs(output[code][0] - expected)
             if diff > worst {
@@ -331,7 +331,7 @@ struct DoviGpuCurveSweepTests {
             let u = Double(cbCode) / Double(blMax)
             let expected = Self.quantize(
                 predNorm: reference.map(u, (y, u, v)),
-                blMax: blMax, vdrScale: 4, vdrMax: 4095, lo: 64, hi: 960
+                blMax: blMax, vdrScale: 4, vdrMax: 4095, lo: 0, hi: 1023
             )
             let diff = abs(output[column][0] - expected)
             if diff > worst {
@@ -388,13 +388,11 @@ struct DoviGpuCurveSweepTests {
         // Denormalising by bl_max * vdr_scale (1023 * 4) rather than vdr_max is
         // what makes this exact; * 4095 would drift by up to 3 codes at the top.
         let output = Self.readPlane(dst, plane: 0, components: 1, row: 0)
-        for code in 64...940 {
+        // The output is clipped to the code space, not to video range, so footroom and headroom pass too.
+        for code in 0...1023 {
             #expect(output[code][0] == code,
                     "identity curve changed BL code \(code) into \(output[code][0])")
         }
-        // Below and above the video range the output saturates instead.
-        #expect(output[0][0] == 64)
-        #expect(output[1023][0] == 940)
     }
 }
 #endif

@@ -63,17 +63,47 @@ case "$(git -C "$DOVI_REPO_DIR" rev-parse HEAD)" in
     *) echo "ERROR: dovi_tool tag $DOVI_TAG is not commit $DOVI_COMMIT (moved upstream?)" >&2; exit 1 ;;
 esac
 
-# A patch the checkout already carries is skipped, so a rebuild over an existing clone is a no-op; one that neither
-# reverses nor applies cleanly stops the build rather than building something in between.
+# The patches are one series, checked as a whole: a later patch can change lines an earlier one wrote, so an earlier
+# patch alone no longer reverses on a checkout that carries the series. The working tree is staged into a scratch
+# index and the series reversed there, newest first; if that lands exactly on the pinned commit, the checkout already
+# carries the series and a rebuild is a no-op. Otherwise the series is applied, to a clean checkout only, so a build
+# never mixes the series with other edits.
+PATCHES=()
 for patch in "$SCRIPT_DIR"/patches/*.patch; do
-    [ -e "$patch" ] || continue
-    if git -C "$DOVI_REPO_DIR" apply --reverse --check "$patch" 2>/dev/null; then
-        echo "==> $(basename "$patch") already applied"
-    else
+    [ -e "$patch" ] && PATCHES+=("$patch")
+done
+series_applied() {
+    local scratch
+    scratch=$(mktemp -d)
+    local index="$scratch/index"
+    local ok=1
+    if GIT_INDEX_FILE="$index" git -C "$DOVI_REPO_DIR" read-tree HEAD \
+        && GIT_INDEX_FILE="$index" git -C "$DOVI_REPO_DIR" add -A; then
+        ok=0
+        for (( i = ${#PATCHES[@]} - 1; i >= 0; i-- )); do
+            GIT_INDEX_FILE="$index" git -C "$DOVI_REPO_DIR" apply --cached --reverse "${PATCHES[$i]}" 2>/dev/null \
+                || { ok=1; break; }
+        done
+        [ "$ok" -eq 0 ] && { GIT_INDEX_FILE="$index" git -C "$DOVI_REPO_DIR" diff --cached --quiet HEAD || ok=1; }
+    fi
+    rm -f "$index"
+    rmdir "$scratch"
+    return "$ok"
+}
+if [ ${#PATCHES[@]} -eq 0 ]; then
+    echo "==> No local patches"
+elif series_applied; then
+    echo "==> Patch series already applied: $(for p in "${PATCHES[@]}"; do basename "$p"; done | tr '\n' ' ')"
+elif [ -z "$(git -C "$DOVI_REPO_DIR" status --porcelain)" ]; then
+    for patch in "${PATCHES[@]}"; do
         echo "==> Applying $(basename "$patch")"
         git -C "$DOVI_REPO_DIR" apply "$patch"
-    fi
-done
+    done
+else
+    echo "ERROR: $DOVI_REPO_DIR carries changes that are not exactly the patch series in patches/." >&2
+    echo "       Write them into a patch (see README.md) or restore the checkout, then build again." >&2
+    exit 1
+fi
 
 CRATE_DIR="$DOVI_REPO_DIR/dolby_vision"
 if [ ! -f "$CRATE_DIR/Cargo.toml" ]; then

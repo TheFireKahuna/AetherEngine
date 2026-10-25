@@ -219,6 +219,15 @@ struct DoviCpuModelTests {
             return Int(dq >> (coefficientLog2Denom - 5 - elBitDepth))
         }
 
+        /// The largest 16-bit sum the reconstruction does not clip, the one that rounds to 2^out_bit_depth - 1: a sum
+        /// clipped to [0, sumMax] rounds to exactly the reconstruction's clipped sample. What the composer clips the
+        /// 16-bit outputs (sv22, P010 full precision) to.
+        static func sumMax(vdrMax: UInt32) -> Int {
+            let out = min(max(DoviFelComposer.bitDepth(ofMax: vdrMax), 1), 15)
+            return min((Int(vdrMax) << (16 - out)) + (1 << (15 - out)) - 1, 0xFFFF)
+        }
+        var sumMax: Int { Self.sumMax(vdrMax: p.vdrMax) }
+
         /// The reconstruction: h = v (+ r), then (h + 2^(15 - out_bit_depth)) >> (16 - out_bit_depth), clipped.
         func reconstruct(_ h: Int) -> Int {
             let out = DoviFelComposer.bitDepth(ofMax: p.vdrMax)
@@ -309,11 +318,11 @@ struct DoviCpuModelTests {
         /// Q20 of a base-layer value (whole or a quarter code, as the M7 variants are): exact.
         func q20(_ s: Double) -> Int64 { Int64((s * Double(1 << (20 - bd))).rounded()) }
 
-        /// The composed 16-bit chroma sums (Cb, Cr) at 4:2:0 site (x, y), clipped to [0, 0xFFFF] as the reconstruction is
+        /// The composed 16-bit chroma sums (Cb, Cr) at 4:2:0 site (x, y), clipped to [0, sumMax] as the reconstruction is
         /// clipped: what sv22's 4:2:2 step interpolates.
         func chromaSums(bl: Plane, blUV: Plane, elUV: Plane, x: Int, y: Int) -> (Int, Int) {
             let (a, b) = chromaParts(bl: bl, blUV: blUV, elUV: elUV, x: x, y: y)
-            return (min(max(a.total, 0), 0xFFFF), min(max(b.total, 0), 0xFFFF))
+            return (min(max(a.total, 0), sumMax), min(max(b.total, 0), sumMax))
         }
 
         /// The 16-bit sums (Cb, Cr) at 4:2:2 site (x, row): the composed 4:2:0 chroma brought to the row. On a chroma
@@ -505,7 +514,7 @@ struct DoviCpuModelTests {
     // MARK: - Loss census (M1) and error attribution (M3, M4, M6)
 
     /// Counts, per plane, every pixel at a point where information can be lost. Fractions of the
-    /// sampled pixels. The output range clamps are video range: 64...940 luma, 64...960 chroma.
+    /// sampled pixels. The output clip is the 10-bit code space, 0...1023, as the reconstruction's is its own.
     struct Census {
         var n = 0
         var predBelow0 = 0, predAbove1 = 0
@@ -554,14 +563,14 @@ struct DoviCpuModelTests {
             let el = Self.plane(cap.el, 0, components: 1), elUV = Self.plane(cap.el, 1, components: 2)
             for yy in stride(from: 3, to: bl.height, by: 5) {
                 for xx in stride(from: 5, to: bl.width, by: 7) {
-                    y.add(m.lumaParts(bl: bl, blUV: blUV, el: el, x: xx, y: yy), p.nlqY, model: m, lo: 64, hi: 940)
+                    y.add(m.lumaParts(bl: bl, blUV: blUV, el: el, x: xx, y: yy), p.nlqY, model: m, lo: 0, hi: 1023)
                 }
             }
             for yy in stride(from: 1, to: blUV.height, by: 3) {
                 for xx in stride(from: 2, to: blUV.width, by: 5) {
                     let (a, b) = m.chromaParts(bl: bl, blUV: blUV, elUV: elUV, x: xx, y: yy)
-                    cb.add(a, p.nlqCb, model: m, lo: 64, hi: 960)
-                    cr.add(b, p.nlqCr, model: m, lo: 64, hi: 960)
+                    cb.add(a, p.nlqCb, model: m, lo: 0, hi: 1023)
+                    cr.add(b, p.nlqCr, model: m, lo: 0, hi: 1023)
                 }
             }
         }

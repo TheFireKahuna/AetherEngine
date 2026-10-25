@@ -20,8 +20,8 @@ typedef int  dovi_i32;
     /// Definitions of the parameters and structs consumed by the Metal kernels.
     static let sharedStructs = """
 /* DOVI_SHARED_STRUCTS_BEGIN */
-/* ---- Target output modes (informational; the composer always emits
-   video-range 10-bit P010, so this does not currently switch clamping) ---- */
+/* ---- Target output modes (unread: no kernel switches on them; the output's range is the RPU's own,
+   carried by the output buffer's format) ---- */
 #define DOVI_TARGET_MODE_PROFILE_8_1  0 /* Rec.2020 YCbCr PQ 10-bit limited range */
 #define DOVI_TARGET_MODE_PROFILE_5    1 /* Dolby IPTPQc2 10-bit full range */
 
@@ -480,27 +480,35 @@ static inline int dovi_reconstruct(int h, uint vdr_max) {
     return clamp((h + (1 << (15u - bits))) >> (16u - bits), 0, int(vdr_max));
 }
 
-// 16-bit sample: h itself, clamped to the video range (10-bit limits shifted left 6). A 10-bit code shifted
-// left 6 and a 12-bit code shifted left 4 are both h's scale (black 64 << 6 = 256 << 4 = 4096), so sv22 carries
-// the sum before the reconstruction's rounding, from which its 12-bit sample is (h + 8) >> 4 exactly; P010's full-precision
-// mode puts the same word in P010, whose low 6 bits CoreVideo calls padding.
-static inline int dovi_full_precision(int h, int lo, int hi) {
-    return clamp(h, lo << 6, hi << 6);
+// The largest 16-bit sum the reconstruction does not clip: the one whose rounding to hdr_bit_depth bits is
+// 2^hdr_bit_depth - 1 (65527 at 12 bits). A sum clipped to [0, dovi_sum_max] rounds to exactly the reconstruction's
+// clipped sample, so the clip is the code space's, whatever range the picture is in. A depth the parser never
+// accepts (outside 1...15 bits) still gives a bound within 16 bits.
+static inline int dovi_sum_max(uint vdr_max) {
+    uint bits = clamp(32u - clz(vdr_max), 1u, 15u);
+    return min((int(vdr_max) << (16u - bits)) + (1 << (15u - bits)) - 1, 0xFFFF);
 }
 
-// h down to the 10-bit output plane, dithered or rounded, in one step from the 16-bit sum.
+// 16-bit sample: h itself, clipped as the reconstruction is clipped (dovi_sum_max). A 10-bit code shifted left 6
+// and a 12-bit code shifted left 4 are both h's scale (black 64 << 6 = 256 << 4 = 4096), so sv22 carries the sum
+// before the reconstruction's rounding, from which its 12-bit sample is (h + 8) >> 4 exactly; P010's
+// full-precision mode puts the same word in P010, whose low 6 bits CoreVideo calls padding.
+static inline int dovi_full_precision(int h, uint vdr_max) {
+    return clamp(h, 0, dovi_sum_max(vdr_max));
+}
+
+// h down to the 10-bit output plane, dithered or rounded, in one step from the 16-bit sum, clipped to the 10-bit code
+// space as the reconstruction is clipped to its own.
 static inline int dovi_quantize(
     int h,
     uint dither_mode,
-    float dither,
-    int lo,
-    int hi)
+    float dither)
 {
     float v = float(h) * (1.0f / 64.0f);
     // Both branches have mean 0.5, so enabling dither redistributes the rounding
     // error without moving the average level.
     float bias = (dither_mode == DOVI_DITHER_NONE) ? 0.5f : dither;
-    return clamp(int(floor(v + bias)), lo, hi);
+    return clamp(int(floor(v + bias)), 0, 1023);
 }
 
 // A 4:2:0 chroma plane's size along an axis of `n` luma samples: half, rounded up, as CoreVideo allocates it, so an
@@ -661,10 +669,10 @@ kernel void dovi_compose_luma(
         return;
     }
     if (params.dither_mode == DOVI_DITHER_FULL_PRECISION) {
-        out_y_tex.write(ushort4(ushort(dovi_full_precision(h, 64, 940)), 0, 0, 0), gid);
+        out_y_tex.write(ushort4(ushort(dovi_full_precision(h, params.vdr_max)), 0, 0, 0), gid);
         return;
     }
-    int out_y = dovi_quantize(h, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(0u, 0u)), 64, 940);
+    int out_y = dovi_quantize(h, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(0u, 0u)));
     out_y_tex.write(ushort4(ushort(out_y << 6), 0, 0, 0), gid);
 }
 
@@ -745,9 +753,10 @@ kernel void dovi_compose_chroma(
         }
     }
 
-    // sv22: the 16-bit sums, clipped to the 16-bit range as the reconstruction is clipped, for the 4:2:2 step.
+    // sv22: the 16-bit sums, clipped as the reconstruction is clipped, for the 4:2:2 step.
     if ((params.flags & DOVI_FLAG_CHROMA_422) != 0u) {
-        out_uv_tex.write(ushort4(ushort(clamp(h_cb, 0, 0xFFFF)), ushort(clamp(h_cr, 0, 0xFFFF)), 0, 0), gid);
+        out_uv_tex.write(ushort4(ushort(dovi_full_precision(h_cb, params.vdr_max)),
+                                 ushort(dovi_full_precision(h_cr, params.vdr_max)), 0, 0), gid);
         return;
     }
     if (params.dither_mode == DOVI_DEBUG_RAW_VDR) {
@@ -757,12 +766,12 @@ kernel void dovi_compose_chroma(
         return;
     }
     if (params.dither_mode == DOVI_DITHER_FULL_PRECISION) {
-        out_uv_tex.write(ushort4(ushort(dovi_full_precision(h_cb, 64, 960)),
-                                 ushort(dovi_full_precision(h_cr, 64, 960)), 0, 0), gid);
+        out_uv_tex.write(ushort4(ushort(dovi_full_precision(h_cb, params.vdr_max)),
+                                 ushort(dovi_full_precision(h_cr, params.vdr_max)), 0, 0), gid);
         return;
     }
-    int out_cb = dovi_quantize(h_cb, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 0u)), 64, 960);
-    int out_cr = dovi_quantize(h_cr, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 1u)), 64, 960);
+    int out_cb = dovi_quantize(h_cb, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 0u)));
+    int out_cr = dovi_quantize(h_cr, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 1u)));
     out_uv_tex.write(ushort4(ushort(out_cb << 6), ushort(out_cr << 6), 0, 0), gid);
 }
 
@@ -799,9 +808,9 @@ static inline int dovi_chroma_422_offset_q(uint loc) {
 
 // sv22's 4:2:0 -> 4:2:2 step, one thread per output sample: Dolby's reference vertical chroma up-sampling, on the
 // reconstructed picture, after composition. `in_uv_tex` holds dovi_compose_chroma's 16-bit sums at the 4:2:0
-// sites, clipped to [0, 0xFFFF]; each output row takes the four chroma rows around it at its phase
+// sites, clipped as the reconstruction is; each output row takes the four chroma rows around it at its phase
 // (dovi_chroma_422_taps), edge rows replicated, rounded once, `+ 64 >> 7` (tvOS and the display take the 4:2:2
-// picture's horizontal step), and clamped to the video range.
+// picture's horizontal step), and clipped the same way.
 // On a chroma row the output is that row's composed sum. The rows sit where the stream's siting puts them
 // (dovi_chroma_422_offset_q); chroma is horizontally co-sited with the even luma column.
 kernel void dovi_chroma_420_to_422(
@@ -825,7 +834,8 @@ kernel void dovi_chroma_420_to_422(
         sum += int2(in_uv_tex.read(uint2(gid.x, row)).rg) * dovi_chroma_422_taps[phase][i];
     }
     int2 h = (sum + 64) >> 7;
-    out_uv_tex.write(ushort4(ushort(clamp(h.x, 64 << 6, 960 << 6)), ushort(clamp(h.y, 64 << 6, 960 << 6)), 0, 0), gid);
+    out_uv_tex.write(ushort4(ushort(dovi_full_precision(h.x, params.vdr_max)),
+                             ushort(dovi_full_precision(h.y, params.vdr_max)), 0, 0), gid);
 }
 
 /* ============================================================================

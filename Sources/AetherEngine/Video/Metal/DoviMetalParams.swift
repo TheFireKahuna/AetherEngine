@@ -50,8 +50,17 @@ enum DoviOutputMode: String, CaseIterable, Sendable {
     /// (`dovi_chroma_420_to_422`); on a chroma row that is the 4:2:0 composition itself.
     case sv22 = "sv22"
 
-    var pixelFormat: OSType {
-        self == .sv22 ? kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+    /// The mode a picture of this range is written in. `sv22` has no full-range form (its range is the 10-bit video
+    /// range shifted left 6), so a full-range picture goes to P010, dithered, as the software decoder sends a
+    /// full-range 12-bit picture.
+    func forRange(fullRange: Bool) -> DoviOutputMode {
+        fullRange && self == .sv22 ? .p010 : self
+    }
+
+    /// The output buffer's format for a picture of this range, after ``forRange(fullRange:)``.
+    func pixelFormat(fullRange: Bool) -> OSType {
+        if self == .sv22 { return kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange }
+        return fullRange ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
     }
 }
 
@@ -219,6 +228,9 @@ struct DoviMetalParams: Sendable {
     /// The RPU's L6, for the HDR10 static metadata a composed frame states (the master's). Swift side only: not
     /// part of the serialized block.
     var masterLevel6: DolbyVisionLevel6?
+    /// Whether the composed picture is full range, as the RPU's colour conversion states it
+    /// (``DoviFelComposer/outputFullRange(rpu:)``); the output buffer's format says so downstream. Swift side only.
+    var outputFullRange = false
 
     init() {}
 

@@ -78,6 +78,14 @@ struct DoviGpuAdversarialTests {
         return p
     }
 
+    /// An output word the composer can write: a 10-bit code in P010's high bits, or with full precision a 16-bit sum
+    /// within the reconstruction's clip.
+    static func legal(_ word: UInt16, _ p: DoviMetalParams) -> Bool {
+        p.ditherMode == .fullPrecision
+            ? Int(word) <= DoviCpuModelTests.Model.sumMax(vdrMax: p.vdrMax)
+            : word & 0x3F == 0
+    }
+
     static func words(_ b: CVPixelBuffer, plane: Int) -> [UInt16] {
         CVPixelBufferLockBaseAddress(b, .readOnly); defer { CVPixelBufferUnlockBaseAddress(b, .readOnly) }
         let base = CVPixelBufferGetBaseAddressOfPlane(b, plane)!
@@ -115,8 +123,8 @@ struct DoviGpuAdversarialTests {
             let b = try #require(composer.compose(baseBuffer: bl, enhancementBuffer: el, params: params, frameIndex: 0))
             #expect(aY == Self.words(b, plane: 0) && aC == Self.words(b, plane: 1), "seed \(seed) iter \(iter) is not deterministic")
 
-            let bad = aY.filter { ($0 >> 6) < 64 || ($0 >> 6) > 940 }.count + aC.filter { ($0 >> 6) < 64 || ($0 >> 6) > 960 }.count
-            #expect(bad == 0, "seed \(seed) iter \(iter): \(bad) samples outside video range (dither \(params.ditherMode), blMax \(params.blMax), vdrMax \(params.vdrMax), vdrScale \(params.vdrScale))")
+            let bad = (aY + aC).filter { !Self.legal($0, params) }.count
+            #expect(bad == 0, "seed \(seed) iter \(iter): \(bad) samples outside the code space (dither \(params.ditherMode), blMax \(params.blMax), vdrMax \(params.vdrMax), vdrScale \(params.vdrScale))")
         }
     }
 
@@ -140,7 +148,7 @@ struct DoviGpuAdversarialTests {
             if let out = composer.compose(baseBuffer: bl, enhancementBuffer: el, params: p, frameIndex: 0) {
                 #expect(CVPixelBufferGetWidth(out) == 64 && CVPixelBufferGetHeight(out) == 32, "output must follow the real base buffer, not the claimed size")
                 let y = Self.words(out, plane: 0)
-                #expect(y.allSatisfy { ($0 >> 6) >= 64 && ($0 >> 6) <= 940 })
+                #expect(y.allSatisfy { Self.legal($0, p) })
             }
         }
     }
