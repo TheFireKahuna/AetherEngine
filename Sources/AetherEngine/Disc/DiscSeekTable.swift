@@ -1,10 +1,15 @@
 import Foundation
+import AetherLibavutil
 
 /// One entry point of a Blu-ray clip's EP map: a video keyframe's presentation time on the clip's own
 /// clock (45 kHz) and the source packet it starts at (192 bytes each in an `.m2ts`).
 struct CLPIEntryPoint: Sendable, Equatable {
     let pts45k: UInt64
     let spn: UInt32
+
+    /// The map's time precision, 45 kHz ticks: the fine field drops the low 9 bits of the 90 kHz PTS,
+    /// so an entry's picture presents in `pts45k..<pts45k + precision45k`.
+    static let precision45k: UInt64 = 256
 }
 
 /// Reads the EP map out of a clip information file (`BDMV/CLIPINF/NNNNN.clpi`).
@@ -105,18 +110,21 @@ struct DiscSeekTable: Sendable {
 
     let clips: [Clip]
 
-    /// The byte of the last keyframe at or before `seconds` on the demuxer's source axis (clip 0's
-    /// observed timestamp base plus the folded title time, AE#105), with the clip it is in and its time on
-    /// that clip's clock. `base0Sec` is NaN until the first clip's base has been read; the play item's
-    /// `in_time` stands in for it then.
-    func keyframe(forSourceSeconds seconds: Double, base0Sec: Double) -> (offset: Int64, clip: Int, keyframeSec: Double)? {
-        guard let first = clips.first else { return nil }
-        let base = base0Sec.isFinite ? base0Sec : first.inTimeSec
-        let titleTime = max(0, seconds - base)
-        guard let k = clips.lastIndex(where: { $0.cumulativeBeforeSec <= titleTime + 0.001 }) else { return nil }
+    /// The byte of the last keyframe at or before `seconds` on the demuxer's source axis (the title's
+    /// origin plus title time, `ClipFold.titleOriginSeconds`), with the clip it is in and its time on
+    /// that clip's clock.
+    func keyframe(forSourceSeconds seconds: Double, titleOriginSec: Double) -> (offset: Int64, clip: Int, keyframeSec: Double)? {
+        guard titleOriginSec.isFinite else { return nil }
+        let titleTime = max(0, seconds - titleOriginSec)
+        // Within the map's precision of a clip's start is that clip: its first keyframe usually presents at
+        // the play item's `in_time`, and its entry may read up to that much earlier (`titleKeyframes`).
+        let tolerance = Double(CLPIEntryPoint.precision45k) / discTickRate
+        guard let k = clips.lastIndex(where: { $0.cumulativeBeforeSec <= titleTime + tolerance }) else { return nil }
         let clip = clips[k]
         guard !clip.entries.isEmpty else { return nil }
-        let raw45k = UInt64(max(0, (clip.inTimeSec + (titleTime - clip.cumulativeBeforeSec)) * discTickRate))
+        // Rounded, not truncated: a plan boundary is an entry's own time (`titleKeyframes`), and the trip
+        // through seconds must come back to that entry rather than one tick below it.
+        let raw45k = UInt64(max(0, ((clip.inTimeSec + (titleTime - clip.cumulativeBeforeSec)) * discTickRate).rounded()))
         var lo = 0
         var hi = clip.entries.count - 1
         var best = 0
@@ -131,6 +139,34 @@ struct DiscSeekTable: Sendable {
         }
         let entry = clip.entries[best]
         return (clip.concatByteStart + Int64(entry.spn) * 192, k, Double(entry.pts45k) / discTickRate)
+    }
+
+    /// Every keyframe the title plays, in title order: each clip's entries whose picture presents inside
+    /// its play item's `in_time..<out_time`, placed on the demuxer's source axis in `timeBase` ticks (the
+    /// inverse of `keyframe(forSourceSeconds:titleOriginSec:)`), with the byte it starts at.
+    ///
+    /// An entry's time is its picture's presentation time to the map's precision (5.7 ms) and never later,
+    /// which is below any frame interval: the first sync sample at or after it is that picture, and no
+    /// other picture presents within that precision of a play item's `in_time` or `out_time`. So a clip's
+    /// first keyframe, which usually presents at `in_time` itself, is kept although its entry may read
+    /// earlier, and the keyframe that presents at `out_time`, the next item's business, is not.
+    func titleKeyframes(titleOriginSec: Double, timeBase: AVRational) -> [(pts: Int64, pos: Int64)] {
+        guard titleOriginSec.isFinite, timeBase.num > 0, timeBase.den > 0 else { return [] }
+        let ticksPerSecond = Double(timeBase.den) / Double(timeBase.num)
+        var out: [(pts: Int64, pos: Int64)] = []
+        out.reserveCapacity(clips.reduce(0) { $0 + $1.entries.count })
+        for clip in clips {
+            let in45k = UInt64((clip.inTimeSec * discTickRate).rounded())
+            let out45k = UInt64((clip.outTimeSec * discTickRate).rounded())
+            let precision = CLPIEntryPoint.precision45k
+            for entry in clip.entries where entry.pts45k + precision > in45k && entry.pts45k + precision <= out45k {
+                let titleSec = clip.cumulativeBeforeSec
+                    + (Double(entry.pts45k) - Double(in45k)) / discTickRate
+                out.append((pts: Int64(((titleOriginSec + titleSec) * ticksPerSecond).rounded()),
+                            pos: clip.concatByteStart + Int64(entry.spn) * 192))
+            }
+        }
+        return out
     }
 }
 

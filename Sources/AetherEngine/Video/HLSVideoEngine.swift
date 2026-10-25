@@ -1525,10 +1525,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 planKeyframePts = keyframes
                 keyframeBytePositions = Dictionary(keyframeEntries.map { ($0.pts, $0.pos) },
                                                    uniquingKeysWith: { first, _ in first })
-                // AE#561: these boundaries ARE this container's index entries, so they carry its
-                // stamping. Read from the demuxer that produced them, never from the URL or the
-                // host's metadata: on a remux session the delivered container is the one indexed.
-                planBoundaryAxis = PlanBoundaryAxis.forContainer(formatName: dem.containerFormatName)
+                // AE#561: these boundaries ARE the source's index entries (a Blu-ray title's EP maps),
+                // so they carry its stamping. Read from the demuxer that produced them, never from the
+                // URL or the host's metadata: on a remux session the delivered container is the one indexed.
+                planBoundaryAxis = dem.keyframeIndexAxis
                 let firstKeyframePts = keyframes.sorted().first ?? 0
                 self.firstKeyframePts = firstKeyframePts
                 let firstKeyframeSeconds = Double(firstKeyframePts) * Double(videoTimeBase.num) / Double(videoTimeBase.den)

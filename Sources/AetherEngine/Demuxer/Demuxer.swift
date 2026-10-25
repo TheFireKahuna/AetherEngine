@@ -541,9 +541,14 @@ public final class Demuxer: @unchecked Sendable {
     /// the folded timeline stays in clip 0's raw domain (the producer gate then zero-bases it). NaN until the
     /// first packet is read. Guarded by `accessLock`. AE#105.
     private var clipBase0Sec: Double = .nan
-    /// Per-clip fold offset actually applied to packets (seconds), resolved from the clip's OBSERVED raw base
-    /// the first time it is read and cached (stable across seeks). NaN = not yet resolved. Guarded by
-    /// `accessLock`. AE#105.
+    /// Where the selected Blu-ray title starts on the source axis (`ClipFold.titleOriginSeconds`): play
+    /// item 0's `in_time` in clip 0's clock span, from the stream's start once it is probed, else from
+    /// clip 0's first packet. The playlist fold, the EP map seeks and the EP map plan all count title
+    /// time from it. NaN for DVD and non-disc sources. Under `accessLock`.
+    private var discTitleOriginSec: Double = .nan
+    /// Per-clip fold offset actually applied to packets (seconds), resolved the first time the clip is read
+    /// (a Blu-ray clip from its play item, a DVD cell from its navigation pack) and cached (stable across
+    /// seeks). NaN = not yet resolved. Guarded by `accessLock`. AE#105.
     private var clipResolvedShiftSec: [Double] = []
     /// The selected DVD title is folded by cell (`DiscReader.dvdCellTimeline`): each cell's timestamp base
     /// comes from its navigation packs (`adoptDVDNav`). Under `accessLock`.
@@ -567,6 +572,7 @@ public final class Demuxer: @unchecked Sendable {
         lastClipIndex = 0
         lastReadClipIdx = -1
         clipBase0Sec = .nan
+        discTitleOriginSec = .nan
         clipResolvedShiftSec = info.clipTimeline.isEmpty
             ? []
             : [0] + Array(repeating: Double.nan, count: info.clipTimeline.count - 1)
@@ -582,6 +588,14 @@ public final class Demuxer: @unchecked Sendable {
         let idx = ClipSpan.index(forPos: pos, in: clipTimeline, fallback: lastClipIndex)
         lastClipIndex = idx
         return clipTimeline[idx].predictedShiftSec
+    }
+
+    /// Play item 0's `in_time` (seconds, on clip 0's 45 kHz clock) of the selected Blu-ray title; nil for
+    /// DVD, non-disc sources and a playlist that carried none.
+    private var bdInTime0Sec: Double? {
+        guard !dvdCellFold, discTitles.indices.contains(selectedDiscTitleIndex),
+              let inTime0 = discTitles[selectedDiscTitleIndex].bdClipInTimes?.first else { return nil }
+        return Double(inTime0) / discTickRate
     }
 
     /// Fold a raw timestamp onto the contiguous presentation timeline given its byte position and time base.
@@ -1105,6 +1119,12 @@ public final class Demuxer: @unchecked Sendable {
         // engine's source axis starts there too), so a resume that lands in a later cell can fold at once.
         if dvdCellFold, clipBase0Sec.isNaN, ctx.pointee.start_time != Int64.min {
             clipBase0Sec = Double(ctx.pointee.start_time) / Double(AV_TIME_BASE)
+        }
+        // A Blu-ray title's origin is known as soon as clip 0's clock span is: the plan is built from it
+        // before the first packet is read, and a resume may never read clip 0.
+        if discTitleOriginSec.isNaN, ctx.pointee.start_time != Int64.min, let inTime0 = bdInTime0Sec {
+            discTitleOriginSec = ClipFold.titleOriginSeconds(
+                inTime0Sec: inTime0, nearRawSec: Double(ctx.pointee.start_time) / Double(AV_TIME_BASE))
         }
         armGeneratedPTSSuppression(ctx)
         if openProfile.auditsRecordlessDolbyVision, let source = auditSource {
@@ -2050,8 +2070,18 @@ public final class Demuxer: @unchecked Sendable {
         indexedKeyframeEntries(streamIndex: streamIndex).map(\.pts)
     }
 
+    /// The axis `indexedKeyframeEntries` are stamped on: presentation for Matroska Cues and a Blu-ray
+    /// title's EP maps, decode for everything libavformat indexes from `pkt->dts` (AE#561).
+    var keyframeIndexAxis: PlanBoundaryAxis {
+        accessLock.lock()
+        let mapsIndexed = discSeekTable != nil
+        accessLock.unlock()
+        return mapsIndexed ? .presentation : PlanBoundaryAxis.forContainer(formatName: containerFormatName)
+    }
+
     /// `indexedKeyframes` with each entry's byte position in the source (AE#783), -1 where the index
-    /// has none. Matroska stores the position of the Cluster that holds the keyframe.
+    /// has none. Matroska stores the position of the Cluster that holds the keyframe; a Blu-ray title's
+    /// entries are its EP maps' (`DiscSeekTable.titleKeyframes`).
     func indexedKeyframeEntries(streamIndex: Int32) -> [(pts: Int64, pos: Int64)] {
         accessLock.lock()
         defer { accessLock.unlock() }
@@ -2063,6 +2093,12 @@ public final class Demuxer: @unchecked Sendable {
             return []
         }
         let tb = stream.pointee.time_base
+        // A Blu-ray title states its keyframes in its clips' EP maps, already on the source axis; the
+        // index libavformat built is only what probing happened to read.
+        if let table = discSeekTable, stream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO,
+           streamIndex == av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0) {
+            return table.titleKeyframes(titleOriginSec: discTitleOriginSec, timeBase: tb)
+        }
         var result: [(pts: Int64, pos: Int64)] = []
         for entry in Self.indexEntries(of: stream) {
             // AVINDEX_KEYFRAME = 0x0001. Fold each entry onto the contiguous timeline (multi-clip disc)
@@ -2540,15 +2576,18 @@ public final class Demuxer: @unchecked Sendable {
                 let rawRef = pkt.pointee.dts != Int64.min ? pkt.pointee.dts : pkt.pointee.pts
                 let rawRefSec = (rawRef != Int64.min && tbSec > 0) ? Double(rawRef) * tbSec : Double.nan
 
-                // Clip 0's observed raw base anchors the whole fold (playback starts at byte 0, so the first
-                // clip-0 packet read is its true base).
+                // Clip 0's raw clock anchors the whole fold: a DVD title on cell 0's base, a Blu-ray title on
+                // play item 0's `in_time` in the clock span clip 0 shows (when the probe did not already).
                 if idx == 0, clipBase0Sec.isNaN, rawRefSec.isFinite { clipBase0Sec = rawRefSec }
+                if idx == 0, discTitleOriginSec.isNaN, rawRefSec.isFinite, let inTime0 = bdInTime0Sec {
+                    discTitleOriginSec = ClipFold.titleOriginSeconds(inTime0Sec: inTime0, nearRawSec: rawRefSec)
+                }
 
-                // Fold offset actually applied. Clip 0 is untouched (the producer gate zero-bases it). For a
-                // later clip, resolve once from its OBSERVED raw base minus clip 0's base minus the (small,
-                // wrap-free) MPLS presentation offset. Trust the observed base only on a clean forward
-                // crossing so a mid-clip seek cannot mis-anchor it; otherwise fall back to the predicted
-                // offset without caching, so a subsequent clean crossing still resolves it correctly.
+                // Fold offset actually applied. Clip 0 is untouched (the producer gate zero-bases it). A later
+                // Blu-ray clip takes the offset its play item states, in the clock span its packet shows, so
+                // every way of reaching it places its frames alike (`ClipFold.playlistOffsetSeconds`). A DVD
+                // cell takes the base its navigation pack states (`adoptDVDNav`); before one is read, its
+                // OBSERVED raw base on a clean forward crossing, else the predicted offset uncached.
                 var shift = 0.0
                 var resolvedNow = false
                 var usedObserved = false
@@ -2556,7 +2595,13 @@ public final class Demuxer: @unchecked Sendable {
                     let cached = idx < clipResolvedShiftSec.count ? clipResolvedShiftSec[idx] : 0
                     if cached.isFinite {
                         shift = cached
-                    } else if cleanForward, clipBase0Sec.isFinite, rawRefSec.isFinite {
+                    } else if !dvdCellFold, discTitleOriginSec.isFinite, rawRefSec.isFinite {
+                        shift = ClipFold.playlistOffsetSeconds(
+                            predictedSec: clipTimeline[idx].predictedShiftSec, rawSec: rawRefSec,
+                            titleOriginSec: discTitleOriginSec, cumulativeBeforeSec: clipTimeline[idx].cumulativeBeforeSec)
+                        if idx < clipResolvedShiftSec.count { clipResolvedShiftSec[idx] = shift }
+                        resolvedNow = true
+                    } else if dvdCellFold, cleanForward, clipBase0Sec.isFinite, rawRefSec.isFinite {
                         shift = ClipFold.offsetSeconds(observedBaseSec: rawRefSec, base0Sec: clipBase0Sec,
                                                        cumulativeBeforeSec: clipTimeline[idx].cumulativeBeforeSec)
                         if idx < clipResolvedShiftSec.count { clipResolvedShiftSec[idx] = shift }
@@ -2655,10 +2700,15 @@ public final class Demuxer: @unchecked Sendable {
         }
         guard isSourceSeekable else { return false }  // audit HLS-103, see `seek(to:)`
         dropPeekedPacketsLocked()
-        if dvdTimeMap != nil, let timeBase = ctx.pointee.streams[Int(streamIndex)]?.pointee.time_base,
-           timeBase.num > 0, timeBase.den > 0,
-           seekByDVDTimeMapLocked(ctx, sourceSeconds: Double(timestamp) * Double(timeBase.num) / Double(timeBase.den)) {
-            return true
+        // A disc title's timestamps are folded across its clips or cells, so they are no raw seek target;
+        // its EP maps or time map take the folded time to the sync point at or before.
+        if discSeekTable != nil || dvdTimeMap != nil,
+           let timeBase = ctx.pointee.streams[Int(streamIndex)]?.pointee.time_base,
+           timeBase.num > 0, timeBase.den > 0 {
+            let seconds = Double(timestamp) * Double(timeBase.num) / Double(timeBase.den)
+            if seekByDiscTableLocked(ctx, sourceSeconds: seconds) || seekByDVDTimeMapLocked(ctx, sourceSeconds: seconds) {
+                return true
+            }
         }
         let ret = avformat_seek_file(
             ctx,
@@ -3017,7 +3067,7 @@ public final class Demuxer: @unchecked Sendable {
     /// holds `accessLock`.
     private func seekByDiscTableLocked(_ ctx: UnsafeMutablePointer<AVFormatContext>, sourceSeconds seconds: Double) -> Bool {
         guard let table = discSeekTable,
-              let hit = table.keyframe(forSourceSeconds: seconds, base0Sec: clipBase0Sec),
+              let hit = table.keyframe(forSourceSeconds: seconds, titleOriginSec: discTitleOriginSec),
               avformat_seek_file(ctx, -1, hit.offset, hit.offset, hit.offset, AVSEEK_FLAG_BYTE) >= 0 else { return false }
         EngineLog.emit("[Demuxer] EP map seek: source=\(String(format: "%.3f", seconds))s -> clip \(hit.clip) keyframe "
                        + "\(String(format: "%.3f", hit.keyframeSec))s on its clock, byte \(hit.offset)", category: .demux)
