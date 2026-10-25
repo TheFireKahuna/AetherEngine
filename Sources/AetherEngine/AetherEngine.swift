@@ -1377,6 +1377,12 @@ public final class AetherEngine: ObservableObject {
     /// Decoded cues for the active subtitle source (sidecar or embedded side-demuxer). When
     /// `LoadOptions.prepareNativeSubtitles` is set, cues also flow into NativeSubtitleCueStore for mov_text injection (#55).
     @Published public internal(set) var subtitleCues: [SubtitleCue] = []
+    /// The pixels the host draws bitmap subtitles (PGS, DVB, DVD) into: the picture area's size in pixels, its
+    /// points times the screen's scale. With the `MLSubtitleUpscale` trait, each bitmap cue is upscaled to it
+    /// before it enters `subtitleCues` (a 1080p canvas on a 2160p picture is 2x; under 1.2x of its own size a cue
+    /// stays as decoded), and a session with a bitmap track starts playing once the upscaler is ready. Applies to
+    /// cues decoded after it is set. nil (default), or without the trait: cues as decoded.
+    public var bitmapSubtitlePixelSize: CGSize?
     /// #100: per-channel holdback for PGS cues arriving behind the playhead (catch-up bursts after
     /// side-reader starvation). Reset wherever the cue arrays reset (track switch, seek re-anchor,
     /// clear, load/stop) so a hold can never leak across subtitle sessions.
@@ -1472,6 +1478,9 @@ public final class AetherEngine: ObservableObject {
     /// cues around the playhead still land in the first batch and the rest of the 60 s lead fills
     /// over the following ticks.
     nonisolated static let subtitleDrainMaxPacketsPerTick: Int = 256
+    /// How far past the playhead an upscaling landing's batch reaches (`bitmapSubtitlePixelSize`): the line on
+    /// screen and the next few, each upscaled before the tick publishes.
+    nonisolated static let subtitleUpscaleLandingSeconds: Double = 3
     /// Phase D: the OCR worker decodes bitmap compositions to playhead + this lead so AVKit's
     /// ~240 s forward .vtt prefetch burst at selection is served populated, never cached empty.
     nonisolated static let subtitleOCRLeadSeconds: Double = 240
@@ -4204,6 +4213,7 @@ public final class AetherEngine: ObservableObject {
             abandonStartupContinuation()
             throw CancellationError()
         }
+        startBitmapSubtitleUpscaler()
         DisplaySignalProbe.sessionBegan(self)
         let attempt = LoadAttempt()
         defer { if let gen = attempt.generation { waitingLoadGenerations.remove(gen) } }
@@ -5791,6 +5801,8 @@ public final class AetherEngine: ObservableObject {
                 presentCurrentLayer()
                 // #124: a paused mount skips autostart; loadSoftware's host.$isReady settles .paused.
                 if Self.loadPerformsAutostart(options) {
+                    await awaitBitmapSubtitleUpscaler()
+                    try checkLoadCurrent(gen)
                     softwareHost?.play()
                     state = .playing
                 }
@@ -5882,6 +5894,8 @@ public final class AetherEngine: ObservableObject {
                 // rejected or park silently, and the escalation (reload master -> reduced HDR master ->
                 // media, all on the LAN IP) is the recovery that hop needs.
                 if Self.loadPerformsAutostart(options) {
+                    await awaitBitmapSubtitleUpscaler()
+                    try checkLoadCurrent(gen)
                     if airPlayServedMasterToReceiver, let session = nativeVideoSession,
                        session.servingMasterPlaylist, !options.isLive {
                         try await runStartupReadinessGate(

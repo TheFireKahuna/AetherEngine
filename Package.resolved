@@ -1,5 +1,5 @@
 {
-  "originHash" : "02a100086bca7e24d63ed902be8242c57deff599b4bca6230e72088ba57303fb",
+  "originHash" : "a4ce73d5471a016fefef6bedd1ee028cf6e762ca999b60805fb36adc22e02a0e",
   "pins" : [
     {
       "identity" : "ffmpegbuild",
@@ -26,6 +26,15 @@
       "state" : {
         "revision" : "d4162ddd28a5d3e93d7533316c4eb6326e91b88e",
         "version" : "2.2.0-fire.2"
+      }
+    },
+    {
+      "identity" : "libmlsubupscaler",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/TheFireKahuna/LibMLSubUpscaler",
+      "state" : {
+        "revision" : "56b3b6771755ed4c2d37c913ede3ddab365d935a",
+        "version" : "1.1.0"
       }
     },
     {

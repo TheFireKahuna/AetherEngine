@@ -54,6 +54,10 @@ let package = Package(
             name: "DolbyVisionStillReshaping",
             description: "Compile the CPU reshaping that turns a Dolby Vision Profile 5 / 10.0 frame into a still (scrub thumbnails, I-frame stills, held pictures)."
         ),
+        .trait(
+            name: "MLSubtitleUpscale",
+            description: "Link LibMLSubUpscaler, so bitmap subtitles (PGS, DVB, DVD) are upscaled to bitmapSubtitlePixelSize by ArtCNN on the Neural Engine before they publish."
+        ),
         .default(enabledTraits: []),
     ],
     dependencies: [
@@ -96,6 +100,9 @@ let package = Package(
         // of its own because it is FFmpeg-derived code under LGPL-2.1-or-later, which the engine's App Store exception
         // cannot cover; linked dynamically it stays replaceable, as FFmpegBuild's frameworks are.
         .package(url: "https://github.com/TheFireKahuna/LibDeinterlace", .upToNextMinor(from: "1.0.0")),  // 1.0.0: bwdif, fieldmatch and decimate on the GPU, bit-exact to FFmpeg n8.1.3
+        // Bitmap subtitles upscaled 2x by ArtCNN (MIT) on the Neural Engine, its models shipped compiled. Pinned to
+        // the minor for the same reason as FFmpegBuild above.
+        .package(url: "https://github.com/TheFireKahuna/LibMLSubUpscaler", .upToNextMinor(from: "1.1.0")),  // 1.1.0: usable after the default specialisation, fastPrediction loaded behind it; 1.0.0: the upscaler from this engine as a package, models compiled
     ],
     targets: [
         .target(
@@ -105,6 +112,7 @@ let package = Package(
                 .product(name: "Dovi", package: "LibDovi"),
                 .product(name: "LibDeinterlace", package: "LibDeinterlace"),
                 .product(name: "TrueHD", package: "LibTrueHD", condition: .when(traits: ["TrueHDObjectAudio"])),
+                .product(name: "LibMLSubUpscaler", package: "LibMLSubUpscaler", condition: .when(traits: ["MLSubtitleUpscale"])),
             ],
             // Silent E-AC-3 Atmos that `AtmosOutputActivator` loops beside an APAC track on tvOS.
             resources: [.copy("Resources/silent-atmos.mp4")],

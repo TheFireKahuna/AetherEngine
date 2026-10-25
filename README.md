@@ -653,7 +653,7 @@ The 7.x line raised the floor from iOS 16, tvOS 17 and macOS 14. A project that 
 
 ### Optional components
 
-Four components are compiled only when a host asks for them, each behind a package trait that is **off by default**:
+Five components are compiled only when a host asks for them, each behind a package trait that is **off by default**:
 
 | Trait | Compiles and links | Without it |
 | --- | --- | --- |
@@ -661,6 +661,7 @@ Four components are compiled only when a host asks for them, each behind a packa
 | `DTSXObjectAudio` | the DTS:X decoder (FFmpeg's `dca` with FFmpegBuild's height patch, no extra library) and the object renderer | DTS:X keeps the channel bridge whatever `objectAudioRendering` asks |
 | `DualLayerDolbyVision` | the Profile 7 FEL dual-layer composer (`DualLayerVideoDecoder`, its Metal composer and the per-frame display metadata) | a Profile 7 source keeps the native route whatever `preferDualLayerDolbyVision` asks |
 | `DolbyVisionStillReshaping` | the reshaping that turns a Dolby Vision Profile 5 / AV1 Profile 10.0 frame into a still | such a source has no scrub stills, I-frame stills or held picture (`supportsCacheBackedStills` is false); playback is unaffected |
+| `MLSubtitleUpscale` | [LibMLSubUpscaler](https://github.com/TheFireKahuna/LibMLSubUpscaler): bitmap subtitles (PGS / DVB / DVD) upscaled by ArtCNN on the Neural Engine to `bitmapSubtitlePixelSize` before they publish, the drain's landing line first, and a session with a bitmap track starting once the upscaler is ready (`prewarmBitmapSubtitleUpscaler()` at app open) | bitmap cues publish as decoded whatever `bitmapSubtitlePixelSize` says |
 
 Without its trait a component is not in the binary: its code is not compiled, and a library behind it is neither linked nor resolved (it drops out of the host's `Package.resolved`). The options that ask for it stay in the API, so a host compiles the same either way; they change nothing, and the session log says why (`TrueHD Atmos rendering requested but not built in (TrueHDObjectAudio trait off)`, `DV P7 dual-layer route: not taken (built without the DualLayerDolbyVision trait)`). A host that wants to hide a setting its build cannot honour asks `AetherEngine.OptionalComponent`, for example `AetherEngine.OptionalComponent.dualLayerDolbyVision.isBuiltIn`.
 
@@ -670,10 +671,11 @@ To enable them, list the traits on the package dependency:
 
 ```swift
 .package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.44.0",
-         traits: ["TrueHDObjectAudio", "DTSXObjectAudio", "DualLayerDolbyVision", "DolbyVisionStillReshaping"])
+         traits: ["TrueHDObjectAudio", "DTSXObjectAudio", "DualLayerDolbyVision", "DolbyVisionStillReshaping",
+                  "MLSubtitleUpscale"])
 ```
 
-In an Xcode project, a remote package's traits are set in the package dependency editor (Project › Package Dependencies), and Xcode stores them in the `.pbxproj`. XcodeGen cannot express them yet (2.45.4 drops a `traits:` key on a package without a word), so an XcodeGen project either patches the generated `.pbxproj` after each generate (a `traits = ( TrueHDObjectAudio, DTSXObjectAudio, );` list in the package's `XCRemoteSwiftPackageReference`, which Xcode 27 builds with), or depends on a small local package that depends on AetherEngine with the traits set and re-exports it (`@_exported import AetherEngine`). [Probes/AllTraits](Probes/AllTraits/Package.swift) is that package with every trait on, and `Probes/DolbyVisionPulse/Device/PulseEngine` one with `DualLayerDolbyVision` alone. The engine itself builds with them through `swift build --traits TrueHDObjectAudio,DTSXObjectAudio,DualLayerDolbyVision,DolbyVisionStillReshaping` (or `--enable-all-traits`); CI builds and tests both the default and the all-traits configuration, and builds the all-traits engine for tvOS and iOS through `Probes/AllTraits`.
+In an Xcode project, a remote package's traits are set in the package dependency editor (Project › Package Dependencies), and Xcode stores them in the `.pbxproj`. XcodeGen cannot express them yet (2.45.4 drops a `traits:` key on a package without a word), so an XcodeGen project either patches the generated `.pbxproj` after each generate (a `traits = ( TrueHDObjectAudio, DTSXObjectAudio, );` list in the package's `XCRemoteSwiftPackageReference`, which Xcode 27 builds with), or depends on a small local package that depends on AetherEngine with the traits set and re-exports it (`@_exported import AetherEngine`). [Probes/AllTraits](Probes/AllTraits/Package.swift) is that package with every trait on, and `Probes/DolbyVisionPulse/Device/PulseEngine` one with `DualLayerDolbyVision` alone. The engine itself builds with them through `swift build --traits TrueHDObjectAudio,DTSXObjectAudio,DualLayerDolbyVision,DolbyVisionStillReshaping,MLSubtitleUpscale` (or `--enable-all-traits`); CI builds and tests both the default and the all-traits configuration, and builds the all-traits engine for tvOS and iOS through `Probes/AllTraits`.
 
 ## Support
 
@@ -698,6 +700,8 @@ The exception covers AetherEngine's own code; it does not extend to its dependen
 **libdovi** reaches your app through [LibDovi](https://github.com/superuser404notfound/LibDovi) as a static library. It is the compiled `dolby_vision` crate from [dovi_tool](https://github.com/quietvoid/dovi_tool), Copyright (c) quietvoid and contributors, dual-licensed MIT OR Apache-2.0 and consumed here under the MIT option. MIT asks for that copyright notice to travel with the binary, and it is quietvoid's notice that belongs on the acknowledgements screen. The MIT text in LibDovi's own `LICENSE` covers the packaging and build scripts only; both parts are in that one file.
 
 **LibTrueHD** ([superuser404notfound/LibTrueHD](https://github.com/superuser404notfound/LibTrueHD)) reaches your app as a static library and decodes TrueHD for `objectAudioRendering`. Its C API, framer and packaging are MIT (Copyright Quick104, who wrote it for Silo as SiloObjectAudio, and Vincent Herbst). It compiles in the `truehd` and `oamd` crates from [truehdd](https://github.com/truehdd/truehdd), Copyright Rainbaby and the truehdd contributors, under the Apache License 2.0, which asks for the license text and LibTrueHD's `NOTICE` to travel with the binary. Apache-2.0 combines with the engine's LGPL-3.0. It comes in only through the `TrueHDObjectAudio` trait, off by default ([Optional components](#optional-components)); with the trait on it is linked whether or not a host turns the option on.
+
+**LibMLSubUpscaler** ([TheFireKahuna/LibMLSubUpscaler](https://github.com/TheFireKahuna/LibMLSubUpscaler)) reaches your app as a static library, MIT, and carries ArtCNN's trained models ([Artoriuz/ArtCNN](https://github.com/Artoriuz/ArtCNN), MIT). MIT asks for ArtCNN's notice to travel with the binary: it is `ArtCNNLicense.text`, re-exported by the engine. It comes in only through the `MLSubtitleUpscale` trait, off by default ([Optional components](#optional-components)).
 
 **DTS:X** is decoded by FFmpeg's own `dca` decoder in the FFmpeg frameworks above: FFmpegBuild carries a patch that decodes the height channels of DTS:X's standard presentation (#798), so the `DTSXObjectAudio` trait adds no library and no license of its own. Earlier releases linked LibDTSX instead, whose `dca` crate is a port of FFmpeg's decoder combined with Apache-2.0 code and therefore LGPL-3.0-or-later, which an App Store app cannot meet without an exception.
 
