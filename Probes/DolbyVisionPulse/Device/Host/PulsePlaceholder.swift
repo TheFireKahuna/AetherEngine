@@ -391,7 +391,7 @@ final class PlaceholderPlayerController: AVPlayerViewController {
         }
     }
 
-    /// FelOverlayRenderer.install(in:)'s placement: inside AVPlayerLayer's intermediate layer, under
+    /// SoftwareOverlayRenderer.install(in:)'s placement: inside AVPlayerLayer's intermediate layer, under
     /// `FigSubtitleCALayer`; on top of the player layer when that shape is not found.
     private func install() {
         guard !installed, let root = viewIfLoaded?.layer, let playerLayer = Self.playerLayer(of: session.player, in: root) else { return }

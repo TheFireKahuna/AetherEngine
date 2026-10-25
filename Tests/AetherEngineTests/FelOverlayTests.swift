@@ -1,5 +1,6 @@
 // The FEL overlay route: AVPlayer plays a Profile 7 FEL's base layer on the native route, and
-// FelOverlayRenderer composes the enhancement layer (read by FelEnhancementSource) over its picture.
+// SoftwareOverlayRenderer shows FelCompositionSource's composition (the enhancement layer read by
+// FelEnhancementTap) over its picture.
 import AVFoundation
 import Foundation
 import Testing
@@ -20,11 +21,10 @@ struct FelOverlayTests {
 extension FelOverlayTests {
 
     /// A renderer over an idle tap, both closed by the caller.
-    private func makeRenderer() throws -> (FelOverlayRenderer, FelEnhancementTap) {
+    private func makeRenderer() throws -> (SoftwareOverlayRenderer, FelEnhancementTap) {
         let tap = FelEnhancementTap()
-        let renderer = try #require(FelOverlayRenderer(item: AVPlayerItem(url: URL(fileURLWithPath: "/dev/null")), tap: tap,
-                                                                  baseLayerFullRange: false))
-        return (renderer, tap)
+        let source = try #require(FelCompositionSource(tap: tap, baseLayerFullRange: false))
+        return (SoftwareOverlayRenderer(item: AVPlayerItem(url: URL(fileURLWithPath: "/dev/null")), source: source), tap)
     }
 
     /// AVPlayerLayer builds its private sublayers at init: an intermediate layer holding the video
@@ -150,17 +150,18 @@ struct FelOverlayRealFileTests {
         let player = try #require(engine.currentAVPlayer, "a FEL with felOverlay plays on the native route")
         player.isMuted = true
         engine.play()
-        let renderer = try #require(engine.felOverlay)
+        let renderer = try #require(engine.softwareOverlay)
+        let source = try #require(renderer.source as? FelCompositionSource)
         let deadline = Date().addingTimeInterval(15)
-        while renderer.counters.composed < 48, Date() < deadline {
+        while renderer.counters.presented < 48, Date() < deadline {
             try await Task.sleep(for: .milliseconds(100))
         }
         let counters = renderer.counters
-        #expect(counters.composed >= 48)
-        #expect(counters.composeFailed == 0)
+        #expect(counters.presented >= 48)
+        #expect(counters.failed == 0)
         #expect(counters.notReady == 0)
         // Past the first second the enhancement layer is decoded in time: the residual is on.
-        #expect(counters.residualOff < counters.composed / 4)
+        #expect(source.residualOff < counters.presented / 4)
     }
 }
 extension FelOverlayTests {

@@ -34,7 +34,7 @@ import UIKit
 //   failure skips the arm); `secs=N`: play N seconds, looping the clip, instead of once through (80 s cap); on `avplayer`
 //   arms it only shortens the arm (no looping).
 // - `overlay`: as `engine`, but the FEL plays on the native route (`LoadOptions.felOverlay`): AVPlayer plays the
-//   8.1 base layer in an `AVPlayerViewController` and `FelOverlayRenderer` composes the enhancement layer over it
+//   8.1 base layer in an `AVPlayerViewController` and `SoftwareOverlayRenderer` shows the composed picture over it
 //   inside AVKit's render layer, as Sodalite shows it. Takes `out=`, `rpu=` and `secs=` like `engine`.
 // - `soak`: `engine` for `minutes=` with a `seeks=at@to,...` schedule, sampled once a second, ending in
 //   one `soak summary` line; takes `out=` like `engine` (default sv22, the engine's).
@@ -318,7 +318,7 @@ struct PulseHarnessView: View {
             log("engine load failed: \(error)")
             return
         }
-        // The overlay is published after load returns; `[FelOverlayRenderer] installed` and its counters confirm it.
+        // The overlay is published after load returns; `[SoftwareOverlay] installed` and its counters confirm it.
         if overlay { log("route=\(e.videoRoute.rawValue)") }
         let deadline = Date().addingTimeInterval(min(seconds ?? 80, 80))
         while Date() < deadline {
@@ -495,7 +495,7 @@ private struct PlaceholderRepresentable: UIViewControllerRepresentable {
 }
 
 /// An `overlay` arm's picture: the engine's AVPlayer in an `AVPlayerViewController`, with the engine's FEL
-/// overlay installed in AVKit's render layer (Sodalite's `PlayerHostController.installFelOverlay`).
+/// overlay installed in AVKit's render layer (Sodalite's `PlayerHostController.installSoftwareOverlay`).
 private struct OverlayPlayerRepresentable: UIViewControllerRepresentable {
     let engine: AetherEngine
 
@@ -520,7 +520,7 @@ private final class OverlayPlayerController: AVPlayerViewController {
                 self?.installOverlay()
             }
             .store(in: &subscriptions)
-        engine.$felOverlay
+        engine.$softwareOverlay
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.installOverlay() }
             .store(in: &subscriptions)
@@ -535,14 +535,14 @@ private final class OverlayPlayerController: AVPlayerViewController {
 
     /// Puts the overlay inside AVKit's player layer once both exist; a no-op when it is already there.
     private func installOverlay() {
-        guard let overlay = engine.felOverlay, let player, let root = viewIfLoaded?.layer,
+        guard let overlay = engine.softwareOverlay, let player, let root = viewIfLoaded?.layer,
               let renderLayer = Self.playerLayer(of: player, in: root) else { return }
         var ancestor = overlay.layer.superlayer
         while let current = ancestor, current !== renderLayer { ancestor = current.superlayer }
         if ancestor === renderLayer { return }
         overlay.layer.removeFromSuperlayer()
         let belowSubtitles = overlay.install(in: renderLayer)
-        PulseLog.shared.note("[Pulse] FEL overlay installed in AVKit's render layer (\(belowSubtitles ? "below its subtitles" : "on top"))")
+        PulseLog.shared.note("[Pulse] software overlay installed in AVKit's render layer (\(belowSubtitles ? "below its subtitles" : "on top"))")
     }
 
     private static func playerLayer(of player: AVPlayer, in layer: CALayer) -> AVPlayerLayer? {
