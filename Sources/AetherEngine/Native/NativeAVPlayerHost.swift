@@ -479,6 +479,11 @@ final class NativeAVPlayerHost {
     /// added later inherits it without anyone remembering to arm at the call site.
     var onWillAttachItem: (@MainActor () -> Void)?
 
+    /// The item just became the player's current item. Same funnel as `onWillAttachItem`, so whatever
+    /// the engine keeps on an item (its legible output, its selection and landing observers) is armed
+    /// on every item, the in-place swaps' included.
+    var onDidAttachItem: (@MainActor (AVPlayerItem) -> Void)?
+
     /// Replace the item under a session that survives the swap, keeping the contract that session was
     /// loaded under (#440 round 5).
     ///
@@ -919,6 +924,7 @@ final class NativeAVPlayerHost {
         }
 
         avPlayer.replaceCurrentItem(with: item)
+        onDidAttachItem?(item)
         if contract.nativeVideoFrameDiagnostics || contract.nativeVideoFrameRecovery {
             startVideoFrameDiagnostics(item: item, session: sid)
         }

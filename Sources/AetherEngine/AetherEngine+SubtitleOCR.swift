@@ -92,7 +92,8 @@ extension AetherEngine {
     /// `subtitleOCRFinishTick` resolves composition ends into CLOSED cues for off-main OCR.
     fileprivate func subtitleOCRPlanTick(ordinal: Int, streamIndex: Int32) -> SubtitleOCRTickPlan? {
         guard let packetStore = activeSubtitlePacketStore else { return nil }
-        let playhead = sourceTime
+        let playhead = subtitleDrainPlayhead()
+        let landingGeneration = subtitleLandingGeneration
         // #271: same rule as the overlay drainer, a tick that ran long is not a seek.
         let tickUptime = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
         let elapsed = subtitleOCRLastTickUptime.map { tickUptime - $0 } ?? 0
@@ -101,14 +102,13 @@ extension AetherEngine {
             cursor: subtitleOCRCursors[ordinal], playhead: playhead,
             lead: subtitleOCRDemandLead(base: Self.subtitleOCRLeadSeconds, playhead: playhead),
             backscan: Self.subtitleDrainBackscanSeconds,
-            jumpThreshold: Self.subtitleDrainJumpThresholdSeconds,
-            elapsedSinceLastPlan: elapsed)
+            repositioning: subtitleRepositioning(elapsedSinceLastPlan: elapsed))
         let window: (from: Double, through: Double)
         switch plan {
         case .idle:
             subtitleOCRCursors[ordinal]?.lastPlayhead = playhead
-            return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, plan: plan,
-                                       window: (playhead, playhead), decoder: nil, batch: [])
+            return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, landingGeneration: landingGeneration,
+                                       plan: plan, window: (playhead, playhead), decoder: nil, batch: [])
         case .decode(let from, let through):
             window = (from, through)
         case .resetAndDecode(let from, let through):
@@ -119,8 +119,8 @@ extension AetherEngine {
             subtitleOCRDecoder = makeSubtitleDrainDecoder(streamIndex: streamIndex)
         }
         guard let decoder = subtitleOCRDecoder else {
-            return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, plan: .idle,
-                                       window: window, decoder: nil, batch: [])
+            return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, landingGeneration: landingGeneration,
+                                       plan: .idle, window: window, decoder: nil, batch: [])
         }
         let entries = packetStore.entries(streamIndex: streamIndex,
                                           from: window.from, through: window.through)
@@ -132,8 +132,8 @@ extension AetherEngine {
         let batchEnd = SubtitleOverlayDrainer.batchEnd(
             count: entries.count, cap: Self.subtitleOCRMaxPacketsPerTick,
             ptsAt: { entries[$0].ptsSeconds })
-        return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, plan: plan, window: window,
-                                   decoder: decoder, batch: entries[..<batchEnd],
+        return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, landingGeneration: landingGeneration,
+                                   plan: plan, window: window, decoder: decoder, batch: entries[..<batchEnd],
                                    windowComplete: batchEnd == entries.count)
     }
 
@@ -187,7 +187,8 @@ extension AetherEngine {
             lastDecoded = tick.window.from
         }
         subtitleOCRCursors[ordinal] = SubtitleDrainCursor(
-            lastDecodedPts: lastDecoded ?? tick.window.from, lastPlayhead: tick.playhead)
+            lastDecodedPts: lastDecoded ?? tick.window.from, lastPlayhead: tick.playhead,
+            landingGeneration: tick.landingGeneration)
         return closed
     }
 
@@ -215,6 +216,8 @@ extension AetherEngine {
 fileprivate struct SubtitleOCRTickPlan: @unchecked Sendable {
     let ordinal: Int
     let playhead: Double
+    /// The landing count the tick planned against (`SubtitleRepositioning.signalled`).
+    let landingGeneration: UInt64
     let plan: SubtitleDrainPlan
     let window: (from: Double, through: Double)
     let decoder: EmbeddedSubtitleDecoder?

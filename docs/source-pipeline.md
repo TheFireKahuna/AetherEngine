@@ -32,6 +32,8 @@ Waiting for a device run, in the order worth doing them:
    AirPlay showing every kind; a subtitle delay set in Settings mid-play moving a text track to the
    overlay, and PiP then rebuilding to serve it. `[NativeSubtitles] following ...` and
    `forced ordinal=N from the index`.
+7. tvOS's own generated subtitles (step 2's follow-ups): the `subs` probe's `case=generated` on English
+   speech without English subtitles, before the generated-option path is built.
 
 ## Why
 
@@ -353,8 +355,106 @@ In order, each step replacing a reader rather than adding one:
      event text, overrides intact) and rich-text runs; `\an` and `\pos` as cue settings
      (`WebVTTCueSettings.settings(for:)`, the parser's inverse). Colour and font are left to the
      viewer's caption style and the host's text style rules.
-3. **The PGS overlay pulls.** The drainer asks the subtitle source for its window around the playhead;
-   the packet store becomes a cache of what was pulled, not a buffer filled ahead.
+   - **Follow-ups, from the tvOS 27.2 SDK, rfc8216bis-22 and WWDC26 session 256 (not built).**
+     - *OCR renditions are machine-generated.* rfc8216bis-22 lets any rendition carry
+       `public.machine-generated` "to indicate the Rendition was authored or translated
+       programmatically"; the SDK has `AVMediaCharacteristicMachineGenerated` on tvOS 26. A bitmap
+       track's rendition (recognized by OCR, forced or full) declares it in `CHARACTERISTICS`, beside
+       the accessibility characteristics an SDH one already carries. A text track's rendition (converted,
+       not generated) and an ASS track's (reduced, not generated) do not.
+     - *tvOS generates subtitles of its own.* tvOS 27 transcribes English audio into English
+       subtitles on device, with no code, for HLS (live included) and files (session 256), and
+       `-[AVPlayerItem selectableMediaSelectionOptionsInMediaSelectionGroup:]` (tvOS 27) exists because
+       such an option "may require that the source audio option is currently selected". Today
+       `followNativeSubtitleSelection` matches the selected option to a track by its position in the
+       group and its language (`nativeOrdinal(forOptionAt:...)`), so a generated English option can be
+       taken for the source's English track or shift the positions of the others; and a generated option
+       selected while the legible output suppresses goes through the "no option" branch, which keeps the
+       suppression and may hide tvOS's own lines. The cutover: options are matched to the engine's
+       renditions by identity (the rendition's own `NAME`/URI the engine declared, through the option's
+       `propertyList`/display name, not by position), an option that matches none of them and has
+       `.machineGenerated` is tvOS's own (drawn by AVKit: suppression lifted, the overlay fed nothing,
+       `primarySubtitleDrawnByAVKit` true), and the host sees it as a selection like any other. The
+       machine-generated characteristic on our OCR renditions (above) is then never the deciding signal,
+       since those match by identity first.
+     - *Probe before building the generated-option path:* a `subs` arm (`case=generated`) on a fixture
+       with English speech and no English subtitles: is a generated option in the group, how is it named
+       and characterised, does AVFoundation select it by itself (subtitles Always On, and the forcedOnly
+       default), and does a suppressing legible output hide it.
+     - *Caption style preview (tvOS 26.4).* `-[AVPlayerLayer setCaptionPreviewProfileID:position:text:]`
+       and `stopShowingCaptionPreview` show a style preview and hide AVKit's own lines while it shows;
+       the overlay is not AVKit's, so a host that offers the preview hides the overlay for its duration
+       (Sodalite's subtitle style menu; nothing in the engine).
+     - *Authoring 5.8* (a language's regular rendition also contains its forced lines) holds whenever
+       the source's regular track carries them, which is the authored norm; nothing is synthesised.
+3. **The PGS overlay pulls. Next.** The drainer and the OCR worker ask the subtitle source for their
+   windows around the playhead; for an indexed stream the packet store becomes a cache of what was
+   pulled, not a buffer filled ahead.
+   - **Why the engine still draws.** tvOS 27.2 offers no native route for a bitmap subtitle:
+     `AVPlayerItemRenderedLegibleOutput` and `AVRenderedCaptionImage` are unavailable on tvOS,
+     `AVCaptionRenderer` there has only its style preview, the new `AVPlayerItemSampleBufferOutput`
+     delivers "only ... decoded PCM audio" of HLS items, and HLS carries WebVTT and IMSC1's text
+     profile only (authoring 4.2, 5.2; AirPlay 2 TVs WebVTT only). So bitmaps stay the overlay's, read
+     the way Apple's own pull output is meant to be used: far ahead of the play time, paced against
+     the item's timebase, paused once near-term playback is covered.
+   - **The pull.** `SubtitleSource.pull(stream, from:through:)` reads the index's blocks in that span
+     on the fill's parallel lanes (`readFrames`), through the exact range reader over the shared source
+     cache, so a span the pump has already read is served from disk and the origin is asked only for
+     what nobody fetched; it stores them and records the span as pulled for that stream. Pulls of one
+     stream are coalesced (a span already pulled or in flight is not asked again) and a newer landing
+     cancels an older one's unread remainder.
+   - **The drainer asks for its own window, nothing more.** Each tick it pulls `[playhead - backscan,
+     playhead + lead]` and decodes what is pulled; on a landing the landing span (backscan through a few
+     seconds past the playhead) is pulled first and the lead after it, so the line on screen at a seek
+     costs one read round, usually from disk. The overlay's 15 s margin past the window is gone: it
+     existed so the set at the window's edge had its clear stored, and an indexed set's end comes from
+     the index (below).
+   - **Landings are signalled natively. Built.** On the HLS route every item the host attaches
+     (`NativeAVPlayerHost.onDidAttachItem`, so the in-place swaps' items too, which used to miss step 2's
+     legible output and selection observer) is observed for `AVPlayerItemTimeJumpedNotification`, and
+     each one is a landing (`subtitleLanded`): the drain and the OCR worker reset on it exactly once
+     (`SubtitleRepositioning.signalled`, a landing count on the cursor), stand at the landing until the
+     picture reports a time of its own (`sourceTime` follows the presented frame, #49, which stays on the
+     old one while AVPlayer buffers towards the target, #123), and #93's rendition re-anchor is checked
+     on it. Measured on macOS 27 with the `subs` fixture: the notification arrives for every seek, paused
+     ones included, on the main queue with the seek's completion and the item time already at the
+     target, and for each step of a reverse scan (about four a second); the legible output's
+     `outputSequenceWasFlushed:` arrives with it, but only on an item with legible media, so the
+     notification is the one used. Since `d2a6df05` a VOD run's item time is source time less the plan
+     anchor in every run, and live's pin keeps its timeline continuous, so on this route the source-axis
+     playhead moves discontinuously only at a stated landing. The jump threshold (#271) and #93's
+     60 s rendered-time rule are gone from it; the threshold stays the software route's, which has no
+     AVPlayer. The landing pull (above) will start here.
+   - **Pacing reads the item's timebase.** The pull's lead is judged against `AVPlayerItem.timebase`
+     (readable off the main actor), not a main-actor hop for `sourceTime` at every park.
+   - **What the index makes exact.** A bitmap set's end is the next block's time in the index, known
+     without reading it, so `firstPTS(after:)` and its derivation horizon (#362 round 2) are the walk's
+     only; a pulled span has no holes, so the harvest-gap hold (#362) is the walk's only; a pulled span
+     is read by construction, so the landing-ground check (#416) is the walk's only.
+   - **One writer per route.** Once the routes settle, the pump's packet sink
+     (`subtitlePacketStreamIndices`) and its decode tap (`subtitleTapRoutes`, Sodalite#32, which today
+     decodes every text stream although an indexed stream's rendition is complete at load) narrow to
+     the walked streams, on both hosts. `IndexSource`'s forward stepping and `CompositeSource` are
+     deleted; the loop is the walk alone and runs only while a walked stream is demanded. A walked
+     stream keeps the walk and the pump, with #362 and #416 as they are; live, which has no source at
+     all, keeps the pump alone.
+   - **The store as a cache.** An indexed stream's packets can be pulled again, so they evict by
+     distance from the playhead, not oldest first, and a seek back past what was evicted is a pull
+     (#125's deferred case closes). The per-stream and aggregate caps (#125, #166) then bound the walked
+     streams only.
+   - **The rendition fill hands over its frames.** `fillIndexedRenditions` already reads every frame
+     of an indexed text stream at load; it stores them as pulled for the whole stream, so the overlay
+     never reads a text frame twice (layer 2, item 6).
+   - **OCR pulls the same way.** The OCR worker pulls its window, as far ahead as AVKit's requests
+     move it, so a full bitmap rendition's recognition is bounded by its CPU budget, not by what the
+     store holds (step 2's decision on full bitmap tracks is reopened once this is built).
+   - **Tests.** `Issue362HarvestHoleTests`, `Issue362AuthoredClearTests` and `Issue416LandingGroundTests`
+     keep the walked route; their indexed cases become pull tests (a landing decodes from a pulled span,
+     an indexed set ends at the index's next block, a seek back past an evicted span pulls it again).
+     `Issue125`/`Issue166` keep the walked streams; `SubtitleIndexPrefetchTests` become pull tests.
+   - **Logs.** `[SubtitleSource] pulled stream N a-b s (k frames, from cache m)`, the narrowed taps
+     (`[HLSVideoEngine] subtitle pump tap armed for streams [...]` naming the walked ones), and no
+     `subwalk` reader in `[SourceLedger]` for a source whose streams are all indexed.
 4. **The I-frame playlist from the index. Built.** `IFrameKeyframeReader`
    (`Video/IFrameKeyframeReader.swift`, the side reader reworked) reads each keyframe one of two ways,
    settled once per session by what the index covers:

@@ -2176,6 +2176,18 @@ public final class AetherEngine: ObservableObject {
         displayAxisIsItemAxis ? shift : sourcePresentationOrigin
     }
 
+    /// The seam shift folding a native item time onto source PTS: the presentation axis's statement for
+    /// that time, else the playlist shift.
+    func nativeItemShiftSeconds(atItemSeconds seconds: Double) -> Double {
+        presentationAxis.shiftSeconds(atItemSeconds: seconds) ?? playlistShiftSeconds
+    }
+
+    /// A native item time on the axis `sourceTime` publishes: source PTS, or the item axis itself on a
+    /// sequential origin (#368).
+    func nativeSourceSeconds(atItemSeconds seconds: Double) -> Double {
+        displayAxisIsItemAxis ? seconds : seconds + nativeItemShiftSeconds(atItemSeconds: seconds)
+    }
+
     /// Diagnostics only. Reads HLSVideoEngine's videoShiftPts synchronously, bypassing the async
     /// onPlaylistShiftChanged relay. A persistent gap vs `playlistShiftSeconds` means the clock is folding
     /// with a stale shift (AetherEngine#49 divergence). Poll alongside `frameAhead` when tracing divergence.
@@ -2594,6 +2606,11 @@ public final class AetherEngine: ObservableObject {
     var nativeSubtitleLegibleOutput: AVPlayerItemLegibleOutput? = nil
     var nativeSubtitleSelectionObserver: NSObjectProtocol? = nil
     var nativeSubtitleSelectionTask: Task<Void, Never>? = nil
+    /// The native item's landings (`AVPlayerItemTimeJumpedNotification`), counted for the subtitle drain
+    /// (`SubtitleRepositioning.signalled`), and the latest one while the picture has not reported past it.
+    var nativeItemTimeJumpObserver: NSObjectProtocol? = nil
+    var subtitleLandingGeneration: UInt64 = 0
+    var subtitleLanding: SubtitleLanding? = nil
     /// What the selection observer last applied.
     var nativeSubtitleFollowedKey: NativeSubtitleFollowedKey? = nil
     /// The anchor a host pick asked for, taken by the selection it causes.
@@ -2765,12 +2782,12 @@ public final class AetherEngine: ObservableObject {
     /// session so a media reload that also fails cannot loop. Reset on each load.
     var masterFallbackUsed = false
 
-    /// #93 PiP skips: AVKit-side seeks (PiP +-15s buttons) bypass the engine seek API, so a far
-    /// playhead jump is detected on $renderedTime and, once settled, the remembered rendition selection
-    /// replays: its demand moves the subtitle source to the playhead and its deselect/reselect busts
-    /// AVKit's cached empty .vtt windows. Cancelled on load reset / stop; newer jumps supersede.
+    /// #93 PiP skips: AVKit-side seeks (PiP +-15s buttons) bypass the engine seek API, so every landing
+    /// the item states (`AVPlayerItemTimeJumpedNotification`) is checked, once settled, against the
+    /// rendition's reading; one outside it replays the remembered rendition selection: its demand moves
+    /// the subtitle source to the playhead and its deselect/reselect busts AVKit's cached empty .vtt
+    /// windows. Cancelled on load reset / stop; newer landings supersede.
     var nativeSubtitleReanchorTask: Task<Void, Never>? = nil
-    nonisolated static let subtitleReanchorJumpSeconds: Double = 60
     nonisolated static let subtitleReanchorSettleNanos: UInt64 = 2_500_000_000
     nonisolated static let subtitleReanchorBackwardSlack: Double = 5
     nonisolated static let subtitleReanchorForwardSlack: Double = 90
@@ -3449,11 +3466,6 @@ public final class AetherEngine: ObservableObject {
             // not-ready window; the stores are already filled, so the pre-fill returns fast.
             setNativeSubtitleSelected(track: ordinal)
         }
-    }
-
-    /// Pure decision (#93 PiP skips): does a rendered-time transition qualify as a seek-like jump?
-    nonisolated static func isSubtitleReanchorJump(from: Double, to: Double) -> Bool {
-        abs(to - from) >= subtitleReanchorJumpSeconds
     }
 
     /// Pure decision (#93 PiP skips): does a rendition's reading cover `position`? Slightly ahead of

@@ -5,7 +5,7 @@ struct SubtitleOverlayDrainerTests {
     @Test("fresh target decodes from playhead minus backscan")
     func freshTargetBackscans() {
         let plan = SubtitleOverlayDrainer.drainPlan(cursor: nil, playhead: 100,
-                                                    lead: 60, backscan: 15, jumpThreshold: 2.5)
+                                                    lead: 60, backscan: 15, repositioning: .inferred(jumpThreshold: 2.5))
         guard case .resetAndDecode(let from, let through) = plan else {
             Issue.record("expected resetAndDecode, got \(plan)"); return
         }
@@ -17,7 +17,7 @@ struct SubtitleOverlayDrainerTests {
     func steadyAdvance() {
         let cursor = SubtitleDrainCursor(lastDecodedPts: 150, lastPlayhead: 100)
         let plan = SubtitleOverlayDrainer.drainPlan(cursor: cursor, playhead: 100.5,
-                                                    lead: 60, backscan: 15, jumpThreshold: 2.5)
+                                                    lead: 60, backscan: 15, repositioning: .inferred(jumpThreshold: 2.5))
         guard case .decode(let from, let through) = plan else {
             Issue.record("expected decode, got \(plan)"); return
         }
@@ -29,7 +29,7 @@ struct SubtitleOverlayDrainerTests {
     func seekResets() {
         let cursor = SubtitleDrainCursor(lastDecodedPts: 150, lastPlayhead: 100)
         let plan = SubtitleOverlayDrainer.drainPlan(cursor: cursor, playhead: 400,
-                                                    lead: 60, backscan: 15, jumpThreshold: 2.5)
+                                                    lead: 60, backscan: 15, repositioning: .inferred(jumpThreshold: 2.5))
         guard case .resetAndDecode(let from, _) = plan else {
             Issue.record("expected resetAndDecode, got \(plan)"); return
         }
@@ -40,7 +40,7 @@ struct SubtitleOverlayDrainerTests {
     func backwardSeekResets() {
         let cursor = SubtitleDrainCursor(lastDecodedPts: 150, lastPlayhead: 100)
         let plan = SubtitleOverlayDrainer.drainPlan(cursor: cursor, playhead: 40,
-                                                    lead: 60, backscan: 15, jumpThreshold: 2.5)
+                                                    lead: 60, backscan: 15, repositioning: .inferred(jumpThreshold: 2.5))
         guard case .resetAndDecode(let from, let through) = plan else {
             Issue.record("expected resetAndDecode, got \(plan)"); return
         }
@@ -52,7 +52,7 @@ struct SubtitleOverlayDrainerTests {
     func caughtUpIdles() {
         let cursor = SubtitleDrainCursor(lastDecodedPts: 160, lastPlayhead: 100)
         let plan = SubtitleOverlayDrainer.drainPlan(cursor: cursor, playhead: 100.2,
-                                                    lead: 60, backscan: 15, jumpThreshold: 2.5)
+                                                    lead: 60, backscan: 15, repositioning: .inferred(jumpThreshold: 2.5))
         #expect(plan == .idle)
     }
 
@@ -94,7 +94,7 @@ struct SubtitleOverlayDrainerTests {
 
         // The session-axis publish: read as a reposition to a position nothing was harvested at.
         let onSessionAxis = SubtitleOverlayDrainer.drainPlan(
-            cursor: cursor, playhead: landing, lead: 60, backscan: 15, jumpThreshold: 2.5)
+            cursor: cursor, playhead: landing, lead: 60, backscan: 15, repositioning: .inferred(jumpThreshold: 2.5))
         guard case .resetAndDecode(let from, _) = onSessionAxis else {
             Issue.record("expected resetAndDecode, got \(onSessionAxis)"); return
         }
@@ -104,7 +104,7 @@ struct SubtitleOverlayDrainerTests {
         // The next tick, back on the raw clock: a second reposition, in the other direction.
         let backOnSourceAxis = SubtitleOverlayDrainer.drainPlan(
             cursor: SubtitleDrainCursor(lastDecodedPts: landing + 60, lastPlayhead: landing),
-            playhead: sessionZero + landing, lead: 60, backscan: 15, jumpThreshold: 2.5)
+            playhead: sessionZero + landing, lead: 60, backscan: 15, repositioning: .inferred(jumpThreshold: 2.5))
         guard case .resetAndDecode = backOnSourceAxis else {
             Issue.record("expected resetAndDecode, got \(backOnSourceAxis)"); return
         }
@@ -113,10 +113,59 @@ struct SubtitleOverlayDrainerTests {
         // really is, and it backscans over ground the store actually holds.
         let carried = SubtitleOverlayDrainer.drainPlan(
             cursor: cursor, playhead: sessionZero + landing, lead: 60, backscan: 15,
-            jumpThreshold: 2.5)
+            repositioning: .inferred(jumpThreshold: 2.5))
         guard case .resetAndDecode(let carriedFrom, _) = carried else {
             Issue.record("expected resetAndDecode, got \(carried)"); return
         }
         #expect(carriedFrom > sessionZero)
+    }
+
+    // MARK: - Landings the player states
+
+    @Test("a stated landing resets once, however short the step")
+    func signalledLandingResetsOnce() {
+        let cursor = SubtitleDrainCursor(lastDecodedPts: 150, lastPlayhead: 100, landingGeneration: 3)
+        let landed = SubtitleOverlayDrainer.drainPlan(cursor: cursor, playhead: 101, lead: 60, backscan: 15,
+                                                      repositioning: .signalled(generation: 4))
+        guard case .resetAndDecode(let from, _) = landed else {
+            Issue.record("expected resetAndDecode, got \(landed)"); return
+        }
+        #expect(from == 86)
+        let followed = SubtitleDrainCursor(lastDecodedPts: 101, lastPlayhead: 101, landingGeneration: 4)
+        let next = SubtitleOverlayDrainer.drainPlan(cursor: followed, playhead: 102.5, lead: 60, backscan: 15,
+                                                    repositioning: .signalled(generation: 4))
+        guard case .decode = next else { Issue.record("expected decode, got \(next)"); return }
+    }
+
+    @Test("without a stated landing a far step is playback, not a seek")
+    func signalledStepIsNotASeek() {
+        // A tick that ran long, or a picture catching up to a landing already followed.
+        let cursor = SubtitleDrainCursor(lastDecodedPts: 150, lastPlayhead: 100, landingGeneration: 4)
+        let plan = SubtitleOverlayDrainer.drainPlan(cursor: cursor, playhead: 140, lead: 60, backscan: 15,
+                                                    repositioning: .signalled(generation: 4))
+        guard case .decode(let from, let through) = plan else {
+            Issue.record("expected decode, got \(plan)"); return
+        }
+        #expect(from > 150)
+        #expect(through == 200)
+    }
+}
+
+@MainActor
+struct SubtitleLandingPlayheadTests {
+    @Test("the drain stands at a landing until the picture reports a time of its own")
+    func landingHeldUntilThePictureMoves() throws {
+        let engine = try AetherEngine()
+        engine.clock.sourceTime = 100
+        let before = engine.subtitleLandingGeneration
+        engine.subtitleLanded(atItemSeconds: 400)
+        #expect(engine.subtitleLandingGeneration == before &+ 1)
+        // Still the old frame (AVPlayer buffering towards the target): the landing is where the drain is.
+        #expect(engine.subtitleDrainPlayhead() == 400)
+        #expect(engine.subtitleDrainPlayhead() == 400)
+        // The picture reports: from here on it is the playhead.
+        engine.clock.sourceTime = 399.6
+        #expect(engine.subtitleDrainPlayhead() == 399.6)
+        #expect(engine.subtitleLanding == nil)
     }
 }

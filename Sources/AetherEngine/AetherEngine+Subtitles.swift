@@ -311,6 +311,39 @@ extension AetherEngine {
 
     // MARK: - #112 rework: playhead-paced overlay drainer
 
+    /// The native item stated a landing (`armNativeItemObservers`): a seek of any origin, the engine's,
+    /// AVKit's scrubbing, a PiP skip, a step of a reverse scan. Counted for the drain and the OCR worker,
+    /// which reset on it once (`SubtitleRepositioning.signalled`), and held as their playhead until the
+    /// picture reports a time of its own: `sourceTime` follows the presented frame (#49), which is still
+    /// the old one while AVPlayer buffers towards the target (#123), so it cannot place the landing.
+    func subtitleLanded(atItemSeconds itemSeconds: Double) {
+        guard itemSeconds.isFinite else { return }
+        subtitleLandingGeneration &+= 1
+        subtitleLanding = SubtitleLanding(seconds: nativeSourceSeconds(atItemSeconds: itemSeconds),
+                                          heldWhileSourceTimeIs: sourceTime)
+        if !subtitleDrainTargets.isEmpty { requestSubtitleDrainTick() }
+        scheduleNativeSubtitleReanchor()   // #93
+    }
+
+    /// Where the drain and the OCR worker stand: the latest landing until the picture reports a time of
+    /// its own after it, then `sourceTime`.
+    func subtitleDrainPlayhead() -> Double {
+        if let landing = subtitleLanding {
+            if sourceTime == landing.heldWhileSourceTimeIs { return landing.seconds }
+            subtitleLanding = nil
+        }
+        return sourceTime
+    }
+
+    /// How the drain and the OCR worker learn of a landing: stated by the native item, inferred from the
+    /// playhead's steps on the software route, which has no AVPlayer.
+    func subtitleRepositioning(elapsedSinceLastPlan: Double) -> SubtitleRepositioning {
+        nativeVideoSession != nil
+            ? .signalled(generation: subtitleLandingGeneration)
+            : .inferred(jumpThreshold: Self.subtitleDrainJumpThresholdSeconds,
+                        elapsedSinceLastPlan: elapsedSinceLastPlan)
+    }
+
     /// The active session's packet store: the HLS producer tap or the SW-host tap.
     /// nil when no session is loaded.
     var activeSubtitlePacketStore: SubtitlePacketStore? {
@@ -421,19 +454,21 @@ extension AetherEngine {
     func prepareSubtitleDrainTick() -> SubtitleDrainTickWork? {
         guard !subtitleDrainTargets.isEmpty, let store = activeSubtitlePacketStore else { return nil }
         store.setProtectedStreams(Set(subtitleDrainTargets.values))   // #166: re-assert protection
-        let playhead = sourceTime
+        let playhead = subtitleDrainPlayhead()
         // #416: the pump is rendering the frame at the playhead, so it has necessarily read from
         // wherever it opened up to here. That is what the pump can state without a hook in its read
         // loop, and it is exactly the stretch a landing claim rests on: the ground between a set
         // decoded behind the playhead and the playhead itself. Its lookahead beyond the playhead
-        // comes from the packets it harvests, which the store notes as it takes them.
-        store.noteHarvestReach(.pump, through: playhead)
+        // comes from the packets it harvests, which the store notes as it takes them. The presented
+        // frame's time, not a landing the picture has not reached: only the frame proves the reading.
+        store.noteHarvestReach(.pump, through: sourceTime)
         // #271: wall time since the previous tick, so a tick that itself ran long cannot be read as
         // a seek by the next one. See SubtitleOverlayDrainer.drainPlan.
         let tickUptime = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
         let elapsed = subtitleDrainLastTickUptime.map { tickUptime - $0 } ?? 0
         subtitleDrainLastTickUptime = tickUptime
-        var work = SubtitleDrainTickWork(store: store, playhead: playhead)
+        var work = SubtitleDrainTickWork(store: store, playhead: playhead,
+                                         landingGeneration: subtitleLandingGeneration)
         for (channel, streamIndex) in subtitleDrainTargets {
             let hadCursor = subtitleDrainCursors[channel] != nil
             let plan = SubtitleOverlayDrainer.drainPlan(
@@ -441,8 +476,7 @@ extension AetherEngine {
                 playhead: playhead,
                 lead: Self.subtitleDrainLeadSeconds,
                 backscan: Self.subtitleDrainBackscanSeconds,
-                jumpThreshold: Self.subtitleDrainJumpThresholdSeconds,
-                elapsedSinceLastPlan: elapsed)
+                repositioning: subtitleRepositioning(elapsedSinceLastPlan: elapsed))
             if Self.subtitleForwardPrefetchNeedsReanchor(plan: plan, hadCursor: hadCursor) {
                 work.prefetchNeedsReanchor = true
             }
@@ -614,7 +648,7 @@ extension AetherEngine {
                     // A cue-less event still matters: a PGS clear composition carries only
                     // pgsTrimAt and is what removes the line during silence.
                     if !event.cues.isEmpty || event.pgsTrimAt != nil {
-                        let applied = applySubtitleEvent(event, to: &cues, channel: channel)
+                        let applied = applySubtitleEvent(event, to: &cues, channel: channel, playhead: playhead)
                         tally.admitted += applied.admitted
                         tally.published += applied.published
                         tally.landingWithheld += applied.landingWithheld   // #416
@@ -640,7 +674,8 @@ extension AetherEngine {
                 retained: runRetained,
                 harvestGapAt: gapHoldAt,
                 harvestGapSequence: gapHoldSequence,
-                harvestGapTicksLeft: gapHoldTicksLeft)
+                harvestGapTicksLeft: gapHoldTicksLeft,
+                landingGeneration: work.landingGeneration)
             // #143/#204: a renderable composition at/after the playhead ends reconstruction while
             // decoding above. If the pass remains active with a candidate after the whole window,
             // finalize it. Raw packet presence cannot answer this: the landing line's own zero-object
@@ -747,7 +782,7 @@ extension AetherEngine {
         // source's read position; move it to the new playhead. Once per tick, not per channel: both
         // channels ride the same playhead and the same source.
         if work.prefetchNeedsReanchor {
-            subtitleSource?.move(to: sourceTime, seekGeneration: currentSeekGeneration)
+            subtitleSource?.move(to: work.playhead, seekGeneration: currentSeekGeneration)
         }
         // #125: the packet store is NOT time-pruned here. A trailing playhead-relative prune
         // (was: playhead - retentionSeconds) evicted packets a backward seek could still land on:
@@ -922,7 +957,8 @@ extension AetherEngine {
     @discardableResult
     private func applySubtitleEvent(_ event: EmbeddedSubtitleDecoder.SubtitleEvent,
                                     to cues: inout [SubtitleCue],
-                                    channel: SubtitleChannel) -> SubtitleDeliveryStatement.Application {
+                                    channel: SubtitleChannel,
+                                    playhead: Double) -> SubtitleDeliveryStatement.Application {
         guard isSubtitleActive(for: channel) else { return .init() }
 
         // #357: primary-only, and budgeted per seek generation rather than per load, so a seek
@@ -947,7 +983,7 @@ extension AetherEngine {
             )
         }
 
-        return applyEventMutations(event, to: &cues, channel: channel)
+        return applyEventMutations(event, to: &cues, channel: channel, playhead: playhead)
     }
 
     /// PGS clear-event trim + sorted insert. Native mov_text stores (#55) are NOT fed here; those are owned by the multi-decode reader.
@@ -955,7 +991,8 @@ extension AetherEngine {
     /// return value reports whether `cues` actually changed.
     @MainActor
     @discardableResult
-    private func applyEventMutations(_ event: EmbeddedSubtitleDecoder.SubtitleEvent, to cues: inout [SubtitleCue], channel: SubtitleChannel = .primary) -> SubtitleDeliveryStatement.Application {
+    private func applyEventMutations(_ event: EmbeddedSubtitleDecoder.SubtitleEvent, to cues: inout [SubtitleCue],
+                                     channel: SubtitleChannel, playhead: Double) -> SubtitleDeliveryStatement.Application {
         var applied = SubtitleDeliveryStatement.Application()
         if let trimAt = event.pgsTrimAt {
             for i in 0..<cues.count {
@@ -970,7 +1007,7 @@ extension AetherEngine {
             // cue's true window. Publish it only if that window covers the playhead (it is the
             // genuinely active cue), drop replayed history silently.
             for cue in pgsStaleArrivalGates[channel, default: PGSStaleArrivalGate()]
-                .resolveHeld(trimAt: trimAt, playhead: sourceTime) {
+                .resolveHeld(trimAt: trimAt, playhead: playhead) {
                 applied.admitted += 1
                 if insertSorted(cue, into: &cues) {
                     applied.changed = true
@@ -995,14 +1032,14 @@ extension AetherEngine {
         // Asked for bitmap events only: a text cue carries its own duration, so it claims nothing
         // about the ground behind it, and a dense text track would pay the lookup per packet.
         let groundIsRead = event.isPGS
-            ? subtitleLandingGroundIsRead(cues: event.cues, playhead: sourceTime)
+            ? subtitleLandingGroundIsRead(cues: event.cues, playhead: playhead)
             : true
         // A false answer here means an actual refusal: the helper returns true when the event
         // carries no cue behind the playhead, so there is nothing that could have been refused.
         if !groundIsRead { applied.landingWithheld += 1 }
         let admitted = pgsStaleArrivalGates[channel, default: PGSStaleArrivalGate()]
             .admit(cues: event.cues, isPGS: event.isPGS,
-                   isSelfContained: event.isSelfContainedPGS, playhead: sourceTime,
+                   isSelfContained: event.isSelfContainedPGS, playhead: playhead,
                    groundIsRead: groundIsRead)
         applied.admitted += admitted.count
         for cue in admitted {
@@ -2276,6 +2313,8 @@ struct SubtitleDrainChannelWork {
 struct SubtitleDrainTickWork {
     let store: SubtitlePacketStore
     let playhead: Double
+    /// The landing count the tick planned against; the cursors it writes have followed that many.
+    let landingGeneration: UInt64
     var channels: [SubtitleDrainChannelWork] = []
     var prefetchNeedsReanchor = false
 

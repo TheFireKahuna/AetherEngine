@@ -163,14 +163,14 @@ struct Issue151SubtitleForwardPrefetchTests {
     func reanchorDecision() {
         let jump = SubtitleOverlayDrainer.drainPlan(
             cursor: SubtitleDrainCursor(lastDecodedPts: 10, lastPlayhead: 10),
-            playhead: 300, lead: 60, backscan: 15, jumpThreshold: 2.5)
+            playhead: 300, lead: 60, backscan: 15, repositioning: .inferred(jumpThreshold: 2.5))
         #expect(AetherEngine.subtitleForwardPrefetchNeedsReanchor(plan: jump, hadCursor: true))
         let fresh = SubtitleOverlayDrainer.drainPlan(
-            cursor: nil, playhead: 10, lead: 60, backscan: 15, jumpThreshold: 2.5)
+            cursor: nil, playhead: 10, lead: 60, backscan: 15, repositioning: .inferred(jumpThreshold: 2.5))
         #expect(!AetherEngine.subtitleForwardPrefetchNeedsReanchor(plan: fresh, hadCursor: false))
         let steady = SubtitleOverlayDrainer.drainPlan(
             cursor: SubtitleDrainCursor(lastDecodedPts: 10, lastPlayhead: 10),
-            playhead: 10.5, lead: 60, backscan: 15, jumpThreshold: 2.5)
+            playhead: 10.5, lead: 60, backscan: 15, repositioning: .inferred(jumpThreshold: 2.5))
         #expect(!AetherEngine.subtitleForwardPrefetchNeedsReanchor(plan: steady, hadCursor: true))
     }
 

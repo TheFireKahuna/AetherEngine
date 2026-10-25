@@ -35,12 +35,27 @@ extension AetherEngine {
         return currentSubtitleDelaySeconds != servedSubtitleDelaySeconds
     }
 
-    /// Arms the selection on the item a load just handed to the native host: its suppressing legible output,
-    /// and the observer that follows every selection change. A session without native renditions has no
-    /// legible group, and the overlay draws its subtitles as before.
-    func armNativeSubtitleSelection() {
+    /// Arms what the engine keeps on each item the native host attaches (`NativeAVPlayerHost.onDidAttachItem`,
+    /// so an in-place swap's item too): the observer of its landings, which the subtitle drain follows
+    /// (`subtitleLanded`), and the selection: its suppressing legible output, and the observer that follows
+    /// every selection change. A session without native renditions has no legible group, and the overlay
+    /// draws its subtitles as before.
+    ///
+    /// The landings come from `AVPlayerItemTimeJumpedNotification` rather than the legible output's
+    /// `outputSequenceWasFlushed:`: both arrive for every seek, on the main queue with the seek's completion
+    /// and the item time already at the target, but the flush only on an item with legible media (measured,
+    /// macOS 27: a media playlist without subtitles posted every jump and flushed nothing).
+    func armNativeItemObservers(on item: AVPlayerItem) {
         disarmNativeSubtitleSelection()
-        guard !nativeSubtitleTrackTable.isEmpty, let item = currentAVPlayer?.currentItem else { return }
+        nativeItemTimeJumpObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.timeJumpedNotification, object: item, queue: .main
+        ) { [weak self, weak item] _ in
+            MainActor.assumeIsolated {
+                guard let item else { return }
+                self?.subtitleLanded(atItemSeconds: item.currentTime().seconds)
+            }
+        }
+        guard !nativeSubtitleTrackTable.isEmpty else { return }
         let output = AVPlayerItemLegibleOutput()
         output.suppressesPlayerRendering = !nativeSubtitleRenderingRequested
         item.add(output)
@@ -60,9 +75,14 @@ extension AetherEngine {
         }
     }
 
-    /// Drops the observer, the output and the record of what was followed. Called by the next load, by
-    /// `stopInternal`, and by `armNativeSubtitleSelection` itself.
+    /// Drops the observers, the output and the record of what was followed. Called by the next load, by
+    /// `stopInternal`, and by `armNativeItemObservers` itself.
     func disarmNativeSubtitleSelection() {
+        if let observer = nativeItemTimeJumpObserver {
+            NotificationCenter.default.removeObserver(observer)
+            nativeItemTimeJumpObserver = nil
+        }
+        subtitleLanding = nil
         nativeSubtitleSelectionTask?.cancel()
         nativeSubtitleSelectionTask = nil
         if let observer = nativeSubtitleSelectionObserver {
