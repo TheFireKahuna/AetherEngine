@@ -11,14 +11,13 @@ import Dovi
 /// titles. The real titles carry what synthetic test content cannot produce (multi-piece luma curves,
 /// MMR chroma, large NLQ scales), so this is the check on those paths.
 ///
-/// The model is ETSI GS CCM 001's pseudo-code ported line for line (5.4.2.2 pivots, 5.4.2.3.2 polynomial with
-/// `ss` / `shift`, 5.4.2.3.3 MMR with `tt[0...21]`, 5.4.3.2 NLQ, 5.4.3.3 reconstruction), not the kernels' own
-/// arrangement of it, and samples the enhancement layer with its own bilinear filter. It compares the spec's
-/// 12-bit reconstructed sample (`DoviDither.debugRawVDR`), which both sides compute in integers, so they agree
+/// The model is Dolby's reference pseudo-code ported line for line (pivot index, polynomial with `ss` / `shift`, MMR
+/// with `tt[0...21]`, NLQ, reconstruction, EL and chroma resampling), not the kernels' own arrangement of it. It
+/// compares the 12-bit reconstructed sample (`DoviDither.debugRawVDR`), which both sides compute in integers, so they agree
 /// exactly or not at all.
 ///
 /// What it settles: arithmetic, piece selection, MMR term layout, NLQ, clamps. What it cannot: the
-/// spec readings the shader and the model share by construction (the chroma-site luma filter, the
+/// readings the shader and the model share by construction (the chroma-site luma filter, the
 /// half-step NLQ reconstruction); those were settled against DoViBaker, an independent implementation.
 @Suite(.offCooperativePoolOneLane)
 struct DoviCpuModelTests {
@@ -61,7 +60,30 @@ struct DoviCpuModelTests {
             bd = DoviFelComposer.bitDepth(ofMax: p.blMax)
         }
 
-        /// 5.4.2.2: the first piece whose next pivot is above `s`, or one past the pieces. Past the last pivot the
+        /// The reference EL resampling, as written: the EL code of output sample (x, y) of `el`'s plane
+        /// upsampled two times both ways, the vertical pass first (luma: the 4-tap pair; chroma: the 2-tap pair),
+        /// then SPATIAL_RESAMPLING_FILTER_H, each rounded and clipped, every sample outside the picture replicated
+        /// from its edge.
+        static func upsampledEL(_ el: Plane, comp: Int, x: Int, y: Int, chroma: Bool) -> Int {
+            func Y(_ c: Int, _ r: Int) -> Int { el.code(min(max(c, 0), el.width - 1), min(max(r, 0), el.height - 1), comp) }
+            func clip(_ v: Int) -> Int { min(max(v, 0), 0xFFFF) }
+            let n = y >> 1
+            func vertical(_ c: Int) -> Int {
+                if !chroma {
+                    if y % 2 == 0 { return clip((-3 * Y(c, n - 2) + 29 * Y(c, n - 1) + 111 * Y(c, n) - 9 * Y(c, n + 1) + 64) >> 7) }
+                    return clip((-9 * Y(c, n - 1) + 111 * Y(c, n) + 29 * Y(c, n + 1) - 3 * Y(c, n + 2) + 64) >> 7)
+                }
+                if y % 2 == 0 { return clip((64 * Y(c, n - 1) + 192 * Y(c, n) + 128) >> 8) }
+                return clip((192 * Y(c, n) + 64 * Y(c, n + 1) + 128) >> 8)
+            }
+            let m = x >> 1
+            if x % 2 == 0 { return vertical(m) }
+            var sum = 22 * vertical(m - 3) + 94 * vertical(m - 2) - 524 * vertical(m - 1) + 2456 * vertical(m)
+            sum += 2456 * vertical(m + 1) - 524 * vertical(m + 2) + 94 * vertical(m + 3) + 22 * vertical(m + 4)
+            return clip((sum + 2048) >> 12)
+        }
+
+        /// The first piece whose next pivot is above `s`, or one past the pieces. Past the last pivot the
         /// sample is clamped to that pivot, so the last piece is the one evaluated.
         func piece(_ c: DoviPolynomialParams, _ s: Int) -> Int {
             let n = Int(c.numPivots) - 2
@@ -78,10 +100,10 @@ struct DoviCpuModelTests {
             return min(idx, n)
         }
 
-        /// The end of 5.4.2.3.2 and 5.4.2.3.3: negative to 0, `>> (4 + coefficient_log2_denom)`, capped at 0xffff.
+        /// The end of the polynomial and the MMR: negative to 0, `>> (4 + coefficient_log2_denom)`, capped at 0xffff.
         static func v16(_ vv: Int64, _ denom: UInt32) -> Int { Int(min(max(vv, 0) >> (4 + Int64(denom)), 0xffff)) }
 
-        /// 5.4.2.3.2 as the spec writes it, for an integer base-layer sample.
+        /// The polynomial as the reference writes it, for an integer base-layer sample.
         func polynomial(_ c: DoviPolynomialParams, _ k: Int, s input: Int) -> (vv: Int64, v: Int) {
             var s = Int64(input)
             if s < Int64(c.pivots[0]) { s = Int64(c.pivots[0]) }
@@ -97,7 +119,7 @@ struct DoviCpuModelTests {
             return (vv, Self.v16(vv, c.coefShift[k]))
         }
 
-        /// 5.4.2.3.3 as the spec writes it (tt[0...21]), for integer samples, each already clamped to its pivots.
+        /// The MMR as the reference writes it (tt[0...21]), for integer samples, each already clamped to its pivots.
         func mmr(_ m: DoviMmrParams, _ k: Int, order: Int, s0: Int64, s1: Int64, s2: Int64) -> (vv: Int64, v: Int) {
             var tt = [Int64](repeating: 0, count: 22)
             tt[0] = 1 << 20
@@ -127,9 +149,9 @@ struct DoviCpuModelTests {
             return (rr, Self.v16(rr, m.coefShift))
         }
 
-        /// The spec's fixed point carried to Q20 inputs that need not be whole codes (the 4:2:2 kernel's
+        /// The reference fixed point carried to Q20 inputs that need not be whole codes (the 4:2:2 kernel's
         /// interpolated chroma): s << (20 - BL_bit_depth) becomes t, a product s_a * s_b << (20 - 2 BL_bit_depth)
-        /// becomes (t_a * t_b) >> 20. For whole codes both are the spec's terms exactly (`q20FormIsTheSpecs`).
+        /// becomes (t_a * t_b) >> 20. For whole codes both are the reference's terms exactly (`q20FormIsTheReferences`).
         func mmr(_ m: DoviMmrParams, _ k: Int, order: Int, q20 t0: Int64, _ t1: Int64, _ t2: Int64) -> (vv: Int64, v: Int) {
             var tt = [Int64](repeating: 0, count: 22)
             tt[0] = 1 << 20
@@ -177,7 +199,7 @@ struct DoviCpuModelTests {
             return (vv, Self.v16(vv, c.coefShift[k]))
         }
 
-        /// 5.4.3.2 as the spec writes it: the 16-bit residual of one EL code.
+        /// The inverse NLQ as the reference writes it: the 16-bit residual of one EL code.
         func inverseNlq(_ n: DoviNlqParams, _ e: Int) -> Int {
             guard n.nlqMethod == .linear, n.nlqScale != 0 else { return 0 }
             let elBitDepth: Int64 = 10
@@ -197,7 +219,7 @@ struct DoviCpuModelTests {
             return Int(dq >> (coefficientLog2Denom - 5 - elBitDepth))
         }
 
-        /// 5.4.3.3: h = v (+ r), then (h + 2^(15 - out_bit_depth)) >> (16 - out_bit_depth), clipped.
+        /// The reconstruction: h = v (+ r), then (h + 2^(15 - out_bit_depth)) >> (16 - out_bit_depth), clipped.
         func reconstruct(_ h: Int) -> Int {
             let out = DoviFelComposer.bitDepth(ofMax: p.vdrMax)
             let maxOut = (1 << out) - 1
@@ -207,25 +229,6 @@ struct DoviCpuModelTests {
 
         func nlqActive(_ n: DoviNlqParams) -> Bool {
             !p.flags.contains(.disableResidual) && n.nlqMethod == .linear && n.nlqScale != 0
-        }
-
-        /// Bilinear sample of an enhancement-layer plane at base-layer sample (x, y) of a plane `baseW` x
-        /// `baseH`: the 10-bit codes interpolated, then rounded half up. Luma samples sit at pixel centres;
-        /// chroma (`cosited`) is co-sited with the top-left luma sample, so the two grids share sample 0.
-        func elCode(_ el: Plane, comp: Int, x: Int, y: Int, baseW: Int, baseH: Int, cosited: Bool = false) -> Int {
-            let centre = cosited ? 0.0 : 0.5
-            // Multiplied before dividing: (x + centre) * el / base is exact for the 2:1 and 1:1 grids, where
-            // (x + centre) / base * el lands a hair below a quarter and turns exact halves down.
-            let u = (Double(x) + centre) * Double(el.width) / Double(baseW) - centre
-            let v = (Double(y) + centre) * Double(el.height) / Double(baseH) - centre
-            let x0 = Int(floor(u)), y0 = Int(floor(v))
-            let fx = u - Double(x0), fy = v - Double(y0)
-            func w(_ xx: Int, _ yy: Int) -> Double {
-                Double(el.code(min(max(xx, 0), el.width - 1), min(max(yy, 0), el.height - 1), comp))
-            }
-            let top = w(x0, y0) * (1 - fx) + w(x0 + 1, y0) * fx
-            let bot = w(x0, y0 + 1) * (1 - fx) + w(x0 + 1, y0 + 1) * fx
-            return Int((top * (1 - fy) + bot * fy + 0.5).rounded(.down))
         }
 
         /// One component's pieces: the prediction sum before its clamps, the 16-bit prediction, the
@@ -240,13 +243,13 @@ struct DoviCpuModelTests {
             (r.vv, r.pred) = predict(p.polyY, p.mmrY, s: by, s0: by, s1: blUV.code(cx, cy, 0), s2: blUV.code(cx, cy, 1))
             if nlqActive(p.nlqY) {
                 r.active = true
-                r.elCode = elCode(el, comp: 0, x: x, y: y, baseW: bl.width, baseH: bl.height)
+                r.elCode = Self.upsampledEL(el, comp: 0, x: x, y: y, chroma: false)
                 r.residual = inverseNlq(p.nlqY, r.elCode)
             }
             return r
         }
 
-        /// Luma at the chroma site, 5.4.2.3.3: [1 2 1] around the even column in both rows of the cell, rounded
+        /// Luma at the chroma site: [1 2 1] around the even column in both rows of the cell, rounded
         /// per row, then the two rows averaged; edges replicated.
         static func chromaSiteLuma(_ bl: Plane, x: Int, y: Int) -> Int {
             func at(_ c: Int, _ r: Int) -> Int { bl.code(min(max(c, 0), bl.width - 1), min(r, bl.height - 1)) }
@@ -262,18 +265,18 @@ struct DoviCpuModelTests {
             (b.vv, b.pred) = predict(p.polyCr, p.mmrCr, s: cr, s0: by, s1: cb, s2: cr)
             if nlqActive(p.nlqCb) {
                 a.active = true
-                a.elCode = elCode(elUV, comp: 0, x: x, y: y, baseW: blUV.width, baseH: blUV.height, cosited: true)
+                a.elCode = Self.upsampledEL(elUV, comp: 0, x: x, y: y, chroma: true)
                 a.residual = inverseNlq(p.nlqCb, a.elCode)
             }
             if nlqActive(p.nlqCr) {
                 b.active = true
-                b.elCode = elCode(elUV, comp: 1, x: x, y: y, baseW: blUV.width, baseH: blUV.height, cosited: true)
+                b.elCode = Self.upsampledEL(elUV, comp: 1, x: x, y: y, chroma: true)
                 b.residual = inverseNlq(p.nlqCr, b.elCode)
             }
             return (a, b)
         }
 
-        /// The 12-bit reconstructed luma sample (5.4.3.3).
+        /// The 12-bit reconstructed luma sample.
         func luma(bl: Plane, blUV: Plane, el: Plane, x: Int, y: Int) -> Int {
             reconstruct(lumaParts(bl: bl, blUV: blUV, el: el, x: x, y: y).total)
         }
@@ -303,63 +306,32 @@ struct DoviCpuModelTests {
              (t + 4 * t * t - 3 * t * t * t) / 2, (-t * t + t * t * t) / 2]
         }
 
-        /// Base-layer chroma at 4:2:2 row `row`: Catmull-Rom at the row's coordinate over the clamped chroma rows,
-        /// clamped to [0, bl_max].
-        func chroma422Base(_ blUV: Plane, x: Int, row: Int, comp: Int) -> Double {
-            let c = chroma422Coordinate(row: row)
-            let i0 = Int(floor(c))
-            let w = Self.catmullRom(c - Double(i0))
-            var s = 0.0
-            for i in 0..<4 {
-                s += Double(blUV.code(x, min(max(i0 - 1 + i, 0), blUV.height - 1), comp)) * w[i]
-            }
-            return min(max(s, 0), Double(p.blMax))
-        }
-
-        /// Q20 of a base-layer value; exact for the 1/128 multiples the 4:2:2 interpolation produces.
+        /// Q20 of a base-layer value (whole or a quarter code, as the M7 variants are): exact.
         func q20(_ s: Double) -> Int64 { Int64((s * Double(1 << (20 - bd))).rounded()) }
 
-        /// Luma at a 4:2:2 chroma site: [1 2 1] around the even column on that row alone, edges clamped.
-        static func chroma422Luma(_ bl: Plane, x: Int, row: Int) -> Int {
-            func at(_ c: Int) -> Int { bl.code(min(max(c, 0), bl.width - 1), row) }
-            return (at(x * 2 - 1) + 2 * at(x * 2) + at(x * 2 + 1) + 2) >> 2
+        /// The composed 16-bit chroma sums (Cb, Cr) at 4:2:0 site (x, y), clipped to [0, 0xFFFF] as the reconstruction is
+        /// clipped: what sv22's 4:2:2 step interpolates.
+        func chromaSums(bl: Plane, blUV: Plane, elUV: Plane, x: Int, y: Int) -> (Int, Int) {
+            let (a, b) = chromaParts(bl: bl, blUV: blUV, elUV: elUV, x: x, y: y)
+            return (min(max(a.total, 0), 0xFFFF), min(max(b.total, 0), 0xFFFF))
         }
 
-        /// Bilinear EL chroma code at 4:2:2 row `row`, column `x`: the row's 4:2:0 coordinate (`chroma422Coordinate`) mapped
-        /// through the co-sited grid relation of ``elCode(_:comp:x:y:baseW:baseH:cosited:)``, rounded half up.
-        func elCode422(_ el: Plane, comp: Int, x: Int, row: Int, baseW: Int, baseH: Int) -> Int {
-            let u = Double(x) * Double(el.width) / Double(baseW)
-            let v = chroma422Coordinate(row: row) * Double(el.height) / Double(baseH)
-            let x0 = Int(floor(u)), y0 = Int(floor(v))
-            let fx = u - Double(x0), fy = v - Double(y0)
-            func w(_ xx: Int, _ yy: Int) -> Double {
-                Double(el.code(min(max(xx, 0), el.width - 1), min(max(yy, 0), el.height - 1), comp))
-            }
-            let top = w(x0, y0) * (1 - fx) + w(x0 + 1, y0) * fx
-            let bot = w(x0, y0 + 1) * (1 - fx) + w(x0 + 1, y0 + 1) * fx
-            return Int((top * (1 - fy) + bot * fy + 0.5).rounded(.down))
-        }
-
-        /// The 16-bit sums (Cb, Cr) at 4:2:2 site (x, row), before any output rounding, as `dovi_compose_chroma_422`
-        /// composes them.
+        /// The 16-bit sums (Cb, Cr) at 4:2:2 site (x, row): the composed 4:2:0 chroma brought to the row. On a chroma
+        /// row (the type 2 / 3 even rows) a copy, and half way between two f[2n + 1] = -4 s[n - 1] + 36 s[n]
+        /// + 36 s[n + 1] - 4 s[n + 2], rounded once at its scale of 64, both as the reference writes them; at the quarter
+        /// phases (other sitings) Catmull-Rom's weights, scaled by 128, rounded once. Edge rows replicated.
         func chroma422Sum(bl: Plane, blUV: Plane, elUV: Plane, x: Int, row: Int) -> (Int, Int) {
-            let t0 = Int64(Self.chroma422Luma(bl, x: x, row: row)) << (20 - bd)
-            let t1 = q20(chroma422Base(blUV, x: x, row: row, comp: 0)), t2 = q20(chroma422Base(blUV, x: x, row: row, comp: 1))
-            var hcb = predict(p.polyCb, p.mmrCb, q20: t1, t0, t1, t2).v
-            var hcr = predict(p.polyCr, p.mmrCr, q20: t2, t0, t1, t2).v
-            if nlqActive(p.nlqCb) {
-                hcb += inverseNlq(p.nlqCb, elCode422(elUV, comp: 0, x: x, row: row, baseW: blUV.width, baseH: blUV.height))
+            let c = chroma422Coordinate(row: row)
+            let i0 = Int(floor(c))
+            let t = c - Double(i0)
+            let rows = (0..<4).map { i in chromaSums(bl: bl, blUV: blUV, elUV: elUV, x: x, y: min(max(i0 - 1 + i, 0), blUV.height - 1)) }
+            func step(_ s: [Int]) -> Int {
+                if t == 0 { return s[1] }
+                if t == 0.5 { return (-4 * s[0] + 36 * s[1] + 36 * s[2] - 4 * s[3] + 32) >> 6 }
+                let w = Self.catmullRom(t).map { Int(($0 * 128).rounded()) }
+                return (w[0] * s[0] + w[1] * s[1] + w[2] * s[2] + w[3] * s[3] + 64) >> 7
             }
-            if nlqActive(p.nlqCr) {
-                hcr += inverseNlq(p.nlqCr, elCode422(elUV, comp: 1, x: x, row: row, baseW: blUV.width, baseH: blUV.height))
-            }
-            return (hcb, hcr)
-        }
-
-        /// The 12-bit (Cb, Cr) at 4:2:2 site (x, row).
-        func chroma422(bl: Plane, blUV: Plane, elUV: Plane, x: Int, row: Int) -> (Int, Int) {
-            let (a, b) = chroma422Sum(bl: bl, blUV: blUV, elUV: elUV, x: x, row: row)
-            return (reconstruct(a), reconstruct(b))
+            return (step(rows.map(\.0)), step(rows.map(\.1)))
         }
     }
 
@@ -486,8 +458,8 @@ struct DoviCpuModelTests {
         return out
     }
 
-    @Test("M9: the Q20 form the kernels use equals the spec's tt[] on every real coefficient set; the spec's truncation stays within a 16-bit unit or two")
-    func q20FormIsTheSpecs() throws {
+    @Test("M9: the Q20 form the kernels use equals the reference's tt[] on every real coefficient set; its truncation stays within a 16-bit unit or two")
+    func q20FormIsTheReferences() throws {
         guard #available(macOS 15.0, iOS 18.0, tvOS 18.0, *) else { return }
         let sets = Self.realMmrParams()
         try #require(!sets.isEmpty)
@@ -510,24 +482,24 @@ struct DoviCpuModelTests {
                     let k = m.piece(curve, own)
                     guard curve.method[k] == DoviMapping.mmr.rawValue else { continue }
                     let order = min(Int(curve.order[k]), 3)
-                    let spec = m.mmr(mmr, k, order: order, s0: Int64(y), s1: Int64(u), s2: Int64(v))
+                    let reference = m.mmr(mmr, k, order: order, s0: Int64(y), s1: Int64(u), s2: Int64(v))
                     let q20 = m.mmr(mmr, k, order: order, q20: Int64(y) << 10, Int64(u) << 10, Int64(v) << 10)
-                    if spec.vv != q20.vv { mismatches += 1 }
-                    // The spec truncates each product term to Q20; against the exact sum, in 16-bit units.
+                    if reference.vv != q20.vv { mismatches += 1 }
+                    // The reference truncates each product term to Q20; against the exact sum, in 16-bit units.
                     let exact = Self.mmrExact(mmr, piece: k, order: order, y: y, u: u, v: v) * 65536
-                    curveWorst = max(curveWorst, abs(Double(spec.vv) / pow(2, Double(mmr.coefShift) + 4) - exact))
+                    curveWorst = max(curveWorst, abs(Double(reference.vv) / pow(2, Double(mmr.coefShift) + 4) - exact))
                     points += 1
                 } } }
                 worstTruncation = max(worstTruncation, curveWorst)
                 if !name.hasPrefix("fel_1584") || curveWorst == worstTruncation {
-                    print(String(format: "[m9] %@ %@: spec truncation vs exact sum, worst %.4f 16-bit units", name, label, curveWorst))
+                    print(String(format: "[m9] %@ %@: reference truncation vs exact sum, worst %.4f 16-bit units", name, label, curveWorst))
                 }
             }
         }
         print("[m9] \(sets.count) coefficient sets, \(curves) MMR curves, \(points) points: \(mismatches) Q20 / tt[] mismatches")
         #expect(curves > 0)
         #expect(mismatches == 0)
-        #expect(worstTruncation < 4, "spec truncation \(worstTruncation) 16-bit units")
+        #expect(worstTruncation < 4, "reference truncation \(worstTruncation) 16-bit units")
     }
 
     // MARK: - Loss census (M1) and error attribution (M3, M4, M6)
@@ -548,7 +520,7 @@ struct DoviCpuModelTests {
             if q.pred == 0xffff { predAbove1 += 1 }
             if q.active {
                 residualPixels += 1
-                // The residual's ceiling, R at 16 bits (5.4.3.2: the clamp is +/-2R before the shift).
+                // The residual's ceiling, R at 16 bits (the clamp is +/-2R before the shift).
                 if nlq.vdrInMax > 0 && abs(q.residual) >= Int((Int64(nlq.vdrInMax) << 1) >> Int64(nlq.nlqShift)) { nlqAtMax += 1 }
                 if q.elCode <= 0 { elAt0 += 1 }
                 if q.elCode >= 1023 { elAt1023 += 1 }

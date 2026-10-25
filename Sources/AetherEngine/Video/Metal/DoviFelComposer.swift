@@ -45,11 +45,6 @@ final class DoviFelComposer: @unchecked Sendable {
     /// This composer's output mode in place of the process-wide ``outputMode``. For tests, which run in
     /// parallel and must not change the mode under each other.
     var outputModeOverride: DoviOutputMode?
-    #if DEBUG
-    /// sv22 chroma from the 4:2:0 kernel, each sample repeated on both rows, as before
-    /// `dovi_compose_chroma_422`: the tests' reference for what the 4:2:2-site kernel changed.
-    var sv22RowDuplicationForTesting = false
-    #endif
     private var poolBuffers: [WeakPoolBuffer] = []
     private var poolBufferHighWaterMark = 0
     /// Set by ``releaseOutputPool()``. A composition arriving after teardown (a VideoToolbox callback still in
@@ -66,10 +61,13 @@ final class DoviFelComposer: @unchecked Sendable {
     private let paramBuffers: [MTLBuffer]
     /// Preallocated 1024-entry luma prediction LUT buffers (dolby-vision-fel.md §5.6).
     private let lumaLutBuffers: [MTLBuffer]
-    /// Preallocated inverse-NLQ tables, one per slot: 1024 EL codes for each of Y, Cb, Cr (`populateNlqLut`).
+    /// Preallocated inverse-NLQ tables, one per slot: ``nlqLutCodes`` EL codes for each of Y, Cb, Cr (`populateNlqLut`).
     private let nlqLutBuffers: [MTLBuffer]
-    /// Preallocated MMR coefficient tables, one per slot, in float (`populateMmrTable`).
+    /// Preallocated MMR coefficient tables, one per slot, as integers then floats (`populateMmrTable`).
     private let mmrTableBuffers: [MTLBuffer]
+    /// sv22's composed 4:2:0 chroma, one texture per slot (`dovi_compose_chroma` writes it, `dovi_chroma_420_to_422`
+    /// reads it), made at the first sv22 frame of a size. A slot is owned by one composition at a time.
+    private var chroma420Textures: [MTLTexture?] = Array(repeating: nil, count: DoviFelComposer.maxFramesInFlight)
     private var freeParamSlotIndices: [Int]
 
     /// Output pixel buffer pool status for 1 Hz summary diagnostics (dolby-vision-fel.md §5.11).
@@ -90,7 +88,7 @@ final class DoviFelComposer: @unchecked Sendable {
     /// One-shot latch for the `linear_deadzone_threshold != 0` diagnostic.
     ///
     /// The inverse NLQ adds the threshold to the scaled magnitude before the shift,
-    /// as the spec's pseudo-code and DoViBaker do; see `inverseNlq`. Every
+    /// as Dolby's reference and DoViBaker do; see `inverseNlq`. Every
     /// stream available to test against carries a zero threshold, so a non-zero one
     /// is the first content to actually exercise that term and is worth saying so
     /// out loud exactly once.
@@ -152,13 +150,25 @@ final class DoviFelComposer: @unchecked Sendable {
     final class SharedPipelines: @unchecked Sendable {
         let lumaPipeline: MTLComputePipelineState
         let chromaPipeline: MTLComputePipelineState
-        /// `dovi_compose_chroma_422`: chroma composed at every 4:2:2 site, for ``DoviOutputMode/sv22``.
+        /// `dovi_chroma_420_to_422`: sv22's 4:2:0 -> 4:2:2 step on the composed chroma.
         let chroma422Pipeline: MTLComputePipelineState
         let layoutProbePipeline: MTLComputePipelineState?
-        /// The library the pipelines came from, kept for the blue-noise specialisation.
+        /// The library the pipelines came from, kept for the specialisations.
         private let library: MTLLibrary?
-        private let blueNoiseLock = NSLock()
-        private var blueNoiseResult: Result<(luma: MTLComputePipelineState, chroma: MTLComputePipelineState), Error>?
+        private let variantLock = NSLock()
+        private var variantResults: [Variant: Result<Kernels, Error>] = [:]
+
+        /// One specialisation of the function constants: `dovi_fc_blue_noise` (0).
+        struct Variant: Hashable, Sendable {
+            var blueNoise = false
+        }
+
+        /// The composition kernels of one ``Variant``, and sv22's 4:2:0 -> 4:2:2 step (no specialisation).
+        struct Kernels {
+            let luma: MTLComputePipelineState
+            let chroma: MTLComputePipelineState
+            let chroma422: MTLComputePipelineState
+        }
 
         init(
             luma: MTLComputePipelineState,
@@ -174,28 +184,33 @@ final class DoviFelComposer: @unchecked Sendable {
             self.library = library
         }
 
-        /// The kernels specialised with the blue-noise dither (`dovi_fc_blue_noise` true), for
-        /// ``DoviDither/blueNoise``. Built on first use, so a session that never asks for the experiment never
-        /// pays the compile; the result, a failure included, is kept.
-        func blueNoisePipelines() throws -> (luma: MTLComputePipelineState, chroma: MTLComputePipelineState) {
-            blueNoiseLock.lock()
-            defer { blueNoiseLock.unlock() }
-            if let blueNoiseResult { return try blueNoiseResult.get() }
-            let result = Result { () throws -> (luma: MTLComputePipelineState, chroma: MTLComputePipelineState) in
+        /// The kernels of `variant`: the default ones built at compile time, any other on first use, so a session
+        /// that never asks for the blue-noise dither never pays the compile; the result, a failure included, is kept.
+        func kernels(_ variant: Variant) throws -> Kernels {
+            if variant == Variant() {
+                return Kernels(luma: lumaPipeline, chroma: chromaPipeline, chroma422: chroma422Pipeline)
+            }
+            variantLock.lock()
+            defer { variantLock.unlock() }
+            if let cached = variantResults[variant] { return try cached.get() }
+            let result = Result { () throws -> Kernels in
                 guard let library else { throw ComposerError.missingKernelFunction }
                 let device = library.device
-                return (try device.makeComputePipelineState(function: try Self.kernel(library, "dovi_compose_luma", blueNoise: true)),
-                        try device.makeComputePipelineState(function: try Self.kernel(library, "dovi_compose_chroma", blueNoise: true)))
+                func make(_ name: String) throws -> MTLComputePipelineState {
+                    try device.makeComputePipelineState(function: try Self.kernel(library, name, variant))
+                }
+                return Kernels(luma: try make("dovi_compose_luma"), chroma: try make("dovi_compose_chroma"),
+                               chroma422: chroma422Pipeline)
             }
-            blueNoiseResult = result
+            variantResults[variant] = result
             return try result.get()
         }
 
-        /// A composition kernel with its function constant set.
-        static func kernel(_ library: MTLLibrary, _ name: String, blueNoise: Bool) throws -> MTLFunction {
+        /// A composition kernel with its function constants set.
+        static func kernel(_ library: MTLLibrary, _ name: String, _ variant: Variant) throws -> MTLFunction {
             let values = MTLFunctionConstantValues()
-            var flag = blueNoise
-            values.setConstantValue(&flag, type: .bool, index: 0)
+            var blueNoise = variant.blueNoise
+            values.setConstantValue(&blueNoise, type: .bool, index: 0)
             return try library.makeFunction(name: name, constantValues: values)
         }
 
@@ -239,12 +254,13 @@ final class DoviFelComposer: @unchecked Sendable {
             let library = try device.makeLibrary(source: source, options: nil)
             guard library.functionNames.contains("dovi_compose_luma"),
                   library.functionNames.contains("dovi_compose_chroma"),
-                  library.functionNames.contains("dovi_compose_chroma_422") else {
+                  library.functionNames.contains("dovi_chroma_420_to_422") else {
                 throw ComposerError.missingKernelFunction
             }
-            let luma = try device.makeComputePipelineState(function: try kernel(library, "dovi_compose_luma", blueNoise: false))
-            let chroma = try device.makeComputePipelineState(function: try kernel(library, "dovi_compose_chroma", blueNoise: false))
-            let chroma422 = try device.makeComputePipelineState(function: try kernel(library, "dovi_compose_chroma_422", blueNoise: false))
+            let luma = try device.makeComputePipelineState(function: try kernel(library, "dovi_compose_luma", Variant()))
+            let chroma = try device.makeComputePipelineState(function: try kernel(library, "dovi_compose_chroma", Variant()))
+            guard let chroma422Fn = library.makeFunction(name: "dovi_chroma_420_to_422") else { throw ComposerError.missingKernelFunction }
+            let chroma422 = try device.makeComputePipelineState(function: chroma422Fn)
             let probe: MTLComputePipelineState?
             if let probeFn = library.makeFunction(name: "dovi_layout_probe") {
                 probe = try? device.makeComputePipelineState(function: probeFn)
@@ -266,7 +282,7 @@ final class DoviFelComposer: @unchecked Sendable {
     /// composer) and again only if the stream's siting changes. Under `lock`.
     private var loggedChromaSiting: UInt32?
 
-    /// Logs the vertical chroma siting `dovi_compose_chroma_422` resolves from `blChromaLocation`. "stream" is
+    /// Logs the vertical chroma siting `dovi_chroma_420_to_422` resolves from `blChromaLocation`. "stream" is
     /// whatever FFmpeg put in the codec parameters, which for HEVC is LEFT both when the VUI says type 0 and when
     /// it carries no chroma_loc_info at all; "default" is an unprobed UNSPECIFIED, which the kernel also takes as
     /// LEFT (type 0), as HEVC infers.
@@ -301,9 +317,10 @@ final class DoviFelComposer: @unchecked Sendable {
         guard let device = MTLCreateSystemDefaultDevice() else { return false }
         let start = CFAbsoluteTimeGetCurrent()
         guard let shared = try? SharedPipelines.getOrCreate(device: device) else { return false }
-        // The blue-noise variant is built on first use; with that mode selected, build it here too so the
-        // first composed frame does not specialise it on the decode thread.
-        if outputMode == .p010BlueNoise, (try? shared.blueNoisePipelines()) == nil { return false }
+        // Any other variant is built on first use; with one selected, build it here too so the first composed
+        // frame does not specialise it on the decode thread.
+        let variant = SharedPipelines.Variant(blueNoise: outputMode == .p010BlueNoise)
+        if (try? shared.kernels(variant)) == nil { return false }
         EngineLog.emit(String(format: "[DoviFelComposer] pipelines ready after %.1f ms (prewarm)",
                               (CFAbsoluteTimeGetCurrent() - start) * 1000), category: .swPlayback, level: .verbose)
         return true
@@ -342,7 +359,7 @@ final class DoviFelComposer: @unchecked Sendable {
         for _ in 0..<Self.maxFramesInFlight {
             guard let buf = dev.makeBuffer(length: DoviMetalParams.serializedSize, options: .storageModeShared),
                   let lut = dev.makeBuffer(length: 1024 * MemoryLayout<Int32>.stride, options: .storageModeShared),
-                  let nlq = dev.makeBuffer(length: 3 * 1024 * MemoryLayout<Int32>.stride, options: .storageModeShared),
+                  let nlq = dev.makeBuffer(length: 3 * Self.nlqLutCodes * MemoryLayout<Int32>.stride, options: .storageModeShared),
                   let mmr = dev.makeBuffer(length: Self.mmrTableCount * MemoryLayout<Int32>.stride, options: .storageModeShared) else {
                 return nil
             }
@@ -959,15 +976,15 @@ final class DoviFelComposer: @unchecked Sendable {
         var keepAliveTextures: [CVMetalTexture] = []
 
         // Plane 0 is luma, plane 1 is interleaved chroma. Every plane is bound as Uint so the kernels see
-        // raw code values; the enhancement layer is upsampled from explicit texel reads (`dovi_upsample_el`),
-        // not by the hardware sampler.
+        // raw code values; the enhancement layer is upsampled from explicit texel reads (`dovi_el_*`), not by
+        // the hardware sampler's filtering.
         guard let blYTex = makeTexture(from: baseBuffer, plane: 0, format: .r16Uint, width: blW, height: blH, keepAlive: &keepAliveTextures),
-              let blUvTex = makeTexture(from: baseBuffer, plane: 1, format: .rg16Uint, width: blW / 2, height: blH / 2, keepAlive: &keepAliveTextures),
+              let blUvTex = makeTexture(from: baseBuffer, plane: 1, format: .rg16Uint, width: Self.chromaSize(blW), height: Self.chromaSize(blH), keepAlive: &keepAliveTextures),
               let elYTex = makeTexture(from: enhancementBuffer, plane: 0, format: .r16Uint, width: elW, height: elH, keepAlive: &keepAliveTextures),
-              let elUvTex = makeTexture(from: enhancementBuffer, plane: 1, format: .rg16Uint, width: elW / 2, height: elH / 2, keepAlive: &keepAliveTextures),
+              let elUvTex = makeTexture(from: enhancementBuffer, plane: 1, format: .rg16Uint, width: Self.chromaSize(elW), height: Self.chromaSize(elH), keepAlive: &keepAliveTextures),
               let outYTex = makeTexture(from: dst, plane: 0, format: .r16Uint, width: blW, height: blH, keepAlive: &keepAliveTextures),
-              let outUvTex = makeTexture(from: dst, plane: 1, format: .rg16Uint, width: blW / 2,
-                                         height: outputMode == .sv22 ? blH : blH / 2, keepAlive: &keepAliveTextures) else {
+              let outUvTex = makeTexture(from: dst, plane: 1, format: .rg16Uint, width: Self.chromaSize(blW),
+                                         height: outputMode == .sv22 ? blH : Self.chromaSize(blH), keepAlive: &keepAliveTextures) else {
             return nil
         }
 
@@ -1001,24 +1018,24 @@ final class DoviFelComposer: @unchecked Sendable {
         if outputMode == .sv22 { serialized.flags.insert(.chroma422) }
         serialized.serialize(into: rawBuffer)
         // The blue-noise dither lives in its own specialisation of the kernels (`dovi_fc_blue_noise`).
-        let lumaPipeline: MTLComputePipelineState
-        var chromaPipeline: MTLComputePipelineState
-        if serialized.ditherMode == .blueNoise {
-            guard let blue = try? pipelines.blueNoisePipelines() else {
+        guard let kernels = try? pipelines.kernels(SharedPipelines.Variant(blueNoise: serialized.ditherMode == .blueNoise)),
+              // The composition kernels upsample the EL with SIMD-group shuffles: whole threadgroups, 32 wide,
+              // refused where the SIMD-group is not 32 lanes.
+              let lumaThreads = Self.elUpsamplingThreadgroup(for: kernels.luma),
+              let chromaThreads = Self.elUpsamplingThreadgroup(for: kernels.chroma) else {
+            returnParamSlot(paramSlot)
+            return nil
+        }
+        // sv22: chroma composed at the 4:2:0 sites into the slot's intermediate, then brought to 4:2:2 by the
+        // reference vertical chroma filter (`dovi_chroma_420_to_422`).
+        let sv22 = outputMode == .sv22
+        var chroma420: MTLTexture?
+        if sv22 {
+            guard let texture = chroma420Texture(slot: paramSlot, width: Self.chromaSize(blW), height: Self.chromaSize(blH)) else {
                 returnParamSlot(paramSlot)
                 return nil
             }
-            (lumaPipeline, chromaPipeline) = blue
-        } else {
-            (lumaPipeline, chromaPipeline) = (pipelines.lumaPipeline, pipelines.chromaPipeline)
-        }
-        // sv22 composes chroma at every 4:2:2 site, one thread per output sample (`dovi_compose_chroma_422`).
-        var chroma422Sites = outputMode == .sv22
-        #if DEBUG
-        if sv22RowDuplicationForTesting { chroma422Sites = false }
-        #endif
-        if chroma422Sites {
-            chromaPipeline = pipelines.chroma422Pipeline
+            chroma420 = texture
             logChromaSitingOnce(metalParams.blChromaLocation)
         }
 
@@ -1034,18 +1051,19 @@ final class DoviFelComposer: @unchecked Sendable {
             return nil
         }
 
-        // Both passes go in one concurrent encoder. Luma reads BL luma + BL
+        // Every pass goes in one concurrent encoder. Luma reads BL luma + BL
         // chroma (a luma MMR curve would need it) and the EL luma; chroma reads
         // BL luma + BL chroma and the EL chroma. Neither reads what the other
         // writes — `outYTex` and `outUvTex` are separate planes — so the barrier
         // Metal puts between two serial encoders buys nothing and costs a full
-        // GPU sync point per frame.
+        // GPU sync point per frame. sv22's 4:2:2 step reads what the chroma pass
+        // wrote, behind a barrier on that one texture.
         guard let encoder = commandBuffer.makeComputeCommandEncoder(dispatchType: .concurrent) else {
             returnParamSlot(paramSlot)
             return nil
         }
 
-        encoder.setComputePipelineState(lumaPipeline)
+        encoder.setComputePipelineState(kernels.luma)
         encoder.setTexture(blYTex, index: 0)
         encoder.setTexture(blUvTex, index: 1)
         encoder.setTexture(elYTex, index: 2)
@@ -1054,19 +1072,28 @@ final class DoviFelComposer: @unchecked Sendable {
         encoder.setBuffer(lutBuffer, offset: 0, index: 1)
         encoder.setBuffer(nlqBuffer, offset: 0, index: 2)
         encoder.setBuffer(mmrBuffer, offset: 0, index: 3)
-        dispatch(encoder, width: blW, height: blH,
-                 threadgroup: threadgroupSize(for: lumaPipeline))
+        dispatch(encoder, width: blW, height: blH, threadgroup: lumaThreads, wholeThreadgroups: true)
 
-        encoder.setComputePipelineState(chromaPipeline)
+        encoder.setComputePipelineState(kernels.chroma)
         encoder.setTexture(blYTex, index: 0)
         encoder.setTexture(blUvTex, index: 1)
         encoder.setTexture(elUvTex, index: 2)
-        encoder.setTexture(outUvTex, index: 3)
+        encoder.setTexture(chroma420 ?? outUvTex, index: 3)
         encoder.setBuffer(paramBuffer, offset: 0, index: 0)
         encoder.setBuffer(nlqBuffer, offset: 0, index: 2)
         encoder.setBuffer(mmrBuffer, offset: 0, index: 3)
-        dispatch(encoder, width: blW / 2, height: chroma422Sites ? blH : blH / 2,
-                 threadgroup: threadgroupSize(for: chromaPipeline))
+        dispatch(encoder, width: Self.chromaSize(blW), height: Self.chromaSize(blH), threadgroup: chromaThreads,
+                 wholeThreadgroups: true)
+
+        if let chroma420 {
+            encoder.memoryBarrier(resources: [chroma420])
+            encoder.setComputePipelineState(kernels.chroma422)
+            encoder.setTexture(chroma420, index: 0)
+            encoder.setTexture(outUvTex, index: 1)
+            encoder.setBuffer(paramBuffer, offset: 0, index: 0)
+            dispatch(encoder, width: Self.chromaSize(blW), height: blH, threadgroup: threadgroupSize(for: kernels.chroma422),
+                     wholeThreadgroups: false)
+        }
 
         encoder.endEncoding()
 
@@ -1086,8 +1113,8 @@ final class DoviFelComposer: @unchecked Sendable {
     /// `n` for a maximum code `2^n - 1`.
     static func bitDepth(ofMax max: UInt32) -> Int { UInt32.bitWidth - max.leadingZeroBitCount }
 
-    /// ETSI GS CCM 001 5.4.2.2 and 5.4.2.3.2 for one base-layer code: the piece it falls in and that piece's
-    /// polynomial at it, as the spec's 16-bit prediction (`vv >> (4 + coefficient_log2_denom)`, negative sums 0,
+    /// One base-layer code's piece and that piece's polynomial at it, as the 16-bit prediction
+    /// (`vv >> (4 + coefficient_log2_denom)`, negative sums 0,
     /// capped at 0xffff). A curve the parser could not trust (`numPivots < 2`), or an MMR piece, gives the identity
     /// value `code << (16 - BL_bit_depth)`, which is also what the identity polynomial computes.
     static func polynomialPrediction(_ poly: DoviPolynomialParams, code: Int, blBitDepth: Int) -> Int32 {
@@ -1114,15 +1141,20 @@ final class DoviFelComposer: @unchecked Sendable {
         return Int32(min(vv >> (4 + Int64(poly.coefShift[piece])), 0xffff))
     }
 
-    /// Fills the 3 x 1024 inverse-NLQ table the kernels index (Y, Cb, Cr; one entry per 10-bit EL code), with
+    /// EL codes per component in the inverse-NLQ table (`DOVI_NLQ_LUT_CODES` in the shader): past the 10-bit
+    /// range, because the EL upsampling filters overshoot (to about 1400 from 10-bit input) and the inverse NLQ takes
+    /// the upsampled code as it is.
+    static let nlqLutCodes = 2048
+
+    /// Fills the 3 x ``nlqLutCodes`` inverse-NLQ table the kernels index (Y, Cb, Cr; one entry per EL code), with
     /// exactly the arithmetic of ``inverseNlq(_:elCode:)``. Only components whose residual the kernels apply
-    /// are filled: the others are never read. 3072 integer evaluations on the CPU per frame replace a 64-bit
-    /// multiply per GPU sample (UHD p010 0.82 -> 0.74 ms per frame on an M4 Pro).
+    /// are filled: the others are never read. A few thousand integer evaluations on the CPU per frame replace a
+    /// 64-bit multiply per GPU sample (UHD p010 0.82 -> 0.74 ms per frame on an M4 Pro).
     static func populateNlqLut(into ptr: UnsafeMutablePointer<Int32>, params: DoviMetalParams) {
         guard !params.flags.contains(.disableResidual) else { return }
         fillNlq(ptr, params.nlqY)
-        fillNlq(ptr + 1024, params.nlqCb)
-        fillNlq(ptr + 2048, params.nlqCr)
+        fillNlq(ptr + nlqLutCodes, params.nlqCb)
+        fillNlq(ptr + 2 * nlqLutCodes, params.nlqCr)
     }
 
     /// 32-bit words in the per-frame MMR table: Y, Cb, Cr, each `maxPieces` pieces of the constant, the 21
@@ -1135,8 +1167,8 @@ final class DoviFelComposer: @unchecked Sendable {
     static let mmrEstimateBound = Double(1 << 49)
 
     /// Fills the MMR table the kernels read (`DOVI_MMR_TABLE_*` in the shader): per component and piece the
-    /// constant then the 21 coefficients, Q(coefficient_log2_denom), which the kernels multiply into the spec's
-    /// 64-bit sum (5.4.2.3.3), and whether every term below 2^20 keeps the piece's sum of |coefficient * term|
+    /// constant then the 21 coefficients, Q(coefficient_log2_denom), which the kernels multiply into the 64-bit
+    /// sum, and whether every term below 2^20 keeps the piece's sum of |coefficient * term|
     /// within ``mmrEstimateBound``; then the coefficients' float values in the same layout.
     static func populateMmrTable(into ptr: UnsafeMutablePointer<Int32>, params: DoviMetalParams) {
         let piece = mmrTablePieceStride
@@ -1162,19 +1194,19 @@ final class DoviFelComposer: @unchecked Sendable {
 
     private static func fillNlq(_ ptr: UnsafeMutablePointer<Int32>, _ nlq: DoviNlqParams) {
         guard nlq.nlqMethod == .linear, nlq.nlqScale != 0 else { return }
-        for code in 0..<1024 { ptr[code] = inverseNlq(nlq, elCode: code) }
+        for code in 0..<nlqLutCodes { ptr[code] = inverseNlq(nlq, elCode: code) }
     }
 
-    /// Inverse linear-deadzone quantiser for one 10-bit EL code: ETSI GS CCM 001 5.4.3.2 line for line, with
-    /// EL_bit_depth 10 (the only depth `layerBitDepthsSupported` admits). The result is the spec's 16-bit signed
-    /// residual r, which 5.4.3.3 adds to the 16-bit prediction before the one rounding.
+    /// Inverse linear-deadzone quantiser for one EL code, Dolby's reference arithmetic, with EL_bit_depth 10 (the
+    /// only depth `layerBitDepthsSupported` admits). The result is the 16-bit signed residual r, which the
+    /// reconstruction adds to the 16-bit prediction before the one rounding.
     ///
     /// S, T and R are `linear_deadzone_slope`, `linear_deadzone_threshold` and `vdr_in_max` in
     /// Q(coefficient_log2_denom). The reconstruction sits at the middle of the quantisation step, (2|rr| - 1) * S,
-    /// in doubled fixed point, the threshold is added to the magnitude (the spec's `TT`, DoViBaker's
+    /// in doubled fixed point, the threshold is added to the magnitude (the reference's `TT`, DoViBaker's
     /// `dq += T * sign`), the doubled product is clamped to +/-2R, and `nlqShift` (coefficient_log2_denom - 5 -
-    /// EL_bit_depth) takes it to 16 bits with an arithmetic shift, so a negative residual rounds down as the spec's
-    /// does. Every real stream carries linear_deadzone_slope 2048 and vdr_in_max 0.125 at denom 23: an EL swing of
+    /// EL_bit_depth) takes it to 16 bits with an arithmetic shift, so a negative residual rounds down as the
+    /// reference's does. Every real stream carries linear_deadzone_slope 2048 and vdr_in_max 0.125 at denom 23: an EL swing of
     /// +/-512 lands on +/-0.125, and the threshold is 0 (RPU survey, 9,816 RPUs).
     ///
     /// Wrapping arithmetic: parameters no real stream carries (a negative or huge slope, an offset far outside the
@@ -1190,6 +1222,33 @@ final class DoviFelComposer: @unchecked Sendable {
         dq = min(max(dq, -limit), limit)
         return Int32(truncatingIfNeeded: dq >> Int64(nlq.nlqShift))
     }
+
+    /// sv22's 4:2:0 chroma intermediate for `slot`, `width` x `height`: the slot's texture, remade when the size changes.
+    private func chroma420Texture(slot: Int, width: Int, height: Int) -> MTLTexture? {
+        if let texture = chroma420Textures[slot], texture.width == width, texture.height == height { return texture }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg16Uint, width: width, height: height, mipmapped: false)
+        descriptor.storageMode = .private
+        descriptor.usage = [.shaderRead, .shaderWrite]
+        let texture = device.makeTexture(descriptor: descriptor)
+        chroma420Textures[slot] = texture
+        return texture
+    }
+
+    /// The threadgroup the composition kernels' EL upsampling needs: 32 wide, one SIMD-group per row, so lane L of a SIMD-group is
+    /// output column x0 + L (`dovi_el_h` reads its neighbours' columns by lane). nil where the SIMD-group is
+    /// not 32 lanes, which the shuffles assume; every Apple GPU's is.
+    static func elUpsamplingThreadgroup(for pipeline: MTLComputePipelineState) -> MTLSize? {
+        guard pipeline.threadExecutionWidth == 32 else {
+            EngineLog.emit("[DoviFelComposer] SIMD width \(pipeline.threadExecutionWidth), not 32: EL upsampling refused",
+                           category: .swPlayback)
+            return nil
+        }
+        return MTLSize(width: 32, height: max(1, min(pipeline.maxTotalThreadsPerThreadgroup / 32, 8)), depth: 1)
+    }
+
+    /// A 4:2:0 chroma plane's size along an axis of `n` luma samples: half, rounded up, as CoreVideo allocates it
+    /// (`dovi_chroma_size`), so an odd picture's last chroma column and row are bound and composed.
+    static func chromaSize(_ n: Int) -> Int { (n + 1) / 2 }
 
     /// Sizes threadgroups using the pipeline's execution width (dolby-vision-fel.md §5.6).
     private func threadgroupSize(for pipeline: MTLComputePipelineState) -> MTLSize {
@@ -1321,8 +1380,7 @@ final class DoviFelComposer: @unchecked Sendable {
             }
         }
         encoder.setBuffer(outBuffer, offset: 0, index: 1)
-        dispatch(encoder, width: 1, height: 1,
-                 threadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        dispatch(encoder, width: 1, height: 1, threadgroup: MTLSize(width: 1, height: 1, depth: 1), wholeThreadgroups: false)
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
@@ -1340,14 +1398,18 @@ final class DoviFelComposer: @unchecked Sendable {
     /// taken where non-uniform threadgroups are unavailable: there the extra
     /// threads are real and the kernels' `gid >= bl_width` guard is what discards
     /// them.
+    ///
+    /// `wholeThreadgroups` takes the second path whatever the device supports: the composition kernels' shuffles need
+    /// every lane of a SIMD-group to run, the ones past the picture included (``elUpsamplingThreadgroup(for:)``).
     private func dispatch(
         _ encoder: MTLComputeCommandEncoder,
         width: Int,
         height: Int,
-        threadgroup: MTLSize
+        threadgroup: MTLSize,
+        wholeThreadgroups: Bool
     ) {
         guard width > 0, height > 0 else { return }
-        if supportsNonUniformThreadgroups {
+        if supportsNonUniformThreadgroups && !wholeThreadgroups {
             encoder.dispatchThreads(
                 MTLSize(width: width, height: height, depth: 1),
                 threadsPerThreadgroup: threadgroup
@@ -1452,9 +1514,9 @@ final class DoviFelComposer: @unchecked Sendable {
             params.flags.insert(.disableResidual)
         }
 
-        // The inverse NLQ product is a doubled Q(coefficient_log2_denom) of a normalised residual; 5.4.3.2's
-        // final shift, coefficient_log2_denom - 5 - EL_bit_depth, takes it to 16 bits. A denominator below
-        // 5 + EL_bit_depth would make the shift negative, which the spec does not define, so that disables the
+        // The inverse NLQ product is a doubled Q(coefficient_log2_denom) of a normalised residual; its final
+        // shift, coefficient_log2_denom - 5 - EL_bit_depth, takes it to 16 bits. A denominator below
+        // 5 + EL_bit_depth would make the shift negative, which the reference does not define, so that disables the
         // residual rather than shifting the other way.
         let nlqShift = UInt32(max(0, coefLog2Denom - 5 - elBitDepth))
         let nlqMethodIdc = mapping.pointee.nlq_method_idc
@@ -1754,7 +1816,7 @@ final class DoviFelComposer: @unchecked Sendable {
             deadzoneLogLock.unlock()
             if first {
                 EngineLog.emit("[DoviFelComposer] \(label) linear_deadzone_threshold = \(threshold) (non-zero); "
-                    + "the inverse NLQ adds it to the scaled magnitude, as the spec's pseudo-code "
+                    + "the inverse NLQ adds it to the scaled magnitude, as Dolby's reference "
                     + "does, but no surveyed stream carries a non-zero threshold. If highlights look "
                     + "crushed or lifted, this is the first thing to question.", category: .swPlayback)
             }
