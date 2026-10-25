@@ -145,7 +145,8 @@ enum LogRedaction {
     {
         if let secret = registeredSecretRange(in: bytes, at: index, secrets: secrets) { return secret }
         if keys, let value = matchedKeyLength(in: bytes, at: index)
-            .flatMap({ valueRange(in: bytes, keyStart: index, keyEnd: index + $0) }) {
+            .flatMap({ valueRange(in: bytes, keyStart: index, keyEnd: index + $0,
+                                  isCookie: isCookieKey(in: bytes, at: index, length: $0)) }) {
             return value
         }
         return authorizationSchemeRange(in: bytes, at: index)
@@ -234,7 +235,16 @@ enum LogRedaction {
     /// Characters are read through `logicalByte`. A terminator ends the value only when it sits under
     /// no more encoding layers than the `=` did: inside a plain query `%26` is part of the value, inside
     /// an encoded one it is the `&` that ends it. With no escape in sight this is the byte scan it was.
-    private static func valueRange(in bytes: [UInt8], keyStart: Int, keyEnd: Int) -> Range<Int>? {
+    /// A `Cookie:` header's value is a `name=value` pair, whose value may hold a `:` (a decoded Seerr
+    /// session is `s:<sid>.<sig>`), so it ends like a query value rather than like a header value.
+    private static func isCookieKey(in bytes: [UInt8], at index: Int, length: Int) -> Bool {
+        length == cookieKey.count
+            && zip(bytes[index ..< index + length], cookieKey).allSatisfy { lowercased($0) == $1 }
+    }
+    private static let cookieKey = Array("cookie".utf8)
+
+    private static func valueRange(in bytes: [UInt8], keyStart: Int, keyEnd: Int,
+                                   isCookie: Bool) -> Range<Int>? {
         var i = keyEnd
         // Audit SUB-109: a JSON member or a dictionary description closes the key's quote before its
         // separator (`{"api_key":"…"}`, `["X-Emby-Token": "…"]`).
@@ -242,7 +252,7 @@ enum LogRedaction {
            i < bytes.count, bytes[i] == bytes[keyStart - 1] {
             i += 1
         }
-        while i < bytes.count, case let char = logicalByte(in: bytes, at: i), char.byte == space {
+        while i < bytes.count, case let char = logicalByte(in: bytes, at: i), isBlank(char.byte) {
             i += char.width
         }
         guard i < bytes.count else { return nil }
@@ -259,7 +269,7 @@ enum LogRedaction {
         // "api_key= (missing)" read as a credential and swallow the rest of the line.
         var afterSpaces = i
         while afterSpaces < bytes.count, case let char = logicalByte(in: bytes, at: afterSpaces),
-              char.byte == space {
+              isBlank(char.byte) {
             afterSpaces += char.width
         }
         var quote: UInt8?
@@ -277,7 +287,7 @@ enum LogRedaction {
             if char.depth <= depth {
                 if let quote, char.byte == quote { break }
                 if quote == nil, isValueTerminator(char.byte),
-                   endsValue(char, at: i, in: bytes, afterHeaderSeparator: isHeaderSeparator) {
+                   endsValue(char, at: i, in: bytes, afterHeaderSeparator: isHeaderSeparator && !isCookie) {
                     break
                 }
             }
@@ -371,15 +381,19 @@ enum LogRedaction {
         let start = index + 3
         var i = start
         var colon: Int?
-        while i < bytes.count, bytes[i] != UInt8(ascii: "@"), !isAuthorityTerminator(bytes[i]) {
-            if bytes[i] == UInt8(ascii: ":"), colon == nil { colon = i }
+        var lastAt: Int?
+        // The userinfo runs to the LAST `@` of the authority, so a raw `@` inside a password (some
+        // tools print it unencoded) does not leave the rest of it readable.
+        while i < bytes.count, !isAuthorityTerminator(bytes[i]) {
+            if bytes[i] == UInt8(ascii: "@") { lastAt = i }
+            if bytes[i] == UInt8(ascii: ":"), colon == nil, lastAt == nil { colon = i }
             i += 1
         }
-        guard i < bytes.count, bytes[i] == UInt8(ascii: "@") else { return nil }
+        guard let end = lastAt else { return nil }
         // With a colon the password is everything after it; without one the whole userinfo is the
         // secret (a bare token in the authority), and then the user name cannot be spared.
         let secretStart = colon.map { $0 + 1 } ?? start
-        return secretStart < i ? secretStart ..< i : nil
+        return secretStart < end ? secretStart ..< end : nil
     }
 
     // MARK: Registered secrets
