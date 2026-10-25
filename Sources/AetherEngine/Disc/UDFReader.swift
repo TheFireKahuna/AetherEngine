@@ -56,6 +56,17 @@ final class UDFReader {
         }
     }
 
+    /// `extents(of:)` for many entries, their file entries read in the order they sit on the image so the
+    /// reader's read-ahead serves neighbours from one fetch; nil for one that cannot be read.
+    func extents(of entries: [UDFEntry]) -> [[(offset: Int64, length: Int64)]?] {
+        var out = [[(offset: Int64, length: Int64)]?](repeating: nil, count: entries.count)
+        let order = entries.indices.sorted {
+            (entries[$0].icbPartRef, entries[$0].icbBlock) < (entries[$1].icbPartRef, entries[$1].icbBlock)
+        }
+        for i in order { out[i] = try? extents(of: entries[i]) }
+        return out
+    }
+
     /// Partition ref for an allocation descriptor. long_ad carries its own ref.
     /// short_ad has none, so it is relative to the FE's own recording partition.
     /// For a metadata-partition FE that means metadata-virtual blocks (resolved via

@@ -12,6 +12,9 @@ enum DiscError: Error, Equatable, CustomStringConvertible, LocalizedError {
     case notUDF
     case directoryNotFound(String)
     case malformed(String)
+    /// The recognition's scope was stopped (`DiscRecognitionScope`): what it read is partial, so it is
+    /// neither returned nor cached.
+    case recognitionStopped
 
     var description: String {
         switch self {
@@ -19,6 +22,7 @@ enum DiscError: Error, Equatable, CustomStringConvertible, LocalizedError {
         case .notUDF: "Disc: not a UDF filesystem"
         case .directoryNotFound(let path): "Disc: directory not found (\(path))"
         case .malformed(let reason): "Disc: malformed structure (\(reason))"
+        case .recognitionStopped: "Disc: recognition stopped"
         }
     }
 

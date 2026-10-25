@@ -170,20 +170,52 @@ struct BluRayEPMapSeekTests {
                               bdClipOutTimes: [423_000, 423_000, 423_000])
         let resolved: [(item: Int, clip: String, byteStart: Int64)] = [(0, "00001", 0), (1, "00002", 6912), (2, "00001", 13824)]
         let map = Self.clpi([(pid: 0x1011, entries: Self.tinyEntries)])
-        var reads: [String] = []
-        let table = DiscReader.buildSeekTable(title: title, resolved: resolved) { clip in
-            reads.append(clip)
-            return map
+        var asked: [[String]] = []
+        let table = DiscReader.buildSeekTable(title: title, resolved: resolved) { clips in
+            asked.append(clips)
+            return clips.map { _ in map }
         }
         #expect(table?.clips.map(\.concatByteStart) == [0, 6912, 13824])
         #expect(table?.clips.map(\.cumulativeBeforeSec) == [0, 8, 16])
         #expect(table?.clips.map(\.outTimeSec) == [9.4, 9.4, 9.4])
-        #expect(reads == ["00001", "00002"])
+        #expect(asked == [["00001", "00002"]])
 
-        let partial = DiscReader.buildSeekTable(title: title, resolved: resolved) { $0 == "00002" ? nil : map }
+        let partial = DiscReader.buildSeekTable(title: title, resolved: resolved) { clips in
+            clips.map { $0 == "00002" ? [] : map }
+        }
         #expect(partial == nil)
+        #expect(DiscReader.buildSeekTable(title: title, resolved: resolved) { _ in nil } == nil)
         let noInTimes = DiscTitle(id: 0, durationTicks: 1, bdClipIDs: ["00001"])
-        #expect(DiscReader.buildSeekTable(title: noInTimes, resolved: [(0, "00001", 0)]) { _ in map } == nil)
+        #expect(DiscReader.buildSeekTable(title: noInTimes, resolved: [(0, "00001", 0)]) { $0.map { _ in map } } == nil)
+    }
+
+    @Test("a title cut into hundreds of clips gets its table, its CLPI asked for at once")
+    func manyClipTitle() {
+        let count = 400
+        let ids = (0..<count).map { String(format: "%05d", $0) }
+        let title = DiscTitle(id: 0, durationTicks: UInt64(count) * 360_000, bdClipIDs: ids,
+                              bdClipCumulativeBeforeTicks: (0..<count).map { UInt64($0) * 360_000 },
+                              bdClipInTimes: Array(repeating: 63_000, count: count),
+                              bdClipOutTimes: Array(repeating: 423_000, count: count))
+        let resolved: [(item: Int, clip: String, byteStart: Int64)] = ids.enumerated().map { ($0, $1, Int64($0) * 6912) }
+        let map = Self.clpi([(pid: 0x1011, entries: Self.tinyEntries)])
+        var calls = 0
+        let table = DiscReader.buildSeekTable(title: title, resolved: resolved) { clips in
+            calls += 1
+            return clips.map { _ in map }
+        }
+        #expect(table?.clips.count == count)
+        #expect(calls == 1)
+    }
+
+    @Test("CLPI files are held to a byte budget on their declared sizes, before any is read")
+    func clipInfoBudget() {
+        let perFile = DiscReader.maxSmallFileBytes
+        let fitting = Int(DiscReader.maxSeekTableBytes / perFile)
+        #expect(DiscReader.clipInfoFitsBudget(Array(repeating: perFile, count: fitting)))
+        #expect(!DiscReader.clipInfoFitsBudget(Array(repeating: perFile, count: fitting + 1)))
+        // A real title: 900 clips of a few KB each.
+        #expect(DiscReader.clipInfoFitsBudget(Array(repeating: 6_000, count: 900)))
     }
 
     // MARK: - The plan's keyframes
@@ -224,6 +256,40 @@ struct BluRayEPMapSeekTests {
                 #expect(hit.offset == keyframe.pos)
             }
         }
+    }
+
+    @Test("a clip whose clock wraps inside it keeps its keyframes in order, and each seeks back to its entry")
+    func clipClockWrapsInsideIt() throws {
+        // The 32-bit 45 kHz clock wraps at 2^32 ticks (95443.7 s). This clip's item starts 3 s before the
+        // wrap and runs 8 s, so its later entries and its out_time read near zero.
+        let wrap: UInt64 = 1 << 32
+        let in45k = wrap - 3 * 45000
+        let entries: [CLPIEntryPoint] = (-1...8).map { (second: Int) -> CLPIEntryPoint in
+            let raw: Int64 = (Int64(in45k) + Int64(second) * 45000) & Int64(wrap - 1)
+            let spn: UInt32 = UInt32(100 + second * 10)
+            return CLPIEntryPoint(pts45k: UInt64(raw) / 256 * 256, spn: spn)
+        }
+        let table = DiscSeekTable(clips: [
+            .init(concatByteStart: 0, cumulativeBeforeSec: 0, inTimeSec: Double(in45k) / 45000,
+                  outTimeSec: Double((in45k + 8 * 45000) & (wrap - 1)) / 45000, entries: entries),
+        ])
+        let origin = 4_000.0
+        let keyframes = table.titleKeyframes(titleOriginSec: origin, timeBase: AVRational(num: 1, den: 90000))
+        // The keyframe on in_time through the one before out_time, a second apart across the wrap.
+        let seconds: [Double] = keyframes.map { (Double($0.pts) / 90000 - origin).rounded() }
+        let expectedSeconds: [Double] = (0...7).map(Double.init)
+        #expect(seconds == expectedSeconds)
+        let positions: [Int64] = keyframes.map(\.pos)
+        let expectedPositions: [Int64] = (0...7).map { (second: Int) -> Int64 in Int64(100 + second * 10) * 192 }
+        #expect(positions == expectedPositions)
+        for keyframe in keyframes {
+            let hit = try #require(table.keyframe(forSourceSeconds: Double(keyframe.pts) / 90000, titleOriginSec: origin))
+            #expect(hit.offset == keyframe.pos)
+        }
+        // A target between keyframes past the wrap lands on the one before it.
+        let mid = try #require(table.keyframe(forSourceSeconds: origin + 5.5, titleOriginSec: origin))
+        let fifth: Int64 = (100 + 5 * 10) * 192
+        #expect(mid.offset == fifth)
     }
 
     // MARK: - Through the demuxer
