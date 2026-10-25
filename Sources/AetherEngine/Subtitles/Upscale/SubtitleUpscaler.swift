@@ -213,15 +213,37 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         workspace = Workspace(device: kernels.device)
     }
 
-    /// Makes this upscaler's window surfaces, one set per window shape, and runs each through the configuration's
-    /// model once, then one small picture through the whole pass, so the first subtitle pays only the steady-state
-    /// cost. Blocks (most of it is the Neural Engine's first use of each surface); for a background queue at app open
-    /// or when a session starts, after ``prewarm(_:)``. A plan that needs more windows of one shape than this made still
-    /// makes them on first use.
-    public func prepare() throws {
+    /// Makes this upscaler's window surfaces and runs each through the configuration's model once, then one small
+    /// picture through the whole pass, so the first subtitle pays only the steady-state cost. The surfaces are one
+    /// set per window shape, and as many sets of each shape as the plans of representative subtitles on `canvas` use
+    /// (one to three lines across 30 to 90% of its width, a line a twentieth of its height). Blocks (most of it is
+    /// the Neural Engine's first use of each surface); for a background queue at app open or when a session starts,
+    /// after ``prewarm(_:)``. A plan needing more windows of one shape than this made still makes them on first use.
+    public func prepare(canvas: CGSize = CGSize(width: 1920, height: 1080)) throws {
         try lock.withLock {
             let config = _configuration
-            let windows = SubtitleUpscaleNeuralEngine.shapes.map { SubtitleUpscaleTilePlan.Window(x: 0, y: 0, width: $0.width, height: $0.height) }
+            var counts = Dictionary(uniqueKeysWithValues: SubtitleUpscaleNeuralEngine.shapes.map { ($0, 1) })
+            let lineHeight = max(8, Int(canvas.height / 20)), gap = lineHeight / 4
+            for lines in 1...3 {
+                for fraction in [0.3, 0.6, 0.9] {
+                    let w = max(16, Int(canvas.width * fraction)), h = lines * lineHeight + (lines - 1) * gap
+                    var spans = [ClosedRange<Int>?](repeating: nil, count: h)
+                    for k in 0..<lines {
+                        // Each line a little shorter than the one above, as subtitle lines run.
+                        let lw = max(8, w - k * w / 5), x0 = (w - lw) / 2
+                        for y in (k * (lineHeight + gap))..<(k * (lineHeight + gap) + lineHeight) { spans[y] = x0...(x0 + lw - 1) }
+                    }
+                    let content = Content(bounds: CGRect(x: 0, y: 0, width: w, height: h), spans: spans)
+                    let plan = SubtitleUpscaleTilePlan.plan(content: content, width: w, height: h, support: supportRadius,
+                                                            alpha: config.alphaModel, luma: config.lumaModel)
+                    var used: [SubtitleUpscaleNeuralEngine.Shape: Int] = [:]
+                    for window in plan.windows { used[.init(height: window.height, width: window.width), default: 0] += 1 }
+                    for (shape, n) in used { counts[shape] = max(counts[shape] ?? 0, n) }
+                }
+            }
+            let windows = counts.flatMap { shape, n in
+                Array(repeating: SubtitleUpscaleTilePlan.Window(x: 0, y: 0, width: shape.width, height: shape.height), count: n)
+            }
             for s in try workspace.surfaces.surfaces(for: windows) {
                 try SubtitleUpscaleNeuralEngine.predict(try SubtitleUpscaleNeuralEngine.model(config.pair, s.shape), s)
             }
@@ -500,22 +522,27 @@ public final class SubtitleUpscaler: @unchecked Sendable {
             return
         }
         g = made
-        encoder.setComputePipelineState(kernels.tileGather)
-        encoder.setTexture(job.source, index: 0)
-        encoder.setBytes(&g, length: MemoryLayout<Geometry>.stride, index: 0)
+        encoder.endEncoding()
+        let events = try workspace.events(records.count)
+        let value = workspace.nextEventValue()
+        // Each window's gather in an encoder of its own, then its gather event: its prediction starts as its inputs
+        // are written, while later windows are still gathering.
         for (k, var record) in records.enumerated() {
+            guard let encoder = gather.makeComputeCommandEncoder(dispatchType: .serial) else { throw UpscaleError.gpu("no compute encoder") }
+            encoder.setComputePipelineState(kernels.tileGather)
+            encoder.setTexture(job.source, index: 0)
+            encoder.setBytes(&g, length: MemoryLayout<Geometry>.stride, index: 0)
             encoder.setTexture(surfaces[k].alphaIn.texture, index: 1)
             encoder.setTexture(surfaces[k].lumaIn.texture, index: 2)
             encoder.setBytes(&record, length: MemoryLayout<WindowRecord>.stride, index: 1)
             encoder.dispatchThreads(MTLSize(width: plan.windows[k].width, height: plan.windows[k].height, depth: 1),
                                     threadsPerThreadgroup: MTLSize(width: 32, height: 8, depth: 1))
+            encoder.endEncoding()
+            gather.encodeSignalEvent(events.gather[k], value: value)
         }
-        encoder.endEncoding()
 
-        let events = try workspace.events(records.count)
-        let value = workspace.nextEventValue()
         for (k, var record) in records.enumerated() {
-            compose.encodeWaitForEvent(events[k], value: value)
+            compose.encodeWaitForEvent(events.compose[k], value: value)
             guard record.coreWidth > 0, record.coreHeight > 0 else { continue }
             guard let encoder = compose.makeComputeCommandEncoder(dispatchType: .serial) else { throw UpscaleError.gpu("no compute encoder") }
             encoder.setComputePipelineState(kernels.compositeTiles)
@@ -536,30 +563,40 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         func release() {
             guard !signalled else { return }
             signalled = true
-            for e in events.prefix(records.count) where e.signaledValue < value { e.signaledValue = value }
+            for e in events.compose.prefix(records.count) where e.signaledValue < value { e.signaledValue = value }
         }
         defer { release() }
-        gather.waitUntilCompleted()
-        stages.gather = lap()
         stages.tiles = records.count
-        if let error = gather.error { release(); compose.waitUntilCompleted(); throw UpscaleError.gpu("\(error)") }
 
-        // All windows' predictions in flight together, each signalling its window's event as it returns.
+        // All windows' predictions in flight together, each starting when its window's gather event fires and
+        // signalling its composite's event as it returns.
         let failure = OSAllocatedUnfairLock<Error?>(initialState: nil)
+        let firstInputs = OSAllocatedUnfairLock<UInt64>(initialState: .max)
         let pair = config.pair
         nonisolated(unsafe) let windows = surfaces
         DispatchQueue.concurrentPerform(iterations: windows.count) { k in
             do {
+                guard events.gather[k].wait(untilSignaledValue: value, timeoutMS: 2000) else {
+                    throw UpscaleError.gpu("window \(k)'s gather did not finish")
+                }
+                let now = DispatchTime.now().uptimeNanoseconds
+                firstInputs.withLock { $0 = min($0, now) }
                 try SubtitleUpscaleNeuralEngine.predict(try SubtitleUpscaleNeuralEngine.model(pair, windows[k].shape), windows[k])
             } catch {
                 failure.withLock { if $0 == nil { $0 = error } }
             }
-            events[k].signaledValue = value
+            events.compose[k].signaledValue = value
         }
         signalled = true
+        let inputs = firstInputs.withLock { $0 }
+        if inputs != .max, inputs > mark {
+            stages.gather = Double(inputs - mark) / 1e6
+            mark = inputs
+        }
         stages.predict = lap()
         compose.waitUntilCompleted()
         stages.composite = lap()
+        if let error = gather.error { throw UpscaleError.gpu("\(error)") }
         if let error = failure.withLock({ $0 }) { throw error }
         if let error = compose.error { throw UpscaleError.gpu("\(error)") }
     }
@@ -583,9 +620,11 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         private(set) var support: MTLBuffer!
         /// The window surfaces, shared by Metal and Core ML.
         let surfaces: SubtitleUpscaleNeuralEngine.Surfaces.Pool
-        /// One event per window, which the CPU signals when that window's prediction returns and its composite
-        /// waits on; every pass signals a new value.
-        private var windowEvents: [MTLSharedEvent] = []
+        /// Two events per window: the GPU signals the first when the window's gather is written and its prediction
+        /// waits on it; the CPU signals the second when the prediction returns and its composite waits on it. Every
+        /// pass signals a new value.
+        private var gatherEvents: [MTLSharedEvent] = []
+        private var composeEvents: [MTLSharedEvent] = []
         private var eventValue: UInt64 = 0
         private var maskCapacity = 0
         private var textures: [Int: MTLTexture] = [:]
@@ -603,12 +642,13 @@ public final class SubtitleUpscaler: @unchecked Sendable {
             return b
         }
 
-        func events(_ count: Int) throws -> [MTLSharedEvent] {
-            while windowEvents.count < count {
-                guard let e = device.makeSharedEvent() else { throw UpscaleError.unavailable("no shared event") }
-                windowEvents.append(e)
+        func events(_ count: Int) throws -> (gather: [MTLSharedEvent], compose: [MTLSharedEvent]) {
+            while gatherEvents.count < count {
+                guard let g = device.makeSharedEvent(), let c = device.makeSharedEvent() else { throw UpscaleError.unavailable("no shared event") }
+                gatherEvents.append(g)
+                composeEvents.append(c)
             }
-            return windowEvents
+            return (gatherEvents, composeEvents)
         }
 
         func nextEventValue() -> UInt64 {
