@@ -82,7 +82,9 @@ final class SourceByteCache: @unchecked Sendable {
         /// Stored and not yet written, readable all the same: a reader that fetched a block must be
         /// able to read it straight back, or the write's latency would be a window in which the next
         /// reader fetches it again.
-        var pending: [(id: UInt64, offset: Int64, data: Data)] = []
+        /// In store order, which is the order their writes land in, so a landed write is always the
+        /// first entry.
+        var pending: [(offset: Int64, data: Data)] = []
         /// What a read can be served from: on disk or pending.
         var visible = ByteSpanSet()
         /// Block index to the tick it was last written or read.
@@ -129,7 +131,11 @@ final class SourceByteCache: @unchecked Sendable {
     private var sources: [SourceCacheKey: Source] = [:]
     private var heldBytes: Int64 = 0
     private var pendingWriteBytes = 0
-    private var nextPendingID: UInt64 = 0
+    /// Stored deliveries not yet handed to the disk, oldest first, across every source. One drain
+    /// on `writeQueue` takes whatever has queued up, so a burst of small deliveries costs one
+    /// dispatch and one `pwritev` per contiguous run rather than a dispatch and a `pwrite` each.
+    private var queuedWrites: [(source: Source, key: SourceCacheKey, offset: Int64, data: Data)] = []
+    private var drainScheduled = false
     private var clock: UInt64 = 0
     private var storedSinceReview: Int64 = 0
     private var writeWaitLogged = false
@@ -309,36 +315,87 @@ final class SourceByteCache: @unchecked Sendable {
         }
         source.version = source.version.merged(with: version)
         pendingWriteBytes += data.count
-        nextPendingID &+= 1
-        let id = nextPendingID
-        source.pending.append((id, offset, data))
+        source.pending.append((offset, data))
         source.visible.insert(start: offset, end: offset + Int64(data.count))
+        queuedWrites.append((source, key, offset, data))
         scheduleReleaseLocked(key, source)
+        let schedule = !drainScheduled
+        drainScheduled = true
         lock.unlock()
+        if schedule { writeQueue.async { [self] in drainWrites() } }
+    }
 
-        writeQueue.async { [self] in
-            let written = Self.writeAll(source.fd, data, at: offset)
+    /// Writes whatever has queued, until nothing has. On `writeQueue`.
+    private func drainWrites() {
+        while true {
             lock.lock()
-            pendingWriteBytes -= data.count
-            lock.broadcast()
-            source.pending.removeAll { $0.id == id }
-            guard written, sources[key] === source else {
-                rebuildVisibleLocked(source)
+            let batch = queuedWrites
+            queuedWrites.removeAll(keepingCapacity: true)
+            if batch.isEmpty {
+                drainScheduled = false
                 lock.unlock()
                 return
             }
-            let added = source.spans.insert(start: offset, end: offset + Int64(data.count))
-            heldBytes += added
-            source.storedBytes += added
-            touchLocked(source, start: offset, end: offset + Int64(data.count))
+            lock.unlock()
+
+            // Contiguous runs into one file go down as one vectored write.
+            var outcomes = [Bool](repeating: false, count: batch.count)
+            var runStart = 0
+            while runStart < batch.count {
+                var runEnd = runStart + 1
+                var nextOffset = batch[runStart].offset + Int64(batch[runStart].data.count)
+                while runEnd < batch.count, runEnd - runStart < Self.maxWriteRunEntries,
+                      batch[runEnd].source === batch[runStart].source,
+                      batch[runEnd].offset == nextOffset {
+                    nextOffset += Int64(batch[runEnd].data.count)
+                    runEnd += 1
+                }
+                let written = Self.writeRun(batch[runStart].source.fd,
+                                            batch[runStart..<runEnd].map(\.data),
+                                            at: batch[runStart].offset)
+                for i in runStart..<runEnd { outcomes[i] = written }
+                runStart = runEnd
+            }
+
+            lock.lock()
+            var review = false
+            var landed: [ObjectIdentifier: Int] = [:]
+            var rebuild: [ObjectIdentifier: Source] = [:]
+            for (i, item) in batch.enumerated() {
+                let source = item.source
+                let count = item.data.count
+                pendingWriteBytes -= count
+                landed[ObjectIdentifier(source), default: 0] += 1
+                guard outcomes[i], sources[item.key] === source else {
+                    rebuild[ObjectIdentifier(source)] = source
+                    continue
+                }
+                let end = item.offset + Int64(count)
+                let added = source.spans.insert(start: item.offset, end: end)
+                heldBytes += added
+                source.storedBytes += added
+                touchLocked(source, start: item.offset, end: end)
+                storedSinceReview += added
+            }
+            for item in batch {
+                let id = ObjectIdentifier(item.source)
+                guard let n = landed.removeValue(forKey: id) else { continue }
+                item.source.pending.removeFirst(min(n, item.source.pending.count))
+            }
+            for source in rebuild.values { rebuildVisibleLocked(source) }
             evictLocked()
-            storedSinceReview += added
-            let review = allowance.map { storedSinceReview >= $0.reviewEvery } ?? false
-            if review { storedSinceReview = 0 }
+            if let allowance, storedSinceReview >= allowance.reviewEvery {
+                storedSinceReview = 0
+                review = true
+            }
+            lock.broadcast()
             lock.unlock()
             if review { reviewBudget() }
         }
     }
+
+    /// Most deliveries one vectored write carries.
+    private static let maxWriteRunEntries = 64
 
     /// Sizes the claim again from the free space now and evicts down to it. The disk can fill under
     /// a long session (another app, the segment caches), and a budget sized once at first use would
@@ -610,16 +667,46 @@ final class SourceByteCache: @unchecked Sendable {
         }
     }
 
-    private static func writeAll(_ fd: Int32, _ data: Data, at offset: Int64) -> Bool {
-        data.withUnsafeBytes { raw -> Bool in
-            guard let base = raw.baseAddress else { return false }
-            var done = 0
-            while done < raw.count {
-                let n = pwrite(fd, base + done, raw.count - done, off_t(offset) + off_t(done))
-                if n > 0 { done += n } else if n < 0, errno == EINTR { continue } else { return false }
+    /// Writes `pieces` back to back from `offset`, as few `pwritev` calls as the kernel takes them in.
+    private static func writeRun(_ fd: Int32, _ pieces: [Data], at offset: Int64) -> Bool {
+        // Each piece's bytes stay pinned for the whole write by the nested closures.
+        func write(_ index: Int, _ vectors: inout [iovec]) -> Bool {
+            guard index < pieces.count else { return writeVectors(fd, &vectors, at: offset) }
+            return pieces[index].withUnsafeBytes { raw -> Bool in
+                guard let base = raw.baseAddress, raw.count > 0 else { return write(index + 1, &vectors) }
+                vectors.append(iovec(iov_base: UnsafeMutableRawPointer(mutating: base), iov_len: raw.count))
+                return write(index + 1, &vectors)
             }
-            return true
         }
+        var vectors: [iovec] = []
+        vectors.reserveCapacity(pieces.count)
+        return write(0, &vectors)
+    }
+
+    private static func writeVectors(_ fd: Int32, _ vectors: inout [iovec], at offset: Int64) -> Bool {
+        var position = off_t(offset)
+        var first = 0
+        while first < vectors.count {
+            let n = vectors[first...].withUnsafeBufferPointer { buffer in
+                pwritev(fd, buffer.baseAddress, Int32(buffer.count), position)
+            }
+            if n < 0 {
+                if errno == EINTR { continue }
+                return false
+            }
+            if n == 0 { return false }
+            position += off_t(n)
+            var left = n
+            while first < vectors.count, left >= vectors[first].iov_len {
+                left -= vectors[first].iov_len
+                first += 1
+            }
+            if left > 0 {
+                vectors[first].iov_base = vectors[first].iov_base?.advanced(by: left)
+                vectors[first].iov_len -= left
+            }
+        }
+        return true
     }
 
     private static func mb(_ bytes: Int64) -> String {
