@@ -41,7 +41,7 @@ struct DolbyVisionLevel6: Equatable, Sendable {
         maxLuminance > 0 && UInt32(minLuminance) < UInt32(maxLuminance) * 10000
     }
 
-    /// Whether L6 states a light level. 0 / 0 is CTA-861.3's "unknown".
+    /// Whether L6 states a light level. 0 / 0 means "unknown".
     var statesLightLevel: Bool { maxContentLightLevel != 0 || maxFrameAverageLightLevel != 0 }
 
     /// `stream`'s HDR10 static metadata rewritten to describe the master. The mastering display's luminance comes from

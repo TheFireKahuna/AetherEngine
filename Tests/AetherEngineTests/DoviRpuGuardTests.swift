@@ -474,7 +474,7 @@ struct DoviRpuGuardTests {
     @Test("a block libdovi carries without interpreting is walked past, and a bad block behind it is still caught",
           arguments: [(3, 7), (5, 3), (1, 8)])
     func carriedCmv29BlockWalk(length: Int, level: Int) {
-        // In the CM v2.9 list: a reserved level, ETSI TS 103 572's L3 (libdovi files L3 under CM v4.0) and a CM v4.0
+        // In the CM v2.9 list: a reserved level, the broadcast L3 (libdovi files L3 under CM v4.0) and a CM v4.0
         // level. The vendored libdovi keeps each as its bytes instead of failing the RPU.
         let block = (UInt64(length), UInt64(level))
         Self.expectAccepted(Self.craftUsePrev(cmv29Block: block, cmv40Block: (10, 8)), "level \(level) in the v2.9 list")

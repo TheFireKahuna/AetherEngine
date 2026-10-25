@@ -34,8 +34,8 @@ import Dovi
 ///
 /// A container statement wins for what it states: a type the codecpar lacks is added, and a mastering display
 /// entry the container left incomplete (a Matroska `MasteringMetadata` with no luminance, which movenc will not
-/// write as `mdcv`) has its missing half filled from the SEI. ATSC A/341 6.3.2.2 requires the ST 2086 message
-/// beside Dolby Vision / ST 2094-10 metadata, and dropping it leaves the panel the mastering black it guessed.
+/// write as `mdcv`) has its missing half filled from the SEI. The mastering display message belongs beside Dolby
+/// Vision metadata, and dropping it leaves the panel the mastering black it guessed.
 ///
 /// The SEI is also looked for in the config record: x265 and other encoders can put prefix SEI arrays in the hvcC,
 /// which `canonicalizeHEVCConfigRecord` strips before the init is written (AE#187), so they are read first.

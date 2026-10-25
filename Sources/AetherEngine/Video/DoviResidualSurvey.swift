@@ -69,7 +69,7 @@ enum DoviResidualSurvey {
         let stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
         guard width > 0, height > 0 else { return nil }
 
-        // The table holds the spec's 16-bit residual; the statistics are in 12-bit codes, 16 of its units each.
+        // The table holds the 16-bit residual; the statistics are in 12-bit codes, 16 of its units each.
         var histogram = [Int](repeating: 0, count: 4096)
         var sumAbs = 0
         var sumSigned = 0
