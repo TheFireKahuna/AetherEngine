@@ -468,13 +468,15 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         grid = nil
     }
 
+    /// A live splice the producer re-timed: everything placed from here on plays `deltaSeconds` later
+    /// (or earlier), through the same placement as any other block, so a positive jump is filled with
+    /// silence and a negative one comes off the audio that follows, and the run's stamps never move
+    /// back over packets already stamped.
     func noteTimelineJump(deltaSeconds: Double) {
         opLock.lock()
         defer { opLock.unlock() }
-        guard deltaSeconds > 0, let start = encoderStartFrame else { return }
-        let frames = Int64((deltaSeconds * Double(Self.sampleRate)).rounded())
-        encoderStartFrame = start + frames
-        pipeline.shift(by: frames)
+        guard deltaSeconds != 0, deltaSeconds.isFinite, encoderStartFrame != nil else { return }
+        outputOffsetFrames += Int64((deltaSeconds * Double(Self.sampleRate)).rounded())
     }
 
     func close() {
@@ -526,10 +528,10 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         } else if block.isDiscontinuity {
             renderer?.markDiscontinuity()
         }
-        // Every block plays where the grid puts it: the encoder is anchored on the first, and a gap
-        // the decoder skipped (corrupt access units) is filled with silence so everything after it
-        // stays on its frame. Nothing says where a block plays before the run's first timestamp, so
-        // until then it is dropped rather than placed at a guess.
+        // Every block plays where the grid puts it: the encoder is anchored on the first, a gap the
+        // decoder skipped (corrupt access units) is filled with silence and an overlap comes off the
+        // block's start, so everything after it stays on its frame. Nothing says where a block plays
+        // before the run's first timestamp, so until then it is dropped rather than placed at a guess.
         let placed = position(of: block)
         let offset = Int64((outputOffsetSeconds * Double(Self.sampleRate)).rounded())
         if measuring.map({ range in placed.map { range.contains($0 + offset) } ?? false }) ?? true {
@@ -544,6 +546,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             stats.blocksDroppedUnplaced += 1
             return
         }
+        var trim = 0
         if encoderStartFrame == nil {
             outputOffsetFrames = Int64((outputOffsetSeconds * Double(Self.sampleRate)).rounded())
             if let runStart = runStartFrame {
@@ -553,25 +556,33 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
                 anchor(at: position + outputOffsetFrames)
             }
         } else {
-            place(at: position + outputOffsetFrames)
+            trim = min(place(at: position + outputOffsetFrames), block.frameCount)
         }
+        let kept = block.frameCount - trim
 
 #if APACObjectOutput
         if objectOutput {
-            stageObjects(block, discontinuity: block.isDiscontinuity && !rebuilt)
-            stats.samplesEnqueued += Int64(block.frameCount)
+            stageObjects(block, droppingFirst: trim, discontinuity: block.isDiscontinuity && !rebuilt)
+            stats.samplesEnqueued += Int64(kept)
             stats.packetsFedSinceLastEnqueue = 0
             if pendingFrames >= Self.encodeChunkFrames { encodePending() }
             return
         }
 #endif
         output.ensureCapacity(pendingFrames + block.frameCount, keeping: pendingFrames)
+        // The whole block goes through the renderer, so its state runs on unbroken; an overlap's
+        // frames come off what it rendered.
         renderer!.render(
             inputs: block.planes, frameCount: block.frameCount, updates: block.updates,
             outputs: output.planes.map { $0 + pendingFrames })
-        pendingFrames += block.frameCount
+        if trim > 0, kept > 0 {
+            for plane in output.planes {
+                memmove(plane + pendingFrames, plane + pendingFrames + trim, kept * MemoryLayout<Float>.stride)
+            }
+        }
+        pendingFrames += kept
         noteRendererSettling(blockAt: position, frames: block.frameCount)
-        stats.samplesEnqueued += Int64(block.frameCount)
+        stats.samplesEnqueued += Int64(kept)
         stats.packetsFedSinceLastEnqueue = 0
         if pendingFrames >= Self.encodeChunkFrames { encodePending() }
     }
@@ -592,26 +603,28 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     }
 
 #if APACObjectOutput
-    /// The block's elements into `output` as they are, and its metadata beside them for the encoder.
-    /// A chunk holds one presentation, so a new one starts a new chunk.
-    private func stageObjects(_ block: ObjectAudioDecodedBlock, discontinuity: Bool) {
+    /// The block's elements into `output` as they are, past its first `dropped` frames (an overlap),
+    /// and its metadata beside them for the encoder. A chunk holds one presentation, so a new one
+    /// starts a new chunk.
+    private func stageObjects(_ block: ObjectAudioDecodedBlock, droppingFirst dropped: Int, discontinuity: Bool) {
         if block.roles != objectRoles {
             if pendingFrames > 0 { encodePending() }
             objectRoles = block.roles
             output.objectRoles = block.roles
         }
-        let n = block.frameCount
+        let n = block.frameCount - dropped
+        guard n > 0 else { return }
         output.ensureCapacity(pendingFrames + n, keeping: pendingFrames)
         for (i, plane) in output.planes.enumerated() {
             if i < block.planes.count {
-                (plane + pendingFrames).update(from: block.planes[i], count: n)
+                (plane + pendingFrames).update(from: block.planes[i] + dropped, count: n)
             } else {
                 (plane + pendingFrames).update(repeating: 0, count: n)
             }
         }
         if discontinuity { output.objectDiscontinuities.append(pendingFrames) }
         for update in block.updates {
-            var shifted = update
+            var shifted = update.droppingFirst(dropped)
             shifted.frameOffset += pendingFrames
             output.objectUpdates.append(shifted)
         }
@@ -656,17 +669,30 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         return at
     }
 
-    /// Continue the encoder's input at `target` (a source position in 48 kHz frames): a short gap
-    /// ahead is filled with silence, anything longer or behind restarts the encoder there, so every
-    /// later packet keeps its source position.
-    private func place(at target: Int64) {
-        guard let start = encoderStartFrame else { return }
+    /// Continue the encoder's input at `target` (a source position in 48 kHz frames), so every later
+    /// packet keeps its source position: a short gap ahead is filled with silence, a short overlap is
+    /// returned as the frames to take off the block's start, and anything longer either way restarts
+    /// the encoder there. An overlap never restarts it short of that: a restarted encoder stamps its
+    /// new run over the old run's tail, whose priming carries its stamps past the sound it holds, so
+    /// the track would hold more sound than its timeline spans.
+    private func place(at target: Int64) -> Int {
+        guard let start = encoderStartFrame else { return 0 }
         let end = runningEnd(from: start)
         let gap = target - end
-        if gap == 0 { return }
+        if gap == 0 { return 0 }
         if gap > 0, gap <= Int64(Self.maxSilenceFillFrames) {
             encodeSilence(frames: Int(gap))
-            return
+            return 0
+        }
+        if gap < 0, -gap <= Int64(Self.maxSilenceFillFrames) {
+            stats.continuityOverlaps += 1
+            if stats.continuityOverlaps <= 5 || stats.continuityOverlaps % 100 == 0 {
+                EngineLog.emit(
+                    "[SpatialAudioBridge] overlap of \(String(format: "%.3f", Double(-gap) / Double(Self.sampleRate))) s "
+                    + "trimmed off a block at \(String(format: "%.3f", Double(target) / Double(Self.sampleRate))) s "
+                    + "(\(stats.continuityOverlaps) so far)", category: .session)
+            }
+            return Int(-gap)
         }
         encodePending()
         drainLimiter()
@@ -676,6 +702,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         EngineLog.emit(
             "[SpatialAudioBridge] encoder re-anchored \(String(format: "%+.3f", Double(gap) / Double(Self.sampleRate))) s "
             + "off its running position", category: .session)
+        return 0
     }
 
     /// Where the next frame taken from the decoder plays.
@@ -702,7 +729,8 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         if position > start { encodeSilence(frames: Int(position - start)) }
     }
 
-    /// The longest gap filled with silence rather than by restarting the encoder.
+    /// The longest gap filled with silence, and the longest overlap trimmed, rather than by restarting
+    /// the encoder.
     private static let maxSilenceFillFrames = sampleRate * 5
 
     /// In chunks, like rendered audio: a 5 s fill handed over in one piece would hold the encoder
@@ -735,10 +763,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
                 memmove(plane, plane + cut, frames * MemoryLayout<Float>.stride)
             }
 #if APACObjectOutput
-            // Metadata from the cut frames still holds where the frames kept begin.
-            for i in output.objectUpdates.indices {
-                output.objectUpdates[i].frameOffset = max(output.objectUpdates[i].frameOffset - cut, 0)
-            }
+            output.objectUpdates = output.objectUpdates.map { $0.droppingFirst(cut) }
             output.objectDiscontinuities = output.objectDiscontinuities.map { max($0 - cut, 0) }
 #endif
             if frames == 0 { return }

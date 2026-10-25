@@ -966,18 +966,24 @@ final class AudioBridge: @unchecked Sendable {
 
     /// Live program-boundary correction. The free-running nextEncoderPTS counter collapses any audio splice gap
     /// sample-continuously while video keeps the rebase-preserved gap. Producer calls this with the residual
-    /// (audio gap minus video gap, seconds): positive deltas advance the PTS (AVPlayer renders silence), negative
-    /// (splice overlap) are clamped, the counter never rewinds. Called on the pump thread (same as feed). FIFO
-    /// leftover (< one frame) is stamped post-jump; that error is one-shot, bounded by one frame (~32 ms).
+    /// (audio gap minus video gap, seconds): a positive one advances the PTS (AVPlayer renders silence), a
+    /// negative one (a splice overlap) comes off the audio decoded next, so what follows the splice plays that
+    /// much earlier on the same count. The counter never rewinds: stamps laid back over audio already encoded
+    /// would leave the track holding more sound than its timeline spans. Called on the pump thread (same as
+    /// feed). FIFO leftover (< one frame) is stamped post-jump; that error is one-shot, bounded by one frame (~32 ms).
     func noteTimelineJump(deltaSeconds: Double) {
         opLock.lock()
         defer { opLock.unlock() }
-        guard deltaSeconds > 0, encoderTimeBase.den > 0 else { return }
-        let samples = Int64((deltaSeconds * Double(encoderTimeBase.den)).rounded())
-        nextEncoderPTS += samples
+        guard deltaSeconds != 0, deltaSeconds.isFinite, encoderTimeBase.den > 0 else { return }
+        let samples = Int64((abs(deltaSeconds) * Double(encoderTimeBase.den)).rounded())
+        if deltaSeconds > 0 {
+            nextEncoderPTS += samples
+        } else {
+            pendingTrimSamples += samples
+        }
         EngineLog.emit(
-            "[AudioBridge] live timeline jump: +\(String(format: "%.3f", deltaSeconds))s "
-            + "(\(samples) samples) at encoder pts \(nextEncoderPTS)",
+            "[AudioBridge] live timeline jump: \(String(format: "%+.3f", deltaSeconds))s "
+            + "(\(samples) samples \(deltaSeconds > 0 ? "of silence" : "trimmed")) at encoder pts \(nextEncoderPTS)",
             category: .session
         )
     }

@@ -126,40 +126,6 @@ struct APACEncodePipelineTests {
         #expect(out.packets.map(\.pts) == out.packets.indices.map { Int64(6 * Self.chunk) + Int64($0) * 1024 })
     }
 
-    @Test("a shift moves every packet stamped after it, the encoder's held-back ones included")
-    func shiftMovesLaterPackets() throws {
-        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
-        let reference = APACEncodePipeline(encoder: try makeEncoder(), channels: Self.layout.channelCount,
-                                           bufferFrames: Self.chunk)
-        var referenceBuffer = reference.takeInitialBuffer()
-        submit(reference, &referenceBuffer, chunks: 0..<5, origin: 0)
-        let unshifted = reference.settle().packets.count
-
-        let pipeline = APACEncodePipeline(encoder: try makeEncoder(), channels: Self.layout.channelCount,
-                                          bufferFrames: Self.chunk)
-        var buffer = pipeline.takeInitialBuffer()
-        submit(pipeline, &buffer, chunks: 0..<5, origin: 0)
-        pipeline.shift(by: 4800)
-        submit(pipeline, &buffer, chunks: 5..<10, origin: 4800)
-        let pts = pipeline.finish().packets.map(\.pts)
-        #expect(pts[..<unshifted].elementsEqual((0..<unshifted).map { Int64($0) * 1024 }))
-        #expect(pts[unshifted...].elementsEqual((unshifted..<pts.count).map { 4800 + Int64($0) * 1024 }))
-    }
-
-    @Test("a shift between runs leaves the next run on its own chunk's position")
-    func shiftBetweenRunsIsTheCallersPosition() throws {
-        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
-        let pipeline = APACEncodePipeline(encoder: try makeEncoder(), channels: Self.layout.channelCount,
-                                          bufferFrames: Self.chunk)
-        var buffer = pipeline.takeInitialBuffer()
-        submit(pipeline, &buffer, chunks: 0..<3, origin: 0)
-        pipeline.restart()
-        _ = pipeline.settle()
-        pipeline.shift(by: 4800)
-        submit(pipeline, &buffer, chunks: 0..<3, origin: 200_000)
-        #expect(pipeline.finish().packets.first?.pts == 200_000)
-    }
-
     @Test("closing with work queued waits for it and leaves nothing running")
     func closeWaitsForQueuedWork() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
