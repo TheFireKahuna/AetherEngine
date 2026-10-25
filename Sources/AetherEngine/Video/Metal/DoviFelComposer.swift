@@ -1125,19 +1125,37 @@ final class DoviFelComposer: @unchecked Sendable {
         fillNlq(ptr + 2048, params.nlqCr)
     }
 
-    /// Floats in the per-frame MMR table: Y, Cb, Cr, each `maxPieces` pieces of the constant and 21 terms.
-    static let mmrTableCount = 3 * DoviMmrParams.maxPieces * (1 + DoviMmrParams.coefficientsPerPiece)
+    /// 32-bit words in the per-frame MMR table: Y, Cb, Cr, each `maxPieces` pieces of the constant, the 21
+    /// coefficients and the estimate flag, as `Int32`, then the same layout as `Float`.
+    static let mmrTablePieceStride = 1 + DoviMmrParams.coefficientsPerPiece + 1
+    static let mmrTableCount = 2 * 3 * DoviMmrParams.maxPieces * mmrTablePieceStride
+
+    /// The largest sum of |coefficient * term| for which the kernels pin the 64-bit MMR sum's high word from a float
+    /// estimate (`dovi_eval_mmr`): the estimate's error, (21 + 2) * 2^-24 of it, stays under 2^31.
+    static let mmrEstimateBound = Double(1 << 49)
 
     /// Fills the MMR table the kernels read (`DOVI_MMR_TABLE_*` in the shader): per component and piece the
     /// constant then the 21 coefficients, Q(coefficient_log2_denom), which the kernels multiply into the spec's
-    /// 64-bit sum (5.4.2.3.3).
+    /// 64-bit sum (5.4.2.3.3), and whether every term below 2^20 keeps the piece's sum of |coefficient * term|
+    /// within ``mmrEstimateBound``; then the coefficients' float values in the same layout.
     static func populateMmrTable(into ptr: UnsafeMutablePointer<Int32>, params: DoviMetalParams) {
-        let piece = 1 + DoviMmrParams.coefficientsPerPiece
+        let piece = mmrTablePieceStride
+        let floats = UnsafeMutableRawPointer(ptr + mmrTableCount / 2).assumingMemoryBound(to: Float.self)
+        let ceiling = Double(1 << 20)
         for (component, mmr) in [params.mmrY, params.mmrCb, params.mmrCr].enumerated() {
             for p in 0..<DoviMmrParams.maxPieces {
-                let base = ptr + (component * DoviMmrParams.maxPieces + p) * piece
+                let at = (component * DoviMmrParams.maxPieces + p) * piece
+                let base = ptr + at, f = floats + at
                 base[0] = mmr.constant[p]
-                for t in 0..<DoviMmrParams.coefficientsPerPiece { base[1 + t] = mmr.coef[p][t] }
+                f[0] = Float(mmr.constant[p])
+                var bound = abs(Double(mmr.constant[p])) * ceiling
+                for t in 0..<DoviMmrParams.coefficientsPerPiece {
+                    base[1 + t] = mmr.coef[p][t]
+                    f[1 + t] = Float(mmr.coef[p][t])
+                    bound += abs(Double(mmr.coef[p][t])) * ceiling
+                }
+                base[piece - 1] = bound <= mmrEstimateBound ? 1 : 0
+                f[piece - 1] = 0
             }
         }
     }
