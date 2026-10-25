@@ -66,6 +66,8 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         var tieBound: Float
         /// Bytes a component load reads, per plane: plane offsets and linesizes must be multiples of it.
         var planeAlignment: [Int]
+        /// AV1 film grain on every sample read (the job carries the frame's parameters).
+        var grain: Bool = false
 
         static func == (a: Plan, b: Plan) -> Bool {
             a.specialisation == b.specialisation && a.rows == b.rows && a.cl == b.cl && a.tp == b.tp && a.tieBound == b.tieBound
@@ -77,7 +79,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         var specialisation: [UInt32] {
             [mode.rawValue] + outputLog2 + sourceLog2 + components.flatMap { $0 }
                 + [bigEndian ? 1 : 0, bitstream ? 1 : 0, palette ? 1 : 0, fullRange ? 1 : 0,
-                   targetBits, fractionBits, containerShift, chromaLocation, matrix, bitDepthRGB, transfer]
+                   targetBits, fractionBits, containerShift, chromaLocation, matrix, bitDepthRGB, transfer, grain ? 1 : 0]
         }
     }
 
@@ -105,10 +107,13 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     /// frame's range (for RGB: whether its codes are full range); `matrix` the Y'CbCr matrix the buffer is tagged
     /// with (and an RGB or converted picture encoded with); `representation` what the source's MatrixCoefficients
     /// call for. An interlaced picture is never resampled vertically: its chroma rows alternate between the fields.
+    /// `grain`: the picture carries AV1 film grain, applied to every sample as it is read (planar 8, 10 and 12-bit
+    /// formats, progressive: what libdav1d writes).
     static func plan(source: AVPixelFormat, output: SoftwareVideoDecoder.OutputFormat, sourceFullRange: Bool,
                      chromaLocation: AVChromaLocation, matrix: CFString, interlaced: Bool = false,
-                     representation: ColourRepresentation = .tagged) -> Plan? {
+                     representation: ColourRepresentation = .tagged, grain: Bool = false) -> Plan? {
         guard reads(source), let desc = av_pix_fmt_desc_get(source)?.pointee else { return nil }
+        if grain { guard FilmGrainParameters.supports(source), !interlaced else { return nil } }
         if case .refused = representation { return nil }
         var comps = components(desc)
         // Identity: the Y'CbCr-labelled planes hold G, B, R; read them as R, G, B.
@@ -221,7 +226,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
             cl: cl, tp: tp,
             // The fast path bounds each pixel's error itself, from this relative error per float32 transfer evaluation.
             tieBound: mode == .constantLuminance ? Self.transferEvaluationError : 0,
-            planeAlignment: alignment)
+            planeAlignment: alignment, grain: grain)
     }
 
     /// The relative error of one float32 exp2 / log2 in the constant-luminance fast path: 4 ulp, the maximum the Metal
@@ -313,7 +318,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         if let ready = Self.pipelines.withLock({ $0[key] }) { return ready }
         let lib = try Self.library(for: device)
         let values = MTLFunctionConstantValues()
-        var boolIndices: Set<Int> = [20, 21, 22, 23]
+        var boolIndices: Set<Int> = [20, 21, 22, 23, 31]
         for (index, value) in plan.specialisation.enumerated() {
             if boolIndices.remove(index) != nil {
                 var flag = value != 0
@@ -332,8 +337,9 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     /// Writes the `width` x `height` picture in `planes` into `buffer` (a bi-planar buffer of the plan's output
     /// format) and waits for the GPU. False when the planes break the plan's alignment, a texture cannot be made
     /// for the buffer, or the GPU reports an error.
-    func finish(_ planes: Planes, plan: Plan, width: Int, height: Int, into buffer: CVPixelBuffer) -> Bool {
-        finish([Job(source: .picture(planes), plan: plan, width: width, height: height, buffer: buffer)])
+    func finish(_ planes: Planes, plan: Plan, width: Int, height: Int, into buffer: CVPixelBuffer,
+                grain: FilmGrainParameters? = nil) -> Bool {
+        finish([Job(source: .picture(planes), plan: plan, width: width, height: height, buffer: buffer, grain: grain)])
     }
 
     // MARK: - Deinterlacing
@@ -356,6 +362,8 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         var width: Int
         var height: Int
         var buffer: CVPixelBuffer
+        /// The frame's AV1 film grain, for a plan with `grain`.
+        var grain: FilmGrainParameters? = nil
     }
 
     /// The planar little-endian format holding `source`'s components at their depths and subsampling, which is what
@@ -467,9 +475,10 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         }
         if fields > 0 { encoder.memoryBarrier(scope: .buffers) }
         var textures: [CVMetalTexture] = []
-        for (job, planes) in zip(jobs, sources) {
-            guard let made = encodeFinish(planes, plan: job.plan, width: job.width, height: job.height, into: job.buffer,
-                                          encoder: encoder) else {
+        for (index, (job, planes)) in zip(jobs, sources).enumerated() {
+            guard let grain = grainTables(job.grain, plan: job.plan, width: job.width, height: job.height, index: index),
+                  let made = encodeFinish(planes, plan: job.plan, width: job.width, height: job.height, into: job.buffer,
+                                          grain: grain, encoder: encoder) else {
                 encoder.endEncoding()
                 return false
             }
@@ -484,7 +493,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
 
     /// Encodes one picture's finishing dispatches; returns the buffer's textures, which must outlive the work.
     private func encodeFinish(_ planes: Planes, plan: Plan, width: Int, height: Int, into buffer: CVPixelBuffer,
-                              encoder: MTLComputeCommandEncoder) -> [CVMetalTexture]? {
+                              grain: MTLBuffer, encoder: MTLComputeCommandEncoder) -> [CVMetalTexture]? {
         for p in 0..<4 where plan.planeAlignment[p] > 1 {
             guard planes.offsets[p] % UInt32(plan.planeAlignment[p]) == 0,
                   planes.linesizes[p] % UInt32(plan.planeAlignment[p]) == 0 else { return nil }
@@ -516,6 +525,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         encoder.setBuffer(planes.buffer, offset: 0, index: 0)
         frame.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }
         encoder.setBuffer(list, offset: 0, index: 2)
+        encoder.setBuffer(grain, offset: 0, index: 5)
         if !plan.lumaTable.isEmpty {
             if lumaTable?.values != plan.lumaTable {
                 guard let made = device.makeBuffer(bytes: plan.lumaTable, length: 4 * plan.lumaTable.count, options: .storageModeShared)
@@ -550,6 +560,68 @@ final class PlanarFrameFinisher: @unchecked Sendable {
                                          threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         }
         return [luma, chroma]
+    }
+
+    // MARK: - Film grain
+
+    /// The film grain tables of each job of a submission (``FilmGrainSynthesis``), grown to the largest frame and kept,
+    /// with what each holds: a repeated set (`show_existing_frame`) is not written again.
+    private var grainBuffers: [(buffer: MTLBuffer, holds: GrainKey?)] = []
+
+    private struct GrainKey: Equatable {
+        var parameters: FilmGrainParameters
+        var width: Int
+        var height: Int
+    }
+
+    /// Job `index`'s grain tables, written for `grain` at `width` x `height`; for a plan without grain, a placeholder
+    /// the kernel never reads. Nil when the plan wants grain and the job carries none, or no buffer can be made.
+    private func grainTables(_ grain: FilmGrainParameters?, plan: Plan, width: Int, height: Int, index: Int) -> MTLBuffer? {
+        guard plan.grain else { return dispatchArguments }
+        guard let grain else { return nil }
+        let length = FilmGrainSynthesis.bufferLength(width: width, height: height)
+        while grainBuffers.count <= index {
+            guard let made = device.makeBuffer(length: length, options: .storageModeShared) else { return nil }
+            grainBuffers.append((made, nil))
+        }
+        if grainBuffers[index].buffer.length < length {
+            guard let made = device.makeBuffer(length: length, options: .storageModeShared) else { return nil }
+            grainBuffers[index] = (made, nil)
+        }
+        let key = GrainKey(parameters: grain, width: width, height: height)
+        if grainBuffers[index].holds != key {
+            FilmGrainSynthesis.write(grain, width: width, height: height, into: grainBuffers[index].buffer.contents())
+            grainBuffers[index].holds = key
+        }
+        return grainBuffers[index].buffer
+    }
+
+    /// The `width` x `height` picture in `planes` with `grain` applied, written into `destination` at the source's own
+    /// layout (`destination` laid out as `planes`): AV1's grained output itself, which reference decoders' checksums
+    /// cover. `plan` is any plan for the source with `grain`; only its reader is used.
+    func grainedPlanes(_ planes: Planes, plan: Plan, width: Int, height: Int, grain: FilmGrainParameters,
+                       into destination: MTLBuffer) -> Bool {
+        guard plan.grain, let tables = grainTables(grain, plan: plan, width: width, height: height, index: 0),
+              let pipeline = try? pipeline(for: plan, function: "fg_planes"),
+              let commands = queue.makeCommandBuffer(), let encoder = commands.makeComputeCommandEncoder() else { return false }
+        var frame = Data()
+        for word in [UInt32(width), UInt32(height), 0, 0] + planes.offsets + planes.linesizes {
+            withUnsafeBytes(of: word) { frame.append(contentsOf: $0) }
+        }
+        for value in plan.rows + plan.cl + plan.tp + [plan.tieBound] { withUnsafeBytes(of: value) { frame.append(contentsOf: $0) } }
+        withUnsafeBytes(of: UInt32(0)) { frame.append(contentsOf: $0) }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(planes.buffer, offset: 0, index: 0)
+        frame.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }
+        encoder.setBuffer(tables, offset: 0, index: 5)
+        encoder.setBuffer(destination, offset: 0, index: 6)
+        let w = pipeline.threadExecutionWidth
+        encoder.dispatchThreads(MTLSize(width: width, height: height, depth: grain.monochrome ? 1 : 3),
+                                threadsPerThreadgroup: MTLSize(width: w, height: max(1, pipeline.maxTotalThreadsPerThreadgroup / w), depth: 1))
+        encoder.endEncoding()
+        commands.commit()
+        commands.waitUntilCompleted()
+        return commands.status == .completed
     }
 
     private func texture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat) -> CVMetalTexture? {

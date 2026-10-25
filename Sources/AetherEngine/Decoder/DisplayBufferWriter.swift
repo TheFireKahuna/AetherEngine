@@ -36,6 +36,7 @@ final class DisplayBufferWriter {
         var matrix: String
         var interlaced: Bool
         var representation: ColourRepresentation
+        var grain: Bool
     }
 
     /// Every log line's prefix: whose buffers these are.
@@ -74,9 +75,16 @@ final class DisplayBufferWriter {
     /// libavcodec's buffers and its pictures are copied), and the conformance window is kept exactly. libavcodec
     /// otherwise rounds a left crop down to keep the planes 32-byte aligned for CPU code, showing columns the stream
     /// crops; the GPU reads any offset.
+    ///
+    /// libdav1d hands AV1's film grain over as parameters instead of a second, grained picture: the finisher applies it
+    /// (AV1 7.18.3, docs/software-route-gpu.md Part 5). Only libdav1d: the H.264 / HEVC decoders' grain is H.274's,
+    /// which they apply themselves.
     func install(on ctx: UnsafeMutablePointer<AVCodecContext>, codec: UnsafePointer<AVCodec>) {
         if codec.pointee.capabilities & AV_CODEC_CAP_DR1 != 0 { allocator.install(on: ctx) }
         ctx.pointee.flags |= AV_CODEC_FLAG_UNALIGNED
+        if String(cString: codec.pointee.name) == "libdav1d" {
+            ctx.pointee.export_side_data |= Int32(AV_CODEC_EXPORT_DATA_FILM_GRAIN)
+        }
     }
 
     /// The display buffer for one decoded picture, written by the GPU from the picture's own memory. Nil (and one log
@@ -84,7 +92,9 @@ final class DisplayBufferWriter {
     func finish(_ frame: UnsafeMutablePointer<AVFrame>) -> CVPixelBuffer? {
         let width = Int(frame.pointee.width), height = Int(frame.pointee.height)
         let interlaced = (frame.pointee.flags & AV_FRAME_FLAG_INTERLACED) != 0
-        guard let (plan, pb) = prepare(frame, planFormat: AVPixelFormat(rawValue: frame.pointee.format), interlaced: interlaced)
+        let grain = FilmGrainParameters(frame: frame)
+        guard let (plan, pb) = prepare(frame, planFormat: AVPixelFormat(rawValue: frame.pointee.format), interlaced: interlaced,
+                                       grain: grain != nil)
         else { return nil }
 
         // The decoder's own slab, or (rawvideo, libavcodec's paletted buffers) a copy of the picture in one.
@@ -99,7 +109,7 @@ final class DisplayBufferWriter {
             return nil
         }
         defer { if let copied { allocator.release(copied) } }
-        guard finisher.finish(planes, plan: plan, width: width, height: height, into: pb) else {
+        guard finisher.finish(planes, plan: plan, width: width, height: height, into: pb, grain: grain) else {
             if !loggedFinishFailure {
                 loggedFinishFailure = true
                 EngineLog.emit("[\(logTag)] GPU finish failed (logged once)", category: .swPlayback)
@@ -112,9 +122,9 @@ final class DisplayBufferWriter {
     /// The finisher's plan for `frame` and the display buffer it writes, tagged with the frame's colour. `planFormat` is
     /// the layout the finisher reads: the frame's own, or for a deinterlaced picture its planar equivalent
     /// (``PlanarFrameFinisher/planarEquivalent(of:)``), with `interlaced` false. Range, siting and colour come from the
-    /// frame and its own format either way.
+    /// frame and its own format either way. `grain`: the frame carries AV1 film grain, applied as the finisher reads it.
     func prepare(_ frame: UnsafeMutablePointer<AVFrame>, planFormat: AVPixelFormat,
-                 interlaced: Bool) -> (plan: PlanarFrameFinisher.Plan, buffer: CVPixelBuffer)? {
+                 interlaced: Bool, grain: Bool = false) -> (plan: PlanarFrameFinisher.Plan, buffer: CVPixelBuffer)? {
         let width = Int(frame.pointee.width), height = Int(frame.pointee.height)
         guard width > 0, height > 0 else { return nil }
         let format = AVPixelFormat(rawValue: frame.pointee.format)
@@ -146,19 +156,20 @@ final class DisplayBufferWriter {
         let location = SoftwareVideoDecoder.resolvedChromaLocation(frame.pointee.chroma_location, isJPEG: isJPEG)
         let key = PlanKey(pixelFormat: planFormat.rawValue, output: outputFormat, sourceFullRange: sourceFullRange,
                           chromaLocation: UInt32(location.rawValue), matrix: matrix as String, interlaced: interlaced,
-                          representation: representation)
+                          representation: representation, grain: grain)
         let plan: PlanarFrameFinisher.Plan
         if let known = plans[key] {
             plan = known
         } else if let made = PlanarFrameFinisher.plan(source: planFormat, output: outputFormat, sourceFullRange: sourceFullRange,
                                                       chromaLocation: location, matrix: matrix, interlaced: interlaced,
-                                                      representation: representation) {
+                                                      representation: representation, grain: grain) {
             plans[key] = made
             plan = made
         } else {
             if refusedPlans.insert(key).inserted {
                 EngineLog.emit("[\(logTag)] cannot write \(av_get_pix_fmt_name(format).map { String(cString: $0) } ?? "?")"
-                               + "\(interlaced ? " (interlaced)" : "") as \(outputFormat.logDescription); frames dropped",
+                               + "\(interlaced ? " (interlaced)" : "")\(grain ? " with film grain" : "") as "
+                               + "\(outputFormat.logDescription); frames dropped",
                                category: .swPlayback)
             }
             return nil

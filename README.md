@@ -701,6 +701,10 @@ The exception covers AetherEngine's own code; it does not extend to its dependen
 
 **DTS:X** is decoded by FFmpeg's own `dca` decoder in the FFmpeg frameworks above: FFmpegBuild carries a patch that decodes the height channels of DTS:X's standard presentation (#798), so the `DTSXObjectAudio` trait adds no library and no license of its own. Earlier releases linked LibDTSX instead, whose `dca` crate is a port of FFmpeg's decoder combined with Apache-2.0 code and therefore LGPL-3.0-or-later, which an App Store app cannot meet without an exception.
 
+**LibDeinterlace** ([TheFireKahuna/LibDeinterlace](https://github.com/TheFireKahuna/LibDeinterlace)) reaches your app as a dynamically linked framework under LGPL-2.1-or-later: its deinterlacer and inverse telecine are transcriptions of FFmpeg's bwdif, fieldmatch and decimate, so they keep FFmpeg's license and live outside the engine, where the exception cannot reach. Embed it dynamically and ship its license text, as for the FFmpeg frameworks.
+
+**AV1 film grain** is synthesised by the engine on the GPU (`Sources/AetherEngine/Video/FilmGrain/`), following dav1d's implementation, Copyright Niklas Haas, VideoLAN and dav1d authors, and Two Orioles, LLC, under the BSD 2-Clause license, whose notice is in each of those files. BSD-2 permits App Store distribution as it is; clause 2 asks for the notice to travel with the binary, so it belongs on the acknowledgements screen. AV1 itself comes with the Alliance for Open Media Patent License 1.0, whose text is in [PATENTS](PATENTS); it asks to be reproduced with the source and in a binary's legal notices.
+
 **SMBClient** ([kishikawakatsumi/SMBClient](https://github.com/kishikawakatsumi/SMBClient), MIT) reaches your app only if you link the `AetherEngineSMB` product. Linking `AetherEngine` alone pulls in none of its symbols, even though SwiftPM still records the package in `Package.resolved`, which describes the resolved graph rather than what the linker kept.
 
 ### Linking the engine statically
