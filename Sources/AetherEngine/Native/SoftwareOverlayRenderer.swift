@@ -1,5 +1,3 @@
-// Only with the DualLayerDolbyVision trait (off by default).
-#if DualLayerDolbyVision
 import AVFoundation
 import CoreMedia
 import CoreVideo
@@ -7,41 +5,59 @@ import QuartzCore
 import IOSurface
 import os
 
-/// Draws a Profile 7 FEL picture over an `AVPlayer` that plays the source's base layer.
+/// What ``SoftwareOverlayRenderer`` shows in place of AVPlayer's picture.
+protocol OverlayFrameSource: AnyObject, Sendable {
+    /// How AVPlayer hands over the frames it decodes (`AVPlayerItemVideoOutput`'s pixel buffer attributes).
+    var outputAttributes: [String: any Sendable] { get }
+    /// The renderer's recommended pixel buffer attributes, for the pool the source's pictures come from.
+    func followRenderer(_ attributes: [String: Any])
+    /// AVPlayer's clock, in item seconds: what the source works toward.
+    func advance(to itemSeconds: Double)
+    /// The picture for AVPlayer's frame `output` at `frameTime`, handed to `done` on any thread (nil when it could
+    /// not be made). False, with `done` never called, when the source has nothing for that time yet. `output` is
+    /// valid until `done` runs.
+    func makePicture(from output: CVPixelBuffer, at frameTime: CMTime,
+                     done: @escaping @Sendable (CVPixelBuffer?) -> Void) -> Bool
+    /// The source's own state, for the renderer's periodic log line.
+    func logSummary() -> String
+}
+
+/// Draws our own picture over an `AVPlayer` whose rendering is suppressed: a Profile 7 FEL's composition over the
+/// base layer AVPlayer plays (``FelCompositionSource``).
 ///
 /// AVPlayer keeps everything it is good at (loading, seeking, audio, AVKit's transport, menus and native
-/// subtitles) and decodes the base layer; with `suppressesPlayerRendering` it renders nothing itself and
-/// hands every decoded frame to an `AVPlayerItemVideoOutput` instead (bit-identical to a VideoToolbox decode
-/// of the base layer, before any reshaping). The overlay is driven the way that output is documented to be
-/// used, by a display link: at each refresh it asks which frame belongs at the refresh after next
-/// (`itemTime(forHostTime:)`, the item's clock, which is the audio clock), pairs it by item time with its
-/// enhancement picture and parameters from the session's ``FelEnhancementTap``, composes it, and enqueues it on ``layer`` stamped for that refresh on a host-clock timebase, the
-/// clock the display link reports in. Every frame shows on the refresh chosen for it, and the picture
-/// follows the audio by construction: there is no second clock to correct.
+/// subtitles); with `suppressesPlayerRendering` it renders nothing itself and hands every decoded frame to an
+/// `AVPlayerItemVideoOutput` instead. The overlay is driven the way that output is documented to be used, by a
+/// display link: at each refresh it asks which frame belongs at the refresh after next (`itemTime(forHostTime:)`,
+/// the item's clock, which is the audio clock), has the ``OverlayFrameSource`` make the picture for it, and
+/// enqueues that on ``layer`` stamped for that refresh on a host-clock timebase, the clock the display link reports
+/// in. Every frame shows on the refresh chosen for it, and the picture follows the audio by construction: there is
+/// no second clock to correct.
 ///
 /// The layer belongs inside the `AVPlayerLayer`, between the video and the subtitle layers, so native
-/// subtitles stay on top (``install(in:)``). A frame whose enhancement picture has not decoded is composed
-/// with its residual off.
-public final class FelOverlayRenderer: @unchecked Sendable {
+/// subtitles stay on top (``install(in:)``).
+public final class SoftwareOverlayRenderer: @unchecked Sendable {
 
     public struct Counters: Sendable {
         public var pulled = 0
-        public var composed = 0
-        public var residualOff = 0
+        public var presented = 0
+        /// Frames the source had nothing for yet.
         public var notReady = 0
-        public var composeFailed = 0
-        /// Composed frames that reached the layer after the refresh they were chosen for.
+        /// Frames the source could not make a picture for.
+        public var failed = 0
+        /// Pictures that reached the layer after the refresh they were chosen for.
         public var late = 0
         /// Frames AVPlayer decoded that no refresh was chosen for.
         public var skipped = 0
-        /// Longest compose and longest gap between refreshes since the last log line, in ms.
-        public var maxComposeMs = 0.0
+        /// Longest picture and longest gap between refreshes since the last log line, in ms.
+        public var maxPictureMs = 0.0
         public var maxRefreshGapMs = 0.0
     }
 
     public let layer = AVSampleBufferDisplayLayer()
-    /// Test seam: every composed frame with the item time it shows, on the render queue.
-    public var onComposed: (@Sendable (CMTime, CVPixelBuffer) -> Void)?
+    let source: any OverlayFrameSource
+    /// Test seam: every presented picture with the item time it shows, on the render queue.
+    public var onPresented: (@Sendable (CMTime, CVPixelBuffer) -> Void)?
 
     /// With no new frame for this long (paused, a still), the display link pauses until the output says frames
     /// are coming again.
@@ -49,17 +65,15 @@ public final class FelOverlayRenderer: @unchecked Sendable {
 
     private let output: AVPlayerItemVideoOutput
     private weak var item: AVPlayerItem?
-    private let tap: FelEnhancementTap
-    private let composer: DoviFelComposer
-    private let queue = DispatchQueue(label: "aether.fel-overlay", qos: .userInteractive)
-    private var displayLink: FelOverlayDisplayLink?
-    private var outputDelegate: FelOverlayOutputDelegate?
+    private let queue = DispatchQueue(label: "aether.software-overlay", qos: .userInteractive)
+    private var displayLink: OverlayDisplayLink?
+    private var outputDelegate: OverlayOutputDelegate?
     private var lastNewFrame = CACurrentMediaTime()
     private var jumpObserver: NSObjectProtocol?
     private var readyObservation: NSKeyValueObservation?
     private var boundsObservation: NSKeyValueObservation?
     private var gravityObservation: NSKeyValueObservation?
-    private let timing = FelOverlayTiming()
+    private let timing = OverlayTiming()
     private var itemTimebase: CMTimebase?
     /// The audio output's clock, for the clock readings in the log.
     private var audioClock: CMClock?
@@ -71,35 +85,23 @@ public final class FelOverlayRenderer: @unchecked Sendable {
     private var stopped = false
     /// Render-queue state.
     private var lastPulled = CMTime.invalid
-    /// Bumped on every clock jump: a composition finishing for an older generation is for a left position.
+    /// Bumped on every clock jump: a picture finishing for an older generation is for a left position.
     private var generation = 0
     /// The mean step between pulled frames: the stream's frame duration (container timestamps can be whole
     /// milliseconds, so single steps are not), for counting skips.
     private var frameSteps: (sum: Double, count: Int) = (0, 0)
     private var frameDuration: Double? { frameSteps.count > 0 ? frameSteps.sum / Double(frameSteps.count) : nil }
-    private var frameIndex: UInt32 = 0
-    private let requestedFormat: OSType
     private var lastRefresh: CFTimeInterval?
-    private var blankEnhancement: CVPixelBuffer?
     private var lastLog = CACurrentMediaTime()
     private let countersLock = NSLock()
     private var _counters = Counters()
 
     public var counters: Counters { countersLock.withLock { _counters } }
 
-    /// Nil when the composer cannot be built (no Metal device). `baseLayerFullRange` is the range the base layer's
-    /// SPS states: asking for the matching format hands over its own codes, where the other would convert them.
-    init?(item: AVPlayerItem, tap: FelEnhancementTap, baseLayerFullRange: Bool) {
-        guard let composer = DoviFelComposer() else { return nil }
-        self.composer = composer
+    init(item: AVPlayerItem, source: any OverlayFrameSource) {
         self.item = item
-        self.tap = tap
-        requestedFormat = HardwareVideoDecoder.pixelFormat(tenBit: true, fullRange: baseLayerFullRange)
-        output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-            kCVPixelBufferPixelFormatTypeKey as String: requestedFormat,
-            kCVPixelBufferMetalCompatibilityKey as String: true,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [String: any Sendable](),
-        ])
+        self.source = source
+        output = AVPlayerItemVideoOutput(pixelBufferAttributes: source.outputAttributes)
         // The overlay is the item's picture: AVPlayer keeps decoding into the output but stops rendering its
         // own, so one video pipeline presents.
         output.suppressesPlayerRendering = true
@@ -142,24 +144,21 @@ public final class FelOverlayRenderer: @unchecked Sendable {
             CMTimebaseSetRateAndAnchorTime(hostTimebase, rate: 1, anchorTime: now, immediateSourceTime: now)
             layer.controlTimebase = hostTimebase
         }
-        tap.advance(to: CMTimebaseGetTime(itemTimebase).seconds)
-        // A seek moves the item's clock before its first frame decodes: point the tap's decoder there at once,
-        // and drop what the layer queued for the old position.
+        source.advance(to: CMTimebaseGetTime(itemTimebase).seconds)
+        // A seek moves the item's clock before its first frame decodes: point the source there at once, and drop
+        // what the layer queued for the old position.
         jumpObserver = NotificationCenter.default.addObserver(forName: CMTimebase.timeJumped, object: itemTimebase, queue: nil) { [weak self] _ in
             guard let self else { return }
-            self.tap.advance(to: CMTimebaseGetTime(itemTimebase).seconds)
+            self.source.advance(to: CMTimebaseGetTime(itemTimebase).seconds)
             self.queue.async { self.restartPresentation() }
         }
-        // The output pool is built the way the renderer asks frames to be made (CoreAnimation-compatible
-        // surfaces, its cache mode), as the software route's is: a frame the compositor can take as it is.
+        // The source's pool is built the way the renderer asks frames to be made (CoreAnimation-compatible
+        // surfaces, its cache mode): a picture the compositor can take as it is.
         if #available(macOS 26, iOS 26, tvOS 26, *) {
-            let recommended = layer.sampleBufferRenderer.__recommendedPixelBufferAttributes
-            composer.rendererRecommendedAttributesOverride = recommended
-            EngineLog.emit("[FelOverlayRenderer] output pool follows the renderer's recommendation \(recommended.keys.sorted()); "
-                           + "the composer delivers \(Self.fourCC(DoviFelComposer.outputMode.pixelFormat))", category: .swPlayback)
+            source.followRenderer(layer.sampleBufferRenderer.__recommendedPixelBufferAttributes)
         }
         logDecoderFormat(item: item)
-        let link = FelOverlayDisplayLink { [weak self] timestamp, targetTimestamp in
+        let link = OverlayDisplayLink { [weak self] timestamp, targetTimestamp in
             guard let self else { return }
             // What is on screen, read at the callback itself: queued behind other work it could be a frame late.
             let shownSurface = self.layer.sampleBufferRenderer.displayedPixelBuffer()
@@ -167,7 +166,7 @@ public final class FelOverlayRenderer: @unchecked Sendable {
                 .map { IOSurfaceGetID($0) }
             self.queue.async { self.refresh(at: timestamp, target: targetTimestamp, shownSurface: shownSurface) }
         }
-        let delegate = FelOverlayOutputDelegate { [weak self] in
+        let delegate = OverlayOutputDelegate { [weak self] in
             self?.lastNewFrame = CACurrentMediaTime()
             self?.displayLink?.setPaused(false)
         }
@@ -228,7 +227,7 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         gravityObservation = playerLayer.observe(\.videoGravity, options: [.new]) { [weak self] playerLayer, _ in
             self?.layer.videoGravity = playerLayer.videoGravity
         }
-        EngineLog.emit("[FelOverlayRenderer] installed \(belowSubtitles ? "below the native subtitles" : "on top of the player layer (subtitle layer not found)")",
+        EngineLog.emit("[SoftwareOverlay] installed \(belowSubtitles ? "below the native subtitles" : "on top of the player layer (subtitle layer not found)")",
                        category: .swPlayback)
         return belowSubtitles
     }
@@ -237,7 +236,7 @@ public final class FelOverlayRenderer: @unchecked Sendable {
 
     /// One display refresh. `timestamp` is when the last frame displayed and `target` when the next one does,
     /// so `target - timestamp` is the actual refresh interval. What is on screen is measured; the frame for the
-    /// refresh after `target` is chosen and composed (one refresh of time to compose it).
+    /// refresh after `target` is chosen and made (one refresh of time to make it).
     private func refresh(at timestamp: CFTimeInterval, target: CFTimeInterval, shownSurface: IOSurfaceID?) {
         guard let itemTimebase else { return }
         let duration = target - timestamp
@@ -260,7 +259,7 @@ public final class FelOverlayRenderer: @unchecked Sendable {
             return
         }
         lastNewFrame = CACurrentMediaTime()
-        guard let (source, frameTime) = outputFrame(forItemTime: itemTime), frameTime.isValid else { return }
+        guard let (frame, frameTime) = outputFrame(forItemTime: itemTime), frameTime.isValid else { return }
         countersLock.withLock { _counters.pulled += 1 }
         if lastPulled.isValid, frameTime > lastPulled {
             let step = (frameTime - lastPulled).seconds
@@ -272,49 +271,33 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         }
         if lastPulled.isValid, frameTime < lastPulled { restartPresentation() }
         lastPulled = frameTime
-        tap.advance(to: frameTime.seconds)
+        source.advance(to: frameTime.seconds)
 
-        source.withBuffer { base in
-            guard let frame = tap.frame(at: frameTime.seconds) else {
-                countersLock.withLock { _counters.notReady += 1 }
-                return
-            }
-            var params = frame.params
-            let enhancement: CVPixelBuffer
-            if let el = frame.enhancement {
-                enhancement = el
-            } else if let blank = blankEnhancement(for: base) {
-                params.flags.insert(.disableResidual)
-                enhancement = blank
-                countersLock.withLock { _counters.residualOff += 1 }
-            } else {
-                return
-            }
-            frameIndex &+= 1
-            let generation = self.generation
-            let shownTime = frameTime
-            let composeStart = CACurrentMediaTime()
-            // Stamped half a refresh before the refresh it was chosen for: that refresh, and no other, shows it.
-            let presentation = CMTime(seconds: presentAt - duration / 2, preferredTimescale: 1_000_000_000)
-            let shownFor = CMTime(seconds: duration, preferredTimescale: 1_000_000_000)
-            composer.composeAsync(baseBuffer: base, enhancementBuffer: enhancement, params: params, frameIndex: frameIndex) { [weak self] composed in
-                withExtendedLifetime(source) {}
+        let generation = self.generation
+        let pictureStart = CACurrentMediaTime()
+        // Stamped half a refresh before the refresh it was chosen for: that refresh, and no other, shows it.
+        let presentation = CMTime(seconds: presentAt - duration / 2, preferredTimescale: 1_000_000_000)
+        let shownFor = CMTime(seconds: duration, preferredTimescale: 1_000_000_000)
+        frame.withBuffer { base in
+            let accepted = source.makePicture(from: base, at: frameTime) { [weak self] picture in
+                withExtendedLifetime(frame) {}
                 guard let self else { return }
-                let composeMs = (CACurrentMediaTime() - composeStart) * 1000
-                self.countersLock.withLock { self._counters.maxComposeMs = max(self._counters.maxComposeMs, composeMs) }
-                guard let composed else {
-                    self.countersLock.withLock { self._counters.composeFailed += 1 }
+                let pictureMs = (CACurrentMediaTime() - pictureStart) * 1000
+                self.countersLock.withLock { self._counters.maxPictureMs = max(self._counters.maxPictureMs, pictureMs) }
+                guard let picture else {
+                    self.countersLock.withLock { self._counters.failed += 1 }
                     return
                 }
-                if let surface = CVPixelBufferGetIOSurface(composed)?.takeUnretainedValue() {
+                if let surface = CVPixelBufferGetIOSurface(picture)?.takeUnretainedValue() {
                     let id = IOSurfaceGetID(surface)
-                    self.surfaceTimes.withLock { $0[id] = shownTime.seconds }
+                    self.surfaceTimes.withLock { $0[id] = frameTime.seconds }
                 }
                 self.queue.async {
                     guard generation == self.generation else { return }
-                    self.enqueue(composed, at: presentation, for: shownFor, frameTime: shownTime, composeMs: composeMs)
+                    self.enqueue(picture, at: presentation, for: shownFor, frameTime: frameTime, pictureMs: pictureMs)
                 }
             }
+            if !accepted { countersLock.withLock { _counters.notReady += 1 } }
         }
     }
 
@@ -341,7 +324,7 @@ public final class FelOverlayRenderer: @unchecked Sendable {
     }
 
     private func enqueue(_ buffer: CVPixelBuffer, at presentation: CMTime, for duration: CMTime,
-                         frameTime: CMTime, composeMs: Double) {
+                         frameTime: CMTime, pictureMs: Double) {
         var format: CMVideoFormatDescription?
         CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: buffer, formatDescriptionOut: &format)
         guard let format else { return }
@@ -352,15 +335,15 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         guard let sample else { return }
         let lead = (presentation - CMClockGetTime(CMClockGetHostTimeClock())).seconds
         if lead < 0 { countersLock.withLock { _counters.late += 1 } }
-        timing.composed(ms: composeMs, leadMs: lead * 1000, frameDuration: frameDuration)
+        timing.made(ms: pictureMs, leadMs: lead * 1000, frameDuration: frameDuration)
         layer.sampleBufferRenderer.enqueue(sample)
-        countersLock.withLock { _counters.composed += 1 }
-        onComposed?(frameTime, buffer)
+        countersLock.withLock { _counters.presented += 1 }
+        onPresented?(frameTime, buffer)
     }
 
     /// A frame from the output: tvOS 26's read-only buffer (`pixelBufferAndDisplayTime(forItemTime:)`), or the
-    /// copied buffer before it. Its pixels are only read, inside `withBuffer`: the composer's Metal textures,
-    /// made there, keep the buffer alive until the GPU is done, and the frame itself is held until then too.
+    /// copied buffer before it. Its pixels are only read, inside `withBuffer`, and the frame is held until the
+    /// source's picture is done.
     private enum OutputFrame: @unchecked Sendable {
         case readOnly(AnyObject)
         case copied(CVPixelBuffer)
@@ -400,39 +383,27 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         #endif
     }
 
-    /// An enhancement-sized picture the kernels can bind when the residual is off; its content is never read.
-    private func blankEnhancement(for base: CVPixelBuffer) -> CVPixelBuffer? {
-        if let blankEnhancement { return blankEnhancement }
-        var buffer: CVPixelBuffer?
-        CVPixelBufferCreate(kCFAllocatorDefault, CVPixelBufferGetWidth(base) / 2, CVPixelBufferGetHeight(base) / 2,
-                            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
-                            [kCVPixelBufferIOSurfacePropertiesKey: [String: Any](),
-                             kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary, &buffer)
-        blankEnhancement = buffer
-        return buffer
-    }
-
     /// Logs, once, the format AVPlayer's decoder produces on its own (an output asking for nothing), beside the
-    /// format this renderer asks for: when they differ, AVPlayer converts every frame to hand it over.
+    /// format the source asks for: when they differ, AVPlayer converts every frame to hand it over.
     private func logDecoderFormat(item: AVPlayerItem) {
         let probe = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
-        let requested = Self.fourCC(requestedFormat)
+        let requested = (source.outputAttributes[kCVPixelBufferPixelFormatTypeKey as String] as? OSType).map(Self.fourCC) ?? "any"
         item.add(probe)
         queue.asyncAfter(deadline: .now() + 2) { [weak item] in
             defer { item?.remove(probe) }
             let now = probe.itemTime(forHostTime: CACurrentMediaTime())
             guard let buffer = probe.copyPixelBuffer(forItemTime: now, itemTimeForDisplay: nil) else {
-                EngineLog.emit("[FelOverlayRenderer] decoder format: no frame to read", category: .swPlayback)
+                EngineLog.emit("[SoftwareOverlay] decoder format: no frame to read", category: .swPlayback)
                 return
             }
             let surface = CVPixelBufferGetIOSurface(buffer) != nil
-            EngineLog.emit("[FelOverlayRenderer] decoder format \(Self.fourCC(CVPixelBufferGetPixelFormatType(buffer))) "
+            EngineLog.emit("[SoftwareOverlay] decoder format \(Self.fourCC(CVPixelBufferGetPixelFormatType(buffer))) "
                            + "\(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer)) iosurface=\(surface); "
                            + "the overlay asks for \(requested)", category: .swPlayback)
         }
     }
 
-    private static func fourCC(_ code: OSType) -> String {
+    static func fourCC(_ code: OSType) -> String {
         String(bytes: [24, 16, 8, 0].map { UInt8((code >> $0) & 0xff) }, encoding: .ascii) ?? "\(code)"
     }
 
@@ -442,24 +413,22 @@ public final class FelOverlayRenderer: @unchecked Sendable {
         lastLog = now
         let c = countersLock.withLock {
             let c = _counters
-            _counters.maxComposeMs = 0
+            _counters.maxPictureMs = 0
             _counters.maxRefreshGapMs = 0
             return c
         }
-        let held = tap.held
-        EngineLog.emit("[FelOverlayRenderer] pulled \(c.pulled), composed \(c.composed), skipped \(c.skipped), late \(c.late), "
-                       + "residual off \(c.residualOff), not ready \(c.notReady), compose failed \(c.composeFailed), "
-                       + String(format: "max compose %.0f ms, max refresh gap %.0f ms, ", c.maxComposeMs, c.maxRefreshGapMs)
-                       + "held \(held.accessUnits) units / \(held.decoded) decoded",
+        EngineLog.emit("[SoftwareOverlay] pulled \(c.pulled), presented \(c.presented), skipped \(c.skipped), late \(c.late), "
+                       + "not ready \(c.notReady), failed \(c.failed), "
+                       + String(format: "max picture %.0f ms, max refresh gap %.0f ms; ", c.maxPictureMs, c.maxRefreshGapMs)
+                       + source.logSummary(),
                        category: .swPlayback)
-        EngineLog.emit("[FelOverlayRenderer] \(timing.drain())", category: .swPlayback)
-        EngineLog.emit("[FelOverlayRenderer] \(timing.drainClocks())", category: .swPlayback)
+        EngineLog.emit("[SoftwareOverlay] \(timing.drain())", category: .swPlayback)
+        EngineLog.emit("[SoftwareOverlay] \(timing.drainClocks())", category: .swPlayback)
         layer.sampleBufferRenderer.loadVideoPerformanceMetrics { metrics in
             guard let metrics else { return }
-            EngineLog.emit("[FelOverlayRenderer] renderer metrics: frames \(metrics.totalNumberOfFrames), dropped \(metrics.numberOfDroppedFrames), "
+            EngineLog.emit("[SoftwareOverlay] renderer metrics: frames \(metrics.totalNumberOfFrames), dropped \(metrics.numberOfDroppedFrames), "
                            + "corrupted \(metrics.numberOfCorruptedFrames), optimized compositing \(metrics.numberOfFramesDisplayedUsingOptimizedCompositing)",
                            category: .swPlayback)
         }
     }
 }
-#endif

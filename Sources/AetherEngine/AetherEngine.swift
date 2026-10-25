@@ -679,16 +679,14 @@ public final class AetherEngine: ObservableObject {
     var loadFilmCarriage: FilmCarriage? = nil
 
     /// `LoadOptions.felOverlay` was decided for this load: a FEL on the native route, its enhancement
-    /// layer composed over AVPlayer's picture by `felOverlay`.
+    /// layer composed over AVPlayer's picture by `softwareOverlay`.
     var felOverlayWanted = false
 
-    #if DualLayerDolbyVision
-    /// The FEL overlay for the current native item, nil unless `LoadOptions.felOverlay` put a Profile 7
-    /// FEL on the native route. A new renderer comes with every item (`replaceCurrentItem` on an audio
-    /// switch or a reload), so a host installs it again whenever this changes: `install(in:)` the
-    /// `AVPlayerLayer` that shows `currentAVPlayer`, AVKit's own included.
-    @Published public internal(set) var felOverlay: FelOverlayRenderer?
-    #endif
+    /// Our own picture over the current native item, nil while AVPlayer's picture is the one shown: a Profile 7
+    /// FEL composed over its base layer (`LoadOptions.felOverlay`). A new renderer comes with every item
+    /// (`replaceCurrentItem` on an audio switch or a reload), so a host installs it again whenever this changes:
+    /// `install(in:)` the `AVPlayerLayer` that shows `currentAVPlayer`, AVKit's own included.
+    @Published public internal(set) var softwareOverlay: SoftwareOverlayRenderer?
 
     /// Whether the loaded source's Dolby Vision has a base layer `LoadOptions.dolbyVisionHandling =
     /// .baseLayerOnly` can present (`VideoRoutingPolicy.dolbyVisionBaseLayerIsPresentable`), decided
@@ -5505,7 +5503,7 @@ public final class AetherEngine: ObservableObject {
         // A route that was not taken leaves no el_type behind, so neither the routing below nor a
         // software host the session reaches for another reason composes the dual layers.
         if !dualLayerDecision.isTaken { elType = nil }
-        // The overlay keeps a FEL on the native route: AVPlayer plays its base layer and `felOverlay`
+        // The overlay keeps a FEL on the native route: AVPlayer plays its base layer and `softwareOverlay`
         // composes the enhancement layer over it, so neither the routing nor a software host sees an el_type.
         if options.felOverlay, dualLayerDecision.isTaken, elType == "FEL" {
             felOverlayWanted = true
@@ -7040,7 +7038,7 @@ public final class AetherEngine: ObservableObject {
     /// place (`replaceCurrentItem`, on every audio-track reload and episode autoplay) without the player itself
     /// changing, so a host holding the item or its timebase gets no signal from `currentAVPlayer` alone.
     @Published public internal(set) var currentAVPlayerItem: AVPlayerItem? {
-        didSet { if currentAVPlayerItem !== oldValue { refreshFelOverlay() } }
+        didSet { if currentAVPlayerItem !== oldValue { refreshSoftwareOverlay() } }
     }
     private var currentItemObservation: NSKeyValueObservation?
 

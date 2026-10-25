@@ -1,5 +1,3 @@
-// Only with the DualLayerDolbyVision trait (off by default).
-#if DualLayerDolbyVision
 import Foundation
 import AVFoundation
 import os
@@ -8,14 +6,14 @@ import QuartzCore
 import AppKit
 #endif
 
-/// The FEL overlay's timing as its frames reach the screen: what a frame costs us, how early it reaches the
+/// The software overlay's timing as its pictures reach the screen: what a frame costs us, how early it reaches the
 /// renderer, and how many display refreshes it actually stays on screen. The last is the cadence the viewer
 /// sees: at a matched refresh rate every frame should stay exactly one refresh; two is a hold, a frame never
 /// seen is a skip. A frame on time from us and held or skipped on screen spent the difference in the
 /// compositor, which has no timing API of its own.
-final class FelOverlayTiming: @unchecked Sendable {
+final class OverlayTiming: @unchecked Sendable {
     private let lock = NSLock()
-    private var composeMs: [Double] = []
+    private var pictureMs: [Double] = []
     private var leadMs: [Double] = []
     private var refreshMs: [Double] = []
     /// Refreshes on screen -> frames.
@@ -34,9 +32,9 @@ final class FelOverlayTiming: @unchecked Sendable {
     /// The displayed frame's item time minus the item clock at that refresh: the picture against the audio.
     private var offsetMs: [Double] = []
 
-    func composed(ms: Double, leadMs lead: Double, frameDuration: Double?) {
+    func made(ms: Double, leadMs lead: Double, frameDuration: Double?) {
         lock.withLock {
-            composeMs.append(ms)
+            pictureMs.append(ms)
             leadMs.append(lead)
             if let frameDuration { self.frameDuration = frameDuration }
         }
@@ -132,7 +130,7 @@ final class FelOverlayTiming: @unchecked Sendable {
     func drain() -> String {
         lock.withLock {
             defer {
-                composeMs.removeAll(keepingCapacity: true)
+                pictureMs.removeAll(keepingCapacity: true)
                 leadMs.removeAll(keepingCapacity: true)
                 offsetMs.removeAll(keepingCapacity: true)
                 refreshMs.removeAll(keepingCapacity: true)
@@ -141,7 +139,7 @@ final class FelOverlayTiming: @unchecked Sendable {
             }
             let held = holds.filter { $0.key >= 3 }.values.reduce(0, +)
             return "on screen: 1 refresh \(holds[1] ?? 0), 2 refreshes \(holds[2] ?? 0), 3+ \(held), skipped \(skipped); "
-                + "refresh interval \(Self.spread(refreshMs)); compose \(Self.spread(composeMs)); "
+                + "refresh interval \(Self.spread(refreshMs)); picture \(Self.spread(pictureMs)); "
                 + "lead \(Self.spread(leadMs)); picture vs audio clock \(Self.spread(offsetMs))"
         }
     }
@@ -158,7 +156,7 @@ final class FelOverlayTiming: @unchecked Sendable {
 /// (when the last frame displayed) and `targetTimestamp` (when the next one displays), in host time; their
 /// difference is the actual refresh interval (`duration` is the interval at the screen's maximum rate). It
 /// can be paused while nothing changes. On a Mac without a screen (tests), a 60 Hz timer stands in.
-final class FelOverlayDisplayLink: NSObject, @unchecked Sendable {
+final class OverlayDisplayLink: NSObject, @unchecked Sendable {
     private let onRefresh: (_ timestamp: CFTimeInterval, _ targetTimestamp: CFTimeInterval) -> Void
     private var thread: Thread?
     private var link: CADisplayLink?
@@ -189,7 +187,7 @@ final class FelOverlayDisplayLink: NSObject, @unchecked Sendable {
             fallback?.invalidate()
         }
         thread.qualityOfService = .userInteractive
-        thread.name = "aether.fel-overlay.display-link"
+        thread.name = "aether.software-overlay.display-link"
         thread.start()
         self.thread = thread
     }
@@ -220,9 +218,8 @@ final class FelOverlayDisplayLink: NSObject, @unchecked Sendable {
 
 /// The video output's pull delegate: AVFoundation says new frames are coming, so a paused display link
 /// resumes (the header's sample for quiescing a display link driving an `AVPlayerItemVideoOutput`).
-final class FelOverlayOutputDelegate: NSObject, AVPlayerItemOutputPullDelegate, @unchecked Sendable {
+final class OverlayOutputDelegate: NSObject, AVPlayerItemOutputPullDelegate, @unchecked Sendable {
     private let onWillChange: () -> Void
     init(onWillChange: @escaping () -> Void) { self.onWillChange = onWillChange }
     func outputMediaDataWillChange(_ sender: AVPlayerItemOutput) { onWillChange() }
 }
-#endif
