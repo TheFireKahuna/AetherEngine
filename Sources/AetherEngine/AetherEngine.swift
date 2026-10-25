@@ -2371,6 +2371,7 @@ public final class AetherEngine: ObservableObject {
         // landing it corrects; a live program boundary rebases the source PTS), so the subtitle drain is
         // told here, at the corrected position.
         if let before, nativeSourceSeconds(atItemSeconds: nativeClockSeconds) != before {
+            sourcePlayheadClock.noteShift(nativeSourceSeconds(atItemSeconds: nativeClockSeconds) - nativeClockSeconds)
             subtitleLanded(atItemSeconds: nativeClockSeconds)
         }
     }
@@ -2615,6 +2616,8 @@ public final class AetherEngine: ObservableObject {
     var nativeItemTimeJumpObserver: NSObjectProtocol? = nil
     var subtitleLandingGeneration: UInt64 = 0
     var subtitleLanding: SubtitleLanding? = nil
+    /// The playhead on the source axis for readers off the main actor: the subtitle walk paces against it.
+    let sourcePlayheadClock = SourcePlayheadClock()
     /// What the selection observer last applied.
     var nativeSubtitleFollowedKey: NativeSubtitleFollowedKey? = nil
     /// The anchor a host pick asked for, taken by the selection it causes.
@@ -6975,6 +6978,7 @@ public final class AetherEngine: ObservableObject {
         audibleReadbackTask?.cancel()
         audibleReadbackTask = nil
         disarmNativeSubtitleSelection()   // the selection belongs to the item being torn down
+        sourcePlayheadClock.stop()
         // #316: the proxy serves exactly one session's master; a standing socket outliving it would keep a
         // port and a decode task alive for a source nobody plays any more.
         remoteHLSSubtitleProxy?.tearDown()

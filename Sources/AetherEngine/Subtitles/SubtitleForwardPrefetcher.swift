@@ -229,16 +229,16 @@ enum SubtitleForwardPrefetcher {
                   link: link, reanchor: reanchor, fence: fence, playhead: playhead)
     }
 
-    /// Read/harvest until EOF, error, cancellation, or a nil playhead (engine gone). Returns why it
-    /// stopped and how many routed subtitle packets it harvested (#231: a read error is not an EOF
-    /// and the caller has to be able to tell them apart). The source must be positioned by the
-    /// caller.
+    /// Read/harvest until EOF, error or cancellation. Returns why it stopped and how many routed subtitle
+    /// packets it harvested (#231: a read error is not an EOF and the caller has to be able to tell them
+    /// apart). The source must be positioned by the caller. `playhead` is the clock playback runs on
+    /// (`SourcePlayheadClock`); nil while none runs, which the loop waits out, since with nothing playing
+    /// there is no lead to read to.
     /// Harvest-then-park: the packet whose PTS crosses `playhead + lead(playhead)` is stored before
     /// the loop parks, so the store may hold one packet past the lead edge (harmless; the drainer
     /// window decides what decodes). The lead is asked at every park decision, so a consumer that
     /// arrives or raises its lead moves the edge without a new session. The playhead is snapshot at
-    /// start and refreshed only inside the park loop: no MainActor hop per packet during a backfill
-    /// burst.
+    /// start and refreshed only inside the park loop: no clock read per packet during a backfill burst.
     static func run(
         source: DemuxerSource,
         store: SubtitlePacketStore,
@@ -249,7 +249,14 @@ enum SubtitleForwardPrefetcher {
         fence: SubtitleResolutionStatement.Fence = .init(),
         playhead: @Sendable () async -> Double?
     ) async -> Outcome {
-        guard var playheadSnapshot = await playhead() else {
+        func runningPlayhead() async -> Double? {
+            while !Task.isCancelled {
+                if let seconds = await playhead() { return seconds }
+                do { try await Task.sleep(nanoseconds: parkPollNanoseconds) } catch { return nil }
+            }
+            return nil
+        }
+        guard var playheadSnapshot = await runningPlayhead() else {
             return Outcome(exit: .cancelled, harvested: 0)
         }
         var harvested = 0
@@ -292,7 +299,7 @@ enum SubtitleForwardPrefetcher {
                     if yielded == 0 { SubtitlePrefetchTelemetry.recordLinkYield(true) }
                     // The playhead moves while we wait, so the lead shrinks: a reader parked behind
                     // a busy pump returns to fetching on its own once it falls under the floor.
-                    guard let fresh = await playhead() else { break readLoop }
+                    guard let fresh = await runningPlayhead() else { break readLoop }
                     playheadSnapshot = fresh
                     do { try await Task.sleep(nanoseconds: link.pollNanoseconds) } catch { break readLoop }
                     yielded += link.pollSeconds
@@ -386,7 +393,7 @@ enum SubtitleForwardPrefetcher {
                     didPark = true
                     SubtitlePrefetchTelemetry.recordPark(true)
                 }
-                guard let fresh = await playhead() else { break readLoop }
+                guard let fresh = await runningPlayhead() else { break readLoop }
                 playheadSnapshot = fresh
                 if position <= playheadSnapshot + lead(playheadSnapshot) { break }
                 do { try await Task.sleep(nanoseconds: parkPollNanoseconds) } catch { break readLoop }

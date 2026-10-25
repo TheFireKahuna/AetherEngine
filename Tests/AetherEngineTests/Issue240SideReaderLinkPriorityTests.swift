@@ -118,7 +118,7 @@ struct Issue240SideReaderLinkPriorityTests {
 
     /// Run the real loop against the fixture with the park disabled, so the only thing that can stop
     /// the read is the link arbitration. The playhead closure holds at 0 for a bounded number of
-    /// calls and then returns nil, the loop's "engine gone" exit, so a yielding loop terminates
+    /// calls and then cancels the loop, as a closed session does, so a yielding loop terminates
     /// instead of spinning the test.
     private static func harvestedPTS(
         link: SideReaderLinkArbiter?,
@@ -136,23 +136,28 @@ struct Issue240SideReaderLinkPriorityTests {
 
         let store = SubtitlePacketStore()
         let calls = CallBudget(limit: playheadCalls)
-        _ = await SubtitleForwardPrefetcher.run(
-            demuxer: demuxer, store: store,
-            streamIndices: [subtitleIndex], assemblyIndices: [],
-            pacingIndex: pacingIndex,
-            lead: { _ in leadSeconds },          // 3600 disables the park: the arbitration is the subject
-            parkPollNanoseconds: 1_000_000,
-            link: link,
-            reanchor: reanchor,
-            playhead: {
-                guard await calls.next() else { return nil }
-                // #496: the park is what calls back, so a request posted from here arrives while
-                // the reader is parked, which is the shape a backward seek leaves behind.
-                if let requestAnchor, await calls.used == requestAnchor.onCall {
-                    reanchor?.request(requestAnchor.seconds)
-                }
-                return 0.0
-            })
+        // A task of its own: the playhead closure cancels this run, not the test.
+        _ = await Task { await SubtitleForwardPrefetcher.run(
+                demuxer: demuxer, store: store,
+                streamIndices: [subtitleIndex], assemblyIndices: [],
+                pacingIndex: pacingIndex,
+                lead: { _ in leadSeconds },          // 3600 disables the park: the arbitration is the subject
+                parkPollNanoseconds: 1_000_000,
+                link: link,
+                reanchor: reanchor,
+                playhead: {
+                    // A spent budget ends the loop the way a closed session does.
+                    guard await calls.next() else {
+                        withUnsafeCurrentTask { $0?.cancel() }
+                        return 0.0
+                    }
+                    // #496: the park is what calls back, so a request posted from here arrives while
+                    // the reader is parked, which is the shape a backward seek leaves behind.
+                    if let requestAnchor, await calls.used == requestAnchor.onCall {
+                        reanchor?.request(requestAnchor.seconds)
+                    }
+                    return 0.0
+                }) }.value
         return store.entries(streamIndex: subtitleIndex, from: 0, through: 1000).map(\.ptsSeconds)
     }
 
@@ -333,8 +338,8 @@ struct Issue240SideReaderLinkPriorityTests {
     }
 }
 
-/// Bounded playhead source: hands out a fixed playhead for `limit` calls, then nil, which is the
-/// loop's engine-gone exit. Lets a yielding loop terminate without a timeout.
+/// Bounded playhead source: hands out a fixed playhead for `limit` calls, after which the caller cancels
+/// the loop. Lets a yielding loop terminate without a timeout.
 private actor CallBudget {
     private var remaining: Int
     private(set) var used = 0

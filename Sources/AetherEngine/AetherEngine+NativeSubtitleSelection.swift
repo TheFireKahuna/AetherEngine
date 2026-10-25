@@ -47,6 +47,7 @@ extension AetherEngine {
     /// macOS 27: a media playlist without subtitles posted every jump and flushed nothing).
     func armNativeItemObservers(on item: AVPlayerItem) {
         disarmNativeSubtitleSelection()
+        sourcePlayheadClock.follow(item: item, shift: nativeSourceSeconds(atItemSeconds: 0))
         nativeItemTimeJumpObserver = NotificationCenter.default.addObserver(
             forName: AVPlayerItem.timeJumpedNotification, object: item, queue: .main
         ) { [weak self, weak item] _ in

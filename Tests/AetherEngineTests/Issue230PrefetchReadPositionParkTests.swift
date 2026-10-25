@@ -99,8 +99,8 @@ struct Issue230PrefetchReadPositionParkTests {
     /// End to end through the real loop: with the playhead at 0 and a 4 s lead, the read must stop
     /// inside the 3 s to 8 s subtitle gap instead of running to the far side of it.
     ///
-    /// The playhead closure returns 0 once (the loop's initial snapshot) and nil afterwards, which
-    /// is the loop's "engine gone" exit. So the second call happening at all proves the park
+    /// The playhead closure returns 0 once (the loop's initial snapshot) and cancels the loop on the
+    /// second call, as a closed session does. So the second call happening at all proves the park
     /// engaged, and where it engaged is readable from what the store holds: harvest-then-park means
     /// a subtitle packet that triggers the park is stored before the loop stops.
     @Test("the park engages on the read position, not on the next cue")
@@ -115,13 +115,17 @@ struct Issue230PrefetchReadPositionParkTests {
 
             let store = SubtitlePacketStore()
             let calls = Counter()
-            _ = await SubtitleForwardPrefetcher.run(
-                demuxer: demuxer, store: store,
-                streamIndices: [subtitleIndex], assemblyIndices: [],
-                pacingIndex: pacingIndex,
-                lead: { _ in 4.0 },
-                parkPollNanoseconds: 1_000_000,
-                playhead: { await calls.next() == 0 ? 0.0 : nil })
+            // A task of its own: the playhead closure cancels this run, not the test.
+            _ = await Task { await SubtitleForwardPrefetcher.run(
+                    demuxer: demuxer, store: store,
+                    streamIndices: [subtitleIndex], assemblyIndices: [],
+                    pacingIndex: pacingIndex,
+                    lead: { _ in 4.0 },
+                    parkPollNanoseconds: 1_000_000,
+                    playhead: {
+                        if await calls.next() > 0 { withUnsafeCurrentTask { $0?.cancel() } }
+                        return 0.0
+                    }) }.value
             return store.entries(streamIndex: subtitleIndex, from: 0, through: 1000)
                 .map(\.ptsSeconds)
         }

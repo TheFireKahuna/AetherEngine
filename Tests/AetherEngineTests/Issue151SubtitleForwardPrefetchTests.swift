@@ -107,9 +107,12 @@ struct Issue151SubtitleForwardPrefetchTests {
         #expect(pts == [2, 30, 55, 90, 120])
     }
 
-    /// A vanished playhead provider (engine torn down mid-read) ends the loop instead of spinning.
-    @Test("prefetch aborts when the playhead provider returns nil")
-    func prefetchAbortsOnNilPlayhead() async throws {
+    /// The walk paces against the clock playback runs on (`SourcePlayheadClock`). While none runs (a load
+    /// before its item attaches) nothing plays and there is no lead to read to, so it waits rather than
+    /// reading or giving up; a session that goes away closes its source, which cancels it.
+    @Test("prefetch waits while no clock runs, reads once one does, and ends on cancellation",
+          .timeLimit(.minutes(1)))
+    func prefetchWaitsForAClock() async throws {
         let fixture = MatroskaSubtitleFixture.make(
             durationMs: 200_000,
             events: [(ms: 1_000, durationMs: 500), (ms: 150_000, durationMs: 500)])
@@ -117,18 +120,27 @@ struct Issue151SubtitleForwardPrefetchTests {
         try demuxer.open(reader: DataIOReader(data: fixture), formatHint: "matroska")
         defer { demuxer.close() }
         let store = SubtitlePacketStore()
-        // The provider serves the initial snapshot (0), then vanishes. Both packets harvest
-        // (harvest-then-park, matching the native readers); the 150 s packet trips the park,
-        // whose playhead refresh gets nil and must end the loop instead of spinning.
-        let provider = ExpiringPlayheadProvider(initial: 0)
-        let outcome = await SubtitleForwardPrefetcher.run(
-            demuxer: demuxer, store: store,
-            streamIndices: [0], assemblyIndices: [],
-            pacingIndex: -1,
-            lead: { _ in 60 }, parkPollNanoseconds: 1_000_000,
-            playhead: { provider.next() })
+        let clock = OptionalPlayheadBox()
+        let run = Task {
+            await SubtitleForwardPrefetcher.run(
+                demuxer: demuxer, store: store,
+                streamIndices: [0], assemblyIndices: [],
+                pacingIndex: -1,
+                lead: { _ in 60 }, parkPollNanoseconds: 1_000_000,
+                playhead: { clock.value })
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(store.entries(streamIndex: 0, from: 0, through: 200).isEmpty)
+        // Harvest-then-park: both packets are stored, the 150 s one past the lead parks the walk.
+        clock.value = 0
+        let deadline = Date().addingTimeInterval(10)
+        while store.entries(streamIndex: 0, from: 0, through: 200).count < 2, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        run.cancel()
+        let outcome = await run.value
         #expect(outcome.harvested == 2)
-        #expect(outcome.exit == .cancelled, "a vanished engine is not a restartable failure (#231)")
+        #expect(outcome.exit == .cancelled, "a closed session is not a restartable failure (#231)")
     }
 
     // MARK: - Engine gating + re-anchor decisions
@@ -179,15 +191,12 @@ struct Issue151SubtitleForwardPrefetchTests {
 }
 
 /// Returns the initial playhead exactly once, nil on every later call (engine torn down mid-read).
-private final class ExpiringPlayheadProvider: @unchecked Sendable {
+private final class OptionalPlayheadBox: @unchecked Sendable {
     private let lock = NSLock()
-    private var value: Double?
-    init(initial: Double) { value = initial }
-    func next() -> Double? {
-        lock.lock(); defer { lock.unlock() }
-        let v = value
-        value = nil
-        return v
+    private var stored: Double?
+    var value: Double? {
+        get { lock.lock(); defer { lock.unlock() }; return stored }
+        set { lock.lock(); stored = newValue; lock.unlock() }
     }
 }
 

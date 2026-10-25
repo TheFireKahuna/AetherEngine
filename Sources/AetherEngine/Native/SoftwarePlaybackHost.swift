@@ -527,6 +527,10 @@ final class SoftwarePlaybackHost {
         audioOutput?.sourceTimebase
     }
 
+    /// The same clock for readers off the main actor (`SourcePlayheadClock`): it follows the `AudioOutput`
+    /// this host holds.
+    nonisolated let presentationTimebases = SoftwareTimebases()
+
     /// #311: forwarded to the renderer, which is where a frame is actually handed over. Set through
     /// the host rather than on the renderer directly so the engine has one place to re-arm it across
     /// a `load()`, the same shape the native path uses for its own observer.
@@ -1523,6 +1527,7 @@ final class SoftwarePlaybackHost {
         // AudioOutput owns the AVSampleBufferRenderSynchronizer (master clock). Created unconditionally: video-only previously got no clock (frozen frame, currentTime=0). Layer attached in play() after the engine hangs it in the view hierarchy (attaching free-floating fails FigVideoQueueRemote -12080 on tvOS 26+).
         let audioOutput = AudioOutput()
         self.audioOutput = audioOutput
+        presentationTimebases.hold(audioOutput)
         audioOutput.onRendererFailed = { [weak self] error in
             Task { @MainActor in self?.handleRendererFailure(.audio, error: error) }
         }
@@ -2370,6 +2375,7 @@ final class SoftwarePlaybackHost {
             aOut.detachVideoRenderer(renderer)
         }
         audioOutput = nil
+        presentationTimebases.hold(nil)
         audioDecoder?.close()
         audioDecoder = nil
         audioIsAPAC = false

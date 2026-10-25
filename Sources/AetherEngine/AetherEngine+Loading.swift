@@ -1499,6 +1499,7 @@ extension AetherEngine {
             .sink { [weak self] value in
                 guard let self = self else { return }
                 let shift = self.nativeItemShiftSeconds(atItemSeconds: value)
+                self.sourcePlayheadClock.noteShift(self.nativeSourceSeconds(atItemSeconds: value) - value)
                 // #93 retest: retire the pending recovery seek target when it lands (rendered
                 // reaches its neighbourhood) or goes stale (organic progress far from it, i.e.
                 // AVPlayer abandoned the seek and playback runs elsewhere).
@@ -2087,6 +2088,7 @@ extension AetherEngine {
             self.climbRendererRecovery(which, error: error)
         }
         self.softwareHost = host
+        sourcePlayheadClock.follow(software: host.presentationTimebases)
         armHeldPictureRelease(onSoftwareHost: host)
         // #311: a load builds a new host and a new renderer, so an observer installed once by the
         // host app has to be carried across the seam, exactly as the native session does at load.

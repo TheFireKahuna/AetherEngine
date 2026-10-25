@@ -859,6 +859,7 @@ extension AetherEngine {
             demuxer: nativeVideoSession?.demuxer ?? softwareHost?.subtitleSourceDemuxer,
             makeDecoder: { [weak self] in self?.makeSubtitleDrainDecoder(streamIndex: $0) },
             playhead: { [weak self] in self?.sourceTime },
+            pacingPlayhead: { [sourcePlayheadClock] in sourcePlayheadClock.seconds },
             duration: { [weak self] in self?.duration ?? 0 },
             videoRestarting: { [weak self] in
                 guard let self else { return false }
