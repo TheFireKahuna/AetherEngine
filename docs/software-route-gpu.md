@@ -1,7 +1,19 @@
 # The software route: one GPU pass, inside the native player
 
-Status: plan, written 2026-10-24 on `research/12bit-fel`. Parts 2 (the GPU finisher and H.273 colour) and 3 (AV1 into
-the slabs) are built and committed; parts 4 (bwdif on the GPU) and 6 (film in interlaced carriage) are built and verified on device; part 5 (AV1 film grain) is built and conformance-tested; parts 1 and 7 are open. The colour equations are in [colour-representation.md](colour-representation.md).
+Status: written 2026-10-24 on `research/12bit-fel`, updated 2026-10-25. The GPU cutover is done: a software-decoded
+picture reaches the display, and every still, in one GPU pass with no CPU pass over its pixels. Parts 2 (the GPU
+finisher and H.273 colour) and 3 (AV1 into the slabs) are built; parts 4 (bwdif on the GPU) and 6 (film in
+interlaced carriage) are built and verified on device; part 5 (AV1 film grain) is built and bit exact on the Argon
+streams; part 7 (stills) is built, its device check open. Part 8 records the mid-stream colour fixes part 5's
+conformance run led to. Part 1 (the software route inside AVPlayer) is open. The colour equations are in
+[colour-representation.md](colour-representation.md).
+
+What still passes over pixels on the CPU, each on purpose:
+
+- rawvideo and libavcodec's paletted pictures are copied into a slab once (for rawvideo the copy is the decode);
+- Dolby Vision profile 5 / AV1 10.0 stills, behind the `DolbyVisionStillReshaping` trait (off by default; playback
+  and the default scrub preview leave the reconstruction to the system compositor);
+- H.274 film grain (H.264 / HEVC SEI), which libavcodec applies; rare in practice, and not AV1's process.
 
 ## Why
 
@@ -385,7 +397,7 @@ mode does; the stages themselves cope with breaks (re-anchoring, combed pictures
   50 Hz (off: 50 deinterlaced). The only drops fell in the first second, across the panel's mode switch. By eye the
   difference did not show on the G5, which likely smooths 3:2 at 59.94 Hz itself.
 
-## Part 7. Stills on the playback path (open)
+## Part 7. Stills on the playback path (built; device check open)
 
 Every still (the SDR I-frame tier AVKit's scrub thumbnails play, `FrameExtractor`'s thumbnails and snapshots, the
 software host's packet-run stills) is a picture the player would show, so it is made the way playback makes it,
@@ -423,6 +435,52 @@ Conformance: a still of a known picture through the software and the VideoToolbo
 buffer playback shows (BT.709 bars at the code values, an untagged SD picture with playback's BT.601 guess, full
 range, an anamorphic picture at its display aspect); HDR10 and HLG sources give BT.709 SDR stills.
 
+### 7.1 Built
+
+`282a72e8`. `DisplayBufferWriter` (Decoder/), `StillRenderer` (FrameExtractor/); `FrameDecodeContext`,
+`IFrameStillBuilder` and `SoftwareStillExtractor` cut over; `HDRToneMapper` and every swscale call removed. A hardware
+context gets the writer too: a codec the hwaccel declines (MPEG-4 Part 2) decodes in software on it.
+`StillColorspaceTests` check stills end to end through the writer and the renderer: BT.709 and untagged HD / SD
+matrices, full-range JPEG formats, HDR to BT.709 SDR. Changed by design: `FrameExtractor`'s HDR snapshots take Apple's
+curve instead of FFmpeg's tonemap. Open: AV1 HDR scrub thumbnails on the Apple TV (grain included).
+
+## Part 8. Colour that changes mid-stream (built)
+
+Four of Argon's 1512 grain streams missed `md5_ref` (5.5): frames after a sequence header without a colour
+description kept the previous header's matrix. The same class of fault was in more places, each now fixed.
+
+- **FFmpegBuild 3.10.1 (`6a2d3af`)**, three patches, each with a test in `ColourPerSequenceTests` that unpatched
+  FFmpeg 9.0.2 fails:
+  - `libdav1d-colour-per-sequence.patch`: each AV1 sequence header's own colour (AV1 6.4.2: unspecified without a
+    description), and dav1d's unknown chroma location as unspecified. All 1512 Argon grain streams now pass.
+  - `h264-colour-per-sps.patch`: each SPS's own colour and range (H.264 E.2.1). A container's declaration still
+    wins where the bitstream says nothing: `avformat_find_stream_info` restores it (`parameters_from_context`).
+  - `h2645-alternative-transfer-cvs.patch`: the alternative transfer characteristics SEI (HLG over a BT.2020
+    transfer, 3GPP TS 26.118) lasts one coded video sequence (H.265 D.3), and crosses H.264's frame threads.
+  - HEVC's own colour export was already per SPS.
+- **Fill from the container** (`ColourBackfill`, `09e23158`): a field is filled only until the bitstream states it.
+  A remux with an empty VUI (AE#499) is filled throughout; a stream that stated its colour and falls silent is
+  unspecified. For MPEG-TS the "container" value is the first SPS's, so filling from it brought the old colour back.
+- **`HardwareVideoDecoder`** (the software route's HEVC, the FEL base layer): each picture's tags travel with it as
+  VideoToolbox's frame refCon, from `HEVCInBandColour` (an SPS read through CoreMedia; the alternative transfer per
+  coded video sequence). Base layer only (`dba6f3aa`).
+- **Native route, live** (`09e23158`, `11a4140d`): an init built from in-band parameter sets (a join, an SSAI
+  creative, a same-PID change) carries the new SPS's colour in `colr` (`InBandVideoConfig`), for HEVC as for H.264.
+  Live HEVC keeps its in-band parameter sets (the #365 sample conversion, as VOD), and an HEVC VPS / SPS / PPS change
+  gets a versioned init, as H.264's.
+- **Native route, VOD HEVC** (`11a4140d`): `HEVCConfigurationTracker`, the H.264 tracker's counterpart, rebuilds the
+  session on the software path when an IRAP's SPS has a decoder signature the `hvcC` lacks. A `hev1` file (no sets in
+  its `hvcC`) has no baseline and is not tracked. Checked on a 4K HDR10 MKV and two Profile 7 FEL clips: no mismatch,
+  one colour throughout.
+- **Display mode, live** (`52b9b1d6`, `LiveDisplayRangeLatch`): the first HDR programme moves the panel into its mode
+  when playback reaches it, once; the panel never comes back down in that session (each switch is an HDMI
+  renegotiation, and SDR plays correctly inside an HDR mode).
+
+Not done, by decision: a VOD colour-only change (same decoder signature, other colour). A VOD playlist is written once
+with one init, so following it needs the change points before the playlist is served. The files it would serve are
+joins whose container already carries the first part's colour for every player, and the case is rare. VIDEO-RANGE and
+CODECS stay as the master declared them at load.
+
 ## Banked
 
 - **Zero-copy rawvideo** by allocating its packets in slabs. Worth it only if a local or loopback producer ever feeds
@@ -437,6 +495,11 @@ range, an anamorphic picture at its display aspect); HDR10 and HLG sources give 
   override is written into the segment producer's packets and the card test is repeated.
 - **dav1d throughput on the A15** at 4K 10-bit (with and without film grain) is unmeasured; it sets the decode-ahead
   the segment gating needs.
-- **The finisher's speed on the Apple TV** is unmeasured (all figures are M4 Pro).
+- **The finisher's speed on the Apple TV** is unmeasured (all figures are M4 Pro), and so is the grain's cost
+  (the per-frame tables on the CPU, the per-sample synthesis inside the finisher).
+- **Device checks still owed**: part 7's AV1 HDR scrub thumbnails; live HEVC through the #365 sample conversion and a
+  mid-stream parameter-set change; a live SDR to HDR programme switch (the panel switching once, AVPlayer playing on
+  across it). The live ones need a probe sequence that serves a growing MPEG-TS.
+- **The `DolbyVisionStillReshaping` trait**: whether its CPU converter stays (7).
 - **ICtCp tagging** relies on CoreVideo's own `ITU_R_2100_ICtCp` tag (code point 14, absent from the public headers);
   whether tvOS's display layer decodes it correctly is untested.
