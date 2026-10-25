@@ -32,7 +32,7 @@ typedef int  dovi_i32;
 #define DOVI_DEBUG_RAW_VDR            2 /* test only: write the un-quantised VDR code << 4 (12-bit in 16) */
 #define DOVI_DITHER_BLUE_NOISE        4 /* static 64x64 blue-noise threshold map, no per-frame change */
 
-/* ---- nlq_method_idc (ETSI GS CCM 001). Anything other than LINEAR yields no
+/* ---- nlq_method_idc. Anything other than LINEAR yields no
    residual rather than a wrong inverse, degrading to base-layer output. ---- */
 #define DOVI_NLQ_METHOD_LINEAR        0
 #define DOVI_NLQ_METHOD_NONE          0xFFFFFFFFu
@@ -50,7 +50,7 @@ typedef int  dovi_i32;
 /* ---- flags ---- */
 #define DOVI_FLAG_DISABLE_RESIDUAL    0x1u /* disable_residual_flag, or el_type == MEL */
 #define DOVI_FLAG_LUMA_MMR            0x2u /* luma curve has at least one MMR piece */
-#define DOVI_FLAG_CHROMA_422          0x4u /* output chroma plane is 4:2:2 (sv22): each sample covers two rows */
+#define DOVI_FLAG_CHROMA_422          0x4u /* sv22: dovi_compose_chroma writes its 16-bit sums for dovi_chroma_420_to_422 */
 
 /* Piecewise reshaping curve for one component.
  *
@@ -68,7 +68,7 @@ typedef int  dovi_i32;
  * the polynomial order for a polynomial piece and the MMR order for an MMR
  * piece. coef[i][j] is Q(coef_shift[i]) and is evaluated against inputs
  * normalised by dividing the BL code value by 2^bl_bit_depth (bl_max + 1), the
- * fixed-point convention of the spec's pseudo-code. */
+ * fixed-point convention of Dolby's reference. */
 struct DoviPolynomialParams {
     dovi_u32 num_pivots;
     dovi_u32 pivots[9];
@@ -148,7 +148,7 @@ struct DoviMetalParams {
     dovi_u32 vdr_scale;
 
     /* The base layer's chroma siting as FFmpeg's AVChromaLocation (chroma_sample_loc_type + 1; 0 =
-       unspecified). Read only by dovi_compose_chroma_422, for the vertical phase of each 4:2:2 row. */
+       unspecified). Read only by dovi_chroma_420_to_422, for the vertical phase of each 4:2:2 row. */
     dovi_u32 bl_chroma_loc;
 
     /* FEL / MEL split view: the luma column from which the residual is no longer added, so the left of the
@@ -241,22 +241,20 @@ static inline float dovi_dither(uint2 gid, uint frame_index, uint2 phase) {
    Reshaping curve evaluation
    ========================================================================= */
 
-// The composition arithmetic is ETSI GS CCM 001's fixed point, clause by clause:
-// - a base-layer value s enters as t = s << (20 - BL_bit_depth), Q20 of s / 2^BL_bit_depth (5.4.2.3.2's
-//   `ss << shift`, 5.4.2.3.3's tt[1..3]), and a product of two terms is taken back to Q20 with >> 20. For integer
-//   s that is the spec's own term (s0 * s1 << (20 - 2 * BL_bit_depth) is (t0 * t1) >> 20 exactly);
+// The composition arithmetic is Dolby's integer fixed point:
+// - a base-layer value s enters as t = s << (20 - BL_bit_depth), Q20 of s / 2^BL_bit_depth, and a product of two
+//   terms is taken back to Q20 with >> 20. For integer s that is the reference's own term (s0 * s1 <<
+//   (20 - 2 * BL_bit_depth) is (t0 * t1) >> 20 exactly);
 // - a prediction v is the 16-bit `vv >> (4 + coefficient_log2_denom)`, negative sums 0, capped at 0xffff;
-// - the residual r is 5.4.3.2's 16-bit value (`DoviFelComposer.inverseNlq`, tabulated per EL code);
+// - the residual r is the 16-bit inverse NLQ (`DoviFelComposer.inverseNlq`, tabulated per EL code);
 // - v + r is kept whole until the output is written (dovi_reconstruct and the writers below).
-// The 4:2:2 kernel's interpolated base chroma is a multiple of 1/128 of a code, which Q20 holds exactly, so it
-// runs the same arithmetic on its fractional values.
 
 // Q20 shift for a base-layer code: 20 - BL_bit_depth.
 static inline uint dovi_q20_shift(uint bl_max) {
     return 20u - (32u - clz(bl_max));
 }
 
-// The arithmetic is the spec's 64-bit integers, carried in 32-bit words, which Apple GPUs multiply natively where
+// The arithmetic is 64-bit integers, carried in 32-bit words, which Apple GPUs multiply natively where
 // 64-bit integers are emulated:
 // - every term is non-negative and below 2^20 (a clamped base-layer value in Q20, or a product of two), so a product
 //   of two is below 2^40 and (a * b) >> 20 is its high word shifted up by 12 and its low word down by 20, exactly;
@@ -275,7 +273,7 @@ struct DoviAcc {
     uint lo;
 };
 
-// constant << 20, the spec's `coef * tt[0]` (`poly_coef[0] * (1 << 20)`).
+// constant << 20, the constant term `coef * tt[0]` (`poly_coef[0] * (1 << 20)`).
 static inline DoviAcc dovi_acc_constant(int c) {
     return DoviAcc{ c >> 12, uint(c) << 20 };
 }
@@ -289,7 +287,7 @@ static inline void dovi_acc_add(thread DoviAcc &acc, int c, uint t) {
     acc.lo = sum;
 }
 
-// 5.4.2.3: the accumulated Q(20 + coefficient_log2_denom) sum to the 16-bit prediction: negative sums 0,
+// The accumulated Q(20 + coefficient_log2_denom) sum to the 16-bit prediction: negative sums 0,
 // `>> (4 + coefficient_log2_denom)`, capped at 0xffff. The shift is held below 64, where a hostile coef_shift would
 // otherwise leave it undefined.
 static inline int dovi_prediction(DoviAcc acc, uint coef_shift) {
@@ -307,9 +305,9 @@ static inline int dovi_prediction(DoviAcc acc, uint coef_shift) {
     return int(min((hi << (32u - k)) | (acc.lo >> k), 0xffffu));
 }
 
-// Index of the piece owning t: the last pivot that t reaches. 5.4.2.2 takes the first piece whose next pivot is
-// above s, which is the same piece, a zero-width piece (two equal pivots) included: both give the later one. Past
-// the last pivot the spec's index runs one beyond the pieces; the value is clamped to that pivot anyway, so the
+// Index of the piece owning t: the last pivot that t reaches. The reference takes the first piece whose next pivot
+// is above s, which is the same piece, a zero-width piece (two equal pivots) included: both give the later one. Past
+// the last pivot the reference's index runs one beyond the pieces; the value is clamped to that pivot anyway, so the
 // last piece is the one that applies.
 static inline int dovi_select_piece(constant struct DoviPolynomialParams &curve, uint t, uint shift) {
     int last_piece = int(curve.num_pivots) - 2;
@@ -322,7 +320,7 @@ static inline int dovi_select_piece(constant struct DoviPolynomialParams &curve,
     return clamp(piece, 0, max(last_piece, 0));
 }
 
-// t clamped to a component's pivot range, in Q20 (5.4.2.3.2 and the s0 / s1 / s2 clamps of 5.4.2.3.3). A
+// t clamped to a component's pivot range, in Q20 (the polynomial's input and each MMR input s0 / s1 / s2). A
 // component with no usable curve (num_pivots < 2) has no range and is left as is.
 static inline uint dovi_clamp_to_pivots(constant struct DoviPolynomialParams &curve, uint t, uint shift) {
     if (curve.num_pivots < 2u) {
@@ -331,7 +329,7 @@ static inline uint dovi_clamp_to_pivots(constant struct DoviPolynomialParams &cu
     return clamp(t, curve.pivots[0] << shift, curve.pivots[curve.num_pivots - 1u] << shift);
 }
 
-// 5.4.2.3.2, polynomial piece: the sum of poly_coef[i] * s^i at Q20, i <= 2.
+// Polynomial piece: the sum of poly_coef[i] * s^i at Q20, i <= 2.
 static inline int dovi_eval_poly(constant struct DoviPolynomialParams &curve, int piece, uint t, uint shift) {
     t = dovi_clamp_to_pivots(curve, t, shift);
     DoviAcc acc = dovi_acc_constant(curve.coef[piece][0]);
@@ -345,9 +343,9 @@ static inline int dovi_eval_poly(constant struct DoviPolynomialParams &curve, in
     return dovi_prediction(acc, curve.coef_shift[piece]);
 }
 
-// 5.4.2.3.3's tt[1...21] for MMR inputs already clamped to their pivots, up to `order`: the seven terms [s0, s1, s2,
+// The MMR terms tt[1...21] for inputs already clamped to their pivots, up to `order`: the seven terms [s0, s1, s2,
 // s0s1, s0s2, s1s2, s0s1s2], then their squares, then their cubes (term * square), each product truncated back to
-// Q20 as the spec's are. Cb and Cr read the same three inputs, so a chroma sample forms these once for both.
+// Q20. Cb and Cr read the same three inputs, so a chroma sample forms these once for both.
 static inline void dovi_mmr_terms(uint t0, uint t1, uint t2, uint order, thread uint* tt, thread float* ttf) {
     tt[0] = t0;
     tt[1] = t1;
@@ -372,11 +370,11 @@ static inline void dovi_mmr_terms(uint t0, uint t1, uint t2, uint order, thread 
     }
 }
 
-// 5.4.2.3.3, MMR piece: the constant and the order's terms against their coefficients. `k` is this component's slice
+// MMR piece: the constant and the order's terms against their coefficients. `k` is this component's slice
 // of the per-frame MMR table (`populateMmrTable`): per piece the constant, the 21 coefficients, Q(coef_shift), and
 // whether the estimate below is safe for the piece.
 //
-// The sum vv is the spec's 64-bit integer. Its low word is exact from wrapping 32-bit multiply-adds, one multiply per
+// The sum vv is a 64-bit integer. Its low word is exact from wrapping 32-bit multiply-adds, one multiply per
 // coefficient. Its high word is pinned by a float estimate E of the same sum, the coefficients' float values against
 // the exact terms: with A = sum of |c * t|, E is within (n + 2) * 2^-24 * A of vv, and for A <= 2^49 that is under
 // 2^31, so hi = rint((E - lo) / 2^32) is vv's high word exactly. The CPU bounds A per piece with the term ceiling
@@ -413,7 +411,7 @@ static inline int dovi_eval_mmr(device const int* k, int piece, uint order, uint
     return dovi_prediction(acc, coef_shift);
 }
 
-// The MMR inputs of a sample: luma (downsampled to the chroma site, 5.4.2.3.3) and the two chroma values, each
+// The MMR inputs of a sample: luma (downsampled to the chroma site) and the two chroma values, each
 // clamped to its own component's pivots.
 static inline void dovi_mmr_inputs(constant struct DoviMetalParams &params, uint t0, uint t1, uint t2, uint shift,
                                    thread uint &c0, thread uint &c1, thread uint &c2) {
@@ -458,22 +456,25 @@ static inline int dovi_eval_curve(
    Inverse NLQ
    ========================================================================= */
 
-// The inverse linear-deadzone quantiser depends on the 10-bit EL code alone, so the composer evaluates it
-// once per frame for all 1024 codes of each component (`DoviFelComposer.inverseNlq`, 5.4.3.2 line for line) and
-// the kernels index that table: nlq_lut[component * 1024 + code], the spec's 16-bit signed r, Y then Cb then Cr.
+// The inverse linear-deadzone quantiser depends on the EL code alone, so the composer evaluates it once per frame
+// for every code of each component (`DoviFelComposer.inverseNlq`) and the kernels index that table:
+// nlq_lut[component * DOVI_NLQ_LUT_CODES + code], the 16-bit signed r, Y then Cb then Cr. It runs past the 10-bit
+// range because the EL upsampling filters overshoot (0 ... about 1400 from 10-bit input) and the inverse NLQ takes
+// the upsampled code as it is.
+#define DOVI_NLQ_LUT_CODES 2048
 static inline int dovi_inv_nlq(device const int* nlq_lut, uint component, int el_code) {
-    return nlq_lut[component * 1024u + uint(clamp(el_code, 0, 1023))];
+    return nlq_lut[component * uint(DOVI_NLQ_LUT_CODES) + uint(clamp(el_code, 0, DOVI_NLQ_LUT_CODES - 1))];
 }
 
 /* ============================================================================
    Reconstruction and output
    ========================================================================= */
 
-// h = v + r (5.4.3.3), still at 16 bits: the spec rounds it once to hdr_bit_depth, and each writer below takes it
+// h = v + r, still at 16 bits: the reconstruction rounds it once to hdr_bit_depth, and each writer below takes it
 // from here, so no output is rounded twice.
 //
-// The spec's reconstructed sample, hdr_bit_depth bits: (h + 2^(15 - hdr_bit_depth)) >> (16 - hdr_bit_depth),
-// clipped to [0, 2^hdr_bit_depth - 1].
+// The reconstructed sample, hdr_bit_depth bits: (h + 2^(15 - hdr_bit_depth)) >> (16 - hdr_bit_depth), clipped to
+// [0, 2^hdr_bit_depth - 1].
 static inline int dovi_reconstruct(int h, uint vdr_max) {
     uint bits = 32u - clz(vdr_max);
     return clamp((h + (1 << (15u - bits))) >> (16u - bits), 0, int(vdr_max));
@@ -481,7 +482,7 @@ static inline int dovi_reconstruct(int h, uint vdr_max) {
 
 // 16-bit sample: h itself, clamped to the video range (10-bit limits shifted left 6). A 10-bit code shifted
 // left 6 and a 12-bit code shifted left 4 are both h's scale (black 64 << 6 = 256 << 4 = 4096), so sv22 carries
-// the sum before the spec's rounding, from which its 12-bit sample is (h + 8) >> 4 exactly; P010's full-precision
+// the sum before the reconstruction's rounding, from which its 12-bit sample is (h + 8) >> 4 exactly; P010's full-precision
 // mode puts the same word in P010, whose low 6 bits CoreVideo calls padding.
 static inline int dovi_full_precision(int h, int lo, int hi) {
     return clamp(h, lo << 6, hi << 6);
@@ -502,99 +503,88 @@ static inline int dovi_quantize(
     return clamp(int(floor(v + bias)), lo, hi);
 }
 
+// A 4:2:0 chroma plane's size along an axis of `n` luma samples: half, rounded up, as CoreVideo allocates it, so an
+// odd picture's last chroma column and row are read and written.
+static inline uint dovi_chroma_size(uint n) {
+    return (n + 1u) >> 1;
+}
+
 /* ============================================================================
    Enhancement layer upsampling
    ========================================================================= */
 
-// EL upsampling: bilinear, from four explicit texel reads with exact weights.
-//
-// el_spatial_resampling_filter_flag advertises that the encoder used its own
-// separable filter, whose taps the RPU does not carry, so no bit-exact inverse
-// is available from the stream. Against the DoViBaker oracle on a fine-detail set (gratings, zone plate,
-// band-limited noise) a 4-fetch Catmull-Rom bought about 0.7% of per-pixel error sd over bilinear, with chroma
-// unchanged, for four times the EL reads.
-//
-// Not the hardware sampler: its bilinear weights are fixed point, so the interpolated code could land one
-// off the exact value (the CPU model saw it), and rounding that with rint() sent every exact half to the
-// even neighbour. A 2:1 EL interpolates at quarter weights, where halves are common (two texels 2 apart
-// mod 4), so ties-to-even was a parity-dependent bias. Here the weights for a 2:1 or 1:1 EL are exact quarters,
-// halves or zero, every product and sum of 10-bit codes at those weights is exact in float, and the caller
-// rounds half up.
+// The EL is brought to the base layer's grid by Dolby's reference resampling: the RPU carries no filter, so the
+// reference is the only defined choice. Every 2:1 step takes the same grid: columns co-sited, rows centred.
 
-// One axis: the lower EL texel index and the fraction towards the next texel for base-layer sample n.
-// `centre` 0.5 puts both grids' samples at their pixel centres (luma: n_el = (n + 1/2) * el / bl - 1/2);
-// 0 co-sites the first samples (chroma: n_el = n * el / bl). For the 2:1 and 1:1 grids streams use,
-// el / bl is 0.5 or 1, so every term is exact in float.
-static inline int dovi_el_axis(uint n, float ratio, float centre, thread float &frac) {
-    float u = (float(n) + centre) * ratio - centre;
-    float i = floor(u);
-    frac = u - i;
-    return int(i);
+// Vertical first, then horizontal, each pass rounded and clipped to [0, 0xFFFF], edges replicated:
+// - vertical, luma (cmp 0): r[2n] = (-3 y[n-2] + 29 y[n-1] + 111 y[n] - 9 y[n+1] + 64) >> 7, r[2n+1] mirrored
+//   (Catmull-Rom at the quarter phases, rows centred);
+// - vertical, chroma (cmp 1, 2): r[2n] = (64 y[n-1] + 192 y[n] + 128) >> 8, r[2n+1] = (192 y[n] + 64 y[n+1] + 128) >> 8;
+// - horizontal, every component (SPATIAL_RESAMPLING_FILTER_H): r[2n] = y[n], r[2n+1] = (22 y[n-3] + 94 y[n-2]
+//   - 524 y[n-1] + 2456 y[n] + 2456 y[n+1] - 524 y[n+2] + 94 y[n+3] + 22 y[n+4] + 2048) >> 12 (columns co-sited).
+//
+// One SIMD-group composes 32 consecutive output columns, which read 23 EL columns (16, and 3 + 4 neighbours for
+// the 8 taps). Lane L runs the vertical pass for EL column (x0 / 2 - 3 + L), x0 being the group's first output
+// column, and each output lane takes its horizontal taps from the lanes that hold them: registers and shuffles,
+// no threadgroup memory, no barrier. That holds when lane L is output column x0 + L: threadgroups 32 wide,
+// dispatched in whole threadgroups, so every lane runs (the composer's `elUpsamplingThreadgroup`). Lanes past the
+// picture still compute, on replicated edge columns, and only leave after the shuffles.
+
+// The EL column lane `lane` of the group holding output column x runs the vertical pass for, edge replicated.
+static inline int dovi_el_column(uint x, uint lane, uint el_width) {
+    return clamp(int((x - lane) >> 1) - 3 + int(lane), 0, int(el_width) - 1);
 }
 
-// Bilinear EL luma code at base-layer pixel `site` of a `bl_size` plane, edges clamped. One gather fetches the
-// 2x2 footprint: the point between the four texel centres selects it and sits half a texel from any footprint
-// boundary. A gather measured cheaper here than four reads (UHD luma 0.41 ms against 0.45 ms on an M4 Pro).
-static inline float dovi_upsample_el(texture2d<ushort, access::sample> tex, uint2 site,
-                                     uint2 bl_size, uint2 el_size) {
+// Vertical pass, luma, for output row `row` at EL column `col`: the four EL rows it reads, from two gathers of the
+// 2 x 2 block at (col, first) and (col, first + 2), this lane keeping column `col`; clamp-to-edge is the reference's
+// replication.
+static inline int dovi_el_v_luma(texture2d<ushort, access::sample> tex, int col, uint row) {
     constexpr sampler s(coord::pixel, filter::nearest, address::clamp_to_edge);
-    float fx, fy;
-    int x0 = dovi_el_axis(site.x, float(el_size.x) / float(bl_size.x), 0.5f, fx);
-    int y0 = dovi_el_axis(site.y, float(el_size.y) / float(bl_size.y), 0.5f, fy);
+    int n = int(row >> 1);
+    bool odd = (row & 1u) != 0u;
+    float first = float(odd ? n - 1 : n - 2);
     // Gather order: (x0, y1), (x1, y1), (x1, y0), (x0, y0).
-    float4 c = float4(tex.gather(s, float2(float(x0 + 1), float(y0 + 1))) >> 6);
-    float top = c.w * (1.0f - fx) + c.z * fx;
-    float bot = c.x * (1.0f - fx) + c.y * fx;
-    return top * (1.0f - fy) + bot * fy;
+    ushort4 a = tex.gather(s, float2(float(col) + 1.0f, first + 1.0f));
+    ushort4 b = tex.gather(s, float2(float(col) + 1.0f, first + 3.0f));
+    int y0 = int(a.w >> 6), y1 = int(a.x >> 6), y2 = int(b.w >> 6), y3 = int(b.x >> 6);
+    int sum = odd ? (-9 * y0 + 111 * y1 + 29 * y2 - 3 * y3) : (-3 * y0 + 29 * y1 + 111 * y2 - 9 * y3);
+    return clamp((sum + 64) >> 7, 0, 0xFFFF);
 }
 
-// Bilinear EL chroma codes (Cb, Cr) at base chroma sample `site`, co-sited, edges clamped. Four reads of the
-// interleaved plane return both components each, which measured cheaper than a gather per component.
-static inline float2 dovi_upsample_el_uv(texture2d<ushort, access::read> tex, uint2 site,
-                                         uint2 bl_size, uint2 el_size) {
-    float fx, fy;
-    int x0 = dovi_el_axis(site.x, float(el_size.x) / float(bl_size.x), 0.0f, fx);
-    int y0 = dovi_el_axis(site.y, float(el_size.y) / float(bl_size.y), 0.0f, fy);
-    int xm = int(el_size.x) - 1, ym = int(el_size.y) - 1;
-    uint xa = uint(clamp(x0, 0, xm)), xb = uint(clamp(x0 + 1, 0, xm));
-    uint ya = uint(clamp(y0, 0, ym)), yb = uint(clamp(y0 + 1, 0, ym));
-    float2 c00 = float2(tex.read(uint2(xa, ya)).rg >> 6);
-    float2 c10 = float2(tex.read(uint2(xb, ya)).rg >> 6);
-    float2 c01 = float2(tex.read(uint2(xa, yb)).rg >> 6);
-    float2 c11 = float2(tex.read(uint2(xb, yb)).rg >> 6);
-    float2 top = c00 * (1.0f - fx) + c10 * fx;
-    float2 bot = c01 * (1.0f - fx) + c11 * fx;
-    return top * (1.0f - fy) + bot * fy;
+// Vertical pass, both chroma components, for BL chroma row `row` at EL chroma column `col`.
+static inline int2 dovi_el_v_chroma(texture2d<ushort, access::read> tex, int col, uint row, uint el_height) {
+    int n = int(row >> 1), last = int(el_height) - 1;
+    bool odd = (row & 1u) != 0u;
+    int2 a = int2(tex.read(uint2(col, clamp(odd ? n : n - 1, 0, last))).rg >> 6);
+    int2 b = int2(tex.read(uint2(col, clamp(odd ? n + 1 : n, 0, last))).rg >> 6);
+    int2 s = odd ? (192 * a + 64 * b) : (64 * a + 192 * b);
+    return clamp((s + 128) >> 8, int2(0), int2(0xFFFF));
 }
 
-// Bilinear EL chroma codes (Cb, Cr) for row `site.y` of a 4:2:2 chroma plane (one chroma row per luma row),
-// column `site.x`. The row sits at 4:2:0 chroma-row coordinate `row_coord` (site.y / 2 plus the siting offset,
-// dovi_compose_chroma_422), and the EL is read at that coordinate through the same grid relation as
-// dovi_upsample_el_uv (n_el = n * el / bl), so at a 4:2:0 site this is that function. For a 2:1 EL the vertical
-// weights are eighths, still exact in float with the horizontal halves, and the caller rounds half up as before.
-static inline float2 dovi_upsample_el_uv_422(texture2d<ushort, access::read> tex, uint2 site, float row_coord,
-                                             uint2 bl_size, uint2 el_size) {
-    float fx;
-    int x0 = dovi_el_axis(site.x, float(el_size.x) / float(bl_size.x), 0.0f, fx);
-    float v = row_coord * (float(el_size.y) / float(bl_size.y));
-    float y0f = floor(v);
-    float fy = v - y0f;
-    int y0 = int(y0f);
-    int xm = int(el_size.x) - 1, ym = int(el_size.y) - 1;
-    uint xa = uint(clamp(x0, 0, xm)), xb = uint(clamp(x0 + 1, 0, xm));
-    uint ya = uint(clamp(y0, 0, ym)), yb = uint(clamp(y0 + 1, 0, ym));
-    float2 c00 = float2(tex.read(uint2(xa, ya)).rg >> 6);
-    float2 c10 = float2(tex.read(uint2(xb, ya)).rg >> 6);
-    float2 c01 = float2(tex.read(uint2(xa, yb)).rg >> 6);
-    float2 c11 = float2(tex.read(uint2(xb, yb)).rg >> 6);
-    float2 top = c00 * (1.0f - fx) + c10 * fx;
-    float2 bot = c01 * (1.0f - fx) + c11 * fx;
-    return top * (1.0f - fy) + bot * fy;
+// Horizontal pass across the SIMD-group: `v` is this lane's vertical result, x this lane's output column. Output
+// column x reads y[x / 2 + k], k = -3 ... 4, which lane L = x - x0 finds at lane L / 2 + 3 + k. Every lane shuffles,
+// whichever phase it keeps.
+template <typename T>
+static inline T dovi_el_h(T v, uint x, uint lane) {
+    ushort b = ushort(lane >> 1);
+    T y0 = simd_shuffle(v, b), y1 = simd_shuffle(v, ushort(b + 1)), y2 = simd_shuffle(v, ushort(b + 2));
+    T y3 = simd_shuffle(v, ushort(b + 3)), y4 = simd_shuffle(v, ushort(b + 4)), y5 = simd_shuffle(v, ushort(b + 5));
+    T y6 = simd_shuffle(v, ushort(b + 6)), y7 = simd_shuffle(v, ushort(b + 7));
+    T odd = clamp((22 * y0 + 94 * y1 - 524 * y2 + 2456 * y3 + 2456 * y4 - 524 * y5 + 94 * y6 + 22 * y7 + 2048) >> 12,
+                  T(0), T(0xFFFF));
+    return (x & 1u) == 0u ? y3 : odd;
 }
 
-// Round half up: the interpolated EL code back to an integer code for the inverse NLQ.
-static inline int dovi_el_code(float v) {
-    return int(floor(v + 0.5f));
+// The upsampled EL luma code at BL pixel gid.
+static inline int dovi_el_luma(texture2d<ushort, access::sample> tex, uint2 gid, uint lane, uint2 el_size) {
+    int col = dovi_el_column(gid.x, lane, el_size.x);
+    return dovi_el_h(dovi_el_v_luma(tex, col, gid.y), gid.x, lane);
+}
+
+// The upsampled EL chroma codes (Cb, Cr) at BL chroma sample (x, row).
+static inline int2 dovi_el_chroma(texture2d<ushort, access::read> tex, uint x, uint row, uint lane, uint2 el_size) {
+    int col = dovi_el_column(x, lane, el_size.x);
+    return dovi_el_h(dovi_el_v_chroma(tex, col, row, el_size.y), x, lane);
 }
 
 /* ============================================================================
@@ -624,8 +614,16 @@ kernel void dovi_compose_luma(
     constant int*                          luma_lut      [[buffer(1)]],
     device const int*                      nlq_lut       [[buffer(2)]],
     device const int*                      mmr_table     [[buffer(3)]],
-    uint2                                  gid           [[thread_position_in_grid]])
+    uint2                                  gid           [[thread_position_in_grid]],
+    uint                                   lane          [[thread_index_in_simdgroup]])
 {
+    bool residual = (params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u &&
+                    params.nlq_y.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_y.nlq_scale != 0;
+    // The EL's horizontal pass reads its neighbours' vertical results, so every lane runs it before any leaves.
+    int el_code = 0;
+    if (residual) {
+        el_code = dovi_el_luma(el_y_tex, gid, lane, uint2(params.el_width, params.el_height));
+    }
     if (gid.x >= params.bl_width || gid.y >= params.bl_height) {
         return;
     }
@@ -650,14 +648,8 @@ kernel void dovi_compose_luma(
         h = dovi_eval_curve(params.poly_y, mmr_table, params.mmr_y.coef_shift, t, tt, ttf, shift);
     }
 
-    if ((params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u &&
-        dovi_residual_at(params, gid.x) &&
-        params.nlq_y.nlq_method == DOVI_NLQ_METHOD_LINEAR &&
-        params.nlq_y.nlq_scale != 0) {
-        // Centre-aligned: luma samples sit at pixel centres on both grids.
-        float el = dovi_upsample_el(el_y_tex, gid, uint2(params.bl_width, params.bl_height),
-                                    uint2(params.el_width, params.el_height));
-        h += dovi_inv_nlq(nlq_lut, 0u, dovi_el_code(el));
+    if (residual && dovi_residual_at(params, gid.x)) {
+        h += dovi_inv_nlq(nlq_lut, 0u, el_code);
     }
 
     if (params.residual_split_x != 0u && uint(abs(int(gid.x) - int(params.residual_split_x))) < 2u) {
@@ -676,22 +668,9 @@ kernel void dovi_compose_luma(
     out_y_tex.write(ushort4(ushort(out_y << 6), 0, 0, 0), gid);
 }
 
-// One composed chroma sample, at its 4:2:0 site. A 4:2:2 output plane has twice the rows,
-// so the sample is written to both (vertical nearest-neighbour; the BL chroma is 4:2:0). The composer
-// fills a 4:2:2 plane with dovi_compose_chroma_422 instead; this duplication is what that kernel replaced,
-// kept so the tests can still produce it and compare.
-static inline void dovi_write_chroma(texture2d<ushort, access::write> out_uv_tex, ushort4 uv,
-                                     uint2 gid, uint flags) {
-    if ((flags & DOVI_FLAG_CHROMA_422) != 0u) {
-        out_uv_tex.write(uv, uint2(gid.x, 2u * gid.y));
-        out_uv_tex.write(uv, uint2(gid.x, 2u * gid.y + 1u));
-    } else {
-        out_uv_tex.write(uv, gid);
-    }
-}
-
 // Chroma: both chroma planes in one pass, since an MMR curve for Cb and for Cr
-// reads the same three base-layer components.
+// reads the same three base-layer components. Composed at the 4:2:0 sites, where the reconstruction is defined;
+// for sv22 (DOVI_FLAG_CHROMA_422) the result goes to the intermediate dovi_chroma_420_to_422 reads, not the output.
 kernel void dovi_compose_chroma(
     texture2d<ushort, access::read>        bl_y_tex      [[texture(0)]],
     texture2d<ushort, access::read>        bl_uv_tex     [[texture(1)]],
@@ -700,10 +679,20 @@ kernel void dovi_compose_chroma(
     constant struct DoviMetalParams&       params        [[buffer(0)]],
     device const int*                      nlq_lut       [[buffer(2)]],
     device const int*                      mmr_table     [[buffer(3)]],
-    uint2                                  gid           [[thread_position_in_grid]])
+    uint2                                  gid           [[thread_position_in_grid]],
+    uint                                   lane          [[thread_index_in_simdgroup]])
 {
-    uint uv_width = params.bl_width / 2u;
-    uint uv_height = params.bl_height / 2u;
+    uint uv_width = dovi_chroma_size(params.bl_width);
+    uint uv_height = dovi_chroma_size(params.bl_height);
+    bool cb_active = params.nlq_cb.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cb.nlq_scale != 0;
+    bool cr_active = params.nlq_cr.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cr.nlq_scale != 0;
+    bool residual = (params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u && (cb_active || cr_active);
+    // As in the luma kernel: every lane runs the EL upsampling before any leaves.
+    int2 el_code = int2(0);
+    if (residual) {
+        el_code = dovi_el_chroma(el_uv_tex, gid.x, gid.y, lane,
+                                      uint2(dovi_chroma_size(params.el_width), dovi_chroma_size(params.el_height)));
+    }
 
     if (gid.x >= uv_width || gid.y >= uv_height) {
         return;
@@ -747,56 +736,47 @@ kernel void dovi_compose_chroma(
     int h_cr = dovi_eval_curve(params.poly_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE, params.mmr_cr.coef_shift,
                                t2, tt, ttf, shift);
 
-    if ((params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u && dovi_residual_at(params, gid.x * 2u)) {
-        bool cb_active = (params.nlq_cb.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cb.nlq_scale != 0);
-        bool cr_active = (params.nlq_cr.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cr.nlq_scale != 0);
-        if (cb_active || cr_active) {
-            // The enhancement chroma grid and the base chroma grid share their first sample rather than
-            // their outer edge: base chroma sample n sits at EL chroma texel n * el / bl, and a
-            // quarter-resolution EL gives the even samples exactly and the odd ones half way between two
-            // texels. This is DoViBaker's phase (`upsampleChromaEven` copies, `upsampleChromaOdd`
-            // interpolates at 0.5); a centre-aligned fetch puts every sample a quarter of an EL chroma
-            // texel up and to the left. Same-resolution EL is unchanged. It is a relation between the two
-            // chroma grids taken from DoViBaker, not a reading of the stream's chroma_sample_loc_type,
-            // which this kernel never consults: it is what decimating top-left co-sited (type 2) chroma
-            // from sample 0 gives, hence the "type 2" this comment used to claim, while the luma at the
-            // chroma site above assumes chroma vertically between rows 2k and 2k + 1 (type 0).
-            float2 el = dovi_upsample_el_uv(el_uv_tex, gid, uint2(uv_width, uv_height),
-                                            uint2(params.el_width / 2u, params.el_height / 2u));
-            if (cb_active) {
-                h_cb += dovi_inv_nlq(nlq_lut, 1u, dovi_el_code(el.x));
-            }
-            if (cr_active) {
-                h_cr += dovi_inv_nlq(nlq_lut, 2u, dovi_el_code(el.y));
-            }
+    if (residual && dovi_residual_at(params, gid.x * 2u)) {
+        if (cb_active) {
+            h_cb += dovi_inv_nlq(nlq_lut, 1u, el_code.x);
+        }
+        if (cr_active) {
+            h_cr += dovi_inv_nlq(nlq_lut, 2u, el_code.y);
         }
     }
 
+    // sv22: the 16-bit sums, clipped to the 16-bit range as the reconstruction is clipped, for the 4:2:2 step.
+    if ((params.flags & DOVI_FLAG_CHROMA_422) != 0u) {
+        out_uv_tex.write(ushort4(ushort(clamp(h_cb, 0, 0xFFFF)), ushort(clamp(h_cr, 0, 0xFFFF)), 0, 0), gid);
+        return;
+    }
     if (params.dither_mode == DOVI_DEBUG_RAW_VDR) {
         uint up = 16u - (32u - clz(params.vdr_max));
-        dovi_write_chroma(out_uv_tex, ushort4(ushort(dovi_reconstruct(h_cb, params.vdr_max) << up),
-                                              ushort(dovi_reconstruct(h_cr, params.vdr_max) << up), 0, 0), gid, params.flags);
+        out_uv_tex.write(ushort4(ushort(dovi_reconstruct(h_cb, params.vdr_max) << up),
+                                 ushort(dovi_reconstruct(h_cr, params.vdr_max) << up), 0, 0), gid);
         return;
     }
     if (params.dither_mode == DOVI_DITHER_FULL_PRECISION) {
-        dovi_write_chroma(out_uv_tex, ushort4(ushort(dovi_full_precision(h_cb, 64, 960)),
-                                              ushort(dovi_full_precision(h_cr, 64, 960)), 0, 0),
-                          gid, params.flags);
+        out_uv_tex.write(ushort4(ushort(dovi_full_precision(h_cb, 64, 960)),
+                                 ushort(dovi_full_precision(h_cr, 64, 960)), 0, 0), gid);
         return;
     }
     int out_cb = dovi_quantize(h_cb, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 0u)), 64, 960);
     int out_cr = dovi_quantize(h_cr, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 1u)), 64, 960);
-    dovi_write_chroma(out_uv_tex, ushort4(ushort(out_cb << 6), ushort(out_cr << 6), 0, 0), gid, params.flags);
+    out_uv_tex.write(ushort4(ushort(out_cb << 6), ushort(out_cr << 6), 0, 0), gid);
 }
 
-// Catmull-Rom (cubic B = 0, C = 0.5) taps for the base-layer chroma at a 4:2:2 row, over chroma rows i - 1 ... i + 2
-// for a row at chroma-row coordinate i + t, by phase t in quarters. t = 0 is the chroma row itself, copied; 1/2 is
-// (-1, 9, 9, -1) / 16. Every tap is n / 128, so a 10-bit code times a tap and the four-tap sum are exact in float.
-constant float dovi_chroma_422_taps[4][4] = {
-    {  0.0f,            1.0f,            0.0f,            0.0f           },
-    { -9.0f / 128.0f, 111.0f / 128.0f,  29.0f / 128.0f,  -3.0f / 128.0f },
-    { -8.0f / 128.0f,  72.0f / 128.0f,  72.0f / 128.0f,  -8.0f / 128.0f },
-    { -3.0f / 128.0f,  29.0f / 128.0f, 111.0f / 128.0f,  -9.0f / 128.0f },
+// The 4:2:0 -> 4:2:2 taps, over chroma rows i - 1 ... i + 2 for a row at chroma-row coordinate i + t, by phase t in
+// quarters, in 128ths:
+// - t = 0, the chroma row itself: a copy, f[2n] = 64 s[n];
+// - t = 1/2: (-1, 9, 9, -1) / 16, f[2n + 1] = -4 s[n - 1] + 36 s[n] + 36 s[n + 1] - 4 s[n + 2];
+//   these two are Dolby's reference chroma up-sampling, for co-sited chroma;
+// - t = 1/4, 3/4: Catmull-Rom at the quarter phases, the EL luma's vertical taps, for the other sitings.
+constant int dovi_chroma_422_taps[4][4] = {
+    {  0, 128,   0,   0 },
+    { -9, 111,  29,  -3 },
+    { -8,  72,  72,  -8 },
+    { -3,  29, 111,  -9 },
 };
 
 // The vertical offset, in quarter chroma rows, of 4:2:2 row 2k from chroma row k, by the base layer's siting
@@ -817,107 +797,35 @@ static inline int dovi_chroma_422_offset_q(uint loc) {
     }
 }
 
-// Chroma for a 4:2:2 output plane (sv22), one thread per output sample: every row is composed at its own site
-// instead of the 4:2:0 result being repeated on both rows. With sv22 the composer, not tvOS, does the 4:2:0 ->
-// 4:2:2 conversion, and the reshaping is not linear in luma: under order-3 MMR chroma two rows with different
-// luma predict different chroma, which a repeated 4:2:0 sample cannot show. So the base layer is brought to the
-// row first and reshaped there (libplacebo's order: chroma upsampled, then reshaped), a deliberate quality choice
-// that is not bit-exact with Dolby's 4:2:0 reference.
-//
-// Chroma is horizontally co-sited with the even luma column (types 0 / 2 / 4; neither chroma kernel models the
-// half-column shift of 1 / 3 / 5); vertically it is sited from the stream (dovi_chroma_422_offset_q).
-// - luma: [1 2 1] around the even column on this row only, in integers, edges clamped;
-// - BL chroma: 4-tap Catmull-Rom over the chroma rows at the row's phase (dovi_chroma_422_taps), edge rows
-//   clamped, clamped to [0, bl_max] and kept fractional for the curve (exact in its Q20 fixed point);
-// - EL chroma: bilinear at the same row coordinate (dovi_upsample_el_uv_422), rounded half up, inverse NLQ.
-//   The EL phase convention itself (base chroma row n at EL chroma row n * el / bl) is kept; the siting only
-//   moves where between the base chroma rows the output row sits, and the residual is read where the base
-//   chroma it corrects is, so at a 4:2:0 site every siting reads what dovi_compose_chroma reads;
-// then prediction, residual and output exactly as in dovi_compose_chroma.
-// A separate kernel rather than a branch in dovi_compose_chroma, so the 4:2:0 kernel the P010 modes run is
-// untouched. It is built without the blue-noise specialisation, which sv22 (full precision) never uses.
-kernel void dovi_compose_chroma_422(
-    texture2d<ushort, access::read>        bl_y_tex      [[texture(0)]],
-    texture2d<ushort, access::read>        bl_uv_tex     [[texture(1)]],
-    texture2d<ushort, access::read>        el_uv_tex     [[texture(2)]],
-    texture2d<ushort, access::write>       out_uv_tex    [[texture(3)]],
+// sv22's 4:2:0 -> 4:2:2 step, one thread per output sample: Dolby's reference vertical chroma up-sampling, on the
+// reconstructed picture, after composition. `in_uv_tex` holds dovi_compose_chroma's 16-bit sums at the 4:2:0
+// sites, clipped to [0, 0xFFFF]; each output row takes the four chroma rows around it at its phase
+// (dovi_chroma_422_taps), edge rows replicated, rounded once, `+ 64 >> 7` (tvOS and the display take the 4:2:2
+// picture's horizontal step), and clamped to the video range.
+// On a chroma row the output is that row's composed sum. The rows sit where the stream's siting puts them
+// (dovi_chroma_422_offset_q); chroma is horizontally co-sited with the even luma column.
+kernel void dovi_chroma_420_to_422(
+    texture2d<ushort, access::read>        in_uv_tex     [[texture(0)]],
+    texture2d<ushort, access::write>       out_uv_tex    [[texture(1)]],
     constant struct DoviMetalParams&       params        [[buffer(0)]],
-    device const int*                      nlq_lut       [[buffer(2)]],
-    device const int*                      mmr_table     [[buffer(3)]],
     uint2                                  gid           [[thread_position_in_grid]])
 {
-    uint uv_width = params.bl_width / 2u;
-    uint uv_height = params.bl_height / 2u;
-
+    uint uv_width = dovi_chroma_size(params.bl_width);
     if (gid.x >= uv_width || gid.y >= params.bl_height) {
         return;
     }
-
-    uint lx = min(gid.x * 2u, params.bl_width - 1u);
-    uint lxl = lx > 0u ? lx - 1u : 0u;
-    uint lxr = min(lx + 1u, params.bl_width - 1u);
-    int bl_y = (int(bl_y_tex.read(uint2(lxl, gid.y)).r >> 6)
-              + 2 * int(bl_y_tex.read(uint2(lx, gid.y)).r >> 6)
-              + int(bl_y_tex.read(uint2(lxr, gid.y)).r >> 6) + 2) >> 2;
-
     // The row's chroma-row coordinate in quarters, q = 2 * row + offset (>= -2): whole part q / 4, phase q % 4.
     int q = 2 * int(gid.y) + dovi_chroma_422_offset_q(params.bl_chroma_loc) + 8;
     int first = q / 4 - 2 - 1;
     int phase = q & 3;
-    int last_row = int(uv_height) - 1;
-    float2 bl_uv = float2(0.0f);
+    int last_row = int(dovi_chroma_size(params.bl_height)) - 1;
+    int2 sum = int2(0);
     for (int i = 0; i < 4; ++i) {
         uint row = uint(clamp(first + i, 0, last_row));
-        bl_uv = fma(float2(bl_uv_tex.read(uint2(gid.x, row)).rg >> 6), dovi_chroma_422_taps[phase][i], bl_uv);
+        sum += int2(in_uv_tex.read(uint2(gid.x, row)).rg) * dovi_chroma_422_taps[phase][i];
     }
-    bl_uv = clamp(bl_uv, 0.0f, float(params.bl_max));
-
-    // The interpolated chroma is a multiple of 1/128 of a code, so its Q20 value is exact.
-    uint shift = dovi_q20_shift(params.bl_max);
-    float q20 = float(1u << shift);
-    uint t0 = uint(bl_y) << shift, t1 = uint(rint(bl_uv.x * q20)), t2 = uint(rint(bl_uv.y * q20));
-    uint order = max(dovi_mmr_order(params.poly_cb, t1, shift), dovi_mmr_order(params.poly_cr, t2, shift));
-    uint tt[21];
-    float ttf[21];
-    if (order > 0u) {
-        uint c0, c1, c2;
-        dovi_mmr_inputs(params, t0, t1, t2, shift, c0, c1, c2);
-        dovi_mmr_terms(c0, c1, c2, order, tt, ttf);
-    }
-    int h_cb = dovi_eval_curve(params.poly_cb, mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE, params.mmr_cb.coef_shift,
-                               t1, tt, ttf, shift);
-    int h_cr = dovi_eval_curve(params.poly_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE, params.mmr_cr.coef_shift,
-                               t2, tt, ttf, shift);
-
-    if ((params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u && dovi_residual_at(params, gid.x * 2u)) {
-        bool cb_active = (params.nlq_cb.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cb.nlq_scale != 0);
-        bool cr_active = (params.nlq_cr.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cr.nlq_scale != 0);
-        if (cb_active || cr_active) {
-            float2 el = dovi_upsample_el_uv_422(el_uv_tex, gid, float(q - 8) * 0.25f, uint2(uv_width, uv_height),
-                                                uint2(params.el_width / 2u, params.el_height / 2u));
-            if (cb_active) {
-                h_cb += dovi_inv_nlq(nlq_lut, 1u, dovi_el_code(el.x));
-            }
-            if (cr_active) {
-                h_cr += dovi_inv_nlq(nlq_lut, 2u, dovi_el_code(el.y));
-            }
-        }
-    }
-
-    if (params.dither_mode == DOVI_DEBUG_RAW_VDR) {
-        uint up = 16u - (32u - clz(params.vdr_max));
-        out_uv_tex.write(ushort4(ushort(dovi_reconstruct(h_cb, params.vdr_max) << up),
-                                 ushort(dovi_reconstruct(h_cr, params.vdr_max) << up), 0, 0), gid);
-        return;
-    }
-    if (params.dither_mode == DOVI_DITHER_FULL_PRECISION) {
-        out_uv_tex.write(ushort4(ushort(dovi_full_precision(h_cb, 64, 960)),
-                                 ushort(dovi_full_precision(h_cr, 64, 960)), 0, 0), gid);
-        return;
-    }
-    int out_cb = dovi_quantize(h_cb, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 0u)), 64, 960);
-    int out_cr = dovi_quantize(h_cr, params.dither_mode, dovi_dither(gid, params.frame_index, uint2(1u, 1u)), 64, 960);
-    out_uv_tex.write(ushort4(ushort(out_cb << 6), ushort(out_cr << 6), 0, 0), gid);
+    int2 h = (sum + 64) >> 7;
+    out_uv_tex.write(ushort4(ushort(clamp(h.x, 64 << 6, 960 << 6)), ushort(clamp(h.y, 64 << 6, 960 << 6)), 0, 0), gid);
 }
 
 /* ============================================================================

@@ -20,9 +20,9 @@ enum DoviNlqMethod: UInt32, Sendable {
 enum DoviDither: UInt32, Sendable {
     case none = 0
     case bayer8x8 = 1
-    /// Test only: planes hold the spec's reconstructed 12-bit VDR sample (CCM 001 5.4.3.3) shifted left 4, not P010.
+    /// Test only: planes hold the reconstructed 12-bit VDR sample shifted left 4, not P010.
     case debugRawVDR = 2
-    /// Undithered: the 16-bit sum of prediction and residual, before the spec's rounding, so P010's unused low
+    /// Undithered: the 16-bit sum of prediction and residual, before the reconstruction's rounding, so P010's unused low
     /// 6 bits hold what lies below the 10-bit code; a consumer that reads the full 16-bit word sees all of it,
     /// one that reads the top 10 bits the truncated code. Not validated on a display path yet.
     case fullPrecision = 3
@@ -45,10 +45,9 @@ enum DoviOutputMode: String, CaseIterable, Sendable {
     case p010FullPrecision = "p010-full"
     /// 16-bit 4:2:2 (`sv22`) with ``DoviDither/fullPrecision``. Its video range (luma 4096...60160) is
     /// the 10-bit range shifted left 6, so the full-precision word is a defined `sv22` value: the format
-    /// itself says every bit is picture. Chroma is composed at every 4:2:2 site (`dovi_compose_chroma_422`):
-    /// the 4:2:0 base chroma is brought to each row by a vertical Catmull-Rom and reshaped there with that
-    /// row's luma, libplacebo's order (upsample, then reshape). A deliberate quality choice, since here the
-    /// composer owns the 4:2:0 -> 4:2:2 conversion; not bit-exact with Dolby's 4:2:0 reference.
+    /// itself says every bit is picture. Chroma is composed at the 4:2:0 sites, where the reconstruction is defined,
+    /// then brought to 4:2:2 by Dolby's reference vertical chroma filter on the reconstructed picture
+    /// (`dovi_chroma_420_to_422`); on a chroma row that is the 4:2:0 composition itself.
     case sv22 = "sv22"
 
     var pixelFormat: OSType {
@@ -66,9 +65,8 @@ struct DoviComposerFlags: OptionSet, Sendable {
     /// The luma curve carries at least one MMR piece, so the luma kernel has to
     /// read the base-layer chroma planes as well.
     static let lumaMmr = DoviComposerFlags(rawValue: 0x2)
-    /// The output chroma plane is 4:2:2 (``DoviOutputMode/sv22``). The composer fills it with
-    /// `dovi_compose_chroma_422`, which ignores the flag; the 4:2:0 kernel, given it, writes each sample to
-    /// both rows it covers (the tests' row-duplicated reference). Set by the composer, not by the parser.
+    /// The output chroma plane is 4:2:2 (``DoviOutputMode/sv22``): the 4:2:0 kernel writes its 16-bit sums to the
+    /// intermediate `dovi_chroma_420_to_422` takes to 4:2:2. Set by the composer, not by the parser.
     static let chroma422 = DoviComposerFlags(rawValue: 0x4)
 }
 
@@ -151,9 +149,9 @@ struct DoviNlqParams: Sendable {
     var nlqOffset: Int32 = 0
     var nlqScale: Int32 = 0
     var nlqThreshold: Int32 = 0
-    /// `vdr_in_max` (the spec's `fp_hdr_in_max`, R), Q(coefficient_log2_denom): the residual's magnitude ceiling.
+    /// `vdr_in_max` (`fp_hdr_in_max`, R), Q(coefficient_log2_denom): the residual's magnitude ceiling.
     var vdrInMax: Int32 = 0
-    /// 5.4.3.2's final shift, coefficient_log2_denom - 5 - EL_bit_depth, to the 16-bit residual.
+    /// The inverse NLQ's final shift, coefficient_log2_denom - 5 - EL_bit_depth, to the 16-bit residual.
     var nlqShift: UInt32 = 0
     /// Decoded (prefix-summed) `nlq_pred_pivot_value`. Carried for diagnostics;
     /// the linear inverse has a single segment and does not consult them.

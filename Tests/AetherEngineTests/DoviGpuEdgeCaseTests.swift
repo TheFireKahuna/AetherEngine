@@ -21,8 +21,8 @@ struct DoviGpuEdgeCaseTests {
     // MARK: - Fixtures
 
     /// NLQ at coefficient_log2_denom 23, as every real stream carries: `scale` and `threshold` in Q23, the
-    /// ceiling `vdrInMax` given in 12-bit codes (512 = 0.125, the real streams' value) and stored as the spec's
-    /// Q23 R, one 12-bit code being 2^11. The shift is 5.4.3.2's 23 - 5 - 10.
+    /// ceiling `vdrInMax` given in 12-bit codes (512 = 0.125, the real streams' value) and stored as Q23 R,
+    /// one 12-bit code being 2^11. The shift is the inverse NLQ's 23 - 5 - 10.
     static func nlq(
         offset: Int32 = 512,
         scale: Int32 = 2048,
@@ -214,16 +214,20 @@ struct DoviGpuEdgeCaseTests {
         #expect(Set(uv.map { $0[1] }) == [487], "Cr \(width)x\(height)")
     }
 
-    @Test("a frame whose enhancement chroma plane would be empty is refused, not composed from garbage",
+    /// An enhancement layer one sample high or wide has a chroma plane of one sample along that axis (half the size,
+    /// rounded up, as CoreVideo allocates it), and the composer reads it: every output sample is composed from real
+    /// planes, none left out.
+    @Test("a frame whose enhancement layer is one sample high composes from its one-sample chroma plane",
           arguments: [(2, 2), (6, 2)])
-    func tooSmallForChromaIsRefused(width: Int, height: Int) throws {
+    func oneSampleChromaPlaneComposes(width: Int, height: Int) throws {
         let composer = try #require(DoviFelComposer.p010ForTesting())
-        let blBuf = try #require(H.makeBuffer(width: width, height: height))
-        let elBuf = try #require(H.makeBuffer(width: width / 2, height: height / 2))
-        #expect(composer.compose(baseBuffer: blBuf, enhancementBuffer: elBuf, params: Self.params()) == nil)
-        // and the failed attempt must not have leaked a parameter slot
-        let ok = try Self.composeConstant(composer, bl: (512, 512, 512), el: (612, 512, 512), params: Self.params())
-        #expect(Self.lumaValues(ok) == [537])
+        let out = try Self.composeConstant(composer, blWidth: width, blHeight: height,
+                                           bl: (512, 512, 512), el: (612, 612, 412), params: Self.params())
+        #expect(Self.lumaValues(out) == [537], "luma \(width)x\(height)")
+        let uv = Self.allSamples(out, plane: 1, components: 2)
+        #expect(uv.count == DoviFelComposer.chromaSize(width) * DoviFelComposer.chromaSize(height))
+        #expect(Set(uv.map { $0[0] }) == [537], "Cb \(width)x\(height)")
+        #expect(Set(uv.map { $0[1] }) == [487], "Cr \(width)x\(height)")
     }
 
     @Test("GPU enhancement-layer upsampling preserves a constant field to the last row and column")
@@ -391,7 +395,7 @@ extension DoviGpuEdgeCaseTests {
     func fullPrecisionKeepsLowBits() throws {
         let composer = try #require(DoviFelComposer.p010ForTesting())
         // BL 500 -> v = 500 << 6 = 32000; EL +2 -> r = 16 * 2 - 8 = 24 (12-bit 1.5): the word is h = 32024,
-        // 500.375 in 10-bit codes, the sum before the spec's rounding.
+        // 500.375 in 10-bit codes, the sum before the reconstruction's rounding.
         var p = Self.params(); p.ditherMode = .fullPrecision
         let out = try Self.composeConstant(composer, bl: (500, 512, 512), el: (514, 512, 512), params: p)
         #expect(Self.rawWord(out, plane: 0) == 32024)

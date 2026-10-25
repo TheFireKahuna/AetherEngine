@@ -102,7 +102,7 @@ struct DoviGpuBenchmark {
         params.serialize(into: UnsafeMutableRawBufferPointer(start: pbuf.contents(), count: DoviMetalParams.serializedSize))
         let lut = try #require(device.makeBuffer(length: 1024 * 4, options: .storageModeShared))
         try #require(DoviFelComposer()).populateLumaLut(into: lut.contents().assumingMemoryBound(to: Int32.self), params: params)
-        let nlq = try #require(device.makeBuffer(length: 3 * 1024 * 4, options: .storageModeShared))
+        let nlq = try #require(device.makeBuffer(length: 3 * DoviFelComposer.nlqLutCodes * 4, options: .storageModeShared))
         DoviFelComposer.populateNlqLut(into: nlq.contents().assumingMemoryBound(to: Int32.self), params: params)
         let mmr = try #require(device.makeBuffer(length: DoviFelComposer.mmrTableCount * 4, options: .storageModeShared))
         DoviFelComposer.populateMmrTable(into: mmr.contents().assumingMemoryBound(to: Int32.self), params: params)
@@ -118,31 +118,46 @@ struct DoviGpuBenchmark {
     }
 
     /// Median GPU milliseconds per dispatch of one kernel, over `iterations` command buffers of
-    /// `dispatchesPerBuffer` dispatches each. `chroma422` dispatches the chroma kernel over the 4:2:2 grid
-    /// (one thread per sv22 output sample, `dovi_compose_chroma_422`) instead of the 4:2:0 one.
-    static func time(_ rig: Rig, pipeline: MTLComputePipelineState, luma: Bool, chroma422: Bool = false, out: CVPixelBuffer,
-                     extraBuffers: [(MTLBuffer, Int)] = [], tgShape: (Int, Int)? = nil, pixelsPerThread: Int = 1) throws -> Double {
+    /// `dispatchesPerBuffer` dispatches each. With `chroma422`, sv22's step (`dovi_chroma_420_to_422`) follows each
+    /// chroma dispatch, the chroma kernel writing the 4:2:0 intermediate it reads, as the composer encodes them; the
+    /// time is the two together. The UHD planes are whole multiples of the 32-wide threadgroups the composition kernels
+    /// need, so `dispatchThreads` launches whole threadgroups.
+    static func time(_ rig: Rig, pipeline: MTLComputePipelineState, luma: Bool, chroma422: MTLComputePipelineState? = nil,
+                     out: CVPixelBuffer, extraBuffers: [(MTLBuffer, Int)] = [], tgShape: (Int, Int)? = nil) throws -> Double {
         let blY = try texture(rig, rig.base, plane: 0, .r16Uint), blUV = try texture(rig, rig.base, plane: 1, .rg16Uint)
         let elY = try texture(rig, rig.enhancement, plane: 0, .r16Uint), elUV = try texture(rig, rig.enhancement, plane: 1, .rg16Uint)
         let oY = try texture(rig, out, plane: 0, .r16Uint), oUV = try texture(rig, out, plane: 1, .rg16Uint)
         let w = pipeline.threadExecutionWidth
         let tg = tgShape.map { MTLSize(width: $0.0, height: $0.1, depth: 1) }
             ?? MTLSize(width: w, height: max(1, min(pipeline.maxTotalThreadsPerThreadgroup / w, 8)), depth: 1)
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg16Uint, width: width / 2, height: height / 2, mipmapped: false)
+        descriptor.storageMode = .private
+        descriptor.usage = [.shaderRead, .shaderWrite]
+        let chroma420 = try #require(rig.device.makeTexture(descriptor: descriptor))
         var samples: [Double] = []
         for i in 0..<(iterations + 3) {
             let cb = try #require(rig.queue.makeCommandBuffer())
             let enc = try #require(cb.makeComputeCommandEncoder())
-            enc.setComputePipelineState(pipeline)
             enc.setTexture(blY.0, index: 0); enc.setTexture(blUV.0, index: 1)
-            enc.setTexture(luma ? elY.0 : elUV.0, index: 2); enc.setTexture(luma ? oY.0 : oUV.0, index: 3)
             enc.setBuffer(rig.params, offset: 0, index: 0)
             enc.setBuffer(rig.lut, offset: 0, index: 1)
             enc.setBuffer(rig.nlq, offset: 0, index: 2)
             enc.setBuffer(rig.mmr, offset: 0, index: 3)
             for (b, idx) in extraBuffers { enc.setBuffer(b, offset: 0, index: idx) }
-            let grid = luma ? MTLSize(width: width / pixelsPerThread, height: height, depth: 1)
-                            : MTLSize(width: width / 2 / pixelsPerThread, height: chroma422 ? height : height / 2, depth: 1)
-            for _ in 0..<dispatchesPerBuffer { enc.dispatchThreads(grid, threadsPerThreadgroup: tg) }
+            let grid = luma ? MTLSize(width: width, height: height, depth: 1) : MTLSize(width: width / 2, height: height / 2, depth: 1)
+            for _ in 0..<dispatchesPerBuffer {
+                enc.setComputePipelineState(pipeline)
+                enc.setTexture(luma ? elY.0 : elUV.0, index: 2)
+                enc.setTexture(luma ? oY.0 : (chroma422 == nil ? oUV.0 : chroma420), index: 3)
+                enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+                if let chroma422 {
+                    // A serial encoder: the step sees what the chroma dispatch wrote.
+                    enc.setComputePipelineState(chroma422)
+                    enc.setTexture(chroma420, index: 0); enc.setTexture(oUV.0, index: 1)
+                    enc.dispatchThreads(MTLSize(width: width / 2, height: height, depth: 1), threadsPerThreadgroup: tg)
+                    enc.setTexture(blY.0, index: 0); enc.setTexture(blUV.0, index: 1)
+                }
+            }
             enc.endEncoding()
             cb.commit()
             cb.waitUntilCompleted()
@@ -182,7 +197,7 @@ struct DoviGpuBenchmark {
     nonisolated(unsafe) static var quiet = false
 
     static func report(_ label: String, source: String, rig: Rig, extra: [(MTLBuffer, Int)] = [],
-                       tgShape: (Int, Int)? = nil, pixelsPerThread: Int = 1) throws {
+                       tgShape: (Int, Int)? = nil) throws {
         let pipes = try DoviFelComposer.SharedPipelines.compile(device: rig.device, source: source)
         let p010 = try #require(makeBuffer(width, height, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange))
         let sv22 = try #require(makeBuffer(width, height, kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange))
@@ -190,12 +205,10 @@ struct DoviGpuBenchmark {
                                           ("p010-bn", DoviDither.blueNoise, p010, false),
                                           ("sv22", DoviDither.fullPrecision, sv22, true)] {
             try setMode(rig, dither: dither, chroma422: c422)
-            let kernels = dither == .blueNoise ? try pipes.blueNoisePipelines()
-                : (pipes.lumaPipeline, c422 ? pipes.chroma422Pipeline : pipes.chromaPipeline)
-            let l = try time(rig, pipeline: kernels.0, luma: true, out: out, extraBuffers: extra,
-                             tgShape: tgShape, pixelsPerThread: pixelsPerThread)
-            let c = try time(rig, pipeline: kernels.1, luma: false, chroma422: c422, out: out, extraBuffers: extra,
-                             tgShape: tgShape, pixelsPerThread: pixelsPerThread)
+            let kernels = try pipes.kernels(.init(blueNoise: dither == .blueNoise))
+            let l = try time(rig, pipeline: kernels.luma, luma: true, out: out, extraBuffers: extra, tgShape: tgShape)
+            let c = try time(rig, pipeline: kernels.chroma, luma: false, chroma422: c422 ? kernels.chroma422 : nil, out: out,
+                             extraBuffers: extra, tgShape: tgShape)
             // The last timed dispatch of each kernel left its output; it must match the baseline's bit for bit.
             let words = planes(out)
             let verdict: String
@@ -249,26 +262,6 @@ struct DoviGpuBenchmark {
 """),
     ]
 
-    /// Each thread composes `n` horizontally adjacent sites (luma pixels / chroma samples) instead of one:
-    /// the kernel body becomes a loop with `gid` rebound per site, its early `return`s turned into `continue`.
-    static func multiPixel(_ source: String, n: Int) throws -> String {
-        var s = source
-        for name in ["dovi_compose_luma", "dovi_compose_chroma", "dovi_compose_chroma_422"] {
-            let start = try #require(s.range(of: "kernel void \(name)("))
-            let open = try #require(s.range(of: "{", range: start.upperBound..<s.endIndex))
-            // The body ends at the first line that is exactly "}" after the opening brace.
-            let close = try #require(s.range(of: "\n}\n", range: open.upperBound..<s.endIndex))
-            var body = String(s[open.upperBound..<close.lowerBound])
-            body = body.replacingOccurrences(of: "return;", with: "continue;")
-            let header = String(s[start.lowerBound..<open.lowerBound])
-                .replacingOccurrences(of: "uint2                                  gid           [[thread_position_in_grid]])",
-                                      with: "uint2                                  gid0          [[thread_position_in_grid]])")
-            let looped = header + "{\n    for (uint px = 0u; px < \(n)u; ++px) {\n    uint2 gid = uint2(gid0.x * \(n)u + px, gid0.y);\n" + body + "\n    }\n}\n"
-            s.replaceSubrange(start.lowerBound..<close.upperBound, with: looped)
-        }
-        return s
-    }
-
     /// The memory floor: each kernel reduced to its own input fetches and output write, no arithmetic.
     /// Luma: BL luma + one EL texel -> write. Chroma: the six BL luma taps, BL chroma, one EL texel -> write.
     static let floorOnly: [(String, String)] = [
@@ -292,21 +285,10 @@ struct DoviGpuBenchmark {
     ushort4 bl_uv = bl_uv_tex.read(gid);
     {
         ushort e = el_uv_tex.read(uint2(gid.x >> 1, gid.y >> 1)).r;
-        dovi_write_chroma(out_uv_tex, ushort4(ushort(bl_uv.r + ushort(bl_y) + e), bl_uv.g, 0, 0), gid, params.flags);
+        out_uv_tex.write(ushort4(ushort(bl_uv.r + ushort(bl_y) + e), bl_uv.g, 0, 0), gid);
         return;
     }
     int bl_cb = int(bl_uv.r >> 6);
-"""),
-        // 4:2:2 chroma: the three luma taps, the four BL chroma rows, one EL texel -> write.
-        ("""
-    bl_uv = clamp(bl_uv, 0.0f, float(params.bl_max));
-""", """
-    bl_uv = clamp(bl_uv, 0.0f, float(params.bl_max));
-    {
-        ushort e = el_uv_tex.read(uint2(gid.x >> 1, gid.y >> 2)).r;
-        out_uv_tex.write(ushort4(ushort(ushort(bl_uv.x) + ushort(bl_y) + e), ushort(bl_uv.y), 0, 0), gid);
-        return;
-    }
 """),
     ]
 
@@ -324,7 +306,7 @@ struct DoviGpuBenchmark {
         ("    if (curve.method[piece] == DOVI_MAPPING_MMR) {", "    if (false) {"),
     ]
     static let chromaNoResidual: [(String, String)] = [
-        ("        if (cb_active || cr_active) {", "        if (false) {"),
+        ("    if (residual && dovi_residual_at(params, gid.x * 2u)) {", "    if (false) {"),
     ]
     static let chromaNoQuantize: [(String, String)] = [
         ("""
@@ -357,11 +339,9 @@ struct DoviGpuBenchmark {
         for pass in 0..<2 {
             Self.quiet = pass == 0
             for (label, source, extra) in variants { try Self.report(label, source: source, rig: rig, extra: extra) }
-            for shape in [(32, 4), (32, 16), (64, 4), (16, 16), (128, 2)] where ProcessInfo.processInfo.environment["DOVI_BENCH_ALL"] == "1" {
+            // Widths that are multiples of 32, so each SIMD-group is one row's 32 consecutive columns (the EL shuffles).
+            for shape in [(32, 4), (32, 16), (64, 4), (128, 2)] where ProcessInfo.processInfo.environment["DOVI_BENCH_ALL"] == "1" {
                 try Self.report("tg \(shape.0)x\(shape.1)     ", source: base, rig: rig, tgShape: shape)
-            }
-            for n in [2, 4] where ProcessInfo.processInfo.environment["DOVI_BENCH_ALL"] == "1" {
-                try Self.report("\(n) px/thread  ", source: try Self.multiPixel(base, n: n), rig: rig, pixelsPerThread: n)
             }
         }
     }

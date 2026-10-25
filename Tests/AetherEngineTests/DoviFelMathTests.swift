@@ -57,9 +57,9 @@ struct DoviFelMathTests {
 
     // MARK: - D1 & S2: inverse NLQ
 
-    /// ETSI GS CCM 001 5.4.3.2: rr = e - offset; dq = (2 rr - sign) * S; r = dq >> (denom - 5 - EL_bit_depth). For
+    /// The inverse NLQ: rr = e - offset; dq = (2 rr - sign) * S; r = dq >> (denom - 5 - EL_bit_depth). For
     /// S = 2048 at denom 23 that is r = 16 rr - 8 sign, exact at 16 bits: the reconstruction sits half a step in from
-    /// rr. 5.4.3.3 then rounds v + r once, (h + 8) >> 4, so on a BL 512 (v = 512 << 6) the 12-bit sample is
+    /// rr. The reconstruction then rounds v + r once, (h + 8) >> 4, so on a BL 512 (v = 512 << 6) the 12-bit sample is
     /// 2048 + rr - sign / 2 rounded half up, the same way on both sides of the offset.
     @Test("inverse NLQ through the composer: el = 1023 gives +511 (510.5 rounded), el = 0 gives -511, centre gives 0",
           arguments: [
