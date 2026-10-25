@@ -262,10 +262,6 @@ enum DiscReader {
         }
     }
 
-    /// Files of a disc folder read at once, each through its own reader: as many lanes as the indexed
-    /// subtitle pull reads with (`SubtitleSource.readLanes`), for the same latency-bound requests.
-    static let smallFileLanes = 12
-
     /// Reads an image's small files (`.mpls`, `.clpi`) through its one reader, in the order their bytes
     /// sit on it (`offsets`, one per file) rather than the order asked, so the reader's read-ahead serves
     /// neighbours from one fetch: over HTTP a few hundred files cost a few range requests rather than one
@@ -294,41 +290,15 @@ enum DiscReader {
     }
 
     /// Reads a disc folder's small files, each through its own reader (`DiscDirectoryReader.openDiscFile`),
-    /// `smallFileLanes` at once, each lane a thread of its own: the reads wait on the network, not the
-    /// CPU, and `DispatchQueue.concurrentPerform`, which sizes its width to the CPUs it finds idle, ran
-    /// them one at a time on a loaded machine. The lanes run at user-initiated priority, as the first
-    /// frame waits on them. `read(i)` gives file i's bytes and is called from those threads, several at
-    /// once; it opens the file through `scope` (`DiscRecognitionScope.withFile`), so a stop cancels the
-    /// files being read and the lanes take no more. The results come back in the order asked, empty for a
-    /// file left unread, once every lane has finished.
+    /// `BlockingWork.readLanes` at once (`BlockingWork.lanes`) at user-initiated priority, as the first
+    /// frame waits on them. `read(i)` gives file i's bytes and is called from those lanes, several at once;
+    /// it opens the file through `scope` (`DiscRecognitionScope.withFile`), so a stop cancels the files
+    /// being read and the lanes take no more. The results come back in the order asked, empty for a file
+    /// left unread.
     static func readFolderFiles(count: Int, scope: DiscRecognitionScope,
                                 read: @escaping @Sendable (Int) -> [UInt8]) -> [[UInt8]] {
-        guard count > 0 else { return [] }
-        final class Results: @unchecked Sendable {
-            private let lock = NSLock()
-            private var files: [[UInt8]]
-            init(_ count: Int) { files = Array(repeating: [], count: count) }
-            func set(_ i: Int, _ bytes: [UInt8]) { lock.lock(); files[i] = bytes; lock.unlock() }
-            var all: [[UInt8]] { lock.lock(); defer { lock.unlock() }; return files }
-        }
-        let results = Results(count)
-        let lanes = min(smallFileLanes, count)
-        let done = DispatchGroup()
-        for lane in 0..<lanes {
-            done.enter()
-            let thread = Thread {
-                defer { done.leave() }
-                for i in stride(from: lane, to: count, by: lanes) {
-                    guard !scope.isStopped else { break }
-                    results.set(i, read(i))
-                }
-            }
-            thread.name = "disc.smallfiles.\(lane)"
-            thread.qualityOfService = .userInitiated
-            thread.start()
-        }
-        done.wait()
-        return results.all
+        BlockingWork.lanes(count: count, qos: .userInitiated, isStopped: { scope.isStopped }) { _, i in read(i) }
+            .map { $0 ?? [] }
     }
 
     /// Read all bytes of an extent list into memory (small files only: mpls).

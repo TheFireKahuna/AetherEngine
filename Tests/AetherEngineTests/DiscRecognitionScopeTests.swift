@@ -103,14 +103,14 @@ struct DiscRecognitionScopeTests {
         }.start()
         // Every lane parks on a file; then stop.
         let deadline = Date().addingTimeInterval(5)
-        while folder.openedFiles.count < DiscReader.smallFileLanes, Date() < deadline { usleep(1_000) }
-        #expect(folder.openedFiles.count == DiscReader.smallFileLanes)
+        while folder.openedFiles.count < BlockingWork.readLanes, Date() < deadline { usleep(1_000) }
+        #expect(folder.openedFiles.count == BlockingWork.readLanes)
         scope.stop()
         #expect(finished.wait(timeout: .now() + 5) == .success)
         #expect(outcome.info == nil)
         #expect((outcome.error as? DiscError) == .recognitionStopped)
         let opened = folder.openedFiles
-        #expect(opened.count == DiscReader.smallFileLanes)
+        #expect(opened.count == BlockingWork.readLanes)
         #expect(opened.allSatisfy { $0.wasCancelled && $0.wasClosed })
     }
 
@@ -126,7 +126,7 @@ struct DiscRecognitionScopeTests {
             finished.signal()
         }.start()
         let deadline = Date().addingTimeInterval(5)
-        while folder.openedFiles.count < DiscReader.smallFileLanes, Date() < deadline { usleep(1_000) }
+        while folder.openedFiles.count < BlockingWork.readLanes, Date() < deadline { usleep(1_000) }
         demuxer.markClosed()
         #expect(finished.wait(timeout: .now() + 5) == .success)
         let openFailed = outcome.error != nil
