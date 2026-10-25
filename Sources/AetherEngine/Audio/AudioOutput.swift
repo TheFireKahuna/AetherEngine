@@ -392,7 +392,7 @@ final class AudioOutput: @unchecked Sendable {
         let from = CMSampleBufferGetPresentationTimeStamp(queued[first])
         let line: String
         let inForce: Bool
-        switch io.flush(fromSourceTime: from) {
+        switch partialFlush(from) {
         case .flushed:
             let shifted = Self.shiftedTail(Array(queued[first...]), by: change, notBefore: from)
             queued.removeSubrange(first...)
@@ -586,7 +586,19 @@ final class AudioOutput: @unchecked Sendable {
     #if DEBUG
     /// Test-only: every enqueue reports as if the renderer had failed, the one state a test cannot put it in.
     var simulatesRendererFailureForTesting = false
+    /// Test-only: answers the partial flush of an offset change in place of the renderer within
+    /// `AudioRendererIO.partialFlushTimeout`, whose answer on a loaded machine comes after it and turns `.flushed` into
+    /// `.unanswered`. Called with `lock` held.
+    var partialFlushForTesting: ((AudioRendererIO, CMTime) -> AudioRendererIO.PartialFlush)?
     #endif
+
+    /// The renderer's answer to a partial flush from `time` on. Called with `lock` held.
+    private func partialFlush(_ time: CMTime) -> AudioRendererIO.PartialFlush {
+        #if DEBUG
+        if let partialFlushForTesting { return partialFlushForTesting(io, time) }
+        #endif
+        return io.flush(fromSourceTime: time)
+    }
 
     /// Reports `failed` once, if it is still the renderer playing: a replaced renderer's late report is not a failure
     /// of the one that took over.

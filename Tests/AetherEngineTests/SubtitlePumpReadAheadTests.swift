@@ -91,14 +91,14 @@ struct SubtitlePumpReadAheadTests {
         defer { producer.stop(); _ = producer.waitForFinish(timeout: 2) }
 
         // Parked at its forward window: the segment past it is not cut.
-        try await settle { cache.highestStoredIndex }
+        try await waitFor { producer.isAdvanceParked }
         let parkedAt = cache.highestStoredIndex
         #expect(parkedAt <= 1)
 
-        // Asked to segment 4, it reads on to it and parks again.
+        // Asked to segment 4, it reads on to it and parks again. Until it notices the reach it is still
+        // parked below it, so what is waited for is parked with segment 3 stored; parked, it cuts no more.
         reach.value = 4
-        try await settle { cache.highestStoredIndex }
-        #expect(cache.highestStoredIndex >= 3)
+        try await waitFor { producer.isAdvanceParked && cache.highestStoredIndex >= 3 }
         #expect(cache.highestStoredIndex < 5)
         let read = reads.value
         #expect(!read.isEmpty)
@@ -224,18 +224,6 @@ struct SubtitlePumpReadAheadTests {
     // MARK: - Helpers
 
     /// Waits until `value` stops changing for half a second.
-    private func settle(_ value: () -> Int) async throws {
-        var last = value()
-        var stableSince = Date()
-        let deadline = Date().addingTimeInterval(20)
-        while Date() < deadline {
-            try await Task.sleep(nanoseconds: 100_000_000)
-            let now = value()
-            if now != last { last = now; stableSince = Date() }
-            if Date().timeIntervalSince(stableSince) > 0.5 { return }
-        }
-    }
-
     private func waitFor(_ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(20)
         while !condition(), Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }

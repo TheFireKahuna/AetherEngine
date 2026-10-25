@@ -518,7 +518,7 @@ final class DisplaySignalRuntime {
                     ("error", error),
                     ("requests", result.requests.joined(separator: ",")),
                     ("ms", String(result.elapsedMs)),
-                    ("timedOut", DisplaySignals.yn(result.timedOut)),
+                    ("ended", result.ended.rawValue),
                 ]
                 emit(DisplaySignals.line("oracle", fields))
                 if ladder.asks == nil {

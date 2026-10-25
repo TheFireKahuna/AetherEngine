@@ -13,6 +13,18 @@ import os
 @MainActor
 final class VariantOracle {
 
+    /// Why a run stopped watching.
+    enum Ending: String, Sendable {
+        /// A variant was picked and the grace after it ran out.
+        case picked
+        /// The item failed.
+        case failed
+        /// Nothing settled within the timeout.
+        case timedOut
+        /// The task running it was cancelled (a session starting).
+        case cancelled
+    }
+
     struct Result: Sendable {
         let ladder: DisplaySignals.Ladder
         let attachment: String
@@ -23,7 +35,7 @@ final class VariantOracle {
         let errorDomain: String?
         let errorCode: Int?
         let elapsedMs: Int
-        let timedOut: Bool
+        let ended: Ending
 
         var failed: Bool { status == "failed" }
         var verdict: DisplaySignals.Verdict {
@@ -60,14 +72,14 @@ final class VariantOracle {
         player.replaceCurrentItem(with: item)
 
         var pickedAt: ContinuousClock.Instant?
-        var timedOut = false
+        let ended: Ending
         while true {
             // A cancelled sleep returns at once, so without this a cancelled run would spin until `timeout`.
-            if Task.isCancelled { break }
+            if Task.isCancelled { ended = .cancelled; break }
             if pickedAt == nil, loader.firstPick != nil { pickedAt = clock.now }
-            if let pickedAt, clock.now - pickedAt >= grace { break }
-            if item.status == .failed { break }
-            if clock.now - started >= timeout { timedOut = true; break }
+            if let pickedAt, clock.now - pickedAt >= grace { ended = .picked; break }
+            if item.status == .failed { ended = .failed; break }
+            if clock.now - started >= timeout { ended = .timedOut; break }
             try? await Task.sleep(for: .milliseconds(20))
         }
 
@@ -88,7 +100,7 @@ final class VariantOracle {
                       errorDomain: error?.domain, errorCode: error?.code,
                       elapsedMs: Int(elapsed.components.seconds * 1000
                                      + elapsed.components.attoseconds / 1_000_000_000_000_000),
-                      timedOut: timedOut)
+                      ended: ended)
     }
 
     /// Serves the ladder's playlists and refuses everything else, recording each request.

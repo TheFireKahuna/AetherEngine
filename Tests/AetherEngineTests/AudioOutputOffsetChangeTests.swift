@@ -92,10 +92,19 @@ struct AudioOutputOffsetChangeTests {
 
     // MARK: - On a renderer
 
+    /// The renderer's own answer to the partial flush, however long it takes. Production waits
+    /// `AudioRendererIO.partialFlushTimeout` and a loaded machine answers after it, which is the `.unanswered`
+    /// branch, tested on its own below; what is tested here is that the renderer takes a flush a quarter of a
+    /// second out, and what the output does with that.
+    private static func rendererAnswers(_ io: AudioRendererIO, _ time: CMTime) -> AudioRendererIO.PartialFlush {
+        io.flush(fromSourceTime: time, timeout: .seconds(60))
+    }
+
     @Test("a change flushes from a quarter-second past the clock and enqueues that tail again, shifted",
           arguments: audioOutputPaths)
     func appliesAtOnce(throughReceivers: Bool) throws {
         let output = AudioOutput(throughReceivers: throughReceivers)
+        output.partialFlushForTesting = Self.rendererAnswers
         for i in Int64(0)..<60 { output.enqueue(sampleBuffer: try buffer(index: i)) }
         let seen = Seen()
         output.rendererEnqueueObserverForTesting = { seen.add($0) }
@@ -112,6 +121,7 @@ struct AudioOutputOffsetChangeTests {
     @Test("what an offset change put back is what a later reconfiguration puts back", arguments: audioOutputPaths)
     func theQueueRecordFollows(throughReceivers: Bool) throws {
         let output = AudioOutput(throughReceivers: throughReceivers)
+        output.partialFlushForTesting = Self.rendererAnswers
         for i in Int64(0)..<30 { output.enqueue(sampleBuffer: try buffer(index: i)) }
         output.setPresentationOffset(seconds: 0.1)
         let seen = Seen()
@@ -120,6 +130,33 @@ struct AudioOutputOffsetChangeTests {
         let first = Int64((0.25 * 48_000 / Double(Self.frames)).rounded(.up))
         let expected = (0..<first).map { Self.ms(index: $0) } + (first..<30).map { Self.ms(index: $0) + 100 }
         #expect(seen.all.map(Self.ms) == expected)
+    }
+
+    @Test("an unanswered partial flush flushes whole and enqueues everything from the clock again, shifted",
+          arguments: audioOutputPaths)
+    func unansweredFlushesWhole(throughReceivers: Bool) throws {
+        let output = AudioOutput(throughReceivers: throughReceivers)
+        output.partialFlushForTesting = { _, _ in .unanswered }
+        for i in Int64(0)..<60 { output.enqueue(sampleBuffer: try buffer(index: i)) }
+        let seen = Seen()
+        output.rendererEnqueueObserverForTesting = { seen.add($0) }
+        // The flush may yet land, so nothing queued is trusted: from the clock (zero) on, all of it, 100 ms later.
+        #expect(output.setPresentationOffset(seconds: 0.1))
+        #expect(seen.all.map(Self.ms) == (0..<60).map { Self.ms(index: $0) + 100 })
+    }
+
+    @Test("a refused partial flush leaves the queue alone and the change waits for the next buffer",
+          arguments: audioOutputPaths)
+    func refusedWaits(throughReceivers: Bool) throws {
+        let output = AudioOutput(throughReceivers: throughReceivers)
+        output.partialFlushForTesting = { _, _ in .refused }
+        for i in Int64(0)..<60 { output.enqueue(sampleBuffer: try buffer(index: i)) }
+        let seen = Seen()
+        output.rendererEnqueueObserverForTesting = { seen.add($0) }
+        #expect(!output.setPresentationOffset(seconds: 0.1))
+        #expect(seen.all.isEmpty)
+        output.enqueue(sampleBuffer: try buffer(index: 60))
+        #expect(seen.all.map(Self.ms) == [Self.ms(index: 60) + 100])
     }
 
     @Test("nothing queued past the lead: the change waits for the next buffer", arguments: audioOutputPaths)

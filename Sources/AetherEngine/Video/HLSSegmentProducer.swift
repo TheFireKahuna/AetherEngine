@@ -772,6 +772,21 @@ final class HLSSegmentProducer: @unchecked Sendable {
         _liveHeadroomParked = parked
         parkStateLock.unlock()
     }
+
+    /// Whether the pump is held at its forward window right now (`awaitBackpressureRelease`): it cuts
+    /// nothing more until a consumer fetch or a subtitle reach releases it. What a test waits for, rather
+    /// than inferring the hold from a segment index that stopped moving for a while.
+    private var _advanceParked = false
+    var isAdvanceParked: Bool {
+        parkStateLock.lock()
+        defer { parkStateLock.unlock() }
+        return _advanceParked
+    }
+    private func setAdvanceParked(_ parked: Bool) {
+        parkStateLock.lock()
+        _advanceParked = parked
+        parkStateLock.unlock()
+    }
     private let noCutWatchdogQueue = DispatchQueue(label: "aether.nocut.watchdog", qos: .userInitiated)
     /// Tick of the lifted watchdog: fine against both windows (10 s wedge, 35 s starvation) and
     /// cheap, one lock and a subtraction unless it has something to say. A private queue rather
@@ -2154,6 +2169,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private func awaitBackpressureRelease(target: Int, head: Int, context: String) -> Bool {
         // Already broken on this session (e.g. a teardown-flush ensureMuxer call): stay broken, don't re-park.
         if isBackpressureWedgeBroken() { return false }
+        setAdvanceParked(true)
+        defer { setAdvanceParked(false) }
         var parked = 0
         var nextLogAt = Self.backpressureWedgeLogThresholdSeconds
         // AE#528: the wait below returns on ANY cache broadcast (a consumer GET that moves the fetch

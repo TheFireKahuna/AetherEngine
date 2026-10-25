@@ -168,9 +168,9 @@ final class AudioRendererIO: @unchecked Sendable {
 
     /// Flushes what is queued from renderer time `time` on and keeps what comes before it playing
     /// (`flushFromSourceTime:completionHandler:`; on 27 the receiver's `flush(fromSourceTime:)`). Blocks until the
-    /// renderer answers, at most `partialFlushTimeout`. The renderer may decline, which its header allows for a
-    /// time too close to the clock or a configuration that cannot flush there.
-    func flush(fromSourceTime time: CMTime) -> PartialFlush {
+    /// renderer answers, at most `timeout`. The renderer may decline, which its header allows for a time too
+    /// close to the clock or a configuration that cannot flush there.
+    func flush(fromSourceTime time: CMTime, timeout: DispatchTimeInterval = AudioRendererIO.partialFlushTimeout) -> PartialFlush {
         let answered = DispatchSemaphore(value: 0)
         let succeeded = OSAllocatedUnfairLock(initialState: false)
         if #available(macOS 27, iOS 27, tvOS 27, visionOS 27, *),
@@ -188,7 +188,7 @@ final class AudioRendererIO: @unchecked Sendable {
                 answered.signal()
             }
         }
-        guard answered.wait(timeout: .now() + Self.partialFlushTimeout) == .success else { return .unanswered }
+        guard answered.wait(timeout: .now() + timeout) == .success else { return .unanswered }
         return succeeded.withLock { $0 } ? .flushed : .refused
     }
 
