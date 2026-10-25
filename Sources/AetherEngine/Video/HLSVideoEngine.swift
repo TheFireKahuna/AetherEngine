@@ -4415,7 +4415,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // Seek outside restartLock (network-bound). Concurrent stop() calls markClosed() so the
         // seek fails fast instead of racing teardown.
         let seekStart = DispatchTime.now()
-        seekToProducerStart(activeDem, targetPts: targetStartPts, audioPreRollSeconds: ab?.preRollSeconds ?? 0)
+        seekToProducerStart(activeDem, targetPts: targetStartPts, preRollSeconds: producerPreRollSeconds(activeDem))
         // AE#782: after the seek, so a container whose seek reads (a TS bisection) spends none of it.
         activeDem.notePlaybackRepositioned()
         // Re-arm bridge PTS rebase so the encoder timeline starts from the new demuxer cursor.
@@ -4489,17 +4489,31 @@ extension HLSVideoEngine {
         let plan = segmentPlan
         guard initialProducerBaseIndex > 0, initialProducerBaseIndex < plan.count else { return }
         seekToProducerStart(dem, targetPts: plan[initialProducerBaseIndex].startPts,
-                            audioPreRollSeconds: audioBridge?.preRollSeconds ?? 0)
+                            preRollSeconds: producerPreRollSeconds(dem))
     }
 
-    /// Where a producer starting at the plan's `targetPts` reads from. Without audio pre-roll: the
-    /// exact video-stream plan timestamp as the lower bound, since a global time seek can choose a
-    /// much earlier sync point in a multi-stream MP4 and leave the producer scanning a whole GOP over
-    /// the origin (#191). With it: the sync point at or before the pre-roll, which the bridge's runs
-    /// need read (`AudioSegmentRuns`), the producer dropping the video up to the target's keyframe.
-    func seekToProducerStart(_ dem: Demuxer, targetPts: Int64, audioPreRollSeconds: Double) {
+    /// How far before its first segment a producer reads: as far back as the stage that remembers
+    /// furthest, so every stage reaches the boundary in the state continuous playback left it in and the
+    /// producer cuts the segment continuous playback cut. The audio bridge's runs
+    /// (`AudioTranscodingBridge.preRollSeconds`); and where the container stores no decode times
+    /// (`Demuxer.storesDecodeTimes`), libavformat's rebuilding of them from the `video_delay` pictures
+    /// before each packet. Those pictures are before the boundary, and a read starts before a keyframe
+    /// only at the one before it, so that stage asks for a tick before the boundary.
+    func producerPreRollSeconds(_ dem: Demuxer) -> Double {
+        let audio = audioBridge?.preRollSeconds ?? 0
+        guard !dem.storesDecodeTimes, let stream = dem.stream(at: videoStreamIndex),
+              stream.pointee.codecpar.pointee.video_delay > 0, stream.pointee.time_base.den > 0 else { return audio }
+        return max(audio, Double(stream.pointee.time_base.num) / Double(stream.pointee.time_base.den))
+    }
+
+    /// Where a producer starting at the plan's `targetPts` reads from. Without pre-roll: the exact
+    /// video-stream plan timestamp as the lower bound, since a global time seek can choose a much
+    /// earlier sync point in a multi-stream MP4 and leave the producer scanning a whole GOP over the
+    /// origin (#191). With it (`producerPreRollSeconds`): the sync point at or before the pre-roll, the
+    /// producer dropping the video up to the target's keyframe.
+    func seekToProducerStart(_ dem: Demuxer, targetPts: Int64, preRollSeconds: Double) {
         let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
-        let preRollTicks = tb.num > 0 ? Int64((audioPreRollSeconds * Double(tb.den) / Double(tb.num)).rounded(.up)) : 0
+        let preRollTicks = tb.num > 0 ? Int64((preRollSeconds * Double(tb.den) / Double(tb.num)).rounded(.up)) : 0
         let readFrom = targetPts - preRollTicks
         // Disc plans use folded multi-clip timestamps that are not valid raw seek targets; their
         // tables seek to the sync point at or before.

@@ -175,7 +175,15 @@ offset), and everything after AVPlayer (tvOS output, HDMI, the receiver).
 1. **Blu-ray discs on their EP maps.** Done (`19f8f4bf`). DVD stays on the grid; a lone BDMV `.m2ts` is not
    built.
 2. **The in-band clock, as one cutover** that writes the `emsg`, attaches the output, maps position from
-   it, and deletes the model.
+   it, and deletes the model. Done (`b85e7ed0`).
 3. **Acceptance:** the picture-probe arms (late open, early, appended run, seek burst, drought, uniform-grid
-   TS); `AVSyncTests` with the box written; the producer determinism test (#8 step 2), segment N
-   byte-identical continuous or after seeks; on the Apple TV, a 4K Matroska title and the `.m2ts`.
+   TS); `AVSyncTests` with the box written (passing); the producer determinism test (#8 step 2), segment N
+   byte-identical continuous or after seeks (`ProducerDeterminismTests`, passing on every audio route); on
+   the Apple TV, a 4K Matroska title and the `.m2ts`.
+
+   The determinism test found three places a run's first segment differed from continuous playback's, each
+   fixed by a rule the producer already had: the muxer now cuts once every track has reached the segment
+   (`SegmentCutGate`), not when video does; a run reads from before its boundary where the container
+   stores no decode times (`producerPreRollSeconds`), so libavformat rebuilds them as it did playing
+   through; and a run's audio starts at its plan boundary, not at its keyframe's decode time. The moov
+   flush of its own that split a run's first segment into two fragments is gone.

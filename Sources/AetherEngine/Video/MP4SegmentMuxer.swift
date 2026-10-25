@@ -207,7 +207,9 @@ final class MP4SegmentMuxer {
     /// the first moov flush can never fire before FFmpeg has parsed an audio packet, mov_write_moov
     /// builds the E-AC-3 `dec3` / AC-3 `dac3` (and TrueHD `dmlp`) sample-entry box from a parsed packet,
     /// and flushing moov video-only errors -22 "Cannot write moov atom before EAC3 packets parsed" and
-    /// wedges the muxer.
+    /// wedges the muxer. Moov goes out at the first flush or cut that holds an audio packet, or at init
+    /// from a prime frame (AE#222), never in a flush of its own: that would split a run's first segment
+    /// into fragments the same segment cut mid-run does not have.
     private var audioPacketWritten: Bool = false
     /// True only when the audio codec's mp4 sample entry requires a PARSED packet before moov can be
     /// written (AC-3 `dac3`, E-AC-3 `dec3`, TrueHD `dmlp`). AAC and other codecs build their sample entry
@@ -833,23 +835,6 @@ final class MP4SegmentMuxer {
         // cross-stream DTS monotonicity and audio+video re-ordering via libavformat.
         let rc = av_interleaved_write_frame(ctx, packet)
 
-        // EAC3/AC-3/TrueHD moov-wedge guard (#92 follow-up). Under +delay_moov the first fragment flush
-        // writes moov lazily, and FFmpeg's mp4 muxer can only build the AC-3/E-AC-3/TrueHD dac3/dec3/dmlp
-        // sample-entry box once it has PARSED an audio packet. On a mid-file backward seek the producer
-        // tears down and rebuilds a FRESH muxer at the restart segment; if that muxer's first moov flush
-        // (a #64 RAM-cap flush, or the first segment cut) fires before any audio packet is written,
-        // mov_write_moov errors -22 "Cannot write moov atom before EAC3 packets parsed", the cut fails, and
-        // the segment is retried forever (AVPlayer 503 -> forever-loading). AAC never hits this (its sample
-        // entry needs no parsed packet). Fix has two parts: (1) latch that an audio packet has been written;
-        // (2) in the video-leads-audio case, the first audio packet arrives after a video packet is already
-        // in the fragment window, proactively flush so moov is emitted WITH a parsed audio packet present
-        // rather than waiting for the first cut. In the common backward-seek path the #74 pregate buffer
-        // replays captured audio BEFORE the first video look-behind packet, so fragmentWindowFirstVideoDts
-        // is still unset here and this proactive arm is skipped, moov is instead primed correctly at the
-        // first cut, which already holds the audio in the interleaver. Idempotent once moovFlushed. Audio
-        // routing/placement is untouched, so no audio dropouts. The proactive flush is scoped to
-        // AC-3/E-AC-3/TrueHD (audioNeedsParsedPacketForMoov): AAC (and every other codec) never wedges and
-        // must keep the exact stock code path, no extra early fragment flush, so nothing perturbs its audio.
         if streamIndex == videoOutputStreamIndex, rc >= 0, clean.pts != Int64.min,
            segmentPictureFirstPts == Int64.min || clean.pts < segmentPictureFirstPts {
             segmentPictureFirstPts = clean.pts
@@ -859,9 +844,6 @@ final class MP4SegmentMuxer {
             if rc >= 0, clean.pts != Int64.min {
                 if segmentSoundFirstPts == Int64.min { segmentSoundFirstPts = clean.pts }
                 segmentSoundLastPts = clean.pts
-            }
-            if audioNeedsParsedPacketForMoov, !moovFlushed, fragmentWindowFirstVideoDts != Int64.min {
-                flushPendingFragment()
             }
         }
 

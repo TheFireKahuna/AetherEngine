@@ -2024,6 +2024,14 @@ public final class Demuxer: @unchecked Sendable {
         return mapsIndexed ? .presentation : PlanBoundaryAxis.forContainer(formatName: containerFormatName)
     }
 
+    /// Whether the container stores its video's decode times. Matroska stores one presentation time per
+    /// block (the fact that puts its Cues on the presentation axis), and libavformat rebuilds each decode
+    /// time from the `video_delay` presentation times read before it, so what a packet's decode time is
+    /// depends on what was read before it.
+    var storesDecodeTimes: Bool {
+        PlanBoundaryAxis.forContainer(formatName: containerFormatName) == .decode
+    }
+
     /// Whether a seek to a time lands without the container's index: a transport or program stream
     /// searches its timestamps (bounded by the keyframes read, `recordKeyframeLocked`), a disc title looks
     /// its EP maps or time map up. Any other container without an index would read up to the target, and a
