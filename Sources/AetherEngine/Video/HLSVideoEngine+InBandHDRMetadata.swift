@@ -2,6 +2,7 @@ import Foundation
 import AetherLibavcodec
 import AetherLibavformat
 import AetherLibavutil
+import Dovi
 
 /// HDR10 static metadata a source states only in its bitstream, lifted into the stream side data movenc
 /// writes the init's `mdcv` / `clli` from.
@@ -31,7 +32,17 @@ import AetherLibavutil
 /// and were served as SDR. The SEI's word is taken on the MP4 path as on the TS path, so one stream is
 /// one delivery whatever it arrives in.
 ///
-/// A container statement wins: only a type the codecpar lacks is added.
+/// A container statement wins for what it states: a type the codecpar lacks is added, and a mastering display
+/// entry the container left incomplete (a Matroska `MasteringMetadata` with no luminance, which movenc will not
+/// write as `mdcv`) has its missing half filled from the SEI. ATSC A/341 6.3.2.2 requires the ST 2086 message
+/// beside Dolby Vision / ST 2094-10 metadata, and dropping it leaves the panel the mastering black it guessed.
+///
+/// The SEI is also looked for in the config record: x265 and other encoders can put prefix SEI arrays in the hvcC,
+/// which `canonicalizeHEVCConfigRecord` strips before the init is written (AE#187), so they are read first.
+///
+/// For a Dolby Vision `dvh1` sample entry the same scan reads the first RPU's `bl_video_full_range_flag`: the range a
+/// Profile 5 base layer is coded in is stated there (libdovi requires it set for Profile 5), and the SPS of such a
+/// stream often has no VUI to say it (#19).
 struct InBandHDRStaticMetadata: Equatable {
     /// mastering_display_colour_volume payload (24 bytes: G, B, R, white point, max / min luminance).
     var masteringDisplay: [UInt8]?
@@ -41,6 +52,8 @@ struct InBandHDRStaticMetadata: Equatable {
     var ambientViewing: [UInt8]?
     /// alternative_transfer_characteristics: preferred_transfer_characteristics.
     var alternativeTransfer: UInt8?
+    /// The first parseable RPU's `bl_video_full_range_flag`, when the scan was asked to read it.
+    var dolbyVisionBaseLayerFullRange: Bool?
 
     var isEmpty: Bool { masteringDisplay == nil && contentLightLevel == nil && ambientViewing == nil }
 
@@ -67,6 +80,50 @@ struct InBandHDRStaticMetadata: Equatable {
         primaries: AVColorPrimaries, transfer: AVColorTransferCharacteristic
     ) -> Bool {
         primaries == AVCOL_PRI_BT2020 && transfer != AVCOL_TRC_SMPTE2084 && transfer != AVCOL_TRC_ARIB_STD_B67
+    }
+
+    /// Whether the codecpar's mastering display entry states both halves movenc needs for `mdcv`.
+    static func masteringIsComplete(_ codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
+        guard let sd = av_packet_side_data_get(codecpar.pointee.coded_side_data, codecpar.pointee.nb_coded_side_data,
+                                               AV_PKT_DATA_MASTERING_DISPLAY_METADATA) else { return false }
+        return sd.pointee.data.withMemoryRebound(to: AVMasteringDisplayMetadata.self, capacity: 1) {
+            $0.pointee.has_primaries != 0 && $0.pointee.has_luminance != 0
+        }
+    }
+
+    /// Read the messages carried in an HEVC config record: the SEI NAL arrays of an hvcC, or the NAL units of Annex B
+    /// extradata. H.264's avcC has no place for SEI.
+    mutating func collect(fromConfigRecord record: [UInt8], codecID: AVCodecID) {
+        guard codecID == AV_CODEC_ID_HEVC, !record.isEmpty else { return }
+        if VideoConfigRecord.isAnnexB(record) {
+            record.withUnsafeBufferPointer { collect(from: $0.baseAddress!, size: $0.count, codecID: codecID, framing: .annexB) }
+            return
+        }
+        guard record.first == 1 else { return }
+        let sei = record.withUnsafeBufferPointer { parseHVCCParameterSets($0.baseAddress!, $0.count) }
+            .filter { $0.count > 2 && [39, 40].contains(($0[0] >> 1) & 0x3F) }
+        guard !sei.isEmpty else { return }
+        let framed = sei.flatMap { n in
+            [UInt8(n.count >> 24 & 0xFF), UInt8(n.count >> 16 & 0xFF), UInt8(n.count >> 8 & 0xFF), UInt8(n.count & 0xFF)] + n
+        }
+        framed.withUnsafeBufferPointer {
+            collect(from: $0.baseAddress!, size: $0.count, codecID: codecID, framing: .lengthPrefixed(size: 4))
+        }
+    }
+
+    /// Read `bl_video_full_range_flag` from the first RPU (unspec62 NAL) in one HEVC access unit that libdovi parses.
+    mutating func collectDolbyVisionRange(from data: UnsafePointer<UInt8>, size: Int, framing: VideoNALFraming) {
+        guard dolbyVisionBaseLayerFullRange == nil, size > 0 else { return }
+        var found: Bool?
+        A53SEIParser.forEachNAL(data, size, framing) { nal, length in
+            guard found == nil, length > 2, (nal[0] >> 1) & 0x3F == 62,
+                  let rpu = DoviRpuGuard.parse(nal, length) else { return }
+            defer { dovi_rpu_free(rpu) }
+            guard let header = dovi_rpu_get_header(rpu) else { return }
+            defer { dovi_rpu_free_header(header) }
+            found = header.pointee.bl_video_full_range_flag
+        }
+        dolbyVisionBaseLayerFullRange = found
     }
 
     /// Read the messages out of one H.264 / HEVC access unit, keeping the first of each.
@@ -105,26 +162,43 @@ struct InBandHDRStaticMetadata: Equatable {
                   | UInt32(b[i + 2]) << 8 | UInt32(b[i + 3]))
         }
         var added: [String] = []
-        if let md = masteringDisplay, !has(AV_PKT_DATA_MASTERING_DISPLAY_METADATA),
-           let sd = av_packet_side_data_new(
-               &codecpar.pointee.coded_side_data, &codecpar.pointee.nb_coded_side_data,
-               AV_PKT_DATA_MASTERING_DISPLAY_METADATA, MemoryLayout<AVMasteringDisplayMetadata>.size, 0) {
-            memset(sd.pointee.data, 0, MemoryLayout<AVMasteringDisplayMetadata>.size)
-            sd.pointee.data.withMemoryRebound(to: AVMasteringDisplayMetadata.self, capacity: 1) { m in
-                // The SEI orders the primaries G, B, R; AVMasteringDisplayMetadata R, G, B
-                // (libavcodec's `mapping[3] = { 2, 0, 1 }`).
+        // The SEI orders the primaries G, B, R; AVMasteringDisplayMetadata R, G, B (libavcodec's
+        // `mapping[3] = { 2, 0, 1 }`).
+        func fill(_ m: UnsafeMutablePointer<AVMasteringDisplayMetadata>, from md: [UInt8], primaries: Bool, luminance: Bool) {
+            if primaries {
                 let rgb = [2, 0, 1].map { c in
                     (AVRational(num: u16(md, c * 4), den: 50000), AVRational(num: u16(md, c * 4 + 2), den: 50000))
                 }
                 m.pointee.display_primaries = ((rgb[0].0, rgb[0].1), (rgb[1].0, rgb[1].1), (rgb[2].0, rgb[2].1))
                 m.pointee.white_point = (AVRational(num: u16(md, 12), den: 50000),
                                          AVRational(num: u16(md, 14), den: 50000))
+                m.pointee.has_primaries = 1
+            }
+            if luminance {
                 m.pointee.max_luminance = AVRational(num: u32(md, 16), den: 10000)
                 m.pointee.min_luminance = AVRational(num: u32(md, 20), den: 10000)
-                m.pointee.has_primaries = 1
                 m.pointee.has_luminance = 1
             }
-            added.append("mdcv")
+        }
+        if let md = masteringDisplay {
+            if let existing = av_packet_side_data_get(codecpar.pointee.coded_side_data, codecpar.pointee.nb_coded_side_data,
+                                                      AV_PKT_DATA_MASTERING_DISPLAY_METADATA) {
+                existing.pointee.data.withMemoryRebound(to: AVMasteringDisplayMetadata.self, capacity: 1) { m in
+                    let missingPrimaries = m.pointee.has_primaries == 0, missingLuminance = m.pointee.has_luminance == 0
+                    guard missingPrimaries || missingLuminance else { return }
+                    fill(m, from: md, primaries: missingPrimaries, luminance: missingLuminance)
+                    added.append(missingPrimaries && missingLuminance ? "mdcv"
+                                 : "mdcv (\(missingLuminance ? "luminance" : "primaries") from the SEI)")
+                }
+            } else if let sd = av_packet_side_data_new(
+                &codecpar.pointee.coded_side_data, &codecpar.pointee.nb_coded_side_data,
+                AV_PKT_DATA_MASTERING_DISPLAY_METADATA, MemoryLayout<AVMasteringDisplayMetadata>.size, 0) {
+                memset(sd.pointee.data, 0, MemoryLayout<AVMasteringDisplayMetadata>.size)
+                sd.pointee.data.withMemoryRebound(to: AVMasteringDisplayMetadata.self, capacity: 1) {
+                    fill($0, from: md, primaries: true, luminance: true)
+                }
+                added.append("mdcv")
+            }
         }
         if let cll = contentLightLevel, !has(AV_PKT_DATA_CONTENT_LIGHT_LEVEL),
            let sd = av_packet_side_data_new(
@@ -154,30 +228,44 @@ struct InBandHDRStaticMetadata: Equatable {
 
 extension HLSVideoEngine {
 
-    /// Look for the in-band HDR10 static metadata in the first video access units of a source whose
-    /// codecpar states none (`InBandHDRStaticMetadata`). The messages ride the first IRAP, so a short
-    /// budget covers every encoder measured. A VOD source is scanned like the parameter-set scan
-    /// (rewound, consumed, `start()` seeks back to 0); a live one is only peeked, so its packets stay
-    /// queued for the producer.
+    /// Look for the in-band HDR10 static metadata a source's codecpar does not state completely
+    /// (`InBandHDRStaticMetadata`): first in the config record, then in the first video access units. The
+    /// messages ride the first IRAP, so a short budget covers every encoder measured. With
+    /// `readsDolbyVisionRange` the same access units also yield the first RPU's base-layer range. A VOD source
+    /// is scanned like the parameter-set scan (rewound, consumed, `start()` seeks back to 0); a live one is only
+    /// peeked, so its packets stay queued for the producer. No head read when the record answered everything.
     func scanInBandHDRStaticMetadata(
         demuxer: Demuxer,
         videoStreamIndex: Int32,
         codecpar: UnsafePointer<AVCodecParameters>,
         framing measuredFraming: VideoNALFraming?,
-        isLive: Bool
+        isLive: Bool,
+        readsDolbyVisionRange: Bool = false
     ) -> InBandHDRStaticMetadata {
         var metadata = InBandHDRStaticMetadata()
         let par = codecpar.pointee
         guard par.codec_id == AV_CODEC_ID_HEVC || par.codec_id == AV_CODEC_ID_H264 else { return metadata }
-        let hasMastering = av_packet_side_data_get(
-            par.coded_side_data, par.nb_coded_side_data, AV_PKT_DATA_MASTERING_DISPLAY_METADATA) != nil
+        let hasMastering = InBandHDRStaticMetadata.masteringIsComplete(codecpar)
         let hasLightLevel = av_packet_side_data_get(
             par.coded_side_data, par.nb_coded_side_data, AV_PKT_DATA_CONTENT_LIGHT_LEVEL) != nil
         let wantsTransfer = InBandHDRStaticMetadata.wantsAlternativeTransfer(
             primaries: par.color_primaries, transfer: par.color_trc)
         let wantsStatic = InBandHDRStaticMetadata.wantsStaticMetadata(
             transfer: par.color_trc, hasMastering: hasMastering, hasLightLevel: hasLightLevel)
-        guard wantsStatic || wantsTransfer else { return metadata }
+        let readsRange = readsDolbyVisionRange && par.codec_id == AV_CODEC_ID_HEVC
+        guard wantsStatic || wantsTransfer || readsRange else { return metadata }
+        if let extradata = par.extradata, par.extradata_size > 0 {
+            metadata.collect(fromConfigRecord: Array(UnsafeBufferPointer(start: extradata, count: Int(par.extradata_size))),
+                             codecID: par.codec_id)
+        }
+        func done() -> Bool {
+            (metadata.masteringDisplay != nil || hasMastering || !wantsStatic)
+                && (metadata.contentLightLevel != nil || hasLightLevel || !wantsStatic)
+                && (metadata.alternativeTransfer != nil || !wantsTransfer)
+                && (metadata.dolbyVisionBaseLayerFullRange != nil || !readsRange)
+        }
+        // The record said all of it: no head read.
+        if done() { return metadata }
         let framing = measuredFraming ?? NALUnitChain.lengthPrefixSize(
             codecID: par.codec_id, extradata: par.extradata, extradataSize: Int(par.extradata_size)
         ).map { .lengthPrefixed(size: $0) } ?? .annexB
@@ -191,11 +279,9 @@ extension HLSVideoEngine {
             videoPackets += 1
             if let data = pkt.pointee.data {
                 metadata.collect(from: data, size: Int(pkt.pointee.size), codecID: par.codec_id, framing: framing)
+                if readsRange { metadata.collectDolbyVisionRange(from: data, size: Int(pkt.pointee.size), framing: framing) }
             }
-            return (metadata.masteringDisplay != nil || hasMastering || !wantsStatic)
-                && (metadata.contentLightLevel != nil || hasLightLevel || !wantsStatic)
-                && (metadata.alternativeTransfer != nil || !wantsTransfer)
-                || videoPackets >= packetBudget
+            return done() || videoPackets >= packetBudget
         }
         if isLive {
             try? demuxer.peekPackets(maxPackets: 512, inspect)
