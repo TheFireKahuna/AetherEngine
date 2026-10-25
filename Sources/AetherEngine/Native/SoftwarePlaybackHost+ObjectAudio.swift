@@ -58,8 +58,8 @@ extension SoftwarePlaybackHost {
         do {
             let objects = APACObjectOutputSwitch.isOn
             let decoder = objects
-                ? try TrueHDObjectAudioDecoder(splitsBed: false, objectOutput: true, dialogueGain: dialogueGain)
-                : try TrueHDObjectAudioDecoder(splitsBed: !TrueHDReferenceRender.isOn, dialogueGain: dialogueGain)
+                ? try TrueHDObjectAudioDecoder(objectOutput: true, dialogueGain: dialogueGain)
+                : try TrueHDObjectAudioDecoder(dialogueGain: dialogueGain)
             let bridge = try SpatialAudioBridge(
                 srcTimeBase: stream.pointee.time_base, layout: layout, decoder: decoder, objectOutput: objects)
             // This route feeds the stream's own timestamps, so its first frame sits at its start.
@@ -67,9 +67,7 @@ extension SoftwarePlaybackHost {
             let apac = try APACSampleBufferDecoder(bridge: bridge)
             let rendering = objects
                 ? "elements sent as APAC objects (\(APACObjectOutputSwitch.variable), personal build)"
-                : TrueHDReferenceRender.isOn
-                    ? "objects rendered into \(layout.rawValue) (reference render, \(TrueHDReferenceRender.variable))"
-                    : "channel presentation split into \(layout.rawValue) by the objects' energy"
+                : "decoded exactly, objects rendered into \(layout.rawValue)"
             EngineLog.emit(
                 "[SWHost] TrueHD Atmos: \(rendering), played as APAC through the sample buffer renderer (lossy)",
                 category: .swPlayback)

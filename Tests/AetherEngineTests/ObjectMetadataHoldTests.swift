@@ -28,7 +28,7 @@ struct ObjectMetadataHoldTests {
             return ObjectAudioDecodedBlock(
                 sampleRate: 48_000, frameCount: frames, inputFrameOffset: Int64(number * frames),
                 configurationGeneration: generation, roles: roles, planes: planes, updates: updates,
-                bed: nil, sourcePts: nil, sourcePtsInputFrame: 0, clockFrame: nil, gridFrames: 40)
+                sourcePts: nil, sourcePtsInputFrame: 0, clockFrame: nil, gridFrames: 40)
         }
 
         static let state = ObjectAudioElementState(position: SIMD3(0, 0, 1))

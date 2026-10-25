@@ -172,7 +172,6 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
             roles: Self.roles,
             planes: planes,
             updates: updates,
-            bed: nil,
             sourcePts: block.stamp?.pts,
             sourcePtsInputFrame: block.stamp?.inputFrame ?? 0,
             clockFrame: nil,

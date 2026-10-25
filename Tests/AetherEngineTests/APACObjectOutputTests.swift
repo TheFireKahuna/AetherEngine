@@ -454,8 +454,7 @@ struct APACObjectOutputTests {
 
     // MARK: - Full-scene quality
 
-    /// Measurement, not a check: AE_APAC_QUALITY=<file.thd> decodes the stream (exactly, with the
-    /// private LibTrueHD), renders it with `ObjectAudioRenderer` to 7.1.4 as the reference, and puts
+    /// Measurement, not a check: AE_APAC_QUALITY=<file.thd> decodes the stream (exactly), renders it with `ObjectAudioRenderer` to 7.1.4 as the reference, and puts
     /// the same elements and metadata through the object encoder and the system renderer. The decoded
     /// 7.1.4 is compared with the reference, and so is the reference itself through the 7.1.4 bed
     /// encoder: the codec at its best on the same scene. AE_APAC_SECONDS (30), AE_APAC_RATE (bit/s);
@@ -471,7 +470,7 @@ struct APACObjectOutputTests {
         let rate = Int(env["AE_APAC_RATE"] ?? "") ?? 17 * 320_000
         let limit = seconds * 48_000
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
-        let decoder = try TrueHDObjectAudioDecoder(splitsBed: false, objectOutput: true)
+        let decoder = try TrueHDObjectAudioDecoder(objectOutput: true)
         var roles: [ObjectAudioRole] = []
         var planes: [[Float]] = []
         var updates: [ObjectAudioMetadataUpdate] = []
@@ -670,14 +669,18 @@ struct APACObjectOutputTests {
         SIMD3(0.5, 0.5, 0.5), SIMD3(1, 1, 1),
     ]
 
-    /// Each point's speaker gains on `layout` as TS 103 448 renders it, default trims included.
+    /// Each point's speaker gains on `layout` as the renderer has them, default trims included: one
+    /// frame of unit input through the renderer.
     static func reference(_ p: SIMD3<Float>, on layout: SpatialSpeakerLayout) -> [Float] {
         let renderer = ObjectAudioRenderer(layout: layout, roles: [.object])
-        renderer.advance(frameCount: 0, updates: [.init(frameOffset: 0, rampFrames: 0, states: [
-            ObjectAudioElementState(position: p, trim: .defaults)])])
-        var snapshot = ObjectAudioGainSnapshot()
-        renderer.snapshot(into: &snapshot)
-        return snapshot.layoutGains
+        var one: Float = 1
+        let outputs = (0..<layout.channelCount).map { _ in UnsafeMutablePointer<Float>.allocate(capacity: 1) }
+        defer { outputs.forEach { $0.deallocate() } }
+        withUnsafePointer(to: &one) { input in
+            renderer.render(inputs: [input], frameCount: 1, updates: [.init(frameOffset: 0, rampFrames: 0, states: [
+                ObjectAudioElementState(position: p, trim: .defaults)])], outputs: outputs)
+        }
+        return outputs.map { $0.pointee }
     }
 
     @Test("on every output tvOS renders to, an object plays as TS 103 448 renders it there, trims included",

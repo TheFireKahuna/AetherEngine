@@ -113,21 +113,6 @@ struct ObjectAudioMetadataUpdate: Sendable {
     var states: [ObjectAudioElementState?]
 }
 
-/// Element gains and positions as `ObjectAudioRenderer.snapshot` reads them, reused across blocks.
-struct ObjectAudioGainSnapshot {
-    var layoutGains: [Float] = []
-    var positions: [SIMD3<Float>?] = []
-    var gains: [Float] = []
-
-    mutating func resize(elements: Int, channels: Int) {
-        if layoutGains.count != elements * channels { layoutGains = [Float](repeating: 0, count: elements * channels) }
-        if positions.count != elements {
-            positions = Array(repeating: nil, count: elements)
-            gains = [Float](repeating: 0, count: elements)
-        }
-    }
-}
-
 /// Renders object audio (beds + dynamic objects + metadata) into a `SpatialSpeakerLayout` bed.
 ///
 /// Gains are computed once per metadata update and interpolated linearly across each update's
@@ -160,11 +145,6 @@ final class ObjectAudioRenderer {
     private var settleRemaining: [Int]
     private var settlesOnNextUpdate: [Bool]
 
-    /// Each object's latest state, for `snapshot`, and where its position and gain were when the
-    /// ramp towards it started (nil when it jumped there).
-    private var objectStates: [ObjectAudioElementState?]
-    private var objectFrom: [(position: SIMD3<Float>, gain: Float)?]
-
     private var scratch: [Float] = []
     private var rampScratch: [Float] = []
 
@@ -181,8 +161,6 @@ final class ObjectAudioRenderer {
         settled = hasMetadata
         settleRemaining = rampRemaining
         settlesOnNextUpdate = hasMetadata
-        objectStates = Array(repeating: nil, count: roles.count)
-        objectFrom = Array(repeating: nil, count: roles.count)
         // Beds and LFE have gains the moment the renderer exists; objects wait for metadata and are
         // silent until their first update, rather than guessing at a position. The TrueHD decoder
         // holds the blocks before that update and gives the first of them its state at frame 0
@@ -202,8 +180,6 @@ final class ObjectAudioRenderer {
             settled[index] = false
             settleRemaining[index] = 0
             settlesOnNextUpdate[index] = false
-            objectStates[index] = nil
-            objectFrom[index] = nil
             if roles[index] == .object {
                 for c in current[index].indices { current[index][c] = 0 }
             } else {
@@ -221,12 +197,7 @@ final class ObjectAudioRenderer {
     func markDiscontinuity() {
         for index in roles.indices {
             if rampRemaining[index] > 0 {
-                // The object holds where its ramp had got to, as its gains do.
-                if let now = objectNow(index) {
-                    objectStates[index]?.position = now.position
-                    objectStates[index]?.gain = now.gain
-                }
-                objectFrom[index] = nil
+                // The element holds where its ramp had got to.
                 let t = Float(rampTotal[index] - rampRemaining[index]) / Float(rampTotal[index])
                 for c in current[index].indices {
                     current[index][c] += (target[index][c] - current[index][c]) * t
@@ -287,7 +258,7 @@ final class ObjectAudioRenderer {
     }
 
     /// Take `frameCount` frames of metadata and ramps forward without mixing any audio: what
-    /// `render` does to the gains, for a caller that reads them through `snapshot` instead.
+    /// `render` does to the gains.
     func advance(frameCount: Int, updates: [ObjectAudioMetadataUpdate]) {
         var cursor = 0
         var pending = updates[...]
@@ -307,40 +278,6 @@ final class ObjectAudioRenderer {
         for update in pending { apply(update) }
     }
 
-    /// Every element's gains towards the layout as they stand now (mid-ramp included), and where
-    /// it sits: `layoutGains` holds `roles.count` rows of `layout.channelCount`; `positions` is nil
-    /// for the LFE and for an object without metadata yet; `gains` is the element gain.
-    func snapshot(into snapshot: inout ObjectAudioGainSnapshot) {
-        let channels = layout.channelCount
-        snapshot.resize(elements: roles.count, channels: channels)
-        for index in roles.indices {
-            let row = index * channels
-            if rampRemaining[index] > 0 {
-                let t = Float(rampTotal[index] - rampRemaining[index]) / Float(rampTotal[index])
-                for c in 0..<channels {
-                    snapshot.layoutGains[row + c] = current[index][c] + (target[index][c] - current[index][c]) * t
-                }
-            } else {
-                for c in 0..<channels { snapshot.layoutGains[row + c] = current[index][c] }
-            }
-            switch roles[index] {
-            case .object:
-                let now = objectNow(index)
-                snapshot.positions[index] = now?.position
-                snapshot.gains[index] = now?.gain ?? 0
-            case .bed(let speaker):
-                snapshot.positions[index] = speaker.position
-                snapshot.gains[index] = 1
-            case .fixed(let position):
-                snapshot.positions[index] = position
-                snapshot.gains[index] = 1
-            case .lfe:
-                snapshot.positions[index] = nil
-                snapshot.gains[index] = 0
-            }
-        }
-    }
-
     // MARK: - Metadata
 
     private func apply(_ update: ObjectAudioMetadataUpdate) {
@@ -355,10 +292,6 @@ final class ObjectAudioRenderer {
                 settleRemaining[index] = update.rampFrames + 1
             }
             settlesOnNextUpdate[index] = false
-            if roles[index] == .object {
-                objectFrom[index] = jump ? nil : objectNow(index)
-                objectStates[index] = state
-            }
             hasMetadata[index] = true
             var gains = [Float](repeating: 0, count: layout.channelCount)
             switch roles[index] {
@@ -398,15 +331,6 @@ final class ObjectAudioRenderer {
             settleRemaining[index] -= min(settleRemaining[index], frames)
             if settleRemaining[index] == 0 { settled[index] = true }
         }
-    }
-
-    /// An object's position and gain where its ramp has got to (the latest state once it is over), in
-    /// the same proportion as its gains (`snapshot`): what the speaker gains are a pan of.
-    private func objectNow(_ index: Int) -> (position: SIMD3<Float>, gain: Float)? {
-        guard let to = objectStates[index] else { return nil }
-        guard rampRemaining[index] > 0, let from = objectFrom[index] else { return (to.position, to.gain) }
-        let t = Float(rampTotal[index] - rampRemaining[index]) / Float(rampTotal[index])
-        return (from.position + (to.position - from.position) * t, from.gain + (to.gain - from.gain) * t)
     }
 
     private func staticGains(for role: ObjectAudioRole, state: ObjectAudioElementState, into gains: inout [Float]) {

@@ -393,24 +393,6 @@ struct SpatialObjectRenderingTests {
         #expect(renderer.isSettled)
     }
 
-    @Test("a snapshot mid-ramp reports the object where its ramp has got to, position and gain as its gains")
-    func snapshotFollowsTheRamp() {
-        let layout = SpatialSpeakerLayout.l714
-        let renderer = ObjectAudioRenderer(layout: layout, roles: [.object])
-        var snapshot = ObjectAudioGainSnapshot()
-        renderer.advance(frameCount: 100, updates: [
-            .init(frameOffset: 0, rampFrames: 0, states: [ObjectAudioElementState(position: SIMD3(0, 0, 0), gain: 1)]),
-            .init(frameOffset: 0, rampFrames: 199, states: [ObjectAudioElementState(position: SIMD3(1, 0, 0), gain: 0.5)]),
-        ])
-        renderer.snapshot(into: &snapshot)
-        // 100 of the ramp's 200 steps.
-        #expect(abs(snapshot.positions[0]!.x - 0.5) < 1e-6)
-        #expect(abs(snapshot.gains[0] - 0.75) < 1e-6)
-        renderer.advance(frameCount: 100, updates: [])
-        renderer.snapshot(into: &snapshot)
-        #expect(snapshot.positions[0] == SIMD3(1, 0, 0) && snapshot.gains[0] == 0.5)
-    }
-
     @Test("a custom trim's balance fades the far end of the room (TS 103 420 5.6.5.9-12)")
     func trimBalance() {
         // Towards the back by 0.5 at ear level: the front wall at half its level, the back untouched.

@@ -21,9 +21,6 @@ struct ObjectAudioDecodedBlock {
     var planes: [UnsafePointer<Float>]
     /// Metadata taking effect inside this block, sorted by frame offset.
     var updates: [ObjectAudioMetadataUpdate]
-    /// The stream's channel-based presentation of the same frames (Dolby's own 7.1 or 5.1 rendering
-    /// of the mix), when the decoder carries one: see `BedSplitter`.
-    var bed: ObjectAudioBed?
     /// The latest source timestamp the decoder was given (`push(_:pts:)`) at or before this block's
     /// first frame since its reset, and the input frame (on `inputFrameOffset`'s axis and rate) that
     /// timestamp marks; nil before any. Most packets of a laced Matroska block carry none, and after a
@@ -39,14 +36,6 @@ struct ObjectAudioDecodedBlock {
     /// Frames per coded frame of the stream (a TrueHD access unit, a DTS frame): the step of the
     /// grid its frames sit on (`SourceGrid`).
     var gridFrames: Int
-}
-
-/// A channel bed decoded alongside an object presentation, sample-aligned with it.
-struct ObjectAudioBed {
-    /// One per plane: `.bed`, `.fixed` or `.lfe`, never `.object`.
-    var roles: [ObjectAudioRole]
-    /// `frameCount` frames each, borrowed like the block's planes.
-    var planes: [UnsafePointer<Float>]
 }
 
 /// A decoder that turns an object-audio bitstream (TrueHD with Atmos, DTS:X) into signals plus the
@@ -67,9 +56,6 @@ protocol ObjectAudioDecoding: AnyObject {
     /// How often the decoder has reset ITSELF after an internal failure. Its input offsets count from
     /// zero again afterwards, so the caller has to re-anchor its timeline.
     var selfResetCount: Int { get }
-    /// The decoder's output is meant to come from its channel bed (`ObjectAudioDecodedBlock.bed`) and
-    /// nothing else: a block without one plays as silence rather than through the renderer's mix.
-    var playsBedOnly: Bool { get }
     /// What its output at a position takes input from (`AudioStageSpan`), from where a read starts:
     /// the wait for a point the bitstream decodes from, and the history the decode is coded against.
     var span: AudioStageSpan { get }
@@ -77,7 +63,6 @@ protocol ObjectAudioDecoding: AnyObject {
 
 extension ObjectAudioDecoding {
     var selfResetCount: Int { 0 }
-    var playsBedOnly: Bool { false }
     func releaseHeldBlocks() {}
 }
 #endif

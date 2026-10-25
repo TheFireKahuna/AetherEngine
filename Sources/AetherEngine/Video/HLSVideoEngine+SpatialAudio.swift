@@ -3,20 +3,6 @@ import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
 
-/// Measurement only, in a build with the TrueHDReferenceRender trait: with this environment variable
-/// set to 1, TrueHD Atmos is decoded exactly and its objects mixed into the layout, the rendering
-/// `BedSplitter` is compared against. Without the trait it is always off and that path is not built.
-enum TrueHDReferenceRender {
-    static let variable = "AETHER_TRUEHD_REFERENCE_RENDER"
-    static var isOn: Bool {
-        #if TrueHDReferenceRender
-        ProcessInfo.processInfo.environment[variable] == "1"
-        #else
-        false
-        #endif
-    }
-}
-
 /// Personal builds only, with the APACObjectOutput trait: with this environment variable set to 1,
 /// TrueHD Atmos elements are sent to APAC as positioned objects (`APACObjectEncoder`) rather than
 /// rendered into the layout. Without the trait it is always off and that path is not built.
@@ -329,8 +315,8 @@ extension HLSVideoEngine {
                 let dialogueGain = objectDialogueGain
                 makeDecoder = {
                     APACObjectOutputSwitch.isOn
-                        ? try TrueHDObjectAudioDecoder(splitsBed: false, objectOutput: true, dialogueGain: dialogueGain)
-                        : try TrueHDObjectAudioDecoder(splitsBed: !TrueHDReferenceRender.isOn, dialogueGain: dialogueGain)
+                        ? try TrueHDObjectAudioDecoder(objectOutput: true, dialogueGain: dialogueGain)
+                        : try TrueHDObjectAudioDecoder(dialogueGain: dialogueGain)
                 }
                 decoder = try makeDecoder()
                 #else
@@ -436,10 +422,8 @@ extension HLSVideoEngine {
             switch source {
             case .trueHDAtmos where APACObjectOutputSwitch.isOn:
                 rendering = "elements sent as APAC objects (\(APACObjectOutputSwitch.variable), personal build)"
-            case .trueHDAtmos where TrueHDReferenceRender.isOn:
-                rendering = "objects rendered into \(layout.rawValue) (reference render, \(TrueHDReferenceRender.variable))"
             case .trueHDAtmos:
-                rendering = "channel presentation split into \(layout.rawValue) by the objects' energy"
+                rendering = "decoded exactly, objects rendered into \(layout.rawValue)"
             case .dtsHDMasterAudio:
                 rendering = "bed and heights routed one to one into \(layout.rawValue)"
             }

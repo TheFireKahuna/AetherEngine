@@ -1,18 +1,14 @@
 // Only with the TrueHDObjectAudio trait (off by default), which links LibTrueHD.
 #if TrueHDObjectAudio
+import Accelerate
 import Foundation
 import TrueHD
 
 /// TrueHD object-presentation decoder over the LibTrueHD library (the Rust `truehd` crate behind
 /// a C API): lossless decode of presentation 3, which for an Atmos stream is the bed plus up to 15
-/// dynamic objects, together with the object audio metadata (OAMD) that positions them.
-///
-/// With `splitsBed` (the engine's TrueHD path, see `BedSplitter`) the decode is a different one:
-/// the matrix interpolation values are discarded, so the object signals are approximate, every block
-/// also carries the stream's channel-based presentation (Dolby's own 7.1 or 5.1 rendering of the mix)
-/// from the same access unit, and the bridge takes every output from that bed, reading only where the
-/// objects' energy lies: elements prepared as TS 103 448 has them (`state(for:stream:)`), ramps
-/// included, so that is where the renderer would put it.
+/// dynamic objects, together with the object audio metadata (OAMD) that positions them. The decode
+/// is exact (LibTrueHD's interpolating decode), and every element is prepared for the
+/// renderer by `state(for:stream:)`.
 ///
 /// The library's coordinates are OAMD room coordinates (ETSI TS 103 420 4.2.1): x left→right and
 /// y front→back on 0...1, z −1 floor, 0 ear level, +1 ceiling. That is the renderer's own room
@@ -30,30 +26,24 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     private var roles: [ObjectAudioRole] = []
     private var rolesSerial: UInt32?
     private var planes: [UnsafePointer<Float>] = []
-    let splitsBed: Bool
     /// Object output (`APACObjectOutput`): the elements and their full metadata, ramps included, go
-    /// out as APAC objects. No bed companion.
+    /// out as APAC objects.
     let objectOutput: Bool
-    var playsBedOnly: Bool { splitsBed }
     /// The TrueHD decoder's (`AudioStageSpan.trueHDDecoderMemory`, `TrueHDMajorSync`) at the rendering
     /// rate; a 96 or 192 kHz stream adds the decimator's filter.
     let span = AudioStageSpan(
         latency: 0,
         memory: AudioStageSpan.trueHDDecoderMemory(outputRate: Int32(ObjectAudioRendering.sampleRate))
             + ObjectAudioDecimator.span.memory)
-    private var bedRoles: [ObjectAudioRole] = []
-    private var bedRolesSerial: UInt32?
-    private var bedPlanes: [UnsafePointer<Float>] = []
     private(set) var selfResetCount = 0
     private var warpLogged = false
     /// Blocks between a reset and the first metadata, so objects play from the first frame (see
     /// `ObjectMetadataHold`), and the released block last handed out, whose planes it owns.
     private let hold = ObjectMetadataHold()
     private var lent: ObjectMetadataHold.Copy?
-    /// A 96 or 192 kHz stream's elements and bed, brought to 48 kHz (`ObjectAudioDecimator`), and a
+    /// A 96 or 192 kHz stream's elements, brought to 48 kHz (`ObjectAudioDecimator`), and a
     /// discontinuity the decimator has not yet produced a block to carry.
     private var decimator: ObjectAudioDecimator?
-    private var bedDecimator: ObjectAudioDecimator?
     private var discontinuityPending = false
     /// The last block's clock and its output_timing (`clock(_:)`). Kept across a reset: the clock is
     /// the stream's, so a resync continues on it.
@@ -63,33 +53,53 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     /// `dialogueEnhancement(gain:maximum:)` has it.
     let dialogueGain: Float
 
-    /// `splitsBed` is false only for the measurement reference (`TrueHDReferenceRender` trait).
-    init(splitsBed: Bool = true, objectOutput: Bool = false, dialogueGain: Float = 0) throws {
-        #if !TrueHDReferenceRender
-        precondition(splitsBed || objectOutput, "the exact decode and mix are only built with the TrueHDReferenceRender trait")
-        #endif
+    /// Dialogue normalisation, which a TrueHD decoder applies: the presentation's stated dialogue
+    /// level is brought to -31 LKFS. On the decoded planes, so both paths after the decoder play it
+    /// (the render, object output). The gain, and the planes the elements are scaled into when it is
+    /// not 1.
+    private var normalisation: Float = 1
+    private let normalisedPlanes = NormalisedPlanes()
+
+    init(objectOutput: Bool = false, dialogueGain: Float = 0) throws {
         #if !APACObjectOutput
         precondition(!objectOutput, "object output is only built with the APACObjectOutput trait")
         #endif
-        precondition(!(splitsBed && objectOutput), "object output plays the elements, not the bed")
         guard let handle = truehd_atmos_decoder_create(TRUEHD_ATMOS_PRESENTATION_HIGHEST) else {
             throw DecoderError(status: TRUEHD_ATMOS_ERR_INVALID_ARGUMENT, message: "create failed")
         }
         self.handle = handle
         self.dialogueGain = dialogueGain
-        self.splitsBed = splitsBed
         self.objectOutput = objectOutput
-        if splitsBed {
-            _ = truehd_atmos_decoder_set_bed_companion(handle, true)
-            _ = truehd_atmos_decoder_set_ignore_interpolation(handle, true)
-        }
-        // Object output, like the reference render, leaves interpolation on (LibTrueHD's default):
-        // with a LibTrueHD built with `matrix-interpolation` the elements decode exactly. With the
-        // shipped binary they decode approximately, with crosstalk wherever the stream interpolates
-        // (research notes §3.8), and object output is not worth listening to.
     }
 
     deinit { truehd_atmos_decoder_destroy(handle) }
+
+    /// -(dialogue_level + 31) dB as a gain: the stated level brought to -31 LKFS. 1 for a
+    /// presentation that states none (dialogue_level 0).
+    static func normalisationGain(dialogueLevel: Int32) -> Float {
+        dialogueLevel == 0 ? 1 : powf(10, -Float(dialogueLevel + 31) / 20)
+    }
+
+    /// The gain dialogue normalisation gives `presentation`, from the stream's latest major sync.
+    private func normalisationGain(presentation: Int) -> Float {
+        var info = TrueHDAtmosStreamInfo()
+        guard truehd_atmos_decoder_get_stream_info(handle, &info) == TRUEHD_ATMOS_OK else { return 1 }
+        return withUnsafeBytes(of: &info.presentations) { raw in
+            let presentations = raw.bindMemory(to: TrueHDAtmosPresentationInfo.self)
+            guard presentations.indices.contains(presentation) else { return 1 }
+            return Self.normalisationGain(dialogueLevel: presentations[presentation].dialogue_level)
+        }
+    }
+
+    /// Note a change of the normalisation gain, logged once each.
+    private func noteNormalisation(_ gain: Float, presentation: Int) {
+        guard gain != normalisation else { return }
+        normalisation = gain
+        EngineLog.emit(
+            String(format: "[TrueHDObjectAudioDecoder] dialogue normalisation: presentation %d at %+.1f dB "
+                   + "(the stream's dialogue_norm brought to -31 LKFS)", presentation, 20 * log10(gain)),
+            category: .session)
+    }
 
     /// The library reports `pts` back on the blocks whose access units start in these bytes, with
     /// how many access units of the same push came before (`TrueHDAtmosBlock.pts_au_index`).
@@ -134,24 +144,15 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     private func decimate(_ block: ObjectAudioDecodedBlock, factor: Int) -> ObjectAudioDecodedBlock? {
         if decimator?.factor != factor {
             decimator = ObjectAudioDecimator(factor: factor)
-            bedDecimator = ObjectAudioDecimator(factor: factor)
         }
-        guard let decimator, let bedDecimator else { return nil }
+        guard let decimator else { return nil }
         if block.isDiscontinuity {
             decimator.reset()
-            bedDecimator.reset()
             discontinuityPending = true
         }
         let main = decimator.process(planes: block.planes, frames: block.frameCount,
                                      inputStart: block.inputFrameOffset, updates: block.updates)
         var out = block
-        if let bed = block.bed {
-            let decimatedBed = bedDecimator.process(planes: bed.planes, frames: block.frameCount,
-                                                    inputStart: block.inputFrameOffset, updates: [])
-            out.bed = ObjectAudioBed(roles: bed.roles, planes: decimatedBed.planes)
-        } else {
-            bedDecimator.reset()
-        }
         guard main.frames > 0 else { return nil }
         out.sampleRate = ObjectAudioRendering.sampleRate
         out.frameCount = main.frames
@@ -190,18 +191,9 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         }
         planes.removeAll(keepingCapacity: true)
         for c in 0..<channels { planes.append(UnsafePointer(block.channels[c]!)) }
-
-        var bed: ObjectAudioBed?
-        let bedChannels = Int(block.bed_channel_count)
-        if bedChannels > 0, let channels = block.bed_channels, let speakers = block.bed_speakers {
-            if bedRolesSerial != block.layout_serial || bedRoles.count != bedChannels {
-                bedRolesSerial = block.layout_serial
-                bedRoles = (0..<bedChannels).map { Self.role(forSpeaker: speakers[$0]) }
-            }
-            bedPlanes.removeAll(keepingCapacity: true)
-            for c in 0..<bedChannels { bedPlanes.append(UnsafePointer(channels[c]!)) }
-            bed = ObjectAudioBed(roles: bedRoles, planes: bedPlanes)
-        }
+        let gain = normalisationGain(presentation: Int(block.presentation))
+        noteNormalisation(gain, presentation: Int(block.presentation))
+        if gain != 1 { normalisedPlanes.scale(&planes, frames: Int(block.frame_count), gain: gain) }
 
         var updates: [ObjectAudioMetadataUpdate] = []
         var firstStates: [ObjectAudioElementState?]?
@@ -231,7 +223,6 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             roles: roles,
             planes: planes,
             updates: updates,
-            bed: bed,
             sourcePts: block.pts == Int64.min ? nil : block.pts,
             sourcePtsInputFrame: Int64(block.input_frame_offset)
                 - Int64(block.pts_au_index) * Int64(block.access_unit_frames),
@@ -257,7 +248,6 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         hold.arm()
         lent = nil
         decimator?.reset()
-        bedDecimator?.reset()
         discontinuityPending = false
     }
 
@@ -349,8 +339,8 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         return stream
     }
 
-    /// An element as TS 103 420 decodes it and TS 103 448 prepares it for panning, which every path
-    /// shares: the bed split's guide, the reference render and object output. In order: the room position (distance, screen
+    /// An element as its metadata decodes and is prepared for panning, which both paths
+    /// share, the render and object output. In order: the room position (distance, screen
     /// anchoring), warp, the elevation switch, snap; zones, trims and the elevation switch's ear-level
     /// position, which depends on the layout, travel on to the panner.
     static func state(for element: TrueHDAtmosElement, stream: StreamMetadata = .init()) -> ObjectAudioElementState {
@@ -507,6 +497,25 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         case TRUEHD_ATMOS_ZONE_SCREEN_ONLY: return screenOnly
         case TRUEHD_ATMOS_ZONE_SURROUND_ONLY: return surroundOnly
         default: return []
+        }
+    }
+}
+/// A block's planes with a gain applied, in planes of its own: the library's are read-only and
+/// valid until the next pull, and these are reused the same way.
+private final class NormalisedPlanes {
+    private var storage: [UnsafeMutablePointer<Float>] = []
+
+    deinit { storage.forEach { $0.deallocate() } }
+
+    /// `planes` (each `frames` long) times `gain`, the pointers replaced with this object's.
+    func scale(_ planes: inout [UnsafePointer<Float>], frames: Int, gain: Float) {
+        while storage.count < planes.count {
+            storage.append(.allocate(capacity: Int(TRUEHD_ATMOS_MAX_BLOCK_FRAMES)))
+        }
+        var g = gain
+        for c in planes.indices {
+            vDSP_vsmul(planes[c], 1, &g, storage[c], 1, vDSP_Length(frames))
+            planes[c] = UnsafePointer(storage[c])
         }
     }
 }
