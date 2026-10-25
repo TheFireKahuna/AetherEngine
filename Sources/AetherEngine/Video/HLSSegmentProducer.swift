@@ -645,6 +645,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// A software overlay session (`HLSVideoEngine.overlayDecodesVideo`): every video packet is served as this
     /// placeholder's sample for its picture. Set before the pump starts, on every producer of the session.
     var overlayPlaceholder: OverlayPlaceholder?
+    /// The overlay session's decode, handed every source video packet before the placeholder takes its place. Set
+    /// with `overlayPlaceholder`.
+    var overlayDecodeTap: OverlayDecodeTap?
     private var loggedFirstDtsBump = false
     private var loggedFirstDtsDrop = false
 
@@ -4756,6 +4759,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             category: .session
                         )
                     }
+                    overlayDecodeTap?.keep(packet, timeBase: videoConfig.timeBase,
+                                           shiftSeconds: Double(videoShiftPts == Int64.min ? 0 : videoShiftPts) * sourceVideoTbSeconds)
                     if let overlayPlaceholder, !overlayPlaceholder.substitute(packet) {
                         exitReason = .muxerFailed
                         break readLoop

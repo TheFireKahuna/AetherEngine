@@ -5,6 +5,16 @@ import QuartzCore
 import IOSurface
 import os
 
+/// How the overlay's pictures follow AVPlayer.
+enum OverlayPacing: Equatable {
+    /// One picture for each frame AVPlayer's output hands over, made from it (`makePicture`).
+    case outputFrames
+    /// AVPlayer's frames as they are: the I-frame tier's stills while it scans.
+    case showOutput
+    /// The source's picture on screen at each refresh's item time (`picture(at:)`), whatever AVPlayer decodes.
+    case clock
+}
+
 /// What ``SoftwareOverlayRenderer`` shows in place of AVPlayer's picture.
 protocol OverlayFrameSource: AnyObject, Sendable {
     /// How AVPlayer hands over the frames it decodes (`AVPlayerItemVideoOutput`'s pixel buffer attributes).
@@ -13,25 +23,30 @@ protocol OverlayFrameSource: AnyObject, Sendable {
     func followRenderer(_ attributes: [String: Any])
     /// AVPlayer's clock, in item seconds: what the source works toward.
     func advance(to itemSeconds: Double)
-    /// The picture for AVPlayer's frame `output` at `frameTime`, handed to `done` on any thread (nil when it could
-    /// not be made). False, with `done` never called, when the source has nothing for that time yet. `output` is
-    /// valid until `done` runs.
+    /// How the pictures follow AVPlayer while the item plays at `rate`.
+    func pacing(atRate rate: Double) -> OverlayPacing
+    /// `.outputFrames`: the picture for AVPlayer's frame `output` at `frameTime`, handed to `done` on any thread (nil
+    /// when it could not be made). False, with `done` never called, when the source has nothing for that time yet.
+    /// `output` is valid until `done` runs.
     func makePicture(from output: CVPixelBuffer, at frameTime: CMTime,
                      done: @escaping @Sendable (CVPixelBuffer?) -> Void) -> Bool
+    /// `.clock`: the picture on screen at `itemSeconds` and its own time, nil while the source has none.
+    func picture(at itemSeconds: Double) -> (picture: CVPixelBuffer, seconds: Double)?
     /// The source's own state, for the renderer's periodic log line.
     func logSummary() -> String
 }
 
 /// Draws our own picture over an `AVPlayer` whose rendering is suppressed: a Profile 7 FEL's composition over the
-/// base layer AVPlayer plays (``FelCompositionSource``).
+/// base layer AVPlayer plays (``FelCompositionSource``), or the session's own decode of a stream AVPlayer is served
+/// a placeholder of (``DecodedPictureSource``).
 ///
 /// AVPlayer keeps everything it is good at (loading, seeking, audio, AVKit's transport, menus and native
 /// subtitles); with `suppressesPlayerRendering` it renders nothing itself and hands every decoded frame to an
 /// `AVPlayerItemVideoOutput` instead. The overlay is driven the way that output is documented to be used, by a
 /// display link: at each refresh it asks which frame belongs at the refresh after next (`itemTime(forHostTime:)`,
-/// the item's clock, which is the audio clock), has the ``OverlayFrameSource`` make the picture for it, and
-/// enqueues that on ``layer`` stamped for that refresh on a host-clock timebase, the clock the display link reports
-/// in. Every frame shows on the refresh chosen for it, and the picture follows the audio by construction: there is
+/// the item's clock, which is the audio clock), has the ``OverlayFrameSource`` make the picture for it (or, paced by
+/// the clock, give the picture on screen at that time), and enqueues that on ``layer`` stamped for that refresh on a
+/// host-clock timebase, the clock the display link reports in. Every frame shows on the refresh chosen for it, and the picture follows the audio by construction: there is
 /// no second clock to correct.
 ///
 /// The layer belongs inside the `AVPlayerLayer`, between the video and the subtitle layers, so native
@@ -85,6 +100,8 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
     private var stopped = false
     /// Render-queue state.
     private var lastPulled = CMTime.invalid
+    /// The time of the picture last presented, by the clock's pacing: a refresh with the same picture enqueues nothing.
+    private var lastShown: Double?
     /// Bumped on every clock jump: a picture finishing for an older generation is for a left position.
     private var generation = 0
     /// The mean step between pulled frames: the stream's frame duration (container timestamps can be whole
@@ -150,7 +167,12 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         jumpObserver = NotificationCenter.default.addObserver(forName: CMTimebase.timeJumped, object: itemTimebase, queue: nil) { [weak self] _ in
             guard let self else { return }
             self.source.advance(to: CMTimebaseGetTime(itemTimebase).seconds)
-            self.queue.async { self.restartPresentation() }
+            self.queue.async {
+                self.restartPresentation()
+                // A seek while paused still shows its target, when the source has it.
+                self.lastNewFrame = CACurrentMediaTime()
+                self.displayLink?.setPaused(false)
+            }
         }
         // The source's pool is built the way the renderer asks frames to be made (CoreAnimation-compatible
         // surfaces, its cache mode): a picture the compositor can take as it is.
@@ -250,17 +272,86 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         // The documented use of the output: the item time for a coming refresh, and its frame if it is new.
         let presentAt = target + duration
         let itemTime = output.itemTime(forHostTime: presentAt)
-        guard output.hasNewPixelBuffer(forItemTime: itemTime) else {
-            // Nothing new for a while (paused, a still): quiesce until the output says frames are coming.
-            if CACurrentMediaTime() - lastNewFrame > Self.quiesceAfter {
-                displayLink?.setPaused(true)
-                output.requestNotificationOfMediaDataChange(withAdvanceInterval: duration)
-            }
+        // Stamped half a refresh before the refresh it was chosen for: that refresh, and no other, shows it.
+        let presentation = CMTime(seconds: presentAt - duration / 2, preferredTimescale: 1_000_000_000)
+        let shownFor = CMTime(seconds: duration, preferredTimescale: 1_000_000_000)
+        let rate = CMTimebaseGetRate(itemTimebase)
+        let pacing = source.pacing(atRate: rate)
+        let newOutput = output.hasNewPixelBuffer(forItemTime: itemTime)
+        if pacing != .clock, !newOutput {
+            quiesceIfIdle(duration)
             return
         }
-        lastNewFrame = CACurrentMediaTime()
-        guard let (frame, frameTime) = outputFrame(forItemTime: itemTime), frameTime.isValid else { return }
-        countersLock.withLock { _counters.pulled += 1 }
+
+        switch pacing {
+        case .clock:
+            // AVPlayer's frames are the placeholder's: taken off the output and dropped.
+            if newOutput, output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) != nil {
+                countersLock.withLock { _counters.pulled += 1 }
+            }
+            source.advance(to: itemTime.seconds)
+            guard let (picture, seconds) = source.picture(at: itemTime.seconds) else {
+                countersLock.withLock { _counters.notReady += 1 }
+                return
+            }
+            guard seconds != lastShown else {
+                if rate == 0 { quiesceIfIdle(duration) }
+                return
+            }
+            lastShown = seconds
+            lastNewFrame = CACurrentMediaTime()
+            let frameTime = CMTime(seconds: seconds, preferredTimescale: 1_000_000_000)
+            noteFrame(frameTime)
+            present(picture, frameTime: frameTime, at: presentation, for: shownFor, pictureMs: 0)
+
+        case .showOutput:
+            var frameTime = CMTime.invalid
+            guard let picture = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &frameTime),
+                  frameTime.isValid else { return }
+            lastNewFrame = CACurrentMediaTime()
+            countersLock.withLock { _counters.pulled += 1 }
+            source.advance(to: frameTime.seconds)
+            present(picture, frameTime: frameTime, at: presentation, for: shownFor, pictureMs: 0)
+
+        case .outputFrames:
+            lastNewFrame = CACurrentMediaTime()
+            guard let (frame, frameTime) = outputFrame(forItemTime: itemTime), frameTime.isValid else { return }
+            countersLock.withLock { _counters.pulled += 1 }
+            noteFrame(frameTime)
+            source.advance(to: frameTime.seconds)
+
+            let generation = self.generation
+            let pictureStart = CACurrentMediaTime()
+            frame.withBuffer { base in
+                let accepted = source.makePicture(from: base, at: frameTime) { [weak self] picture in
+                    withExtendedLifetime(frame) {}
+                    guard let self else { return }
+                    let pictureMs = (CACurrentMediaTime() - pictureStart) * 1000
+                    self.countersLock.withLock { self._counters.maxPictureMs = max(self._counters.maxPictureMs, pictureMs) }
+                    guard let picture else {
+                        self.countersLock.withLock { self._counters.failed += 1 }
+                        return
+                    }
+                    self.queue.async {
+                        guard generation == self.generation else { return }
+                        self.present(picture, frameTime: frameTime, at: presentation, for: shownFor, pictureMs: pictureMs)
+                    }
+                }
+                if !accepted { countersLock.withLock { _counters.notReady += 1 } }
+            }
+        }
+    }
+
+    /// Nothing new for a while (paused, a still): quiesce until the output says frames are coming.
+    private func quiesceIfIdle(_ refresh: CFTimeInterval) {
+        guard CACurrentMediaTime() - lastNewFrame > Self.quiesceAfter else { return }
+        displayLink?.setPaused(true)
+        output.requestNotificationOfMediaDataChange(withAdvanceInterval: refresh)
+    }
+
+    /// A new frame in the shown sequence at `frameTime`: frames between it and the last one were skipped, and a step
+    /// back is a restart of the sequence.
+    private func noteFrame(_ frameTime: CMTime) {
         if lastPulled.isValid, frameTime > lastPulled {
             let step = (frameTime - lastPulled).seconds
             if let frameDuration, frameDuration > 0 {
@@ -271,34 +362,16 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         }
         if lastPulled.isValid, frameTime < lastPulled { restartPresentation() }
         lastPulled = frameTime
-        source.advance(to: frameTime.seconds)
+    }
 
-        let generation = self.generation
-        let pictureStart = CACurrentMediaTime()
-        // Stamped half a refresh before the refresh it was chosen for: that refresh, and no other, shows it.
-        let presentation = CMTime(seconds: presentAt - duration / 2, preferredTimescale: 1_000_000_000)
-        let shownFor = CMTime(seconds: duration, preferredTimescale: 1_000_000_000)
-        frame.withBuffer { base in
-            let accepted = source.makePicture(from: base, at: frameTime) { [weak self] picture in
-                withExtendedLifetime(frame) {}
-                guard let self else { return }
-                let pictureMs = (CACurrentMediaTime() - pictureStart) * 1000
-                self.countersLock.withLock { self._counters.maxPictureMs = max(self._counters.maxPictureMs, pictureMs) }
-                guard let picture else {
-                    self.countersLock.withLock { self._counters.failed += 1 }
-                    return
-                }
-                if let surface = CVPixelBufferGetIOSurface(picture)?.takeUnretainedValue() {
-                    let id = IOSurfaceGetID(surface)
-                    self.surfaceTimes.withLock { $0[id] = frameTime.seconds }
-                }
-                self.queue.async {
-                    guard generation == self.generation else { return }
-                    self.enqueue(picture, at: presentation, for: shownFor, frameTime: frameTime, pictureMs: pictureMs)
-                }
-            }
-            if !accepted { countersLock.withLock { _counters.notReady += 1 } }
+    /// Render queue: records what `picture` shows for reading the screen back, and enqueues it.
+    private func present(_ picture: CVPixelBuffer, frameTime: CMTime, at presentation: CMTime, for duration: CMTime,
+                         pictureMs: Double) {
+        if let surface = CVPixelBufferGetIOSurface(picture)?.takeUnretainedValue() {
+            let id = IOSurfaceGetID(surface)
+            surfaceTimes.withLock { $0[id] = frameTime.seconds }
         }
+        enqueue(picture, at: presentation, for: duration, frameTime: frameTime, pictureMs: pictureMs)
     }
 
     /// What is on screen at this refresh: which frame (by its surface), how far its item time is from the item
@@ -320,6 +393,7 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         layer.sampleBufferRenderer.flush()
         layer.sampleBufferRenderer.presentationTimeExpectation = .monotonicallyIncreasing
         lastPulled = .invalid
+        lastShown = nil
         generation += 1
     }
 

@@ -609,6 +609,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var overlayDecodesVideo = false
     /// That placeholder, made by `prepare()`; every producer of the session serves it in place of the source's video.
     private(set) var overlayPlaceholder: OverlayPlaceholder?
+    /// The overlay session's own decode of the source, fed by every producer and shown by `DecodedPictureSource`.
+    /// Made by `prepare()`.
+    private(set) var overlayDecodeTap: OverlayDecodeTap?
+    /// What the overlay's decoder does with interlaced carriage, as the load decided. Set before `prepare()`.
+    var overlayDeinterlace = DeinterlaceConfig()
+    /// The overlay decoder's A53 captions, in presentation order on the source axis (the native route's are read off
+    /// the packets, `a53CaptionObserverForSession`, and AVPlayer is served placeholder bytes here).
+    var overlayCaptionObserverForSession: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
 
     #if DualLayerDolbyVision
     /// `LoadOptions.felOverlay`: every producer of the session hands its enhancement layer to this tap, which
@@ -1996,6 +2004,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             self.sourceVideoConfig = HLSSegmentProducer.StreamConfig(
                 codecpar: UnsafePointer(ownedSourceParams.ptr), timeBase: videoTimeBase, codecTagOverride: nil,
                 nalFramingOverride: sourceFraming.measuredFraming)
+            overlayDecodeTap = OverlayDecodeTap(
+                parameters: ownedSourceParams.ptr, timeBase: videoTimeBase,
+                containerSAR: videoStream.pointee.sample_aspect_ratio, deinterlace: overlayDeinterlace
+            ) { [weak self] triplets, sourceSeconds in self?.overlayCaptionObserverForSession?(triplets, sourceSeconds) }
         } else {
             self.sourceVideoConfig = videoConfig
         }
@@ -3356,6 +3368,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         savedVideoConfig = nil
         sourceVideoConfig = nil
         overlayPlaceholder = nil
+        overlayDecodeTap?.close()
+        overlayDecodeTap = nil
         savedAudioConfig = nil
         let ownedParams = ownedCodecParams
         ownedCodecParams = []
@@ -3798,6 +3812,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         prod.felTap = felTap
         #endif
         prod.overlayPlaceholder = overlayPlaceholder
+        prod.overlayDecodeTap = overlayDecodeTap
         prod.playedMediaLedger = playedMediaLedger
         prod.onFirstHDR10PlusDetected = { [weak self] in
             self?.notifyHDR10PlusOnce()
