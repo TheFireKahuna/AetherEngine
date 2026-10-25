@@ -682,6 +682,11 @@ public final class AetherEngine: ObservableObject {
     /// layer composed over AVPlayer's picture by `softwareOverlay`.
     var felOverlayWanted = false
 
+    /// This load's video is one AVPlayer cannot decode itself (`VideoRoutingPolicy.requiresSoftwarePath`): the
+    /// session decodes it and shows it in the software overlay, AVPlayer served a placeholder of its format
+    /// (`HLSVideoEngine.overlayDecodesVideo`).
+    var overlayDecodesVideoWanted = false
+
     /// Our own picture over the current native item, nil while AVPlayer's picture is the one shown: a Profile 7
     /// FEL composed over its base layer (`LoadOptions.felOverlay`). A new renderer comes with every item
     /// (`replaceCurrentItem` on an audio switch or a reload), so a host installs it again whenever this changes:
@@ -4540,6 +4545,7 @@ public final class AetherEngine: ObservableObject {
         sourceCarriesHDR10PlusMetadata = false
         sourceElType = nil
         felOverlayWanted = false
+        overlayDecodesVideoWanted = false
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
@@ -5420,6 +5426,7 @@ public final class AetherEngine: ObservableObject {
         let composesDualLayers = options.preferDualLayerDolbyVision
             || (options.felOverlay && DualLayerRouteDecision.isBuiltIn)
         felOverlayWanted = false
+        overlayDecodesVideoWanted = false
         // A Profile 7 source with in-band parameter sets (`hev1` with an empty hvcC) is unclassifiable
         // to the strict verdict below and would stay native for that reason alone. When the dual-layer
         // route is wanted, complete the probe's record from the head of the stream first; the session
@@ -5516,7 +5523,7 @@ public final class AetherEngine: ObservableObject {
         if !dualLayerDecision.isTaken { elType = nil }
         // The overlay keeps a FEL on the native route: AVPlayer plays its base layer and `softwareOverlay`
         // composes the enhancement layer over it, so neither the routing nor a software host sees an el_type.
-        if options.felOverlay, dualLayerDecision.isTaken, elType == "FEL" {
+        if composesDualLayers, dualLayerDecision.isTaken, elType == "FEL" {
             felOverlayWanted = true
             elType = nil
             EngineLog.emit("[AetherEngine] Profile 7 FEL: native route with the enhancement layer composed over AVPlayer (felOverlay)", category: .engine)
@@ -5736,187 +5743,114 @@ public final class AetherEngine: ObservableObject {
             throw AetherEngineError.dolbyVisionUnplayableOnSoftwarePath(profile: profileLabel)
         }
 
-        // Demuxed-audio live ingest is native-path-only (side-demuxer merge lives in HLSSegmentProducer).
-        // A demuxed-audio source routed SW would play silent; fail fast so the host falls back to server-muxed.
-        if useSoftwarePath, options.isLive,
-           (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil,
-           probe.audioStreamIndex < 0 {
-            probe.markClosed()
-            BlockingWork.detached { [probe] in probe.close() }
-            EngineLog.emit(
-                "[AetherEngine] demuxed-audio live source routed to the software path "
-                + "(codec=\(detectedCodecID.rawValue)); side-audio merge is native-only, failing fast",
-                category: .engine
-            )
-            publishError(.demuxedAudioLiveUnsupported, "Demuxed-audio live source not supported on this codec path")
-            throw HLSIngestError.demuxedAudioNotSupported
+        overlayDecodesVideoWanted = useSoftwarePath
+        if useSoftwarePath {
+            EngineLog.emit("[AetherEngine] video plays in the software overlay over an AVPlayer placeholder "
+                           + "(codec=\(detectedCodecID.rawValue))", category: .engine)
         }
-
         do {
-            if useSoftwarePath {
-                if !panelRoutingSettled {
-                    try await settlePanelRouting(ownsProbe: true)
+            // Native path: pass the probe Demuxer to loadNative so HLSVideoEngine.start() skips
+            // avformat_open_input + find_stream_info (~1-3 s saved on slow CDN). The cue prewarm
+            // seek inside start() invalidates any stale read position. Pass nil if probe failed.
+            try await loadNative(
+                url: url,
+                sourceHTTPHeaders: options.httpHeaders,
+                startPosition: startPosition,
+                audioSourceStreamIndex: selectedAudio,
+                keepDvh1TagWithoutDV: options.keepDvh1TagWithoutDV,
+                forceDolbyVisionOnNonDVDisplay: options.forceDolbyVisionOnNonDVDisplay,
+                dolbyVisionHandling: options.dolbyVisionHandling,
+                dolbyVisionRPUProfile: detectedDVRPUProfile,
+                matchContentEnabled: options.matchContentEnabled,
+                panelIsInHDRMode: routingPanelHDR,
+                // AE#535: the table composed at the top of this load, not a second read of it.
+                sessionDisplayCaps: sessionDisplayCaps,
+                audioBridgeMode: options.audioBridgeMode,
+                isLive: options.isLive,
+                dvrWindowSeconds: options.dvrWindowSeconds,
+                // Set only by reloadAtCurrentPosition's live reopen:
+                // the host must skip its initial seek so AVPlayer
+                // joins the rebuilt (possibly backlog-bearing)
+                // playlist at its own live edge. Hosts cannot set
+                // this; fresh joins keep the verified seek-to-0.
+                liveRejoin: options.isLiveRejoin,
+                preopenedDemuxer: probeOpened ? probe : nil,
+                generation: gen,
+                resolvePanelRouting: panelRoutingSettled ? nil : {
+                    try await settlePanelRouting(ownsProbe: false)
+                    return routingPanelHDR
                 }
-                // SW path reuses the probe demuxer (single AVFormatContext open); do not close here.
-                // Release a preserved NativeAVPlayerHost from a native->native reload: the SW pipeline
-                // renders into its own layer and currentAVPlayer must publish nil to drop AVKit's stale player.
-                if nativeHost != nil {
-                    nativeHost?.tearDown()
-                    nativeHost = nil
-                    currentAVPlayer = nil
-                }
-                try await loadSoftware(
-                    url: url,
-                    sourceHTTPHeaders: options.httpHeaders,
-                    startPosition: startPosition,
-                    audioSourceStreamIndex: selectedAudio,
-                    isLive: options.isLive,
-                    dvrWindowSeconds: options.dvrWindowSeconds,
-                    preopenedDemuxer: probeOpened ? probe : nil,
-                    generation: gen,
-                    elType: elType
-                )
-                playbackBackend = .software
-                // AE#550: the one thing a viewer on a receiver needs said out loud. This backend's
-                // picture cannot leave the device, so a wireless route carries the sound alone, and
-                // the report that opened this was someone hearing a film they could not see.
-                if Self.isWirelessAirPlayRoute() {
-                    EngineLog.emit(
-                        "[AetherEngine] AE#550: software path with a wireless receiver on the audio route; "
-                        + "the sound goes to the receiver and the picture stays on this device "
-                        + "(screen mirroring is what carries it)",
-                        category: .engine
-                    )
-                }
-                activeVideoDecoder = Self.videoDecoderLabel(
-                    codecID: detectedCodecID,
-                    isSoftware: !(softwareHost?.usesHardwareVideoDecoder ?? false)
-                )
-                // AE#462: the host's own resolved index, not the engine's pick. The pick says which
-                // track was ASKED for; only the host knows whether a decoder opened for it, and this
-                // label claimed one for a session that had dropped its audio and gone video-only.
-                activeAudioDecoder = softwareHost?.audioPipelineDescription ?? Self.softwareAudioDecoderLabel(
-                    audioTracks: probedAudioTracks,
-                    activeIndex: softwareHost?.audioStreamIndex ?? -1
-                )
-                presentCurrentLayer()
-                // #124: a paused mount skips autostart; loadSoftware's host.$isReady settles .paused.
-                if Self.loadPerformsAutostart(options) {
-                    await awaitBitmapSubtitleUpscaler()
-                    try checkLoadCurrent(gen)
-                    softwareHost?.play()
-                    state = .playing
-                }
-                startMemoryProbe()
-                startLiveTelemetrySampler()
-                armDisplayModeDiagnostic(gen: gen, backend: "software",
-                                         contentRate: detectedRate, requestedRate: snappedRate)
-                armPlaybackPanelProbe(gen: gen, effectiveFormat: effectiveFormat,
-                                      panelPresentedHDRAtLoad: panelHDRAfterHandshake,
-                                      sessionIsPlaying: Self.loadPerformsAutostart(options))
-            } else {
-                // Native path: pass the probe Demuxer to loadNative so HLSVideoEngine.start() skips
-                // avformat_open_input + find_stream_info (~1-3 s saved on slow CDN). The cue prewarm
-                // seek inside start() invalidates any stale read position. Pass nil if probe failed.
-                try await loadNative(
-                    url: url,
-                    sourceHTTPHeaders: options.httpHeaders,
-                    startPosition: startPosition,
-                    audioSourceStreamIndex: selectedAudio,
-                    keepDvh1TagWithoutDV: options.keepDvh1TagWithoutDV,
-                    forceDolbyVisionOnNonDVDisplay: options.forceDolbyVisionOnNonDVDisplay,
-                    dolbyVisionHandling: options.dolbyVisionHandling,
-                    dolbyVisionRPUProfile: detectedDVRPUProfile,
-                    matchContentEnabled: options.matchContentEnabled,
-                    panelIsInHDRMode: routingPanelHDR,
-                    // AE#535: the table composed at the top of this load, not a second read of it.
-                    sessionDisplayCaps: sessionDisplayCaps,
-                    audioBridgeMode: options.audioBridgeMode,
-                    isLive: options.isLive,
-                    dvrWindowSeconds: options.dvrWindowSeconds,
-                    // Set only by reloadAtCurrentPosition's live reopen:
-                    // the host must skip its initial seek so AVPlayer
-                    // joins the rebuilt (possibly backlog-bearing)
-                    // playlist at its own live edge. Hosts cannot set
-                    // this; fresh joins keep the verified seek-to-0.
-                    liveRejoin: options.isLiveRejoin,
-                    preopenedDemuxer: probeOpened ? probe : nil,
-                    generation: gen,
-                    resolvePanelRouting: panelRoutingSettled ? nil : {
-                        try await settlePanelRouting(ownsProbe: false)
-                        return routingPanelHDR
-                    }
-                )
-                playbackBackend = .native
-                activeVideoDecoder = Self.videoDecoderLabel(
-                    codecID: detectedCodecID, isSoftware: false
-                )
-                // Audio label comes from HLSVideoEngine's stream-copy/FLAC-bridge cascade.
-                activeAudioDecoder = nativeVideoSession?.audioPipelineDescription
-                // Reconcile published audioTracks with the session's real pick (side-demuxer tracks for
-                // demuxed-audio sources). Without this a post-load language check would reload the track already playing.
-                syncPublishedAudioStateFromNativeSession()
-                presentCurrentLayer()
-                // Gate play() on panel handshake. With appliesPreferredDisplayCriteriaAutomatically=true,
-                // AVKit drives the criteria write from the live AVPlayerItem's formatDescription (reads dvcC
-                // via private CoreMedia hooks). waitForSwitch Stage 1 gives AVKit time to fire that write;
-                // Stage 2 waits for the panel to settle so the first frame doesn't hit a mid-transition panel.
-                // Critical for DV P5 (no HDR10 base, requires immediate DV mode).
-                // #133: unchanged criteria (same-format zap) mean the panel is already in the target mode and
-                // neither the engine nor AVKit will switch it, so there is nothing to settle here. Skipping
-                // avoids Stage 1's blind 1s (and, on unobservable-DV panels, the full ~3s cap) on every zap.
-                // #274: the 1000ms Stage 1 budget is the DV-cold-start bet on a sole-writer host's inbound
-                // write. Sessions no dynamic-range switch can reach (engine-writer, or SDR content) take the
-                // 200ms budget instead of paying it on every load.
-                await displayCriteria.waitForSwitch(
-                    startGrace: Self.playGateGrace(
-                        criteriaUnchanged: criteriaUnchanged,
-                        criteriaWrittenBeforeLoad: !options.awaitsInboundCriteriaWrite,
-                        formatKnown: probeOpened,
-                        effectiveFormat: effectiveFormat,
-                        noWriterExpected: options.sharedOutputRole == .secondary
-                    ),
-                    // Sodalite#49: this gate runs after the item is ready, so waiting out an observed switch
-                    // blocks nothing else, and the panel is dark until it ends either way. Live keeps the
-                    // standard cap: a zap must not sit behind a panel handshake.
-                    settleCap: options.isLive ? .standard : .awaitObservedEnd,
-                    isCurrent: { self.loadGeneration == gen })
+            )
+            playbackBackend = .native
+            activeVideoDecoder = Self.videoDecoderLabel(
+                codecID: detectedCodecID, isSoftware: overlayDecodesVideoWanted
+            )
+            // Audio label comes from HLSVideoEngine's stream-copy/FLAC-bridge cascade.
+            activeAudioDecoder = nativeVideoSession?.audioPipelineDescription
+            // Reconcile published audioTracks with the session's real pick (side-demuxer tracks for
+            // demuxed-audio sources). Without this a post-load language check would reload the track already playing.
+            syncPublishedAudioStateFromNativeSession()
+            presentCurrentLayer()
+            // Gate play() on panel handshake. With appliesPreferredDisplayCriteriaAutomatically=true,
+            // AVKit drives the criteria write from the live AVPlayerItem's formatDescription (reads dvcC
+            // via private CoreMedia hooks). waitForSwitch Stage 1 gives AVKit time to fire that write;
+            // Stage 2 waits for the panel to settle so the first frame doesn't hit a mid-transition panel.
+            // Critical for DV P5 (no HDR10 base, requires immediate DV mode).
+            // #133: unchanged criteria (same-format zap) mean the panel is already in the target mode and
+            // neither the engine nor AVKit will switch it, so there is nothing to settle here. Skipping
+            // avoids Stage 1's blind 1s (and, on unobservable-DV panels, the full ~3s cap) on every zap.
+            // #274: the 1000ms Stage 1 budget is the DV-cold-start bet on a sole-writer host's inbound
+            // write. Sessions no dynamic-range switch can reach (engine-writer, or SDR content) take the
+            // 200ms budget instead of paying it on every load.
+            await displayCriteria.waitForSwitch(
+                startGrace: Self.playGateGrace(
+                    criteriaUnchanged: criteriaUnchanged,
+                    criteriaWrittenBeforeLoad: !options.awaitsInboundCriteriaWrite,
+                    formatKnown: probeOpened,
+                    effectiveFormat: effectiveFormat,
+                    noWriterExpected: options.sharedOutputRole == .secondary
+                ),
+                // Sodalite#49: this gate runs after the item is ready, so waiting out an observed switch
+                // blocks nothing else, and the panel is dark until it ends either way. Live keeps the
+                // standard cap: a zap must not sit behind a panel handshake.
+                settleCap: options.isLive ? .standard : .awaitObservedEnd,
+                isCurrent: { self.loadGeneration == gen })
+            try checkLoadCurrent(gen)
+            // automaticallyWaitsToMinimizeStalling=true (default) handles play-before-ready.
+            // A local start is a plain play(): a start that fails surfaces through the host's startup
+            // path as a failure, and nothing changes the served format behind the criteria already
+            // written. Cold Dolby Vision resumes after a fresh launch start cleanly on tvOS 27.2 with
+            // the item created during the switch (five of five, Apple TV 4K and LG G5).
+            // #124: a paused mount skips the terminal play() AND the readiness gate (it plays to poll
+            // readiness). loadNative wired host.$isReady, which settles .loading -> .paused; the host
+            // resumes later with play().
+            // #227: a master handed to a wireless AirPlay receiver runs the readiness gate. The
+            // receiver's HDR mode is unreadable from the sender, so an offered HDR/DV master can be
+            // rejected or park silently, and the escalation (reload master -> reduced HDR master ->
+            // media, all on the LAN IP) is the recovery that hop needs.
+            if Self.loadPerformsAutostart(options) {
+                await awaitBitmapSubtitleUpscaler()
                 try checkLoadCurrent(gen)
-                // automaticallyWaitsToMinimizeStalling=true (default) handles play-before-ready.
-                // A local start is a plain play(): a start that fails surfaces through the host's startup
-                // path as a failure, and nothing changes the served format behind the criteria already
-                // written. Cold Dolby Vision resumes after a fresh launch start cleanly on tvOS 27.2 with
-                // the item created during the switch (five of five, Apple TV 4K and LG G5).
-                // #124: a paused mount skips the terminal play() AND the readiness gate (it plays to poll
-                // readiness). loadNative wired host.$isReady, which settles .loading -> .paused; the host
-                // resumes later with play().
-                // #227: a master handed to a wireless AirPlay receiver runs the readiness gate. The
-                // receiver's HDR mode is unreadable from the sender, so an offered HDR/DV master can be
-                // rejected or park silently, and the escalation (reload master -> reduced HDR master ->
-                // media, all on the LAN IP) is the recovery that hop needs.
-                if Self.loadPerformsAutostart(options) {
-                    await awaitBitmapSubtitleUpscaler()
-                    try checkLoadCurrent(gen)
-                    if airPlayServedMasterToReceiver, let session = nativeVideoSession,
-                       session.servingMasterPlaylist, !options.isLive {
-                        try await runStartupReadinessGate(
-                            session: session, position: startPosition ?? 0, gen: gen)
-                    } else {
-                        nativeHost?.play()
-                    }
-                    state = .playing
-                    // #227: a receiver that refuses the playlist it was handed neither fails the item nor
-                    // reports a rejection, so the gate above cannot see it. Watch the clock instead.
-                    armAirPlayProgressWatchdog(gen: gen, position: startPosition ?? 0)
+                if airPlayServedMasterToReceiver, let session = nativeVideoSession,
+                   session.servingMasterPlaylist, !options.isLive {
+                    try await runStartupReadinessGate(
+                        session: session, position: startPosition ?? 0, gen: gen)
+                } else {
+                    nativeHost?.play()
                 }
-                startMemoryProbe()
-                startLiveTelemetrySampler()
-                armDisplayModeDiagnostic(gen: gen, backend: "native",
-                                         contentRate: detectedRate, requestedRate: snappedRate)
-                armPlaybackPanelProbe(gen: gen, effectiveFormat: effectiveFormat,
-                                      panelPresentedHDRAtLoad: panelHDRAfterHandshake,
-                                      sessionIsPlaying: Self.loadPerformsAutostart(options))
+                state = .playing
+                // #227: a receiver that refuses the playlist it was handed neither fails the item nor
+                // reports a rejection, so the gate above cannot see it. Watch the clock instead.
+                armAirPlayProgressWatchdog(gen: gen, position: startPosition ?? 0)
             }
+            startMemoryProbe()
+            startLiveTelemetrySampler()
+            armDisplayModeDiagnostic(gen: gen, backend: "native",
+                                     contentRate: detectedRate, requestedRate: snappedRate)
+            armPlaybackPanelProbe(gen: gen, effectiveFormat: effectiveFormat,
+                                  panelPresentedHDRAtLoad: panelHDRAfterHandshake,
+                                  sessionIsPlaying: Self.loadPerformsAutostart(options))
+
         } catch is CancellationError {
             // Superseded.
             throw CancellationError()
@@ -7005,6 +6939,7 @@ public final class AetherEngine: ObservableObject {
         sourceCarriesHDR10PlusMetadata = false
         sourceElType = nil
         felOverlayWanted = false
+        overlayDecodesVideoWanted = false
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
