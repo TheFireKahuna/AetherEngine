@@ -1,15 +1,15 @@
 import Foundation
 
-/// How the upscaler covers a picture's kept area with the models' fixed windows
-/// (``ArtCNNCoreMLModels/windowHeights`` x ``ArtCNNCoreMLModels/windowWidths``). Each window is a core plus the
-/// network's 7-pixel reach on every side, so a core's outputs are exact. The cores form a grid: rows of chosen core
-/// heights down the kept area, columns of chosen core widths across it, every row with the same columns.
+/// How the upscaler covers a picture with the models' fixed windows (``ArtCNNCoreMLModels/windowHeights`` x
+/// ``ArtCNNCoreMLModels/windowWidths``). Each window is a core plus the network's 7-pixel reach on every side, so a
+/// core's outputs are exact.
 ///
-/// The Neural Engine's time is close to linear in the window pixels it runs, plus a fixed cost per call (measured on
-/// the A15: C4F16 about 7.5 ns per pixel, C4F32 about 17, and about 0.3 ms a call, flat across the shapes). The plan
-/// takes, for each count of rows and of columns, the cover with the fewest window rows (and columns), then the
-/// pair of counts with the least estimated time. With one fixed 128 x 704 core, a 1920 x 200 strip ran 2.3 times the
-/// window pixels this plan runs.
+/// Only the support needs computing: the pixels within S (the support radius) of content; everything else is exactly
+/// transparent. The plan cuts the rows into bands, each band one core height tall, and covers each band with a row of
+/// cores across just the columns its own support spans, so two lines of different lengths, or the gap between them,
+/// cost only what they hold. Rows with no support take no band. The choice is a dynamic programme over the rows (a
+/// band of each height, or skipping an unsupported row), each band's columns the cheapest cover of its span, every
+/// window costed by its measured prediction time (``milliseconds(_:height:width:)``).
 struct SubtitleUpscaleTilePlan: Equatable {
     struct Window: Equatable {
         /// Picture position of the window's top-left pixel: its core's minus 7 on each axis.
@@ -19,80 +19,111 @@ struct SubtitleUpscaleTilePlan: Equatable {
         var height: Int
     }
 
-    /// Core heights from the top of the kept area, and core widths from its left.
-    var rows: [Int]
-    var columns: [Int]
-    /// Row-major: window `r * columns.count + c` holds core (r, c).
+    /// A band's rows (core height) from `y`, its cores' widths from column `x`, in picture coordinates.
+    struct Band: Equatable {
+        var y: Int
+        var height: Int
+        var x: Int
+        var columns: [Int]
+        var width: Int { columns.reduce(0, +) }
+    }
+
+    var bands: [Band]
+    /// Band by band, left to right.
     var windows: [Window]
 
     static let reach = 7
 
-    /// Estimated Neural Engine nanoseconds per window pixel of `model`.
-    static func nanosecondsPerPixel(_ model: ArtCNNModel) -> Double {
-        switch model {
-        case .c4f16: 7.5
-        case .c4f32: 17
+    /// Wall milliseconds of one synchronous prediction of `model` on a window, measured on the A15 (Apple TV 4K,
+    /// tvOS 27.2, Release; ``SubtitleUpscaler/benchmark(iterations:)`` prints the device's own). Proportions, not
+    /// the absolute times, steer the plan, and they hold across Apple's Neural Engines.
+    static func milliseconds(_ model: ArtCNNModel, height: Int, width: Int) -> Double {
+        let table: [Int: [Int: Double]] = switch model {
+        case .c4f16: [46: [256: 0.44, 512: 0.55, 1024: 0.59, 2048: 0.85],
+                      78: [256: 0.49, 512: 0.61, 1024: 0.79, 2048: 1.23],
+                      142: [256: 0.55, 512: 0.75, 1024: 1.17, 2048: 2.25]]
+        case .c4f32: [46: [256: 0.47, 512: 0.54, 1024: 0.86, 2048: 1.40],
+                      78: [256: 0.52, 512: 0.78, 1024: 1.25, 2048: 2.26],
+                      142: [256: 0.75, 512: 1.16, 1024: 2.15, 2048: 4.55]]
         }
+        return table[height]![width]!
     }
 
-    static let nanosecondsPerCall = 300_000.0
-
-    /// The cheapest grid over `kept` (picture coordinates) for one prediction per window per plane, at
-    /// `nanosecondsPerPixel` per window pixel and `nanosecondsPerCall` per window, both planes together.
-    static func plan(kept: (x: Int, y: Int, width: Int, height: Int), nanosecondsPerPixel: Double, nanosecondsPerCall: Double) -> Self {
-        guard kept.width > 0, kept.height > 0 else { return Self(rows: [], columns: [], windows: []) }
-        let rowCovers = covers(kept.height, cores: ArtCNNCoreMLModels.windowHeights.map { $0 - 2 * reach })
-        let columnCovers = covers(kept.width, cores: ArtCNNCoreMLModels.windowWidths.map { $0 - 2 * reach })
-        var best: (cost: Double, rows: [Int], columns: [Int])?
-        for r in rowCovers {
-            let rowPixels = r.reduce(0) { $0 + $1 + 2 * reach }
-            for c in columnCovers {
-                let columnPixels = c.reduce(0) { $0 + $1 + 2 * reach }
-                let cost = Double(rowPixels * columnPixels) * nanosecondsPerPixel + Double(r.count * c.count) * nanosecondsPerCall
-                if best == nil || cost < best!.cost { best = (cost, r, c) }
+    /// The plan for `content` in a `width` x `height` picture, keeping pixels within `support` of it, with `alpha`
+    /// and `luma` the networks on the two planes.
+    static func plan(content: SubtitleUpscaler.Content, width: Int, height: Int, support: Int,
+                     alpha: ArtCNNModel, luma: ArtCNNModel) -> Self {
+        let r = reach
+        let coreHeights = ArtCNNCoreMLModels.windowHeights.map { $0 - 2 * r }
+        let coreWidths = ArtCNNCoreMLModels.windowWidths.map { $0 - 2 * r }
+        let kept = content.kept(width: width, height: height, support: support)
+        guard kept.width > 0 else { return Self(bands: [], windows: []) }
+        let y0 = kept.y, y1 = kept.y + kept.height
+        // The columns each picture row's support spans: its own content and that of the rows within `support`,
+        // each grown by `support` and clipped to the picture.
+        var span = [(Int, Int)?](repeating: nil, count: height)
+        for y in max(0, y0 - support)..<min(height, y1 + support) {
+            guard let s = content.span(row: y) else { continue }
+            let lo = max(0, s.lowerBound - support), hi = min(width - 1, s.upperBound + support)
+            for yy in max(0, y - support)...min(height - 1, y + support) {
+                span[yy] = span[yy].map { (min($0.0, lo), max($0.1, hi)) } ?? (lo, hi)
             }
         }
-        let rows = best!.rows, columns = best!.columns
-        var windows: [Window] = []
-        var y = kept.y
-        for h in rows {
-            var x = kept.x
-            for w in columns {
-                windows.append(Window(x: x - reach, y: y - reach, width: w + 2 * reach, height: h + 2 * reach))
-                x += w
-            }
-            y += h
-        }
-        return Self(rows: rows, columns: columns, windows: windows)
-    }
-
-    /// For each count of cores, the cores (largest first) covering `length` with the least total: `best[n][t]` is the
-    /// least total of n cores covering at least t.
-    static func covers(_ length: Int, cores: [Int]) -> [[Int]] {
-        let maxCount = (length + cores.min()! - 1) / cores.min()!
-        var best = [[Int]](repeating: [Int](repeating: .max, count: length + 1), count: maxCount + 1)
-        var choice = [[Int]](repeating: [Int](repeating: 0, count: length + 1), count: maxCount + 1)
-        best[0][0] = 0
-        var result: [[Int]] = []
-        for n in 1...maxCount {
+        // The cheapest cover of `length` columns with cores of height `h`: memoised per height.
+        var covers: [Int: [Int: (cost: Double, cores: [Int])]] = [:]
+        func cover(_ length: Int, _ h: Int) -> (cost: Double, cores: [Int]) {
+            if let made = covers[h]?[length] { return made }
+            var best = [(cost: Double, cores: [Int])](repeating: (.infinity, []), count: length + 1)
+            best[0] = (0, [])
             for t in 1...length {
-                for core in cores {
-                    let before = best[n - 1][max(0, t - core)]
-                    guard before != .max, before + core < best[n][t] else { continue }
-                    best[n][t] = before + core
-                    choice[n][t] = core
+                for c in coreWidths {
+                    let before = best[max(0, t - c)]
+                    let cost = before.cost + milliseconds(alpha, height: h + 2 * r, width: c + 2 * r)
+                        + milliseconds(luma, height: h + 2 * r, width: c + 2 * r)
+                    if cost < best[t].cost { best[t] = (cost, before.cores + [c]) }
                 }
             }
-            guard best[n][length] != .max else { continue }
-            var cover: [Int] = []
-            var t = length
-            for k in stride(from: n, to: 0, by: -1) {
-                let core = choice[k][t]
-                cover.append(core)
-                t = max(0, t - core)
-            }
-            result.append(cover.sorted(by: >))
+            for t in 1...length { covers[h, default: [:]][t] = best[t] }
+            return best[length]
         }
-        return result
+        // A band of core height h from row t: the union of its rows' spans, nil when it holds no support.
+        func bandSpan(_ t: Int, _ h: Int) -> (Int, Int)? {
+            var lo = Int.max, hi = -1
+            for y in t..<min(y1, t + h) { if let s = span[y] { lo = min(lo, s.0); hi = max(hi, s.1) } }
+            return hi < 0 ? nil : (lo, hi)
+        }
+        // best[i]: the cheapest plan for rows y0 + i ..< y1, and its first step (0 skips a row).
+        let n = y1 - y0
+        var best = [Double](repeating: .infinity, count: n + 1)
+        var step = [Int](repeating: 0, count: n + 1)
+        best[n] = 0
+        for i in stride(from: n - 1, through: 0, by: -1) {
+            let t = y0 + i
+            if span[t] == nil { best[i] = best[i + 1]; step[i] = 0 }
+            for h in coreHeights {
+                let rest = best[min(n, i + h)]
+                guard let s = bandSpan(t, h) else { continue }
+                let cost = cover(s.1 - s.0 + 1, h).cost + rest
+                if cost < best[i] { best[i] = cost; step[i] = h }
+            }
+        }
+        var bands: [Band] = []
+        var windows: [Window] = []
+        var i = 0
+        while i < n {
+            let h = step[i]
+            guard h > 0 else { i += 1; continue }
+            let t = y0 + i
+            let s = bandSpan(t, h)!
+            let cores = cover(s.1 - s.0 + 1, h).cores.sorted(by: >)
+            bands.append(Band(y: t, height: h, x: s.0, columns: cores))
+            var x = s.0
+            for c in cores {
+                windows.append(Window(x: x - r, y: t - r, width: c + 2 * r, height: h + 2 * r))
+                x += c
+            }
+            i += h
+        }
+        return Self(bands: bands, windows: windows)
     }
 }

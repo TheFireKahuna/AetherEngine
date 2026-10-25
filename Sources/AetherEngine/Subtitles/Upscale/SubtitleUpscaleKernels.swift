@@ -19,7 +19,7 @@ final class SubtitleUpscaleKernels: @unchecked Sendable {
     let maskColumns: MTLComputePipelineState
     let tileGather: MTLComputePipelineState
     let compositeTiles: MTLComputePipelineState
-    let clearOutside: MTLComputePipelineState
+    let clearRect: MTLComputePipelineState
     let resample: MTLComputePipelineState
 
     private static let sharedLock = NSLock()
@@ -55,7 +55,7 @@ final class SubtitleUpscaleKernels: @unchecked Sendable {
         maskColumns = try make("up_mask_columns")
         tileGather = try make("up_tile_gather")
         compositeTiles = try make("up_composite_tiles")
-        clearOutside = try make("up_clear_outside")
+        clearRect = try make("up_clear_rect")
         resample = try make("up_resample")
     }
 }

@@ -66,37 +66,100 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         public var source: MTLTexture
         public var destination: MTLTexture
         public var sourceAlpha: SourceAlpha
-        /// Source pixels outside this rectangle are fully transparent (a display set's object rectangles, or
-        /// ``contentBounds(_:width:height:bytesPerRow:alphaOffset:)``). The network then runs on these bounds grown
-        /// by its reach instead of the whole canvas; nil runs it on the whole picture. The output is the same
+        /// Where the source's non-transparent pixels are (``Content``); every other source pixel is fully
+        /// transparent. The network runs only near them; nil runs it on the whole picture. The output is the same
         /// either way as long as the promise holds.
-        public var contentBounds: CGRect?
-        public init(source: MTLTexture, destination: MTLTexture, sourceAlpha: SourceAlpha = .premultiplied, contentBounds: CGRect? = nil) {
+        public var content: Content?
+        public init(source: MTLTexture, destination: MTLTexture, sourceAlpha: SourceAlpha = .premultiplied, content: Content? = nil) {
             self.source = source
             self.destination = destination
             self.sourceAlpha = sourceAlpha
-            self.contentBounds = contentBounds
+            self.content = content
         }
     }
 
-    /// The bounding rectangle of the pixels with non-zero alpha in a 4-byte-per-pixel bitmap, nil when there are
-    /// none. `alphaOffset` is the alpha byte's position in the pixel (3 for RGBA and BGRA).
-    public static func contentBounds(_ base: UnsafeRawPointer, width: Int, height: Int, bytesPerRow: Int, alphaOffset: Int) -> CGRect? {
-        var x0 = width, x1 = -1, y0 = height, y1 = -1
-        for y in 0..<height {
-            let row = base.advanced(by: y * bytesPerRow).assumingMemoryBound(to: UInt8.self)
-            var first = -1, last = -1
-            for x in 0..<width where row[4 * x + alphaOffset] != 0 {
-                if first < 0 { first = x }
-                last = x
-            }
-            guard first >= 0 else { continue }
-            x0 = min(x0, first); x1 = max(x1, last)
-            if y0 == height { y0 = y }
-            y1 = y
+    /// Where a picture's non-transparent pixels are, row by row: for each row of `bounds`, the columns from its first
+    /// such pixel to its last, nil for a row with none. A caller that knows only rectangles (a display set's object
+    /// rectangles) gives them as ``init(bounds:)``, every row in full; ``scan(_:width:height:bytesPerRow:alphaOffset:)``
+    /// reads the rows of a bitmap. The upscaler plans its windows from the rows, so two lines of different lengths,
+    /// and the gap between them, cost only what they hold.
+    public struct Content: Sendable, Equatable {
+        /// Integral, picture coordinates; empty when there is no content.
+        public let bounds: CGRect
+        /// One per row of `bounds`: the first and last columns (picture coordinates) of content in that row.
+        let spans: [ClosedRange<Int>?]
+
+        public static let empty = Content(bounds: .zero)
+
+        public init(bounds: CGRect) {
+            let b = bounds.integral
+            guard !b.isNull, !b.isEmpty else { self.bounds = .zero; spans = []; return }
+            self.bounds = b
+            spans = Array(repeating: Int(b.minX)...Int(b.maxX) - 1, count: Int(b.height))
         }
-        guard x1 >= 0 else { return nil }
-        return CGRect(x: x0, y: y0, width: x1 - x0 + 1, height: y1 - y0 + 1)
+
+        init(bounds: CGRect, spans: [ClosedRange<Int>?]) {
+            self.bounds = bounds
+            self.spans = spans
+        }
+
+        /// The rows of the pixels with non-zero alpha in a 4-byte-per-pixel bitmap, nil when there are none.
+        /// `alphaOffset` is the alpha byte's position in the pixel (3 for RGBA and BGRA).
+        public static func scan(_ base: UnsafeRawPointer, width: Int, height: Int, bytesPerRow: Int, alphaOffset: Int) -> Content? {
+            var rows = [ClosedRange<Int>?](repeating: nil, count: height)
+            var x0 = width, x1 = -1, y0 = height, y1 = -1
+            for y in 0..<height {
+                let row = base.advanced(by: y * bytesPerRow).assumingMemoryBound(to: UInt8.self)
+                var first = -1, last = -1
+                for x in 0..<width where row[4 * x + alphaOffset] != 0 {
+                    if first < 0 { first = x }
+                    last = x
+                }
+                guard first >= 0 else { continue }
+                rows[y] = first...last
+                x0 = min(x0, first); x1 = max(x1, last)
+                if y0 == height { y0 = y }
+                y1 = y
+            }
+            guard x1 >= 0 else { return nil }
+            return Content(bounds: CGRect(x: x0, y: y0, width: x1 - x0 + 1, height: y1 - y0 + 1), spans: Array(rows[y0...y1]))
+        }
+
+        /// The content columns of picture row `y`.
+        func span(row y: Int) -> ClosedRange<Int>? {
+            let i = y - Int(bounds.minY)
+            return i >= 0 && i < spans.count ? spans[i] : nil
+        }
+
+        /// The kept area of a `width` x `height` picture: the pixels within `support` of the content bounds, which
+        /// hold every output pixel that is not exactly transparent. Empty without content.
+        func kept(width: Int, height: Int, support: Int) -> Rect {
+            let picture = CGRect(x: 0, y: 0, width: width, height: height)
+            let c = bounds.intersection(picture)
+            guard !c.isNull, !c.isEmpty else { return Rect(x: 0, y: 0, width: 0, height: 0) }
+            let k = c.insetBy(dx: -CGFloat(support), dy: -CGFloat(support)).intersection(picture)
+            return Rect(x: Int(k.minX), y: Int(k.minY), width: Int(k.width), height: Int(k.height))
+        }
+
+        /// The content of a 2x pass's output: every output pixel within `support` of this content (the only ones
+        /// not exactly transparent), row by row.
+        func doubled(support: Int, width: Int, height: Int) -> Content {
+            guard !spans.isEmpty else { return .empty }
+            let y0 = max(0, Int(bounds.minY) - support), y1 = min(height, Int(bounds.maxY) + support)
+            var rows: [ClosedRange<Int>?] = []
+            for y in y0..<y1 {
+                var lo = Int.max, hi = -1
+                for yy in max(y0, y - support)...min(y1 - 1, y + support) {
+                    if let s = span(row: yy) { lo = min(lo, s.lowerBound); hi = max(hi, s.upperBound) }
+                }
+                let out: ClosedRange<Int>? = hi < 0 ? nil : 2 * max(0, lo - support)...2 * min(width - 1, hi + support) + 1
+                rows.append(out); rows.append(out)
+            }
+            let xs = rows.compactMap { $0 }
+            guard !xs.isEmpty else { return .empty }
+            let x0 = xs.map(\.lowerBound).min()!, x1 = xs.map(\.upperBound).max()!
+            return Content(bounds: CGRect(x: x0, y: 2 * y0, width: x1 - x0 + 1, height: rows.count), spans: rows)
+        }
     }
 
     public var configuration: Configuration {
@@ -112,8 +175,8 @@ public final class SubtitleUpscaler: @unchecked Sendable {
     let kernels: SubtitleUpscaleKernels
     /// Serialises every call; recursive, so a convenience holds it across its staging and its ``upscale(_:)``.
     private let lock = NSRecursiveLock()
-    private var _configuration: Configuration
-    private var workspace: Workspace
+    var _configuration: Configuration
+    var workspace: Workspace
 
     /// Wall milliseconds of the last pass's stages, for the benchmark.
     struct NeuralEngineStages {
@@ -169,7 +232,7 @@ public final class SubtitleUpscaler: @unchecked Sendable {
             d.width = 32; d.height = 32
             d.storageMode = .private
             guard let destination = device.makeTexture(descriptor: d) else { throw UpscaleError.unavailable("no texture") }
-            try upscale([Job(source: source, destination: destination, contentBounds: CGRect(x: 8, y: 8, width: 1, height: 1))])
+            try upscale([Job(source: source, destination: destination, content: Content(bounds: CGRect(x: 8, y: 8, width: 1, height: 1)))])
         }
     }
 
@@ -196,15 +259,14 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         var passes: [Job] = []
         var current = job.source
         var alpha = job.sourceAlpha
-        var bounds = job.contentBounds
+        var content = job.content
         for pass in 0..<(scale >= 4 ? 2 : 1) {
             let target = try workspace.intermediate(pass, width: current.width * 2, height: current.height * 2)
-            passes.append(Job(source: current, destination: target, sourceAlpha: alpha, contentBounds: bounds))
+            passes.append(Job(source: current, destination: target, sourceAlpha: alpha, content: content))
+            content = (content ?? Content(bounds: CGRect(x: 0, y: 0, width: current.width, height: current.height)))
+                .doubled(support: supportRadius, width: current.width, height: current.height)
             current = target
             alpha = .premultiplied
-            // The output is transparent beyond the support of content.
-            let grow = CGFloat(2 * supportRadius)
-            bounds = bounds.map { $0.isEmpty ? $0 : $0.applying(CGAffineTransform(scaleX: 2, y: 2)).insetBy(dx: -grow, dy: -grow) }
         }
         return (passes, (current, job.destination))
     }
@@ -241,11 +303,11 @@ public final class SubtitleUpscaler: @unchecked Sendable {
               let out else { throw UpscaleError.unavailable("no output pixel buffer") }
         let source = try workspace.texture(for: pixelBuffer), destination = try workspace.texture(for: out)
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-        let bounds = CVPixelBufferGetBaseAddress(pixelBuffer).map {
-            Self.contentBounds($0, width: w, height: h, bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer), alphaOffset: 3)
+        let content = CVPixelBufferGetBaseAddress(pixelBuffer).map {
+            Content.scan($0, width: w, height: h, bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer), alphaOffset: 3)
         } ?? nil
         CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
-        try upscale([Job(source: source.texture, destination: destination.texture, sourceAlpha: sourceAlpha, contentBounds: bounds ?? .zero)])
+        try upscale([Job(source: source.texture, destination: destination.texture, sourceAlpha: sourceAlpha, content: content ?? .empty)])
         withExtendedLifetime((source, destination)) {}
         return out
     }
@@ -262,7 +324,7 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         let source = try workspace.staging(0, width: w, height: h)
         let destination = try workspace.staging(1, width: dw, height: dh)
         var pixels = [UInt8](repeating: 0, count: w * h * 4)
-        var bounds: CGRect?
+        var content: Content?
         let space = CGColorSpace(name: CGColorSpace.sRGB)!
         let info = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
         try pixels.withUnsafeMutableBytes { raw in
@@ -270,9 +332,9 @@ public final class SubtitleUpscaler: @unchecked Sendable {
                                           space: space, bitmapInfo: info) else { throw UpscaleError.unavailable("no bitmap context") }
             context.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
             source.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: raw.baseAddress!, bytesPerRow: w * 4)
-            bounds = Self.contentBounds(raw.baseAddress!, width: w, height: h, bytesPerRow: w * 4, alphaOffset: 3)
+            content = Content.scan(raw.baseAddress!, width: w, height: h, bytesPerRow: w * 4, alphaOffset: 3)
         }
-        try upscale([Job(source: source, destination: destination, contentBounds: bounds ?? .zero)])
+        try upscale([Job(source: source, destination: destination, content: content ?? .empty)])
         var result = [UInt8](repeating: 0, count: dw * dh * 4)
         result.withUnsafeMutableBytes { raw in
             destination.getBytes(raw.baseAddress!, bytesPerRow: dw * 4, from: MTLRegionMake2D(0, 0, dw, dh), mipmapLevel: 0)
@@ -308,14 +370,9 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         var support: UInt32 = 0
     }
 
-    /// Validates `job`, clears its destination outside the kept area and encodes the kept area's content mask (the
-    /// support the composite keeps). Nil when the kept area is empty: the destination is then all transparent.
+    /// Encodes the kept area's content mask (the support the composite keeps). Nil when the kept area is empty.
     private func encodeMask(_ job: Job, kept: Rect, encoder: MTLComputeCommandEncoder) throws -> Geometry? {
         let pw = job.source.width, ph = job.source.height
-        guard pw > 0, ph > 0 else { throw UpscaleError.size("empty source") }
-        guard job.destination.width == 2 * pw, job.destination.height == 2 * ph else {
-            throw UpscaleError.size("destination \(job.destination.width)x\(job.destination.height) is not 2x \(pw)x\(ph)")
-        }
         var g = Geometry()
         g.support = UInt32(supportRadius)
         g.originX = Int32(kept.x); g.originY = Int32(kept.y)
@@ -323,12 +380,6 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         g.width = UInt32(kept.width); g.height = UInt32(kept.height)
         g.straightAlpha = job.sourceAlpha == .straight ? 1 : 0
         let geometrySize = MemoryLayout<Geometry>.stride
-        if kept.width == 0 || kept.x > 0 || kept.y > 0 || kept.x + kept.width < pw || kept.y + kept.height < ph {
-            encoder.setComputePipelineState(kernels.clearOutside)
-            encoder.setTexture(job.destination, index: 0)
-            encoder.setBytes(&g, length: geometrySize, index: 0)
-            dispatch(encoder, kernels.clearOutside, width: pw, height: ph)
-        }
         guard kept.width > 0 else { return nil }
         let h = kept.height
         let wordsX = (kept.width + 31) / 32
@@ -374,19 +425,22 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         var coreHeight: UInt32
     }
 
-    /// The kept area: the picture pixels within the support of the content bounds (the whole picture without
-    /// bounds), which hold every output pixel that is not exactly transparent.
-    private func keptArea(_ job: Job) -> Rect {
-        let picture = CGRect(x: 0, y: 0, width: job.source.width, height: job.source.height)
-        var b = picture
-        if let bounds = job.contentBounds {
-            // Content first: empty bounds hold nothing to grow.
-            let content = bounds.integral.intersection(picture)
-            guard !content.isNull, !content.isEmpty else { return Rect(x: 0, y: 0, width: 0, height: 0) }
-            b = content.insetBy(dx: -CGFloat(supportRadius), dy: -CGFloat(supportRadius)).intersection(picture)
+    /// The source pixels no window's core covers, as rectangles (picture coordinates): rows outside every band,
+    /// and each band's columns beside its cores. All of them are exactly transparent in the output.
+    static func uncovered(_ plan: SubtitleUpscaleTilePlan, kept: Rect, width: Int, height: Int) -> [Rect] {
+        var rects: [Rect] = []
+        var y = 0
+        for band in plan.bands {
+            let y0 = max(band.y, kept.y), y1 = min(band.y + band.height, kept.y + kept.height)
+            let x0 = max(band.x, kept.x), x1 = min(band.x + band.width, kept.x + kept.width)
+            guard y1 > y0 else { continue }
+            if y0 > y { rects.append(Rect(x: 0, y: y, width: width, height: y0 - y)) }
+            if x0 > 0 { rects.append(Rect(x: 0, y: y0, width: x0, height: y1 - y0)) }
+            if x1 < width { rects.append(Rect(x: x1, y: y0, width: width - x1, height: y1 - y0)) }
+            y = y1
         }
-        guard !b.isNull, !b.isEmpty else { return Rect(x: 0, y: 0, width: 0, height: 0) }
-        return Rect(x: Int(b.minX), y: Int(b.minY), width: Int(b.width), height: Int(b.height))
+        if y < height { rects.append(Rect(x: 0, y: y, width: width, height: height - y)) }
+        return rects
     }
 
     /// One 2x pass: the mask and the window gather on the GPU, a prediction per window and plane on the Neural
@@ -394,12 +448,16 @@ public final class SubtitleUpscaler: @unchecked Sendable {
     /// for each step.
     private func passLocked(_ job: Job) throws {
         let config = _configuration
-        let kept = keptArea(job)
-        let plan = SubtitleUpscaleTilePlan.plan(
-            kept: (kept.x, kept.y, kept.width, kept.height),
-            nanosecondsPerPixel: SubtitleUpscaleTilePlan.nanosecondsPerPixel(config.alphaModel)
-                + SubtitleUpscaleTilePlan.nanosecondsPerPixel(config.lumaModel),
-            nanosecondsPerCall: 2 * SubtitleUpscaleTilePlan.nanosecondsPerCall)
+        let pw = job.source.width, ph = job.source.height
+        guard pw > 0, ph > 0 else { throw UpscaleError.size("empty source") }
+        guard job.destination.width == 2 * pw, job.destination.height == 2 * ph else {
+            throw UpscaleError.size("destination \(job.destination.width)x\(job.destination.height) is not 2x \(pw)x\(ph)")
+        }
+        let content = job.content ?? Content(bounds: CGRect(x: 0, y: 0, width: pw, height: ph))
+        let kept = content.kept(width: pw, height: ph, support: supportRadius)
+        let plan = SubtitleUpscaleTilePlan.plan(content: content, width: pw, height: ph, support: supportRadius,
+                                                alpha: config.alphaModel, luma: config.lumaModel)
+        let clears = Self.uncovered(plan, kept: kept, width: pw, height: ph)
         let surfaces = try workspace.surfaces.surfaces(for: plan.windows)
         let records = plan.windows.map { w in
             let core = CGRect(x: w.x + SubtitleUpscaleTilePlan.reach, y: w.y + SubtitleUpscaleTilePlan.reach,
@@ -421,6 +479,12 @@ public final class SubtitleUpscaler: @unchecked Sendable {
         try run { commandBuffer in
             guard let encoder = commandBuffer.makeComputeCommandEncoder(dispatchType: .serial) else { throw UpscaleError.gpu("no compute encoder") }
             defer { encoder.endEncoding() }
+            encoder.setComputePipelineState(kernels.clearRect)
+            encoder.setTexture(job.destination, index: 0)
+            for var rect in clears.map({ SIMD4<Int32>(Int32($0.x), Int32($0.y), Int32($0.width), Int32($0.height)) }) {
+                encoder.setBytes(&rect, length: MemoryLayout<SIMD4<Int32>>.stride, index: 0)
+                dispatch(encoder, kernels.clearRect, width: Int(rect.z), height: Int(rect.w))
+            }
             guard let made = try encodeMask(job, kept: kept, encoder: encoder) else { empty = true; return }
             g = made
             encoder.setComputePipelineState(kernels.tileGather)
