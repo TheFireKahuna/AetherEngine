@@ -112,14 +112,27 @@ struct BluRayEPMapSeekTests {
         #expect(CLPIParser.entryPoints(Self.clpi([])).isEmpty)
     }
 
+    // MARK: - MPLS
+
+    @Test("each play item's in_time and out_time reach the title")
+    func playItemSpans() throws {
+        let playlist = try #require(MPLSParser.parse(Self.mpls([(id: "00001", inT: 63_000, outT: 423_000),
+                                                                (id: "00002", inT: 90_000, outT: 180_000)])))
+        #expect(playlist.inTimes == [63_000, 90_000])
+        #expect(playlist.outTimes == [423_000, 180_000])
+        let title = try #require(BDTitleSelector.enumerateTitles([playlist]).first)
+        #expect(title.bdClipInTimes == [63_000, 90_000])
+        #expect(title.bdClipOutTimes == [423_000, 180_000])
+    }
+
     // MARK: - The table
 
     /// Two clips that both run their clock from 11.6 s, 6149.6 s and 388 s long: the shape of a real
     /// two-clip UHD title a timestamp seek could not land in.
     static let overlappingClips = DiscSeekTable(clips: [
-        .init(concatByteStart: 0, cumulativeBeforeSec: 0, inTimeSec: 11.6,
+        .init(concatByteStart: 0, cumulativeBeforeSec: 0, inTimeSec: 11.6, outTimeSec: 11.6 + 6149.6,
               entries: (0..<6150).map { CLPIEntryPoint(pts45k: UInt64((11.6 + Double($0)) * 45000), spn: UInt32($0 * 1000)) }),
-        .init(concatByteStart: 50_000_000_000, cumulativeBeforeSec: 6149.6, inTimeSec: 11.6,
+        .init(concatByteStart: 50_000_000_000, cumulativeBeforeSec: 6149.6, inTimeSec: 11.6, outTimeSec: 11.6 + 388,
               entries: (0..<388).map { CLPIEntryPoint(pts45k: UInt64((11.6 + Double($0)) * 45000), spn: UInt32($0 * 1000)) }),
     ])
 
@@ -155,7 +168,8 @@ struct BluRayEPMapSeekTests {
     func buildingTheTable() {
         let title = DiscTitle(id: 0, durationTicks: 2 * 360_000, bdClipIDs: ["00001", "00002", "00001"],
                               bdClipCumulativeBeforeTicks: [0, 360_000, 720_000],
-                              bdClipInTimes: [63_000, 63_000, 63_000])
+                              bdClipInTimes: [63_000, 63_000, 63_000],
+                              bdClipOutTimes: [423_000, 423_000, 423_000])
         let resolved: [(item: Int, clip: String, byteStart: Int64)] = [(0, "00001", 0), (1, "00002", 6912), (2, "00001", 13824)]
         let map = Self.clpi([(pid: 0x1011, entries: Self.tinyEntries)])
         var reads: [String] = []
@@ -165,6 +179,7 @@ struct BluRayEPMapSeekTests {
         }
         #expect(table?.clips.map(\.concatByteStart) == [0, 6912, 13824])
         #expect(table?.clips.map(\.cumulativeBeforeSec) == [0, 8, 16])
+        #expect(table?.clips.map(\.outTimeSec) == [9.4, 9.4, 9.4])
         #expect(reads == ["00001", "00002"])
 
         let partial = DiscReader.buildSeekTable(title: title, resolved: resolved) { $0 == "00002" ? nil : map }
@@ -188,6 +203,7 @@ struct BluRayEPMapSeekTests {
         #expect(table.clips.count == 1)
         #expect(table.clips[0].entries == Self.tinyEntries)
         #expect(table.clips[0].inTimeSec == 1.4)
+        #expect(table.clips[0].outTimeSec == 9.4)
     }
 
     @Test("an image without CLIPINF has no table, and seeks as before")

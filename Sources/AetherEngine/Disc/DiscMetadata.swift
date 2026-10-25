@@ -81,6 +81,9 @@ struct DiscTitle: Sendable, Equatable {
     /// Blu-ray: each play item's `in_time` (45 kHz, on its clip's own clock), parallel to `bdClipIDs`.
     /// A seek by the clips' EP maps turns title time back into clip time with it (`DiscSeekTable`).
     let bdClipInTimes: [UInt64]?
+    /// Blu-ray: each play item's `out_time` (45 kHz, on its clip's own clock), parallel to `bdClipIDs`:
+    /// where the title stops using the clip.
+    let bdClipOutTimes: [UInt64]?
 
     init(id: Int, durationTicks: UInt64, chapters: [DiscChapter] = [],
          bdClipIDs: [String]? = nil, bdClipSubtractTicks: [Int64]? = nil,
@@ -88,7 +91,7 @@ struct DiscTitle: Sendable, Equatable {
          dvdVTSN: Int? = nil, dvdTitleNumber: Int? = nil,
          streamLanguages: [Int: String] = [:],
          dvdSubpictureStreamIDs: [Int]? = nil,
-         bdClipInTimes: [UInt64]? = nil) {
+         bdClipInTimes: [UInt64]? = nil, bdClipOutTimes: [UInt64]? = nil) {
         self.id = id
         self.durationTicks = durationTicks
         self.chapters = chapters
@@ -100,6 +103,7 @@ struct DiscTitle: Sendable, Equatable {
         self.streamLanguages = streamLanguages
         self.dvdSubpictureStreamIDs = dvdSubpictureStreamIDs
         self.bdClipInTimes = bdClipInTimes
+        self.bdClipOutTimes = bdClipOutTimes
     }
 }
 

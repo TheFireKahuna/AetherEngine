@@ -98,6 +98,8 @@ struct DiscSeekTable: Sendable {
         let cumulativeBeforeSec: Double
         /// The play item's `in_time`: where on the clip's own clock the title starts using it.
         let inTimeSec: Double
+        /// The play item's `out_time`: where on the clip's own clock the title stops using it.
+        let outTimeSec: Double
         let entries: [CLPIEntryPoint]
     }
 
@@ -138,12 +140,13 @@ extension DiscReader {
 
     /// The selected title's seek table, from the CLPI of each clip the title resolved. `resolved` lists
     /// those clips with their play item index and their first byte in the concatenated stream. nil when
-    /// the playlist carries no `in_time`s or any clip has no readable EP map, so a title is either sought
-    /// by its maps throughout or by timestamp throughout.
+    /// the playlist carries no `in_time`s or `out_time`s or any clip has no readable EP map, so a title is
+    /// either sought by its maps throughout or by timestamp throughout.
     static func buildSeekTable(title: DiscTitle,
                                resolved: [(item: Int, clip: String, byteStart: Int64)],
                                readCLPI: (String) -> [UInt8]?) -> DiscSeekTable? {
-        guard let inTimes = title.bdClipInTimes, !resolved.isEmpty else { return nil }
+        guard let inTimes = title.bdClipInTimes, let outTimes = title.bdClipOutTimes,
+              inTimes.count == outTimes.count, !resolved.isEmpty else { return nil }
         // One small file per distinct clip. A real title has a handful; a title past this is not worth a
         // request per clip before the first frame, and keeps seeking by timestamp.
         guard Set(resolved.map(\.clip)).count <= maxSeekTableClips else { return nil }
@@ -162,6 +165,7 @@ extension DiscReader {
                                cumulativeBeforeSec: item.item < cumulativeBefore.count
                                    ? Double(cumulativeBefore[item.item]) / discTickRate : 0,
                                inTimeSec: Double(inTimes[item.item]) / discTickRate,
+                               outTimeSec: Double(outTimes[item.item]) / discTickRate,
                                entries: entries))
         }
         EngineLog.emit("[disc] seek table: \(clips.count) clip(s), entries=\(clips.map(\.entries.count))", category: .demux)
