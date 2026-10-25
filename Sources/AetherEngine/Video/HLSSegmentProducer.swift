@@ -5367,7 +5367,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private static func hex(_ bytes: [UInt8]) -> String { bytes.map { String(format: "%02x", $0) }.joined() }
 
     /// `packet` with `bytes` as its whole payload, in a buffer of its own.
-    private static func replacePayload(of packet: UnsafeMutablePointer<AVPacket>, with bytes: [UInt8]) -> Bool {
+    static func replacePayload(of packet: UnsafeMutablePointer<AVPacket>, with bytes: [UInt8]) -> Bool {
         guard let buffer = av_buffer_alloc(bytes.count + Int(AV_INPUT_BUFFER_PADDING_SIZE)) else { return false }
         bytes.withUnsafeBufferPointer { buffer.pointee.data.update(from: $0.baseAddress!, count: bytes.count) }
         memset(buffer.pointee.data + bytes.count, 0, Int(AV_INPUT_BUFFER_PADDING_SIZE))
