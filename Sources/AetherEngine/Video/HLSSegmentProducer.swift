@@ -2084,17 +2084,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 extradata = startCode + vps + startCode + sps + startCode + pps
                 lengthPrefixedRecord = VideoConfigRecord.fromAnnexB(extradata, codecID: AV_CODEC_ID_HEVC,
                                                                     width: width, height: height)
-                let description = HEVCInBandColour.formatDescription(vps: vps, sps: sps, pps: pps)
-                func value(_ key: CFString) -> CFString? {
-                    description.flatMap { CMFormatDescriptionGetExtension($0, extensionKey: key) as? String }.map { $0 as CFString }
-                }
-                let fullRange = description.flatMap {
-                    CMFormatDescriptionGetExtension($0, extensionKey: kCMFormatDescriptionExtension_FullRangeVideo) as? Bool
-                }
-                colour = ColorAttachments.description(primaries: value(kCMFormatDescriptionExtension_ColorPrimaries),
-                                                      transfer: value(kCMFormatDescriptionExtension_TransferFunction),
-                                                      matrix: value(kCMFormatDescriptionExtension_YCbCrMatrix),
-                                                      fullRange: fullRange)
+                colour = HEVCInBandColour.colourDescription(vps: vps, sps: sps, pps: pps) ?? .unspecified
             }
             if AlternativeTransferSEI.declaredTransferMayHideHLG(codecID: codecID, primaries: colour.primaries,
                                                                  transfer: colour.transfer),

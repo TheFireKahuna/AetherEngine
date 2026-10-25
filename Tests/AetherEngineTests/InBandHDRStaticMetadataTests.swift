@@ -210,7 +210,9 @@ struct InBandHDRStaticMetadataTests {
         #expect(try !Self.initBoxes(lifting: false).contains("mdcv"))
     }
 
-    static func initBoxes(lifting: Bool) throws -> Set<String> {
+    /// `containerPrimariesOnly`: the codecpar first carries a mastering display entry with primaries and no
+    /// luminance, the shape of a Matroska `MasteringMetadata` without `LuminanceMax` / `LuminanceMin`.
+    static func initBoxes(lifting: Bool, containerPrimariesOnly: Bool = false) throws -> Set<String> {
         let demuxer = Demuxer()
         defer { demuxer.close() }
         try demuxer.open(
@@ -232,6 +234,7 @@ struct InBandHDRStaticMetadataTests {
         defer { avcodec_parameters_free(&p) }
         let par = try #require(p)
         #expect(avcodec_parameters_copy(par, stream.pointee.codecpar) >= 0)
+        if containerPrimariesOnly { try addPrimariesOnlyMastering(to: par) }
         if lifting {
             let m = collect(annexB([hevcCLL, hevcMDCV, hevcAMVE]), codecID: AV_CODEC_ID_HEVC, framing: .annexB)
             m.attach(to: par)
@@ -258,3 +261,112 @@ struct InBandHDRStaticMetadataTests {
         return found
     }
 }
+
+// MARK: - Incomplete container statements, config-record SEI, the Dolby Vision base-layer range
+
+extension InBandHDRStaticMetadataTests {
+
+    /// A mastering display entry stating primaries (BT.2020's, not the SEI's) and no luminance.
+    static func addPrimariesOnlyMastering(to par: UnsafeMutablePointer<AVCodecParameters>) throws {
+        let sd = try #require(av_packet_side_data_new(
+            &par.pointee.coded_side_data, &par.pointee.nb_coded_side_data,
+            AV_PKT_DATA_MASTERING_DISPLAY_METADATA, MemoryLayout<AVMasteringDisplayMetadata>.size, 0))
+        memset(sd.pointee.data, 0, MemoryLayout<AVMasteringDisplayMetadata>.size)
+        sd.pointee.data.withMemoryRebound(to: AVMasteringDisplayMetadata.self, capacity: 1) { m in
+            m.pointee.display_primaries.0.0 = AVRational(num: 35400, den: 50000)   // R x 0.708
+            m.pointee.has_primaries = 1
+        }
+    }
+
+    @Test("an incomplete container mastering entry keeps what it states and takes the rest from the SEI")
+    func incompleteContainerMasteringCompleted() throws {
+        var p: UnsafeMutablePointer<AVCodecParameters>? = avcodec_parameters_alloc()
+        defer { avcodec_parameters_free(&p) }
+        let par = try #require(p)
+        try Self.addPrimariesOnlyMastering(to: par)
+        #expect(!InBandHDRStaticMetadata.masteringIsComplete(UnsafePointer(par)))
+
+        let m = Self.collect(Self.annexB([Self.hevcCLL, Self.hevcMDCV]), codecID: AV_CODEC_ID_HEVC, framing: .annexB)
+        #expect(m.attach(to: par) == ["mdcv (luminance from the SEI)", "clli"])
+        #expect(InBandHDRStaticMetadata.masteringIsComplete(UnsafePointer(par)))
+        #expect(par.pointee.nb_coded_side_data == 2)
+        let md = try #require(av_packet_side_data_get(
+            par.pointee.coded_side_data, par.pointee.nb_coded_side_data, AV_PKT_DATA_MASTERING_DISPLAY_METADATA))
+        md.pointee.data.withMemoryRebound(to: AVMasteringDisplayMetadata.self, capacity: 1) { m in
+            #expect(m.pointee.display_primaries.0.0.num == 35400)   // the container's, not the SEI's 34000
+            #expect(m.pointee.max_luminance.num == 10_000_000)
+            #expect(m.pointee.min_luminance.num == 1)             // 0.0001 cd/m2, the SEI's mastering black
+            #expect(m.pointee.min_luminance.den == 10_000)
+        }
+    }
+
+    @Test("a complete container mastering entry is left alone")
+    func completeContainerMasteringWins() throws {
+        var p: UnsafeMutablePointer<AVCodecParameters>? = avcodec_parameters_alloc()
+        defer { avcodec_parameters_free(&p) }
+        let par = try #require(p)
+        try Self.addPrimariesOnlyMastering(to: par)
+        let sd = try #require(av_packet_side_data_get(
+            par.pointee.coded_side_data, par.pointee.nb_coded_side_data, AV_PKT_DATA_MASTERING_DISPLAY_METADATA))
+        sd.pointee.data.withMemoryRebound(to: AVMasteringDisplayMetadata.self, capacity: 1) { m in
+            m.pointee.max_luminance = AVRational(num: 4000, den: 1)
+            m.pointee.min_luminance = AVRational(num: 50, den: 10_000)
+            m.pointee.has_luminance = 1
+        }
+        let m = Self.collect(Self.annexB([Self.hevcMDCV]), codecID: AV_CODEC_ID_HEVC, framing: .annexB)
+        #expect(m.attach(to: par).isEmpty)
+        sd.pointee.data.withMemoryRebound(to: AVMasteringDisplayMetadata.self, capacity: 1) { m in
+            #expect(m.pointee.max_luminance.num == 4000)
+            #expect(m.pointee.min_luminance.num == 50)
+        }
+    }
+
+    @Test("movenc writes mdcv once an incomplete container entry is completed, and not before")
+    func incompleteContainerMasteringReachesTheInit() throws {
+        #expect(!(try Self.initBoxes(lifting: false, containerPrimariesOnly: true)).contains("mdcv"))
+        #expect(try Self.initBoxes(lifting: true, containerPrimariesOnly: true).contains("mdcv"))
+    }
+
+    @Test("SEI carried in the hvcC arrays is read before the record is canonicalised")
+    func configRecordSEI() {
+        // BitstreamVideoRangeTests' limited record with a prefix SEI array (NAL type 39) appended.
+        var record = BitstreamVideoRangeTests.hevcLimited
+        record[22] += 1
+        record += [0x27, 0x00, 0x02]
+        for nal in [Self.hevcMDCV, Self.hevcCLL] { record += [UInt8(nal.count >> 8), UInt8(nal.count & 0xFF)] + nal }
+        var m = InBandHDRStaticMetadata()
+        m.collect(fromConfigRecord: record, codecID: AV_CODEC_ID_HEVC)
+        #expect(m.masteringDisplay == Self.expectedMDCV)
+        #expect(m.contentLightLevel == [0x03, 0xe8, 0x01, 0x90])
+
+        var plain = InBandHDRStaticMetadata()
+        plain.collect(fromConfigRecord: BitstreamVideoRangeTests.hevcLimited, codecID: AV_CODEC_ID_HEVC)
+        #expect(plain.isEmpty)
+    }
+
+    /// dovi_tool's `profile5.bin` (MIT licence, Copyright quietvoid): a Profile 5 RPU, `bl_video_full_range_flag` set,
+    /// the unspec62 payload after its 4-byte start code, escaped.
+    static let profile5RPUHex =
+        "190809004061b6506f003ff801ffc00fffd000001000001b00000302000003036000004000006880000c7c1a448003f16c110c8000042f"
+        + "a95c0000030000200000030020000003010ae7fa8ffa8ffa8d0ae7fa8ffa8ffa8d0ae7fffc00000300000300000300019081f73805463"
+        + "0080169b99980c028218008008005b6854100020200000300080500000300000300000300120c1f40006400000300007b68c48480"
+
+    static func rpuAccessUnit(_ payload: [UInt8]) -> [UInt8] {
+        lengthPrefixed([hevcSlice, [0x7C, 0x01] + payload])
+    }
+
+    @Test("the RPU's base-layer range: Profile 5 full, Profile 7 limited, none without an RPU")
+    func dolbyVisionBaseLayerRange() {
+        func read(_ au: [UInt8]) -> Bool? {
+            var m = InBandHDRStaticMetadata()
+            au.withUnsafeBufferPointer {
+                m.collectDolbyVisionRange(from: $0.baseAddress!, size: $0.count, framing: .lengthPrefixed(size: 4))
+            }
+            return m.dolbyVisionBaseLayerFullRange
+        }
+        #expect(read(Self.rpuAccessUnit(BitstreamVideoRangeTests.bytes(Self.profile5RPUHex))) == true)
+        #expect(read(Self.rpuAccessUnit(Array(DoviComposedFrameRpuTests.felNAL.dropFirst(2)))) == false)
+        #expect(read(Self.lengthPrefixed([Self.hevcSlice])) == nil)
+    }
+}
+

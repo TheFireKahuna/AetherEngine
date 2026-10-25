@@ -1716,13 +1716,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
 
         // 5b. HDR10 static metadata stated only in-band (MPEG-TS, a Matroska remuxed from one): read
-        //     the SEI so movenc writes `mdcv` / `clli`. See `InBandHDRStaticMetadata`.
+        //     the SEI so movenc writes `mdcv` / `clli`, and for a `dvh1` sample entry the RPU's base-layer
+        //     range. See `InBandHDRStaticMetadata`.
         let inBandHDRMetadata = scanInBandHDRStaticMetadata(
             demuxer: dem,
             videoStreamIndex: videoIndex,
             codecpar: codecpar,
             framing: measuredVideoNALFraming,
-            isLive: isLiveSession
+            isLive: isLiveSession,
+            readsDolbyVisionRange: codecTagOverride == "dvh1"
         )
         let sdrUpgradedToHLG = inBandHDRMetadata.videoRange(upgrading: videoRange) != videoRange
         if sdrUpgradedToHLG {
@@ -1806,10 +1808,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // color_trc/primaries/space all unspecified, so AVPlayer's DV decoder won't engage on the dvh1
         // sample entry (MKV reads Colour element directly into codecpar; MP4 demuxer has no fallback).
         // Forcing the canonical IPT-PQ-c2 tuple writes `colr nclx` so AVPlayer sees the PQ signal.
-        // Primaries/transfer/matrix are spec-fixed for P5, so this is a repair. Range is preserved if
-        // already signaled (full-range P5 is legal, #20); unspecified defaults to limited.
+        // Primaries/transfer/matrix are spec-fixed for P5, so this is a repair (range: see below).
         // The AE#455 P8.1-as-P5 route needs the same guarantee for the same reason, and lands on the
         // same tuple: an HDR10 base layer is BT.2020 / PQ / BT.2020-NCL by definition.
+        // The range is the RPU's `bl_video_full_range_flag` (a Profile 5 base layer is full range, and its SPS
+        // often has no VUI to say so), then the parameter sets', then the container's, then limited.
         // Keyed on the sample entry the route chose, not on the variant: a Profile 5 record served as
         // its base layer (`dolbyVisionHandling = .baseLayerOnly`) is plain hvc1 whose VUI the muxer
         // stream-copies as it stands.
@@ -1819,16 +1822,30 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // bitstream in two containers, Dolby's P5 asset with and without its `dvcC`: with the record
         // `init.mp4` is 883 B carrying `colr nclx` 9 / 16 / 9 full range, without it and without this
         // override 864 B and no `colr` at all, which would be two deliveries of one picture.
+        // The range every init's `colr` states is the one its picture is decoded with: the parameter sets'
+        // (`BitstreamVideoRange`), not codecpar's, where FFmpeg keeps a container's range over the SPS.
+        let initRecord: [UInt8] = hevcExtradataOverride
+            ?? codecpar.pointee.extradata.map { Array(UnsafeBufferPointer(start: $0, count: Int(codecpar.pointee.extradata_size))) }
+            ?? []
+        let parameterSetRange = BitstreamVideoRange.range(codecID: codecpar.pointee.codec_id, record: initRecord)
         let p5ColorOverride: MP4SegmentMuxer.ColorOverride?
         if codecTagOverride == "dvh1" {
             let sourceRange = codecpar.pointee.color_range
+            let rpuRange = inBandHDRMetadata.dolbyVisionBaseLayerFullRange.map { $0 ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG }
+            let range = rpuRange ?? parameterSetRange
+                ?? (sourceRange == AVCOL_RANGE_UNSPECIFIED ? AVCOL_RANGE_MPEG : sourceRange)
+            EngineLog.emit(
+                "[HLSVideoEngine] dvh1 colr range \(range == AVCOL_RANGE_JPEG ? "full" : "limited") from "
+                + (rpuRange != nil ? "the RPU's bl_video_full_range_flag"
+                   : parameterSetRange != nil ? "the parameter sets (no RPU read)" : "the container (no RPU, no sets)")
+                + " (container: \(av_color_range_name(sourceRange).map { String(cString: $0) } ?? "?"))",
+                category: .session
+            )
             p5ColorOverride = MP4SegmentMuxer.ColorOverride(
                 primaries: AVCOL_PRI_BT2020,
                 trc: AVCOL_TRC_SMPTE2084,
                 space: AVCOL_SPC_BT2020_NCL,
-                range: sourceRange == AVCOL_RANGE_UNSPECIFIED
-                    ? AVCOL_RANGE_MPEG
-                    : sourceRange
+                range: range
             )
         } else {
             p5ColorOverride = nil
@@ -1838,6 +1855,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
             throw HLSVideoEngineError.openFailed(reason: "codecpar copy failed")
         }
         ownedCodecParams.append(ownedVideoParams)
+        if let parameterSetRange, parameterSetRange != ownedVideoParams.ptr.pointee.color_range {
+            func name(_ r: AVColorRange) -> String { av_color_range_name(r).map { String(cString: $0) } ?? "?" }
+            EngineLog.emit(
+                "[HLSVideoEngine] colr range \(name(parameterSetRange)) from the parameter sets, over the "
+                + "container's \(name(ownedVideoParams.ptr.pointee.color_range)): VideoToolbox decodes by the SPS",
+                category: .session
+            )
+            ownedVideoParams.ptr.pointee.color_range = parameterSetRange
+        }
         let liftedHDRBoxes = inBandHDRMetadata.attach(to: ownedVideoParams.ptr)
         // The `colr` the MPEG-TS delivery of the same stream carries (see `InBandHDRStaticMetadata`).
         if sdrUpgradedToHLG { ownedVideoParams.ptr.pointee.color_trc = AVCOL_TRC_ARIB_STD_B67 }

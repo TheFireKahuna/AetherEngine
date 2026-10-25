@@ -106,6 +106,21 @@ struct HEVCInBandColour {
                     matrix: value(kCMFormatDescriptionExtension_YCbCrMatrix))
     }
 
+    /// The colour one VPS, SPS and PPS state, as CoreMedia reads their VUI: primaries, transfer and matrix where it
+    /// names them, and the range its `FullRangeVideo` reports, which is the range VideoToolbox decodes the picture
+    /// with (limited when the SPS signals none, as H.265 E.3.1 infers). nil when CoreMedia cannot read the sets.
+    static func colourDescription(vps: [UInt8], sps: [UInt8], pps: [UInt8]) -> ColorDescription? {
+        guard let description = formatDescription(vps: vps, sps: sps, pps: pps) else { return nil }
+        func value(_ key: CFString) -> CFString? {
+            CMFormatDescriptionGetExtension(description, extensionKey: key).flatMap { $0 as? String }.map { $0 as CFString }
+        }
+        let fullRange = CMFormatDescriptionGetExtension(description, extensionKey: kCMFormatDescriptionExtension_FullRangeVideo) as? Bool
+        return ColorAttachments.description(primaries: value(kCMFormatDescriptionExtension_ColorPrimaries),
+                                            transfer: value(kCMFormatDescriptionExtension_TransferFunction),
+                                            matrix: value(kCMFormatDescriptionExtension_YCbCrMatrix),
+                                            fullRange: fullRange)
+    }
+
     /// CoreMedia's description of one VPS, SPS and PPS (NALs with their 2-byte headers): it parses the VUI.
     static func formatDescription(vps: [UInt8], sps: [UInt8], pps: [UInt8]) -> CMFormatDescription? {
         let sets = [vps, sps, pps]
