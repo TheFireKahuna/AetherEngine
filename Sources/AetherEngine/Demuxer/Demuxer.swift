@@ -2026,8 +2026,10 @@ public final class Demuxer: @unchecked Sendable {
 
     /// Whether a seek to a time lands without the container's index: a transport or program stream
     /// searches its timestamps (bounded by the keyframes read, `recordKeyframeLocked`), a disc title looks
-    /// its EP maps or time map up. Any other container without an index would read up to the target.
+    /// its EP maps or time map up. Any other container without an index would read up to the target, and a
+    /// segmented source (`timeSeekableReader`, an HLS ingest) is no byte range a reader of the source can seek.
     var seeksToTimeWithoutIndex: Bool {
+        guard timeSeekableReader == nil else { return false }
         accessLock.lock()
         let mapped = discSeekTable != nil || dvdTimeMap != nil
         accessLock.unlock()

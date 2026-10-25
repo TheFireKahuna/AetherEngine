@@ -76,14 +76,15 @@ extension AetherEngine {
                          validRange: rangeStart..<(rangeStart + source.durationSeconds))
     }
 
-    /// Cache-backed scrub still for the active native session (live or VOD). Decodes from
-    /// already-produced SegmentCache bytes, so it never opens a second connection and works
-    /// on single-connection sources (debrid/torrent HTTP links, #106) where the
-    /// FrameExtractor's second demuxer is refused. Returns nil when there is no native
-    /// session, the segment is not resident (not yet produced far ahead of the playhead, or
-    /// evicted past the retention budget), or decode fails; a nil is the correct
-    /// "not available yet" and hosts show time-only. `seconds` is session-timeline
-    /// (seekableLiveRange axis) for live, playlist/output seconds for VOD.
+    /// Scrub still for the active session (live or VOD). A resident segment (SegmentCache bytes, or the
+    /// software path's packet cache) decodes with no read of the source at all. Past the resident window a
+    /// native VOD session reads the picture off the source through its one keyframe reader, the I-frame
+    /// rendition's (`HLSVideoEngine.sourceStill`): exact byte ranges through the source cache, the keyframe at
+    /// or before `seconds` where the container lists keyframes, the picture at `seconds` where it only seeks
+    /// to a time (an MPEG-TS recording). Where the rendition's rule refuses a read (a single-connection or
+    /// sequential origin, #106; a source that can do neither) it stays at resident segments. Returns nil when
+    /// nothing can answer, or decode fails; a nil is the correct "not available" and hosts show time-only.
+    /// `seconds` is session-timeline (seekableLiveRange axis) for live, playlist/output seconds for VOD.
     public func scrubThumbnail(atSeconds seconds: Double, maxWidth: Int = 320) async -> CGImage? {
         if isLive {
             return await liveScrubThumbnail(atSessionSeconds: seconds, maxWidth: maxWidth)
@@ -114,9 +115,16 @@ extension AetherEngine {
         let source = await BlockingWork.detached(priority: .userInitiated) { [session] in
             session.scrubThumbnailSource(atSeconds: seconds)
         }.value
+        guard loadGeneration == gen else { return nil }
+        guard let source else {
+            // Past the resident window: the picture off the source, through the session's keyframe reader.
+            let image = await BlockingWork.detached(priority: .userInitiated) { [session] in
+                session.sourceStill(atSeconds: seconds, maxWidth: maxWidth)
+            }.value
+            return loadGeneration == gen ? image : nil
+        }
         // Guard against zap/stop clearing the LRU: a stale extractor's segment indices
         // collide with the next source's.
-        guard let source, loadGeneration == gen else { return nil }
         let extractor: FrameExtractor
         if let idx = scrubThumbnailExtractors.firstIndex(where: { $0.segmentIndex == source.segmentIndex }) {
             let hit = scrubThumbnailExtractors.remove(at: idx)
@@ -140,8 +148,21 @@ extension AetherEngine {
         }
     }
 
-    /// True when the active session can serve cache-backed stills from `scrubThumbnail` with no
-    /// second connection: any native session (live or VOD, SegmentCache), a software live session
+    /// True when `scrubThumbnail` answers every position of the loaded VOD title, past the resident window
+    /// too, by reading the picture off the source through the session's own keyframe reader (exact byte
+    /// ranges through the session's source cache, `HLSVideoEngine.sourceStill`). A host that would otherwise
+    /// open a still reader of its own over the same file (`makeFrameExtractor`) needs none while this is true.
+    /// False before load, for live, on the software route, and where the I-frame rendition's rule refuses a
+    /// read of the source (a single-connection, sequential or held-connection origin; a container with
+    /// neither a keyframe index nor a seek to a time).
+    public var readsStillsOffSource: Bool {
+        guard !isLive, let session = nativeVideoSession else { return false }
+        return session.yieldsStills && session.sourceStillTimeline != nil
+    }
+
+    /// True when the active session can serve stills from `scrubThumbnail` with no reader of its own: any
+    /// native session (live or VOD: resident segments, and past them the session's keyframe reader where the
+    /// source allows one), a software live session
     /// (DVR packet ring, #544) and a software VOD session reading a remote source (packet cache,
     /// AE#605). False before load and on a software session that plays a local file, which keeps no
     /// cache because re-reading the file is free; `makeFrameExtractor()` serves that case. Hosts on a single-connection source should gate the

@@ -84,4 +84,21 @@ struct IFrameDenseStillsTests {
             #expect(abs(tfdt / timescale - timeline[index].startSeconds) < 0.002)
         }
     }
+
+    @Test("a scrub still past the resident window is the picture read off the source, rendition or not",
+          .timeLimit(.minutes(2)))
+    func sourceStillWithoutTheRendition() throws {
+        let (url, _) = try Self.writeTransportStream()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let engine = HLSVideoEngine(url: url, dvModeAvailable: false)
+        _ = try engine.start()
+        defer { engine.stop() }
+        #expect(engine.iFrameRenditionVerdict == .absent(.notRequested))
+        #expect(engine.sourceStillTimeline == .stills)
+        #expect(engine.yieldsStills)
+        for seconds in [4.5, 0.25, 2.0] {
+            let image = try #require(engine.sourceStill(atSeconds: seconds, maxWidth: 320), "no still at \(seconds)")
+            #expect(image.width <= 320 && image.width > 0)
+        }
+    }
 }

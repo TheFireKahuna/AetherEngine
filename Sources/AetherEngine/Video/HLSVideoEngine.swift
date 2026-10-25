@@ -249,10 +249,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// AE#682: the host asked for an I-frame rendition. Whether the session can serve one is decided
     /// in `start()` and read back as `iFrameRenditionVerdict`.
     var iFramePlaylistRequested = false
-    /// AE#682: an independent reader for a custom-IO source, which this session cannot reopen by URL.
-    /// Set before `start()`. The session owns it from then on and closes it: through the side reader
-    /// that took it, at once when the rendition stays absent, or in `stop()`.
-    var customIFrameReader: (reader: IOReader, formatHint: String?)?
+    /// An independent reader for a custom-IO source, which this session cannot reopen by URL: what the
+    /// session's keyframe reader reads through (`sessionKeyframeReader`). Set before `start()`. The session
+    /// owns it from then on and closes it: through the keyframe reader that took it, or in `stop()`.
+    var customKeyframeReader: (reader: IOReader, formatHint: String?)?
+    /// The keyframe reader reads a custom source's clone, which has no origin to ration. Set with the reader.
+    private var isCustomKeyframeSource = false
     private(set) var iFrameRenditionVerdict: IFrameRenditionEligibility.Verdict = .absent(.notRequested)
     /// False for a Dolby Vision Profile 5 / 10.0 source in a build without the
     /// `DolbyVisionStillReshaping` trait: none of its frames can become a correct still.
@@ -2501,8 +2503,26 @@ public final class HLSVideoEngine: @unchecked Sendable {
             heldSourceConnection: openProfile.avioHeldConnection,
             originIsSerial: sourceReopenableByURL
                 && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
-            secondReaderAvailable: sourceReopenableByURL || customIFrameReader != nil,
+            secondReaderAvailable: sourceReopenableByURL || customKeyframeReader != nil,
             stillsUnavailable: !stillsAvailable))
+        // A scrub still past the resident window reads off the source by the same rule, whether or not the
+        // rendition was asked for.
+        if case .served(let timeline) = IFrameRenditionEligibility.candidate(.init(
+            requested: true,
+            isLive: isLiveSession,
+            planBoundariesClaimRandomAccess: planBoundariesClaimRandomAccess,
+            seeksToTimeWithoutIndex: dem.seeksToTimeWithoutIndex,
+            sequentialOrigin: sequentialOrigin,
+            heldSourceConnection: openProfile.avioHeldConnection,
+            originIsSerial: sourceReopenableByURL
+                && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
+            secondReaderAvailable: sourceReopenableByURL || customKeyframeReader != nil,
+            stillsUnavailable: !stillsAvailable)) {
+            sourceStillTimeline = timeline
+        } else {
+            // Nothing will read a picture off this source, so a custom source's clone is not kept for it.
+            closeUnusedCustomKeyframeReader()
+        }
         // The compositor preview reads by URL only: a custom reader's clone belongs to the rendition. It reads
         // the plan's keyframes, so it needs the keyframe timeline.
         previewReadsSource = previewNeedsCompositor && IFrameRenditionEligibility.candidate(.init(
@@ -2554,7 +2574,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
                            + "format=\(rendition.format.logName) "
                            + "sdrCompanion=\(rendition.companionFormat?.logName ?? "none")", category: .session)
         } else if iFramePlaylistRequested {
-            closeUnusedCustomIFrameReader()
             if iFrameRenditionVerdict.isServed { iFrameRenditionVerdict = .absent(.noSecondReader) }
             if case .absent(let reason) = iFrameRenditionVerdict {
                 EngineLog.emit("[HLSVideoEngine] i-frame rendition: absent reason=\(reason.rawValue)",
@@ -3174,10 +3193,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             IFrameRendition.Entry(startPts: $0.startPts, startSeconds: $0.startSeconds,
                                   durationSeconds: $0.durationSeconds)
         }
-        let keyframes = makeKeyframeRendition(
-            config: cfg, entries: entries,
-            cache: IFramePayloadCache(),
-            format: .keyframes, buildFragment: { _, _, _ in nil }, custom: nil)
+        guard let keyframes = makeKeyframeRendition(
+            entries: entries, cache: IFramePayloadCache(),
+            format: .keyframes, buildFragment: { _, _, _ in nil }) else { return nil }
         previewKeyframes = keyframes
         previewKeyframeBuilder = builder
         EngineLog.emit("[HLSVideoEngine] compositor preview: source keyframe reader ready "
@@ -3273,7 +3291,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
         previewKeyframes = nil
         let previewBuilder = previewKeyframeBuilder
         previewKeyframeBuilder = nil
-        closeUnusedCustomIFrameReader()
+        closeUnusedCustomKeyframeReader()
+        keyframeReaderLock.lock()
+        let keyframes = keyframeReader
+        keyframeReader = nil
+        keyframeReaderLock.unlock()
+        // Ends a read in flight, so the shutdowns below do not wait it out.
+        keyframes?.interrupt()
+        sourceStillLock.lock()
+        let stillDecoder = sourceStillDecoder
+        sourceStillDecoder = nil
+        sourceStillTimeline = nil
+        sourceStillLock.unlock()
         savedVideoConfig = nil
         savedAudioConfig = nil
         let ownedParams = ownedCodecParams
@@ -3313,6 +3342,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         BlockingWork.detached {
             iFrames?.shutdown()
             previewFrames?.shutdown()
+            keyframes?.close()
+            stillDecoder?.close()
             previewBuilder?.close()
             _ = p?.waitForFinish(timeout: 3.0)
             s?.stop()
@@ -3367,27 +3398,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
                               bandwidth: IFrameStillBuilder.bandwidth(shortestSegmentSeconds: shortest),
                               averageBandwidth: IFrameStillBuilder.averageBandwidth(meanSegmentSeconds: mean))
         }
-        // The keyframe reader owns the clone from here; `stop()` must not close it a second time.
-        let custom = customIFrameReader
-        customIFrameReader = nil
-
         if timeline == .stills {
-            guard let still = makeStillBuilder() else {
-                custom?.reader.close()
-                return nil
-            }
+            guard let still = makeStillBuilder() else { return nil }
             let entries = Self.denseStillEntries(plan: plan, timeBaseSeconds: sourceVideoTbSeconds)
             // The read is the picture's run, decoded and encoded on the rendition's queue, so what the cache
             // keeps per entry is the still itself.
             return makeKeyframeRendition(
-                config: cfg, entries: entries, cache: IFramePayloadCache(), format: stillsFormat(still, entries: entries),
+                entries: entries, cache: IFramePayloadCache(), format: stillsFormat(still, entries: entries),
                 read: { reader, entry in reader.pictureRun(atPts: entry.startPts).flatMap { still.encode(run: $0) } },
                 buildFragment: { sample, index, entry in
                     let built = still.output(sample: sample, index: index, startSeconds: entry.startSeconds,
                                              durationSeconds: entry.durationSeconds)
                     return IFrameFragmentBuilder.Output(initSegment: built.initSegment, fragment: built.fragment)
-                },
-                custom: custom)
+                })
         }
 
         // Fragments are muxed in memory and payloads cached in memory: nothing here is written to disk, so
@@ -3418,39 +3441,37 @@ public final class HLSVideoEngine: @unchecked Sendable {
                          })
         }
         return makeKeyframeRendition(
-            config: cfg, entries: entries,
-            cache: IFramePayloadCache(),
-            format: .keyframes, buildFragment: buildKeyframe, companion: companion, custom: custom)
+            entries: entries, cache: IFramePayloadCache(),
+            format: .keyframes, buildFragment: buildKeyframe, companion: companion)
     }
 
-    /// The read half every keyframe consumer shares: the keyframe from the source's index, or from a
-    /// demuxer of its own where only libavformat can read the container (`IFrameKeyframeReader`), the
-    /// P7 conversion the playing samples get, and the gates that keep it off a busy or serial origin.
-    private func makeKeyframeRendition(
-        config cfg: HLSSegmentProducer.StreamConfig,
-        entries: [IFrameRendition.Entry],
-        cache: IFramePayloadCache,
-        format: IFrameRenditionFormat,
-        read: @escaping (IFrameKeyframeReader, IFrameRendition.Entry) -> Data? = { reader, entry in
-            reader.payload(startPts: entry.startPts)
-        },
-        buildFragment: @escaping (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?,
-        companion: (format: IFrameRenditionFormat,
-                    build: (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?)? = nil,
-        custom: (reader: IOReader, formatHint: String?)?
-    ) -> IFrameRendition {
+    /// The session's one reader of single pictures off the source (`IFrameKeyframeReader`): the I-frame
+    /// rendition's, the compositor preview's and the scrub stills' past the resident window. The keyframe
+    /// from the source's index, or from a demuxer of its own where only libavformat can read the container,
+    /// with the P7 conversion the playing samples get. Made on the first request that needs it, over the
+    /// custom source's clone when there is one; `stop()` interrupts and closes it. Under `keyframeReaderLock`.
+    private var keyframeReader: IFrameKeyframeReader?
+    private let keyframeReaderLock = NSLock()
+
+    private func sessionKeyframeReader() -> IFrameKeyframeReader? {
+        keyframeReaderLock.lock()
+        defer { keyframeReaderLock.unlock() }
+        if let keyframeReader { return keyframeReader }
+        guard let cfg = savedVideoConfig, let session = demuxer else { return nil }
         let framing = cfg.nalFramingOverride ?? A53SEIParser.nalFraming(
             codec: cfg.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC ? .hevc : .h264,
             extradata: cfg.codecpar.pointee.extradata.map { UnsafePointer($0) },
             size: Int(cfg.codecpar.pointee.extradata_size))
         let url = sourceURL, headerStore = requestHeaders
-        let positions: [Int64: Int64] = demuxer.map { dem in
-            Dictionary(dem.indexedKeyframeEntries(streamIndex: dem.videoStreamIndex).map { ($0.pts, $0.pos) },
-                       uniquingKeysWith: { first, _ in first })
-        } ?? [:]
-        let session = demuxer
+        let positions: [Int64: Int64] = Dictionary(
+            session.indexedKeyframeEntries(streamIndex: session.videoStreamIndex).map { ($0.pts, $0.pos) },
+            uniquingKeysWith: { first, _ in first })
+        // The reader owns the clone from here; `stop()` must not close it a second time.
+        let custom = customKeyframeReader
+        customKeyframeReader = nil
+        isCustomKeyframeSource = custom != nil
         let reader = IFrameKeyframeReader(
-            resolveIndex: {
+            resolveIndex: { [weak session] in
                 guard let session else { return .failed("the session's demuxer is gone") }
                 return await Self.iFrameKeyframeIndex(url: url, headers: headerStore.current, demuxer: session,
                                                       custom: custom?.reader)
@@ -3458,7 +3479,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             position: { positions[$0] },
             // Over exact range reads of the source, through the source cache: a seek reads what it lands
             // on and nothing streams ahead of it. A disc title is opened as the session's.
-            open: { dem in
+            open: { [weak session] dem in
                 let title = session?.selectedDiscTitleID
                 if let custom {
                     try dem.open(reader: custom.reader, formatHint: custom.formatHint, profile: .iFrameSideDemuxer,
@@ -3485,6 +3506,98 @@ public final class HLSVideoEngine: @unchecked Sendable {
             cleanup: { custom?.reader.close() },
             convertP7ToProfile81: cfg.convertP7ToProfile81,
             nalFraming: framing)
+        keyframeReader = reader
+        return reader
+    }
+
+    /// What a scrub still past the resident window reads off the source (`sourceStill`): the plan's keyframes,
+    /// or the picture at a time on a source with no keyframe list; nil while this session may not read one.
+    /// Decided in `serve()` by the I-frame rendition's own rule.
+    private(set) var sourceStillTimeline: IFrameRenditionEligibility.Timeline?
+    /// The decoder `sourceStill` turns a keyframe or a picture run into an image with, made on first use.
+    /// Under `sourceStillLock`, which also keeps one still at a time on it.
+    private var sourceStillDecoder: FrameDecodeContext?
+    private let sourceStillLock = NSLock()
+
+    /// A still of the picture at `seconds` (playlist axis), read off the source through the session's keyframe
+    /// reader, for a scrub preview past the resident window: the keyframe at or before it where the plan lists
+    /// keyframes, the picture at it where the source seeks to a time. nil while no picture can be read off this
+    /// source, when the origin has no room for a read, or when the read fails. Blocks; any thread but main.
+    func sourceStill(atSeconds seconds: Double, maxWidth: Int) -> CGImage? {
+        guard let timeline = sourceStillTimeline, seconds.isFinite, keyframeReadsAllowed() else { return nil }
+        restartLock.lock()
+        let plan = segmentPlan
+        let keyframes = planKeyframePts.sorted()
+        let cfg = savedVideoConfig
+        restartLock.unlock()
+        let tb = sourceVideoTbSeconds
+        guard let cfg, tb > 0, !plan.isEmpty else { return nil }
+        // The plan's segment holding `seconds`, and the target on the source axis inside it.
+        var first = 0, past = plan.count
+        while first < past {
+            let mid = (first + past) / 2
+            if plan[mid].startSeconds <= seconds { first = mid + 1 } else { past = mid }
+        }
+        let segment = plan[max(0, first - 1)]
+        let target = segment.startPts + Int64((max(0, seconds - segment.startSeconds) / tb).rounded())
+        guard let reader = sessionKeyframeReader() else { return nil }
+        waitForKeyframeLink { false }
+        sourceStillLock.lock()
+        defer { sourceStillLock.unlock() }
+        if sourceStillDecoder == nil {
+            // The decoder reads the samples as the session serves them: Annex B ones with the source's own
+            // extradata, length-prefixed ones with the record the muxer writes.
+            sourceStillDecoder = FrameDecodeContext(
+                streamParameters: cfg.codecpar, timeBase: cfg.timeBase,
+                extradata: cfg.convertsAnnexBSamples ? nil : cfg.extradataOverride)
+        }
+        guard let decoder = sourceStillDecoder, (try? decoder.ensureOpen()) != nil else { return nil }
+        switch timeline {
+        case .keyframes:
+            // The keyframe at or before the target: what playing from there would show first.
+            var low = 0, high = keyframes.count
+            while low < high {
+                let mid = (low + high) / 2
+                if keyframes[mid] <= target { low = mid + 1 } else { high = mid }
+            }
+            let keyframe = low > 0 ? keyframes[low - 1] : segment.startPts
+            return reader.payload(startPts: keyframe).flatMap { decoder.decodeStill(keyframe: $0, targetWidth: maxWidth) }
+        case .stills:
+            return reader.pictureRun(atPts: target).flatMap { decoder.decodeStill(run: $0, targetWidth: maxWidth) }
+        }
+    }
+
+    /// Whether a read off the source may go out now. The budget learns its limits mid-session (a 429 halves
+    /// them and arms a pacer), so the check `start()` made is repeated before every read. A custom reader has
+    /// no origin.
+    private func keyframeReadsAllowed() -> Bool {
+        isCustomKeyframeSource || !(OriginRequestBudget.shared.requiresSerialRequests(sourceURL)
+                                    || OriginRequestBudget.shared.isPaced(sourceURL))
+    }
+
+    /// A seek or a producer restart owns the link for a moment; a picture can wait that out, but not
+    /// ordinary fetching, or it would stall whenever the pump is busy.
+    private func waitForKeyframeLink(_ shouldStop: () -> Bool) {
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline, !shouldStop(), restartInFlight || (seekInFlight?.isSeeking ?? false) {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+    }
+
+    /// A rendition over the session's keyframe reader: what each entry reads (`read`), and how a read
+    /// becomes a fragment. nil when the reader cannot be made (the session has no demuxer).
+    private func makeKeyframeRendition(
+        entries: [IFrameRendition.Entry],
+        cache: IFramePayloadCache,
+        format: IFrameRenditionFormat,
+        read: @escaping (IFrameKeyframeReader, IFrameRendition.Entry) -> Data? = { reader, entry in
+            reader.payload(startPts: entry.startPts)
+        },
+        buildFragment: @escaping (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?,
+        companion: (format: IFrameRenditionFormat,
+                    build: (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?)? = nil
+    ) -> IFrameRendition? {
+        guard let reader = sessionKeyframeReader() else { return nil }
         return IFrameRendition(
             entries: entries,
             cache: cache,
@@ -3492,23 +3605,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             readPayload: { read(reader, $0) },
             buildFragment: buildFragment,
             companion: companion,
-            waitForLink: { [weak self] shouldStop in
-                // A seek or a producer restart owns the link for a moment; a thumbnail can wait that
-                // out, but not ordinary fetching, or it would stall whenever the pump is busy.
-                let deadline = Date().addingTimeInterval(2)
-                while Date() < deadline, !shouldStop(), let self,
-                      self.restartInFlight || (self.seekInFlight?.isSeeking ?? false) {
-                    Thread.sleep(forTimeInterval: 0.05)
-                }
-            },
-            // The budget learns its limits mid-session (a 429 halves them and arms a pacer), so the
-            // check `start()` made is repeated before every read. A custom reader has no origin.
-            sourceReadsAllowed: {
-                custom != nil || !(OriginRequestBudget.shared.requiresSerialRequests(url)
-                                   || OriginRequestBudget.shared.isPaced(url))
-            },
-            interruptReads: { reader.interrupt() },
-            closeReader: { reader.close() })
+            waitForLink: { [weak self] shouldStop in self?.waitForKeyframeLink(shouldStop) },
+            sourceReadsAllowed: { [weak self] in self?.keyframeReadsAllowed() ?? false })
     }
 
     /// Stop answering I-frame requests. The shutdown waits for a read in flight, so it runs off the
@@ -3521,9 +3619,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
         DispatchQueue.global(qos: .utility).async { rendition.shutdown() }
     }
 
-    private func closeUnusedCustomIFrameReader() {
-        customIFrameReader?.reader.close()
-        customIFrameReader = nil
+    private func closeUnusedCustomKeyframeReader() {
+        keyframeReaderLock.lock()
+        let custom = customKeyframeReader
+        customKeyframeReader = nil
+        keyframeReaderLock.unlock()
+        custom?.reader.close()
     }
 
     // MARK: - Producer construction + restart
