@@ -9,6 +9,7 @@ import Foundation
 /// luma block it covers (2x2 for 4:2:0, 2x1 for 4:2:2, 1x1 for 4:4:4).
 enum PlanarFrameShaderSource {
     static let source: String = template.replacingOccurrences(of: "/*PF_TABLES*/", with: tables)
+        .replacingOccurrences(of: "/*PF_GRAIN*/", with: FilmGrainShaderSource.source)
 
     /// The double-float constants and the exp2 / log2 tables, computed in double and written as hex float pairs, so
     /// the kernel's values are exactly the host's.
@@ -77,6 +78,8 @@ constant uint FC_MATRIX        [[function_constant(28)]];
 constant uint FC_BITDEPTH_RGB  [[function_constant(29)]];
 // Constant luminance: the stream's TransferCharacteristics (1, 4, 5, 6, 7, 8, 13, 14, 15, 16 or 18).
 constant uint FC_TRANSFER      [[function_constant(30)]];
+// AV1 film grain (FilmGrainShaderSource) on every sample read, from the tables in buffer 5.
+constant bool FC_GRAIN         [[function_constant(31)]];
 
 constant bool PF_DITHER = FC_FRACTION_BITS > 0u;
 constant uint PF_BLOCK_W = 1u << FC_OUT_LOG2_W;
@@ -297,14 +300,54 @@ static inline uint pf_read(device const uchar* src, constant PFFrame& f,
     return pf_read_row(src + f.plane_offset[plane] + y * f.linesize[plane], step, offset, shift, depth, x);
 }
 
-static inline uint pf_c0(device const uchar* s, constant PFFrame& f, uint x, uint y) {
+// Components 0...2 as decoded.
+static inline uint pf_r0(device const uchar* s, constant PFFrame& f, uint x, uint y) {
     return pf_read(s, f, FC_C0_PLANE, FC_C0_STEP, FC_C0_OFFSET, FC_C0_SHIFT, FC_C0_DEPTH, x, y);
 }
-static inline uint pf_c1(device const uchar* s, constant PFFrame& f, uint x, uint y) {
+static inline uint pf_r1(device const uchar* s, constant PFFrame& f, uint x, uint y) {
     return pf_read(s, f, FC_C1_PLANE, FC_C1_STEP, FC_C1_OFFSET, FC_C1_SHIFT, FC_C1_DEPTH, x, y);
 }
-static inline uint pf_c2(device const uchar* s, constant PFFrame& f, uint x, uint y) {
+static inline uint pf_r2(device const uchar* s, constant PFFrame& f, uint x, uint y) {
     return pf_read(s, f, FC_C2_PLANE, FC_C2_STEP, FC_C2_OFFSET, FC_C2_SHIFT, FC_C2_DEPTH, x, y);
+}
+
+// The picture and the film grain tables (bound to a placeholder when FC_GRAIN is off).
+struct pf_src {
+    device const uchar* p;
+    device const uchar* g;
+};
+
+// The sample of plane `plane` at (x, y), as decoded: the component that lives there (for GBR, plane 0 is G).
+static inline uint pf_plane_sample(pf_src s, constant PFFrame& f, uint plane, uint x, uint y) {
+    if (FC_C0_PLANE == plane) { return pf_r0(s.p, f, x, y); }
+    if (FC_C1_PLANE == plane) { return pf_r1(s.p, f, x, y); }
+    return pf_r2(s.p, f, x, y);
+}
+
+/*PF_GRAIN*/
+
+// A sample of plane `plane` with its film grain. Grain is a property of the plane (AV1's planes 0, 1, 2), not of the
+// component the finisher reads it as. Chroma takes the un-noised luma at its site.
+static inline uint pf_grained(pf_src s, constant PFFrame& f, uint plane, uint v, uint x, uint y) {
+    if (plane == 0u) { return fg_luma(s.g, v, x, y); }
+    uint lx = x << FC_SRC_LOG2_W, ly = y << FC_SRC_LOG2_H;
+    uint average = pf_plane_sample(s, f, 0u, lx, ly);
+    if (FC_SRC_LOG2_W != 0u) { average = (average + pf_plane_sample(s, f, 0u, min(lx + 1u, f.width - 1u), ly) + 1u) >> 1; }
+    return fg_chroma(s.g, plane - 1u, v, average, FC_SRC_LOG2_W, FC_SRC_LOG2_H, x, y);
+}
+
+// Components 0...2 as shown: with their grain under FC_GRAIN.
+static inline uint pf_c0(pf_src s, constant PFFrame& f, uint x, uint y) {
+    uint v = pf_r0(s.p, f, x, y);
+    return FC_GRAIN ? pf_grained(s, f, FC_C0_PLANE, v, x, y) : v;
+}
+static inline uint pf_c1(pf_src s, constant PFFrame& f, uint x, uint y) {
+    uint v = pf_r1(s.p, f, x, y);
+    return FC_GRAIN ? pf_grained(s, f, FC_C1_PLANE, v, x, y) : v;
+}
+static inline uint pf_c2(pf_src s, constant PFFrame& f, uint x, uint y) {
+    uint v = pf_r2(s.p, f, x, y);
+    return FC_GRAIN ? pf_grained(s, f, FC_C2_PLANE, v, x, y) : v;
 }
 
 // MARK: - Codes at the output depth
@@ -371,7 +414,7 @@ static inline int4 pf_cubic8(int k) {
 }
 
 // Source chroma (components 1, 2) at output chroma sample `o`, as exact numerators over 2^20 (2^10 per axis).
-static inline long2 pf_resample(device const uchar* s, constant PFFrame& f, uint2 o) {
+static inline long2 pf_resample(pf_src s, constant PFFrame& f, uint2 o) {
     if (FC_SRC_LOG2_W == FC_OUT_LOG2_W && FC_SRC_LOG2_H == FC_OUT_LOG2_H) {
         return long2(long(pf_c1(s, f, o.x, o.y)), long(pf_c2(s, f, o.x, o.y))) << 20;
     }
@@ -416,10 +459,10 @@ static inline uint pf_resampled_word(long c, uint d) {
 
 // MARK: - RGB
 
-static inline int3 pf_rgb_codes(device const uchar* s, constant PFFrame& f, uint x, uint y) {
+static inline int3 pf_rgb_codes(pf_src s, constant PFFrame& f, uint x, uint y) {
     if (FC_PALETTE) {
         // AV_PIX_FMT_PAL8: an index into 256 native-endian ARGB words in plane 1.
-        uint e = *(device const uint*)(s + f.plane_offset[1] + pf_c0(s, f, x, y) * 4u);
+        uint e = *(device const uint*)(s.p + f.plane_offset[1] + pf_r0(s.p, f, x, y) * 4u);
         return int3(int((e >> 16) & 0xFFu), int((e >> 8) & 0xFFu), int(e & 0xFFu));
     }
     return int3(int(pf_c0(s, f, x, y)), int(pf_c1(s, f, x, y)), int(pf_c2(s, f, x, y)));
@@ -665,7 +708,7 @@ static inline uint3 pf_round_codes_df(thread pf_df* words) {
 constant uint PF_SRC_BW = 1u << FC_SRC_LOG2_W;
 constant uint PF_SRC_BH = 1u << FC_SRC_LOG2_H;
 
-static inline void pf_load_window(device const uchar* s, constant PFFrame& f, uint2 g, thread int2 (&w)[5][5]) {
+static inline void pf_load_window(pf_src s, constant PFFrame& f, uint2 g, thread int2 (&w)[5][5]) {
     int src_w = int((f.width + PF_SRC_BW - 1u) >> FC_SRC_LOG2_W);
     int src_h = int((f.height + PF_SRC_BH - 1u) >> FC_SRC_LOG2_H);
     for (int j = 0; j < 5; ++j) {
@@ -740,21 +783,23 @@ kernel void pf_finish(device const uchar*            src     [[buffer(0)]],
                       constant PFFrame&               f       [[buffer(1)]],
                       device atomic_uint*             list    [[buffer(2)]],
                       device const pf_luma_entry*     lut     [[buffer(4)]],
+                      device const uchar*             grain   [[buffer(5)]],
                       texture2d<uint, access::write>  out_y   [[texture(0)]],
                       texture2d<uint, access::write>  out_c   [[texture(1)]],
                       uint2                           gid     [[thread_position_in_grid]]) {
+    pf_src s = pf_src{src, grain};
     if (FC_MODE == 4u || FC_MODE == 5u) {
         // gid is a source chroma sample; its block of pixels.
         uint2 base = gid * uint2(PF_SRC_BW, PF_SRC_BH);
         if (base.x >= f.width || base.y >= f.height) { return; }
         int2 window[5][5];
-        pf_load_window(src, f, gid, window);
+        pf_load_window(s, f, gid, window);
         uint flagged = 0u;  // bit k: the block's pixel k needs the exact recompute
         for (uint j = 0u; j < PF_SRC_BH; ++j) {
             for (uint i = 0u; i < PF_SRC_BW; ++i) {
                 uint2 p = base + uint2(i, j);
                 if (p.x >= f.width || p.y >= f.height) { continue; }
-                uint y = pf_c0(src, f, p.x, p.y);
+                uint y = pf_c0(s, f, p.x, p.y);
                 long2 c = pf_window_sample(window, gid, p);
                 if (FC_MODE == 4u) {
                     pf_write_codes(out_y, out_c, p, pf_convert_codes(f, long(y), c));
@@ -799,7 +844,7 @@ kernel void pf_finish(device const uchar*            src     [[buffer(0)]],
     uint cb, cr;
     if (FC_MODE == 3u) {
         // RGB goes out 4:4:4: one pixel, all three outputs from one read.
-        int3 c = pf_rgb_codes(src, f, gid.x, gid.y);
+        int3 c = pf_rgb_codes(s, f, gid.x, gid.y);
         pf_df r = pf_df{float(c.x), 0.0f}, g = pf_df{float(c.y), 0.0f}, b = pf_df{float(c.z), 0.0f};
         out_y.write(uint4(pf_container(pf_affine_word(f, 0u, r, g, b, PF_WORD_MAX), gid.x, gid.y)), gid);
         cb = pf_affine_word(f, 1u, r, g, b, PF_WORD_MAX);
@@ -810,19 +855,19 @@ kernel void pf_finish(device const uchar*            src     [[buffer(0)]],
             for (uint i = 0u; i < PF_BLOCK_W; ++i) {
                 uint2 p = base + uint2(i, j);
                 if (p.x < f.width && p.y < f.height) {
-                    out_y.write(uint4(pf_container(pf_luma_word(pf_c0(src, f, p.x, p.y), FC_C0_DEPTH), p.x, p.y)), p);
+                    out_y.write(uint4(pf_container(pf_luma_word(pf_c0(s, f, p.x, p.y), FC_C0_DEPTH), p.x, p.y)), p);
                 }
             }
         }
         if (FC_MODE == 2u) {
             cb = cr = 1u << (FC_TARGET_BITS - 1u + FC_FRACTION_BITS);
         } else if (FC_MODE == 1u) {
-            long2 c = pf_resample(src, f, gid);
+            long2 c = pf_resample(s, f, gid);
             cb = pf_resampled_word(c.x, FC_C1_DEPTH);
             cr = pf_resampled_word(c.y, FC_C2_DEPTH);
         } else {
-            cb = pf_chroma_word(pf_c1(src, f, gid.x, gid.y), FC_C1_DEPTH);
-            cr = pf_chroma_word(pf_c2(src, f, gid.x, gid.y), FC_C2_DEPTH);
+            cb = pf_chroma_word(pf_c1(s, f, gid.x, gid.y), FC_C1_DEPTH);
+            cr = pf_chroma_word(pf_c2(s, f, gid.x, gid.y), FC_C2_DEPTH);
         }
     }
     out_c.write(uint4(pf_container(cb, 2u * gid.x, gid.y), pf_container(cr, 2u * gid.x + 1u, gid.y), 0u, 0u), gid);
@@ -842,18 +887,38 @@ kernel void pf_cl_correct(device const uchar*            src     [[buffer(0)]],
                           constant PFFrame&               f       [[buffer(1)]],
                           device atomic_uint*             list    [[buffer(2)]],
                           device const pf_luma_entry*     lut     [[buffer(4)]],
+                          device const uchar*             grain   [[buffer(5)]],
                           texture2d<uint, access::write>  out_y   [[texture(0)]],
                           texture2d<uint, access::write>  out_c   [[texture(1)]],
                           uint                            gid     [[thread_position_in_grid]]) {
+    pf_src s = pf_src{src, grain};
     uint count = min(atomic_load_explicit(&list[0], memory_order_relaxed), f.list_capacity);
     if (gid >= count) { return; }
     uint packed = atomic_load_explicit(&list[1u + gid], memory_order_relaxed);
     uint2 p = uint2(packed & 0xFFFFu, packed >> 16);
-    pf_luma_entry e = lut[pf_c0(src, f, p.x, p.y)];
+    pf_luma_entry e = lut[pf_c0(s, f, p.x, p.y)];
     pf_df ey, epb, epr, words[3];
-    pf_cl_signals(f, e, pf_resample(src, f, p), ey, epb, epr);
+    pf_cl_signals(f, e, pf_resample(s, f, p), ey, epb, epr);
     pf_cl_exact(ey, epb, epr, pf_df{e.ly.x, e.ly.y}, f, words);
     pf_write_codes(out_y, out_c, p, pf_round_codes_df(words));
+}
+
+// The picture's planes with their film grain, at the source's layout and depth (`dst` laid out as `src`): AV1's
+// grained output itself, for conformance against reference decoders. One thread per sample, gid.z the plane.
+kernel void fg_planes(device const uchar*  src    [[buffer(0)]],
+                      constant PFFrame&    f      [[buffer(1)]],
+                      device const uchar*  grain  [[buffer(5)]],
+                      device uchar*        dst    [[buffer(6)]],
+                      uint3                gid    [[thread_position_in_grid]]) {
+    pf_src s = pf_src{src, grain};
+    uint plane = gid.z;
+    uint sx = plane == 0u ? 0u : FC_SRC_LOG2_W, sy = plane == 0u ? 0u : FC_SRC_LOG2_H;
+    uint w = (f.width + (1u << sx) - 1u) >> sx, h = (f.height + (1u << sy) - 1u) >> sy;
+    if (gid.x >= w || gid.y >= h) { return; }
+    uint v = pf_plane_sample(s, f, plane, gid.x, gid.y);
+    uint out = FC_GRAIN ? pf_grained(s, f, plane, v, gid.x, gid.y) : v;
+    device uchar* row = dst + f.plane_offset[plane] + gid.y * f.linesize[plane];
+    if (FC_C0_DEPTH > 8u) { ((device ushort*)row)[gid.x] = ushort(out); } else { row[gid.x] = uchar(out); }
 }
 """
 }
