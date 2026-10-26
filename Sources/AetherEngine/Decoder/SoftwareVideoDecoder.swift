@@ -1,5 +1,6 @@
 import Foundation
 import os
+import Synchronization
 import CoreMedia
 import CoreVideo
 import AetherLibavformat
@@ -17,8 +18,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     // telecine, the film cadence, every counter below) belongs to the decode thread: `decode(packet:epoch:)` and
     // `drainForEndOfStream()`, which run under `gate`. Nothing else takes `gate` but `close()`, once, to wait out the call
     // in progress before it tears the state down; the frame path takes no lock any other thread contends for. A host's
-    // `flush()`, the discard switch and the skip threshold are small control state the decode thread reads at its next
-    // call (`control`, `skipLock`). A finished frame reaches the host through `delivery`, in decode order, from the
+    // `flush()`, the discard switch and the skip threshold are control state the decode thread reads at its next call:
+    // atomics (the epoch, the reset and discard requests) it reads without a lock, and the skip threshold, a multi-word
+    // CMTime, under `skipThreshold`. A finished frame reaches the host through `delivery`, in decode order, from the
     // GPU's completion: the decode thread never waits on the GPU.
 
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
@@ -71,13 +73,13 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// smeared picture names its own cause instead of looking like a renderer bug.
     private var loggedSARReject = false
 
-    /// Skip pre-seek frames; decoded for reference but not converted. Set by the host, read by the decode thread, under
-    /// `skipLock` (CMTime is multi-word).
+    /// Skip pre-seek frames; decoded for reference but not converted. Set by the host, read by the decode thread and the
+    /// completions.
     var skipUntilPTS: CMTime? {
-        get { skipLock.lock(); defer { skipLock.unlock() }; return _skipUntilPTS }
-        set { skipLock.lock(); _skipUntilPTS = newValue; skipLock.unlock() }
+        get { skipThreshold.withLock { $0 } }
+        set { skipThreshold.withLock { $0 = newValue } }
     }
-    private var _skipUntilPTS: CMTime?
+    private let skipThreshold = Mutex<CMTime?>(nil)
 
     /// Set per packet by a caller that knows the packet's picture would be too late to show (it sets
     /// `skipUntilPTS` to the first picture that is not): a picture no other picture references is then
@@ -89,7 +91,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// film run) is not handed the late pictures at all: it starts over on the first picture that is not
     /// late, as it does after a seek, so the pictures it shows keep their timestamps and cadence.
     func discardsNonReferencePictures(_ discard: Bool) {
-        control.withLock { $0.discard = discard }
+        discardRequest.store(discard ? Self.discardOn : Self.discardOff, ordering: .releasing)
     }
 
     /// Late pictures are bypassing the consecutive-picture chain, which starts over on the first one that is
@@ -98,28 +100,27 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// The stream's decoded pictures have carried A53 captions.
     private var carriesDecodedCaptions = false
 
-    /// What the host's calls leave for the decode thread: the feed epoch (AE#492), a reset `flush()` asks for, the
-    /// discard switch, and `close()`.
-    private struct Control {
-        var epoch: UInt64 = 0
-        var resetPending = false
-        var resetFilterGraph = false
-        var discard: Bool?
-        var closed = false
-    }
-    private let control = OSAllocatedUnfairLock(initialState: Control())
-    var feedEpoch: UInt64 { control.withLock { $0.epoch } }
+    // What the host's calls leave for the decode thread. The feed epoch (AE#492) is read lock-free between frames; a
+    // flush's reset request and the discard switch are taken by the decode thread at its next call. `flush()` and
+    // `close()` serialise with each other under `hostCalls`, which no frame path takes.
+    private let epoch = Atomic<UInt64>(0)
+    private let closed = Atomic<Bool>(false)
+    /// Bit 0: a reset is pending; bit 1: it resets the consecutive-picture chains too.
+    private let resetRequest = Atomic<UInt8>(0)
+    private static let resetPending: UInt8 = 1, resetFilterGraph: UInt8 = 2
+    /// The discard switch's latest value not yet applied: 0 none, else off or on.
+    private let discardRequest = Atomic<UInt8>(0)
+    private static let discardOff: UInt8 = 1, discardOn: UInt8 = 2
+    private let hostCalls = Mutex<Void>(())
+    var feedEpoch: UInt64 { epoch.load(ordering: .acquiring) }
     /// Whether `epoch` is still the feed's, for the decode thread between frames.
-    private func isCurrent(_ epoch: UInt64) -> Bool { control.withLock { !$0.closed && $0.epoch == epoch } }
-    private let skipLock = NSLock()
+    private func isCurrent(_ e: UInt64) -> Bool { !closed.load(ordering: .acquiring) && epoch.load(ordering: .acquiring) == e }
 
     /// Clear the skip threshold only if it is still the one we acted on.
     private func clearSkip(ifStillAt threshold: CMTime) {
-        skipLock.lock()
-        if let current = _skipUntilPTS, CMTimeCompare(current, threshold) == 0 {
-            _skipUntilPTS = nil
+        skipThreshold.withLock { current in
+            if let set = current, CMTimeCompare(set, threshold) == 0 { current = nil }
         }
-        skipLock.unlock()
     }
 
     /// Held by the decode thread for each call; `close()` takes it once (see Threading, above).
@@ -303,8 +304,16 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// on the decode thread, where it learns which fields the bitstream states itself.
     private var colourFill = ColourBackfill(container: .unspecified)
 
-    /// Deinterlaced frames dropped for carrying no PTS (see the drop site in decode()).
-    private var droppedUntimestampedFields = 0
+    /// Deinterlaced or telecine-recovered pictures dropped for carrying no PTS: counted on the decode thread and, for
+    /// inverse telecine, whose timestamps are known only when its pass has completed, on the completion queue.
+    private let droppedUntimestamped = Atomic<Int>(0)
+
+    private func noteUntimestamped() {
+        let count = droppedUntimestamped.wrappingAdd(1, ordering: .relaxed).newValue
+        if count == 1 || count % 250 == 0 {
+            EngineLog.emit("[SWDecoder] dropped \(count) untimestamped deinterlaced picture(s)", category: .swPlayback)
+        }
+    }
 
     /// #407: frames whose PTS was reconstructed from `best_effort_timestamp` (see the repair site
     /// in drainDecodedFrames()).
@@ -486,14 +495,14 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// reset (the decoder's buffers, the consecutive-picture chains) and the discard switch. The current epoch, or nil
     /// once the decoder is closed. Caller holds `gate`.
     private func takeControl() -> UInt64? {
-        let pending = control.withLock { c -> Control in
-            defer { c.resetPending = false; c.resetFilterGraph = false; c.discard = nil }
-            return c
-        }
-        guard !pending.closed else { return nil }
-        if pending.resetPending {
+        guard !closed.load(ordering: .acquiring) else { return nil }
+        // The epoch first: a flush stores its request before it moves the epoch, so a request it made for this epoch is
+        // seen below.
+        let current = epoch.load(ordering: .acquiring)
+        let reset = resetRequest.exchange(0, ordering: .acquiring)
+        if reset & Self.resetPending != 0 {
             // Deinterlacer temporal references are stale across seeks.
-            if pending.resetFilterGraph {
+            if reset & Self.resetFilterGraph != 0 {
                 window?.reset()
                 inverseTelecine?.reset()
             }
@@ -501,13 +510,15 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             chainRestartPending = false
             if let ctx = codecContext { avcodec_flush_buffers(ctx) }
         }
-        if let discard = pending.discard, let ctx = codecContext {
+        let discardValue = discardRequest.exchange(0, ordering: .acquiring)
+        if discardValue != 0, let ctx = codecContext {
+            let discard = discardValue == Self.discardOn
             ctx.pointee.skip_frame = discard && !carriesDecodedCaptions ? AVDISCARD_NONREF : AVDISCARD_DEFAULT
             if discard, window?.isActive == true || inverseTelecine != nil || filmCadence?.isActive == true {
                 chainRestartPending = true
             }
         }
-        return pending.epoch
+        return current
     }
 
     /// The next delivery ticket of `epoch`'s line, which starts at 0. Decode thread.
@@ -592,7 +603,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             }
 
             if let ivtc = inverseTelecine(for: f), let picture = hold(f) {
-                render(ivtc.push(picture).map { .picture($0.picture, pts: $0.pts) }, timeBase: ivtc.outputTimeBase, epoch: epoch)
+                telecine(ivtc, picture, epoch: epoch)
                 continue
             }
             let isInterlaced = (f.pointee.flags & AV_FRAME_FLAG_INTERLACED) != 0
@@ -688,11 +699,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             case .field(_, let cur, _, _, _, _, let t): (picture, pts) = (cur, t)
             }
             guard pts != Int64.min else {
-                droppedUntimestampedFields += 1
-                if droppedUntimestampedFields == 1 || droppedUntimestampedFields % 250 == 0 {
-                    EngineLog.emit("[SWDecoder] dropped \(droppedUntimestampedFields) untimestamped deinterlaced picture(s)",
-                                   category: .swPlayback)
-                }
+                noteUntimestamped()
                 continue
             }
             if let threshold = skipUntilPTS {
@@ -727,7 +734,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let tickets = emits
         finisher.finish(jobs) { ok in
             withExtendedLifetime(pictures) {}
-            if !ok, failureLogged.withLock({ logged in defer { logged = true }; return !logged }) {
+            if !ok, failureLogged.claim() {
                 EngineLog.emit("[SWDecoder] GPU deinterlace and finish failed (logged once)", category: .swPlayback)
             }
             for e in tickets {
@@ -736,8 +743,65 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
     }
 
+    /// One decoded picture (nil: the end of the stream) through inverse telecine and the finish of the film pictures it
+    /// releases, in one batch: the chain's work first (its decisions taken on the GPU), the finishes behind it. Each film
+    /// picture takes its ticket here, in order; whether it goes out, and at what timestamp, is read when the batch
+    /// completes (decimate drops one in five, and the skip threshold applies to the timestamp it gets). The batch starts
+    /// after the earlier ones, whose state the chain's work reads. Decode thread.
+    private func telecine(_ ivtc: InverseTelecine, _ picture: BwdifWindow.Picture?, epoch: UInt64) {
+        guard let finisher = writer?.finisher else { return }
+        finisher.finish(orderedAfterEarlierWork: true) { pass in
+            let pushed = ivtc.push(picture, into: pass)
+            var jobs: [PlanarFrameFinisher.Job] = []
+            var films: [(ticket: UInt64, output: InverseTelecine.Output, buffer: SendableBuffer, hdr10: Data?)] = []
+            for output in pushed.outputs {
+                let frame = output.picture.frame
+                guard let prepared = prepare(frame, planFormat: AVPixelFormat(rawValue: frame.pointee.format), interlaced: false)
+                else { continue }
+                jobs.append(.init(source: .picture(output.picture.storage.planes), plan: prepared.plan,
+                                  width: Int(frame.pointee.width), height: Int(frame.pointee.height), buffer: prepared.buffer))
+                reportDecodedFormat(pixelBuffer: prepared.buffer)
+                films.append((takeTicket(epoch), output, SendableBuffer(value: prepared.buffer), extractHDR10PlusBytes(from: frame)))
+            }
+            nonisolated(unsafe) let held = pushed.touched + pushed.outputs.map(\.picture)
+            let delivery = delivery, timeBase = ivtc.outputTimeBase
+            // Read on the completion queue: the films' records (immutable from here) and the chain's results, which
+            // `resolve` reads once the pass has completed.
+            nonisolated(unsafe) let tickets = films
+            nonisolated(unsafe) let chain = ivtc
+            let failureLogged = finishFailureLogged
+            return (jobs, { [weak self] ok in
+                withExtendedLifetime(held) {}
+                if !ok, failureLogged.claim() {
+                    EngineLog.emit("[SWDecoder] GPU inverse telecine and finish failed (logged once)", category: .swPlayback)
+                }
+                for film in tickets {
+                    guard ok, let pts = chain.resolve(film.output) else {
+                        delivery.skip(ticket: film.ticket, epoch: epoch)
+                        continue
+                    }
+                    guard pts != Int64.min else {
+                        self?.noteUntimestamped()
+                        delivery.skip(ticket: film.ticket, epoch: epoch)
+                        continue
+                    }
+                    let cmPTS = SourceTimestampBounds.cmTime(ticks: pts, timeBase: timeBase)
+                    if let self, let threshold = self.skipUntilPTS, cmPTS.isValid {
+                        if CMTimeCompare(cmPTS, threshold) < 0 {
+                            delivery.skip(ticket: film.ticket, epoch: epoch)
+                            continue
+                        }
+                        self.clearSkip(ifStillAt: threshold)
+                    }
+                    delivery.fulfil(ticket: film.ticket, epoch: epoch,
+                                    DeliveredFrame(buffer: film.buffer, pts: cmPTS, hdr10Data: film.hdr10, dmNAL: nil))
+                }
+            })
+        }
+    }
+
     /// A deinterlaced or telecine-recovered picture's failed finish is logged once; set from the completion queue.
-    private let finishFailureLogged = OSAllocatedUnfairLock(initialState: false)
+    private let finishFailureLogged = OnceFlag()
 
     /// End of source or a live seam: deliver what libavcodec and the deinterlacer still hold, then
     /// leave both ready to decode again. The protocol default did nothing here, so the host's
@@ -764,7 +828,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             render(window.finish(), timeBase: window.outputTimeBase, epoch: epoch)
         }
         if isCurrent(epoch), let ivtc = inverseTelecine {
-            render(ivtc.push(nil).map { .picture($0.picture, pts: $0.pts) }, timeBase: ivtc.outputTimeBase, epoch: epoch)
+            telecine(ivtc, nil, epoch: epoch)
         }
         window?.reset()
         inverseTelecine?.reset()
@@ -845,13 +909,13 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     func flush(resetFilterGraph: Bool) {
         // AE#492: retires every packet a caller had already decided to send, and every frame not yet delivered. The
-        // delivery line is reset in the same step the epoch moves, so no frame of the new epoch can reach it first; the
-        // decode thread applies the reset itself at its next call.
-        control.withLock { c in
-            c.epoch &+= 1
-            c.resetPending = true
-            c.resetFilterGraph = c.resetFilterGraph || resetFilterGraph
-            delivery.resetAsync(epoch: c.epoch, nextTicket: 0)
+        // delivery line is reset before the epoch moves, so no frame of the new epoch can reach it first; the decode
+        // thread applies the reset itself at its next call.
+        hostCalls.withLock { _ in
+            let next = epoch.load(ordering: .relaxed) &+ 1
+            delivery.resetAsync(epoch: next, nextTicket: 0)
+            resetRequest.bitwiseOr(Self.resetPending | (resetFilterGraph ? Self.resetFilterGraph : 0), ordering: .releasing)
+            epoch.store(next, ordering: .releasing)
         }
         delivery.barrier()
     }
@@ -886,10 +950,11 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
 
     func close() {
-        control.withLock { c in
-            c.closed = true
-            c.epoch &+= 1
-            delivery.resetAsync(epoch: c.epoch, nextTicket: 0)
+        hostCalls.withLock { _ in
+            let next = epoch.load(ordering: .relaxed) &+ 1
+            delivery.resetAsync(epoch: next, nextTicket: 0)
+            closed.store(true, ordering: .releasing)
+            epoch.store(next, ordering: .releasing)
         }
         delivery.setOnFrame(nil)
         // The one wait on the decode thread: its call in progress ends before the state goes. GPU work still in flight

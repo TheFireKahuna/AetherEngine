@@ -2,6 +2,7 @@ import Foundation
 import CoreMedia
 import CoreVideo
 import os
+import Synchronization
 
 /// A `CVPixelBuffer` (or the display metadata riding with it) on its way across a
 /// queue boundary.
@@ -113,9 +114,9 @@ final class OrderedDelivery: @unchecked Sendable {
     /// once for the event rather than once per skipped ticket.
     private var stallLogPending = false
 
-    private let pendingCountLock = NSLock()
-    private var pendingCount: Int = 0
-    private var peakPendingCount: Int = 0
+    /// Written on `queue`, read from any thread.
+    private let pendingCount = Atomic<Int>(0)
+    private let peakPendingCount = Atomic<Int>(0)
 
     private struct PendingEntry {
         /// Nil for a ticket given up (``skip(ticket:epoch:)``): its place goes, nothing is emitted.
@@ -213,10 +214,8 @@ final class OrderedDelivery: @unchecked Sendable {
             nextToEmit = nextTicket
             pending.removeAll()
             stallLogPending = false
-            pendingCountLock.lock()
-            pendingCount = 0
-            peakPendingCount = 0
-            pendingCountLock.unlock()
+            pendingCount.store(0, ordering: .relaxed)
+            peakPendingCount.store(0, ordering: .relaxed)
         }
     }
 
@@ -299,30 +298,20 @@ final class OrderedDelivery: @unchecked Sendable {
     }
 
     private func updatePendingCounts() {
-        pendingCountLock.lock()
         let count = pending.count
-        pendingCount = count
-        if count > peakPendingCount {
-            peakPendingCount = count
-        }
-        pendingCountLock.unlock()
+        pendingCount.store(count, ordering: .relaxed)
+        peakPendingCount.max(count, ordering: .relaxed)
     }
 
     /// Peak count of pending frames waiting in the delivery queue since the last read.
     /// Resets the peak to the current pending count for the next interval (dolby-vision-fel.md §5.11).
     func takePeakPendingCount() -> Int {
-        pendingCountLock.lock()
-        defer { pendingCountLock.unlock() }
-        let peak = peakPendingCount
-        peakPendingCount = pendingCount
-        return peak
+        peakPendingCount.exchange(pendingCount.load(ordering: .relaxed), ordering: .relaxed)
     }
 
     /// Current count of pending frames waiting in the delivery queue without blocking `queue`.
     var currentPendingCount: Int {
-        pendingCountLock.lock()
-        defer { pendingCountLock.unlock() }
-        return pendingCount
+        pendingCount.load(ordering: .relaxed)
     }
 
     // MARK: - Test seams

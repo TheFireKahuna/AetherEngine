@@ -285,10 +285,13 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     /// submission keeps the one it read (``Slot/retained``).
     private var lumaTable: (values: [Float], buffer: MTLBuffer)?
 
-    /// What a submission's GPU work reads after its commit, the CPU's writes into it included: a slot is taken for each
-    /// submission and given back by its completion, so the next frame never writes what the last one's work still
-    /// reads. Up to ``slotCount`` submissions are in flight; a further one waits for a slot.
+    /// What a submission's GPU work reads after its commit, the CPU's writes into it included. The slots are a ring
+    /// taken in submission order, each handed back by its own submission's completion (`free`), so the next frame never
+    /// writes what an earlier one's work still reads, and nothing but that handoff is shared between the encoding thread
+    /// and the completion. Up to ``slotCount`` submissions are in flight; a further one waits for the oldest.
     private final class Slot: @unchecked Sendable {
+        /// Signalled when the slot's last submission has completed.
+        let free = DispatchSemaphore(value: 1)
         /// Scratch pictures, one per field, grown to the largest field seen.
         var scratch: [MTLBuffer] = []
         /// Film grain tables, one per job, with what each holds: a repeated set (`show_existing_frame`) is not written
@@ -303,9 +306,9 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     }
 
     static let slotCount = 3
-    private let slotLock = NSLock()
-    private var freeSlots: [Slot] = []
-    private let slotsAvailable = DispatchSemaphore(value: PlanarFrameFinisher.slotCount)
+    private let slots: [Slot]
+    /// The next slot of the ring; the encoding thread's alone.
+    private var nextSlot = 0
     private let inFlight = DispatchGroup()
 
     /// LibDeinterlace's kernels, submitting through this finisher's submitter.
@@ -322,7 +325,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
             throw FinisherError.unavailable("no buffer")
         }
         self.placeholder = placeholder
-        freeSlots = (0..<Self.slotCount).map { _ in Slot() }
+        slots = (0..<Self.slotCount).map { _ in Slot() }
         var cache: CVMetalTextureCache?
         guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess, let cache
         else { throw FinisherError.unavailable("no texture cache") }
@@ -333,7 +336,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         if let cached = Self.library.withLock({ $0[ObjectIdentifier(device)] }) { return cached }
         let options = MTLCompileOptions()
         // IEEE rounding throughout: the rounding steps are H.273's Round.
-        if #available(macOS 15, iOS 18, tvOS 18, visionOS 2, *) { options.mathMode = .safe } else { options.fastMathEnabled = false }
+        options.mathMode = .safe
         let made = try device.makeLibrary(source: PlanarFrameShaderSource.source, options: options)
         Self.library.withLock { $0[ObjectIdentifier(device)] = made }
         return made
@@ -472,24 +475,40 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     /// `completion`.
     func finish(_ jobs: [Job], completion: @escaping @Sendable (Bool) -> Void) {
         guard !jobs.isEmpty else { return completion(true) }
-        slotsAvailable.wait()
-        let slot = slotLock.withLock { freeSlots.removeLast() }
+        if !finish(orderedAfterEarlierWork: false, { _ in (jobs, completion) }) { completion(false) }
+    }
+
+    /// ``finish(_:completion:)`` behind work of the caller's own: `encode` encodes into the batch's pass first (inverse
+    /// telecine) and returns the jobs to write after it, behind a barrier, with the completion. `orderedAfterEarlierWork`
+    /// starts the batch only once this finisher's earlier batches have finished, for a caller whose work carries state
+    /// from one batch to the next. False, with `encode` never called, when no batch could be made.
+    @discardableResult
+    func finish(orderedAfterEarlierWork: Bool,
+                _ encode: (ComputePass) -> (jobs: [Job], completion: @Sendable (Bool) -> Void)) -> Bool {
+        let slot = slots[nextSlot]
+        nextSlot = (nextSlot + 1) % slots.count
+        slot.free.wait()
         slot.retained.removeAll()
-        let giveBack: @Sendable () -> Void = { [self] in
-            slotLock.withLock { freeSlots.append(slot) }
-            slotsAvailable.signal()
-        }
-        guard let batch = submitter.makeBatch() else {
+        let giveBack: @Sendable () -> Void = { slot.free.signal() }
+        guard let batch = submitter.makeBatch(orderedAfterEarlierWork: orderedAfterEarlierWork) else {
             giveBack()
-            return completion(false)
+            return false
         }
-        let encoded = encode(jobs, slot: slot, batch: batch)
+        guard let pass = batch.makePass() else {
+            // Committed empty, so its command memory goes back to the pool.
+            batch.commit { _ in giveBack() }
+            return false
+        }
+        let (jobs, completion) = encode(pass)
+        if !jobs.isEmpty { pass.barrier() }
+        let encoded = self.encode(jobs, slot: slot, pass: pass)
         inFlight.enter()
-        batch.commit { [self] result in
+        batch.commit { [inFlight] result in
             giveBack()
             inFlight.leave()
             completion(encoded && result.error == nil)
         }
+        return true
     }
 
     /// Blocks until every submission made so far has completed: for the end of a stream, never per frame.
@@ -498,8 +517,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     /// Codes above 12 bits go straight to the exact path in the kernel (PF_EXACT_ONLY): no list, no second pass.
     private func usesList(_ plan: Plan) -> Bool { plan.mode == .constantLuminance && plan.components[0][4] <= 12 }
 
-    private func encode(_ jobs: [Job], slot: Slot, batch: GPUBatch) -> Bool {
-        guard let pass = batch.makePass() else { return false }
+    private func encode(_ jobs: [Job], slot: Slot, pass: ComputePass) -> Bool {
         var sources: [Planes] = []
         var fields = 0
         for job in jobs {

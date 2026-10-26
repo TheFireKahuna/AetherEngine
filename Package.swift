@@ -8,7 +8,7 @@ let package = Package(
         .iOS(.v18),
         .tvOS(.v18),
         .macOS(.v15),
-        .visionOS(.v1),
+        .visionOS(.v2),
     ],
     products: [
         .library(
@@ -98,7 +98,7 @@ let package = Package(
         // Deinterlacing (FFmpeg's bwdif) and inverse telecine (fieldmatch, decimate) on the GPU. A dynamic library
         // of its own because it is FFmpeg-derived code under LGPL-2.1-or-later, which the engine's App Store exception
         // cannot cover; linked dynamically it stays replaceable, as FFmpegBuild's frameworks are.
-        .package(url: "https://github.com/TheFireKahuna/LibDeinterlace", .upToNextMinor(from: "1.1.0")),  // 1.1.0: GPU work through the caller's submission; 1.0.0: bwdif, fieldmatch and decimate on the GPU, bit-exact to FFmpeg n8.1.3
+        .package(url: "https://github.com/TheFireKahuna/LibDeinterlace", .upToNextMinor(from: "1.2.0")),  // 1.2.0: inverse telecine's decisions on the GPU, no round trips, fused kernels; 1.1.0: GPU work through the caller's submission; 1.0.0: bwdif, fieldmatch and decimate on the GPU, bit-exact to FFmpeg n8.1.3
         // Bitmap subtitles upscaled 2x by ArtCNN (MIT) on the Neural Engine, its models shipped compiled. Pinned to
         // the minor for the same reason as FFmpegBuild above.
         .package(url: "https://github.com/TheFireKahuna/LibMLSubUpscaler", .upToNextMinor(from: "1.2.0")),  // 1.2.0: GPU passes through the caller's submission; 1.1.0: usable after the default specialisation, fastPrediction loaded behind it; 1.0.0: the upscaler from this engine as a package, models compiled

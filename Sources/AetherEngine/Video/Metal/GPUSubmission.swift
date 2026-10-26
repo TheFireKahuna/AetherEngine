@@ -370,11 +370,7 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
 
         init(device: MTLDevice, counters: MTLCounterSet?) {
             uploads = Uploads(device: device)
-            if #available(macOS 15, iOS 18, tvOS 18, visionOS 2, *) {
-                residency = try? device.makeResidencySet(descriptor: MTLResidencySetDescriptor())
-            } else {
-                residency = nil
-            }
+            residency = try? device.makeResidencySet(descriptor: MTLResidencySetDescriptor())
             if let counters {
                 let descriptor = MTLCounterSampleBufferDescriptor()
                 descriptor.counterSet = counters
@@ -403,7 +399,7 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
         guard let commandBuffer = queue.makeCommandBufferWithUnretainedReferences() else { return nil }
         let context = pool.withLock { $0.popLast() } ?? Context(device: device, counters: timestampCounters)
         context.uploads.reset()
-        if #available(macOS 15, iOS 18, tvOS 18, visionOS 2, *), let residency = context.residency {
+        if let residency = context.residency {
             residency.removeAllAllocations()
             commandBuffer.useResidencySet(residency)
         }
@@ -459,7 +455,7 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
             open?.end()
             open = nil
             for (event, value) in signals { commandBuffer.encodeSignalEvent(event, value: value) }
-            if #available(macOS 15, iOS 18, tvOS 18, visionOS 2, *) { context.residency?.commit() }
+            context.residency?.commit()
             let labels = labels
             let context = context
             let backend = backend
@@ -509,7 +505,7 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
         }
 
         private func resident(_ allocation: MTLAllocation) {
-            if #available(macOS 15, iOS 18, tvOS 18, visionOS 2, *) { batch.context.residency?.addAllocation(allocation) }
+            batch.context.residency?.addAllocation(allocation)
         }
 
         func setPipeline(_ pipeline: MTLComputePipelineState) {

@@ -8,14 +8,15 @@ import LibMLSubUpscaler
 // The libraries the engine encodes for declare the submission they need as protocols of their own; these present a
 // ``GPUSubmitter`` as each. A pass needs nothing: every ``ComputePass`` is already the libraries' pass.
 
-/// A ``GPUSubmitter`` as LibDeinterlace's submission.
+/// A ``GPUSubmitter`` as LibDeinterlace's submission: each batch ordered after the work committed before it, as inverse
+/// telecine's passes carry their running state from one to the next.
 final class DeinterlaceGPU: DeinterlaceSubmission, @unchecked Sendable {
     let submitter: GPUSubmitter
     var device: MTLDevice { submitter.device }
 
     init(_ submitter: GPUSubmitter) { self.submitter = submitter }
 
-    func makeBatch() -> (any DeinterlaceBatch)? { submitter.makeBatch().map(Batch.init) }
+    func makeBatch() -> (any DeinterlaceBatch)? { submitter.makeBatch(orderedAfterEarlierWork: true).map(Batch.init) }
 
     private final class Batch: DeinterlaceBatch {
         let batch: GPUBatch
