@@ -39,36 +39,72 @@ struct ProducerDeterminismTests {
             .appendingPathComponent("Fixtures/determinism").appendingPathComponent(name)
     }
 
+    /// A session for `route`, served in `shape`. The load's planned playlist decides it (`HLSOutputShape.forPlan`):
+    /// a planned master, which these SDR clips with audio are served, is demuxed; no plan is muxed.
+    private static func session(_ route: Route, shape: HLSOutputShape, forwardBufferSegments: Int? = nil) -> HLSVideoEngine {
+        let engine = HLSVideoEngine(url: fixture(route.clip), dvModeAvailable: false, audioBridgeMode: route.mode,
+                                    forwardBufferSegments: forwardBufferSegments)
+        engine.audioDelaySeconds = route.delay
+        if shape == .demuxed { engine.plannedPanelIsInHDRMode = false }
+        return engine
+    }
+
+    /// Segment `index` as served: one file muxed, the video's and the audio rendition's demuxed.
+    private struct Served {
+        let video: Data
+        let audio: Data?
+    }
+
+    private static func served(_ provider: VideoSegmentProvider, _ index: Int) -> Served? {
+        guard let video = provider.mediaSegment(at: index), !video.isEmpty else { return nil }
+        guard provider.servesAudioRendition else { return Served(video: video, audio: nil) }
+        guard let audio = VideoSegmentProvider.drain(provider.audioSegmentSource(at: index, onSlow: nil)),
+              !audio.isEmpty else { return nil }
+        return Served(video: video, audio: audio)
+    }
+
     @Test("every segment a seeking session serves is the one continuous playback served",
-          .timeLimit(.minutes(4)), arguments: routes)
-    func seeksServeContinuousSegments(_ route: Route) throws {
+          .timeLimit(.minutes(4)), arguments: routes, [HLSOutputShape.muxed, .demuxed])
+    func seeksServeContinuousSegments(_ route: Route, _ shape: HLSOutputShape) throws {
         let url = Self.fixture(route.clip)
         try #require(FileManager.default.fileExists(atPath: url.path),
                      "run Scripts/fetch-fixtures.sh to generate Fixtures/determinism/")
 
-        let continuous = HLSVideoEngine(url: url, dvModeAvailable: false, audioBridgeMode: route.mode)
-        continuous.audioDelaySeconds = route.delay
+        let continuous = Self.session(route, shape: shape)
         let playback = try continuous.start()
         defer { continuous.stop() }
+        try #require(continuous.outputShape == shape, "served \(continuous.outputShape)")
         let reference = try #require(continuous.provider)
         let count = reference.segmentCount
         try #require(count >= 6, "\(count) segments")
-        var want: [Int: Data] = [:]
-        for index in 0..<count { want[index] = reference.mediaSegment(at: index) }
-        try #require(want.count == count && want.values.allSatisfy { !$0.isEmpty }, "continuous playback served every segment")
+        var want: [Int: Served] = [:]
+        for index in 0..<count { want[index] = Self.served(reference, index) }
+        try #require(want.count == count, "continuous playback served every segment")
         #expect(continuous.audioBridge != nil || !["opus.mkv", "dts.mkv", "dts-drift.mkv", "truehd.mkv", "truehd-drift.mkv"].contains(route.clip))
-        let wantTracks = Fragments(want[1]!).tracks.count
-        #expect(wantTracks == 2, "video and audio: \(wantTracks) tracks")
+        let one = want[1]!
+        if shape == .muxed {
+            #expect(Fragments(one.video).tracks.count == 2, "video and audio in one file")
+        } else {
+            #expect(Fragments(one.video).tracks.count == 1 && Fragments(one.audio ?? Data()).tracks.count == 1,
+                    "video and audio a file each")
+        }
 
         // A segment has sound from its first picture: a packet that straddles a boundary opens the
         // segment after it, so a seek to a segment's start is not silent until the next audio frame.
-        // From segment 1: before the timeline's start there is nothing to play.
+        // From segment 1: before the timeline's start there is nothing to play. Demuxed, the picture is the
+        // video rendition's and the sound the audio's, each on its own init's timescale (track 1 in both).
         var base = try #require(URLComponents(url: playback.deletingLastPathComponent(), resolvingAgainstBaseURL: false))
         base.query = nil
-        let scales = Fragments.timescales(init: try Data(contentsOf: try #require(base.url).appendingPathComponent("init.mp4")))
+        let root = try #require(base.url)
+        let videoScales = Fragments.timescales(init: try Data(contentsOf: root.appendingPathComponent("init.mp4")))
+        let audioScales = shape == .demuxed
+            ? Fragments.timescales(init: try Data(contentsOf: root.appendingPathComponent("audio-init.mp4"))) : videoScales
+        let audioTrack: UInt32 = shape == .demuxed ? 1 : 2
         for index in 1..<count {
-            let f = Fragments(want[index]!)
-            guard let video = f.tracks[1], let audio = f.tracks[2], let vs = scales[1], let aus = scales[2],
+            let served = want[index]!
+            let videoFile = Fragments(served.video), audioFile = Fragments(served.audio ?? served.video)
+            guard let video = videoFile.tracks[1], let audio = audioFile.tracks[audioTrack],
+                  let vs = videoScales[1], let aus = audioScales[audioTrack],
                   let picture = video.samples.map(\.presentationTime).min(), let sound = audio.samples.first else {
                 Issue.record("seg\(index): no video and audio to compare")
                 continue
@@ -78,11 +114,10 @@ struct ProducerDeterminismTests {
         }
 
         // A window of one counted segment, so a seek lands where nothing was cut and starts a run there.
-        let seeking = HLSVideoEngine(url: url, dvModeAvailable: false, audioBridgeMode: route.mode,
-                                     forwardBufferSegments: 1)
-        seeking.audioDelaySeconds = route.delay
+        let seeking = Self.session(route, shape: shape, forwardBufferSegments: 1)
         _ = try seeking.start()
         defer { seeking.stop() }
+        try #require(seeking.outputShape == shape)
         let served = try #require(seeking.provider)
         try #require(served.segmentCount == count, "both sessions plan alike")
         let cache = try #require(seeking.cache)
@@ -94,11 +129,17 @@ struct ProducerDeterminismTests {
         let seeks = [(far, far + 1), (near, far - 1), (count - 2, count - 1), (1, 2)]
         var compared = 0
         func check(_ index: Int) throws {
-            let got = try #require(served.mediaSegment(at: index), "seg\(index) after seeks")
+            let got = try #require(Self.served(served, index), "seg\(index) after seeks")
             compared += 1
-            let a = Fragments(want[index]!), b = Fragments(got)
+            let wanted = want[index]!
+            let a = Fragments(wanted.video), b = Fragments(got.video)
             #expect(b.normalized == a.normalized,
-                    "seg\(index) (\(route.testDescription)): \(Fragments.difference(a, b))")
+                    "seg\(index) (\(route.testDescription), \(shape)): \(Fragments.difference(a, b))")
+            if let wantAudio = wanted.audio {
+                let a = Fragments(wantAudio), b = Fragments(got.audio ?? Data())
+                #expect(b.normalized == a.normalized,
+                        "audio\(index) (\(route.testDescription)): \(Fragments.difference(a, b))")
+            }
         }
         func seek(to index: Int) throws {
             let before = cache.peekURL(index: index).flatMap(Self.inode)

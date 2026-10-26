@@ -82,6 +82,25 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// The playlist `serve(panelIsInHDRMode:)` will hand AVPlayer, known from `prepare()` on when the load
     /// planned the panel answer: true for the master, false for the media playlist, nil until `serve`.
     private(set) var plannedServesMaster: Bool?
+    /// How this session's output carries its audio (`HLSOutputShape`), decided in `prepare()` before the first
+    /// producer is built, from the playlist the load planned.
+    private(set) var outputShape: HLSOutputShape = .muxed
+    /// Set before `prepare()` by a rebuild that must play from the media playlist: a master the display or a
+    /// receiver refused for a demuxed session, whose own media playlist is its video alone. The session is
+    /// planned for the media playlist, so it carries its audio muxed.
+    var servesMediaPlaylistOnly = false
+    /// The same for an HDR source only: an AirPlay receiver remembered as refusing HDR masters takes the media
+    /// playlist for one (`AirPlayPlaylistDecision`).
+    var servesMediaPlaylistOnlyForHDR = false
+
+    /// Whether this source must be planned for the media playlist (`servesMediaPlaylistOnly`,
+    /// `servesMediaPlaylistOnlyForHDR`).
+    private func plansMediaPlaylistOnly(videoRange: HLSVideoRange) -> Bool {
+        servesMediaPlaylistOnly || (servesMediaPlaylistOnlyForHDR && videoRange != .sdr)
+    }
+    /// The demuxed shape's audio rendition: its segments, on the video's indices. Nil when muxed. Guarded by
+    /// `restartLock` with `cache`.
+    var audioRenditionCache: SegmentCache?
 
     /// `dvModeAvailable || keepDvh1TagWithoutDV`; DV routing branches key off this.
     var effectiveDvMode: Bool { dvModeAvailable || keepDvh1TagWithoutDV }
@@ -2368,6 +2387,24 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         }
 
+        // docs/demuxed-audio.md: the playlist the load planned, and with it the output's shape, decided before the
+        // first producer is built. The audio the source carries stands in for the cascade's verdict: the cascade
+        // can only take audio away, and a master without an audio group plays a session left video-only.
+        let carriesAudio = audioStreamIndex >= 0
+        if plansMediaPlaylistOnly(videoRange: videoRange) {
+            plannedServesMaster = false
+        } else if let planned = plannedPanelIsInHDRMode {
+            plannedServesMaster = playlistDecision(
+                codecpar: codecpar, demuxer: dem, frameRate: frameRate, carriesAudio: carriesAudio,
+                videoRange: videoRange, panelIsInHDRMode: planned).useMaster
+        }
+        outputShape = .forPlan(servesMaster: plannedServesMaster, carriesAudio: carriesAudio)
+        if outputShape == .demuxed, let audioStream = audioDem.stream(at: audioStreamIndex) {
+            makeAudioRenditionCache(audioCodecpar: audioStream.pointee.codecpar)
+        }
+        EngineLog.emit("[HLSVideoEngine] output shape: \(outputShape.rawValue) "
+                       + "(planned master: \(plannedServesMaster.map { "\($0)" } ?? "at serve"))", category: .session)
+
         // 6b. Run the stream-copy / bridge / video-only cascade.
         let prod: HLSSegmentProducer
         prod = try buildProducerWithAudioCascade(
@@ -2382,6 +2419,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
         self.producer = prod
         self.activeAudioSourceStreamIndex = savedAudioConfig != nil ? audioStreamIndex : -1
+        // A cascade that ended video-only has no audio to serve as a rendition: the session goes back to one
+        // file per segment, its video's, and its cache takes the whole budget again.
+        if savedAudioConfig == nil, let audioCache = audioRenditionCache {
+            restartLock.lock()
+            audioRenditionCache = nil
+            restartLock.unlock()
+            _ = audioCache.close(reason: .sessionStopped)
+            if retentionBudgetBytes > 0 { segmentCache.setRetentionBudget(retentionBudgetBytes) }
+            outputShape = .muxed
+            EngineLog.emit("[HLSVideoEngine] output shape: muxed (the audio cascade left the session video-only)",
+                           category: .session)
+        }
         // AE#458: only when the audio actually reached the variant. A cascade that fell through to
         // video-only must not advertise an audio rendition that is not in the segments, and must not
         // force the master for one either.
@@ -2403,6 +2452,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let manifestCodecs = audioHLSCodecs.map { "\(primaryCodecs),\($0)" } ?? primaryCodecs
         let prov = VideoSegmentProvider(
             cache: segmentCache,
+            audioRendition: audioRenditionCache,
             segments: plan,
             codecsString: manifestCodecs,
             supplementalCodecs: supplementalCodecs,
@@ -2504,12 +2554,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
             subtitlePacketStore.noteHarvestAnchor(
                 at: Double(plan[openIndex].startPts) * Double(tb.num) / Double(tb.den))
         }
-        if let planned = plannedPanelIsInHDRMode {
-            plannedServesMaster = playlistDecision(
-                codecpar: codecpar, demuxer: dem, frameRate: frameRate, servedAudioLanguage: servedAudioLanguage,
-                servedAudioIsAtmosStreamCopy: servedAudioIsAtmosStreamCopy, videoRange: videoRange,
-                panelIsInHDRMode: planned).useMaster
-        }
         prod.start()
         preparedServe = PreparedServe(
             codecpar: codecpar, demuxer: dem, plan: plan, segmentCache: segmentCache, server: srv,
@@ -2561,8 +2605,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // The load's planned answer wins over a later one: the session was prepared for it (`plannedServesMaster`).
         let panelIsInHDRMode = plannedPanelIsInHDRMode ?? panelIsInHDRMode
         let decision = playlistDecision(codecpar: codecpar, demuxer: dem, frameRate: frameRate,
-                                        servedAudioLanguage: servedAudioLanguage,
-                                        servedAudioIsAtmosStreamCopy: servedAudioIsAtmosStreamCopy,
+                                        carriesAudio: savedAudioConfig != nil,
                                         videoRange: videoRange, panelIsInHDRMode: panelIsInHDRMode)
         let stillsAvailable = decision.stillsAvailable
         yieldsStills = stillsAvailable
@@ -2603,7 +2646,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             originIsSerial: sourceReopenableByURL
                 && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
             secondReaderAvailable: sourceReopenableByURL)) == .served(.keyframes)
-        let useMasterPlaylist = decision.useMaster
+        // A demuxed session's audio is a rendition, which only a master names: it was prepared for the master.
+        let useMasterPlaylist = outputShape == .demuxed
+            || (decision.useMaster && !plansMediaPlaylistOnly(videoRange: videoRange))
         if let planned = plannedServesMaster, planned != useMasterPlaylist {
             EngineLog.emit("[HLSVideoEngine] planned playlist (\(planned ? "master" : "media")) differs from the "
                            + "one served (\(useMasterPlaylist ? "master" : "media"))", category: .session)
@@ -2641,14 +2686,44 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return url
     }
 
+    /// The demuxed shape's audio rendition cache, beside `cache`. Each keeps resident its rendition's share of the
+    /// session's retention budget, the share of the session's bitrate its rendition is, so both keep about the
+    /// same span of the title; the claim counts both.
+    private func makeAudioRenditionCache(audioCodecpar: UnsafePointer<AVCodecParameters>) {
+        guard let videoCache = cache else { return }
+        let budget = retentionBudgetBytes
+        let par = audioCodecpar.pointee
+        let audioRate = AudioBridge.peakBitRate(bitRate: par.bit_rate, channels: par.ch_layout.nb_channels,
+                                                sampleRate: par.sample_rate, bitsPerRawSample: par.bits_per_raw_sample)
+        let sessionRate = max(sourceBitrate, audioRate + 1)
+        let audioShare = budget > 0 ? Int(Int64(budget) * min(audioRate, sessionRate) / sessionRate) : 0
+        let audioCache = SegmentCache(
+            forwardWindow: forwardWindowSegments,
+            backwardWindow: SegmentCache.defaultBackwardWindow
+                * (isLiveSession ? 1 : Self.vodSegmentsPerCountedSegment),
+            retentionBudgetBytes: audioShare,
+            nativeLiveDVRPolicy: isLiveSession ? nativeLiveDVRPolicy : nil,
+            onResidentSetChanged: { [weak self] in self?.noteResidentSetChanged() }
+        )
+        if budget > 0 { videoCache.setRetentionBudget(budget - audioShare) }
+        restartLock.lock()
+        audioRenditionCache = audioCache
+        retentionClaim?.track { [weak videoCache, weak audioCache] in
+            (videoCache?.totalBytes ?? 0) + (audioCache?.totalBytes ?? 0)
+        }
+        restartLock.unlock()
+        EngineLog.emit("[HLSVideoEngine] audio rendition: \(audioShare / (1 << 20)) MiB of the "
+                       + "\(budget / (1 << 20)) MiB retention budget (\(audioRate) of \(sessionRate) bps)",
+                       category: .session)
+    }
+
     /// Which playlist AVPlayer is handed, from facts `prepare()` already has and the panel answer.
     ///
     /// Side-effect free, so `prepare()` can ask it for a load that decided the panel answer before the display
     /// switch (`plannedPanelIsInHDRMode`) and `serve(panelIsInHDRMode:)` asks it again with the same inputs.
     private func playlistDecision(
         codecpar: UnsafeMutablePointer<AVCodecParameters>, demuxer dem: Demuxer, frameRate: Double?,
-        servedAudioLanguage: String?, servedAudioIsAtmosStreamCopy: Bool, videoRange: HLSVideoRange,
-        panelIsInHDRMode: Bool
+        carriesAudio: Bool, videoRange: HLSVideoRange, panelIsInHDRMode: Bool
     ) -> (useMaster: Bool, iFrameCandidate: IFrameRenditionEligibility.Verdict, stillsAvailable: Bool) {
         let stillsAvailable = FrameDecodeContext.yieldsStill(
             dolbyVisionNoBaseLayer: FrameDecodeContext.isDVNoBaseLayer(codecpar: codecpar))
@@ -2682,7 +2757,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             builtInPanelEngagesOnDemand: Self.builtInPanelEngagesOnDemand,
             frameRateKnown: frameRate != nil,
             videoCodecNeedsMasterSignaling: videoCodecNeedsMasterSignaling,
-            hasAudioRendition: servedAudioLanguage != nil || servedAudioIsAtmosStreamCopy,
+            // The HLS Authoring Specification serves audio as a rendition (9.5, 9.6), and a rendition lives in
+            // the master: any audio is a reason to serve one where it plays.
+            hasAudioRendition: carriesAudio,
             hasIFrameRendition: iFrameCandidate.isServed)
         return (useMaster, iFrameCandidate, stillsAvailable)
     }
@@ -3366,6 +3443,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         server = nil
         let c = cache
         cache = nil
+        let audioRendition = audioRenditionCache
+        audioRenditionCache = nil
         let cacheStatusCallback = onSessionCacheStatusChanged
         let cacheRequestedBudget = requestedSessionCacheBudgetBytes.map { max(0, $0) }
         let cacheEffectiveBudget = sessionCacheBaseEffectiveBytes
@@ -3452,6 +3531,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             previewBuilder?.close()
             _ = p?.waitForFinish(timeout: 3.0)
             s?.stop()
+            _ = audioRendition?.close(reason: reason)
             if let c {
                 _ = c.close(reason: reason)
                 cacheStatusCallback?(c.status(
@@ -3809,6 +3889,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             audio: savedAudioConfig,
             sideAudioDemuxer: sideAudioDemuxer,
             cache: cache,
+            audioRendition: audioRenditionCache,
             baseIndex: baseIndex,
             targetSegmentDurationSeconds: liveCutTargetSeconds,
             videoFallbackDurationPts: videoFallbackDurationPts,

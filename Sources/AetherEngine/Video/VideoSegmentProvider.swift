@@ -727,6 +727,8 @@ struct LiveTargetDurationSeal {
 final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     private let cache: SegmentCache
+    /// The demuxed shape's audio rendition (`HLSOutputShape.demuxed`): its segments, on `cache`'s indices.
+    private let audioRendition: SegmentCache?
     /// Immutable for VOD; grows under stateLock for live (producer appends via appendLiveSegment).
     private var segments: [HLSVideoEngine.Segment]
     private let iFrameSourceLock = NSLock()
@@ -1004,6 +1006,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     init(
         cache: SegmentCache,
+        audioRendition: SegmentCache? = nil,
         segments: [HLSVideoEngine.Segment],
         codecsString: String,
         supplementalCodecs: String?,
@@ -1047,6 +1050,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         nativeSubtitleDefaultOrdinal: Int = 0
     ) {
         self.cache = cache
+        self.audioRendition = audioRendition
         self.segments = segments
         self.isLive = isLive
         self.servesSegmentsProgressively = servesSegmentsProgressively
@@ -1497,6 +1501,41 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     func initSegment(versionID: Int) -> Data? {
         if versionID == 0 { return cache.fetchInit(timeout: 30.0) }  // version 0 may not be ready yet at startup
         return cache.initData(versionID: versionID)
+    }
+
+    // MARK: - The audio rendition (demuxed shape)
+
+    var servesAudioRendition: Bool { audioRendition != nil }
+
+    func audioInitSegment() -> Data? {
+        audioRendition?.fetchInit(timeout: 30.0)
+    }
+
+    /// The audio rendition's segment `index`. The video's requests are what move the producer; the producer cuts
+    /// both renditions of an index together, so an audio request waits for its march, and fires a restart only
+    /// where that march will not reach the index (a producer stopped after adopting an index's video and before
+    /// its audio, or audio evicted while the video stayed resident).
+    func audioSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource? {
+        guard let audio = audioRendition, index >= 0, index < currentSegmentCount else { return nil }
+        if isLive {
+            stateLock.lock()
+            let firstVisible = _liveFirstVisible
+            stateLock.unlock()
+            if index < firstVisible { return nil }
+        }
+        audio.declareTarget(index)
+        if let hit = audio.peek(index: index) { return .data(hit) }
+        if !isLive, !activeMarchCovers(index), lastRestartIndex != index, let restart = restartHandler {
+            EngineLog.emit(
+                "[VideoSegmentProvider] audio\(index) is not resident and no producer's march reaches it; "
+                + "restarting there", category: .session)
+            lastRestartIndex = index
+            restart(index)
+            cache.resetHighWaterForRestart()
+        }
+        let signal = onSlow.flatMap { isLive ? nil : SlowServeSignal(thresholdSeconds: slowServeThresholdSeconds, onSlow: $0) }
+        defer { signal?.complete() }
+        return audio.fetchSource(index: index, timeout: forwardBackpressureWaitSeconds, progressive: fetchesProgressively)
     }
 
     /// File URL for sendfile(2) fast path. Drives same side effects as mediaSegment(at:);
@@ -3003,10 +3042,13 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             let name = Locale.current.localizedString(forIdentifier: audioLanguage) ?? audioLanguage
             return (language: audioLanguage, name: name)
         }
-        return audioIsAtmosStreamCopy ? (language: nil, name: Self.untaggedAtmosRenditionName) : nil
+        if audioIsAtmosStreamCopy { return (language: nil, name: Self.untaggedAtmosRenditionName) }
+        // A rendition of its own is declared whatever it states (HLS Authoring Specification 8.9).
+        return audioRendition != nil ? (language: nil, name: Self.untaggedRenditionName) : nil
     }
 
     static let untaggedAtmosRenditionName = "Dolby Atmos"
+    static let untaggedRenditionName = "Audio"
 
     /// Apple HLS Authoring Spec 2.13 ("CHANNELS ... MUST be present") plus Dolby's DD+ Online
     /// Delivery Kit: the value is the count of decodable objects, a slash, then `JOC`. 16 is the

@@ -513,17 +513,39 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Nil for a stream-copy session, which has no bridge and whose analogous verdict is
     /// `audioMoovPrimeUnobtainable`.
     var audioBridgeFeedStats: AudioBridge.FeedStats? { audioConfig?.bridge?.feedStats }
-    private var currentMuxer: MP4SegmentMuxer?
+    /// One file the producer writes per segment, with the cache it is adopted into (`HLSOutputShape`).
+    /// Pump thread only; `muxer` changes only through `installMuxer`, under `stateLock`, which the
+    /// telemetry getters read it under.
+    private final class Rendition {
+        enum Track { case video, audio }
+        let track: Track
+        let cache: SegmentCache
+        var muxer: MP4SegmentMuxer?
+        /// The index `muxer` is writing.
+        var segmentIndex: Int = .min
+        /// Latched once this producer's first muxer of the file emits ftyp+moov; later inits are versions.
+        var initCaptured = false
+        /// The highest index this producer has served into `cache`, cut or without samples.
+        var head: Int = .min
+        /// The audio track's time base in its muxer, latched when one is built (`serveEmptyAudio`).
+        var audioTimeBase: AVRational?
+        init(track: Track, cache: SegmentCache) {
+            self.track = track
+            self.cache = cache
+        }
+        var name: String { track == .video ? "seg" : "audio" }
+    }
+    /// The file each segment's video goes into; in the muxed shape its audio too.
+    private let videoFile: Rendition
+    /// The demuxed shape's audio rendition (`HLSOutputShape.demuxed`); nil when muxed.
+    private let audioFile: Rendition?
     /// AE#443: totals folded off muxers this producer has ROTATED away. A rotation (program switch, ad
     /// pod, a rebuilt muxer after a failure) hands the session a fresh `ByteCounter`, so a read of the
     /// current muxer alone drops everything the previous ones emitted, and the "lifetime" it is read as
-    /// silently means "since the last rotation". Guarded by `stateLock` with `currentMuxer` itself.
+    /// silently means "since the last rotation". Guarded by `stateLock` with `videoFile.muxer` itself.
     private var retiredMuxerBytes: Int = 0
     private var retiredMuxerFragmentCuts: Int = 0
-    private var currentMuxerSegmentIndex: Int = .min
 
-    /// Latched once first muxer emits ftyp+moov bytes; subsequent muxers' init bytes are discarded.
-    private var initCaptured: Bool = false
 
     /// Last valid dts per stream (source TB); used to repair NOPTS dts via lastValidDts+1.
     private var lastVideoSourceDts: Int64 = Int64.min
@@ -1393,24 +1415,27 @@ final class HLSSegmentProducer: @unchecked Sendable {
     var muxerLifetimeFragmentBytes: Int {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return retiredMuxerBytes + (currentMuxer?.lifetimeFragmentBytesEmitted ?? 0)
+        return retiredMuxerBytes + (videoFile.muxer?.lifetimeFragmentBytesEmitted ?? 0)
+            + (audioFile?.muxer?.lifetimeFragmentBytesEmitted ?? 0)
     }
 
     var muxerFragmentCuts: Int {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return retiredMuxerFragmentCuts + (currentMuxer?.fragmentCutCount ?? 0)
+        return retiredMuxerFragmentCuts + (videoFile.muxer?.fragmentCutCount ?? 0)
+            + (audioFile?.muxer?.fragmentCutCount ?? 0)
     }
 
-    /// The only way `currentMuxer` changes. Folds the outgoing muxer's totals in first, so every
+    /// The only way a file's muxer changes. Folds the outgoing muxer's totals in first, so every
     /// rotation site inherits the accounting instead of having to remember it (AE#443).
-    private func installMuxer(_ new: MP4SegmentMuxer?) {
+    private func installMuxer(_ new: MP4SegmentMuxer?, into file: Rendition) {
         stateLock.lock()
-        if let outgoing = currentMuxer {
+        if let outgoing = file.muxer {
             retiredMuxerBytes &+= outgoing.lifetimeFragmentBytesEmitted
             retiredMuxerFragmentCuts &+= outgoing.fragmentCutCount
         }
-        currentMuxer = new
+        file.muxer = new
+        if let new, new.audioOutputStreamIndex >= 0 { file.audioTimeBase = new.muxerAudioTimeBase }
         stateLock.unlock()
     }
 
@@ -1667,6 +1692,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         audio: AudioConfig? = nil,
         sideAudioDemuxer: Demuxer? = nil,
         cache: SegmentCache,
+        audioRendition: SegmentCache? = nil,
         baseIndex: Int = 0,
         targetSegmentDurationSeconds: Double = 6.0,
         videoFallbackDurationPts: Int64,
@@ -1772,6 +1798,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             }
         }
         self.cache = cache
+        self.videoFile = Rendition(track: .video, cache: cache)
+        self.audioFile = audio == nil ? nil : audioRendition.map { Rendition(track: .audio, cache: $0) }
         self.baseIndex = baseIndex
         self.sourceVideoTimeBase = video.timeBase
         self.targetSegmentDurationSeconds = targetSegmentDurationSeconds
@@ -1959,33 +1987,35 @@ final class HLSSegmentProducer: @unchecked Sendable {
         return min(max(lo - 1, 0), max(0, count - 2))
     }
 
-    /// Returns muxer for targetIdx, advancing/allocating as needed. Forward-only: clamps late packets
+    /// Returns `file`'s muxer for targetIdx, advancing/allocating as needed. Forward-only: clamps late packets
     /// (HEVC RASL B-frames, bridge lag) upward to avoid premature finalize. Returns nil on stop/alloc failure.
-    private func ensureMuxer(forSegmentIndex targetIdx: Int) -> MP4SegmentMuxer? {
-        let effectiveIdx = max(targetIdx, currentMuxerSegmentIndex)
+    private func ensureMuxer(_ file: Rendition, forSegmentIndex targetIdx: Int) -> MP4SegmentMuxer? {
+        let effectiveIdx = max(targetIdx, file.segmentIndex)
 
-        if let m = currentMuxer, m.currentSegmentIndex == effectiveIdx {
+        if let m = file.muxer, m.currentSegmentIndex == effectiveIdx {
             return m
         }
 
-        if currentMuxer == nil {
+        if file.muxer == nil {
+            guard file.track == .video else { return allocateMuxer(file, initialSegmentIndex: effectiveIdx) }
             // #133: pendingJoinVideoConfig is non-nil only when a live H.264 join reconstructed dimensions
             // from in-band SPS/PPS because the probe left codecpar at 0x0. Consumed once, here.
             let joinConfig = pendingJoinVideoConfig
             pendingJoinVideoConfig = nil
-            return allocateMuxer(initialSegmentIndex: effectiveIdx, reconstructedVideoConfig: joinConfig)
+            return allocateMuxer(file, initialSegmentIndex: effectiveIdx, reconstructedVideoConfig: joinConfig)
         }
-        // SSAI program switch: new video codec params need a fresh muxer (versioned EXT-X-MAP).
-        if pendingVideoProgramSwitch, effectiveIdx > currentMuxerSegmentIndex {
+        // SSAI program switch: new video codec params need a fresh muxer (versioned EXT-X-MAP). The audio
+        // rendition keeps its init; its playlist takes the discontinuity at the same index.
+        if file.track == .video, pendingVideoProgramSwitch, effectiveIdx > file.segmentIndex {
             return rotateMuxerForProgramSwitch(to: effectiveIdx)
         }
-        return advanceMuxer(to: effectiveIdx)
+        return advanceMuxer(file, to: effectiveIdx)
     }
 
     private func rotateMuxerForProgramSwitch(to newIdx: Int) -> MP4SegmentMuxer? {
         if checkShouldStop() { return nil }
-        let finishedIdx = currentMuxerSegmentIndex
-        finalizeSessionMuxerAndAdopt() // adopts finishedIdx, nils currentMuxer
+        let finishedIdx = videoFile.segmentIndex
+        finalizeSessionMuxerAndAdopt(videoFile) // adopts finishedIdx, nils videoFile.muxer
         pendingVideoProgramSwitch = false
         let isAdCreative = pendingReinitIsAdCreative
         pendingReinitIsAdCreative = false
@@ -1996,7 +2026,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 + "the open's init again for seg-\(newIdx)",
                 category: .session
             )
-            return allocateMuxer(initialSegmentIndex: newIdx, reconstructedVideoConfig: nil, versionedInit: true,
+            return allocateMuxer(videoFile, initialSegmentIndex: newIdx, reconstructedVideoConfig: nil, versionedInit: true,
                                  isAdCreative: false)
         }
         guard let adConfig = pendingAdVideoConfig else {
@@ -2017,7 +2047,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             + "(\(adConfig.width)x\(adConfig.height))",
             category: .session
         )
-        return allocateMuxer(initialSegmentIndex: newIdx,
+        return allocateMuxer(videoFile, initialSegmentIndex: newIdx,
                              reconstructedVideoConfig: adConfig,
                              versionedInit: true,
                              isAdCreative: isAdCreative)
@@ -2439,7 +2469,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// - `isAdCreative`: drop the program's DV/color overrides because the new content carries its own signaling.
     ///   True only for an SSAI ad creative on a new PID; a same-PID parameter-set change stays in the same program
     ///   and KEEPS the overrides (an HDR-live encoder restart must not lose its color signaling).
-    private func allocateMuxer(initialSegmentIndex: Int,
+    private func allocateMuxer(_ file: Rendition,
+                               initialSegmentIndex: Int,
                                reconstructedVideoConfig: InBandVideoConfig? = nil,
                                versionedInit: Bool = false,
                                isAdCreative: Bool = false) -> MP4SegmentMuxer? {
@@ -2452,7 +2483,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // and releases immediately).
         // Live never parks on the fetch high-water (see awaitLiveWindowHeadroom); an SSAI
         // versioned-init re-alloc mid-live must not re-enter the park either.
-        if initialSegmentIndex != baseIndex, !isLive {
+        // The video drives backpressure; an audio rendition's segment is made when the source reaches it.
+        if file.track == .video, initialSegmentIndex != baseIndex, !isLive {
             let backpressureTarget = initialSegmentIndex - bufferAheadSegments
             if !awaitBackpressureRelease(target: backpressureTarget, head: initialSegmentIndex, context: "alloc") { return nil }
         }
@@ -2460,67 +2492,70 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
         var adPar: UnsafeMutablePointer<AVCodecParameters>?
         defer { if adPar != nil { avcodec_parameters_free(&adPar) } }
-        let videoCodecpar: UnsafePointer<AVCodecParameters>
-        if let reconstructedVideoConfig {
-            guard let par = avcodec_parameters_alloc() else { return nil }
-            par.pointee.codec_type = AVMEDIA_TYPE_VIDEO
-            par.pointee.codec_id = reconstructedVideoConfig.codecID
-            par.pointee.width = reconstructedVideoConfig.width
-            par.pointee.height = reconstructedVideoConfig.height
-            // The init's `colr` (movenc writes it from these) describes the parameter sets it is built from.
-            par.pointee.color_primaries = reconstructedVideoConfig.colour.primaries
-            par.pointee.color_trc = reconstructedVideoConfig.colour.transfer
-            par.pointee.color_space = reconstructedVideoConfig.colour.matrix
-            par.pointee.color_range = reconstructedVideoConfig.colour.range
-            let ed = reconstructedVideoConfig.extradata
-            let pad = Int(AV_INPUT_BUFFER_PADDING_SIZE)
-            if let raw = av_malloc(ed.count + pad) {
-                let bytes = raw.assumingMemoryBound(to: UInt8.self)
-                ed.withUnsafeBytes { _ = memcpy(bytes, $0.baseAddress, ed.count) }
-                memset(bytes + ed.count, 0, pad)
-                par.pointee.extradata = bytes
-                par.pointee.extradata_size = Int32(ed.count)
+        // The file's tracks: the video's carries the video, and the audio too unless the audio is a rendition
+        // of its own (`HLSOutputShape`); the audio rendition's carries the audio alone.
+        var muxerVideo: MP4SegmentMuxer.VideoConfig?
+        if file.track == .video {
+            let videoCodecpar: UnsafePointer<AVCodecParameters>
+            if let reconstructedVideoConfig {
+                guard let par = avcodec_parameters_alloc() else { return nil }
+                par.pointee.codec_type = AVMEDIA_TYPE_VIDEO
+                par.pointee.codec_id = reconstructedVideoConfig.codecID
+                par.pointee.width = reconstructedVideoConfig.width
+                par.pointee.height = reconstructedVideoConfig.height
+                // The init's `colr` (movenc writes it from these) describes the parameter sets it is built from.
+                par.pointee.color_primaries = reconstructedVideoConfig.colour.primaries
+                par.pointee.color_trc = reconstructedVideoConfig.colour.transfer
+                par.pointee.color_space = reconstructedVideoConfig.colour.matrix
+                par.pointee.color_range = reconstructedVideoConfig.colour.range
+                let ed = reconstructedVideoConfig.extradata
+                let pad = Int(AV_INPUT_BUFFER_PADDING_SIZE)
+                if let raw = av_malloc(ed.count + pad) {
+                    let bytes = raw.assumingMemoryBound(to: UInt8.self)
+                    ed.withUnsafeBytes { _ = memcpy(bytes, $0.baseAddress, ed.count) }
+                    memset(bytes + ed.count, 0, pad)
+                    par.pointee.extradata = bytes
+                    par.pointee.extradata_size = Int32(ed.count)
+                }
+                adPar = par
+                videoCodecpar = UnsafePointer(par)
+            } else {
+                videoCodecpar = videoConfig.codecpar
             }
-            adPar = par
-            videoCodecpar = UnsafePointer(par)
-        } else {
-            videoCodecpar = videoConfig.codecpar
-        }
 
-        if isLive, versionedInit {
-            liveColourBySegment[initialSegmentIndex] = ColorDescription(codecpar: videoCodecpar)
+            if isLive, versionedInit {
+                liveColourBySegment[initialSegmentIndex] = ColorDescription(codecpar: videoCodecpar)
+            }
+            muxerVideo = MP4SegmentMuxer.VideoConfig(
+                codecpar: videoCodecpar,
+                timeBase: videoConfig.timeBase,
+                codecTagOverride: videoConfig.codecTagOverride,
+                // Ad creative carries its own signaling; don't force the program's overrides onto it. A same-PID
+                // parameter-set change is still the same program, so it keeps them (isAdCreative false).
+                doviConfig: isAdCreative ? .keep : videoConfig.doviConfig,
+                colorOverride: isAdCreative ? nil : videoConfig.colorOverride,
+                // An init built from in-band HEVC sets gets their own record and converts its samples (#365), whatever
+                // the open's were; the open's record never describes another program's sets.
+                extradataOverride: reconstructedVideoConfig.map { $0.lengthPrefixedRecord }
+                    ?? (isAdCreative ? nil : videoConfig.extradataOverride),
+                convertsAnnexBSamples: reconstructedVideoConfig.map { $0.lengthPrefixedRecord != nil }
+                    ?? (isAdCreative ? false : videoConfig.convertsAnnexBSamples),
+                nalFramingLatch: isAdCreative ? nil : videoConfig.nalFramingLatch
+            )
         }
-        let muxerVideo = MP4SegmentMuxer.VideoConfig(
-            codecpar: videoCodecpar,
-            timeBase: videoConfig.timeBase,
-            codecTagOverride: videoConfig.codecTagOverride,
-            // Ad creative carries its own signaling; don't force the program's overrides onto it. A same-PID
-            // parameter-set change is still the same program, so it keeps them (isAdCreative false).
-            doviConfig: isAdCreative ? .keep : videoConfig.doviConfig,
-            colorOverride: isAdCreative ? nil : videoConfig.colorOverride,
-            // An init built from in-band HEVC sets gets their own record and converts its samples (#365), whatever
-            // the open's were; the open's record never describes another program's sets.
-            extradataOverride: reconstructedVideoConfig.map { $0.lengthPrefixedRecord }
-                ?? (isAdCreative ? nil : videoConfig.extradataOverride),
-            convertsAnnexBSamples: reconstructedVideoConfig.map { $0.lengthPrefixedRecord != nil }
-                ?? (isAdCreative ? false : videoConfig.convertsAnnexBSamples),
-            nalFramingLatch: isAdCreative ? nil : videoConfig.nalFramingLatch
-        )
-        let muxerAudio: MP4SegmentMuxer.AudioConfig? = audioConfig.map { a in
-            MP4SegmentMuxer.AudioConfig(codecpar: a.codecpar, timeBase: a.inputTimeBase,
-                                        soundSampleEntryOverride: a.bridge?.soundSampleEntryOverride, language: a.language)
-        }
+        let muxerAudio = file.track == .audio || audioFile == nil ? audioMuxerConfig : nil
 
         do {
             // #15: subtitles ship as a separate WebVTT rendition (HLSLocalServer), NOT muxed into the A/V
             // fMP4. In-band timed text is non-conformant for HLS and fails the AVPlayer open (RFC 8216 §3.1,
             // empirically -11829/-12848). The muxer carries no subtitle streams; the cue stores feed the WebVTT.
             // Only a progressive serve follows a staging file while it grows.
+            let fileCache = file.cache
             var onBytesStaged: (@Sendable () -> Void)?
-            if servesProgressively { onBytesStaged = { [cache] in cache.noteStagingAppended() } }
+            if servesProgressively { onBytesStaged = { [fileCache] in fileCache.noteStagingAppended() } }
             let muxer = try MP4SegmentMuxer(
                 initialSegmentIndex: initialSegmentIndex,
-                sessionDir: cache.sessionDir,
+                sessionDir: fileCache.sessionDir,
                 video: muxerVideo,
                 audio: muxerAudio,
                 // Cap the muxer's in-RAM interleaver at ~2 segments so a long/degenerate segment or an
@@ -2531,14 +2566,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     ? Self.progressiveFragmentSeconds : max(8.0, 2 * targetSegmentDurationSeconds),
                 // AE#222 + mid-session rotation: the last frame a muxer accepted, or the host's
                 // construction-time prime while no muxer has accepted one yet.
-                audioMoovPrimeFrame: audioMoovPrimeFrame,
+                audioMoovPrimeFrame: muxerAudio == nil ? nil : audioMoovPrimeFrame,
                 audioDelaySeconds: audioConfig?.bridge == nil ? audioDelaySeconds : 0,
-                onStorageExhausted: { [cache] in cache.noteStorageExhausted() },
+                onStorageExhausted: { [fileCache] in fileCache.noteStorageExhausted() },
                 onBytesStaged: onBytesStaged,
                 // docs/segment-axis.md: every VOD segment states where its first picture sits on the source
                 // (`InBandClock`), the item-axis time it was written at plus the run's shift. Live rebases its
-                // own timeline and states nothing.
-                segmentClock: isLive ? nil : { [weak self] index, pts, timeBase in
+                // own timeline and states nothing. The clock rides the video.
+                segmentClock: isLive || muxerVideo == nil ? nil : { [weak self] index, pts, timeBase in
                     guard let self, self.sourceVideoTbSeconds > 0 else { return nil }
                     let shift = self.videoShiftPts == Int64.min ? 0 : self.videoShiftPts
                     return InBandClock.Stamp(
@@ -2549,34 +2584,68 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if versionedInit {
-                        self.cache.addInitVersion(initBytes, fromSegment: initialSegmentIndex)
+                        fileCache.addInitVersion(initBytes, fromSegment: initialSegmentIndex)
                         EngineLog.emit(
                             "[HLSSegmentProducer] versioned init captured for seg-\(initialSegmentIndex) "
                             + "(\(initBytes.count) B, \(isAdCreative ? "SSAI program switch" : "same-PID parameter-set change"))",
                             category: .session
                         )
-                    } else if !self.initCaptured {
-                        self.initCaptured = true
-                        self.cache.setInit(initBytes)
+                    } else if !file.initCaptured {
+                        file.initCaptured = true
+                        fileCache.setInit(initBytes)
                         EngineLog.emit(
-                            "[HLSSegmentProducer] init.mp4 captured (\(initBytes.count) B)",
+                            "[HLSSegmentProducer] \(file.track == .video ? "init.mp4" : "audio-init.mp4") captured "
+                            + "(\(initBytes.count) B)",
                             category: .session
                         )
                     }
                 }
             )
-            // Write through installMuxer: telemetry getters read currentMuxer under stateLock, and the
+            // Write through installMuxer: telemetry getters read the muxer under stateLock, and the
             // outgoing muxer's totals have to be folded before the reference goes.
-            self.installMuxer(muxer)
-            self.currentMuxerSegmentIndex = initialSegmentIndex
-            self.noteSegmentInProgress(initialSegmentIndex, muxer: muxer)
+            self.installMuxer(muxer, into: file)
+            file.segmentIndex = initialSegmentIndex
+            self.noteSegmentInProgress(file, initialSegmentIndex, muxer: muxer)
+            if file.track == .audio, file.head == .min {
+                serveEmptyAudio(file, from: baseIndex, to: initialSegmentIndex)
+            }
             return muxer
         } catch {
             EngineLog.emit(
-                "[HLSSegmentProducer] muxer alloc for seg-\(initialSegmentIndex) failed: \(error)",
+                "[HLSSegmentProducer] \(file.name) muxer alloc for seg-\(initialSegmentIndex) failed: \(error)",
                 category: .session
             )
             return nil
+        }
+    }
+
+    /// The audio track as a muxer carries it.
+    private var audioMuxerConfig: MP4SegmentMuxer.AudioConfig? {
+        audioConfig.map { a in
+            MP4SegmentMuxer.AudioConfig(codecpar: a.codecpar, timeBase: a.inputTimeBase,
+                                        soundSampleEntryOverride: a.bridge?.soundSampleEntryOverride, language: a.language)
+        }
+    }
+
+    /// Serves indices `[first, end)` of the audio rendition as fragments with no sample, each at its segment's
+    /// start on the audio track's timeline: their time holds no audio, and the playlist lists every index
+    /// (HLS Authoring Specification 8.3).
+    private func serveEmptyAudio(_ file: Rendition, from first: Int, to end: Int) {
+        guard file.track == .audio, first < end, let atb = file.audioTimeBase, atb.den > 0 else { return }
+        let shift = videoShiftPts == Int64.min ? 0 : videoShiftPts
+        for index in first..<end {
+            let local = index - baseIndex
+            guard local >= 0, local < segmentBoundaries.count else { continue }
+            let start = av_rescale_q(segmentBoundaries[local] &- shift, sourceVideoTimeBase, atb)
+            let bytes = MP4SegmentMuxer.emptyFragment(trackID: 1, sequence: UInt32(truncatingIfNeeded: index + 1),
+                                                      baseMediaDecodeTime: UInt64(max(0, start)))
+            let path = file.cache.sessionDir.appendingPathComponent(
+                "staging-audio-\(index)-empty-\(UUID().uuidString.prefix(8)).tmp")
+            guard (try? bytes.write(to: path)) != nil else { continue }
+            file.cache.adopt(index: index, stagingPath: path, byteCount: bytes.count, videoReach: nil)
+            file.head = max(file.head, index)
+            EngineLog.emit("[HLSSegmentProducer] audio\(index).mp4 holds no audio; served without samples",
+                           category: .session, level: .verbose)
         }
     }
 
@@ -2765,37 +2834,40 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
     }
 
-    private func advanceMuxer(to newIdx: Int) -> MP4SegmentMuxer? {
-        guard let muxer = currentMuxer else { return nil }
+    private func advanceMuxer(_ file: Rendition, to newIdx: Int) -> MP4SegmentMuxer? {
+        guard let muxer = file.muxer else { return nil }
+        let cutIdx = file.segmentIndex
         // Audit SEG-5: an abandoned pump whose blocked read returns after stop() gets a packet from
         // the NEW producer's position. Cutting on it would adopt this pump's partial segment under
         // its full index; the teardown rule decides what happens to the in-flight segment instead.
         if checkShouldStop() { return nil }
-        releaseOverlayRunStart()
+        if file.track == .video { releaseOverlayRunStart() }
         switch muxer.cutFragmentForNextSegment(newIdx) {
         case .completed(let path, let bytesWritten):
             EngineLog.emit(
-                "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s captured (\(bytesWritten) B)",
+                "[HLSSegmentProducer] \(file.name)-\(cutIdx).m4s captured (\(bytesWritten) B)",
                 category: .session, level: .verbose
             )
-            cache.adopt(index: currentMuxerSegmentIndex,
-                        stagingPath: path,
-                        byteCount: bytesWritten,
-                        videoReach: takeVideoReach(forSegmentIndex: currentMuxerSegmentIndex))
-            // AE#286: per-epoch head. cache.highestStoredIndex is monotonic across restarts and would
-            // credit this pump with the previous epoch's production.
-            pumpEpochHighestStored = max(pumpEpochHighestStored, currentMuxerSegmentIndex)
-            recordSegmentOpening(muxer, index: currentMuxerSegmentIndex)
-            if isLive {
-                reportLiveSegmentFinalized(index: currentMuxerSegmentIndex,
-                                           nextIndex: newIdx)
-            } else if onSequentialSegmentFinalized != nil {
-                reportSequentialSegmentFinalized(index: currentMuxerSegmentIndex, isFinal: false)
+            file.cache.adopt(index: cutIdx,
+                             stagingPath: path,
+                             byteCount: bytesWritten,
+                             videoReach: file.track == .video ? takeVideoReach(forSegmentIndex: cutIdx) : nil)
+            file.head = max(file.head, cutIdx)
+            recordSegmentOpening(file, muxer, index: cutIdx)
+            if file.track == .video {
+                // AE#286: per-epoch head. cache.highestStoredIndex is monotonic across restarts and would
+                // credit this pump with the previous epoch's production.
+                pumpEpochHighestStored = max(pumpEpochHighestStored, cutIdx)
+                if isLive {
+                    reportLiveSegmentFinalized(index: cutIdx, nextIndex: newIdx)
+                } else if onSequentialSegmentFinalized != nil {
+                    reportSequentialSegmentFinalized(index: cutIdx, isFinal: false)
+                }
             }
             // Cut succeeded but muxer failed to open the next staging fd: silently discards every subsequent byte.
             if muxer.isWedged {
                 EngineLog.emit(
-                    "[HLSSegmentProducer] muxer wedged after seg-\(currentMuxerSegmentIndex) cut "
+                    "[HLSSegmentProducer] muxer wedged after \(file.name)-\(cutIdx) cut "
                     + "(next staging fd open failed), ending pump",
                     category: .session
                 )
@@ -2815,24 +2887,29 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // question ("why has the bridge emitted nothing?") had no line at all.
             if let bridge = audioConfig?.bridge {
                 EngineLog.emit(
-                    "[HLSSegmentProducer] AE#396 seg-\(currentMuxerSegmentIndex).m4s cut deferred: the "
+                    "[HLSSegmentProducer] AE#396 \(file.name)-\(cutIdx).m4s cut deferred: the "
                     + "audio sample entry is built from a BRIDGED packet and the bridge has muxed none. "
                     + "Bridge: \(bridge.feedStats.summary)",
                     category: .session
                 )
             } else {
                 EngineLog.emit(
-                    "[HLSSegmentProducer] AE#222 seg-\(currentMuxerSegmentIndex).m4s cut deferred: audio sample "
+                    "[HLSSegmentProducer] AE#222 \(file.name)-\(cutIdx).m4s cut deferred: audio sample "
                     + "entry needs a parsed packet and none has been muxed; scanning forward for a prime frame",
                     category: .session
                 )
             }
             return nil
-        case .failed:
-            // Failed cut: muxer has no open staging fd, every byte is silently discarded. Fatal.
-            abandonSegmentInProgress(currentMuxerSegmentIndex)
+        case .empty where file.track == .audio:
+            // Its time holds no audio; the rendition still serves the index.
+            abandonSegmentInProgress(file, cutIdx)
+            serveEmptyAudio(file, from: cutIdx, to: cutIdx + 1)
+        case .failed, .empty:
+            // Failed cut: muxer has no open staging fd, every byte is silently discarded. Fatal. A video
+            // segment with no sample is no segment either.
+            abandonSegmentInProgress(file, cutIdx)
             EngineLog.emit(
-                "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s cut FAILED; "
+                "[HLSSegmentProducer] \(file.name)-\(cutIdx).m4s cut FAILED; "
                 + "muxer is wedged, ending pump",
                 category: .session
             )
@@ -2841,8 +2918,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // #358: the cut jumped over plan indices, so no keyframe reached their boundaries and no
         // segment will ever open there. The VOD playlist still offers them, which is what turns the
         // gap into a consumer that waits forever, so record them for the wedge handler.
-        if !isLive, newIdx > currentMuxerSegmentIndex + 1 {
-            let folded = (currentMuxerSegmentIndex + 1)..<newIdx
+        if file.track == .audio {
+            // The audio passed these indices without a sample; its rendition still serves them.
+            serveEmptyAudio(file, from: cutIdx + 1, to: newIdx)
+        } else if !isLive, newIdx > cutIdx + 1 {
+            let folded = (cutIdx + 1)..<newIdx
             cache.noteFolded(folded)
             if folded.count > SegmentCache.maxFoldRunLength {
                 // #369: a leap this wide is not a long GOP, a timeline jump escaped the rebase.
@@ -2858,8 +2938,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 category: .session
             )
         }
-        currentMuxerSegmentIndex = newIdx
-        noteSegmentInProgress(newIdx, muxer: muxer)
+        file.segmentIndex = newIdx
+        noteSegmentInProgress(file, newIdx, muxer: muxer)
+        // The video drives backpressure; the audio rendition's segments follow the source.
+        guard file.track == .video else { return checkShouldStop() ? nil : muxer }
         if isLive {
             // Live is source-paced: the pump only runs ahead of real time while draining the join
             // backlog, and the sliding window (notePlaylistBuild -> evictBelow) bounds resident
@@ -3006,30 +3088,34 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Progressive delivery is VOD only: live keeps its own window and blocking-reload contracts.
     private var servesProgressively: Bool { !isLive && servesSegmentsProgressively }
 
-    private func noteSegmentInProgress(_ index: Int, muxer: MP4SegmentMuxer) {
+    private func noteSegmentInProgress(_ file: Rendition, _ index: Int, muxer: MP4SegmentMuxer) {
         // An overlay run's first segment is served whole, once its picture is decoded.
-        guard servesProgressively, !holdsOverlayRunStart || overlayRunStartReleased else { return }
-        cache.beginInProgress(index: index, stagingPath: muxer.stagingURL)
+        guard servesProgressively, file.track == .audio || !holdsOverlayRunStart || overlayRunStartReleased
+        else { return }
+        file.cache.beginInProgress(index: index, stagingPath: muxer.stagingURL)
     }
 
-    private func abandonSegmentInProgress(_ index: Int) {
+    private func abandonSegmentInProgress(_ file: Rendition, _ index: Int) {
         guard servesProgressively, index != .min else { return }
-        cache.abandonInProgress(index: index)
+        file.cache.abandonInProgress(index: index)
     }
 
     /// What the segment just cut at `index` opened with. Live keeps its sound span (AE#684); VOD
     /// reports the normalization its bytes were written with, which maps a frame's time in the file
     /// back onto the source (scrub thumbnails decode the file itself).
-    private func recordSegmentOpening(_ muxer: MP4SegmentMuxer, index: Int) {
+    private func recordSegmentOpening(_ file: Rendition, _ muxer: MP4SegmentMuxer, index: Int) {
         let opening = muxer.takeSegmentOpening()
         if isLive {
+            // The sound span is the file's that carries the audio: the video's when muxed, the audio
+            // rendition's when not.
+            guard muxer.audioOutputStreamIndex >= 0 else { return }
             let atb = muxer.muxerAudioTimeBase
             let tick = atb.den > 0 ? Double(atb.num) / Double(atb.den) : 0
             liveSegmentSoundByIndex.updateValue(
                 opening.sound.map { (Double($0.first) * tick, Double($0.last) * tick) }, forKey: index)
             return
         }
-        guard videoShiftPts != Int64.min else { return }
+        guard file.track == .video, videoShiftPts != Int64.min else { return }
         onSegmentWritten?(index, Double(videoShiftPts) * sourceVideoTbSeconds)
     }
 
@@ -3075,62 +3161,80 @@ final class HLSSegmentProducer: @unchecked Sendable {
                        + "after \(String(format: "%.0f", waitedMs)) ms", category: .session)
     }
 
-    private func finalizeSessionMuxerAndAdopt() {
-        guard let muxer = currentMuxer else { return }
-        let idx = currentMuxerSegmentIndex
-        releaseOverlayRunStart()
+    /// Finalize `file`'s muxer and adopt its open segment. The audio rendition's adopts one with no sample
+    /// as such (`serveEmptyAudio`), as a cut does.
+    private func finalizeSessionMuxerAndAdopt(_ file: Rendition) {
+        guard let muxer = file.muxer else { return }
+        let idx = file.segmentIndex
+        if file.track == .video { releaseOverlayRunStart() }
         if let result = muxer.finalize() {
             EngineLog.emit(
-                "[HLSSegmentProducer] seg-\(idx).m4s captured (\(result.bytesWritten) B)",
+                "[HLSSegmentProducer] \(file.name)-\(idx).m4s captured (\(result.bytesWritten) B)",
                 category: .session, level: .verbose
             )
-            cache.adopt(index: idx, stagingPath: result.path,
-                        byteCount: result.bytesWritten,
-                        videoReach: takeVideoReach(forSegmentIndex: idx))
-            recordSegmentOpening(muxer, index: idx)
-            if isLive {
-                reportLiveSegmentFinalized(index: idx, nextIndex: nil)
-            } else if onSequentialSegmentFinalized != nil {
-                reportSequentialSegmentFinalized(index: idx, isFinal: true)
+            file.cache.adopt(index: idx, stagingPath: result.path,
+                             byteCount: result.bytesWritten,
+                             videoReach: file.track == .video ? takeVideoReach(forSegmentIndex: idx) : nil)
+            file.head = max(file.head, idx)
+            recordSegmentOpening(file, muxer, index: idx)
+            if file.track == .video {
+                if isLive {
+                    reportLiveSegmentFinalized(index: idx, nextIndex: nil)
+                } else if onSequentialSegmentFinalized != nil {
+                    reportSequentialSegmentFinalized(index: idx, isFinal: true)
+                }
             }
+        } else if file.track == .audio {
+            abandonSegmentInProgress(file, idx)
+            serveEmptyAudio(file, from: idx, to: idx + 1)
         } else {
-            abandonSegmentInProgress(idx)
+            abandonSegmentInProgress(file, idx)
             EngineLog.emit(
-                "[HLSSegmentProducer] seg-\(idx).m4s final finalize failed; not adopted",
+                "[HLSSegmentProducer] \(file.name)-\(idx).m4s final finalize failed; not adopted",
                 category: .session
             )
         }
-        installMuxer(nil)
-        currentMuxerSegmentIndex = .min
+        installMuxer(nil, into: file)
+        file.segmentIndex = .min
     }
 
-    /// Finalize the muxer to release its context and staging file, but throw the partial segment
+    /// Finalize `file`'s muxer to release its context and staging file, but throw the partial segment
     /// away instead of adopting it into the cache (see `shouldAdoptTeardownSegment`).
-    private func discardSessionMuxer() {
-        guard let muxer = currentMuxer else { return }
-        let idx = currentMuxerSegmentIndex
+    private func discardSessionMuxer(_ file: Rendition) {
+        guard let muxer = file.muxer else { return }
+        let idx = file.segmentIndex
         // The partial segment is not adopted; a reader draining it is told before the file goes.
-        abandonSegmentInProgress(idx)
+        abandonSegmentInProgress(file, idx)
         if let result = muxer.finalize() {
             try? FileManager.default.removeItem(at: result.path)
             EngineLog.emit(
-                "[HLSSegmentProducer] seg-\(idx).m4s partial at teardown (\(result.bytesWritten) B) discarded, not adopted",
+                "[HLSSegmentProducer] \(file.name)-\(idx).m4s partial at teardown (\(result.bytesWritten) B) "
+                + "discarded, not adopted",
                 category: .session
             )
         }
-        installMuxer(nil)
-        currentMuxerSegmentIndex = .min
+        installMuxer(nil, into: file)
+        file.segmentIndex = .min
+    }
+
+    /// The pump's end, for every file it writes: adopted (`adopting`), the audio rendition then serving
+    /// each index through the video's last, or the partial segments discarded.
+    private func finishFiles(adopting: Bool) {
+        let lastVideoIndex = videoFile.segmentIndex
+        let files = [videoFile] + (audioFile.map { [$0] } ?? [])
+        for file in files {
+            if adopting { finalizeSessionMuxerAndAdopt(file) } else { discardSessionMuxer(file) }
+        }
+        if adopting, let audioFile, lastVideoIndex != .min {
+            serveEmptyAudio(audioFile, from: max(audioFile.head + 1, baseIndex), to: lastVideoIndex + 1)
+        }
     }
 
     deinit {
         // Backstop for a pump that never exited normally; without an exit reason, a VOD in-flight
         // segment is partial by definition, so only live may adopt here.
-        if currentMuxer != nil {
-            if isLive {
-                finalizeSessionMuxerAndAdopt()
-            } else {
-                discardSessionMuxer()
-            }
+        if videoFile.muxer != nil || audioFile?.muxer != nil {
+            finishFiles(adopting: isLive)
         }
     }
 
@@ -3806,7 +3910,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if isLive { startNoCutWatchdog() }
         defer { stopNoCutWatchdog() }
         var vodLedgerLastRoutedSeg = Int.min  // #65 ledger: last VOD segment index logged at the routing site
-        cutGate = isLive || audioFollowsVideoCut ? nil
+        // The muxed shape's: one file holds both tracks. Demuxed, each track cuts a file of its own.
+        cutGate = isLive || audioFollowsVideoCut || audioFile != nil ? nil
             : SegmentCutGate(tracks: audioConfig == nil ? [.video] : [.video, .audio], segment: baseIndex)
 
         do {
@@ -4884,14 +4989,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     // late. Where audio follows the video cutter (sequential origins) they are routed
                     // by the cutter and the open muxer (the `max` in `ensureMuxer`), so settle it
                     // before this packet advances the cutter or the look-behind write below cuts.
-                    // Routed by time, the cut gate waits for them instead.
-                    if !isLive, cutGate == nil, let audio = audioConfig, let bridge = audio.bridge {
+                    // Routed by time, the cut gate waits for them instead (muxed), or the audio cuts a file
+                    // of its own on its own routing (demuxed).
+                    if !isLive, audioFollowsVideoCut, let audio = audioConfig, let bridge = audio.bridge {
                         let advancesCutter = audioFollowsVideoCut && isVideoKeyframe
                             && vodCutter.peekIndex(
                                 pts: planBoundaryAxis.timestamp(dts: packet.pointee.dts, pts: packet.pointee.pts),
                                 isKeyframe: true) != vodCutter.current
-                        let lookBehindCuts = pendingVideoPkt != nil && currentMuxer != nil
-                            && pendingVideoSegIndex > currentMuxerSegmentIndex
+                        let lookBehindCuts = pendingVideoPkt != nil && videoFile.muxer != nil
+                            && pendingVideoSegIndex > videoFile.segmentIndex
                         if advancesCutter || lookBehindCuts, !writeBridgedAudio(bridge.settle(), audio: audio) {
                             exitReason = .muxerFailed
                             break readLoop
@@ -5134,11 +5240,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             }
         }
 
-        if Self.shouldAdoptTeardownSegment(exitReason: exitReason, isLive: isLive) {
-            finalizeSessionMuxerAndAdopt()
-        } else {
-            discardSessionMuxer()
-        }
+        finishFiles(adopting: Self.shouldAdoptTeardownSegment(exitReason: exitReason, isLive: isLive))
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - pumpStart.uptimeNanoseconds) / 1_000_000
         EngineLog.emit(
             "[HLSSegmentProducer] pump finished: reason=\(exitReason) "
@@ -5183,6 +5285,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Muxes `item` into `segment`: through the cut gate, which may hold it for another track, or at once
     /// where there is none. False when the muxer is gone; every packet released is then freed.
     private func mux(_ track: SegmentCutGate<GatedWrite>.Track, segment: Int, _ item: GatedWrite) -> Bool {
+        // Demuxed, the audio has a file of its own, cut on its own routing, and nothing waits for the video.
+        if track == .audio, let audioFile {
+            guard let muxer = ensureMuxer(audioFile, forSegmentIndex: segment) else { item.free(); return false }
+            item.write(muxer)
+            return true
+        }
         guard cutGate != nil else { return muxReleased([(segment, item)]) }
         return muxReleased(cutGate!.submit(item, track: track, segment: segment))
     }
@@ -5190,7 +5298,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private func muxReleased(_ entries: [(segment: Int, item: GatedWrite)]) -> Bool {
         var muxerGone = false
         for entry in entries {
-            if !muxerGone, let muxer = ensureMuxer(forSegmentIndex: entry.segment) {
+            if !muxerGone, let muxer = ensureMuxer(videoFile, forSegmentIndex: entry.segment) {
                 entry.item.write(muxer)
             } else {
                 muxerGone = true
@@ -5368,7 +5476,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             ? Int64.min
             : Self.foldingShiftBack(packet.pointee.pts, shift: videoShiftPts)
         let frameIsKeyframe = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
-        let frameSegmentIndex = currentMuxerSegmentIndex
+        let frameSegmentIndex = videoFile.segmentIndex
 
         av_packet_rescale_ts(packet, sourceVideoTimeBase, muxer.muxerVideoTimeBase)
         let write = muxer.writePacket(packet)
