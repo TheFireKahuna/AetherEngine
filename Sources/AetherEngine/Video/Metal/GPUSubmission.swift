@@ -198,6 +198,9 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
         let residency: MTLResidencySet
         let stamps: MTL4CounterHeap?
         let uploads: Uploads
+        /// The pipelines the batch's passes set, held until it completes: a command buffer holds them without retaining
+        /// them.
+        var pipelines: [MTLComputePipelineState] = []
 
         init?(device: MTLDevice) {
             let tableDescriptor = MTL4ArgumentTableDescriptor()
@@ -277,6 +280,7 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
         context.allocator.reset()
         context.residency.removeAllAllocations()
         context.uploads.reset()
+        context.pipelines.removeAll(keepingCapacity: true)
         context.commandBuffer.beginCommandBuffer(allocator: context.allocator)
         context.commandBuffer.useResidencySet(context.residency)
         return Batch(backend: self, context: context, timed: timed && context.stamps != nil, ordered: orderedAfterEarlierWork)
@@ -367,7 +371,10 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
             self.encoder = encoder
         }
 
-        func setPipeline(_ pipeline: MTLComputePipelineState) { encoder.setComputePipelineState(pipeline) }
+        func setPipeline(_ pipeline: MTLComputePipelineState) {
+            batch.context.pipelines.append(pipeline)
+            encoder.setComputePipelineState(pipeline)
+        }
 
         func setTexture(_ texture: MTLTexture, index: Int) {
             batch.context.residency.addAllocation(texture)
@@ -457,6 +464,9 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
         let residency: MTLResidencySet?
         let samples: MTLCounterSampleBuffer?
         let uploads: Uploads
+        /// The pipelines the batch's passes set, held until it completes: an unretained command buffer holds them
+        /// without retaining them.
+        var pipelines: [MTLComputePipelineState] = []
 
         init(device: MTLDevice, counters: MTLCounterSet?) {
             uploads = Uploads(device: device)
@@ -492,6 +502,7 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
         guard let commandBuffer = queue.makeCommandBufferWithUnretainedReferences() else { return nil }
         let context = pool.withLock { $0.popLast() } ?? Context(device: device, counters: timestampCounters)
         context.uploads.reset()
+        context.pipelines.removeAll(keepingCapacity: true)
         if let residency = context.residency {
             residency.removeAllAllocations()
             commandBuffer.useResidencySet(residency)
@@ -618,6 +629,7 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
 
         func setPipeline(_ pipeline: MTLComputePipelineState) {
             self.pipeline = pipeline
+            batch.context.pipelines.append(pipeline)
             encoder?.setComputePipelineState(pipeline)
         }
 
