@@ -25,8 +25,11 @@ protocol OverlayTapDecoder: AnyObject {
 /// ahead of AVPlayer, so a unit exists before AVPlayer can show it, and a seek restarts the producer at the target,
 /// so the tap follows seeks with no logic of its own.
 ///
-/// The decoder works from the keyframe at or before the clock, along the run, `decodeAheadSeconds` ahead. A clock
-/// outside what has been fed (a seek, a new run) restarts it at the keyframe before the clock, the random-access
+/// The decoder works from the keyframe at or before the clock, along the run, until its newest picture is
+/// `decodeAheadSeconds` ahead of the clock. The window is measured in pictures out, not units in: everything between
+/// holds pictures back by its own amount (B-frame reordering, a deinterlacer's window, inverse telecine's cycle), and a
+/// window of units would leave pictures arriving at the last moment, or not at all while the clock stands still. A
+/// clock outside what has been fed (a seek, a new run) restarts it at the keyframe before the clock, the random-access
 /// points the segments are cut on. Units are kept `keepBehindSeconds` behind the clock, so a backward seek into
 /// segments the session still has cached (which the producer does not cut again) finds its packets.
 final class OverlayPacketTap<Info>: @unchecked Sendable {
@@ -52,6 +55,9 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
     /// A clock this far behind the decode window has jumped back: the decode is past where it is needed. More than a
     /// reordered GOP's lead, so a stream with B-frames does not read as one.
     static var behindDecodeMs: Int64 { 500 }
+    /// How far past the window units are fed while no picture reaches it: well past what any decoder and filter chain
+    /// holds back, so a decoder that puts nothing out stops here rather than run through the stream.
+    static var feedPastWindowMs: Int64 { 1000 }
 
     private struct Entry {
         let seq: Int
@@ -278,13 +284,15 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
     /// enough ahead, or the producer has not cut what comes next. Caller holds `state`.
     private func nextPacketLocked() -> (UnsafeMutablePointer<AVPacket>, Bool)? {
         let aheadMs = Int64(decodeAheadSeconds * 1000)
+        let newestPictureMs = decoded.keys.max()
         let entry: Entry
         let restart: Bool
-        if let fed = lastFed, clockMs >= runFirstPtsMs - 50, clockMs >= runLastPtsMs - aheadMs - Self.behindDecodeMs,
-           !keyframePastDecodeLocked() {
-            // What was fed leads to the clock: carry on along the run, up to the decode window. A decode still
-            // short of the clock carries on too, unless a keyframe past everything fed is nearer to it.
-            guard runLastPtsMs < clockMs + aheadMs else { return nil }
+        if let fed = lastFed, clockMs >= runFirstPtsMs - 50,
+           clockMs >= (newestPictureMs ?? runLastPtsMs) - aheadMs - Self.behindDecodeMs, !keyframePastDecodeLocked() {
+            // What was fed leads to the clock: carry on along the run until the pictures reach the decode window. A
+            // decode still short of the clock carries on too, unless a keyframe past everything fed is nearer to it.
+            guard (newestPictureMs ?? .min) < clockMs + aheadMs,
+                  runLastPtsMs < clockMs + aheadMs + Self.feedPastWindowMs else { return nil }
             let following = entries[fed.seq + 1]
             if following == nil, fed.seq + 1 >= nextSeq { return nil }   // not cut yet
             if let following, following.run == fed.run {
@@ -322,12 +330,15 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
     }
 
     /// The keyframe the decoder starts from for `ms`: in the run that cut `ms` (or the closest unit before it), the
-    /// last keyframe at or before it in decode order. Caller holds `state`.
+    /// last keyframe at or before it both in decode order and in time. A picture that follows its GOP's keyframe in
+    /// decode order but precedes it in time (an open GOP's leading pictures) references the GOP before, and decoded
+    /// from its own keyframe it never comes out: the decode starts at the previous GOP's keyframe instead. Caller holds
+    /// `state`.
     private func keyframeLocked(beforeOrAt ms: Int64) -> Entry? {
         let seq = seqByPts[ms] ?? seqByPts.filter { $0.key <= ms }.max { $0.key < $1.key }?.value
         guard let seq, let clockEntry = entries[seq] else { return nil }
         return entries.values
-            .filter { $0.isKey && $0.run == clockEntry.run && $0.seq <= seq }
+            .filter { $0.isKey && $0.run == clockEntry.run && $0.seq <= seq && $0.ptsMs <= ms }
             .max { $0.seq < $1.seq }
     }
 
@@ -336,6 +347,8 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         state.lock()
         decoded[ms] = Picture(picture: picture, time: time, seconds: Double(ms) / 1000)
         trimDecodedLocked()
+        // The decode window is counted in pictures: a new one can close it, or leave it open for the next unit.
+        state.broadcast()
         state.unlock()
     }
 

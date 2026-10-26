@@ -340,7 +340,7 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         switch pacing {
         case .outputFrames: fillFromOutput(itemTimebase: itemTimebase, rate: rate, refresh: duration)
         case .clock: fillFromSource(itemTimebase: itemTimebase, rate: rate, presentAt: target + duration, refresh: duration)
-        case .showOutput: showOutput(presentAt: target + duration, refresh: duration)
+        case .showOutput: showOutput(rate: rate, presentAt: target + duration, refresh: duration)
         }
     }
 
@@ -360,11 +360,18 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
             }
             // A frame AVPlayer is served is asked for half a millisecond past its whole-millisecond time: at or
             // past its own time, short of the next frame's. One the clock has passed is behind the picture
-            // on screen, and the frame at the clock is taken instead.
-            var itemTime = clock
+            // on screen, and the frame at the clock is taken instead. With none taken since a restart, the first is
+            // the first AVPlayer has from the clock on: after a seek AVPlayer starts its clock short of the target,
+            // and the frames before the target are never put out.
+            let itemTime: CMTime
             if lastPulled.isValid {
                 guard let next = source.frameTime(after: lastPulled.seconds) else { break }
                 itemTime = CMTimeMaximum(CMTime(seconds: next + 0.0005, preferredTimescale: 1_000_000_000), clock)
+            } else if let first = firstOutputTime(from: clock) {
+                itemTime = first
+            } else {
+                countersLock.withLock { _counters.atOutputEdge += 1 }
+                break
             }
             guard output.hasNewPixelBuffer(forItemTime: itemTime) else {
                 countersLock.withLock { _counters.atOutputEdge += 1 }
@@ -386,9 +393,23 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         if lastQueued.isValid { stages.record("queued ahead of the clock", ms: (lastQueued - clock).seconds * 1000) }
         if took {
             lastNewFrame = CACurrentMediaTime()
-        } else {
+        } else if rate == 0 {
             quiesceIfIdle(refresh)
         }
+    }
+
+    /// The item time to ask the output for the first frame it has at or after `clock`, walking the frames AVPlayer is
+    /// served up to the look-ahead; nil when it has none of them yet.
+    private func firstOutputTime(from clock: CMTime) -> CMTime? {
+        if output.hasNewPixelBuffer(forItemTime: clock) { return clock }
+        var cursor = clock.seconds
+        for _ in 0..<Self.lookaheadFrames {
+            guard let next = source.frameTime(after: cursor) else { return nil }
+            let time = CMTime(seconds: next + 0.0005, preferredTimescale: 1_000_000_000)
+            if output.hasNewPixelBuffer(forItemTime: time) { return time }
+            cursor = next
+        }
+        return nil
     }
 
     /// Hands AVPlayer's frame at `frameTime` to the source; false when the source has nothing for it yet.
@@ -452,10 +473,10 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
 
     /// `.showOutput`: AVPlayer's frame for the refresh after next, as it is, stamped for that refresh on the host
     /// clock, the clock the display link reports in.
-    private func showOutput(presentAt: CFTimeInterval, refresh: CFTimeInterval) {
+    private func showOutput(rate: Double, presentAt: CFTimeInterval, refresh: CFTimeInterval) {
         let itemTime = output.itemTime(forHostTime: presentAt)
         guard output.hasNewPixelBuffer(forItemTime: itemTime) else {
-            quiesceIfIdle(refresh)
+            if rate == 0 { quiesceIfIdle(refresh) }
             return
         }
         var frameTime = CMTime.invalid
@@ -542,7 +563,8 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         return (from, lastQueued + frame)
     }
 
-    /// Nothing new for a while (paused, a still): quiesce until the output says frames are coming.
+    /// Nothing new for a while with the clock stopped (paused, a seek prerolling): quiesce until the output says frames
+    /// are coming. A running clock keeps the refreshes, so frames are taken as soon as AVPlayer has them.
     private func quiesceIfIdle(_ refresh: CFTimeInterval) {
         guard CACurrentMediaTime() - lastNewFrame > Self.quiesceAfter else { return }
         displayLink?.setPaused(true)

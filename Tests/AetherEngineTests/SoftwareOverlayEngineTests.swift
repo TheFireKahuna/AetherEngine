@@ -80,9 +80,13 @@ struct SoftwareOverlayEngineTests {
             await engine.seek(to: target)
             #expect(try await presented.wait(forPictureAt: target + 1.5, before: target + 3, after: before), "seek to \(target)")
             let run = presented.run(afterSeekTo: target, after: before, interval: clip.interval)
-            let start = try #require(run.first?.time, "a picture near \(target) after the seek")
-            #expect(start >= target - clip.interval - 0.002 && start <= target + clip.interval + 0.002,
-                    "the first picture after the seek to \(target) is at \(start)")
+            // The picture on screen at the clock it reached the layer at, by the decode's hold rule: no later than the
+            // target's own, and the one after it no more than the hold overdue then.
+            let first = try #require(run.first, "a picture near \(target) after the seek")
+            let overdueMs = (first.clock - (first.time + clip.interval)) * 1000
+            #expect(first.time <= target + clip.interval + 0.002
+                        && overdueMs <= Double(OverlayPacketTap<Double>.heldPastMs) + 2,
+                    "the first picture after the seek to \(target) is at \(first.time), clock \(first.clock)")
             let faults = OverlayPresentations.faults(in: run, interval: clip.interval, steadyFrom: target + 0.5)
             #expect(faults.isEmpty, "after the seek to \(target), \(faults.count) faults: \(faults.prefix(8))")
         }

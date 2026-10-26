@@ -90,8 +90,11 @@ struct OverlayDecodeTapTests {
             let expected = try #require(referencePictures.withLock { $0.first { abs($0.key - ms) <= 1 }?.value },
                                         "a plain decode's picture at \(seconds)")
             #expect(Self.planes(picture) == expected, "clock \(clock)")
-            // The decoder works a few pictures ahead of the clock and keeps no more behind it than the one shown.
-            #expect(tap.held.decoded <= Int(OverlayDecodeTap.decodeAheadSeconds * 24) + 3)
+            // The decoder works a few pictures ahead of the clock and keeps no more behind it than the one shown: the
+            // window, and the pictures still inside the decoder when its pictures reach the window (4 for dav1d, 5 for
+            // VideoToolbox, measured on these clips), which come out after it.
+            #expect(tap.held.decoded <= Int(OverlayDecodeTap.decodeAheadSeconds * 24) + 3 + 5,
+                    "\(tap.held.decoded) pictures held")
         }
     }
 
