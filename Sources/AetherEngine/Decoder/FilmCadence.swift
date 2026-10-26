@@ -16,6 +16,11 @@ import AetherLibavutil
 /// so a run ends on an interlaced picture, a duration that breaks the alternation, or a timestamp further than one
 /// carriage frame from its slot (an edit, a splice), and detection starts over.
 ///
+/// A stream the load already found to be film coded this way (`filmCoded`) starts a run at its first progressive
+/// picture instead of after `confirmation` of them, so the pictures after a start or a seek are on the grid too.
+/// Anchored at any picture of the cadence the grid still lies within half a field of the field timeline; the run is
+/// checked picture by picture as any other, and a picture that breaks it starts the next run.
+///
 /// Not thread-safe; the owning decoder serialises access with its lock.
 final class FilmCadence {
 
@@ -35,11 +40,13 @@ final class FilmCadence {
     }
 
     let timeBase: AVRational
+    let filmCoded: Bool
     private var seen: [Seen] = []
     private var run: Run?
 
-    init(timeBase: AVRational) {
+    init(timeBase: AVRational, filmCoded: Bool = false) {
         self.timeBase = timeBase
+        self.filmCoded = filmCoded
     }
 
     /// Pictures needed to recognise a run: two full alternations.
@@ -81,6 +88,11 @@ final class FilmCadence {
                 return slot
             }
             reset()
+        }
+        if filmCoded, !interlaced, pts != noPTS, [2, 3, 4, 6].contains(halves) {
+            run = Run(anchor: pts, index: 0, short: halves <= 3 ? 2 : 4, lastHalves: halves, carriage: carriage)
+            seen.removeAll()
+            return pts
         }
         seen.append(Seen(halves: halves, progressive: !interlaced, pts: pts))
         if seen.count > Self.confirmation { seen.removeFirst(seen.count - Self.confirmation) }

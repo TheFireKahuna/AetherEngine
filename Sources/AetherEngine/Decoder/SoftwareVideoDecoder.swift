@@ -369,7 +369,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let made = try DisplayBufferWriter(device: device, streamIs10Bit: streamIs10Bit, twelveBit420: Self.twelveBit420Output,
                                            containerHDRStatic: HDRStaticMetadata(codecpar: codecpar), logTag: "SWDecoder")
         writer = made
-        filmCadence = AetherEngine.filmDetection ? FilmCadence(timeBase: timeBase) : nil
+        filmCadence = AetherEngine.filmDetection
+            ? FilmCadence(timeBase: timeBase, filmCoded: deinterlaceConfig.softTelecine) : nil
         if deinterlaces {
             window = BwdifWindow(timeBase: timeBase, fieldRate: deinterlaceConfig.fieldRate == .field)
             // A stream that declares interlacing compiles the deinterlacer's pipeline now, off this thread, so its first

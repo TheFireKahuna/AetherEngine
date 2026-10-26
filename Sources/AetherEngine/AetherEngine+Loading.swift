@@ -931,7 +931,8 @@ extension AetherEngine {
         // A stream AVPlayer cannot decode: the session decodes it for the software overlay, which shows it over a
         // placeholder, deinterlaced or film-matched as the load decided.
         session.overlayDecodesVideo = overlayDecodesVideoWanted
-        session.overlayDeinterlace = DeinterlaceConfig(fieldRate: loadedOptions.deinterlaceFieldRate, film: loadFilmCarriage)
+        session.overlayDeinterlace = DeinterlaceConfig(fieldRate: loadedOptions.deinterlaceFieldRate, film: loadFilmCarriage,
+                                                       softTelecine: loadSoftTelecine)
         // #240: a scrub thumbnail waits out a seek in flight. Set before start().
         session.seekInFlight = seekInFlight
         // How far the subtitle consumers ask the pump to have read on the source axis: the playback clock
@@ -2067,7 +2068,8 @@ extension AetherEngine {
                                                   closedCadence: ingest?.closedLiveCadenceSeconds)
             }
         }
-        host.deinterlaceConfig = DeinterlaceConfig(fieldRate: loadedOptions.deinterlaceFieldRate, film: loadFilmCarriage)
+        host.deinterlaceConfig = DeinterlaceConfig(fieldRate: loadedOptions.deinterlaceFieldRate, film: loadFilmCarriage,
+                                                   softTelecine: loadSoftTelecine)
         host.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
         }

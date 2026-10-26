@@ -7,6 +7,9 @@ struct DeinterlaceConfig: Sendable, Equatable {
     /// Film in interlaced carriage, found by the load probe (docs/software-route-gpu.md 6.4): the pictures go through
     /// ``InverseTelecine`` instead of the deinterlacer. Nil for video.
     var film: FilmCarriage? = nil
+    /// Film coded with repeat-field flags, found by the load probe (docs/software-route-gpu.md 6.1): ``FilmCadence``
+    /// puts a run's pictures on the film grid from its first picture rather than after confirming the cadence.
+    var softTelecine = false
 }
 
 /// How film sits in interlaced carriage (docs/software-route-gpu.md 6.2 - 6.4).
