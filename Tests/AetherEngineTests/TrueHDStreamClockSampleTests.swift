@@ -62,7 +62,7 @@ struct TrueHDStreamClockSampleTests {
                                                 decoder: try TrueHDObjectAudioDecoder())
             defer { bridge.close() }
             bridge.setSourceStart(0)
-            bridge.setStreamClock(headOffset: Self.expectedHeadOffset)
+            bridge.setStreamClock(anchors: StreamClockAnchors(headOffset: Self.expectedHeadOffset))
             var out: [Int64] = [], i = 0
             try Self.packets(mid) { packet in
                 packet.pointee.pts -= drift(i)

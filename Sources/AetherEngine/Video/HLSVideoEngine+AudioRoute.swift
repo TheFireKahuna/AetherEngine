@@ -214,7 +214,7 @@ extension HLSVideoEngine {
     /// the last restart's, plus the units since. Two reads of the offset from that:
     /// - The timestamps bound it. A packet's timestamp is its access unit's place rounded to the container's tick, so
     ///   each one allows the offsets within half a tick of its own reading (its timestamp less its clock,
-    ///   ``mostAllowed(_:halfWidth:)``); the offset lies where the most packets allow it. With a millisecond's tick
+    ///   `StreamClockPlacement.mostAllowed(_:halfWidth:)`); the offset lies where the most packets allow it. With a millisecond's tick
     ///   and 40-sample access units that is a window eight frames wide, whatever the number of packets. A packet that
     ///   does not allow it is stamped apart.
     /// - The count from the head pins it. The stream's first packet is its start, unrounded, so the access units
@@ -278,7 +278,7 @@ extension HLSVideoEngine {
             return (nil, readings.count, 0, false, head)
         }
         let window = readings.map { first + StreamClockPlacement.nearest($0 - first, modulus: 1 << 16) }
-        let allowed = mostAllowed(window, halfWidth: halfTick)
+        let allowed = StreamClockPlacement.mostAllowed(window, halfWidth: halfTick)
         // A reading is stamped apart when it allows none of the window.
         let allowsWindow: (Int64) -> Bool = { $0 + halfTick > allowed.lowerBound && $0 - halfTick <= allowed.upperBound }
         let apart = window.filter { !allowsWindow($0) }.count
@@ -286,32 +286,7 @@ extension HLSVideoEngine {
             let near = first + StreamClockPlacement.nearest(counted - first, modulus: 1 << 16)
             if allowed.contains(near) { return (counted, readings.count, apart, true, head) }
         }
-        return ((allowed.lowerBound + allowed.upperBound) / 2, readings.count, apart, false, head)
-    }
-
-    /// The values the most readings allow: a closed range. A reading is a timestamp rounded to the nearest tick, a
-    /// tie upward, less its exact place, so it lies in (x - halfWidth, x + halfWidth] of the true value x, and allows
-    /// x in [r - halfWidth, r + halfWidth). A reading off by a whole tick then allows none of the true window, where a
-    /// closed allowance would let late ones pull it a lattice step.
-    static func mostAllowed(_ readings: [Int64], halfWidth: Int64) -> ClosedRange<Int64> {
-        // Each reading's allowance opens at r - halfWidth and closes at r + halfWidth. Every change at a value is
-        // applied before the stretch from it to the next change is counted; the best stretch is where most are open.
-        var changes: [Int64: Int] = [:]
-        for r in readings {
-            changes[r - halfWidth, default: 0] += 1
-            changes[r + halfWidth, default: 0] -= 1
-        }
-        let at = changes.keys.sorted()
-        var open = 0, best = 0
-        var range = (readings.first ?? 0)...(readings.first ?? 0)
-        for (i, value) in at.enumerated() where i + 1 < at.count {
-            open += changes[value]!
-            if open > best {
-                best = open
-                range = value...(at[i + 1] - 1)
-            }
-        }
-        return range
+        return (StreamClockPlacement.middle(of: allowed), readings.count, apart, false, head)
     }
 
     func handleBridgeDecodedNothing(streamIndex: Int32, summary: String) {
@@ -496,15 +471,16 @@ extension HLSVideoEngine {
                 }
                 let watchesDecoder = sideAudioDemuxer == nil
                 let streamIndex = sourceAudioStreamIndex
-                let clockHeadOffset = trueHDClockHeadOffset(audioStream: audioStream, audioDemuxer: audioDemuxer,
-                                                            streamIndex: sourceAudioStreamIndex)
-                bridge.setStreamClock(headOffset: clockHeadOffset)
+                // One store of the stream clock's anchors for the bridge and every run.
+                let clockAnchors = trueHDClockHeadOffset(audioStream: audioStream, audioDemuxer: audioDemuxer,
+                                                         streamIndex: sourceAudioStreamIndex).map(StreamClockAnchors.init(headOffset:))
+                bridge.setStreamClock(anchors: clockAnchors)
                 let delivered = segmentRuns(template: bridge, sourceStream: audioStream) { [weak self, audioBridgeMode, isLiveSession] in
                     let run = try AudioBridge(srcCodecpar: audioStream.pointee.codecpar,
                                               srcTimeBase: audioStream.pointee.time_base,
                                               mode: audioBridgeMode, followsSourceContinuity: !isLiveSession,
                                               announces: false)
-                    run.setStreamClock(headOffset: clockHeadOffset)
+                    run.setStreamClock(anchors: clockAnchors)
                     if watchesDecoder {
                         run.onDecoderProducedNothing = { [weak self] stats in
                             self?.handleBridgeDecodedNothing(streamIndex: streamIndex, summary: stats.summary)

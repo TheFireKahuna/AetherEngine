@@ -15,30 +15,30 @@ struct StreamClockPlacementTests {
 
     @Test("a frame lands at the stream's start plus the offset plus its clock, whatever its timestamp says")
     func placesByTheClock() {
-        var placement = StreamClockPlacement(headOffset: Self.head)
+        var placement = StreamClockPlacement(anchors: StreamClockAnchors(headOffset: Self.head))
         // An hour in, 1024-frame steps; the first timestamp 96 ms early, the rest up to 112 frames off.
         let start: Int64 = 3_600 * 48_000
         for i: Int64 in 0..<200 {
             let position = start + i * 1024
             let estimate = position + (i == 0 ? -96 * 48 : (i % 7) * 32 - 112)
             #expect(placement.place(clock: Self.clock(at: position), modulus: Self.wrap, scale: 1, origin: 0,
-                                    estimate: estimate, noise: Self.noise) == .position(position))
+                                    estimate: estimate, noise: Self.noise, tick: 48) == .position(position))
         }
     }
 
     @Test("a run's first frame needs a timestamp, good to half the wrap, to choose its window")
     func firstFrameWindow() {
-        var placement = StreamClockPlacement(headOffset: Self.head)
+        var placement = StreamClockPlacement(anchors: StreamClockAnchors(headOffset: Self.head))
         let position: Int64 = 3_600 * 48_000
         #expect(placement.place(clock: Self.clock(at: position), modulus: Self.wrap, scale: 1, origin: 0,
-                                estimate: nil, noise: Self.noise) == .unplaced)
+                                estimate: nil, noise: Self.noise, tick: 48) == .unplaced)
         #expect(placement.place(clock: Self.clock(at: position), modulus: Self.wrap, scale: 1, origin: 0,
-                                estimate: position + Self.wrap / 2 - 1, noise: Self.noise) == .position(position))
+                                estimate: position + Self.wrap / 2 - 1, noise: Self.noise, tick: 48) == .position(position))
     }
 
     @Test("timestamps that leave the clock for good part it after a run of frames; one stray timestamp does not")
     func partsAtASplice() {
-        var placement = StreamClockPlacement(headOffset: Self.head)
+        var placement = StreamClockPlacement(anchors: StreamClockAnchors(headOffset: Self.head))
         let start: Int64 = 3_600 * 48_000
         var parted: Int64?
         for i: Int64 in 0..<30 {
@@ -46,23 +46,66 @@ struct StreamClockPlacementTests {
             // One stray timestamp at frame 5, then the container jumps a second ahead from frame 10.
             let estimate = position + (i == 5 ? 4_800 : i >= 10 ? 48_000 : 0)
             switch placement.place(clock: Self.clock(at: position), modulus: Self.wrap, scale: 1, origin: 0,
-                                   estimate: estimate, noise: Self.noise) {
+                                   estimate: estimate, noise: Self.noise, tick: 48) {
             case .parted(let frames): parted = parted ?? (frames == 48_000 ? i : -1)
             case .position(let p): #expect(p == position)
             case .unplaced: Issue.record("frame \(i) unplaced")
+            case .byTimestamps: break
             }
             if placement.parted { break }
         }
         #expect(parted == 10 + Int64(SourceGrid.phaseShiftTimestamps) - 1)
     }
 
+    /// A stretch past a splice: the clock reads zero 3 000 frames later against the timeline than before it.
+    static let spliced = head + 3_000
+
+    /// A frame's timestamp on a millisecond timeline: its place rounded to the tick (48 frames), a tie upward.
+    static func stamped(_ position: Int64) -> Int64 { (position + 24) / 48 * 48 }
+
+    @Test("a run past a splice no anchor fits parts, reads the stretch's anchor, and the next run places by it")
+    func learnsAStretch() {
+        let anchors = StreamClockAnchors(headOffset: Self.head)
+        let start: Int64 = 3_600 * 48_000
+        func clock(_ position: Int64) -> Int64 { ((position - Self.spliced) % Self.wrap + Self.wrap) % Self.wrap }
+        // A run on the new stretch, access units of 40 frames each stamped to the millisecond.
+        var run = StreamClockPlacement(anchors: anchors)
+        var parted = false
+        for i: Int64 in 0..<Int64(StreamClockPlacement.learningReadings + 16) {
+            let position = start + i * 40
+            if case .parted = run.place(clock: clock(position), modulus: Self.wrap, scale: 1, origin: 0,
+                                        estimate: Self.stamped(position), noise: Self.noise, tick: 48) { parted = true }
+        }
+        #expect(parted)
+        #expect(anchors.all == [Self.head, Self.spliced], "\(anchors.all)")
+        // The next run, further on, places by the learned anchor from its first frame, exactly.
+        var next = StreamClockPlacement(anchors: anchors)
+        for i: Int64 in 0..<64 {
+            let position = start + 96_000 + i * 40
+            #expect(next.place(clock: clock(position), modulus: Self.wrap, scale: 1, origin: 0,
+                               estimate: Self.stamped(position), noise: Self.noise, tick: 48) == .position(position))
+        }
+    }
+
+    @Test("a run inside the clock's first stretch keeps the load's anchor when a later one is known")
+    func choosesTheStretch() {
+        let anchors = StreamClockAnchors(headOffset: Self.head)
+        anchors.learn(Self.spliced)
+        var run = StreamClockPlacement(anchors: anchors)
+        for i: Int64 in 0..<64 {
+            let position = 600 * 48_000 + i * 40
+            #expect(run.place(clock: Self.clock(at: position), modulus: Self.wrap, scale: 1, origin: 0,
+                              estimate: Self.stamped(position), noise: Self.noise, tick: 48) == .position(position))
+        }
+    }
+
     @Test("a decimated stream's clock and offset are counted at 48 kHz")
     func decimated() {
         // A 96 kHz stream: the clock wraps at 2^15 frames at 48 kHz and its offset halves.
-        var placement = StreamClockPlacement(headOffset: 2 * Self.head)
+        var placement = StreamClockPlacement(anchors: StreamClockAnchors(headOffset: 2 * Self.head))
         let position: Int64 = 3_600 * 48_000
         #expect(placement.place(clock: Self.clock(at: position) % (Self.wrap / 2), modulus: Self.wrap / 2, scale: 2,
-                                origin: 0, estimate: position + 100, noise: Self.noise) == .position(position))
+                                origin: 0, estimate: position + 100, noise: Self.noise, tick: 48) == .position(position))
     }
 
     @Test("a clock difference is brought into the wrap's window around zero")
