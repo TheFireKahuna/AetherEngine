@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/TheFireKahuna/LibDeinterlace",
       "state" : {
-        "revision" : "10073d7c2dc7534903ff658e3dd4e0ed019d6382",
-        "version" : "1.3.1"
+        "revision" : "fca47faf073eaa2a980d770e880a7507a40dbdd5",
+        "version" : "1.4.0"
       }
     },
     {

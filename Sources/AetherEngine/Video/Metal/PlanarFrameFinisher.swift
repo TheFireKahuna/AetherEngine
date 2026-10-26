@@ -514,8 +514,9 @@ final class PlanarFrameFinisher: @unchecked Sendable {
             // Tables whose synthesis did not complete hold nothing a later job may reuse.
             if failure != nil { for index in slot.grain.indices { slot.grain[index].holds = nil } }
             giveBack()
-            inFlight.leave()
+            // After the hand-off: waitUntilIdle's caller (the end of a stream) then waits on what the completion handed on.
             completion(failure)
+            inFlight.leave()
         }
         return true
     }
