@@ -95,8 +95,14 @@ final class OverlayDecodeTap: @unchecked Sendable {
     }
 
     /// The picture on screen at `seconds` (item time) and its own time, nil before the decoder reaches it.
-    func picture(atOrBefore seconds: Double) -> (picture: CVPixelBuffer, seconds: Double)? {
+    func picture(atOrBefore seconds: Double) -> OverlayPacketTap<Double>.Picture? {
         units.picture(atOrBefore: seconds)
+    }
+
+    /// The pictures to queue for display after `last`, from the one on screen at `seconds` on
+    /// (``OverlayPacketTap/pictures(after:atOrBefore:)``).
+    func pictures(after last: CMTime?, atOrBefore seconds: Double) -> [OverlayPacketTap<Double>.Picture] {
+        units.pictures(after: last, atOrBefore: seconds)
     }
 
     /// Where AVPlayer's clock is (item time).

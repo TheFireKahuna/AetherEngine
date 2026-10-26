@@ -10,6 +10,9 @@
 #   av1.mp4         - AV1, software dav1d path on devices without HW
 #   vp9.webm        - VP9, software libavcodec path
 #   overlay-mpeg2.mkv - MPEG-2 + AAC, 8 s, a keyframe every 2 s: the software overlay over an AVPlayer placeholder
+#   overlay-mpeg2-interlaced.mkv - the same, 576i25 video: deinterlaced at the field rate, 50 pictures a second
+#   overlay-mpeg2-telecine.mkv    - the same, 23.976 film in 3:2 hard telecine at 480i29.97: inverse telecined
+#   overlay-mpeg2-soft-telecine.ts  - the same, 23.976 film soft-telecined to 29.97 carriage: the film grid
 #
 # plus two clips for RestartTimelineContinuityTests (the suite skips
 # those tests when the clips are absent, e.g. on CI):
@@ -125,6 +128,40 @@ ffmpeg -hide_banner -loglevel error -y \
     -f lavfi -i "sine=frequency=440:sample_rate=48000" \
     -t 8 -c:v mpeg2video -q:v 4 -g 50 -bf 2 -c:a aac -b:a 128k \
     "$FIXTURES_DIR/overlay-mpeg2.mkv"
+
+# The overlay's pictures that do not follow the placeholder's frames one for one (SoftwareOverlayEngineTests):
+# real interlaced video, deinterlaced at the field rate; film in 3:2 hard telecine, which the load finds and inverse
+# telecines to 4/5 of the carriage rate; film soft-telecined with repeat-field flags, played on the film grid.
+echo "→ overlay-mpeg2-interlaced.mkv (MPEG-2 576i25 + AAC, 8s)"
+ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "testsrc2=size=720x576:rate=50" \
+    -f lavfi -i "sine=frequency=440:sample_rate=48000" \
+    -t 8 -vf "tinterlace=interleave_top,setfield=tff" -c:v mpeg2video -q:v 4 -g 50 -bf 2 \
+    -flags +ildct+ilme -field_order tt -pix_fmt yuv420p -c:a aac -b:a 128k \
+    "$FIXTURES_DIR/overlay-mpeg2-interlaced.mkv"
+
+# Drawn at 180x120 and scaled up: testsrc2's moving parts drawn at 720x480 cover too little of the picture for the
+# load's comb detector to see the cadence.
+echo "→ overlay-mpeg2-telecine.mkv (23.976 film in 3:2 hard telecine, MPEG-2 480i29.97 + AAC, 8s)"
+ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "testsrc2=size=180x120:rate=24000/1001,scale=720:480:flags=neighbor" \
+    -f lavfi -i "sine=frequency=440:sample_rate=48000" \
+    -t 8 -vf "telecine=first_field=top:pattern=23,setfield=tff" -c:v mpeg2video -q:v 4 -g 15 -bf 2 \
+    -flags +ildct+ilme -field_order tt -pix_fmt yuv420p -c:a aac -b:a 128k \
+    "$FIXTURES_DIR/overlay-mpeg2-telecine.mkv"
+
+# MPEG-TS, which states the carriage rate the load looks for; Matroska keeps only the timestamps.
+echo "→ overlay-mpeg2-soft-telecine.ts (23.976 film soft-telecined to 29.97 carriage, MPEG-2 + AAC, 8s)"
+SOFT_DIR="$(mktemp -d)"
+ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "testsrc2=size=720x480:rate=24000/1001" -frames:v 192 \
+    -c:v mpeg2video -q:v 4 -bf 0 -g 12 -pix_fmt yuv420p -f mpeg2video "$SOFT_DIR/film.m2v"
+python3 "$REPO_ROOT/Probes/DolbyVisionPulse/Scripts/mpeg2_pulldown.py" "$SOFT_DIR/film.m2v" "$SOFT_DIR/soft.m2v"
+ffmpeg -hide_banner -loglevel error -y \
+    -fflags +genpts -f mpegvideo -i "$SOFT_DIR/soft.m2v" \
+    -f lavfi -i "sine=frequency=440:sample_rate=48000" \
+    -t 8 -c:v copy -c:a aac -b:a 128k -muxrate 0 -f mpegts \
+    "$FIXTURES_DIR/overlay-mpeg2-soft-telecine.ts"
 
 # Restart-continuity witness: A/V with real B-frame reorder (bf 3) and a keyframe
 # every 2 s so the 4 s segment plan cuts on keyframes. Drives

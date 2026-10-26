@@ -3,9 +3,9 @@ import CoreVideo
 import Foundation
 
 /// The overlay picture of a stream AVPlayer is served a placeholder of (`OverlayPlaceholder`): the session's own
-/// decode of the source (``OverlayDecodeTap``), the picture on screen at each refresh's item time. Its pictures do
-/// not follow the placeholder's frames one for one (a field-rate deinterlace doubles them, decimation drops one in
-/// five, soft telecine retimes them), so the clock chooses, and AVPlayer's frames are dropped.
+/// decode of the source (``OverlayDecodeTap``), each picture at its own item time. Its pictures do not follow the
+/// placeholder's frames one for one (a field-rate deinterlace doubles them, decimation drops one in five, soft
+/// telecine retimes them), so they are queued by their own times, and AVPlayer's frames are dropped.
 ///
 /// Scanning (reverse, or faster than twice real time) AVPlayer plays the I-frame tier, whose stills an overlay
 /// session encodes from the source's keyframes in the source's range: those frames are shown as they are.
@@ -24,11 +24,13 @@ final class DecodedPictureSource: OverlayFrameSource, @unchecked Sendable {
 
     func pacing(atRate rate: Double) -> OverlayPacing { rate < 0 || rate > 2 ? .showOutput : .clock }
 
+    func frameTime(after itemSeconds: Double) -> Double? { nil }
+
     func makePicture(from output: CVPixelBuffer, at frameTime: CMTime,
                      done: @escaping @Sendable (CVPixelBuffer?) -> Void) -> Bool { false }
 
-    func picture(at itemSeconds: Double) -> (picture: CVPixelBuffer, seconds: Double)? {
-        tap.picture(atOrBefore: itemSeconds)
+    func pictures(after last: CMTime?, at itemSeconds: Double) -> [(picture: CVPixelBuffer, time: CMTime)] {
+        tap.pictures(after: last, atOrBefore: itemSeconds).map { ($0.picture, $0.time) }
     }
 
     func logSummary() -> String {

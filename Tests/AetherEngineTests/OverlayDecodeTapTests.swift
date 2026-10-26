@@ -84,7 +84,8 @@ struct OverlayDecodeTapTests {
             // The picture at the clock itself, within the window the reference keeps: one a frame earlier is the
             // right picture while the decoder is still a frame short, and has no reference to compare with.
             #expect(Self.waitUntil(10) { (tap.picture(atOrBefore: clock)?.seconds ?? -1) >= clock - 0.021 }, "clock \(clock)")
-            let (picture, seconds) = try #require(tap.picture(atOrBefore: clock))
+            let shown = try #require(tap.picture(atOrBefore: clock))
+            let (picture, seconds) = (shown.picture, shown.seconds)
             let ms = Int64((seconds * 1000).rounded())
             let expected = try #require(referencePictures.withLock { $0.first { abs($0.key - ms) <= 1 }?.value },
                                         "a plain decode's picture at \(seconds)")
