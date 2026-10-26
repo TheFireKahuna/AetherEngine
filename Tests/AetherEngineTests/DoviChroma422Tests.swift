@@ -96,13 +96,14 @@ struct DoviChroma422Tests {
         }
     }
 
-    @Test("an MMR piece too large for the float-pinned high word takes the two-word path, and both equal the reference")
-    func mmrBothPathsEqualTheReference() throws {
-        // Cb = c * (u - 1/2) + 1/2 at Q23 with c = 2^6: a steep but in-range curve whose |coefficient * term| sum is
-        // 2^29 * 2^20 + (2^28 - 2^22) * 2^20, over the 2^49 bound, so the kernel cannot pin the high word from the
-        // estimate. Cr is the same curve at c = 2^2, inside the bound: the estimate path.
+    @Test("a frame with an MMR piece too large for the float-pinned high word takes the exact pipelines, a frame without the estimate ones, and both equal the reference",
+          arguments: [(Int32(1) << 29, true), (Int32(1) << 25, false)])
+    func mmrBothPathsEqualTheReference(cbCoefficient: Int32, exact: Bool) throws {
+        // Cb = c * (u - 1/2) + 1/2 at Q23. At c = 2^29 its |coefficient * term| sum is 2^29 * 2^20 + (2^28 - 2^22) * 2^20,
+        // over the 2^49 bound, so the frame cannot pin the high word from the estimate; at c = 2^25 it is inside the
+        // bound. Cr is the same curve at c = 2^25 in both frames.
         var p = DoviGpuEdgeCaseTests.params(flags: [.disableResidual])
-        for (comp, c) in [(0, Int32(1) << 29), (1, Int32(1) << 25)] {
+        for (comp, c) in [(0, cbCoefficient), (1, Int32(1) << 25)] {
             var poly = DoviPolynomialParams()
             poly.numPivots = 2; poly.pivots[0] = 0; poly.pivots[1] = 1023
             poly.method[0] = DoviMapping.mmr.rawValue; poly.order[0] = 1; poly.coefShift[0] = 23
@@ -113,10 +114,8 @@ struct DoviChroma422Tests {
             if comp == 0 { (p.polyCb, p.mmrCb) = (poly, mmr) } else { (p.polyCr, p.mmrCr) = (poly, mmr) }
         }
         var table = [Int32](repeating: 0, count: DoviFelComposer.mmrTableCount)
-        DoviFelComposer.populateMmrTable(into: &table, params: p)
-        let stride = DoviFelComposer.mmrTablePieceStride, flag = stride - 1
-        #expect(table[1 * 8 * stride + flag] == 0, "Cb: over the bound, the two-word path")
-        #expect(table[2 * 8 * stride + flag] == 1, "Cr: within it, the estimate path")
+        #expect(DoviFelComposer.populateMmrTable(into: &table, params: p) == exact,
+                exact ? "over the bound: the exact pipelines" : "within it: the estimate pipelines")
 
         let (w, h) = (128, 32)
         let (bl, el) = try Self.buffers(width: w, height: h,
@@ -135,8 +134,8 @@ struct DoviChroma422Tests {
             }
         }
         #expect(spread.count > 20, "the steep Cb curve spans many output words, not a clamp")
-        #expect(cb.exact == cb.n, "two-word path: \(cb.description)")
-        #expect(cr.exact == cr.n, "estimate path: \(cr.description)")
+        #expect(cb.exact == cb.n, "Cb: \(cb.description)")
+        #expect(cr.exact == cr.n, "Cr: \(cr.description)")
     }
 
     @Test("on flat luma and flat chroma every 4:2:2 row is the 4:2:0 composition")

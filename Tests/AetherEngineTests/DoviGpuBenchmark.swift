@@ -17,5 +17,13 @@ struct DoviGpuBenchmark {
         #expect(!report.contains("[bench] failed"))
         #expect(!report.contains("DIFFERS"), "a composition variant differs from the baseline")
     }
+
+    /// The composition's kernels one at a time, for a GPU counter recording (``FelComposerBenchmark/profile(emit:)``):
+    /// only with `DOVI_PROFILE=1`.
+    @Test("composition kernels run one at a time for a GPU counter recording",
+          .enabled(if: ProcessInfo.processInfo.environment["DOVI_PROFILE"] == "1", "set DOVI_PROFILE=1"))
+    func profileStretches() {
+        #expect(!FelComposerBenchmark.profile().contains("[profile] failed"))
+    }
 }
 #endif
