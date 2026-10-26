@@ -371,5 +371,120 @@ struct DoviMetalParams: Sendable {
         }
         return data
     }
+
+    /// Little-endian sequential reader of the layout ``BufferWriter`` writes.
+    private struct BufferReader {
+        let buffer: UnsafeRawBufferPointer
+        var offset: Int = 0
+
+        mutating func u32() -> UInt32 {
+            defer { offset += 4 }
+            return UInt32(littleEndian: buffer.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
+        }
+
+        mutating func i32() -> Int32 { Int32(bitPattern: u32()) }
+        mutating func u32s(_ count: Int) -> [UInt32] { (0..<count).map { _ in u32() } }
+        mutating func i32s(_ count: Int) -> [Int32] { (0..<count).map { _ in i32() } }
+
+        mutating func poly() -> DoviPolynomialParams {
+            var poly = DoviPolynomialParams()
+            poly.numPivots = u32()
+            poly.pivots = u32s(DoviPolynomialParams.maxPivots)
+            poly.method = u32s(DoviPolynomialParams.maxPieces)
+            poly.order = u32s(DoviPolynomialParams.maxPieces)
+            poly.coef = (0..<DoviPolynomialParams.maxPieces).map { _ in i32s(3) }
+            poly.coefShift = u32s(DoviPolynomialParams.maxPieces)
+            return poly
+        }
+
+        mutating func mmr() -> DoviMmrParams {
+            var mmr = DoviMmrParams()
+            mmr.constant = i32s(DoviMmrParams.maxPieces)
+            mmr.coef = (0..<DoviMmrParams.maxPieces).map { _ in i32s(DoviMmrParams.coefficientsPerPiece) }
+            mmr.coefShift = u32()
+            return mmr
+        }
+
+        mutating func nlq() -> DoviNlqParams? {
+            var nlq = DoviNlqParams()
+            guard let method = DoviNlqMethod(rawValue: u32()) else { return nil }
+            nlq.nlqMethod = method
+            nlq.nlqOffset = i32()
+            nlq.nlqScale = i32()
+            nlq.nlqThreshold = i32()
+            nlq.vdrInMax = i32()
+            nlq.nlqShift = u32()
+            nlq.nlqPivots = u32s(2)
+            return nlq
+        }
+    }
+
+    /// The parameters as an overlay tap's unit record keeps them: the layout ``serialize(into:)`` writes, then what only
+    /// the Swift side reads (the master's Level 6, the output range).
+    static let recordSize = serializedSize + 4 + 4 * 2 + 4
+
+    func record() -> Data {
+        var data = Data(count: Self.recordSize)
+        data.withUnsafeMutableBytes { raw in
+            serialize(into: UnsafeMutableRawBufferPointer(rebasing: raw[0..<Self.serializedSize]))
+            var offset = Self.serializedSize
+            func put(_ value: UInt32) { raw.storeBytes(of: value.littleEndian, toByteOffset: offset, as: UInt32.self); offset += 4 }
+            put(masterLevel6 == nil ? 0 : 1)
+            let level6 = masterLevel6
+            put(UInt32(level6?.minLuminance ?? 0) | UInt32(level6?.maxLuminance ?? 0) << 16)
+            put(UInt32(level6?.maxContentLightLevel ?? 0) | UInt32(level6?.maxFrameAverageLightLevel ?? 0) << 16)
+            put(outputFullRange ? 1 : 0)
+        }
+        return data
+    }
+
+    /// The parameters a ``record()`` holds; nil for bytes that are not one.
+    init?(record data: Data) {
+        guard data.count == Self.recordSize else { return nil }
+        let read: DoviMetalParams? = data.withUnsafeBytes { raw in
+            var r = BufferReader(buffer: raw)
+            var p = DoviMetalParams()
+            p.blWidth = r.u32()
+            p.blHeight = r.u32()
+            p.elWidth = r.u32()
+            p.elHeight = r.u32()
+            p.targetMode = r.u32()
+            guard let dither = DoviDither(rawValue: r.u32()) else { return nil }
+            p.ditherMode = dither
+            p.frameIndex = r.u32()
+            p.flags = DoviComposerFlags(rawValue: r.u32())
+            p.polyY = r.poly()
+            p.mmrY = r.mmr()
+            guard let nlqY = r.nlq() else { return nil }
+            p.nlqY = nlqY
+            p.polyCb = r.poly()
+            p.mmrCb = r.mmr()
+            guard let nlqCb = r.nlq() else { return nil }
+            p.nlqCb = nlqCb
+            p.polyCr = r.poly()
+            p.mmrCr = r.mmr()
+            guard let nlqCr = r.nlq() else { return nil }
+            p.nlqCr = nlqCr
+            p.minPq = r.u32()
+            p.maxPq = r.u32()
+            p.avgPq = r.u32()
+            p.blMax = r.u32()
+            p.vdrMax = r.u32()
+            p.vdrScale = r.u32()
+            p.blChromaLocation = r.u32()
+            p.residualSplitX = r.u32()
+            let hasLevel6 = r.u32() != 0
+            let luminance = r.u32(), light = r.u32()
+            if hasLevel6 {
+                p.masterLevel6 = DolbyVisionLevel6(minLuminance: UInt16(luminance & 0xffff), maxLuminance: UInt16(luminance >> 16),
+                                                   maxContentLightLevel: UInt16(light & 0xffff),
+                                                   maxFrameAverageLightLevel: UInt16(light >> 16))
+            }
+            p.outputFullRange = r.u32() != 0
+            return p
+        }
+        guard let read else { return nil }
+        self = read
+    }
 }
 #endif

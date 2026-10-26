@@ -43,9 +43,9 @@ struct OverlayPacketTapTests {
     static let tb = AVRational(num: 1, den: 1000)
 
     /// `seconds` of 25 fps units, a keyframe every `gop` seconds, fed as the producer feeds them.
-    static func makeTap(seconds: Int, gop: Int) -> (OverlayPacketTap<Int>, () -> EchoDecoder?) {
+    static func makeTap(seconds: Int, gop: Int) -> (OverlayPacketTap<Double>, () -> EchoDecoder?) {
         var decoder: EchoDecoder?
-        let tap = OverlayPacketTap<Int>(decodeAheadSeconds: 0.2) { deliver in
+        let tap = OverlayPacketTap<Double>(decodeAheadSeconds: 0.2) { deliver in
             let d = EchoDecoder(deliver: deliver)
             decoder = d
             return d
@@ -58,7 +58,7 @@ struct OverlayPacketTapTests {
             packet.pointee.dts = pts
             let isKey = i % (gop * 25) == 0
             _ = tap.beginsRun(dts: pts)
-            tap.insert(pts: pts, timeBase: tb, isKey: isKey, info: i, packet: packet)
+            tap.insert(pts: pts, timeBase: tb, isKey: isKey, info: Double(i), packet: packet)
         }
         return (tap, { decoder })
     }
@@ -214,7 +214,7 @@ struct OverlayPacketTapStorageTests {
     @Test("a unit is decoded from disk exactly as it was cut, side data included")
     func unitRoundTrips() {
         var decoder: RecordingDecoder?
-        let tap = OverlayPacketTap<Int>(decodeAheadSeconds: 0.2) { deliver in
+        let tap = OverlayPacketTap<Double>(decodeAheadSeconds: 0.2) { deliver in
             let d = RecordingDecoder(deliver: deliver)
             decoder = d
             return d
@@ -241,11 +241,21 @@ struct OverlayPacketTapStorageTests {
         #expect(tap.held.bytes > payload.count)
     }
 
+    @Test("a unit's info comes back from disk, for one the decoder has fed and one it has not")
+    func infoRoundTrips() {
+        let (tap, decoder) = OverlayPacketTapTests.makeTap(seconds: 4, gop: 2)
+        defer { tap.close() }
+        tap.advance(to: 0)
+        #expect(OverlayPacketTapTests.waitUntil(2) { (decoder()?.fed.count ?? 0) > 0 })
+        #expect(tap.unit(at: 0)?.info == 0)
+        #expect(tap.unit(at: 3.96)?.info == 99)
+    }
+
     @Test("a full tap holds the producer and keeps every unit ahead of the clock; the clock moving on makes room")
     func fullTapHoldsTheProducer() {
         let (tap, _) = OverlayPacketTapTests.makeTap(seconds: 0, gop: 2)
         defer { tap.close() }
-        let units = OverlayPacketTap<Int>.maxEntries
+        let units = OverlayPacketTap<Double>.maxEntries
         for i in 0..<(units + 100) {
             let pts = Int64(i * 40)
             let packet = av_packet_alloc()!
@@ -253,14 +263,14 @@ struct OverlayPacketTapStorageTests {
             packet.pointee.pts = pts
             packet.pointee.dts = pts
             _ = tap.beginsRun(dts: pts)
-            tap.insert(pts: pts, timeBase: OverlayPacketTapTests.tb, isKey: i % 50 == 0, info: i, packet: packet)
+            tap.insert(pts: pts, timeBase: OverlayPacketTapTests.tb, isKey: i % 50 == 0, info: Double(i), packet: packet)
         }
         // Past its ceiling the producer is owed no more room, but nothing it already cut ahead is dropped.
         #expect(tap.hasRoomAhead == false)
         #expect(tap.held.units == units + 100)
         #expect(tap.unit(at: Double(units + 99) * 0.04) != nil)
         // The clock passing the first units by more than the minute kept behind drops them, which makes room.
-        tap.advance(to: OverlayPacketTap<Int>.keepBehindSeconds + 10)
+        tap.advance(to: OverlayPacketTap<Double>.keepBehindSeconds + 10)
         #expect(tap.hasRoomAhead)
         #expect(tap.unit(at: 0) == nil)
     }

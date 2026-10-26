@@ -33,10 +33,11 @@ protocol OverlayTapDecoder: AnyObject {
 /// points the segments are cut on. Units are kept `keepBehindSeconds` behind the clock, so a backward seek into
 /// segments the session still has cached (which the producer does not cut again) finds its packets.
 ///
-/// A unit's packet is kept on disk (``SpilledPackets``), and only what the overlay asks of a unit stays in memory, so
-/// how far ahead the producer cuts costs disk, not memory. The producer parks while the tap is full
+/// A unit is kept on disk (``SpilledUnits``), its packet and its `Info` both, and in memory only its place in the
+/// stream, so how far ahead the producer cuts costs disk, not memory. The decode thread reads a unit back as it feeds
+/// it and keeps its `Info` while the overlay may ask for it. The producer parks while the tap is full
 /// (``hasRoomAhead``), so a unit it cuts ahead is never dropped before the clock reaches it.
-final class OverlayPacketTap<Info>: @unchecked Sendable {
+final class OverlayPacketTap<Info: OverlayUnitInfo>: @unchecked Sendable {
 
     struct Unit: @unchecked Sendable {
         let info: Info
@@ -73,20 +74,21 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         let run: Int
         let ptsMs: Int64
         let isKey: Bool
-        let info: Info
-        let packet: SpilledPackets.Ref?
+        let hasPacket: Bool
+        let stored: SpilledUnits.Ref
     }
 
-    private let spill = SpilledPackets()
+    private let spill = SpilledUnits()
     private let state = NSCondition()
     private var entries: [Int: Entry] = [:]            // by arrival sequence
     private var seqByPts: [Int64: Int] = [:]           // the latest cut of each presentation time
     private var decoded: [Int64: Picture] = [:]  // by the picture's own time, ms
+    private var fedInfo: [Int64: Info] = [:]     // the units the decoder has read back, by presentation time, ms
     private var timeBase = AVRational(num: 1, den: 1000)
     private var clockMs: Int64 = 0
     private var closed = false
     private var nextSeq = 0
-    /// The bytes of the packets the kept units hold on disk.
+    /// The bytes the kept units hold on disk.
     private var storedBytes = 0
 
     // Producer side, only touched by the one producer feeding at a time.
@@ -116,6 +118,7 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         entries.removeAll()
         seqByPts.removeAll()
         decoded.removeAll()
+        fedInfo.removeAll()
         storedBytes = 0
         state.broadcast()
         state.unlock()
@@ -136,21 +139,24 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
 
     /// Keeps one access unit: its presentation time in `timeBase`, and `packet`, which the tap takes ownership of
     /// (nil when the unit has nothing to decode). The same access unit cut again (a producer restart over a region)
-    /// replaces the earlier cut.
+    /// replaces the earlier cut. A unit the volume refuses is not kept (``SpilledUnits`` logs it).
     func insert(pts: Int64, timeBase: AVRational, isKey: Bool, info: Info, packet: UnsafeMutablePointer<AVPacket>?) {
         let ptsMs = Int64((Double(pts) * av_q2d(timeBase) * 1000).rounded())
         var packet = packet
-        let stored = packet.flatMap { spill.write($0) }
+        let stored = spill.write(info: info.unitRecord(), packet: packet)
+        let hasPacket = packet != nil
         trackedPacketFree(&packet)
+        guard let stored else { return }
         state.lock()
         defer { state.unlock() }
         guard !closed else { return }
         self.timeBase = timeBase
         let seq = nextSeq
         nextSeq += 1
-        if let stale = seqByPts[ptsMs], let old = entries.removeValue(forKey: stale) { storedBytes -= old.packet?.length ?? 0 }
-        entries[seq] = Entry(seq: seq, run: run, ptsMs: ptsMs, isKey: isKey, info: info, packet: stored)
-        storedBytes += stored?.length ?? 0
+        if let stale = seqByPts[ptsMs], let old = entries.removeValue(forKey: stale) { storedBytes -= old.stored.length }
+        entries[seq] = Entry(seq: seq, run: run, ptsMs: ptsMs, isKey: isKey, hasPacket: hasPacket, stored: stored)
+        fedInfo.removeValue(forKey: ptsMs)
+        storedBytes += stored.length
         seqByPts[ptsMs] = seq
         if entries.count > Self.hardMaxEntries { trimLocked() }
         state.broadcast()
@@ -158,17 +164,23 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
 
     // MARK: - Overlay
 
-    /// The unit AVPlayer shows at `seconds` (item time), nil when the producer has not cut it.
+    /// The unit AVPlayer shows at `seconds` (item time), nil when the producer has not cut it. Its `Info` is the one the
+    /// decoder read back, or read from disk here for a unit the decoder has not fed.
     func unit(at seconds: Double) -> Unit? {
         let ms = Int64((seconds * 1000).rounded())
         state.lock()
-        defer { state.unlock() }
-        for key in [ms, ms - 1, ms + 1] {
-            if let seq = seqByPts[key], let entry = entries[seq] {
-                return Unit(info: entry.info, picture: decoded[key]?.picture)
-            }
+        guard let (key, entry) = [ms, ms - 1, ms + 1].lazy
+            .compactMap({ key in self.seqByPts[key].flatMap { self.entries[$0] }.map { (key, $0) } }).first
+        else {
+            state.unlock()
+            return nil
         }
-        return nil
+        let picture = decoded[key]?.picture
+        let fed = fedInfo[key]
+        state.unlock()
+        if let fed { return Unit(info: fed, picture: picture) }
+        guard let record = SpilledUnits.readInfo(entry.stored), let info = Info(unitRecord: record) else { return nil }
+        return Unit(info: info, picture: picture)
     }
 
     /// The time of the first unit cut after `seconds` (item time), in whole milliseconds as units are keyed; nil
@@ -297,8 +309,13 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
             let tb = timeBase
             let clock = Double(clockMs) / 1000
             state.unlock()
-            guard let (stored, restart) = next else { continue }
-            var packet = SpilledPackets.read(stored)
+            guard let (stored, ptsMs, restart) = next, let read = SpilledUnits.read(stored) else { continue }
+            if let info = Info(unitRecord: read.info) {
+                state.lock()
+                fedInfo[ptsMs] = info
+                state.unlock()
+            }
+            var packet = read.packet
             guard let unit = packet else { continue }
             // A pool per unit: this thread's own drains only when it exits, and a picture's buffers and Metal objects
             // would otherwise stay alive for the whole playback.
@@ -309,7 +326,7 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
 
     /// Where the next access unit to decode is kept, and whether it starts a new decode. Nil when the decoder is far
     /// enough ahead, or the producer has not cut what comes next. Caller holds `state`.
-    private func nextPacketLocked() -> (SpilledPackets.Ref, Bool)? {
+    private func nextPacketLocked() -> (SpilledUnits.Ref, Int64, Bool)? {
         let aheadMs = Int64(decodeAheadSeconds * 1000)
         let newestPictureMs = decoded.keys.max()
         let entry: Entry
@@ -334,7 +351,7 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
             guard let key = keyframeLocked(beforeOrAt: clockMs) else { return nil }
             entry = key; restart = true
         }
-        guard let packet = entry.packet else {
+        guard entry.hasPacket else {
             lastFed = (entry.seq, entry.run)   // nothing to decode for this unit; step past it
             return nil
         }
@@ -346,7 +363,7 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         }
         lastFed = (entry.seq, entry.run)
         runLastPtsMs = max(runLastPtsMs, entry.ptsMs)
-        return (packet, restart)
+        return (entry.stored, entry.ptsMs, restart)
     }
 
     /// Whether the decode is short of the clock and a keyframe at or before the clock lies past everything fed:
@@ -382,9 +399,13 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
     /// Keeps the decoded pictures from the one on screen at the clock (the newest at or before it) on. Caller holds
     /// `state`.
     private func trimDecodedLocked() {
+        fedInfo = fedInfo.filter { $0.key >= clockMs - Self.fedInfoBehindMs }
         guard let shown = decoded.keys.filter({ $0 <= clockMs }).max() else { return }
         decoded = decoded.filter { $0.key >= shown }
     }
+
+    /// How long behind the clock a fed unit's `Info` stays in memory: past any frame the overlay is still asked to make.
+    static var fedInfoBehindMs: Int64 { 2000 }
 
     /// Drops decoded pictures the clock has passed, units further behind than `keepBehindSeconds`, and past
     /// ``hardMaxEntries`` those furthest from the clock. Caller holds `state`.
@@ -402,7 +423,7 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         for seq in drop {
             guard let entry = entries.removeValue(forKey: seq) else { continue }
             if seqByPts[entry.ptsMs] == seq { seqByPts.removeValue(forKey: entry.ptsMs) }
-            storedBytes -= entry.packet?.length ?? 0
+            storedBytes -= entry.stored.length
         }
     }
 }

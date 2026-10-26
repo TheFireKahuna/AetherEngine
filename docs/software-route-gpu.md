@@ -89,7 +89,8 @@ FEL overlay counts late frames today.
      (`AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer:playbackDelegate:)`).
 2. **`OverlayPacketTap`** (`Video/`) is `FelEnhancementTap`'s store, runs, keyframe restarts and decode loop, shared
    by both sources.
-   - **Storage:** each unit's packet on disk (`SpilledPackets`), read back just before it is decoded; the producer
+   - **Storage:** each unit on disk, its packet and its composer parameters (`SpilledUnits`), read back just before it
+     is decoded; the producer
      parks while the tap is full, so no unit ahead of the clock is dropped (source-pipeline.md, layer 3 step 5, "What
      reading ahead may cost").
    - **FEL tap:** keeps the enhancement-layer packets and the composer parameters.

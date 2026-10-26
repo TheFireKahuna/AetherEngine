@@ -132,6 +132,12 @@ final class FelEnhancementTap: @unchecked Sendable {
     var hasRoomAhead: Bool { units.hasRoomAhead }
 }
 
+/// A FEL unit's composer parameters, kept on disk with its enhancement-layer packet.
+extension DoviMetalParams: OverlayUnitInfo {
+    func unitRecord() -> Data { record() }
+    init?(unitRecord: Data) { self.init(record: unitRecord) }
+}
+
 /// The enhancement layer's VideoToolbox decoder, opened from the parameter sets of the first unit it is given.
 private final class EnhancementLayerDecoder: OverlayTapDecoder {
     private let deliver: @Sendable (CVPixelBuffer, CMTime) -> Void
