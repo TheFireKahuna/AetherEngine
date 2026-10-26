@@ -7,10 +7,11 @@ import AetherLibavutil
 /// The decoder an ``OverlayPacketTap`` drives, on the tap's own thread. It hands each picture it decodes to the
 /// `deliver` it was made with, with the picture's item time.
 protocol OverlayTapDecoder: AnyObject {
-    /// Decodes `packet`, the tap's own copy, freed after the call. `restartingAt`, the clock in item seconds, first
-    /// drops what the decoder holds (a seek, a new run, a decoder that fell behind): the pictures before it are
-    /// references the decode passes through, not pictures anyone will show.
-    func decode(_ packet: UnsafeMutablePointer<AVPacket>, restartingAt clock: Double?, timeBase: AVRational)
+    /// Decodes `packet`, the tap's own copy, freed after the call. `restarting` first drops what the decoder holds
+    /// (a seek, a new run, a decoder that fell behind). `clock` is where the player is, in item seconds: a picture
+    /// before it is a reference the decode passes through, not a picture anyone will show, so a decoder can spend
+    /// as little on it as it is able to.
+    func decode(_ packet: UnsafeMutablePointer<AVPacket>, restarting: Bool, clock: Double, timeBase: AVRational)
     func close()
 }
 
@@ -189,7 +190,7 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
             let clock = Double(clockMs) / 1000
             state.unlock()
             guard let (packet, restart) = next else { continue }
-            decoder?.decode(packet, restartingAt: restart ? clock : nil, timeBase: tb)
+            decoder?.decode(packet, restarting: restart, clock: clock, timeBase: tb)
             var copy: UnsafeMutablePointer<AVPacket>? = packet
             trackedPacketFree(&copy)
         }

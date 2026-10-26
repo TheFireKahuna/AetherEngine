@@ -4286,8 +4286,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                 )
                             } else {
                                 // Stream-copy: apply seam-derived shift; a sub-0.5 s overlap's packets are dropped by
-                                // the muxer as audio it already holds (`OutputTimestampSanitizer`); only a > 0.5 s
-                                // overlap re-anchors.
+                                // the muxer as audio it already holds (`OutputTimestampSanitizer`). A > 0.5 s overlap
+                                // says this video seam is not the audio boundary's: audio carries on contiguously, and
+                                // the seam waits for an audio boundary of its own inside the pairing window, which then
+                                // takes the video-derived shift.
                                 let lastOutputDts = SourceTimestampBounds.difference(lastAudioSourceDts, audioShiftPts)
                                 let firstOutputDts = SourceTimestampBounds.difference(override_.boundarySrcDts, derivedShift)
                                 let overlapTicks = lastOutputDts - firstOutputDts
@@ -4303,6 +4305,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                     + (applied != derivedShift ? " (re-anchored, overlap \(overlapTicks) ticks)" : ""),
                                     category: .session
                                 )
+                                if applied != derivedShift {
+                                    pendingAudioInheritSeamOut = (override_.seamOutAudioTb, override_.at)
+                                }
                                 audioShiftPts = applied
                                 lastAudioSourceDts = packet.pointee.dts - 1
                             }

@@ -61,6 +61,19 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
     private var _skipUntilPTS: CMTime?
 
+    /// Set per packet by a caller that knows the packet's picture would be too late to show: a picture no
+    /// other picture references is then dropped before it is decoded, so a decoder behind its clock catches
+    /// up at the cost of the references alone. Never while a chain that counts consecutive pictures is in
+    /// force (the deinterlacer's window, inverse telecine, a soft-telecine film run): a picture missing
+    /// from it would move the timestamps or the cadence of the ones it does show.
+    func discardsNonReferencePictures(_ discard: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let ctx = codecContext else { return }
+        let chainInForce = window?.isActive == true || inverseTelecine != nil || filmCadence?.isActive == true
+        ctx.pointee.skip_frame = discard && !chainInForce ? AVDISCARD_NONREF : AVDISCARD_DEFAULT
+    }
+
     /// AE#492: guarded by `lock`, the same one `flush()` and `decode(packet:epoch:)` take.
     private var _feedEpoch: UInt64 = 0
     var feedEpoch: UInt64 {
