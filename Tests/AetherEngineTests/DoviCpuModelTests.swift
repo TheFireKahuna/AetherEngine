@@ -514,16 +514,19 @@ struct DoviCpuModelTests {
     // MARK: - Loss census (M1) and error attribution (M3, M4, M6)
 
     /// Counts, per plane, every pixel at a point where information can be lost. Fractions of the
-    /// sampled pixels. The output clip is the 10-bit code space, 0...1023, as the reconstruction's is its own.
+    /// sampled pixels. The output clip is the 10-bit code space, 0...1023, as the reconstruction's is its own; the
+    /// samples outside video range's nominal black and white (64, and 940 luma / 960 chroma) are counted beside it,
+    /// what a clamp to video range would change.
     struct Census {
         var n = 0
         var predBelow0 = 0, predAbove1 = 0
         var nlqAtMax = 0, residualPixels = 0
         var vdrBelow0 = 0, vdrAboveMax = 0
         var outBelowLo = 0, outAboveHi = 0
+        var belowBlack = 0, aboveWhite = 0, deepestBelowBlack = 0
         var elAt0 = 0, elAt1023 = 0
         var worstOvershoot = 0
-        mutating func add(_ q: Model.Parts, _ nlq: DoviNlqParams, model m: Model, lo: Int, hi: Int) {
+        mutating func add(_ q: Model.Parts, _ nlq: DoviNlqParams, model m: Model, lo: Int, hi: Int, white: Int) {
             n += 1
             if q.vv < 0 { predBelow0 += 1 }
             if q.pred == 0xffff { predAbove1 += 1 }
@@ -540,10 +543,12 @@ struct DoviCpuModelTests {
             let out = Int(floor(Double(min(max(t, 0), 0xffff)) / 64 + 0.5))
             if out < lo { outBelowLo += 1; worstOvershoot = max(worstOvershoot, lo - out) }
             if out > hi { outAboveHi += 1; worstOvershoot = max(worstOvershoot, out - hi) }
+            if out < 64 { belowBlack += 1; deepestBelowBlack = max(deepestBelowBlack, 64 - out) }
+            if out > white { aboveWhite += 1 }
         }
         var line: String {
             func f(_ v: Int) -> String { String(format: "%.4f%%", n == 0 ? 0 : 100 * Double(v) / Double(n)) }
-            return "n=\(n) pred<0 \(f(predBelow0)) pred>1 \(f(predAbove1)) | residual px \(f(residualPixels)) at vdr_in_max \(f(nlqAtMax)) EL=0 \(f(elAt0)) EL=1023 \(f(elAt1023)) | vdr<0 \(f(vdrBelow0)) vdr>max \(f(vdrAboveMax)) | out<lo \(f(outBelowLo)) out>hi \(f(outAboveHi)) worst overshoot \(worstOvershoot) codes"
+            return "n=\(n) pred<0 \(f(predBelow0)) pred>1 \(f(predAbove1)) | residual px \(f(residualPixels)) at vdr_in_max \(f(nlqAtMax)) EL=0 \(f(elAt0)) EL=1023 \(f(elAt1023)) | vdr<0 \(f(vdrBelow0)) vdr>max \(f(vdrAboveMax)) | out<lo \(f(outBelowLo)) out>hi \(f(outAboveHi)) worst overshoot \(worstOvershoot) codes | <64 \(f(belowBlack)) (deepest \(deepestBelowBlack)) >white \(f(aboveWhite))"
         }
     }
 
@@ -563,14 +568,14 @@ struct DoviCpuModelTests {
             let el = Self.plane(cap.el, 0, components: 1), elUV = Self.plane(cap.el, 1, components: 2)
             for yy in stride(from: 3, to: bl.height, by: 5) {
                 for xx in stride(from: 5, to: bl.width, by: 7) {
-                    y.add(m.lumaParts(bl: bl, blUV: blUV, el: el, x: xx, y: yy), p.nlqY, model: m, lo: 0, hi: 1023)
+                    y.add(m.lumaParts(bl: bl, blUV: blUV, el: el, x: xx, y: yy), p.nlqY, model: m, lo: 0, hi: 1023, white: 940)
                 }
             }
             for yy in stride(from: 1, to: blUV.height, by: 3) {
                 for xx in stride(from: 2, to: blUV.width, by: 5) {
                     let (a, b) = m.chromaParts(bl: bl, blUV: blUV, elUV: elUV, x: xx, y: yy)
-                    cb.add(a, p.nlqCb, model: m, lo: 0, hi: 1023)
-                    cr.add(b, p.nlqCr, model: m, lo: 0, hi: 1023)
+                    cb.add(a, p.nlqCb, model: m, lo: 0, hi: 1023, white: 960)
+                    cr.add(b, p.nlqCr, model: m, lo: 0, hi: 1023, white: 960)
                 }
             }
         }

@@ -103,8 +103,8 @@ public enum FelComposerBenchmark {
                  { try patched(base, [("    int2 el_code = int2(0);\n    if (residual) {", "    int2 el_code = int2(0);\n    if (false) {")]) },
                  .chroma, false),
                 ("cx-nopoly", "chroma alone, no polynomial code",
-                 { try patched(base, [("dovi_eval_curve(params.poly_cb, piece_cb, t1, shift)", "int(t1 >> 4)"),
-                                      ("dovi_eval_curve(params.poly_cr, piece_cr, t2, shift)", "int(t2 >> 4)")]) }, .chroma, false),
+                 { try patched(base, [("dovi_eval_curve(params.poly_cb, piece_cb, c1, shift)", "int(c1 >> 4)"),
+                                      ("dovi_eval_curve(params.poly_cr, piece_cr, c2, shift)", "int(c2 >> 4)")]) }, .chroma, false),
                 ("floor", "luma, memory floor", { try patched(base, floorOnly) }, .luma, false),
             ]
             let wanted = ProcessInfo.processInfo.environment["DOVI_PROFILE_STRETCHES"]?.split(separator: ",").map(String.init)
@@ -590,10 +590,12 @@ public enum FelComposerBenchmark {
     /// Luma's EL upsampling split: the vertical pass alone (no shuffles), the horizontal alone (no gathers), and the
     /// residual's table lookup left out.
     static let lumaNoHorizontal: [(String, String)] = [
-        ("    return dovi_el_h(dovi_el_v_luma(tex, col, gid.y), gid.x, lane);", "    return dovi_el_v_luma(tex, col, gid.y);"),
+        ("    return dovi_el_h(dovi_el_v_luma(tex, dovi_el_column(x0, lane, el_size.x), row), lane);",
+         "    return dovi_el_v_luma(tex, dovi_el_column(x0, lane, el_size.x), row);"),
     ]
     static let lumaNoVertical: [(String, String)] = [
-        ("    return dovi_el_h(dovi_el_v_luma(tex, col, gid.y), gid.x, lane);", "    return dovi_el_h(col & 1023, gid.x, lane);"),
+        ("    return dovi_el_h(dovi_el_v_luma(tex, dovi_el_column(x0, lane, el_size.x), row), lane);",
+         "    return dovi_el_h(dovi_el_column(x0, lane, el_size.x) & 1023, lane);"),
     ]
     static let lumaNoNlq: [(String, String)] = [
         ("        h += dovi_inv_nlq(nlq_lut, 0u, el_code);", "        h += el_code - 512;"),

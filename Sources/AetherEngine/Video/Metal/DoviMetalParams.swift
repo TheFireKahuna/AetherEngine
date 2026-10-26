@@ -71,8 +71,8 @@ struct DoviComposerFlags: OptionSet, Sendable {
 
     /// `disable_residual_flag`, or the RPU declares `el_type == MEL`.
     static let disableResidual = DoviComposerFlags(rawValue: 0x1)
-    /// The luma curve carries at least one MMR piece, so the luma kernel has to
-    /// read the base-layer chroma planes as well.
+    /// The luma curve carries at least one MMR piece: the composer takes the luma pipeline with the MMR path
+    /// (`dovi_fc_luma_mmr`), which reads the base-layer chroma planes as well.
     static let lumaMmr = DoviComposerFlags(rawValue: 0x2)
     /// The output chroma plane is 4:2:2 (``DoviOutputMode/sv22``): the 4:2:0 kernel writes its 16-bit sums to the
     /// intermediate `dovi_chroma_420_to_422` takes to 4:2:2. Set by the composer, not by the parser.

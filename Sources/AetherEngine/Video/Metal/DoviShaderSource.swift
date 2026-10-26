@@ -41,17 +41,18 @@ typedef int  dovi_i32;
 #define DOVI_MAPPING_POLYNOMIAL       0
 #define DOVI_MAPPING_MMR              1
 
-/* ---- per-frame MMR table (buffer 3): [Y, Cb, Cr][piece 0..8][constant, 21 coefficients] as int. Piece 8 of each
-        component is all zeros, and a piece's coefficients above its order are zero: every sample sums all 21 terms
+/* ---- per-frame MMR table (buffer 3): [Y, Cb, Cr][piece 0..8][24 coefficients] as int. Coefficient (power - 1) * 8
+        + subset is the one against the product of `subset`'s inputs (bit 0 s0, bit 1 s1, bit 2 s2) raised to power
+        1, 2 or 3; the empty subset's product is 1.0, so slot 0 is the constant and slots 8 and 16 are zero. Piece 8 of
+        each component is all zeros, and a piece's coefficients above its order are zero: every sample sums all 24
         against some piece. ---- */
-#define DOVI_MMR_TABLE_PIECE_STRIDE      22
+#define DOVI_MMR_TABLE_PIECE_STRIDE      24
 #define DOVI_MMR_TABLE_PIECES            9
 #define DOVI_MMR_ZERO_PIECE              8
 #define DOVI_MMR_TABLE_COMPONENT_STRIDE  (DOVI_MMR_TABLE_PIECES * DOVI_MMR_TABLE_PIECE_STRIDE)
 
 /* ---- flags ---- */
 #define DOVI_FLAG_DISABLE_RESIDUAL    0x1u /* disable_residual_flag, or el_type == MEL */
-#define DOVI_FLAG_LUMA_MMR            0x2u /* luma curve has at least one MMR piece */
 #define DOVI_FLAG_CHROMA_422          0x4u /* sv22: dovi_compose_chroma writes its 16-bit sums for dovi_chroma_420_to_422 */
 
 /* Piecewise reshaping curve for one component.
@@ -188,6 +189,11 @@ constant bool dovi_fc_blue_noise [[function_constant(0)]];
 // float estimate cannot pin; false, the default, takes the estimate path for every piece. Chosen per frame by the
 // composer (`populateMmrTable`), so neither pipeline carries the other's path.
 constant bool dovi_fc_mmr_exact [[function_constant(1)]];
+
+// Function constant 2: the luma kernel's MMR path, for a frame whose luma curve has an MMR piece (no profile 7
+// stream seen has one). The default luma pipeline is the lookup table alone, so it carries none of the MMR's
+// registers.
+constant bool dovi_fc_luma_mmr [[function_constant(2)]];
 
 // Blue-noise threshold in [0.5/4096, 4095.5/4096]: rank k of the 4096 cells maps to (k + 0.5) / 4096, so the
 // mean over the tile is exactly 0.5, the rounding bias of the undithered branch. A 10-bit code plus the
@@ -358,7 +364,7 @@ static inline int dovi_eval_poly(constant struct DoviPolynomialParams &curve, in
 // terms are added, and for A <= 2^49 that is under 2^31, so hi = rint((E - lo) / 2^32) is vv's high word exactly. The
 // CPU bounds A for every piece the frame can reach with the term ceiling 2^20; a frame with a piece it cannot bound
 // gets the exact pipelines, which carry both words through two-word products for any coefficient. Either way the
-// sum does not depend on the order its terms arrive in, and a zero coefficient adds exactly nothing.
+// sum does not depend on the order its terms arrive in, and a zero coefficient or a zero term adds exactly nothing.
 struct DoviMmrSum {
     DoviAcc acc;
     float e;
@@ -383,41 +389,37 @@ static inline int dovi_mmr_end(thread const DoviMmrSum &s, uint coef_shift) {
     return dovi_prediction(DoviAcc{ hi, s.acc.lo }, coef_shift);
 }
 
-// Coefficient i of this pass's piece, from the lane that loaded it (`dovi_mmr_shared`), or 0 for a lane whose piece
-// is another pass's. Every lane takes part in the shuffle.
-static inline int dovi_mmr_coef(int loaded, ushort i, bool mine) {
-    int c = simd_shuffle(loaded, i);
-    return mine ? c : 0;
-}
-
-// Term j of the seven [s0, s1, s2, s0s1, s0s2, s1s2, s0s1s2], its square and its cube (term * square), each product
-// truncated back to Q20, against coefficients 1 + j, 8 + j and 15 + j of `a`'s piece (and, with `Both`, `b`'s).
+// One term of a step of `dovi_mmr_shared`, its square and its cube (term * square), each product truncated back to
+// Q20, against the coefficients the step's rotation has brought to lanes `first`, first + 8 and first + 16, of
+// `a`'s piece and, with `Both`, `b`'s. Every lane takes part in the shuffles.
 template <bool Both>
-static inline void dovi_mmr_feed(thread DoviMmrSum &a, int ka, thread DoviMmrSum &b, int kb, bool mine,
-                                 ushort j, uint term) {
+static inline void dovi_mmr_feed(thread DoviMmrSum &a, int ka, thread DoviMmrSum &b, int kb, ushort first,
+                                 uint term) {
     uint square = dovi_mul_q20(term, term);
     uint cube = dovi_mul_q20(term, square);
-    dovi_mmr_add(a, dovi_mmr_coef(ka, ushort(1 + j), mine), term);
-    dovi_mmr_add(a, dovi_mmr_coef(ka, ushort(8 + j), mine), square);
-    dovi_mmr_add(a, dovi_mmr_coef(ka, ushort(15 + j), mine), cube);
+    dovi_mmr_add(a, simd_shuffle(ka, first), term);
+    dovi_mmr_add(a, simd_shuffle(ka, ushort(first + 8)), square);
+    dovi_mmr_add(a, simd_shuffle(ka, ushort(first + 16)), cube);
     if (Both) {
-        dovi_mmr_add(b, dovi_mmr_coef(kb, ushort(1 + j), mine), term);
-        dovi_mmr_add(b, dovi_mmr_coef(kb, ushort(8 + j), mine), square);
-        dovi_mmr_add(b, dovi_mmr_coef(kb, ushort(15 + j), mine), cube);
+        dovi_mmr_add(b, simd_shuffle(kb, first), term);
+        dovi_mmr_add(b, simd_shuffle(kb, ushort(first + 8)), square);
+        dovi_mmr_add(b, simd_shuffle(kb, ushort(first + 16)), cube);
     }
 }
 
 // The MMR sums of this sample's pieces, `piece_a` of `table_a` (and with `Both`, `piece_b` of `table_b`: Cb and Cr
 // read the same three inputs), with the coefficients shared across the SIMD-group instead of every lane loading its
-// own: in each pass the first lane still pending names a piece (pair), lane L loads coefficient L of it (the
-// constant, then the 21), and every term takes its coefficient from that lane by shuffle. A lane whose pieces are
-// the pass's adds them; any other adds zero coefficients, exactly nothing, and waits for a later pass. A group on
-// one piece, as nearly every one is, takes one pass. `need` false (no MMR piece, or outside the picture) never
-// counts as pending. Every lane of the SIMD-group must be here: the shuffles read every lane.
+// own: in each pass the first lane still pending names a piece (pair), lane L loads coefficient L of it, and every
+// term takes its coefficient from the lane holding it by shuffle. A lane whose pieces are the pass's sums its
+// terms; any other sums zero terms, exactly nothing, and waits for a later pass. A group on one piece, as nearly
+// every one is, takes one pass. `need` false (no MMR piece, or outside the picture) never counts as pending. Every
+// lane of the SIMD-group must be here: the shuffles read every lane.
 //
-// Each term is formed once a pass, for all 21 coefficients (a piece's coefficients above its order are zero in the
-// table) and dropped once it is added: the sample holds three inputs, one term, two sums and one coefficient a
-// component, never its 21 terms or their coefficients.
+// A pass runs four steps, step i the subsets i and i + 4 (base and base * s2, the bases 1.0, s0, s1, s0s1): each
+// reads its coefficients at lanes 0, 4, 8, 12, 16, 20 and then rotates them down a lane for the next. The steps are
+// a loop the compiler keeps rolled, so a sample holds its inputs, the bases still to come, two sums a component and
+// one step's six products, never the 21 terms (unrolled, the compiler forms them all up front and keeps them for
+// the second component and the estimate).
 template <bool Both>
 static inline void dovi_mmr_shared(device const int* table_a, int piece_a, device const int* table_b, int piece_b,
                                    bool need, uint t0, uint t1, uint t2, uint lane,
@@ -425,30 +427,32 @@ static inline void dovi_mmr_shared(device const int* table_a, int piece_a, devic
     a = DoviMmrSum{ DoviAcc{ 0, 0u }, 0.0f };
     b = DoviMmrSum{ DoviAcc{ 0, 0u }, 0.0f };
     bool pending = need;
-    uint t01 = dovi_mul_q20(t0, t1);
     while (true) {
         uint waiting = uint(uint64_t(simd_ballot(pending)));
         if (waiting == 0u) {
             break;
         }
         ushort leader = ushort(ctz(waiting));
-        int pass_a = simd_shuffle(piece_a, leader);
-        int pass_b = Both ? simd_shuffle(piece_b, leader) : 0;
+        int pass_a = simd_broadcast(piece_a, leader);
+        int pass_b = Both ? simd_broadcast(piece_b, leader) : 0;
         bool mine = pending && piece_a == pass_a && (!Both || piece_b == pass_b);
         uint k = min(lane, uint(DOVI_MMR_TABLE_PIECE_STRIDE - 1));
         int ka = table_a[pass_a * DOVI_MMR_TABLE_PIECE_STRIDE + k];
         int kb = Both ? table_b[pass_b * DOVI_MMR_TABLE_PIECE_STRIDE + k] : 0;
-        dovi_mmr_add(a, dovi_mmr_coef(ka, ushort(0), mine), 1u << 20);
-        if (Both) {
-            dovi_mmr_add(b, dovi_mmr_coef(kb, ushort(0), mine), 1u << 20);
+        uint s0 = mine ? t0 : 0u, s1 = mine ? t1 : 0u, s2 = mine ? t2 : 0u;
+        uint base = mine ? (1u << 20) : 0u, next = s0, after = s1, last = dovi_mul_q20(s0, s1);
+        #pragma clang loop unroll(disable)
+        for (ushort step = 0; step < 4; ++step) {
+            dovi_mmr_feed<Both>(a, ka, b, kb, ushort(0), base);
+            dovi_mmr_feed<Both>(a, ka, b, kb, ushort(4), dovi_mul_q20(base, s2));
+            ka = simd_shuffle_rotate_down(ka, ushort(1));
+            if (Both) {
+                kb = simd_shuffle_rotate_down(kb, ushort(1));
+            }
+            base = next;
+            next = after;
+            after = last;
         }
-        dovi_mmr_feed<Both>(a, ka, b, kb, mine, ushort(0), t0);
-        dovi_mmr_feed<Both>(a, ka, b, kb, mine, ushort(1), t1);
-        dovi_mmr_feed<Both>(a, ka, b, kb, mine, ushort(2), t2);
-        dovi_mmr_feed<Both>(a, ka, b, kb, mine, ushort(3), t01);
-        dovi_mmr_feed<Both>(a, ka, b, kb, mine, ushort(4), dovi_mul_q20(t0, t2));
-        dovi_mmr_feed<Both>(a, ka, b, kb, mine, ushort(5), dovi_mul_q20(t1, t2));
-        dovi_mmr_feed<Both>(a, ka, b, kb, mine, ushort(6), dovi_mul_q20(t01, t2));
         pending = pending && !mine;
     }
 }
@@ -563,16 +567,25 @@ static inline uint dovi_chroma_size(uint n) {
 // - horizontal, every component (SPATIAL_RESAMPLING_FILTER_H): r[2n] = y[n], r[2n+1] = (22 y[n-3] + 94 y[n-2]
 //   - 524 y[n-1] + 2456 y[n] + 2456 y[n+1] - 524 y[n+2] + 94 y[n+3] + 22 y[n+4] + 2048) >> 12 (columns co-sited).
 //
-// One SIMD-group composes 32 consecutive output columns, which read 23 EL columns (16, and 3 + 4 neighbours for
-// the 8 taps). Lane L runs the vertical pass for EL column (x0 / 2 - 3 + L), x0 being the group's first output
-// column, and each output lane takes its horizontal taps from the lanes that hold them: registers and shuffles,
-// no threadgroup memory, no barrier. That holds when lane L is output column x0 + L: threadgroups 32 wide,
-// dispatched in whole threadgroups, so every lane runs (the composer's `elUpsamplingThreadgroup`). Lanes past the
-// picture still compute, on replicated edge columns, and only leave after the shuffles.
+// One SIMD-group composes the 32 consecutive output columns x0 ... x0 + 31, which read 23 EL columns (16, and 3 + 4
+// neighbours for the 8 taps). Lane L runs the vertical pass for EL column x0 / 2 - 3 + L, and each output lane takes
+// its horizontal taps from the lanes that hold them: registers and shuffles, no threadgroup memory, no barrier.
+// Lanes 0 - 15 compose the even columns and lanes 16 - 31 the odd ones (`dovi_lane_column`), so that every tap is a
+// fixed number of lanes away: a shuffle by a constant offset is one instruction, where one whose source lane varies
+// inside a quad of lanes (lane L reading lane L / 2 + k) is four shuffles and three selects on the A15. That holds
+// when lane L is grid column x0 + L: threadgroups 32 wide, dispatched in whole threadgroups, so every lane runs (the
+// composer's `elUpsamplingThreadgroup`). Lanes past the picture still compute, on replicated edge columns, and only
+// leave after the shuffles.
 
-// The EL column lane `lane` of the group holding output column x runs the vertical pass for, edge replicated.
-static inline int dovi_el_column(uint x, uint lane, uint el_width) {
-    return clamp(int((x - lane) >> 1) - 3 + int(lane), 0, int(el_width) - 1);
+// The output column lane `lane` composes, in the SIMD-group whose first grid column is x0: x0 + 2L for lanes 0 - 15,
+// x0 + 2(L - 16) + 1 for lanes 16 - 31.
+static inline uint dovi_lane_column(uint x0, uint lane) {
+    return x0 + ((lane & 15u) << 1) + (lane >> 4);
+}
+
+// The EL column lane `lane` runs the vertical pass for, edge replicated.
+static inline int dovi_el_column(uint x0, uint lane, uint el_width) {
+    return clamp(int(x0 >> 1) - 3 + int(lane), 0, int(el_width) - 1);
 }
 
 // Vertical pass, luma, for output row `row` at EL column `col`: the four EL rows it reads, from two gathers of the
@@ -601,40 +614,39 @@ static inline int2 dovi_el_v_chroma(texture2d<ushort, access::read> tex, int col
     return clamp((s + 128) >> 8, int2(0), int2(0xFFFF));
 }
 
-// Horizontal pass across the SIMD-group: `v` is this lane's vertical result, x this lane's output column. Output
-// column x reads y[x / 2 + k], k = -3 ... 4, which lane L = x - x0 finds at lane L / 2 + 3 + k. Every lane shuffles,
-// whichever phase it keeps.
+// Horizontal pass across the SIMD-group: `v` is this lane's vertical result. An even lane L (0 - 15, output column
+// x0 + 2L) takes y[x0 / 2 + L], the co-sited value, from lane L + 3; an odd lane (16 - 31, output column
+// x0 + 2(L - 16) + 1) takes its eight taps from lanes L - 16 ... L - 9. Every lane shuffles, whichever phase it keeps.
 //
-// The eight neighbours arrive as four pairs: every lane first takes its right neighbour's value beside its own (one
-// shuffle down; each value is 16 bits, so the two fit a 32-bit word, Cb and Cr a word each), then lane L / 2 + 3 + k
-// holds y[k] and y[k + 1] for k = -3, -1, 1, 3. Five shuffles where eight single values took eight (sixteen for
-// chroma's two components); every y[k] is the same value either way.
+// The eight taps arrive as four pairs: every lane first takes its right neighbour's value beside its own (one
+// shuffle down; each value is 16 bits, so the two fit a 32-bit word, Cb and Cr a word each), then an odd lane takes
+// the pairs 16, 14, 12 and 10 lanes up. Six shuffles (ten for chroma's two components), each by a constant offset.
 static inline int dovi_el_h_filter(int y0, int y1, int y2, int y3, int y4, int y5, int y6, int y7) {
     return clamp((22 * y0 + 94 * y1 - 524 * y2 + 2456 * y3 + 2456 * y4 - 524 * y5 + 94 * y6 + 22 * y7 + 2048) >> 12,
                  0, 0xFFFF);
 }
 
-static inline int dovi_el_h(int v, uint x, uint lane) {
+static inline int dovi_el_h(int v, uint lane) {
     uint own = uint(v);
+    uint even = simd_shuffle_down(own, ushort(3));
     uint pair = own | (simd_shuffle_down(own, ushort(1)) << 16);
-    ushort b = ushort(lane >> 1);
-    uint p0 = simd_shuffle(pair, b), p1 = simd_shuffle(pair, ushort(b + 2));
-    uint p2 = simd_shuffle(pair, ushort(b + 4)), p3 = simd_shuffle(pair, ushort(b + 6));
-    if ((x & 1u) == 0u) {
-        return int(p1 >> 16);
+    uint p0 = simd_shuffle_up(pair, ushort(16)), p1 = simd_shuffle_up(pair, ushort(14));
+    uint p2 = simd_shuffle_up(pair, ushort(12)), p3 = simd_shuffle_up(pair, ushort(10));
+    if (lane < 16u) {
+        return int(even);
     }
     return dovi_el_h_filter(int(p0 & 0xFFFFu), int(p0 >> 16), int(p1 & 0xFFFFu), int(p1 >> 16),
                             int(p2 & 0xFFFFu), int(p2 >> 16), int(p3 & 0xFFFFu), int(p3 >> 16));
 }
 
-static inline int2 dovi_el_h(int2 v, uint x, uint lane) {
+static inline int2 dovi_el_h(int2 v, uint lane) {
     uint own = uint(v.x) | (uint(v.y) << 16);
+    uint even = simd_shuffle_down(own, ushort(3));
     uint2 pair = uint2(own, simd_shuffle_down(own, ushort(1)));
-    ushort b = ushort(lane >> 1);
-    uint2 p0 = simd_shuffle(pair, b), p1 = simd_shuffle(pair, ushort(b + 2));
-    uint2 p2 = simd_shuffle(pair, ushort(b + 4)), p3 = simd_shuffle(pair, ushort(b + 6));
-    if ((x & 1u) == 0u) {
-        return int2(int(p1.y & 0xFFFFu), int(p1.y >> 16));
+    uint2 p0 = simd_shuffle_up(pair, ushort(16)), p1 = simd_shuffle_up(pair, ushort(14));
+    uint2 p2 = simd_shuffle_up(pair, ushort(12)), p3 = simd_shuffle_up(pair, ushort(10));
+    if (lane < 16u) {
+        return int2(int(even & 0xFFFFu), int(even >> 16));
     }
     int2 result;
     for (uint c = 0u; c < 2u; ++c) {
@@ -647,35 +659,34 @@ static inline int2 dovi_el_h(int2 v, uint x, uint lane) {
     return result;
 }
 
-// The upsampled EL luma code at BL pixel gid.
-static inline int dovi_el_luma(texture2d<ushort, access::sample> tex, uint2 gid, uint lane, uint2 el_size) {
-    int col = dovi_el_column(gid.x, lane, el_size.x);
-    return dovi_el_h(dovi_el_v_luma(tex, col, gid.y), gid.x, lane);
+// The upsampled EL luma code at this lane's BL pixel in row `row` (`dovi_lane_column`).
+static inline int dovi_el_luma(texture2d<ushort, access::sample> tex, uint x0, uint row, uint lane, uint2 el_size) {
+    return dovi_el_h(dovi_el_v_luma(tex, dovi_el_column(x0, lane, el_size.x), row), lane);
 }
 
-// The upsampled EL chroma codes (Cb, Cr) at BL chroma sample (x, row).
-static inline int2 dovi_el_chroma(texture2d<ushort, access::read> tex, uint x, uint row, uint lane, uint2 el_size) {
-    int col = dovi_el_column(x, lane, el_size.x);
-    return dovi_el_h(dovi_el_v_chroma(tex, col, row, el_size.y), x, lane);
+// The upsampled EL chroma codes (Cb, Cr) at this lane's BL chroma sample in row `row`.
+static inline int2 dovi_el_chroma(texture2d<ushort, access::read> tex, uint x0, uint row, uint lane, uint2 el_size) {
+    return dovi_el_h(dovi_el_v_chroma(tex, dovi_el_column(x0, lane, el_size.x), row, el_size.y), lane);
 }
 
 /* ============================================================================
    Composition kernels
    ========================================================================= */
 
-// Luma: BL luma + reshaping curve + inverse-NLQ residual -> 10-bit P010 plane.
-//
-// bl_uv_tex is bound only because a luma curve may carry MMR pieces, which need
-// all three components. No observed profile 7 stream has an MMR luma curve (libdovi
-// would report it as mapping_idc = 1 for component 0), so the DOVI_FLAG_LUMA_MMR gate
-// normally skips the fetch entirely. When it does fire, the chroma pair is taken
-// nearest-neighbour from the 4:2:0 plane: the reshaping model is defined on 4:4:4
-// input, and reconstructing chroma to full resolution here would cost a separate
-// pass for a case that does not occur in practice.
 // Whether the residual is added at luma column `x`: everywhere without a split, left of it with one.
 static inline bool dovi_residual_at(constant struct DoviMetalParams &params, uint x) {
     return params.residual_split_x == 0u || x < params.residual_split_x;
 }
+
+// Luma: BL luma + reshaping curve + inverse-NLQ residual -> 10-bit P010 plane.
+//
+// bl_uv_tex is bound only because a luma curve may carry MMR pieces, which need
+// all three components. No observed profile 7 stream has an MMR luma curve (libdovi
+// would report it as mapping_idc = 1 for component 0), so only the `dovi_fc_luma_mmr`
+// pipeline fetches it. There the chroma pair is taken
+// nearest-neighbour from the 4:2:0 plane: the reshaping model is defined on 4:4:4
+// input, and reconstructing chroma to full resolution here would cost a separate
+// pass for a case that does not occur in practice.
 
 kernel void dovi_compose_luma(
     texture2d<ushort, access::read>        bl_y_tex      [[texture(0)]],
@@ -686,15 +697,18 @@ kernel void dovi_compose_luma(
     constant int*                          luma_lut      [[buffer(1)]],
     device const int*                      nlq_lut       [[buffer(2)]],
     device const int*                      mmr_table     [[buffer(3)]],
-    uint2                                  gid           [[thread_position_in_grid]],
+    uint2                                  grid          [[thread_position_in_grid]],
     uint                                   lane          [[thread_index_in_simdgroup]])
 {
+    // This lane's pixel (`dovi_lane_column`); x0 is the first column of its SIMD-group's 32.
+    uint x0 = grid.x - lane;
+    uint2 gid = uint2(dovi_lane_column(x0, lane), grid.y);
     bool residual = (params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u &&
                     params.nlq_y.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_y.nlq_scale != 0;
     // The EL's horizontal pass reads its neighbours' vertical results, so every lane runs it before any leaves.
     int el_code = 0;
     if (residual) {
-        el_code = dovi_el_luma(el_y_tex, gid, lane, uint2(params.el_width, params.el_height));
+        el_code = dovi_el_luma(el_y_tex, x0, gid.y, lane, uint2(params.el_width, params.el_height));
     }
     // A lane past the picture reads the edge and stays until the MMR's shuffles are done (they read every lane).
     bool inside = gid.x < params.bl_width && gid.y < params.bl_height;
@@ -703,7 +717,7 @@ kernel void dovi_compose_luma(
     int bl_y = int(bl_y_tex.read(at).r >> 6);
 
     int h;
-    if ((params.flags & DOVI_FLAG_LUMA_MMR) == 0u) {
+    if (!dovi_fc_luma_mmr) {
         h = luma_lut[bl_y];
     } else {
         uint shift = dovi_q20_shift(params.bl_max);
@@ -713,9 +727,13 @@ kernel void dovi_compose_luma(
         bool mmr = dovi_is_mmr(params.poly_y, piece);
         uint c0, c1, c2;
         dovi_mmr_inputs(params, t, uint(bl_uv.r >> 6) << shift, uint(bl_uv.g >> 6) << shift, shift, c0, c1, c2);
+        // As in the chroma kernel: a polynomial piece first, on the clamped input.
+        h = mmr ? 0 : dovi_eval_curve(params.poly_y, piece, c0, shift);
         DoviMmrSum sum, unused;
         dovi_mmr_shared<false>(mmr_table, piece, mmr_table, 0, inside && mmr, c0, c1, c2, lane, sum, unused);
-        h = mmr ? dovi_mmr_end(sum, params.mmr_y.coef_shift) : dovi_eval_curve(params.poly_y, piece, t, shift);
+        if (mmr) {
+            h = dovi_mmr_end(sum, params.mmr_y.coef_shift);
+        }
     }
     if (!inside) {
         return;
@@ -752,9 +770,12 @@ kernel void dovi_compose_chroma(
     constant struct DoviMetalParams&       params        [[buffer(0)]],
     device const int*                      nlq_lut       [[buffer(2)]],
     device const int*                      mmr_table     [[buffer(3)]],
-    uint2                                  gid           [[thread_position_in_grid]],
+    uint2                                  grid          [[thread_position_in_grid]],
     uint                                   lane          [[thread_index_in_simdgroup]])
 {
+    // This lane's chroma sample (`dovi_lane_column`); x0 is the first column of its SIMD-group's 32.
+    uint x0 = grid.x - lane;
+    uint2 gid = uint2(dovi_lane_column(x0, lane), grid.y);
     uint uv_width = dovi_chroma_size(params.bl_width);
     uint uv_height = dovi_chroma_size(params.bl_height);
     bool cb_active = params.nlq_cb.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cb.nlq_scale != 0;
@@ -763,8 +784,8 @@ kernel void dovi_compose_chroma(
     // As in the luma kernel: every lane runs the EL upsampling before any leaves.
     int2 el_code = int2(0);
     if (residual) {
-        el_code = dovi_el_chroma(el_uv_tex, gid.x, gid.y, lane,
-                                      uint2(dovi_chroma_size(params.el_width), dovi_chroma_size(params.el_height)));
+        el_code = dovi_el_chroma(el_uv_tex, x0, gid.y, lane,
+                                 uint2(dovi_chroma_size(params.el_width), dovi_chroma_size(params.el_height)));
     }
 
     // A lane past the picture reads the edge and stays until the MMR's shuffles are done (they read every lane).
@@ -798,15 +819,23 @@ kernel void dovi_compose_chroma(
     uint t0 = uint(bl_y) << shift, t1 = uint(bl_cb) << shift, t2 = uint(bl_cr) << shift;
     int piece_cb = dovi_curve_piece(params.poly_cb, t1, shift), piece_cr = dovi_curve_piece(params.poly_cr, t2, shift);
     bool mmr_cb = dovi_is_mmr(params.poly_cb, piece_cb), mmr_cr = dovi_is_mmr(params.poly_cr, piece_cr);
-    // One pass over the terms feeds both sums; a component whose piece is not MMR sums against the zero piece.
     uint c0, c1, c2;
     dovi_mmr_inputs(params, t0, t1, t2, shift, c0, c1, c2);
+    // A polynomial piece is evaluated before the MMR pass (on the clamped input, which it clamps to the same range), so
+    // the pass carries one value a component rather than its piece and input.
+    int h_cb = mmr_cb ? 0 : dovi_eval_curve(params.poly_cb, piece_cb, c1, shift);
+    int h_cr = mmr_cr ? 0 : dovi_eval_curve(params.poly_cr, piece_cr, c2, shift);
+    // One pass over the terms feeds both sums; a component whose piece is not MMR sums against the zero piece.
     DoviMmrSum sum_cb, sum_cr;
     dovi_mmr_shared<true>(mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE, mmr_cb ? piece_cb : DOVI_MMR_ZERO_PIECE,
                           mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE, mmr_cr ? piece_cr : DOVI_MMR_ZERO_PIECE,
                           inside && (mmr_cb || mmr_cr), c0, c1, c2, lane, sum_cb, sum_cr);
-    int h_cb = mmr_cb ? dovi_mmr_end(sum_cb, params.mmr_cb.coef_shift) : dovi_eval_curve(params.poly_cb, piece_cb, t1, shift);
-    int h_cr = mmr_cr ? dovi_mmr_end(sum_cr, params.mmr_cr.coef_shift) : dovi_eval_curve(params.poly_cr, piece_cr, t2, shift);
+    if (mmr_cb) {
+        h_cb = dovi_mmr_end(sum_cb, params.mmr_cb.coef_shift);
+    }
+    if (mmr_cr) {
+        h_cr = dovi_mmr_end(sum_cr, params.mmr_cr.coef_shift);
+    }
     if (!inside) {
         return;
     }

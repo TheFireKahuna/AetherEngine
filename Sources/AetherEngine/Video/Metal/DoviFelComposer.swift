@@ -158,14 +158,30 @@ final class DoviFelComposer: @unchecked Sendable {
         /// The library the pipelines came from, kept for the specialisations.
         private let library: MTLLibrary?
         private let variantLock = NSLock()
-        private var variantResults: [Variant: Result<Kernels, Error>] = [:]
+        private var variantResults: [KernelKey: Result<MTLComputePipelineState, Error>] = [:]
 
-        /// One specialisation of the function constants: `dovi_fc_blue_noise` (0), `dovi_fc_mmr_exact` (1).
+        /// One specialisation of the function constants: `dovi_fc_blue_noise` (0), `dovi_fc_mmr_exact` (1),
+        /// `dovi_fc_luma_mmr` (2).
         struct Variant: Hashable, Sendable {
             var blueNoise = false
             /// The MMR sums kept as two exact words throughout, for a frame some piece of which the float estimate
             /// cannot pin (`populateMmrTable`).
             var mmrExact = false
+            /// The luma kernel's MMR path, for a frame whose luma curve has an MMR piece (``DoviComposerFlags/lumaMmr``).
+            var lumaMmr = false
+
+            /// The constants `name` reads: luma reads `mmrExact` only on its MMR path, chroma never reads `lumaMmr`,
+            /// so frames that differ in a constant a kernel does not read share its pipeline.
+            func specialised(for name: String) -> Variant {
+                name == "dovi_compose_luma"
+                    ? Variant(blueNoise: blueNoise, mmrExact: lumaMmr && mmrExact, lumaMmr: lumaMmr)
+                    : Variant(blueNoise: blueNoise, mmrExact: mmrExact)
+            }
+        }
+
+        private struct KernelKey: Hashable {
+            let name: String
+            let variant: Variant
         }
 
         /// The composition kernels of one ``Variant``, and sv22's 4:2:0 -> 4:2:2 step (no specialisation).
@@ -190,24 +206,26 @@ final class DoviFelComposer: @unchecked Sendable {
         }
 
         /// The kernels of `variant`: the default ones built at compile time, any other on first use, so a session
-        /// that never asks for the blue-noise dither never pays the compile; the result, a failure included, is kept.
+        /// that never asks for the blue-noise dither never pays the compile; each kernel's result, a failure
+        /// included, is kept per the constants it reads (``Variant/specialised(for:)``).
         func kernels(_ variant: Variant) throws -> Kernels {
-            if variant == Variant() {
-                return Kernels(luma: lumaPipeline, chroma: chromaPipeline, chroma422: chroma422Pipeline)
-            }
+            Kernels(luma: try pipeline("dovi_compose_luma", variant, default: lumaPipeline),
+                    chroma: try pipeline("dovi_compose_chroma", variant, default: chromaPipeline),
+                    chroma422: chroma422Pipeline)
+        }
+
+        private func pipeline(_ name: String, _ variant: Variant,
+                              default built: MTLComputePipelineState) throws -> MTLComputePipelineState {
+            let key = KernelKey(name: name, variant: variant.specialised(for: name))
+            if key.variant == Variant() { return built }
             variantLock.lock()
             defer { variantLock.unlock() }
-            if let cached = variantResults[variant] { return try cached.get() }
-            let result = Result { () throws -> Kernels in
+            if let cached = variantResults[key] { return try cached.get() }
+            let result = Result { () throws -> MTLComputePipelineState in
                 guard let library else { throw ComposerError.missingKernelFunction }
-                let device = library.device
-                func make(_ name: String) throws -> MTLComputePipelineState {
-                    try device.makeComputePipelineState(function: try Self.kernel(library, name, variant))
-                }
-                return Kernels(luma: try make("dovi_compose_luma"), chroma: try make("dovi_compose_chroma"),
-                               chroma422: chroma422Pipeline)
+                return try library.device.makeComputePipelineState(function: try Self.kernel(library, name, key.variant))
             }
-            variantResults[variant] = result
+            variantResults[key] = result
             return try result.get()
         }
 
@@ -218,6 +236,8 @@ final class DoviFelComposer: @unchecked Sendable {
             values.setConstantValue(&blueNoise, type: .bool, index: 0)
             var mmrExact = variant.mmrExact
             values.setConstantValue(&mmrExact, type: .bool, index: 1)
+            var lumaMmr = variant.lumaMmr
+            values.setConstantValue(&lumaMmr, type: .bool, index: 2)
             return try library.makeFunction(name: name, constantValues: values)
         }
 
@@ -1023,9 +1043,10 @@ final class DoviFelComposer: @unchecked Sendable {
         serialized.serialize(into: rawBuffer)
         let mmrBuffer = mmrTableBuffers[paramSlot]
         let mmrExact = Self.populateMmrTable(into: mmrBuffer.contents().assumingMemoryBound(to: Int32.self), params: serialized)
-        // The blue-noise dither and the exact MMR sums live in their own specialisations of the kernels.
+        // The blue-noise dither, the exact MMR sums and the luma MMR path live in their own specialisations.
         guard let kernels = try? pipelines.kernels(SharedPipelines.Variant(blueNoise: serialized.ditherMode == .blueNoise,
-                                                                          mmrExact: mmrExact)),
+                                                                          mmrExact: mmrExact,
+                                                                          lumaMmr: serialized.flags.contains(.lumaMmr))),
               // The composition kernels upsample the EL with SIMD-group shuffles: whole threadgroups, 32 wide,
               // refused where the SIMD-group is not 32 lanes.
               let lumaThreads = Self.elUpsamplingThreadgroup(for: kernels.luma),
@@ -1150,10 +1171,10 @@ final class DoviFelComposer: @unchecked Sendable {
         fillNlq(ptr + 2 * nlqLutCodes, params.nlqCr)
     }
 
-    /// 32-bit words in the per-frame MMR table: Y, Cb, Cr, each `mmrTablePieces` pieces of the constant and the 21
-    /// coefficients, as `Int32`. The last piece of each component is all zeros: a sample whose piece is not MMR sums
-    /// against it, so every sample runs the same code.
-    static let mmrTablePieceStride = 1 + DoviMmrParams.coefficientsPerPiece
+    /// 32-bit words in the per-frame MMR table: Y, Cb, Cr, each `mmrTablePieces` pieces of 24 coefficients, as
+    /// `Int32`, in the kernels' order (``mmrTableSlot(power:term:)``). The last piece of each component is all zeros:
+    /// a sample whose piece is not MMR sums against it, so every sample runs the same code.
+    static let mmrTablePieceStride = 24
     static let mmrTablePieces = DoviMmrParams.maxPieces + 1
     static let mmrTableCount = 3 * mmrTablePieces * mmrTablePieceStride
 
@@ -1162,10 +1183,18 @@ final class DoviFelComposer: @unchecked Sendable {
     /// stays under 2^31.
     static let mmrEstimateBound = Double(1 << 49)
 
+    /// The table slot of coefficient `term` (0 ... 6: s0, s1, s2, s0s1, s0s2, s1s2, s0s1s2, the RPU's order) raised to
+    /// `power` (1 ... 3): (power - 1) * 8 + the term's subset of the inputs (bit 0 s0, bit 1 s1, bit 2 s2), the order
+    /// the kernels step through (`dovi_mmr_shared`). Slot 0, the empty subset to the first power, is the constant.
+    static func mmrTableSlot(power: Int, term: Int) -> Int {
+        (power - 1) * 8 + [1, 2, 4, 3, 5, 6, 7][term]
+    }
+
     /// Fills the MMR table the kernels read (`DOVI_MMR_TABLE_*` in the shader): per component and piece the
-    /// constant then the 21 coefficients, Q(coefficient_log2_denom), which the kernels multiply into the 64-bit sum
-    /// (and, on the estimate path, convert to float for the estimate). A piece's coefficients above its order are
-    /// written as zero, so the kernels add all 21 terms whatever the order and get the order's sum exactly.
+    /// constant and the 21 coefficients at their slots (``mmrTableSlot(power:term:)``), Q(coefficient_log2_denom),
+    /// which the kernels multiply into the 64-bit sum (and, on the estimate path, convert to float for the estimate).
+    /// The two slots of the empty subset's square and cube, and a piece's coefficients above its order, are written as
+    /// zero, so the kernels add all 24 whatever the order and get the order's sum exactly.
     ///
     /// Returns whether the frame needs the exact pipelines: some MMR piece the kernels can reach (luma's only when
     /// its curve is MMR) has a sum of |coefficient * term|, every term below 2^20, over ``mmrEstimateBound``.
@@ -1182,11 +1211,13 @@ final class DoviFelComposer: @unchecked Sendable {
                 let base = ptr + at
                 let isPiece = p < DoviMmrParams.maxPieces
                 let terms = isPiece ? 7 * min(Int(curve.order[p]), 3) : 0
+                base.update(repeating: 0, count: piece)
                 base[0] = isPiece ? mmr.constant[p] : 0
                 var bound = abs(Double(base[0])) * ceiling
-                for t in 0..<DoviMmrParams.coefficientsPerPiece {
-                    base[1 + t] = t < terms ? mmr.coef[p][t] : 0
-                    bound += abs(Double(base[1 + t])) * ceiling
+                for t in 0..<terms {
+                    let slot = mmrTableSlot(power: 1 + t / 7, term: t % 7)
+                    base[slot] = mmr.coef[p][t]
+                    bound += abs(Double(base[slot])) * ceiling
                 }
                 let used = isPiece && reachable && curve.numPivots >= 2 && p < Int(curve.numPivots) - 1
                     && curve.method[p] == DoviMapping.mmr.rawValue
@@ -1238,8 +1269,9 @@ final class DoviFelComposer: @unchecked Sendable {
         return texture
     }
 
-    /// The threadgroup the composition kernels' EL upsampling needs: 32 wide, one SIMD-group per row, so lane L of a SIMD-group is
-    /// output column x0 + L (`dovi_el_h` reads its neighbours' columns by lane). nil where the SIMD-group is
+    /// The threadgroup the composition kernels' EL upsampling needs: 32 wide, one SIMD-group per row, so lane L of a
+    /// SIMD-group is grid column x0 + L (the kernels compose the group's 32 columns in their own lane order,
+    /// `dovi_lane_column`, and `dovi_el_h` reads its neighbours' columns by lane). nil where the SIMD-group is
     /// not 32 lanes, which the shuffles assume; every Apple GPU's is.
     static func elUpsamplingThreadgroup(for pipeline: MTLComputePipelineState) -> MTLSize? {
         guard pipeline.threadExecutionWidth == 32 else {
