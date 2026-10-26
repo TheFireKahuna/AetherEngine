@@ -597,7 +597,7 @@ in-flight group is left only after the completion has handed its frame on) and t
 
 ### 9.3 The libraries' ABI
 
-LibDeinterlace 2.0.0 and LibMLSubUpscaler 2.0.0 ship as committed XCFrameworks (tvOS, iOS, macOS, visionOS, devices
+LibDeinterlace 2.0.1 and LibMLSubUpscaler 2.0.0 ship as committed XCFrameworks (tvOS, iOS, macOS, visionOS, devices
 and simulators, dSYMs), FFmpegBuild-style: the root package is a `binaryTarget`, the source package with its tests
 and build in `Development/`. Built with library evolution, so the `.swiftinterface` is a stable ABI (a rebuilt
 LibDeinterlace drops into an app, as LGPL-2.1 asks); public enums are `@frozen` only where no further case can exist.
