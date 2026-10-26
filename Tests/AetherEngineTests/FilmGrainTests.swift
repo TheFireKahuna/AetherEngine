@@ -1,4 +1,5 @@
 import CoreVideo
+import CryptoKit
 import Foundation
 import Metal
 import Testing
@@ -33,9 +34,10 @@ struct FilmGrainTests {
         6iIPBku/F5+QEANeFOuX9SvZMUbGgjd6y0JKuv93gooVGymN0xfM4m542nPSAn3ef5L/ZZj/EO8SABoBmA==
         """, options: .ignoreUnknownCharacters)!
 
-    /// libdav1d over `packets`, set up by the display writer as playback sets it up, every picture written by it. With
+    /// libdav1d over `packets`, set up by the display writer as playback sets it up, the digest of every picture written
+    /// by it: nil for a picture the writer gave no buffer for (a colour it refuses to show, or a failed finish). With
     /// `libdav1dGrain` the grain export is taken back off, so libdav1d applies grain into a picture of its own.
-    static func written(_ packets: [[UInt8]], libdav1dGrain: Bool, threads: Int32 = 0) throws -> [[UInt8]] {
+    static func written(_ packets: [[UInt8]], libdav1dGrain: Bool, threads: Int32 = 0) throws -> [SHA256Digest?] {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let writer = try DisplayBufferWriter(device: device, streamIs10Bit: true, twelveBit420: .p010Dithered,
                                              containerHDRStatic: .none, logTag: "FilmGrainTests")
@@ -50,13 +52,13 @@ struct FilmGrainTests {
         var packet = av_packet_alloc()
         var frame = av_frame_alloc()
         defer { av_packet_free(&packet); av_frame_free(&frame) }
-        var out: [[UInt8]] = []
+        var out: [SHA256Digest?] = []
         func drain() throws {
             while avcodec_receive_frame(ctx, frame) >= 0 {
                 if !libdav1dGrain {
                     #expect(writer.allocator.slab(of: frame!) != nil, "decoded in place, no copy")
                 }
-                out.append(try bytes(of: try #require(writer.finishAndWait(frame!))))
+                out.append(try writer.finishAndWait(frame!).map(digest(of:)))
                 av_frame_unref(frame)
             }
         }
@@ -73,20 +75,22 @@ struct FilmGrainTests {
         return out
     }
 
-    /// The display buffer's planes, visible rows only.
-    static func bytes(of pb: CVPixelBuffer) throws -> [UInt8] {
+    /// The digest of the display buffer's planes, visible rows only.
+    static func digest(of pb: CVPixelBuffer) throws -> SHA256Digest {
         CVPixelBufferLockBaseAddress(pb, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
         let eightBit: Set<OSType> = [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
         let sampleBytes = eightBit.contains(CVPixelBufferGetPixelFormatType(pb)) ? 1 : 2
-        var out: [UInt8] = []
+        var hash = SHA256()
         for p in 0..<CVPixelBufferGetPlaneCount(pb) {
             let base = try #require(CVPixelBufferGetBaseAddressOfPlane(pb, p))
             let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(pb, p)
             let visible = CVPixelBufferGetWidthOfPlane(pb, p) * (p == 0 ? 1 : 2) * sampleBytes
-            for y in 0..<CVPixelBufferGetHeightOfPlane(pb, p) { out += UnsafeRawBufferPointer(start: base + y * rowBytes, count: visible) }
+            for y in 0..<CVPixelBufferGetHeightOfPlane(pb, p) {
+                hash.update(bufferPointer: UnsafeRawBufferPointer(start: base + y * rowBytes, count: visible))
+            }
         }
-        return out
+        return hash.finalize()
     }
 
     @Test("the finisher's grain gives what libdav1d's grained picture gives", arguments: [Int32(1), 4])
@@ -95,6 +99,7 @@ struct FilmGrainTests {
         let ours = try Self.written(packets, libdav1dGrain: false, threads: threads)
         let reference = try Self.written(packets, libdav1dGrain: true, threads: threads)
         #expect(ours.count == 3)
+        #expect(!ours.contains(nil))
         #expect(ours == reference)
     }
 
@@ -103,8 +108,11 @@ struct FilmGrainTests {
     static let argon = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         .deletingLastPathComponent().deletingLastPathComponent().appending(path: "argon-dl/extracted/argon")
 
-    /// dav1d's Argon set: everything but large-scale tiles and the stress streams.
-    static let argonDirectories = [
+    /// dav1d's Argon set: everything but large-scale tiles and the stress streams; `AETHER_ARGON_DIRS` (comma-separated)
+    /// narrows it.
+    static let argonDirectories = ProcessInfo.processInfo.environment["AETHER_ARGON_DIRS"]
+        .map { $0.split(separator: ",").map(String.init) } ?? allArgonDirectories
+    static let allArgonDirectories = [
         "profile0_core", "profile0_core_special", "profile0_not_annexb", "profile0_not_annexb_special",
         "profile1_core", "profile1_core_special", "profile1_not_annexb", "profile1_not_annexb_special",
         "profile2_core", "profile2_core_special", "profile2_not_annexb", "profile2_not_annexb_special",
@@ -159,6 +167,10 @@ struct FilmGrainTests {
     static let argonEnabled = ProcessInfo.processInfo.environment["AETHER_ARGON"] == "1"
         && FileManager.default.fileExists(atPath: argon.path)
 
+    /// `AETHER_ARGON_STREAMS`: comma-separated parts of stream names; only the streams naming one are checked.
+    static let argonStreams = ProcessInfo.processInfo.environment["AETHER_ARGON_STREAMS"]
+        .map { $0.split(separator: ",").map(String.init) }
+
     /// Every Argon stream with film grain (its checksum with grain differs from the one without): the writer's pictures
     /// with the GPU's grain against the writer's pictures of libdav1d's grained output.
     @Test("Argon: the GPU's grain gives libdav1d's grained pictures", .enabled(if: FilmGrainTests.argonEnabled),
@@ -166,8 +178,9 @@ struct FilmGrainTests {
     func argonConformance(directory: String) throws {
         let root = Self.argon.appending(path: directory)
         let streams = try FileManager.default.contentsOfDirectory(atPath: root.appending(path: "streams").path)
-            .filter { $0.hasSuffix(".obu") }.sorted()
-        var checked = 0, failures: [String] = []
+            .filter { name in name.hasSuffix(".obu") && Self.argonStreams.map { $0.contains { name.contains($0) } } != false }
+            .sorted()
+        var checked = 0, refused = 0, failures: [String] = []
         for name in streams {
             let stem = String(name.dropLast(4))
             func expected(_ kind: String) throws -> String {
@@ -177,15 +190,20 @@ struct FilmGrainTests {
             let packets = try #require(Self.chunks(try Data(contentsOf: root.appending(path: "streams/\(name)")),
                                                    annexB: !directory.contains("not_annexb")), "\(name) framing")
             // One decoder thread a stream: the directories run side by side, about one thread a core in all.
-            let ours = try Self.written(packets, libdav1dGrain: false, threads: 1)
-            let reference = try Self.written(packets, libdav1dGrain: true, threads: 1)
+            // Each decode's buffers released as it ends: the test's thread drains no autorelease pool of its own.
+            let ours = try autoreleasepool { try Self.written(packets, libdav1dGrain: false, threads: 1) }
+            let reference = try autoreleasepool { try Self.written(packets, libdav1dGrain: true, threads: 1) }
+            // A colour the writer refuses to show is refused with and without grain; such a stream checks nothing.
+            if reference.allSatisfy({ $0 == nil }), ours.allSatisfy({ $0 == nil }) { refused += 1; continue }
             checked += 1
             if ours != reference {
                 let first = zip(ours, reference).enumerated().first { $1.0 != $1.1 }?.offset ?? min(ours.count, reference.count)
-                failures.append("\(name): picture \(first) of \(reference.count)")
+                let unwritten = first < ours.count && ours[first] == nil ? ", not written" : ""
+                failures.append("\(name): picture \(first) of \(reference.count)\(unwritten)")
             }
         }
-        #expect(failures.isEmpty, "\(failures.count) of \(checked): \(failures.prefix(20).joined(separator: "; "))")
-        #expect(checked > 0)
+        #expect(failures.isEmpty,
+                "\(failures.count) of \(checked) (\(refused) refused): \(failures.prefix(20).joined(separator: "; "))")
+        #expect(checked > 0 || Self.argonStreams != nil)
     }
 }

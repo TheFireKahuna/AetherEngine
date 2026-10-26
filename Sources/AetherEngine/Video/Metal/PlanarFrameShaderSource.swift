@@ -327,8 +327,9 @@ static inline uint pf_plane_sample(pf_src s, constant PFFrame& f, uint plane, ui
 /*PF_GRAIN*/
 
 // A sample of plane `plane` with its film grain. Grain is a property of the plane (AV1's planes 0, 1, 2), not of the
-// component the finisher reads it as. Chroma takes the un-noised luma at its site.
-static inline uint pf_grained(pf_src s, constant PFFrame& f, uint plane, uint v, uint x, uint y) {
+// component the finisher reads it as. Chroma takes the un-noised luma at its site. Kept inline: outlined, it is a call
+// with a stack frame from every sample read.
+static inline __attribute__((always_inline)) uint pf_grained(pf_src s, constant PFFrame& f, uint plane, uint v, uint x, uint y) {
     if (plane == 0u) { return fg_luma(s.g, v, x, y); }
     uint lx = x << FC_SRC_LOG2_W, ly = y << FC_SRC_LOG2_H;
     uint average = pf_plane_sample(s, f, 0u, lx, ly);

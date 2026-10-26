@@ -115,12 +115,12 @@ final class DisplayBufferWriter {
         let tag = logTag
         let failureLogged = finishFailureLogged
         finisher.finish(planes, plan: prepared.plan, width: width, height: height, into: prepared.buffer,
-                        grain: FilmGrainParameters(frame: frame)) { ok in
+                        grain: FilmGrainParameters(frame: frame)) { failure in
             held.release()
-            if !ok, failureLogged.claim() {
-                EngineLog.emit("[\(tag)] GPU finish failed (logged once)", category: .swPlayback)
+            if let failure, failureLogged.claim() {
+                EngineLog.emit("[\(tag)] GPU finish failed: \(failure) (logged once)", category: .swPlayback)
             }
-            completion(ok ? written : nil)
+            completion(failure == nil ? written : nil)
         }
     }
 

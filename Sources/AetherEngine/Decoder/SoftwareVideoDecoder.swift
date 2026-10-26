@@ -733,13 +733,18 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let failureLogged = finishFailureLogged
         nonisolated(unsafe) let pictures = held
         let tickets = emits
-        finisher.finish(jobs) { ok in
+        finisher.finish(jobs) { failure in
             withExtendedLifetime(pictures) {}
-            if !ok, failureLogged.claim() {
-                EngineLog.emit("[SWDecoder] GPU deinterlace and finish failed (logged once)", category: .swPlayback)
+            if let failure, failureLogged.claim() {
+                EngineLog.emit("[SWDecoder] GPU deinterlace and finish failed: \(failure) (logged once)",
+                               category: .swPlayback)
             }
             for e in tickets {
-                if ok { delivery.fulfil(ticket: e.ticket, epoch: epoch, e.frame) } else { delivery.skip(ticket: e.ticket, epoch: epoch) }
+                if failure == nil {
+                    delivery.fulfil(ticket: e.ticket, epoch: epoch, e.frame)
+                } else {
+                    delivery.skip(ticket: e.ticket, epoch: epoch)
+                }
             }
         }
     }
@@ -771,13 +776,14 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             nonisolated(unsafe) let tickets = films
             nonisolated(unsafe) let chain = ivtc
             let failureLogged = finishFailureLogged
-            return (jobs, { [weak self] ok in
+            return (jobs, { [weak self] failure in
                 withExtendedLifetime(held) {}
-                if !ok, failureLogged.claim() {
-                    EngineLog.emit("[SWDecoder] GPU inverse telecine and finish failed (logged once)", category: .swPlayback)
+                if let failure, failureLogged.claim() {
+                    EngineLog.emit("[SWDecoder] GPU inverse telecine and finish failed: \(failure) (logged once)",
+                                   category: .swPlayback)
                 }
                 for film in tickets {
-                    guard ok, let pts = chain.resolve(film.output) else {
+                    guard failure == nil, let pts = chain.resolve(film.output) else {
                         delivery.skip(ticket: film.ticket, epoch: epoch)
                         continue
                     }
