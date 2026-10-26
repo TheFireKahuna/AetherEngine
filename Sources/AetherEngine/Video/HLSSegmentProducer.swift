@@ -650,6 +650,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
     var overlayDecodeTap: OverlayDecodeTap?
     /// Whether this run's first segment has been released to AVPlayer (`releaseOverlayRunStart`). Pump thread only.
     private var overlayRunStartReleased = false
+    /// Whether this producer feeds an overlay whose decode AVPlayer's start waits for: the software overlay's, or the
+    /// FEL overlay's enhancement layer.
+    private var holdsOverlayRunStart: Bool {
+        #if DualLayerDolbyVision
+        if felTap != nil { return true }
+        #endif
+        return overlayDecodeTap != nil
+    }
     /// Bounds the wait for a run's first picture: a decoder that cannot produce it in this long would not keep up
     /// with the clock either, and AVPlayer is better told by a stall than by a wedged segment.
     static let overlayRunStartTimeout: TimeInterval = 5
@@ -3000,7 +3008,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     private func noteSegmentInProgress(_ index: Int, muxer: MP4SegmentMuxer) {
         // An overlay run's first segment is served whole, once its picture is decoded.
-        guard servesProgressively, overlayDecodeTap == nil || overlayRunStartReleased else { return }
+        guard servesProgressively, !holdsOverlayRunStart || overlayRunStartReleased else { return }
         cache.beginInProgress(index: index, stagingPath: muxer.stagingURL)
     }
 
@@ -3044,16 +3052,24 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 Self.foldingShiftBack(packet.pointee.dts, shift: videoShiftPts), sourceVideoTimeBase)
     }
 
-    /// An overlay session: the run's first segment waits for the overlay's decode to have the run's first picture.
-    /// AVPlayer prerolls the placeholder at once and starts its clock as soon as it has the segment, so this is the
-    /// one point where it has to wait for a decoder it does not own; after it the decoder only has to keep pace.
+    /// An overlay session: the run's first segment waits for the overlay's decode to have the run's first picture
+    /// (the software overlay's picture, or the FEL overlay's enhancement picture). AVPlayer prerolls its own decode
+    /// and starts its clock as soon as it has the segment, so this is the one point where it has to wait for a
+    /// decoder it does not own; after it the decoder only has to keep pace.
     private func releaseOverlayRunStart() {
-        guard let overlayDecodeTap, !overlayRunStartReleased else { return }
+        guard holdsOverlayRunStart, !overlayRunStartReleased else { return }
         overlayRunStartReleased = true
         let start = DispatchTime.now()
-        let ready = overlayDecodeTap.awaitRunStart(timeout: Self.overlayRunStartTimeout) { [weak self] in
-            self?.checkShouldStop() ?? true
+        let shouldStop: () -> Bool = { [weak self] in self?.checkShouldStop() ?? true }
+        var ready = true
+        if let overlayDecodeTap {
+            ready = overlayDecodeTap.awaitRunStart(timeout: Self.overlayRunStartTimeout, shouldStop: shouldStop)
         }
+        #if DualLayerDolbyVision
+        if let felTap {
+            ready = felTap.awaitRunStart(timeout: Self.overlayRunStartTimeout, shouldStop: shouldStop)
+        }
+        #endif
         let waitedMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
         EngineLog.emit("[HLSSegmentProducer] overlay run start: \(ready ? "first picture decoded" : "no picture yet, released") "
                        + "after \(String(format: "%.0f", waitedMs)) ms", category: .session)
