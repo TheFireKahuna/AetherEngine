@@ -6,8 +6,8 @@ finisher and H.273 colour) and 3 (AV1 into the slabs) are built; parts 4 (bwdif 
 interlaced carriage) are built and verified on device; part 5 (AV1 film grain, its synthesis on the GPU since
 2026-10-26) is built and bit exact on the Argon streams; part 7 (stills) is built, its device check open. Part 8
 records the mid-stream colour fixes part 5's conformance run led to. Part 9 (2026-10-26) is the one GPU submission
-layer every GPU user goes through, the software decoder's frame path without CPU waits, and the libraries' binary ABI;
-built, not yet run on the TV. Part 1 (one overlay for every picture AVPlayer cannot show) is open. What is left is in
+layer every GPU user goes through, the software decoder's frame path without CPU waits, the libraries' binary ABI, and
+the engine's own shaders precompiled with an A15 pipeline archive; built, not yet run on the TV. Part 1 (one overlay for every picture AVPlayer cannot show) is open. What is left is in
 "Order of work" at the end. The colour equations are in [colour-representation.md](colour-representation.md).
 
 What still passes over pixels on the CPU, each on purpose:
@@ -338,8 +338,8 @@ of every picture. The target is the specification's Option 1, bit for bit.
 ### 5.5 Built and measured
 
 - `Video/FilmGrain/`: `FilmGrainParameters` (from `AV_FRAME_DATA_FILM_GRAIN_PARAMS`), `FilmGrainSynthesis` (the
-  buffer's layout, its header and the synthesis arguments, the LFSR jump matrices) and `FilmGrainShaderSource`
-  (`fg_synthesize` and the per-sample `fg_*`). The finisher's `pf_c0..2` read through `pf_grained` under `FC_GRAIN`
+  buffer's layout, its header and the synthesis arguments) and `Shaders/FilmGrain.h` (`fg_synthesize`, the LFSR jump
+  matrices and the per-sample `fg_*`). The finisher's `pf_c0..2` read through `pf_grained` under `FC_GRAIN`
   (function constant 31), so every path (pack, resample, grey, RGB, convert, constant luminance) takes grain on the
   samples it reads. `DisplayBufferWriter.install` turns on `AV_CODEC_EXPORT_DATA_FILM_GRAIN` for libdav1d only (H.264 /
   HEVC grain is H.274's, which libavcodec applies).
@@ -622,6 +622,33 @@ Every kernel is checked offline for its A15 register allocation, spills, calls a
 choices are function constants or indirect dispatches written on the GPU; a choice uniform over a dispatch (the
 passthrough source) compiles into the per-dispatch preamble, not the per-pixel body.
 
+### 9.5 The engine's shaders precompiled
+
+The finisher (`Shaders/Finisher.metal`, with `FilmGrain.h`), the Metal 3 fill and the FEL composer
+(`Sources/AetherFELShaders/Shaders/DolbyVisionFEL.metal`, a target of its own that only the `DualLayerDolbyVision`
+trait links) are `.metal` resources the package compiles into its bundles' `default.metallib`; nothing compiles Metal
+source at run time (the FEL benchmark's bisection variants aside, which edit the source a test hands it). The math mode
+is in each file (`safe` for the finisher). Constants the Swift side shares (film grain's header words and buffer layout)
+and the tables derived on the host (the double-float constants, the exp2 / log2 tables, the LFSR jumps) are numbers in
+the source, held to their derivation by `ShaderTablesTests`.
+
+Every pipeline is made by `GPUPipelines`, one per device for the process: on Metal 4 one compiler, the request's archive
+first (`MTL4Archive` itself, so a miss is known: it is compiled and logged as `[GPUPipelines] <function> not in
+<archive>`), on Metal 3 the device. Functions that read no function constant (`fg_synthesize`, `pf_cl_prepare`,
+`pf_gate`) are one pipeline each, not one per plan.
+
+The planned set (`PlanarFrameFinisher.plannedSet`) is 74 finisher plans: the 62 of Order of work 3 and inverse
+telecine's variants of the 8-bit planar ones; with grain's synthesis and decimate's gate, 76 pipelines, and the FEL
+composer's 12 (every variant it tells apart). `Scripts/build-shader-archive.sh` builds the package for tvOS devices in
+Release, records those 88 with a Metal 4 compiler (`ShaderHarvest`) and translates them for the A15 on tvOS 27.0 into
+`Resources/AetherEngine-pipelines.metallib` (6.3 MB, 3.4 MB compressed; `metal-tt`'s compression options change
+nothing). The archive is bound to the exact libraries: Xcode's Release build of the package and `swift build`'s compile
+the kernels to the same bytes (measured), a Debug build does not. Rerun the script after any shader change and for a
+new tvOS release. On the Mac, the same chain translated for its own GPU served all 88 from the archive.
+
+At launch the app calls `AetherEngine.prewarmSoftwareDecode()` (the planned set and LibDeinterlace's common formats,
+about 150 pipelines) and `prewarmDualLayerDolbyVision()`, at utility priority.
+
 ## Banked
 
 - **Zero-copy rawvideo** by allocating its packets in slabs. Worth it only if a local or loopback producer ever feeds
@@ -641,7 +668,8 @@ passthrough source) compiles into the per-dispatch preamble, not the per-pixel b
   flight failing at once with Metal's timeout was a freed pipeline running on the GPU: two threads made the same
   pipeline at once and the cache stored the second over the first, which an already-encoded batch held without
   retaining. Caches now keep the first one made, and each batch holds the pipelines it sets until it completes.
-- **The archives on the device**: whether the A15 takes the libraries' pipelines from them (a launch logging misses).
+- **The archives on the device**: whether the A15 takes the engine's and the libraries' pipelines from them (the
+  engine's misses are logged by `GPUPipelines`; a refused archive is logged once), and the launch prewarm's time.
 - **Device checks still owed**: part 7's AV1 HDR scrub thumbnails; live HEVC through the #365 sample conversion and a
   mid-stream parameter-set change; a live SDR to HDR programme switch (the panel switching once, AVPlayer playing on
   across it). The live ones need a probe sequence that serves a growing MPEG-TS.
@@ -658,8 +686,7 @@ passthrough source) compiles into the per-dispatch preamble, not the per-pixel b
    chroma siting only on resampled axes, as its class; big-endian only past a byte), so over a realistic stream set
    434 distinct pipelines became 62, the kernel and its per-pixel cost unchanged. Moving data-only constants into the
    frame's arguments was rejected: it adds registers and work to every pixel for a first-launch saving.
-4. The engine's own shaders precompiled (the finisher, the FEL composer): `.metal` resources, archives through the
-   layer's pipeline call for a curated list of plans (the 62 above are its basis), a prewarm at app launch.
+4. Done (9.5): the engine's own shaders precompiled, the A15 archive of the planned set, a prewarm at app launch.
 5. Grain synthesis split by role across threadgroups (the luma wavefront, the chroma draws, the scaling tables and
    the offsets at once, then both chroma wavefronts), in a pass of its own beside the field bwdif.
 6. A queue-level residency set for the long-lived allocations (slabs, pool buffers, tables), leaving only per-batch

@@ -1,6 +1,6 @@
 // AV1 film grain synthesis (AV1 7.18.3), the CPU's part: the grain buffer's layout, the header and the synthesis
-// arguments of a frame's parameters, and the LFSR's jump matrices; the GPU synthesises the templates, the scaling
-// tables and the block offsets into the buffer (FilmGrainShaderSource's fg_synthesize). The structure follows dav1d's
+// arguments of a frame's parameters; the GPU synthesises the templates, the scaling tables and the block offsets into
+// the buffer (fg_synthesize, Shaders/FilmGrain.h). The structure follows dav1d's
 // src/filmgrain_tmpl.c and src/fg_apply_tmpl.c:
 //
 // Copyright © 2018, Niklas Haas
@@ -132,10 +132,10 @@ struct FilmGrainParameters: Hashable, Sendable {
     }
 }
 
-/// The per-frame tables, laid out as `FilmGrainShaderSource` reads them: a header the CPU writes, and the templates,
-/// scaling tables and block offsets the GPU synthesises in the frame's own batch (`fg_synthesize`). AV1's generator is
-/// serial (one LFSR stream, a causal auto-regressive filter), and the GPU takes it exactly: each draw's LFSR state
-/// jumped to directly (``jumpColumns``), the filter run as a wavefront, the tables in closed form.
+/// The per-frame tables, laid out as Shaders/FilmGrain.h reads them (its FG_* constants): a header the CPU writes, and
+/// the templates, scaling tables and block offsets the GPU synthesises in the frame's own batch (`fg_synthesize`). AV1's
+/// generator is serial (one LFSR stream, a causal auto-regressive filter), and the GPU takes it exactly: each draw's
+/// LFSR state jumped to directly (the shader's FG_JUMP), the filter run as a wavefront, the tables in closed form.
 enum FilmGrainSynthesis {
     static let templateWidth = 82
     static let templateHeight = 73
@@ -211,27 +211,4 @@ enum FilmGrainSynthesis {
         while bytes.count % 4 != 0 { bytes.append(0) }
         return bytes
     }
-
-    // MARK: - Random numbers (7.18.3.2)
-
-    /// The 16-bit LFSR's step, a linear map over GF(2): draw n's state is its n-th power applied to the seed. Columns of
-    /// the step's 2^j-th powers, j = 0 ... 12 (a template's 5,986 draws), for the shader's jumps (`fg_jump`): column b
-    /// is the state bit b alone becomes.
-    static let jumpColumns: [[UInt16]] = {
-        func step(_ r: UInt32) -> UInt32 {
-            let bit = (r ^ (r >> 1) ^ (r >> 3) ^ (r >> 12)) & 1
-            return (r >> 1) | (bit << 15)
-        }
-        func apply(_ columns: [UInt16], _ v: UInt16) -> UInt16 {
-            var out: UInt16 = 0
-            for b in 0..<16 where v & (1 << b) != 0 { out ^= columns[b] }
-            return out
-        }
-        var powers: [[UInt16]] = [(0..<16).map { UInt16(step(UInt32(1) << $0)) }]
-        for _ in 1..<13 {
-            let m = powers.last!
-            powers.append(m.map { apply(m, $0) })
-        }
-        return powers
-    }()
 }

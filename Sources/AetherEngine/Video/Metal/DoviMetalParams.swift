@@ -27,7 +27,7 @@ enum DoviDither: UInt32, Sendable {
     /// one that reads the top 10 bits the truncated code. Not validated on a display path yet.
     case fullPrecision = 3
     /// Like ``bayer8x8``, a threshold added before the floor, with the same exact 0.5 mean, but taken from a
-    /// static 64x64 blue-noise map (`DoviShaderSource.blueNoiseRows`) instead of the 8x8 Bayer matrix with its
+    /// static 64x64 blue-noise map (`dovi_blue_noise_64` in DolbyVisionFEL.metal) instead of the 8x8 Bayer matrix with its
     /// per-frame inversion: no fixed-period pattern and no frame-to-frame alternation.
     case blueNoise = 4
 }
@@ -80,7 +80,7 @@ struct DoviComposerFlags: OptionSet, Sendable {
 }
 
 /// Piecewise reshaping curve for one component; mirrors
-/// `struct DoviPolynomialParams` in `DoviShaderSource`.
+/// `struct DoviPolynomialParams` in DolbyVisionFEL.metal.
 ///
 /// `numPivots < 2` means identity passthrough, which is the fail-safe the parser
 /// installs whenever a curve cannot be trusted.
@@ -178,7 +178,7 @@ struct DoviNlqParams: Sendable {
 }
 
 /// Parameter block uploaded to the composition kernels; mirrors
-/// `struct DoviMetalParams` in `DoviShaderSource`.
+/// `struct DoviMetalParams` in DolbyVisionFEL.metal.
 ///
 /// ``serialize()`` writes the fields in declaration order and asserts each
 /// sub-block's size, and `dovi_layout_probe` reads sentinels back out of the

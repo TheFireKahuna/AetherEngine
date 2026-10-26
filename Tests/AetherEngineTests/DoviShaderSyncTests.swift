@@ -11,11 +11,11 @@ struct DoviShaderSyncTests {
 
     static let metalAvailable = MTLCreateSystemDefaultDevice() != nil
 
-    @Test("The runtime-compiled source carries all expected kernels")
-    func runtimeSourceCarriesKernels() {
+    @Test("the shipped library carries every kernel", .enabled(if: DoviShaderSyncTests.metalAvailable, "needs a Metal device"))
+    func shippedLibraryCarriesKernels() throws {
+        let library = try EngineShaders.felLibrary(for: try #require(MTLCreateSystemDefaultDevice()))
         for kernel in ["dovi_compose_luma", "dovi_compose_chroma", "dovi_chroma_420_to_422", "dovi_layout_probe"] {
-            #expect(DoviShaderSource.source.contains("kernel void \(kernel)("),
-                    "runtime source is missing \(kernel)")
+            #expect(library.functionNames.contains(kernel), "the library is missing \(kernel)")
         }
     }
 
@@ -76,7 +76,7 @@ struct DoviShaderSyncTests {
         DispatchQueue.concurrentPerform(iterations: 16) { _ in
             _ = try? cache.resolve(device: device) {
                 compiles.bump()
-                return try DoviFelComposer.SharedPipelines.compile(device: device, source: DoviShaderSource.source)
+                return try DoviFelComposer.SharedPipelines.make(library: EngineShaders.felLibrary(for: device), archive: nil)
             }
         }
         #expect(compiles.count == 1)

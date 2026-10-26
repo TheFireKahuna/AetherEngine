@@ -155,8 +155,9 @@ final class DoviFelComposer: @unchecked Sendable {
         /// `dovi_chroma_420_to_422`: sv22's 4:2:0 -> 4:2:2 step on the composed chroma.
         let chroma422Pipeline: MTLComputePipelineState
         let layoutProbePipeline: MTLComputePipelineState?
-        /// The library the pipelines came from, kept for the specialisations.
+        /// The library the pipelines came from, and the archive they are looked for in, kept for the specialisations.
         private let library: MTLLibrary?
+        private let archive: URL?
         private let variantLock = NSLock()
         private var variantResults: [KernelKey: Result<MTLComputePipelineState, Error>] = [:]
 
@@ -196,13 +197,15 @@ final class DoviFelComposer: @unchecked Sendable {
             chroma: MTLComputePipelineState,
             chroma422: MTLComputePipelineState,
             probe: MTLComputePipelineState?,
-            library: MTLLibrary? = nil
+            library: MTLLibrary? = nil,
+            archive: URL? = nil
         ) {
             self.lumaPipeline = luma
             self.chromaPipeline = chroma
             self.chroma422Pipeline = chroma422
             self.layoutProbePipeline = probe
             self.library = library
+            self.archive = archive
         }
 
         /// The kernels of `variant`: the default ones built at compile time, any other on first use, so a session
@@ -223,14 +226,16 @@ final class DoviFelComposer: @unchecked Sendable {
             if let cached = variantResults[key] { return try cached.get() }
             let result = Result { () throws -> MTLComputePipelineState in
                 guard let library else { throw ComposerError.missingKernelFunction }
-                return try library.device.makeComputePipelineState(function: try Self.kernel(library, name, key.variant))
+                return try GPUPipelines.shared(for: library.device).make(library: library, function: name,
+                                                                         constants: Self.constants(key.variant),
+                                                                         archive: archive)
             }
             variantResults[key] = result
             return try result.get()
         }
 
-        /// A composition kernel with its function constants set.
-        static func kernel(_ library: MTLLibrary, _ name: String, _ variant: Variant) throws -> MTLFunction {
+        /// A composition kernel's function constants.
+        static func constants(_ variant: Variant) -> MTLFunctionConstantValues {
             let values = MTLFunctionConstantValues()
             var blueNoise = variant.blueNoise
             values.setConstantValue(&blueNoise, type: .bool, index: 0)
@@ -238,7 +243,25 @@ final class DoviFelComposer: @unchecked Sendable {
             values.setConstantValue(&mmrExact, type: .bool, index: 1)
             var lumaMmr = variant.lumaMmr
             values.setConstantValue(&lumaMmr, type: .bool, index: 2)
-            return try library.makeFunction(name: name, constantValues: values)
+            return values
+        }
+
+        /// Every pipeline a composer can use, as the archive records it: each composition kernel in every variant it
+        /// tells apart, and the functions without constants.
+        static func archivedRequests() -> [(function: String, constants: MTLFunctionConstantValues?)] {
+            var requests: [(function: String, constants: MTLFunctionConstantValues?)] = [
+                ("dovi_chroma_420_to_422", nil), ("dovi_layout_probe", nil),
+            ]
+            var seen = Set<KernelKey>()
+            for blueNoise in [false, true] { for mmrExact in [false, true] { for lumaMmr in [false, true] {
+                for name in ["dovi_compose_luma", "dovi_compose_chroma"] {
+                    let variant = Variant(blueNoise: blueNoise, mmrExact: mmrExact, lumaMmr: lumaMmr).specialised(for: name)
+                    if seen.insert(KernelKey(name: name, variant: variant)).inserted {
+                        requests.append((name, constants(variant)))
+                    }
+                }
+            } } }
+            return requests
         }
 
         /// Per-device results, failures included: a shader that does not compile will not compile on the next
@@ -269,7 +292,7 @@ final class DoviFelComposer: @unchecked Sendable {
         static func getOrCreate(device: MTLDevice) throws -> SharedPipelines {
             try shared.resolve(device: device) {
                 do {
-                    return try compile(device: device, source: DoviShaderSource.source)
+                    return try make(library: EngineShaders.felLibrary(for: device), archive: EngineShaders.archive)
                 } catch {
                     EngineLog.emit("[DoviFelComposer] Metal shader compilation error: \(error)", category: .swPlayback)
                     throw error
@@ -277,25 +300,22 @@ final class DoviFelComposer: @unchecked Sendable {
             }
         }
 
-        static func compile(device: MTLDevice, source: String) throws -> SharedPipelines {
-            let library = try device.makeLibrary(source: source, options: nil)
-            guard library.functionNames.contains("dovi_compose_luma"),
-                  library.functionNames.contains("dovi_compose_chroma"),
-                  library.functionNames.contains("dovi_chroma_420_to_422") else {
+        /// The default pipelines of `library`'s kernels, made through the layer, looked for in `archive` first.
+        static func make(library: MTLLibrary, archive: URL?) throws -> SharedPipelines {
+            let names = library.functionNames
+            guard names.contains("dovi_compose_luma"), names.contains("dovi_compose_chroma"),
+                  names.contains("dovi_chroma_420_to_422") else {
                 throw ComposerError.missingKernelFunction
             }
-            let luma = try device.makeComputePipelineState(function: try kernel(library, "dovi_compose_luma", Variant()))
-            let chroma = try device.makeComputePipelineState(function: try kernel(library, "dovi_compose_chroma", Variant()))
-            guard let chroma422Fn = library.makeFunction(name: "dovi_chroma_420_to_422") else { throw ComposerError.missingKernelFunction }
-            let chroma422 = try device.makeComputePipelineState(function: chroma422Fn)
-            let probe: MTLComputePipelineState?
-            if let probeFn = library.makeFunction(name: "dovi_layout_probe") {
-                probe = try? device.makeComputePipelineState(function: probeFn)
-            } else {
-                probe = nil
+            let pipelines = GPUPipelines.shared(for: library.device)
+            func pipeline(_ name: String, _ variant: Variant?) throws -> MTLComputePipelineState {
+                try pipelines.make(library: library, function: name, constants: variant.map(constants), archive: archive)
             }
-
-            return SharedPipelines(luma: luma, chroma: chroma, chroma422: chroma422, probe: probe, library: library)
+            let probe = names.contains("dovi_layout_probe") ? try? pipeline("dovi_layout_probe", nil) : nil
+            return SharedPipelines(luma: try pipeline("dovi_compose_luma", Variant()),
+                                   chroma: try pipeline("dovi_compose_chroma", Variant()),
+                                   chroma422: try pipeline("dovi_chroma_420_to_422", nil), probe: probe,
+                                   library: library, archive: archive)
         }
 
         #if DEBUG

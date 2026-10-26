@@ -114,16 +114,16 @@ A frame bypasses composition, and goes out as its base layer with its own DV met
 stream is not FEL, when MEL was detected, when no RPU parameters exist for its PTS, or when
 composition fails.
 
-**Kernels** (`DoviShaderSource.swift`). Luma: base code → piece selection → polynomial (evaluated in
+**Kernels** (`Sources/AetherFELShaders/Shaders/DolbyVisionFEL.metal`, compiled when the package builds). Luma: base code → piece selection → polynomial (evaluated in
 normalized float) or MMR when the luma curve uses MMR → plus the inverse-NLQ residual of the
 enhancement-layer luma, upsampled with one hardware-bilinear fetch →
 12-bit clamp → dither → 10-bit. Chroma: base chroma plus the base luma at the chroma site ([1 2 1] around
 the even column in each of the cell's two rows, rows averaged; DoViBaker's MMR input) → MMR → plus the residual from the enhancement chroma, upsampled with one
 hardware-bilinear fetch co-sited with the top-left luma sample (DoViBaker's phase) → dither.
 
-**Parameter ABI.** `DoviShaderSource.sharedStructs` on the GPU side, `DoviMetalParams.serialize` on
+**Parameter ABI.** The shader's `DOVI_SHARED_STRUCTS` block on the GPU side, `DoviMetalParams.serialize` on
 the Swift side. `DoviLayoutProbeTests` has the GPU read every sub-block back at the offset Swift wrote
-it to; `DoviShaderSyncTests` pins the serialized size and that every kernel is present.
+it to; `DoviShaderSyncTests` pins the serialized size and that the shipped library has every kernel.
 
 ### 3.1 Audio
 

@@ -190,7 +190,7 @@ struct ColourAffine: Equatable {
 /// (docs/colour-representation.md section 3).
 struct TransferCharacteristics: Hashable {
     let code: UInt32
-    /// The kernel's f.tp, in double (see PlanarFrameShaderSource).
+    /// The kernel's f.tp, in double (see Finisher.metal).
     let constants: [Double]
 
     init?(_ transfer: AVColorTransferCharacteristic) {
