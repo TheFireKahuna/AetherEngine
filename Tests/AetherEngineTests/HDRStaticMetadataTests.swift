@@ -136,6 +136,7 @@ struct HDRStaticMetadataTests {
             var p: UnsafeMutablePointer<AVPacket>? = pkt
             trackedPacketFree(&p)
         }
+        decoder.awaitDelivered()
         return try #require(box.first, "the fixture must decode to at least one frame")
     }
 
