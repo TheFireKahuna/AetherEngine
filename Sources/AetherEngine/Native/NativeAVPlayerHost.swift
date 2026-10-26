@@ -315,6 +315,9 @@ final class NativeAVPlayerHost {
     nonisolated(unsafe) private var loadStartTime = DispatchTime.now()
     private var notificationObservers: [NSObjectProtocol] = []
     private var itemDiagnostics: AVPlayerItemDiagnostics?
+    /// AVFoundation's own playback metrics for the current item (`AVPlayerItemMetricsLog`), typed `AnyObject`
+    /// because the type exists from tvOS 18.
+    private var itemMetrics: AnyObject?
     private var retiringDiagnostics: [ObjectIdentifier: AVPlayerItemDiagnostics] = [:]
     private var counterGeneration = 0
     private var reportedIncompleteRetirement = false
@@ -621,6 +624,7 @@ final class NativeAVPlayerHost {
         playerItem = item
         let diagnostics = AVPlayerItemDiagnostics(item: item, pool: diagnosticPool, read: diagnosticRead)
         itemDiagnostics = diagnostics
+        if #available(macOS 15, iOS 18, tvOS 18, *) { itemMetrics = AVPlayerItemMetricsLog(item: item, sid: sid) }
         diagnostics.onSnapshot = { [weak self, weak diagnostics] snapshot, request in
             guard let self, let diagnostics, self.sessionID == sid,
                   self.itemDiagnostics === diagnostics else { return }
@@ -2578,6 +2582,7 @@ final class NativeAVPlayerHost {
             NotificationCenter.default.removeObserver(obs)
         }
         notificationObservers.removeAll()
+        itemMetrics = nil
         // Clear terminal flags: keepNativeHost reload reuses the host and @Published replays on subscribe; stale failure/didReachEnd corrupt the new session (issue #15).
         failure = nil
         // Audit Vcore-102: the same replay would hand the successor's sinks this item's refusal.
