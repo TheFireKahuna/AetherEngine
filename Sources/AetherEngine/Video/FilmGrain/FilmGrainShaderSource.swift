@@ -1,5 +1,6 @@
-// AV1 film grain synthesis (AV1 7.18.3), the per-sample half: Metal functions the finisher's reader calls for every
-// sample it takes, over the tables FilmGrainSynthesis writes. The block sampling and overlap blending follow dav1d's
+// AV1 film grain synthesis (AV1 7.18.3) on the GPU: fg_synthesize, which writes a frame's templates, scaling tables and
+// block offsets into its grain buffer, and the per-sample functions the finisher's reader calls for every sample it
+// takes, over those tables. The block sampling and overlap blending follow dav1d's
 // src/filmgrain_tmpl.c (sample_lut, fgy_32x32xn_c, fguv_32x32xn_c):
 //
 // Copyright © 2018, Niklas Haas

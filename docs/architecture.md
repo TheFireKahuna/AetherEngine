@@ -448,16 +448,25 @@ Sources/AetherEngine/
 │   ├── A53SEIParser.swift                   A53/GA94 cc_data extraction from H.264/HEVC SEI NALs (#131)
 │   ├── DualLayerPictureAlignment.swift      SW FEL path (`DualLayerDolbyVision` trait): pairs each EL picture with the base picture of the same display slot (POC), falling back to access-unit pairing (#702)
 │   ├── FrameSideDataRing.swift              SW FEL path (`DualLayerDolbyVision` trait): fixed ring of per-frame RPU parameters and display metadata keyed by timestamp (#702)
-│   ├── OrderedDelivery.swift                SW FEL path (`DualLayerDolbyVision` trait): hands composed frames from the Metal completion queue to the renderer in decode order, with an epoch for seeks and a stall guard (#702)
+│   ├── OrderedDelivery.swift                Both SW decoders: hands frames from the GPU's completion queue to the host in decode order (by ticket), drops old epochs after a seek, skips a failed frame's ticket, with a stall guard (#702)
 │   ├── CCDataParser.swift                   Parses the bare cc_data triplet stream from a demuxable CEA-608 caption track (#77)
 │   ├── CEA608Decoder.swift                  In-house CEA-608 line-21 decoder (field-1 / CC1), validated against FFmpeg ccaption_dec.c (#77)
-│   ├── BwdifWindow.swift                    SW path: FFmpeg bwdif's scheduling (yadif_common.c): the previous / current / next window, intra first and last fields, field-rate timestamps, progressive pass-through; the arithmetic runs in the finisher's `pf_bwdif`
 │   ├── EmbeddedSubtitleDecoder.swift        Inline subtitle decode from demuxed packets; opens DVB teletext with libzvbi_teletextdec text-format options (#107)
 │   ├── InterlaceProbe.swift                 Decodes a sample and applies the deinterlacer's own engagement predicate, so a declared field order that no frame backs up (PsF) stops costing a SW decode (#232)
 │   ├── VideoRoutingPolicy.swift             Pure codec-and-field-order dispatch rule: AV1 gated on HW, VP9/VP8/MPEG4/MPEG2/VC1 always SW, interlaced H.264 SW so the deinterlacer can run (#107, verified against decoded frames on VOD, #232), plus a second-stage gate routing H.264 High 4:2:2/4:4:4/10 + HEVC Rext to SW where VideoToolbox has no HW decoder (#2)
 │   ├── HardwareVideoDecoder.swift           SW path: VideoToolbox HW HEVC / AV1 decoder for sources routed away from AVPlayer
 │   ├── DualLayerVideoDecoder.swift          SW path: Dolby Vision Profile 7 FEL (`DualLayerDolbyVision` trait). Two HardwareVideoDecoders (a base layer, typically 4K, and an enhancement layer, typically 1080p) paired by HEVC picture order with the packet's RPU, composed on Metal by `DoviFelComposer`, delivered in decode order with the Profile 8.1 RPU attached per frame; see [dolby-vision-fel.md](dolby-vision-fel.md)
-│   ├── SoftwareVideoDecoder.swift           SW path: libavcodec/dav1d → CVPixelBuffer (NV12 / P010), HDR10+ side data
+│   ├── SoftwareVideoDecoder.swift           SW path: libavcodec/dav1d into GPU-visible slabs, one GPU batch per frame (grain, deinterlace or inverse telecine, finish) with no CPU wait, frames out through `OrderedDelivery` from the GPU's completion; its pipelines made when it opens; HDR10+ side data
+│   ├── DecodeFrameAllocator.swift           The slabs libavcodec decodes into: shared-storage `MTLBuffer`s the finisher reads in place (the copy path for decoders without DR1)
+│   ├── DisplayBufferWriter.swift            A decoded picture into the display buffer: the finisher's plan (cached), the pool buffer, colour / siting / HDR tags; `finishAndWait` for stills
+│   ├── ColorDescription.swift               A stream's colour description from its frames or its codec parameters, in one place (AE#499)
+│   ├── DeinterlaceConfig.swift              Deinterlacer cadence and how film sits in interlaced carriage, resolved from `LoadOptions` at load
+│   ├── FilmCadence.swift                    Soft telecine: progressive pictures with repeat-field flags retimed onto the film grid (docs/software-route-gpu.md 6.1)
+│   ├── AlternativeTransferSEI.swift         The alternative transfer characteristics SEI (H.264 / HEVC): broadcast HLG behind a backward-compatible VUI (AE#839)
+│   ├── HEVCInBandColour.swift               The colour an HEVC stream states per picture in its own bitstream, for `HardwareVideoDecoder`
+│   ├── DualLayerRouteDecision.swift         Whether a Profile 7 load takes the dual-layer route or stays native, and why (pure, logged once per source)
+│   ├── OnceFlag.swift                       A once-only claim any thread can make (an atomic), for logging a GPU failure once from completions
+│   ├── ZlibBlock.swift                      One zlib-wrapped Matroska block inflated (ContentCompression algorithm 0)
 │   ├── SubtitleDecoder.swift                Sidecar URL one-shot decode (text only); decodes several streams of one container in a single pass (#266)
 │   ├── VideoDecoderTypes.swift              DecodedFrameHandler typealias + VideoDecoderError
 │   └── PixelAspectPolicy.swift              Whether a declared sample aspect ratio deserves to be believed: an absurd-component gate (#177, live TS carrying 1088:1) plus a display-aspect gate judged against the frame the SAR applies to, since 2:1 is right on 960x1080 and wrong on 1920x1080 (#290)
@@ -590,10 +599,21 @@ Sources/AetherEngine/
 │   ├── DoviRpuSurvey.swift                  L1 / L2 display-metadata survey over a title's RPUs (no decode, no GPU); backs `aetherctl dvsurvey`
 │   ├── AetherEngine+FelProbe.swift          `DualLayerDolbyVision` trait: FEL decode probe backing `aetherctl feltest`, and the `--cycle-el` residual switch
 │   ├── AetherEngine+DolbyVisionTest.swift   DEBUG-only, `DualLayerDolbyVision` trait: `@_spi(Diagnostics)` hook (not host API) that arms the pin test from a debug menu or `aetherctl play --dv-pin`
-│   ├── Metal/                               `DualLayerDolbyVision` trait only
+│   ├── Metal/                               Every GPU submission, the software route's finisher, and (`DualLayerDolbyVision` trait) the FEL composer
+│   │   ├── GPUSubmission.swift              `GPUSubmitter`: the one submission layer (Metal 4 where the device has it, Metal 3 otherwise): batches, passes, uploads, events, fences, fills, pipelines made by the layer with Metal 4 binary archives; a batch holds what it binds until it completes
+│   │   ├── GPUSubmission+Libraries.swift    The submitter as LibDeinterlace's and LibMLSubUpscaler's submissions (`DeinterlaceGPU`, `SubtitleUpscaleGPU`)
+│   │   ├── PlanarFrameFinisher.swift        The one pass between a software decoder and the display: a decoded picture into a bi-planar display buffer (H.273), with grain, deinterlaced fields, inverse telecine's chosen and gated outputs; slots, plans, the pipeline cache and prewarm
+│   │   ├── PlanarFrameShaderSource.swift    The finisher's kernel, specialised per plan with function constants (constants a plan never reads take one value)
+│   │   ├── ColourRepresentation.swift       What the finisher does with a picture's MatrixCoefficients: tag, convert or refuse (docs/colour-representation.md)
+│   │   ├── DoviFelComposer+Benchmark.swift  `DualLayerDolbyVision` trait: each composition kernel's GPU cost at UHD on the device it runs on
+│   │   ├── FelPlaybackBenchmark.swift       `DualLayerDolbyVision` trait: a FEL title played as the app plays it, timed by the overlay's own instruments
 │   │   ├── DoviFelComposer.swift            BL + EL + RPU composition: runtime-compiled pipelines, pooled P010 output, `composeAsync` bounded at `maxFramesInFlight` with completions on its own serial queue; RPU → `DoviMetalParams` parsing
 │   │   ├── DoviShaderSource.swift           Luma / chroma compose kernels (reshaping, inverse NLQ, bilinear EL upsampling, ordered dither) and the ABI layout probe, compiled at runtime
 │   │   └── DoviMetalParams.swift            Swift mirror of the kernel parameter structs and their byte-exact serializer
+│   ├── FilmGrain/                           AV1 film grain on the GPU, bit exact to the specification (docs/software-route-gpu.md part 5)
+│   │   ├── FilmGrainSynthesis.swift         `FilmGrainParameters` (a frame's, from libdav1d); the grain buffer's layout, its header and the synthesis arguments
+│   │   ├── FilmGrainShaderSource.swift      `fg_synthesize` (templates, scaling tables, block offsets, one threadgroup) and the per-sample grain the finisher reads through
+│   │   └── FilmGrainGaussianSequence.swift  AV1's Gaussian sequence (dav1d's table)
 │   ├── Issue65LivelockBreakers.swift        Pure backpressure-wedge detection (`BackpressureWedgeDetector`) breaking the VOD HLS scrub-burst livelock (#65); `seekIsWedged` starvation check + `SeekResumeGuard` single-resume latch for the deadline-bounded seek
 │   ├── Issue99MuxerFailureRevive.swift      Bounded revive for a VOD pump that died with `muxerFailed` (#99): the first cut firing before any bridged audio reached the muxer (dec3 box) no longer ends the session
 │   ├── SlowServeSignal.swift                One-shot slow-serve timer arming the server's early chunked header (keeps TTFB under AVPlayer's ~3.5 s -12889 window, #93 round 3)

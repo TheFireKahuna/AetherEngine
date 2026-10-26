@@ -1,5 +1,6 @@
-// AV1 film grain synthesis (AV1 7.18.3), the per-frame half: the grain templates, the scaling tables and the block
-// offsets, written into the buffer the finisher's shader reads (FilmGrainShaderSource). The structure follows dav1d's
+// AV1 film grain synthesis (AV1 7.18.3), the CPU's part: the grain buffer's layout, the header and the synthesis
+// arguments of a frame's parameters, and the LFSR's jump matrices; the GPU synthesises the templates, the scaling
+// tables and the block offsets into the buffer (FilmGrainShaderSource's fg_synthesize). The structure follows dav1d's
 // src/filmgrain_tmpl.c and src/fg_apply_tmpl.c:
 //
 // Copyright © 2018, Niklas Haas
