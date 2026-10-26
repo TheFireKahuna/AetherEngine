@@ -164,77 +164,29 @@ extension HLSVideoEngine {
     }
 
     /// Packets and bytes the TrueHD clock measurement may peek. Peeked packets stay resident until the
-    /// producer reads them, as for the TrueHD verdict (`trueHDVerdictByteBudget`); the stream's first restart
-    /// header normally comes within its first few hundred access units.
+    /// producer reads them, as for the TrueHD verdict (`trueHDVerdictByteBudget`); restart headers come every
+    /// sixteen access units, so the readings it takes arrive within about a second of the stream.
     static let trueHDClockPacketBudget = 16_384
     static let trueHDClockByteBudget = 64 << 20
+    /// Restart headers the TrueHD clock measurement reads up to: about a second of the stream.
+    static let trueHDClockRestarts = 64
 
     /// Where a TrueHD stream's own clock reads zero, counted from the stream's start, in frames at its rate
-    /// (`StreamClockPlacement.headOffset`), for the bridges that place by it. The stream's first access unit is
-    /// its start, and FFmpeg's decoder states each restart header's output_timing on its frame
-    /// (`mlp_output_timing`), so decoding the stream from its first packet gives it exactly: the access units
-    /// before the first frame that states it, times the unit's samples, less what it states. One value for the
-    /// stream, the same whichever segment a run starts at. Nil where the head is out of reach (live, a side
-    /// audio demuxer the producer positions itself, a stream that states no start, nothing stated within the
-    /// budget, a frame that does not sit where that count puts it), and the grid then places as before.
+    /// (`StreamClockPlacement.headOffset`), for the bridges that place by it: the one number the container alone
+    /// knows, how the stream's clock sits against the timeline the picture shares (``trueHDClockOffset(audioStream:
+    /// demuxer:streamIndex:)``), read from the stream's head. Nil where it cannot be read (live, a side audio demuxer
+    /// the producer positions itself, a stream that states no start, too few readings within the budget), and the
+    /// grid then places as before.
     func trueHDClockHeadOffset(audioStream: UnsafeMutablePointer<AVStream>, audioDemuxer: Demuxer,
                                streamIndex: Int32) -> Int64? {
-        let start = audioStream.pointee.start_time
-        let tb = audioStream.pointee.time_base
         guard audioStream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_TRUEHD,
-              !isLiveSession, audioDemuxer === demuxer, start != Int64.min, tb.den > 0,
-              let codec = avcodec_find_decoder(AV_CODEC_ID_TRUEHD) else { return nil }
+              !isLiveSession, audioDemuxer === demuxer, audioStream.pointee.start_time != Int64.min else { return nil }
         let started = DispatchTime.now()
-        func measure() -> (offset: Int64?, atHead: Bool) {
-            var context = avcodec_alloc_context3(codec)
-            var frame = av_frame_alloc()
-            defer { avcodec_free_context(&context); av_frame_free(&frame) }
-            guard let context, let frame,
-                  avcodec_parameters_to_context(context, audioStream.pointee.codecpar) >= 0 else { return (nil, false) }
-            context.pointee.pkt_timebase = tb
-            guard avcodec_open2(context, codec, nil) >= 0 else { return (nil, false) }
-            var offset: Int64?
-            var atHead: Bool?
-            var units: Int64 = 0, heldBytes = 0
-            try? audioDemuxer.peekPackets(maxPackets: Self.trueHDClockPacketBudget) { packet in
-                heldBytes += Int(max(packet.pointee.size, 0))
-                if heldBytes > Self.trueHDClockByteBudget { return true }
-                guard packet.pointee.stream_index == streamIndex, packet.pointee.size > 0 else { return false }
-                if atHead == nil {
-                    // Only a read from the stream's first packet counts its access units from the start.
-                    atHead = packet.pointee.pts == start
-                    if atHead == false { return true }
-                }
-                var frames: Int64 = 0
-                if avcodec_send_packet(context, packet) >= 0 {
-                    while avcodec_receive_frame(context, frame) >= 0 {
-                        defer { av_frame_unref(frame) }
-                        let unit = AudioBridge.trueHDAccessUnitFrames(rate: frame.pointee.sample_rate)
-                        if let entry = av_dict_get(frame.pointee.metadata, "mlp_output_timing", nil, 0),
-                           let timing = Int64(String(cString: entry.pointee.value)) {
-                            let position = (units + frames) * unit
-                            // The frame sits where the count puts it, to the container's noise: one access unit
-                            // a packet, as every container the engine reads carries TrueHD.
-                            let stated = av_rescale_q(packet.pointee.pts &- start, tb,
-                                                      AVRational(num: 1, den: frame.pointee.sample_rate))
-                            let noise = SourceGrid.noise(tolerance: AudioContinuity.tolerance(
-                                sourceTimeBase: tb, sampleRate: frame.pointee.sample_rate))
-                            if abs(stated - position) <= noise { offset = position - timing }
-                            return true
-                        }
-                        frames += 1
-                    }
-                }
-                units += max(frames, 1)
-                return false
-            }
-            return (offset, atHead ?? false)
-        }
-        var result = measure()
+        var read = Self.trueHDClockOffset(audioStream: audioStream, demuxer: audioDemuxer, streamIndex: streamIndex)
         var seeked = false
-        if !result.atHead {
-            seeked = audioDemuxer.seek(to: start, streamIndex: streamIndex, atOrBefore: true)
-            result = seeked ? measure() : (nil, false)
+        if !read.atHead {
+            seeked = audioDemuxer.seek(to: audioStream.pointee.start_time, streamIndex: streamIndex, atOrBefore: true)
+            if seeked { read = Self.trueHDClockOffset(audioStream: audioStream, demuxer: audioDemuxer, streamIndex: streamIndex) }
         }
         if seeked || initialProducerBaseIndex > 0 {
             seekToInitialProducerStart(audioDemuxer)
@@ -243,10 +195,123 @@ extension HLSVideoEngine {
         let ms = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1e6
         EngineLog.emit(
             "[HLSVideoEngine] TrueHD clock "
-            + (result.offset.map { "reads zero \($0) frames from the stream's start (\(String(format: "%.0f", ms)) ms)" }
-               ?? "not read off the stream's head (\(String(format: "%.0f", ms)) ms); placing on the grid"),
+            + (read.offset.map { "reads zero \($0) frames from the stream's start, "
+                                 + (read.counted ? "counted from its head, within what its timestamps allow"
+                                                 : "the middle of what its timestamps allow (its first packet is stamped apart)")
+                                 + "; \(read.apart) of \(read.readings) access units stamped apart" }
+               ?? "not read: \(read.readings) access units within the budget; placing on the grid")
+            + " (\(String(format: "%.0f", ms)) ms)",
             category: .session)
-        return result.offset
+        return read.offset
+    }
+
+    /// The offset ``trueHDClockHeadOffset(audioStream:audioDemuxer:streamIndex:)`` reads, on `demuxer` from where it
+    /// stands: the offset, how many access units it read and how many of those were stamped apart from it, whether it
+    /// is the count from the head, and whether the demuxer stood at the stream's first packet.
+    ///
+    /// FFmpeg's decoder states each restart header's output_timing on its frame (`mlp_output_timing`), every sixteen
+    /// access units, and every access unit is the same number of samples, so the clock is known at every access unit:
+    /// the last restart's, plus the units since. Two reads of the offset from that:
+    /// - The timestamps bound it. A packet's timestamp is its access unit's place rounded to the container's tick, so
+    ///   each one allows the offsets within half a tick of its own reading (its timestamp less its clock,
+    ///   ``mostAllowed(_:halfWidth:)``); the offset lies where the most packets allow it. With a millisecond's tick
+    ///   and 40-sample access units that is a window eight frames wide, whatever the number of packets. A packet that
+    ///   does not allow it is stamped apart.
+    /// - The count from the head pins it. The stream's first packet is its start, unrounded, so the access units
+    ///   before the first restart header, times the unit's samples, less its clock, is the offset to the frame.
+    /// The count stands where the timestamps allow it. Where they do not, the first packet is the one stamped apart (a
+    /// library title's sat at zero, 5.3 ms ahead of a gap its clock runs straight through), and the offset is the
+    /// middle of what they allow, within four frames. A survey of seven TrueHD titles found every other stamp within
+    /// a millisecond of its access unit, spread both ways. The clock wraps at 2^16, so the readings are taken in the
+    /// wrap's window around the first.
+    static func trueHDClockOffset(audioStream: UnsafeMutablePointer<AVStream>, demuxer: Demuxer, streamIndex: Int32)
+        -> (offset: Int64?, readings: Int, apart: Int, counted: Bool, atHead: Bool) {
+        let start = audioStream.pointee.start_time
+        let tb = audioStream.pointee.time_base
+        guard start != Int64.min, tb.den > 0, let codec = avcodec_find_decoder(AV_CODEC_ID_TRUEHD)
+        else { return (nil, 0, 0, false, false) }
+        var readings: [Int64] = []
+        var restarts = 0
+        var lastRestart: (timing: Int64, unitsSince: Int64)?
+        var atHead: Bool?
+        var unitsFromStart: Int64 = 0
+        var counted: Int64?
+        var halfTick: Int64 = 0
+        var context = avcodec_alloc_context3(codec)
+        var frame = av_frame_alloc()
+        defer { avcodec_free_context(&context); av_frame_free(&frame) }
+        guard let context, let frame, avcodec_parameters_to_context(context, audioStream.pointee.codecpar) >= 0
+        else { return (nil, 0, 0, false, false) }
+        context.pointee.pkt_timebase = tb
+        guard avcodec_open2(context, codec, nil) >= 0 else { return (nil, 0, 0, false, false) }
+        var heldBytes = 0
+        try? demuxer.peekPackets(maxPackets: trueHDClockPacketBudget) { packet in
+            heldBytes += Int(max(packet.pointee.size, 0))
+            if heldBytes > trueHDClockByteBudget { return true }
+            guard packet.pointee.stream_index == streamIndex, packet.pointee.size > 0 else { return false }
+            if atHead == nil { atHead = packet.pointee.pts == start }
+            var units: Int64 = 0
+            if avcodec_send_packet(context, packet) >= 0 {
+                while avcodec_receive_frame(context, frame) >= 0 {
+                    defer { av_frame_unref(frame); units += 1 }
+                    let rate = AVRational(num: 1, den: frame.pointee.sample_rate)
+                    let unit = AudioBridge.trueHDAccessUnitFrames(rate: frame.pointee.sample_rate)
+                    if let entry = av_dict_get(frame.pointee.metadata, "mlp_output_timing", nil, 0),
+                       let timing = Int64(String(cString: entry.pointee.value)) {
+                        lastRestart = (timing, 0)
+                        restarts += 1
+                        if atHead == true, counted == nil { counted = (unitsFromStart + units) * unit - timing }
+                    } else if let last = lastRestart {
+                        lastRestart = (last.timing, last.unitsSince + 1)
+                    }
+                    // Only a packet's first access unit carries its timestamp.
+                    guard units == 0, packet.pointee.pts != Int64.min, let last = lastRestart else { continue }
+                    halfTick = max(1, av_rescale_q(1, tb, rate) / 2)
+                    readings.append(av_rescale_q(packet.pointee.pts &- start, tb, rate) - (last.timing + last.unitsSince * unit))
+                }
+            }
+            unitsFromStart += max(units, 1)
+            return restarts >= trueHDClockRestarts
+        }
+        let head = atHead ?? false
+        guard restarts >= trueHDClockRestarts / 2, let first = readings.first else {
+            return (nil, readings.count, 0, false, head)
+        }
+        let window = readings.map { first + StreamClockPlacement.nearest($0 - first, modulus: 1 << 16) }
+        let allowed = mostAllowed(window, halfWidth: halfTick)
+        // A reading is stamped apart when it allows none of the window.
+        let allowsWindow: (Int64) -> Bool = { $0 + halfTick > allowed.lowerBound && $0 - halfTick <= allowed.upperBound }
+        let apart = window.filter { !allowsWindow($0) }.count
+        if let counted {
+            let near = first + StreamClockPlacement.nearest(counted - first, modulus: 1 << 16)
+            if allowed.contains(near) { return (counted, readings.count, apart, true, head) }
+        }
+        return ((allowed.lowerBound + allowed.upperBound) / 2, readings.count, apart, false, head)
+    }
+
+    /// The values the most readings allow: a closed range. A reading is a timestamp rounded to the nearest tick, a
+    /// tie upward, less its exact place, so it lies in (x - halfWidth, x + halfWidth] of the true value x, and allows
+    /// x in [r - halfWidth, r + halfWidth). A reading off by a whole tick then allows none of the true window, where a
+    /// closed allowance would let late ones pull it a lattice step.
+    static func mostAllowed(_ readings: [Int64], halfWidth: Int64) -> ClosedRange<Int64> {
+        // Each reading's allowance opens at r - halfWidth and closes at r + halfWidth. Every change at a value is
+        // applied before the stretch from it to the next change is counted; the best stretch is where most are open.
+        var changes: [Int64: Int] = [:]
+        for r in readings {
+            changes[r - halfWidth, default: 0] += 1
+            changes[r + halfWidth, default: 0] -= 1
+        }
+        let at = changes.keys.sorted()
+        var open = 0, best = 0
+        var range = (readings.first ?? 0)...(readings.first ?? 0)
+        for (i, value) in at.enumerated() where i + 1 < at.count {
+            open += changes[value]!
+            if open > best {
+                best = open
+                range = value...(at[i + 1] - 1)
+            }
+        }
+        return range
     }
 
     func handleBridgeDecodedNothing(streamIndex: Int32, summary: String) {
