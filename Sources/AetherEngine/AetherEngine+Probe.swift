@@ -834,6 +834,15 @@ extension AetherEngine {
 
     // MARK: - Decoder identity helpers
 
+    /// The video decoder of the native route's session: AVPlayer's own, or on an overlay session (a stream
+    /// AVPlayer is served a placeholder of) the overlay's decoder, which is VideoToolbox where it opened a
+    /// hardware session and libavcodec / dav1d otherwise. Read off the running session, never the route asked
+    /// for, so a load and a reload of the same stream name the same decoder.
+    func nativeVideoDecoderLabel(codecID: AVCodecID) -> String? {
+        let tap = nativeVideoSession?.overlayDecodeTap
+        return Self.videoDecoderLabel(codecID: codecID, isSoftware: tap.map { !$0.decodesInHardware } ?? false)
+    }
+
     /// User-facing label for the active video decoder. nil when no video track (AV_CODEC_ID_NONE).
     /// isSoftware describes the decoder, not the playback path: the software host can use VideoToolbox.
     static func videoDecoderLabel(codecID: AVCodecID, isSoftware: Bool) -> String? {

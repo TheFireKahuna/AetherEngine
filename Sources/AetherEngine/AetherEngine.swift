@@ -5784,9 +5784,7 @@ public final class AetherEngine: ObservableObject {
                 }
             )
             playbackBackend = .native
-            activeVideoDecoder = Self.videoDecoderLabel(
-                codecID: detectedCodecID, isSoftware: overlayDecodesVideoWanted
-            )
+            activeVideoDecoder = nativeVideoDecoderLabel(codecID: detectedCodecID)
             // Audio label comes from HLSVideoEngine's stream-copy/FLAC-bridge cascade.
             activeAudioDecoder = nativeVideoSession?.audioPipelineDescription
             // Reconcile published audioTracks with the session's real pick (side-demuxer tracks for
