@@ -209,6 +209,13 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         default:
             rows = nil
         }
+        // Constants the kernel never reads take one value, so plans it cannot tell apart share a pipeline: the chroma
+        // siting only on an axis it resamples, big-endian only where a component spans more than a byte.
+        let resampled = [.resample, .convert, .constantLuminance].contains(mode)
+            ? (srcLog2[0] != outLog2[0], srcLog2[1] != outLog2[1]) : (false, false)
+        let siting = Self.siting(chromaLocation, horizontal: resampled.0, vertical: resampled.1)
+        let multiByte = comps.prefix(isPalette ? 1 : 3).contains { $0.shift + $0.depth > 8 }
+
         var alignment = [1, 1, 1, 1]
         for c in comps.prefix(isPalette ? 1 : 3) where desc.flags & UInt64(AV_PIX_FMT_FLAG_BITSTREAM) == 0 {
             let bits = Int(c.shift + c.depth)
@@ -219,11 +226,11 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         return Plan(
             mode: mode, outputLog2: outLog2, sourceLog2: [.pack, .resample, .convert, .constantLuminance].contains(mode) ? srcLog2 : outLog2,
             components: comps.prefix(3).map { [UInt32($0.plane), UInt32($0.step), UInt32($0.offset), UInt32($0.shift), UInt32($0.depth)] },
-            bigEndian: desc.flags & UInt64(AV_PIX_FMT_FLAG_BE) != 0,
+            bigEndian: multiByte && desc.flags & UInt64(AV_PIX_FMT_FLAG_BE) != 0,
             bitstream: desc.flags & UInt64(AV_PIX_FMT_FLAG_BITSTREAM) != 0,
             palette: isPalette, fullRange: mode == .rgb ? (isPalette || sourceFullRange) : sourceFullRange,
             targetBits: targetBits, fractionBits: fractionBits, containerShift: containerShift,
-            chromaLocation: UInt32(chromaLocation.rawValue), wideOutput: output.depth != .eight,
+            chromaLocation: siting, wideOutput: output.depth != .eight,
             matrix: matrixMode, bitDepthRGB: bitDepthRGB, transfer: transferCode, lumaTable: lumaTable,
             rows: (rows?.doubleFloatRows ?? [Float](repeating: 0, count: 24)) + (second?.doubleFloatRows ?? [Float](repeating: 0, count: 24)),
             cl: cl, tp: tp,
@@ -235,6 +242,26 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     /// The relative error of one float32 exp2 / log2 in the constant-luminance fast path: 4 ulp, the maximum the Metal
     /// Shading Language specification guarantees for both with fast math disabled (Table 8.1), on every Apple GPU.
     static let transferEvaluationError: Float = 4 * Float.ulpOfOne
+
+    /// The chroma location as the kernel's siting reads it (pf_site2), on the axes it resamples: left-sited or centred
+    /// horizontally; on the top row, centred or on the bottom row vertically. An axis it does not resample takes the
+    /// centred class, so locations that differ only there share a pipeline.
+    static func siting(_ location: AVChromaLocation, horizontal: Bool, vertical: Bool) -> UInt32 {
+        let l = location.rawValue
+        let left = horizontal && [AVCHROMA_LOC_LEFT, AVCHROMA_LOC_TOPLEFT, AVCHROMA_LOC_BOTTOMLEFT].map(\.rawValue).contains(l)
+        let row: Int = !vertical ? 0
+            : ([AVCHROMA_LOC_TOPLEFT, AVCHROMA_LOC_TOP].map(\.rawValue).contains(l) ? -1
+               : ([AVCHROMA_LOC_BOTTOMLEFT, AVCHROMA_LOC_BOTTOM].map(\.rawValue).contains(l) ? 1 : 0))
+        let code: AVChromaLocation = switch (left, row) {
+        case (true, -1): AVCHROMA_LOC_TOPLEFT
+        case (false, -1): AVCHROMA_LOC_TOP
+        case (true, 1): AVCHROMA_LOC_BOTTOMLEFT
+        case (false, 1): AVCHROMA_LOC_BOTTOM
+        case (true, _): AVCHROMA_LOC_LEFT
+        default: AVCHROMA_LOC_CENTER
+        }
+        return UInt32(code.rawValue)
+    }
 
     private static func components(_ desc: AVPixFmtDescriptor) -> [AVComponentDescriptor] {
         withUnsafeBytes(of: desc.comp) { Array($0.bindMemory(to: AVComponentDescriptor.self)) }

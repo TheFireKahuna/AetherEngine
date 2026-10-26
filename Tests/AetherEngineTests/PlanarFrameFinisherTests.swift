@@ -148,6 +148,27 @@ struct PlanarFrameFinisherTests {
         #expect(Double(codes.filter { $0 == 513 }.count) / Double(codes.count) == 0.25)
     }
 
+    /// The chroma siting is a constant only on an axis the plan resamples, so locations the kernel cannot tell apart
+    /// share one pipeline, and those it can stay apart.
+    @Test("plans differing only in a constant their path never reads share one pipeline")
+    func unreadConstantsShare() throws {
+        func specialisation(into chroma: SoftwareVideoDecoder.OutputFormat.Chroma, _ location: AVChromaLocation) throws -> [UInt32] {
+            let output = SoftwareVideoDecoder.OutputFormat(chroma: chroma, depth: .eight, fullRange: false)
+            return try #require(PlanarFrameFinisher.plan(source: AV_PIX_FMT_YUV420P, output: output, sourceFullRange: false,
+                                                         chromaLocation: location, matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2)).specialisation
+        }
+        let all = (0...6).map { AVChromaLocation(rawValue: $0) }
+        // 4:2:0 into a 4:2:0 buffer is a pack: no siting is read.
+        #expect(Set(try all.map { try specialisation(into: .yuv420, $0) }).count == 1)
+        // Into a 4:2:2 buffer the rows alone are resampled: left and centre siting read alike, top, centre and bottom
+        // rows do not.
+        #expect(try specialisation(into: .yuv422, AVCHROMA_LOC_LEFT) == specialisation(into: .yuv422, AVCHROMA_LOC_CENTER))
+        #expect(try specialisation(into: .yuv422, AVCHROMA_LOC_TOP) != specialisation(into: .yuv422, AVCHROMA_LOC_CENTER))
+        #expect(Set(try all.map { try specialisation(into: .yuv422, $0) }).count == 3)
+        // Into 4:4:4 both axes are: six classes.
+        #expect(Set(try all.map { try specialisation(into: .yuv444, $0) }).count == 6)
+    }
+
     /// Words the GPU would write earlier in a batch, set here: a passthrough choice (32-bit, at 0) and decimate's kept
     /// flag (64-bit, at 8).
     @Test("a job reads the picture its word chooses, and a job gated off leaves its buffer as it was",
