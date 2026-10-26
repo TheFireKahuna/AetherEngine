@@ -161,6 +161,7 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         // 80 or 160 frames at 96 or 192 kHz, so the division is exact.
         out.sourcePtsInputFrame = block.sourcePtsInputFrame / Int64(factor)
         out.clockFrame = block.clockFrame.map { $0 / Int64(factor) }
+        out.clockModulus = block.clockModulus.map { $0 / Int64(factor) }
         out.gridFrames = block.gridFrames / factor
         out.planes = main.planes
         out.updates = main.updates
@@ -227,7 +228,8 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             sourcePtsInputFrame: Int64(block.input_frame_offset)
                 - Int64(block.pts_au_index) * Int64(block.access_unit_frames),
             clockFrame: clock(block.output_timing),
-            gridFrames: Int(block.access_unit_frames)), firstStates)
+            gridFrames: Int(block.access_unit_frames),
+            clockModulus: 1 << 16), firstStates)
     }
 
     /// output_timing (the frame this block plays at, modulo 2^16) counted on from the last block's,

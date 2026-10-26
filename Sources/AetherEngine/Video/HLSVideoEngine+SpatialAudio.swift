@@ -206,6 +206,76 @@ extension HLSVideoEngine {
         }
     }
 
+    #if TrueHDObjectAudio
+    /// Packets and bytes the TrueHD clock measurement may peek. Peeked packets stay resident until the
+    /// producer reads them, as for the TrueHD verdict above; the first decoded block normally comes within
+    /// the stream's first few hundred access units.
+    static let trueHDClockPacketBudget = 16_384
+    static let trueHDClockByteBudget = 64 << 20
+
+    /// Where a TrueHD stream's own clock reads zero, counted from the stream's start, in 48 kHz frames
+    /// (`SpatialAudioBridge.setStreamClock`). The stream's first access unit is its start, so a decoder of
+    /// its own, fed the stream from its first packet, gives it exactly: the first block's `inputFrameOffset`
+    /// (every access unit before it counted, decodable or not) less its `clockFrame`. One value for the
+    /// stream, the same whichever segment a run starts at. Nil where the head is out of reach (live, a side
+    /// audio demuxer the producer positions itself, a stream that states no start, nothing decoded within
+    /// the budget); the grid then places TrueHD as before.
+    func trueHDClockHeadOffset(audioStream: UnsafeMutablePointer<AVStream>, audioDemuxer: Demuxer,
+                               streamIndex: Int32, decoder: ObjectAudioDecoding) -> Int64? {
+        let start = audioStream.pointee.start_time
+        guard !isLiveSession, audioDemuxer === demuxer, start != Int64.min else { return nil }
+        let started = DispatchTime.now()
+        func measure() -> (offset: Int64?, atHead: Bool) {
+            var offset: Int64?
+            var atHead: Bool?
+            var packets = 0, heldBytes = 0
+            try? audioDemuxer.peekPackets(maxPackets: Self.trueHDClockPacketBudget) { packet in
+                packets += 1
+                heldBytes += Int(max(packet.pointee.size, 0))
+                if heldBytes > Self.trueHDClockByteBudget { return true }
+                guard packet.pointee.stream_index == streamIndex,
+                      let data = packet.pointee.data, packet.pointee.size > 0 else { return false }
+                if atHead == nil {
+                    // Only a read from the stream's first packet counts its access units from the start.
+                    atHead = packet.pointee.pts == start
+                    if atHead == false { return true }
+                }
+                do {
+                    try decoder.push(UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)),
+                                     pts: packet.pointee.pts)
+                    while let block = try decoder.nextBlock() {
+                        guard let clock = block.clockFrame else { continue }
+                        offset = block.inputFrameOffset - clock
+                        return true
+                    }
+                } catch {
+                    return true
+                }
+                return false
+            }
+            return (offset, atHead ?? false)
+        }
+        var result = measure()
+        var seeked = false
+        if !result.atHead {
+            decoder.reset()
+            seeked = audioDemuxer.seek(to: start, streamIndex: streamIndex, atOrBefore: true)
+            result = seeked ? measure() : (nil, false)
+        }
+        if seeked || initialProducerBaseIndex > 0 {
+            seekToInitialProducerStart(audioDemuxer)
+            demuxerAtInitialProducerStart = true
+        }
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1e6
+        EngineLog.emit(
+            "[HLSVideoEngine] TrueHD clock "
+            + (result.offset.map { "reads zero \($0) frames from the stream's start (\(String(format: "%.0f", ms)) ms)" }
+               ?? "not read off the stream's head (\(String(format: "%.0f", ms)) ms); placing on the grid"),
+            category: .session)
+        return result.offset
+    }
+    #endif
+
     /// Build the producer on a `SpatialAudioBridge` when the host asked for object rendering and the
     /// source qualifies. Nil means "not this route": ineligible, unsupported OS, not DTS:X, or a
     /// bridge/header failure, each logged, and the caller carries on with the ordinary bridge
@@ -307,6 +377,8 @@ extension HLSVideoEngine {
         let bridge: SpatialAudioBridge
         /// A decoder for each segment's run, made as the session's own.
         let makeDecoder: () throws -> ObjectAudioDecoding
+        /// The stream's clock against its start, for a source whose bitstream carries one (TrueHD).
+        var clockHeadOffset: Int64?
         do {
             let decoder: ObjectAudioDecoding
             switch source {
@@ -319,6 +391,8 @@ extension HLSVideoEngine {
                         : try TrueHDObjectAudioDecoder(dialogueGain: dialogueGain)
                 }
                 decoder = try makeDecoder()
+                clockHeadOffset = trueHDClockHeadOffset(audioStream: audioStream, audioDemuxer: audioDemuxer,
+                                                        streamIndex: sourceAudioStreamIndex, decoder: try makeDecoder())
                 #else
                 return nil
                 #endif
@@ -368,6 +442,7 @@ extension HLSVideoEngine {
             bridge = try SpatialAudioBridge(
                 srcTimeBase: audioStream.pointee.time_base, layout: layout, decoder: decoder,
                 objectOutput: source == .trueHDAtmos && APACObjectOutputSwitch.isOn)
+            bridge.setStreamClock(headOffset: clockHeadOffset)
         } catch {
             EngineLog.emit(
                 "[HLSVideoEngine] ERROR: \(source.name) rendering unavailable (\(error)); keeping the channel bridge",
@@ -388,6 +463,7 @@ extension HLSVideoEngine {
             let run = try SpatialAudioBridge(srcTimeBase: audioStream.pointee.time_base, layout: layout,
                                              decoder: try makeDecoder(), objectOutput: objectOutput,
                                              sessionLevels: levels)
+            run.setStreamClock(headOffset: clockHeadOffset)
             if watchesDecoder {
                 run.onDecoderProducedNothing = { [weak self] stats in
                     self?.handleBridgeDecodedNothing(streamIndex: streamIndex, summary: stats.summary)
