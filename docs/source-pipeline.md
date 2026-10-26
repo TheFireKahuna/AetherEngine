@@ -584,9 +584,12 @@ In order, each step replacing a reader rather than adding one:
      2. **What an overlay keeps for a unit is on disk, and its bound holds the producer.** The overlay's
         tap (`OverlayPacketTap`: the FEL enhancement layer and its composer parameters, or a software
         overlay's whole source packets) keeps every unit cut until the clock is a minute past it. Each
-        unit's packet is written once when it is cut (`SpilledPackets`: chunk files unlinked as they are
-        opened, a chunk's space back once no unit kept in it is) and read back on the decode thread
-        just before it is decoded; only the composer parameters stay in memory, a few KB a FEL unit.
+        unit, its packet and its composer parameters, is written once when it is cut (`SpilledUnits`:
+        chunk files unlinked as they are opened, a chunk's space back once no unit kept in it is) and read
+        back on the decode thread just before it is decoded, which keeps the parameters of the units it
+        feeds for the overlay; in memory a unit is its place in the stream. On the Apple TV the
+        parameters in memory, as Swift arrays, were about 40 KB a FEL unit (malloc rose 100 MB over 2400
+        units with the packets already on disk).
         The producer parks while the tap is full (12000 units, a minute behind and about seven ahead at
         24p) or while the tap's bytes and the segments' together reach the session's retention budget
         (`PrefetchDiskBudget`), never inside the ten segments AVPlayer is owed. So the tap never drops a
