@@ -3,8 +3,10 @@ import Testing
 import VideoToolbox
 @testable import AetherEngine
 
-/// AE#753: the software playback host can use VideoToolbox. Exercise the public label after
-/// both initial load and a session rebuild, rather than testing the label formatter alone.
+/// AE#753: the label names the decoder that actually runs, which is not the route's: a stream played in the
+/// software overlay over AVPlayer (the native backend) is decoded by the overlay's own decoder, VideoToolbox
+/// where it opens a hardware session. Exercise the public label after both initial load and a session rebuild,
+/// rather than testing the label formatter alone.
 /// These synthetic clips are local-only; generate them with Scripts/fetch-fixtures.sh.
 @Suite("Active video decoder identity", .serialized)
 @MainActor
@@ -30,15 +32,15 @@ struct ActiveVideoDecoderTests {
         let reader = DataIOReader(data: try Data(contentsOf: Self.fixture(name)))
         _ = try await engine.load(source: .custom(reader), options: options)
         engine.pause()
-        #expect(engine.playbackBackend == .software)
+        #expect(engine.playbackBackend == .native, "the software path is the overlay over AVPlayer")
         #expect(engine.activeVideoDecoder == label, "initial load must name the actual decoder")
 
         _ = try await engine.reloadAtCurrentPosition()
-        #expect(engine.playbackBackend == .software)
+        #expect(engine.playbackBackend == .native)
         #expect(engine.activeVideoDecoder == label, "reload must name the newly opened decoder")
     }
 
-    @Test("HEVC decoded by VideoToolbox on the software path (#753)",
+    @Test("HEVC decoded by VideoToolbox in the software overlay (#753)",
           .enabled(if: hasFixture("hdr10-hevc.mp4") && VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)),
           .timeLimit(.minutes(1)))
     func hardwareHEVC() async throws {

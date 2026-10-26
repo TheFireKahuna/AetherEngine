@@ -2547,7 +2547,12 @@ extension AetherEngine {
         // construction. What the software path cannot REPRESENT is refused before any teardown, in
         // `reloadAtCurrentPosition(applying:)`, because the guards that catch it in `load` run after
         // the routing decision and would fail a session this rebuild had already stopped.
-        let targetSoftwarePath = VideoRoutingPolicy.usesSoftwarePath(
+        //
+        // A session whose video already plays in the software overlay is on the software path as `load` routes
+        // it, the overlay over AVPlayer, and is rebuilt there (its overlay flag outlives the teardown below). Only
+        // a session whose video AVPlayer decodes is re-routed onto the software host by the preference: the
+        // escalation of a session AVPlayer refused, which must not hand AVPlayer the same video again.
+        let targetSoftwarePath = !overlayDecodesVideoWanted && VideoRoutingPolicy.usesSoftwarePath(
             routedSoftware: wasOnSoftwarePath, preferred: loadedOptions.preferredDecodePath)
         if targetSoftwarePath != wasOnSoftwarePath {
             EngineLog.emit(
@@ -2796,9 +2801,7 @@ extension AetherEngine {
                 playbackBackend = .native
                 // Publish the session's actual pick (invalid override falls back to auto; demuxed-audio resolves in side-demuxer numbering).
                 syncPublishedAudioStateFromNativeSession()
-                activeVideoDecoder = Self.videoDecoderLabel(
-                    codecID: preservedVideoCodec, isSoftware: false
-                )
+                activeVideoDecoder = nativeVideoDecoderLabel(codecID: preservedVideoCodec)
                 activeAudioDecoder = nativeVideoSession?.audioPipelineDescription
                 presentCurrentLayer()
                 // Wait for pending AVKit display-criteria handshake before resuming (first frame must not hit a mid-transition panel).
