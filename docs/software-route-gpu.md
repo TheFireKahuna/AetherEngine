@@ -693,8 +693,10 @@ about 150 pipelines) and `prewarmDualLayerDolbyVision()`, at utility priority.
 4. Done (9.5): the engine's own shaders precompiled, the A15 archive of the planned set, a prewarm at app launch.
 5. Done (5.3): grain synthesis split by role, in a pass of its own beside the field bwdif; 29% less GPU time for a
    lag-3 4:2:0 set on the M4 Pro.
-6. A queue-level residency set for the long-lived allocations (slabs, pool buffers, tables), leaving only per-batch
-   transients in each batch's set.
+6. Deferred: a queue-level residency set for the long-lived allocations (slabs, pool buffers, tables). Measured on
+   the M4 Pro, a batch's own set (a rotating 3 of 12 4K slabs, tables, textures) costs 3.9 us to commit with its
+   submission, against 2.7 us with slabs and tables in a set on the queue: about a microsecond a frame, for lifetime
+   registration in every owner of a long-lived buffer.
 7. The PiP subtitle compositor's `CIContext` replaced by a blend kernel on the layer; Sodalite's log-export QR code
    drawn on the CPU.
 8. Two long-running threads still drain no autorelease pool per iteration: the HLS segment producer's pump and the
