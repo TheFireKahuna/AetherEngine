@@ -1,3 +1,4 @@
+import QuartzCore
 import AVFoundation
 import Foundation
 import AetherLibavformat
@@ -3637,6 +3638,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 extradata: cfg.convertsAnnexBSamples ? nil : cfg.extradataOverride)
         }
         guard let decoder = sourceStillDecoder, (try? decoder.ensureOpen()) != nil else { return nil }
+        let decodeStart = CACurrentMediaTime()
+        defer { StageTimes.alongsidePlayback.record("source still decode", ms: (CACurrentMediaTime() - decodeStart) * 1000) }
         switch timeline {
         case .keyframes:
             // The keyframe at or before the target: what playing from there would show first.

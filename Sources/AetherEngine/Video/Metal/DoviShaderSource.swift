@@ -420,21 +420,24 @@ static inline void dovi_mmr_inputs(constant struct DoviMetalParams &params, uint
     c2 = dovi_clamp_to_pivots(params.poly_cr, t2, shift);
 }
 
-// Whether `curve`'s piece for t is MMR, and that piece's order (0 when it is not).
-static inline uint dovi_mmr_order(constant struct DoviPolynomialParams &curve, uint t, uint shift) {
-    if (curve.num_pivots < 2u) {
-        return 0u;
-    }
-    int piece = dovi_select_piece(curve, t, shift);
-    return curve.method[piece] == DOVI_MAPPING_MMR ? curve.order[piece] : 0u;
+// The piece of `curve` that t falls in, found once per sample and handed to everything that reads it; -1 for a curve
+// with no usable pivots (num_pivots < 2), which is identity.
+static inline int dovi_curve_piece(constant struct DoviPolynomialParams &curve, uint t, uint shift) {
+    return curve.num_pivots < 2u ? -1 : dovi_select_piece(curve, t, shift);
 }
 
-// One component's 16-bit prediction from its own value t (Q20). An MMR piece reads `tt`, the sample's MMR terms
-// (dovi_mmr_terms), formed up to at least its order. num_pivots < 2 is the parser's fail-safe for a curve it could
-// not trust, and means identity: the base layer passes through untouched (v = s << (16 - BL_bit_depth), the identity
-// polynomial's exact value).
+// Whether `curve`'s `piece` is MMR, and that piece's order (0 when it is not).
+static inline uint dovi_mmr_order(constant struct DoviPolynomialParams &curve, int piece) {
+    return piece >= 0 && curve.method[piece] == DOVI_MAPPING_MMR ? curve.order[piece] : 0u;
+}
+
+// One component's 16-bit prediction from its own value t (Q20), in `piece` (`dovi_curve_piece`). An MMR piece reads
+// `tt`, the sample's MMR terms (dovi_mmr_terms), formed up to at least its order. Piece -1, num_pivots < 2, is the
+// parser's fail-safe for a curve it could not trust, and means identity: the base layer passes through untouched
+// (v = s << (16 - BL_bit_depth), the identity polynomial's exact value).
 static inline int dovi_eval_curve(
     constant struct DoviPolynomialParams &curve,
+    int piece,
     device const int* mmr,
     uint mmr_coef_shift,
     uint t,
@@ -442,10 +445,9 @@ static inline int dovi_eval_curve(
     thread const float* ttf,
     uint shift)
 {
-    if (curve.num_pivots < 2u) {
+    if (piece < 0) {
         return int(min(t >> 4, 0xffffu));
     }
-    int piece = dovi_select_piece(curve, t, shift);
     if (curve.method[piece] == DOVI_MAPPING_MMR) {
         return dovi_eval_mmr(mmr, piece, curve.order[piece], mmr_coef_shift, tt, ttf);
     }
@@ -572,15 +574,47 @@ static inline int2 dovi_el_v_chroma(texture2d<ushort, access::read> tex, int col
 // Horizontal pass across the SIMD-group: `v` is this lane's vertical result, x this lane's output column. Output
 // column x reads y[x / 2 + k], k = -3 ... 4, which lane L = x - x0 finds at lane L / 2 + 3 + k. Every lane shuffles,
 // whichever phase it keeps.
-template <typename T>
-static inline T dovi_el_h(T v, uint x, uint lane) {
+//
+// The eight neighbours arrive as four pairs: every lane first takes its right neighbour's value beside its own (one
+// shuffle down; each value is 16 bits, so the two fit a 32-bit word, Cb and Cr a word each), then lane L / 2 + 3 + k
+// holds y[k] and y[k + 1] for k = -3, -1, 1, 3. Five shuffles where eight single values took eight (sixteen for
+// chroma's two components); every y[k] is the same value either way.
+static inline int dovi_el_h_filter(int y0, int y1, int y2, int y3, int y4, int y5, int y6, int y7) {
+    return clamp((22 * y0 + 94 * y1 - 524 * y2 + 2456 * y3 + 2456 * y4 - 524 * y5 + 94 * y6 + 22 * y7 + 2048) >> 12,
+                 0, 0xFFFF);
+}
+
+static inline int dovi_el_h(int v, uint x, uint lane) {
+    uint own = uint(v);
+    uint pair = own | (simd_shuffle_down(own, ushort(1)) << 16);
     ushort b = ushort(lane >> 1);
-    T y0 = simd_shuffle(v, b), y1 = simd_shuffle(v, ushort(b + 1)), y2 = simd_shuffle(v, ushort(b + 2));
-    T y3 = simd_shuffle(v, ushort(b + 3)), y4 = simd_shuffle(v, ushort(b + 4)), y5 = simd_shuffle(v, ushort(b + 5));
-    T y6 = simd_shuffle(v, ushort(b + 6)), y7 = simd_shuffle(v, ushort(b + 7));
-    T odd = clamp((22 * y0 + 94 * y1 - 524 * y2 + 2456 * y3 + 2456 * y4 - 524 * y5 + 94 * y6 + 22 * y7 + 2048) >> 12,
-                  T(0), T(0xFFFF));
-    return (x & 1u) == 0u ? y3 : odd;
+    uint p0 = simd_shuffle(pair, b), p1 = simd_shuffle(pair, ushort(b + 2));
+    uint p2 = simd_shuffle(pair, ushort(b + 4)), p3 = simd_shuffle(pair, ushort(b + 6));
+    if ((x & 1u) == 0u) {
+        return int(p1 >> 16);
+    }
+    return dovi_el_h_filter(int(p0 & 0xFFFFu), int(p0 >> 16), int(p1 & 0xFFFFu), int(p1 >> 16),
+                            int(p2 & 0xFFFFu), int(p2 >> 16), int(p3 & 0xFFFFu), int(p3 >> 16));
+}
+
+static inline int2 dovi_el_h(int2 v, uint x, uint lane) {
+    uint own = uint(v.x) | (uint(v.y) << 16);
+    uint2 pair = uint2(own, simd_shuffle_down(own, ushort(1)));
+    ushort b = ushort(lane >> 1);
+    uint2 p0 = simd_shuffle(pair, b), p1 = simd_shuffle(pair, ushort(b + 2));
+    uint2 p2 = simd_shuffle(pair, ushort(b + 4)), p3 = simd_shuffle(pair, ushort(b + 6));
+    if ((x & 1u) == 0u) {
+        return int2(int(p1.y & 0xFFFFu), int(p1.y >> 16));
+    }
+    int2 result;
+    for (uint c = 0u; c < 2u; ++c) {
+        uint shift = c * 16u;
+        result[c] = dovi_el_h_filter(int((p0.x >> shift) & 0xFFFFu), int((p0.y >> shift) & 0xFFFFu),
+                                     int((p1.x >> shift) & 0xFFFFu), int((p1.y >> shift) & 0xFFFFu),
+                                     int((p2.x >> shift) & 0xFFFFu), int((p2.y >> shift) & 0xFFFFu),
+                                     int((p3.x >> shift) & 0xFFFFu), int((p3.y >> shift) & 0xFFFFu));
+    }
+    return result;
 }
 
 // The upsampled EL luma code at BL pixel gid.
@@ -647,13 +681,14 @@ kernel void dovi_compose_luma(
         uint t = uint(bl_y) << shift;
         uint tt[21];
         float ttf[21];
-        uint order = dovi_mmr_order(params.poly_y, t, shift);
+        int piece = dovi_curve_piece(params.poly_y, t, shift);
+        uint order = dovi_mmr_order(params.poly_y, piece);
         if (order > 0u) {
             uint c0, c1, c2;
             dovi_mmr_inputs(params, t, uint(bl_uv.r >> 6) << shift, uint(bl_uv.g >> 6) << shift, shift, c0, c1, c2);
             dovi_mmr_terms(c0, c1, c2, order, tt, ttf);
         }
-        h = dovi_eval_curve(params.poly_y, mmr_table, params.mmr_y.coef_shift, t, tt, ttf, shift);
+        h = dovi_eval_curve(params.poly_y, piece, mmr_table, params.mmr_y.coef_shift, t, tt, ttf, shift);
     }
 
     if (residual && dovi_residual_at(params, gid.x)) {
@@ -731,7 +766,8 @@ kernel void dovi_compose_chroma(
 
     uint shift = dovi_q20_shift(params.bl_max);
     uint t0 = uint(bl_y) << shift, t1 = uint(bl_cb) << shift, t2 = uint(bl_cr) << shift;
-    uint order = max(dovi_mmr_order(params.poly_cb, t1, shift), dovi_mmr_order(params.poly_cr, t2, shift));
+    int piece_cb = dovi_curve_piece(params.poly_cb, t1, shift), piece_cr = dovi_curve_piece(params.poly_cr, t2, shift);
+    uint order = max(dovi_mmr_order(params.poly_cb, piece_cb), dovi_mmr_order(params.poly_cr, piece_cr));
     uint tt[21];
     float ttf[21];
     if (order > 0u) {
@@ -739,10 +775,10 @@ kernel void dovi_compose_chroma(
         dovi_mmr_inputs(params, t0, t1, t2, shift, c0, c1, c2);
         dovi_mmr_terms(c0, c1, c2, order, tt, ttf);
     }
-    int h_cb = dovi_eval_curve(params.poly_cb, mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE, params.mmr_cb.coef_shift,
-                               t1, tt, ttf, shift);
-    int h_cr = dovi_eval_curve(params.poly_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE, params.mmr_cr.coef_shift,
-                               t2, tt, ttf, shift);
+    int h_cb = dovi_eval_curve(params.poly_cb, piece_cb, mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE,
+                               params.mmr_cb.coef_shift, t1, tt, ttf, shift);
+    int h_cr = dovi_eval_curve(params.poly_cr, piece_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE,
+                               params.mmr_cr.coef_shift, t2, tt, ttf, shift);
 
     if (residual && dovi_residual_at(params, gid.x * 2u)) {
         if (cb_active) {

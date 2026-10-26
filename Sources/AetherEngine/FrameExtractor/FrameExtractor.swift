@@ -1,3 +1,4 @@
+import QuartzCore
 import Foundation
 import CoreGraphics
 
@@ -308,7 +309,10 @@ public actor FrameExtractor {
     private func runOnQueue<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
         await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
             decodeQueue.async {
-                continuation.resume(returning: work())
+                let start = CACurrentMediaTime()
+                let result = work()
+                StageTimes.alongsidePlayback.record("thumbnail decode", ms: (CACurrentMediaTime() - start) * 1000)
+                continuation.resume(returning: result)
             }
         }
     }
