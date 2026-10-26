@@ -17,7 +17,7 @@ struct ProducerDeterminismTests {
         var mode: AudioBridgeMode = .surroundCompat
         var delay: Double = 0
         var testDescription: String {
-            clip + (["opus.mkv", "dts.mkv", "truehd.mkv"].contains(clip) ? " \(mode)" : "")
+            clip + (["opus.mkv", "dts.mkv", "dts-drift.mkv", "truehd.mkv"].contains(clip) ? " \(mode)" : "")
                 + (delay == 0 ? "" : " delay \(delay)")
         }
     }
@@ -29,6 +29,8 @@ struct ProducerDeterminismTests {
         .init(clip: "opus.mkv"), .init(clip: "dts.mkv"), .init(clip: "dts.mkv", mode: .lossless),
         .init(clip: "truehd.mkv"), .init(clip: "truehd.mkv", mode: .lossless),
         .init(clip: "truehd.mkv", delay: 0.15), .init(clip: "aac.mkv", delay: -0.15),
+        // Timestamps up to 112 frames off their frames, drifting and snapping back (fetch-fixtures.sh).
+        .init(clip: "dts-drift.mkv"),
     ]
 
     private static func fixture(_ name: String) -> URL {
@@ -54,7 +56,7 @@ struct ProducerDeterminismTests {
         var want: [Int: Data] = [:]
         for index in 0..<count { want[index] = reference.mediaSegment(at: index) }
         try #require(want.count == count && want.values.allSatisfy { !$0.isEmpty }, "continuous playback served every segment")
-        #expect(continuous.audioBridge != nil || !["opus.mkv", "dts.mkv", "truehd.mkv"].contains(route.clip))
+        #expect(continuous.audioBridge != nil || !["opus.mkv", "dts.mkv", "dts-drift.mkv", "truehd.mkv"].contains(route.clip))
         let wantTracks = Fragments(want[1]!).tracks.count
         #expect(wantTracks == 2, "video and audio: \(wantTracks) tracks")
 

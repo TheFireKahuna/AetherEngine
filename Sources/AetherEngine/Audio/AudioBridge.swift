@@ -890,7 +890,8 @@ final class AudioBridge: @unchecked Sendable {
             grid = SourceGrid(
                 origin: SourceGrid.origin(start: sourceStart, timeBase: srcTimeBase, sampleRate: rate,
                                           initialPadding: parameters.pointee.initial_padding),
-                step: SourceGrid.lattice(codecpar: parameters, sampleRate: rate),
+                step: SourceGrid.lattice(codecpar: parameters, sampleRate: rate,
+                                         decodedFrameSamples: Int64(frame.pointee.nb_samples)),
                 tolerance: AudioContinuity.tolerance(sourceTimeBase: srcTimeBase, sampleRate: rate))
             runFrames = 0
         }

@@ -389,7 +389,8 @@ final class AudioDecoder: @unchecked Sendable {
             grid = SourceGrid(
                 origin: SourceGrid.origin(start: sourceStart, timeBase: timeBase, sampleRate: rate,
                                           initialPadding: parameters.pointee.initial_padding),
-                step: SourceGrid.lattice(codecpar: parameters, sampleRate: rate),
+                step: SourceGrid.lattice(codecpar: parameters, sampleRate: rate,
+                                         decodedFrameSamples: Int64(frame.pointee.nb_samples)),
                 tolerance: AudioContinuity.tolerance(sourceTimeBase: timeBase, sampleRate: rate))
             runFrames = 0
         }

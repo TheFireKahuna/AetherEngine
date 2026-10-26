@@ -433,6 +433,10 @@ avsync_clip pcm.mkv "$AVSYNC_STEREO" -c:a pcm_s24le
 avsync_clip truehd.mkv "$AVSYNC_51" -c:a truehd -strict -2
 avsync_clip opus.mkv "$AVSYNC_STEREO" -c:a libopus
 avsync_clip mp3.mkv "$AVSYNC_STEREO" -c:a libmp3lame
+# FFmpeg's DTS encoder delays its output by one frame (512 samples) and declares no padding, so FFmpeg's
+# own decode puts a click at 48 000 one frame late: the DTS clip's click goes in a frame early.
+AVSYNC_DTS_CLICK="if(between(n,47488,47631),0.8*sin(2*PI*1000*(n-47488)/48000),0)"
+avsync_clip dts.mkv "aevalsrc='$AVSYNC_DTS_CLICK|0|0|0|0|0':s=48000:d=4:c=5.1" -c:a dca -strict -2
 
 # AudioDecoderMemoryTests: per channel, a tone with vibrato and a slow swell, a gated harmonic, a
 # repeating chirp, gated noise bursts and a noise floor, so every band carries something that changes.
@@ -478,6 +482,17 @@ determinism_clip flac.mkv "$DET_ST" -c:a flac
 determinism_clip opus.mkv "$DET_ST" -c:a libopus -b:a 128k
 determinism_clip dts.mkv "$DET_51" -c:a dca -strict -2
 determinism_clip truehd.mkv "$DET_51" -c:a truehd -strict -2
+
+# DTS with timestamps that fall behind their frames and snap back, the way a DTS-HD MA remux in the
+# library carries them (research/dts-timing): every 60 frames, about 2 ms off at worst, the audio itself
+# continuous. Remuxed from the clips above, so the bitstream is the same and only the timestamps differ.
+echo "→ avsync/dts-drift.mkv, determinism/dts-drift.mkv (DTS, timestamps drifting off their frames)"
+DTS_DRIFT="setts=pts=PTS-round(mod(N\,60)*32/25/48000/TB):dts=DTS-round(mod(N\,60)*32/25/48000/TB)"
+dts_drift() {  # <from> <to>
+    ffmpeg -hide_banner -loglevel error -y -i "$1" -map 0 -c copy -bsf:a "$DTS_DRIFT" "$2"
+}
+dts_drift "$FIXTURES_DIR/avsync/dts.mkv" "$FIXTURES_DIR/avsync/dts-drift.mkv"
+dts_drift "$FIXTURES_DIR/determinism/dts.mkv" "$FIXTURES_DIR/determinism/dts-drift.mkv"
 
 echo ""
 echo "Done. Try:"

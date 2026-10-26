@@ -97,3 +97,92 @@ extension SourceGridTests {
         #expect(grid.place(relative: 0, estimate: 40 * 1024 + 9).0 == .position(40 * 1024))
     }
 }
+
+/// A long lattice (DTS here): a timestamp picks the frame, and noise short of half a frame never moves a run.
+extension SourceGridTests {
+    /// A DTS stream at 48 kHz from 53 ms, frame `n`'s exact position.
+    static let dtsOrigin: Int64 = 53 * 48
+    static func dtsFrame(_ n: Int64) -> Int64 { dtsOrigin + n * 512 }
+
+    /// Frame `n`'s Matroska timestamp from a remux whose timestamps fall behind their frames and snap back:
+    /// 32 frames behind per 25 frames, back every 60, then rounded to the millisecond, as measured on a
+    /// DTS-HD MA title (up to 112 frames off).
+    static func driftingTimestamp(_ n: Int64) -> Int64 {
+        let behind = (n % 60) * 32 / 25
+        let ms = (Double(dtsFrame(n) - behind) / 48).rounded()
+        return Int64(ms) * 48
+    }
+
+    @Test("timestamps that drift and snap back, up to 112 frames off, place every frame exactly and never restart")
+    func driftingTimestampsHold() {
+        var grid = SourceGrid(origin: Self.dtsOrigin, step: 512, tolerance: Self.matroska)
+        for n: Int64 in 1_845..<2_245 {
+            let (placement, restarted) = grid.place(relative: (n - 1_845) * 512, estimate: Self.driftingTimestamp(n))
+            #expect(!restarted, "frame \(n)")
+            #expect(placement == .position(Self.dtsFrame(n)), "frame \(n)")
+        }
+        // The worst measured either way still names its frame.
+        #expect(grid.place(relative: 400 * 512, estimate: Self.dtsFrame(2_245) - 112) == (.position(Self.dtsFrame(2_245)), false))
+        #expect(grid.place(relative: 401 * 512, estimate: Self.dtsFrame(2_246) + 112) == (.position(Self.dtsFrame(2_246)), false))
+    }
+
+    @Test("frames missing from the file: timestamps naming other frames move the run by whole frames, once")
+    func wholeFrameCut() {
+        var grid = SourceGrid(origin: Self.dtsOrigin, step: 512, tolerance: Self.matroska)
+        var restarts = 0
+        for i: Int64 in 0..<200 {
+            // Three frames are missing after the 100th: the decoder's count runs on, the timestamps jump.
+            let n = i < 100 ? i : i + 3
+            let (placement, restarted) = grid.place(relative: i * 512, estimate: Self.driftingTimestamp(n))
+            if restarted { restarts += 1 }
+            #expect(placement == .position(Self.dtsFrame(n)), "frame \(n)")
+        }
+        #expect(restarts == 1)
+    }
+
+    @Test("frames moved off the lattice by less than a frame, beyond the noise, take the new phase after a stretch")
+    func subFramePhaseShift() {
+        var grid = SourceGrid(origin: Self.dtsOrigin, step: 512, tolerance: Self.matroska)
+        var restartedAt: [Int64] = []
+        for n: Int64 in 0..<200 {
+            let shift: Int64 = n < 100 ? 0 : 200
+            let (placement, restarted) = grid.place(relative: n * 512, estimate: Self.dtsFrame(n) + shift)
+            if restarted { restartedAt.append(n) }
+            if n < 100 + Int64(SourceGrid.phaseShiftTimestamps) - 1 {
+                #expect(placement == .position(Self.dtsFrame(n)), "frame \(n)")
+            } else {
+                #expect(placement == .position(Self.dtsFrame(n) + 200), "frame \(n)")
+            }
+        }
+        #expect(restartedAt == [100 + Int64(SourceGrid.phaseShiftTimestamps) - 1])
+    }
+
+    @Test("a shift within the noise is absorbed: the run stays where it is")
+    func shiftWithinTheNoise() {
+        var grid = SourceGrid(origin: Self.dtsOrigin, step: 512, tolerance: Self.matroska)
+        for n: Int64 in 0..<200 {
+            let (placement, restarted) = grid.place(relative: n * 512, estimate: Self.dtsFrame(n) + (n < 100 ? 0 : 100))
+            #expect(!restarted)
+            #expect(placement == .position(Self.dtsFrame(n)))
+        }
+    }
+
+    @Test("a copied packet's timestamp names its frame within the noise on a long lattice; beyond it, it is the position")
+    func copiedPacketOnALongLattice() {
+        let point = Self.dtsFrame(1_000)
+        for error: Int64 in [-112, -96, 0, 112, 147] {
+            #expect(SourceGrid.position(estimate: point + error, origin: Self.dtsOrigin, lattice: 512, tolerance: Self.matroska) == point)
+        }
+        #expect(SourceGrid.position(estimate: point + 200, origin: Self.dtsOrigin, lattice: 512, tolerance: Self.matroska) == point + 200)
+        // E-AC-3's 256-frame block is no long lattice on Matroska: a rounded timestamp's span as before.
+        #expect(!SourceGrid.isLong(lattice: 256, tolerance: Self.matroska))
+        #expect(SourceGrid.position(estimate: 256 * 40 + 120, origin: 0, lattice: 256, tolerance: Self.matroska) == 256 * 40 + 120)
+    }
+
+    @Test("on a sample-exact container every lattice is long, TrueHD's included")
+    func sampleExactContainer() {
+        #expect(SourceGrid.isLong(lattice: 40, tolerance: 2))
+        var grid = SourceGrid(origin: 0, step: 40, tolerance: 2)
+        #expect(grid.place(relative: 0, estimate: 40 * 777 + 3) == (.position(40 * 777), false))
+    }
+}
