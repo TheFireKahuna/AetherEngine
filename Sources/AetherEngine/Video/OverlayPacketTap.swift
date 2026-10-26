@@ -1,6 +1,7 @@
 import Foundation
 import CoreMedia
 import CoreVideo
+import QuartzCore
 import AetherLibavcodec
 import AetherLibavutil
 
@@ -149,15 +150,62 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         state.unlock()
     }
 
+    /// How long the next picture may be overdue and the one before it still be shown while the decoder works
+    /// toward the clock: where a viewer starts to see picture behind sound, which is a time whatever the frame
+    /// rate. Further behind, the picture on screen is held until the decoder is back on the clock, and the next
+    /// one shown is the clock's own.
+    ///
+    /// The whole budget is the overlay's to spend: it is asked for the picture at the item time of the refresh
+    /// that will show it, the clock AVPlayer keeps against the audio output's own latency, so in step it is on
+    /// time to the refresh. The same timing makes the comparison exact in whole refreshes, at any display rate.
+    static var heldPastMs: Int64 { 45 }
+
     /// The newest decoded picture at or before `seconds` (item time), with its own time: the picture on screen
     /// then, when pictures do not follow the units one for one (a field-rate deinterlace, decimation, a cadence
-    /// retimed onto the film grid).
+    /// retimed onto the film grid). Nil while the decoder is short of the clock and the next picture has been due
+    /// for more than `heldPastMs`, measured from the first unit past the decoder's newest picture (a picture is
+    /// late from when the one after it should have replaced it, not from its own time, so the measure holds at
+    /// any frame rate): the caller keeps what it shows rather than move the picture on out of sync with the sound.
+    /// Once held, nothing is shown until no picture is overdue at all, so a decoder hovering at the limit does not
+    /// alternate held and late pictures. Where nothing lies between the decoder's newest picture and the clock (a
+    /// gap in the stream, its end) the picture is the one on screen however old, and is shown.
     func picture(atOrBefore seconds: Double) -> (picture: CVPixelBuffer, seconds: Double)? {
         let ms = Int64((seconds * 1000).rounded())
         state.lock()
-        defer { state.unlock() }
-        return decoded.filter { $0.key <= ms }.max { $0.key < $1.key }.map { ($0.value, Double($0.key) / 1000) }
+        guard let candidate = decoded.filter({ $0.key <= ms }).max(by: { $0.key < $1.key }) else {
+            state.unlock()
+            return nil
+        }
+        let newest = decoded.keys.max() ?? candidate.key
+        let overdueMs = newest < ms ? seqByPts.keys.filter({ $0 > newest && $0 <= ms }).min().map { ms - $0 } : nil
+        let behind = (overdueMs ?? 0) > (catchUp.holding ? 0 : Self.heldPastMs)
+        let note = catchUp.note(behindMs: behind ? overdueMs : nil, now: CACurrentMediaTime())
+        state.unlock()
+        if let note { EngineLog.emit("[OverlayPacketTap] \(note)", category: .swPlayback) }
+        return behind ? nil : (candidate.value, Double(candidate.key) / 1000)
     }
+
+    /// One stretch of the decoder behind the clock, from the refreshes that asked for a picture: how long the
+    /// picture was held and how far behind it got, logged when it ends.
+    private struct CatchUp {
+        var since: CFTimeInterval?
+        var peakMs: Int64 = 0
+        var holding: Bool { since != nil }
+
+        mutating func note(behindMs: Int64?, now: CFTimeInterval) -> String? {
+            if let behindMs {
+                if since == nil { since = now }
+                peakMs = Swift.max(peakMs, behindMs)
+                return nil
+            }
+            guard let start = since else { return nil }
+            defer { since = nil; peakMs = 0 }
+            return String(format: "decoder behind the clock: next picture overdue by up to %lld ms; picture held %.0f ms, then shown on the clock",
+                          peakMs, (now - start) * 1000)
+        }
+    }
+    /// Guarded by `state`.
+    private var catchUp = CatchUp()
 
     /// Whether a picture within `toleranceSeconds` of `seconds` (item time) has been decoded.
     func hasPicture(near seconds: Double, toleranceSeconds: Double) -> Bool {
@@ -227,6 +275,7 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         }
         if restart {
             decoded.removeAll()
+            catchUp = CatchUp()
             runFirstPtsMs = entry.ptsMs
             runLastPtsMs = entry.ptsMs
         }
