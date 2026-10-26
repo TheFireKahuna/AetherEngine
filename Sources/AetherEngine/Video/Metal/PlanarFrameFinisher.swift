@@ -68,6 +68,8 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         var planeAlignment: [Int]
         /// AV1 film grain on every sample read (the job carries the frame's parameters).
         var grain: Bool = false
+        /// The source is one of two pictures chosen on the GPU (``Job/passthrough``); set by the finisher per job.
+        var choosesSource: Bool = false
 
         static func == (a: Plan, b: Plan) -> Bool {
             a.specialisation == b.specialisation && a.rows == b.rows && a.cl == b.cl && a.tp == b.tp && a.tieBound == b.tieBound
@@ -79,7 +81,8 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         var specialisation: [UInt32] {
             [mode.rawValue] + outputLog2 + sourceLog2 + components.flatMap { $0 }
                 + [bigEndian ? 1 : 0, bitstream ? 1 : 0, palette ? 1 : 0, fullRange ? 1 : 0,
-                   targetBits, fractionBits, containerShift, chromaLocation, matrix, bitDepthRGB, transfer, grain ? 1 : 0]
+                   targetBits, fractionBits, containerShift, chromaLocation, matrix, bitDepthRGB, transfer, grain ? 1 : 0,
+                   choosesSource ? 1 : 0]
         }
     }
 
@@ -350,7 +353,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         if let ready = Self.pipelines.withLock({ $0[key] }) { return ready }
         let lib = try Self.library(for: device)
         let values = MTLFunctionConstantValues()
-        var boolIndices: Set<Int> = [20, 21, 22, 23, 31]
+        var boolIndices: Set<Int> = [20, 21, 22, 23, 31, 32]
         for (index, value) in plan.specialisation.enumerated() {
             if boolIndices.remove(index) != nil {
                 var flag = value != 0
@@ -399,6 +402,9 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         /// A 64-bit word written earlier in the batch (inverse telecine's decimate): the job is written when it is
         /// nonzero and dispatches nothing when it is zero, decided on the GPU.
         var kept: (buffer: MTLBuffer, offset: Int)? = nil
+        /// A second picture of the source's layout and a 32-bit word written earlier in the batch: the job reads this
+        /// picture in place of its source when the word is nonzero (inverse telecine's window passing its weave through).
+        var passthrough: (planes: Planes, chosen: (buffer: MTLBuffer, offset: Int))? = nil
     }
 
     /// The planar little-endian format holding `source`'s components at their depths and subsampling, which is what
@@ -528,6 +534,11 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     private func usesList(_ plan: Plan) -> Bool { plan.mode == .constantLuminance && plan.components[0][4] <= 12 }
 
     private func encode(_ jobs: [Job], slot: Slot, pass: ComputePass) -> Bool {
+        let jobs = jobs.map { job in
+            var chosen = job
+            chosen.plan.choosesSource = job.passthrough != nil
+            return chosen
+        }
         var sources: [Planes] = []
         var fields = 0
         for job in jobs {
@@ -589,7 +600,8 @@ final class PlanarFrameFinisher: @unchecked Sendable {
                 lists += 1
             }
             guard encodeFinish(sources[index], plan: job.plan, width: job.width, height: job.height, into: job.buffer,
-                               grain: grain, list: list, gate: gates[index], slot: slot, pass: pass) else { return false }
+                               grain: grain, list: list, gate: gates[index], passthrough: job.passthrough, slot: slot,
+                               pass: pass) else { return false }
         }
         return true
     }
@@ -633,10 +645,16 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     }
 
     /// Encodes one picture's finishing dispatches, the buffer's textures kept in the slot until the work completes.
-    /// `list` is a constant-luminance job's; `gate` the GPU's threadgroup counts for a gated job.
+    /// `list` is a constant-luminance job's; `gate` the GPU's threadgroup counts for a gated job; `passthrough` the
+    /// picture a job with a chosen source reads instead when its word says so.
     private func encodeFinish(_ planes: Planes, plan: Plan, width: Int, height: Int, into buffer: CVPixelBuffer,
                               grain: MTLBuffer, list: (counter: MTLBuffer, arguments: MTLBuffer)?, gate: MTLBuffer?,
-                              slot: Slot, pass: ComputePass) -> Bool {
+                              passthrough: (planes: Planes, chosen: (buffer: MTLBuffer, offset: Int))?, slot: Slot,
+                              pass: ComputePass) -> Bool {
+        // One layout for both pictures: the frame's offsets and linesizes serve either.
+        if let passthrough, passthrough.planes.offsets != planes.offsets || passthrough.planes.linesizes != planes.linesizes {
+            return false
+        }
         for p in 0..<4 where plan.planeAlignment[p] > 1 {
             guard planes.offsets[p] % UInt32(plan.planeAlignment[p]) == 0,
                   planes.linesizes[p] % UInt32(plan.planeAlignment[p]) == 0 else { return false }
@@ -666,6 +684,8 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         frame.withUnsafeBytes { pass.setBytes($0, index: 1) }
         pass.setBuffer(list?.counter ?? placeholder, offset: 0, index: 2)
         pass.setBuffer(grain, offset: 0, index: 5)
+        pass.setBuffer(passthrough?.planes.buffer ?? placeholder, offset: 0, index: 6)
+        pass.setBuffer(passthrough?.chosen.buffer ?? placeholder, offset: passthrough?.chosen.offset ?? 0, index: 7)
         if !plan.lumaTable.isEmpty {
             if lumaTable?.values != plan.lumaTable {
                 guard let made = device.makeBuffer(bytes: plan.lumaTable, length: 4 * plan.lumaTable.count, options: .storageModeShared)

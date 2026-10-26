@@ -148,6 +148,65 @@ struct PlanarFrameFinisherTests {
         #expect(Double(codes.filter { $0 == 513 }.count) / Double(codes.count) == 0.25)
     }
 
+    /// Words the GPU would write earlier in a batch, set here: a passthrough choice (32-bit, at 0) and decimate's kept
+    /// flag (64-bit, at 8).
+    @Test("a job reads the picture its word chooses, and a job gated off leaves its buffer as it was",
+          arguments: [(chosen: UInt32(0), kept: UInt64(1)), (1, 1), (0, 0), (1, 0)])
+    func chosenAndGated(_ words: (chosen: UInt32, kept: UInt64)) throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let allocator = try #require(DecodeFrameAllocator(device: device))
+        let finisher = try PlanarFrameFinisher(device: device)
+        let (width, height) = (64, 48)
+        /// A yuv420p picture, its luma a ramp from `base` and chroma flat, copied into a slab.
+        func picture(_ base: Int) throws -> (planes: PlanarFrameFinisher.Planes, slab: DecodeFrameAllocator.Slab) {
+            var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+            defer { av_frame_free(&frame) }
+            let f = try #require(frame)
+            f.pointee.width = Int32(width); f.pointee.height = Int32(height); f.pointee.format = AV_PIX_FMT_YUV420P.rawValue
+            try #require(av_frame_get_buffer(f, 0) >= 0)
+            for (p, h) in [(0, height), (1, height / 2), (2, height / 2)] {
+                let base8 = try #require([f.pointee.data.0, f.pointee.data.1, f.pointee.data.2][p])
+                let stride = Int([f.pointee.linesize.0, f.pointee.linesize.1, f.pointee.linesize.2][p])
+                for y in 0..<h { for x in 0..<stride { base8[y * stride + x] = UInt8(p == 0 ? (base + x + y) & 0xFF : 128) } }
+            }
+            return try #require(allocator.copy(f))
+        }
+        let source = try picture(16), passthrough = try picture(120)
+        defer { allocator.release(source.slab); allocator.release(passthrough.slab) }
+        let output = SoftwareVideoDecoder.outputFormat(pixelFormat: AV_PIX_FMT_YUV420P.rawValue, colorRange: AVCOL_RANGE_MPEG,
+                                                       streamIs10Bit: false)
+        let plan = try #require(PlanarFrameFinisher.plan(source: AV_PIX_FMT_YUV420P, output: output, sourceFullRange: false,
+                                                         chromaLocation: AVCHROMA_LOC_LEFT, matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2))
+        let word = try #require(device.makeBuffer(length: 16, options: .storageModeShared))
+        word.contents().storeBytes(of: words.chosen, toByteOffset: 0, as: UInt32.self)
+        word.contents().storeBytes(of: words.kept, toByteOffset: 8, as: UInt64.self)
+
+        let pb = try makeBuffer(output, width: width, height: height)
+        CVPixelBufferLockBaseAddress(pb, [])
+        memset(CVPixelBufferGetBaseAddressOfPlane(pb, 0), 0x5A, CVPixelBufferGetBytesPerRowOfPlane(pb, 0) * height)
+        CVPixelBufferUnlockBaseAddress(pb, [])
+        let untouched = readPlane(pb, plane: 0)
+        let done = DispatchSemaphore(value: 0)
+        let failed = OSAllocatedUnfairLock(initialState: true)
+        finisher.finish([.init(source: .picture(source.planes), plan: plan, width: width, height: height, buffer: pb,
+                               kept: (word, 8), passthrough: (passthrough.planes, (word, 0)))]) { failure in
+            failed.withLock { $0 = failure != nil }
+            done.signal()
+        }
+        done.wait()
+        #expect(!failed.withLock { $0 })
+
+        let expected = try makeBuffer(output, width: width, height: height)
+        #expect(Self.finished(finisher, words.chosen != 0 ? passthrough.planes : source.planes, plan: plan, width: width,
+                              height: height, into: expected))
+        if words.kept == 0 {
+            #expect(readPlane(pb, plane: 0) == untouched)
+        } else {
+            #expect(readPlane(pb, plane: 0) == readPlane(expected, plane: 0))
+            #expect(readPlane(pb, plane: 1) == readPlane(expected, plane: 1))
+        }
+    }
+
     // MARK: - Harness
 
     /// One picture through the finisher, waited for.

@@ -766,13 +766,14 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 guard let prepared = prepare(frame, planFormat: AVPixelFormat(rawValue: frame.pointee.format), interlaced: false)
                 else { continue }
                 // Decimate's drop is decided on the GPU in this batch; the dropped picture's finish dispatches nothing.
+                // So is the window's: a picture it passed through is read from its weave, bwdif never having written it.
                 jobs.append(.init(source: .picture(output.picture.storage.planes), plan: prepared.plan,
                                   width: Int(frame.pointee.width), height: Int(frame.pointee.height), buffer: prepared.buffer,
-                                  kept: output.kept))
+                                  kept: output.kept, passthrough: (output.passthrough.storage.planes, output.passedThrough)))
                 reportDecodedFormat(pixelBuffer: prepared.buffer)
                 films.append((takeTicket(epoch), output, SendableBuffer(value: prepared.buffer), extractHDR10PlusBytes(from: frame)))
             }
-            nonisolated(unsafe) let held = pushed.touched + pushed.outputs.map(\.picture)
+            nonisolated(unsafe) let held = pushed.touched + pushed.outputs.flatMap { [$0.picture, $0.passthrough] }
             let delivery = delivery, timeBase = ivtc.outputTimeBase
             // Read on the completion queue: the films' records (immutable from here) and the chain's results, which
             // `resolve` reads once the pass has completed.

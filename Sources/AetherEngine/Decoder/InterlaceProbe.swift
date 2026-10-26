@@ -189,7 +189,7 @@ enum InterlaceProbe {
         withExtendedLifetime(held) {}
         let out = outputs.filter { chain.resolve($0) != nil }
         let cycles = chain.cycles, duplicates = chain.cyclesWithDuplicate
-        let stillCombed = out.filter { combed($0.picture.storage.planes) }.count
+        let stillCombed = out.filter { combed(chain.shown($0).storage.planes) }.count
         if cycles >= 2, duplicates == cycles, stillCombed * 10 <= out.count { return .pulldown32 }
         return nil
     }
