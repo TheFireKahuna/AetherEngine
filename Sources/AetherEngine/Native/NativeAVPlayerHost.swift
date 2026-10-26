@@ -741,6 +741,7 @@ final class NativeAVPlayerHost {
                 case .readyToPlay:
                     self.duration = item.duration.seconds.isFinite ? item.duration.seconds : 0
                     self.isReady = true
+                    self.beginStartPrerollIfDue()
                     // Re-assert play() if the replaceCurrentItem swap swallowed it (playIntent latch).
                     if self.playIntent, self.avPlayer.timeControlStatus == .paused {
                         EngineLog.emit(
@@ -817,6 +818,7 @@ final class NativeAVPlayerHost {
                 // AE#287: swallow the pause AVPlayer takes while a premature-end recovery re-seeks.
                 if status == .paused, self.prematureEndRecoveryInFlight { return }
                 self.timeControlStatus = status
+                self.restoreAutoWaitAfterPrerolledStart(status: status)
                 self.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
                 self.startSeekLandingIfHolding()
                 // First .playing: re-sample route after 2.5s settle -- AVKit only negotiates HDMI format on playback start (issue #24).
@@ -1016,6 +1018,7 @@ final class NativeAVPlayerHost {
                 Task { @MainActor in
                     guard let self, self.sessionID == sid else { return }
                     self.mountSeekPending = false
+                    self.beginStartPrerollIfDue()
                 }
             }
         }
@@ -2011,8 +2014,128 @@ final class NativeAVPlayerHost {
     func play() {
         // Set intent before play() so readyToPlay observer can re-assert if the replaceCurrentItem swap swallowed it.
         playIntent = true
-        // Call play() immediately (no defer-until-ready): item.status never advances past .unknown until AVPlayer is told to play.
+        // Not deferred until ready: AVPlayer's own wait (automaticallyWaitsToMinimizeStalling) holds a play()
+        // over an item that is not. `startPrerolled()` is the start that waits for the pipelines instead.
+        cancelStartPreroll()
         avPlayer.play()
+    }
+
+    // MARK: - Prerolled start (docs/startup-determinism.md, step 6)
+
+    /// Where the start's preroll stands for the mounted item.
+    private enum StartPreroll {
+        case none
+        /// Asked for; begins once the item is ready and its mount seek has landed.
+        case wanted
+        case running
+        case finished(Bool)
+    }
+    private var startPreroll = StartPreroll.none
+    private var startPrerollWaiters: [CheckedContinuation<Bool, Never>] = []
+    /// Auto-wait is off for the prerolled start alone, and back on once the clock has moved or stopped.
+    private var autoWaitOffForStart = false
+
+    /// How far ahead of the call the prerolled start places the clock: Apple's own prerolled start
+    /// (AVMediaSelectionDemo, `prerollPlayersAndStartPlayback`) starts 10 ms ahead.
+    nonisolated static let prerolledStartLeadSeconds = 0.01
+
+    enum StartOutcome: Equatable {
+        /// The pipelines were primed and the clock started at a host time.
+        case prerolled
+        /// A plain play(); the reason the prerolled start did not happen.
+        case played(String)
+    }
+
+    /// The speed the item starts at: `defaultRate` (#436), 1.0 while it is unset.
+    private var startRate: Float { avPlayer.defaultRate != 0 ? avPlayer.defaultRate : 1.0 }
+
+    /// Prime the render pipelines for the start while the display switches. The preroll begins once the item
+    /// is ready and its mount seek has landed (`AVPlayer.preroll(atRate:)` requires a ready player at rate 0, and
+    /// a time change interrupts it).
+    func prerollForStart() {
+        guard case .none = startPreroll else { return }
+        startPreroll = .wanted
+        beginStartPrerollIfDue()
+    }
+
+    private func beginStartPrerollIfDue() {
+        guard case .wanted = startPreroll, isReady, !mountSeekPending, !playIntent,
+              avPlayer.status == .readyToPlay, avPlayer.rate == 0 else { return }
+        startPreroll = .running
+        let sid = sessionID
+        let begun = DispatchTime.now()
+        avPlayer.preroll(atRate: startRate) { [weak self] finished in
+            Task { @MainActor in
+                guard let self, self.sessionID == sid, case .running = self.startPreroll else { return }
+                let ms = Double(DispatchTime.now().uptimeNanoseconds - begun.uptimeNanoseconds) / 1_000_000
+                EngineLog.emit("[NativeAVPlayerHost] #\(sid) start preroll \(finished ? "finished" : "interrupted") "
+                               + "after \(String(format: "%.0f", ms)) ms", category: .engine)
+                self.startPreroll = .finished(finished)
+                self.resumeStartPrerollWaiters(finished)
+            }
+        }
+    }
+
+    private func resumeStartPrerollWaiters(_ finished: Bool) {
+        let waiters = startPrerollWaiters
+        startPrerollWaiters = []
+        waiters.forEach { $0.resume(returning: finished) }
+    }
+
+    /// Start the mounted item: at a host time over primed pipelines when the preroll finished, or with a
+    /// plain play() when it was never begun or was interrupted. A preroll still running is waited for: it ends
+    /// when the pipelines hold what the start needs, which a play() would wait for too.
+    func startPrerolled() async -> StartOutcome {
+        let finished: Bool
+        switch startPreroll {
+        case .none:
+            play()
+            return .played("no preroll asked")
+        case .wanted:
+            play()
+            return .played("item not ready at the start")
+        case .running:
+            finished = await withCheckedContinuation { startPrerollWaiters.append($0) }
+        case .finished(let value):
+            finished = value
+        }
+        startPreroll = .none
+        guard finished, isReady, avPlayer.rate == 0 else {
+            play()
+            return .played(finished ? "item changed under the preroll" : "preroll interrupted")
+        }
+        playIntent = true
+        // setRate(_:time:atHostTime:) raises while auto-wait is on. Over primed pipelines nothing is left for
+        // auto-wait to wait for, and it is back on once the clock moves (`restoreAutoWaitAfterPrerolledStart`).
+        autoWaitOffForStart = true
+        avPlayer.automaticallyWaitsToMinimizeStalling = false
+        let lead = CMTime(seconds: Self.prerolledStartLeadSeconds, preferredTimescale: 1_000_000_000)
+        avPlayer.setRate(startRate, time: .invalid,
+                         atHostTime: CMTimeAdd(CMClockGetTime(CMClockGetHostTimeClock()), lead))
+        return .prerolled
+    }
+
+    /// Auto-wait back on after a prerolled start: at the first `.playing`, or at a `.paused` the start stalled
+    /// into, which without auto-wait would stay paused; that one is restarted with auto-wait's own wait.
+    private func restoreAutoWaitAfterPrerolledStart(status: AVPlayer.TimeControlStatus) {
+        guard autoWaitOffForStart, status != .waitingToPlayAtSpecifiedRate else { return }
+        autoWaitOffForStart = false
+        avPlayer.automaticallyWaitsToMinimizeStalling = true
+        if status == .paused, playIntent {
+            EngineLog.emit("[NativeAVPlayerHost] #\(sessionID) prerolled start stopped before playing; "
+                           + "playing again with auto-wait", category: .engine)
+            avPlayer.play()
+        }
+    }
+
+    private func cancelStartPreroll() {
+        if case .running = startPreroll { avPlayer.cancelPendingPrerolls() }
+        startPreroll = .none
+        resumeStartPrerollWaiters(false)
+        if autoWaitOffForStart {
+            autoWaitOffForStart = false
+            avPlayer.automaticallyWaitsToMinimizeStalling = true
+        }
     }
 
     func pause() {
@@ -2544,6 +2667,7 @@ final class NativeAVPlayerHost {
     }
 
     private func unloadCurrentItem(inPlaceSwap: Bool = false) {
+        cancelStartPreroll()
         videoFrameTask?.cancel(); videoFrameTask = nil
         if let output = diagnosticVideoOutput { playerItem?.remove(output) }
         diagnosticVideoOutput = nil

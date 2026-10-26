@@ -48,22 +48,31 @@ struct Issue667MasterAfterSwitchTests {
             code: -11868, servedMasterIsHDR: true, displayEligibleForHDRNow: true, displaySwitchInProgress: false))
     }
 
-    /// A policy test cannot see the call site, so this one reads it: the wait sits between the route and the
-    /// serve, and re-reads the panel afterwards so the route is decided on the arrived mode.
-    @Test("The load waits for the switch before routing, then routes again")
-    func loadSiteWaitsThenReroutes() throws {
+    /// A policy test cannot see the call site, so this one reads it: the plan decides the route before the
+    /// session is built, and an unproven master's wait for the switch's end sits in the routing the session
+    /// awaits between `prepare()` and `serve`.
+    @Test("The load plans the route, and an unproven master is served after the switch ends")
+    func loadSitePlansThenWaitsBeforeServing() throws {
         let source = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("Sources/AetherEngine/AetherEngine.swift")
         let text = try #require(try? String(contentsOf: source, encoding: .utf8))
-        let gate = try #require(text.range(of: "Self.unprovenMasterAwaitsSwitchEnd("))
-        let after = text[gate.upperBound...]
+        let plan = try #require(text.range(of: "Self.plannedPanelRouting("))
+        let after = text[plan.upperBound...]
         let wait = try #require(after.range(of: "waitForSwitch(consumesRecord: false, settleCap: .awaitObservedEnd"))
-        let reroute = try #require(after.range(of: "routingPanelHDR = Self.sessionRoutesAsHDRPanel("))
-        let serve = try #require(after.range(of: "panelIsInHDRMode: routingPanelHDR"))
-        #expect(wait.lowerBound < reroute.lowerBound)
-        #expect(reroute.lowerBound < serve.lowerBound)
+        let serve = try #require(after.range(of: "resolvePanelRouting: resolvePanelRouting"))
+        #expect(wait.lowerBound < serve.lowerBound)
+    }
+
+    @Test("The plan waits for the switch only for an unproven master")
+    func planWaitsOnlyForUnprovenMaster() {
+        #expect(AetherEngine.plannedPanelRouting(
+            hostAsserts: false, provenForWrite: false, attemptWhenUnproven: true, displayEligibleForHDR: true,
+            panelRefusedHDRMaster: false, switchRequested: true) == .decided(routesAsHDR: true, waitsForSwitchEnd: true))
+        #expect(AetherEngine.plannedPanelRouting(
+            hostAsserts: false, provenForWrite: true, attemptWhenUnproven: true, displayEligibleForHDR: true,
+            panelRefusedHDRMaster: false, switchRequested: true) == .decided(routesAsHDR: true, waitsForSwitchEnd: false))
     }
 }

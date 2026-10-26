@@ -24,6 +24,10 @@ final class AtmosOutputActivator {
     private var looper: AVPlayerLooper?
     private weak var host: AVPlayer?
     private var playsAPAC: @MainActor (AVPlayerItem) -> Bool = { _ in false }
+    /// While the host is starting a programme that plays APAC: the stream plays whatever the host is doing,
+    /// because the host is paused until the start and the sink reads the link as the display switch ends,
+    /// before it.
+    private var startingUp: @MainActor () -> Bool = { false }
     /// A programme that is not an `AVPlayer` (the software host): whether it plays APAC and is paused.
     /// It has nothing to observe, so its owner calls `refresh()` when either may have changed.
     private var programme: (playsAPAC: @MainActor () -> Bool, isPaused: @MainActor () -> Bool)?
@@ -57,11 +61,14 @@ final class AtmosOutputActivator {
         #endif
     }
 
-    /// Follows `host`: its item, its audio selection and whether it is playing.
-    func attach(to host: AVPlayer, playsAPAC: @escaping @MainActor (AVPlayerItem) -> Bool) {
-        detach()
+    /// Follows `host`: its item, its audio selection and whether it is playing. While `startingUp` holds, the
+    /// stream plays through the host's paused startup and the item swap that opens it.
+    func attach(to host: AVPlayer, playsAPAC: @escaping @MainActor (AVPlayerItem) -> Bool,
+                startingUp: @escaping @MainActor () -> Bool = { false }) {
+        stopObserving()
         self.host = host
         self.playsAPAC = playsAPAC
+        self.startingUp = startingUp
         observeRoute()
         // A host play() changes timeControlStatus synchronously on the main thread, so the stream
         // starts inside that call, ahead of the APAC output.
@@ -78,15 +85,15 @@ final class AtmosOutputActivator {
     /// Follows a programme the engine plays without an `AVPlayer`: the software host, whose
     /// `AVSampleBufferAudioRenderer` sends APAC to the sink as multichannel PCM until this runs beside it.
     func attach(playsAPAC: @escaping @MainActor () -> Bool, isPaused: @escaping @MainActor () -> Bool) {
-        detach()
+        stopObserving()
         programme = (playsAPAC, isPaused)
         observeRoute()
         update()
     }
 
-    /// Re-reads an `attach(playsAPAC:isPaused:)` programme's state.
+    /// Re-reads the programme's state, or the host's startup.
     func refresh() {
-        guard programme != nil else { return }
+        guard programme != nil || host != nil else { return }
         update()
     }
 
@@ -101,14 +108,33 @@ final class AtmosOutputActivator {
     }
 
     func detach() {
+        stopObserving()
+        follow(nil)
+    }
+
+    /// Everything `detach()` drops except the stream itself, so a re-attach carries a playing stream across
+    /// to the next thing it follows instead of stopping it in between.
+    private func stopObserving() {
         observations.forEach { $0.invalidate() }
         observations = []
         if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
         routeObserver = nil
+        if let selectionObserver { NotificationCenter.default.removeObserver(selectionObserver) }
+        selectionObserver = nil
         host = nil
         programme = nil
+        startingUp = { false }
         loggedRouteVerdict = nil
-        follow(nil)
+    }
+
+    /// What the stream does beside an `AVPlayer` host: nil to release it, true to play, false to pause.
+    /// `itemPlaysAPAC` is nil while the host has no item, which during a startup is the swap to the next one.
+    nonisolated static func hostVerdict(itemPlaysAPAC: Bool?, hostPaused: Bool, startingUp: Bool) -> Bool? {
+        switch itemPlaysAPAC {
+        case false?: return nil
+        case nil: return startingUp ? true : nil
+        case true?: return !hostPaused || startingUp
+        }
     }
 
     private func follow(_ item: AVPlayerItem?) {
@@ -132,11 +158,14 @@ final class AtmosOutputActivator {
             }
             paused = programme.isPaused()
         } else {
-            guard let host, let item = host.currentItem, playsAPAC(item) else {
+            guard let host,
+                  let plays = Self.hostVerdict(itemPlaysAPAC: host.currentItem.map { playsAPAC($0) },
+                                               hostPaused: host.timeControlStatus == .paused,
+                                               startingUp: startingUp()) else {
                 release()
                 return
             }
-            paused = host.timeControlStatus == .paused
+            paused = !plays
         }
         let ports = outputPortTypes()
         let routeTakesIt = Self.routeTakesActivator(outputPortTypes: ports)
@@ -186,7 +215,13 @@ extension AetherEngine {
         if let player = currentAVPlayer {
             let activator = atmosOutputActivator ?? AtmosOutputActivator()
             atmosOutputActivator = activator
-            activator.attach(to: player) { [weak self] _ in self?.nativeVideoSession?.audioIsAPAC == true }
+            activator.attach(
+                to: player,
+                playsAPAC: { [weak self] _ in self?.nativeVideoSession?.audioIsAPAC == true },
+                // The session is built before its player is published, so it already knows what it plays.
+                startingUp: { [weak self] in
+                    self?.state == .loading && self?.nativeVideoSession?.audioIsAPAC == true
+                })
         } else if let host = softwareHost, host.audioIsAPAC {
             // The software host plays APAC through its own renderer (the Dolby Vision FEL route): followed
             // by the engine's state, which `state`'s didSet refreshes. Loading and seeking count as playing,

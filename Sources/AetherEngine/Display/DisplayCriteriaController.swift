@@ -32,13 +32,21 @@ final class DisplayCriteriaController {
 
     /// Has a criteria write ever demonstrably driven THIS display into HDR (headroom observed above 1.0)?
     ///
-    /// Deliberately never cleared, not by `reset()` and not by a switch that ends at headroom 1.0. The
+    /// Never cleared by the headroom, not by `reset()` and not by a switch that ends at headroom 1.0. The
     /// headroom collapses while HDR video is on the screen (see `panelPresentsHDR`), so its absence at
     /// exactly the moment a load asks proves nothing, and any invalidation rule built on it would re-arm
-    /// the very false negative this exists to answer. A display change cannot strand it either:
-    /// `effectiveVideoFormat` clamps to `displayCapabilities` before `apply()`, so an SDR route writes SDR
-    /// criteria and never consults the proof.
+    /// the very false negative this exists to answer. An SDR route cannot strand it either:
+    /// `effectiveVideoFormat` clamps to `displayCapabilities` before `apply()`, so it writes SDR criteria
+    /// and never consults the proof.
+    ///
+    /// Kept between launches (`PanelProof`) under the output configuration it was earned in, and forgotten
+    /// when that configuration changes or AVFoundation refuses an HDR master for the display
+    /// (`forgetPanelProof`).
     private var panelProvenToEngageHDR: Bool = false
+    private let proofStore: PanelProof.Store
+    /// The stored proof is read once per controller, on the first question that needs it.
+    private var proofRestoreAttempted = false
+    private var proofObservers: [NSObjectProtocol] = []
 
     #if os(tvOS)
     /// #339: armed at the criteria write, not when the play gate opens, so an engine-written switch is
@@ -745,7 +753,47 @@ final class DisplayCriteriaController {
         + "provenHDR=\(proven ? "yes" : "no")"
     }
 
-    init() {}
+    init(proofStore: PanelProof.Store = .userDefaults) {
+        self.proofStore = proofStore
+        #if os(tvOS)
+        // A configuration change is the one thing that ends a proof's standing; both are posted by the system.
+        let forget: @Sendable (Notification) -> Void = { [weak self] note in
+            let reason = note.name.rawValue
+            MainActor.assumeIsolated { self?.forgetPanelProof(reason: reason) }
+        }
+        proofObservers = [
+            NotificationCenter.default.addObserver(
+                forName: .AVDisplayManagerModeSwitchSettingsChanged, object: nil, queue: .main, using: forget),
+            NotificationCenter.default.addObserver(
+                forName: AVPlayer.eligibleForHDRPlaybackDidChangeNotification, object: nil, queue: .main,
+                using: forget),
+        ]
+        #endif
+    }
+
+    /// Whether the criteria in force are the engine's own HDR criteria.
+    var engineHDRCriteriaInForce: Bool {
+        Self.criteriaAttribution(didApply: didApply, lastCriteriaWasHDR: lastCriteriaWasHDR) == .engineHDR
+    }
+
+    /// Whether this display is proven to engage HDR when an engine HDR write asks it to, from this process or
+    /// from a stored proof the current configuration still stands behind.
+    func panelIsProvenToEngageHDR() -> Bool {
+        #if os(tvOS)
+        if let window = resolveWindow() { restorePanelProofIfStanding(window) }
+        #endif
+        return panelProvenToEngageHDR
+    }
+
+    /// The display refused what the proof promised, or its configuration changed: the next load asks again.
+    func forgetPanelProof(reason: String) {
+        proofRestoreAttempted = true
+        guard panelProvenToEngageHDR || proofStore.load() != nil else { return }
+        panelProvenToEngageHDR = false
+        proofStore.save(nil)
+        EngineLog.emit("[DisplayCriteria] panel proof forgotten (\(reason)); the next HDR load proves the panel again",
+                       category: .engine)
+    }
 
     /// Program AVDisplayCriteria before the session starts. `.sdr` programs a rate-only criteria so Match Frame Rate still engages. `codecTag` nil derives from format (`'dvh1'` for DV, `'hvc1'` otherwise). `omitColorExtensions` skips BT.2020 extensions for diagnostic builds. Returns `.willSwitch` when a dynamic-range switch is expected (caller should call waitForSwitch), `.applied` for an SDR rate-only write, or `.unchanged` when the criteria are already active and nothing was written (#133).
     @discardableResult
@@ -1212,6 +1260,7 @@ final class DisplayCriteriaController {
     func currentPanelIsHDR() -> Bool {
         #if os(tvOS)
         guard let window = resolveWindow() else { return false }
+        restorePanelProofIfStanding(window)
         return Self.panelPresentsHDR(
             headroomAboveOne: observeHeadroom(window.screen),
             attribution: Self.criteriaAttribution(didApply: didApply, lastCriteriaWasHDR: lastCriteriaWasHDR),
@@ -1274,10 +1323,31 @@ final class DisplayCriteriaController {
     private func observeHeadroom(_ screen: UIScreen) -> Bool {
         guard screen.currentEDRHeadroom > 1.001 else { return false }
         if !panelProvenToEngageHDR {
-            EngineLog.emit("[DisplayCriteria] panel proven to engage HDR (headroom \(String(format: "%.2f", screen.currentEDRHeadroom))); later sessions trust an accepted HDR write even after the headroom decays", category: .engine)
+            EngineLog.emit("[DisplayCriteria] panel proven to engage HDR (headroom \(String(format: "%.2f", screen.currentEDRHeadroom))); later sessions and launches trust an accepted HDR write even after the headroom decays", category: .engine)
             panelProvenToEngageHDR = true
+            proofRestoreAttempted = true
+            if let window = resolveWindow() { proofStore.save(Self.proofConfiguration(window)) }
         }
         return true
+    }
+
+    private func restorePanelProofIfStanding(_ window: UIWindow) {
+        guard !panelProvenToEngageHDR, !proofRestoreAttempted else { return }
+        proofRestoreAttempted = true
+        guard let stored = proofStore.load() else { return }
+        let current = Self.proofConfiguration(window)
+        if PanelProof.stands(stored: stored, current: current) {
+            panelProvenToEngageHDR = true
+            EngineLog.emit("[DisplayCriteria] panel proven to engage HDR by a stored proof (matching=\(current.matchingEnabled ? "on" : "off") hdrEligible=\(current.eligibleForHDR ? "yes" : "no"))", category: .engine)
+        } else {
+            proofStore.save(nil)
+            EngineLog.emit("[DisplayCriteria] stored panel proof dropped: earned under matching=\(stored.matchingEnabled ? "on" : "off") hdrEligible=\(stored.eligibleForHDR ? "yes" : "no"), the display now reports matching=\(current.matchingEnabled ? "on" : "off") hdrEligible=\(current.eligibleForHDR ? "yes" : "no")", category: .engine)
+        }
+    }
+
+    private static func proofConfiguration(_ window: UIWindow) -> PanelProof.Configuration {
+        PanelProof.Configuration(matchingEnabled: window.avDisplayManager.isDisplayCriteriaMatchingEnabled,
+                                 eligibleForHDR: AVPlayer.eligibleForHDRPlayback)
     }
     #endif
 

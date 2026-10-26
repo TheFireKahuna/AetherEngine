@@ -2966,6 +2966,11 @@ public final class AetherEngine: ObservableObject {
         masterFallbackUsed = true
         // AE#459: the display answered. Display-rejection codes only, never the -1002 parse failure.
         // AE#535: and only for an HDR master on an HDR-eligible display, or the answer is about the window.
+        // A refused HDR master is the display contradicting a proof that served it without waiting for the
+        // switch, whatever the latch below decides.
+        if MasterFallbackDecision.isDisplayRejectionCode(rejection.code), session.servedSourceIsHDR {
+            displayCriteria.forgetPanelProof(reason: "HDR master refused, code=\(rejection.code)")
+        }
         if MasterFallbackDecision.isDisplayRejectionCode(rejection.code), !Self.panelRefusedHDRMaster {
             let eligibleNow = AVPlayer.eligibleForHDRPlayback
             let switching = displayCriteria.displayModeSwitchInProgress
@@ -4591,9 +4596,9 @@ public final class AetherEngine: ObservableObject {
             // #316: this bypass returns before the probe path's registration, so a host that declared
             // sidecars at load time used to get nothing at all, silently. Seat them here instead.
             registerDeclaredExternalSubtitles(options)
-            // #361: the bypass demuxes nothing and runs no panel handshake of its own, so those
+            // #361: the bypass demuxes nothing and asks the display nothing of its own, so those
             // checkpoints are credited here rather than left for a probe that never runs.
-            recordStartupCheckpoint(.routed, generation: startupGen)
+            recordStartupCheckpoint(.displayPrepared, generation: startupGen)
             do {
                 // AE#246: a VOD playlist honors the resume anchor here the same way the AE#154 reroute
                 // does; without it a rerouted (or directly requested) VOD bypass always restarted at 0.
@@ -4919,7 +4924,7 @@ public final class AetherEngine: ObservableObject {
             loadedOptions.nativeRemoteHLS = true
             // #316: the reroute returns before the registration below, same as the direct bypass.
             registerDeclaredExternalSubtitles(loadedOptions)
-            recordStartupCheckpoint(.routed, generation: startupGen)   // #361
+            recordStartupCheckpoint(.displayPrepared, generation: startupGen)   // #361, as the direct bypass
             do {
                 try await loadRemoteHLS(url: hlsURL, options: loadedOptions, startPosition: startPosition,
                                         generation: gen)
@@ -4951,8 +4956,8 @@ public final class AetherEngine: ObservableObject {
             clock.currentTime = 0
         }
 
-        // sourceVideoFormat = what's in the file; videoFormat = what the panel shows (published after
-        // the criteria handshake; see panelHDRAfterHandshake below).
+        // sourceVideoFormat = what's in the file; videoFormat = what the panel shows (published once the
+        // display switch has ended; see readSettledPanel below).
         sourceVideoFormat = detectedFormat
         sourceDVProfile = detectedDVProfileNum
         sourceDVBLCompatID = detectedDVBLCompatIDNum
@@ -5089,9 +5094,9 @@ public final class AetherEngine: ObservableObject {
         //     (required for custom sources).
         let hasVideoStream = probeOpened && probe.videoStreamIndex >= 0
         if Self.shouldUseAudioOnlyPath(audioOnlyRequested: options.audioOnly, probeOpened: probeOpened, hasVideoStream: hasVideoStream) {
-            // #361: this path is decided before the panel handshake and never runs one, so the route
-            // checkpoint credits both.
-            recordStartupCheckpoint(.routed, generation: startupGen)
+            // #361: this path is routed here and asks the display nothing, so the display checkpoint
+            // credits both.
+            recordStartupCheckpoint(.displayPrepared, generation: startupGen)
             // The load seam preserves display criteria (#128 follow-up); an audio-only session never calls
             // apply(), so clear a criteria the previous video session left applied. The engine is a
             // process-wide singleton; without this, music playback keeps the panel in DV/HDR.
@@ -5178,202 +5183,6 @@ public final class AetherEngine: ObservableObject {
             EngineLog.emit("[AetherEngine] probe failed; falling through to the native video path (HLSVideoEngine will reopen and discover the stream) rather than degrading to audio-only", category: .engine)
         }
 
-        // 2. Display-criteria handshake. Use effective format so a non-DV panel isn't asked to switch to dvh1.
-        // #133: when apply() reports the criteria are already active (same-format zap), the panel never
-        // starts a switch, so the post-load play-gate waitForSwitch() below has nothing to settle and would
-        // otherwise burn its full ~3s cap on unobservable-DV panels. Skip it in exactly that case.
-        var criteriaUnchanged = false
-        // AE#348: the pre-flight gate of a VOD load, running beside the load instead of in front of it.
-        var preflightGate: Task<Void, Never>?
-        defer { preflightGate?.cancel() }
-        // A track that will play as APAC (TrueHD Atmos, or DTS-HD MA the probe labels DTS:X) plays with the
-        // Atmos activator on either route; started before the panel switch, so the TV's format banner after
-        // it already sees Atmos.
-        if probeOpened, resolvedInitialAudio >= 0, let par = probe.stream(at: resolvedInitialAudio)?.pointee.codecpar,
-           HLSVideoEngine.probeAnticipatesAPAC(
-               rendering: options.objectAudioRendering, codecID: par.pointee.codec_id,
-               profile: par.pointee.profile, sampleRate: par.pointee.sample_rate) {
-            anticipateAtmosOutput()
-        }
-        switch Self.loadDisplayCriteriaAction(engineWritesCriteria: options.engineWritesDisplayCriteria, audioOnlyPath: false) {
-        case .applyFresh:
-            if options.isLive { liveDisplayRange = LiveDisplayRangeLatch(openedIn: effectiveFormat, frameRate: snappedRate) }
-            let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
-            switch displayCriteria.apply(
-                format: effectiveFormat,
-                frameRate: snappedRate,
-                codecTag: codecTag,
-                omitColorExtensions: options.omitCriteriaColorExtensions
-            ) {
-            case .willSwitch:
-                // #339: consumesRecord: false, the play gate after loadNative is entitled to the same
-                // start/end timestamps; spending them here made it pay Stage 1's grace for a settled switch.
-                // AE#348: started here, at the write, so it releases exactly when it always did, but only
-                // the routing read waits for it (`settlePanelRouting`), not the segment production.
-                if Self.preflightGateRunsBesideLoad(isLive: options.isLive) {
-                    preflightGate = Task { [displayCriteria] in
-                        await displayCriteria.waitForSwitch(consumesRecord: false,
-                                                            isCurrent: { self.loadGeneration == gen })
-                    }
-                    break
-                }
-                await displayCriteria.waitForSwitch(consumesRecord: false,
-                                                    isCurrent: { self.loadGeneration == gen })
-                // Superseded during panel handshake: close local probe and unwind.
-                if loadGeneration != gen {
-                    probe.markClosed()
-                    if probeOpened {
-                        BlockingWork.detached { [probe] in probe.close() }
-                    }
-                    try checkLoadCurrent(gen)
-                }
-            case .applied:
-                break
-            case .unchanged:
-                criteriaUnchanged = true
-            }
-        case .clearStale:
-            // Suppressed host: the load seam preserved the criteria (#128 follow-up), and AVKit writes its
-            // own from the AVPlayerItem formatDescription later. Clear a leftover engine criteria now
-            // (didApply-gated no-op for hosts that always suppress) so the two writers can't fight.
-            resetDisplayCriteriaRespectingOthers()
-            // #339: AVKit's write lands inside loadNative, so the observation has to be armed before the
-            // load rather than when the play gate opens. After reset(), so a switch back to the default
-            // mode is not recorded as this session's. Audio-only loads reach clearStale too and have no
-            // panel handshake to observe.
-            if !options.engineWritesDisplayCriteria { displayCriteria.armSwitchObservation() }
-        }
-
-        // 2.5. Post-handshake panel-mode snapshot.
-        //      tvOS exposes only one combined isDisplayCriteriaMatchingEnabled toggle; no API distinguishes
-        //      Match Dynamic Range from Match Frame Rate. A user with rate-only matching reports the flag true,
-        //      host passes matchContentEnabled=true, but the panel stays SDR. The old supportsHDR gate routed
-        //      via the master playlist with VIDEO-RANGE=PQ and AVPlayer rejected -11848/-11868.
-        //
-        //      Reading currentEDRHeadroom after waitForSwitch is the only authoritative check: headroom > 1.0
-        //      means the panel accepted HDR (range matching on); == 1.0 means refused. Pass to both videoFormat
-        //      and HLSVideoEngine master-vs-media routing so they stay in step.
-        //
-        //      Suppressed-criteria hosts fall back to the caller's pre-load panelIsInHDRMode snapshot
-        //      (AVKit fires criteria later from the AVPlayerItem formatDescription).
-        //      AE#459: the host's assertion is an OR term over that readout on every platform, not just
-        //      where criteria are suppressed. The readout answers only around a dynamic-range transition,
-        //      so a panel parked in HDR never proves itself and one tvOS 27 box stopped answering at all;
-        //      a host that knows better says so, and a wrong claim costs the -11848 fallback, not the item.
-        var criteriaPanelReadout: Bool?
-        var panelHDRAfterHandshake = false
-        var routingPanelHDR = false
-        var panelRoutingSettled = false
-        // AE#348: everything from here to `.displayPrepared` reads the settled panel. With the pre-flight
-        // gate running beside the load it runs where the route is chosen, after the session has started
-        // producing segments; otherwise right here, as before. `ownsProbe` is false once the probe has
-        // been handed to the native session, which then closes it.
-        func settlePanelRouting(ownsProbe: Bool) async throws {
-            panelRoutingSettled = true
-            if let gate = preflightGate {
-                preflightGate = nil
-                await gate.value
-                if loadGeneration != gen {
-                    if ownsProbe {
-                        probe.markClosed()
-                        if probeOpened {
-                            BlockingWork.detached { [probe] in probe.close() }
-                        }
-                    }
-                    try checkLoadCurrent(gen)
-                }
-            }
-            criteriaPanelReadout =
-                options.awaitsInboundCriteriaWrite ? nil : displayCriteria.currentPanelIsHDR()
-            panelHDRAfterHandshake = Self.sessionPanelPresentsHDR(
-                hostAsserts: options.panelIsInHDRMode, criteriaReadout: criteriaPanelReadout)
-            // AE#459: the ROUTE may assume more than the LABEL may claim. `panelHDRAfterHandshake` stays the
-            // label's answer, conservative by design; the route additionally offers an unproven but
-            // HDR-eligible display the master and lets AVFoundation's acceptance be the readout `UIScreen`
-            // has been measured getting wrong on a panel that was demonstrably presenting HDR. Live is excluded: its fallback is a rejoin at
-            // the edge rather than a restored position, and that cost has not been measured.
-            routingPanelHDR = Self.sessionRoutesAsHDRPanel(
-                panelPresentsHDR: panelHDRAfterHandshake,
-                attemptWhenUnproven: options.attemptsHDRMasterOnUnprovenPanel && !options.isLive,
-                displayEligibleForHDR: observedDisplayCaps.supportsHDR,
-                panelRefusedHDRMaster: Self.panelRefusedHDRMaster)
-            // AE#667: that acceptance only answers once the panel has arrived. See `unprovenMasterAwaitsSwitchEnd`.
-            if Self.unprovenMasterAwaitsSwitchEnd(
-                routesAsHDR: routingPanelHDR,
-                panelPresentsHDR: panelHDRAfterHandshake,
-                switchRunning: displayCriteria.observedSwitchIsRunning()) {
-                EngineLog.emit(
-                    "[DisplayCriteria] unproven HDR master waits for the running switch to end before it is "
-                    + "served (#667)",
-                    category: .session)
-                await displayCriteria.waitForSwitch(consumesRecord: false, settleCap: .awaitObservedEnd,
-                                                    isCurrent: { self.loadGeneration == gen })
-                if loadGeneration != gen {
-                    if ownsProbe {
-                        probe.markClosed()
-                        if probeOpened {
-                            BlockingWork.detached { [probe] in probe.close() }
-                        }
-                    }
-                    try checkLoadCurrent(gen)
-                }
-                criteriaPanelReadout = options.awaitsInboundCriteriaWrite ? nil : displayCriteria.currentPanelIsHDR()
-                panelHDRAfterHandshake = Self.sessionPanelPresentsHDR(
-                    hostAsserts: options.panelIsInHDRMode, criteriaReadout: criteriaPanelReadout)
-                routingPanelHDR = Self.sessionRoutesAsHDRPanel(
-                    panelPresentsHDR: panelHDRAfterHandshake,
-                    attemptWhenUnproven: options.attemptsHDRMasterOnUnprovenPanel && !options.isLive,
-                    displayEligibleForHDR: observedDisplayCaps.supportsHDR,
-                    panelRefusedHDRMaster: Self.panelRefusedHDRMaster)
-            }
-            sessionPanelHDRReadout = criteriaPanelReadout
-            sessionObservedDisplayCaps = observedDisplayCaps
-            if routingPanelHDR != panelHDRAfterHandshake {
-                EngineLog.emit(
-                    "[DisplayCriteria] panel unproven but HDR-eligible: serving the master and letting "
-                    + "AVPlayer answer (refusal costs one in-place media fallback)",
-                    category: .session)
-            }
-
-            // Only when an assertion actually claims something: a line that fires on every load stops being
-            // read, and this one has to be legible next to the rejection a wrong claim can produce.
-            if options.panelIsInHDRMode || options.panelPresentsDolbyVision {
-                EngineLog.emit(
-                    "[DisplayCriteria] host assertion in force: panelIsInHDRMode="
-                    + "\(options.panelIsInHDRMode) panelPresentsDolbyVision=\(options.panelPresentsDolbyVision)"
-                    + " (observed: panelReadout="
-                    + (criteriaPanelReadout.map { "\($0)" } ?? "suppressed")
-                    + " supportsDolbyVision=\(observedDisplayCaps.supportsDolbyVision))",
-                    category: .session)
-            }
-            #if os(iOS) || os(macOS)
-            // The iPhone built-in display has no HDMI Match-Content handshake; it renders HDR/DV natively
-            // whenever the system reports it eligible. effectiveFormat is already clamped to displayCapabilities
-            // (the same signal that drives the served DV/HDR stream), so publish it directly. Gating on
-            // panelHDRAfterHandshake (false on iOS, kept for media-playlist routing) wrongly relabelled every
-            // HDR/DV title as SDR in Stats for Nerds.
-            //
-            // AE#493: macOS belongs on this branch for the same reason and was on the tvOS one. It composites
-            // EDR per window with no display mode switch, so there is no handshake to read and
-            // `currentPanelIsHDR()` is a hard `false` off tvOS, which labelled every HDR title on an XDR
-            // display SDR. `panelIsInHDRMode` is not the fix there: the panel-mode question is the tvOS
-            // question, and asking it of a window is the wrong question.
-            videoFormat = effectiveFormat
-            #else
-            videoFormat = Self.presentedVideoFormat(
-                effectiveFormat: effectiveFormat,
-                panelPresentsHDR: panelHDRAfterHandshake,
-                sourceCarriesHDR10Plus: sourceCarriesHDR10PlusMetadata)
-            #endif
-            // #361: the handshake above is the second stretch a host cannot see, and on a real SDR->HDR
-            // switch it is seconds long. Recorded on every branch, including the ones with nothing to
-            // wait for, so a suppressed-criteria host advances here too.
-            recordStartupCheckpoint(.displayPrepared, generation: startupGen)
-        }
-        if preflightGate == nil {
-            try await settlePanelRouting(ownsProbe: true)
-        }
-
         // 3. Dispatch by codec.
         //    Native: HEVC/H.264 (unconditional) and AV1 on platforms with HW decode (iOS 17+/macOS 14+).
         //    That list is exactly what HLSVideoEngine accepts; everything else it refuses with
@@ -5438,16 +5247,6 @@ public final class AetherEngine: ObservableObject {
         // to the strict verdict below and would stay native for that reason alone. When the dual-layer
         // route is wanted, complete the probe's record from the head of the stream first; the session
         // reuses this demuxer, so the software host and its decoders see the completed record too.
-        // AE#348: the dual-layer probes below open a VideoToolbox session, which is decode work the serial
-        // order never ran mid-switch. A source that may take that route settles the panel first.
-        if !panelRoutingSettled, VideoRoutingPolicy.dualLayerRouteIsWanted(
-               codecID: detectedCodecID,
-               dvProfile: detectedDVProfileNum,
-               dolbyVisionHandling: options.dolbyVisionHandling,
-               preferDualLayerDolbyVision: composesDualLayers,
-               canHardwareDecode: nil) {
-            try await settlePanelRouting(ownsProbe: true)
-        }
         if probeOpened, probe.videoStreamIndex >= 0, !options.isLive, probe.isSourceSeekable,
            VideoRoutingPolicy.dualLayerRouteIsWanted(
                codecID: detectedCodecID,
@@ -5608,25 +5407,14 @@ public final class AetherEngine: ObservableObject {
            let vStream = probe.stream(at: probe.videoStreamIndex),
            let codecpar = vStream.pointee.codecpar {
             let dvProfile = Self.dvProfile(stream: vStream)
-            let forcesSoftware = {
-                VideoRoutingPolicy.forcesSoftwareForUndecodableFormat(
+            if VideoRoutingPolicy.forcesSoftwareForUndecodableFormat(
                    codecID: detectedCodecID,
                    // A Profile 5 record served as its base layer plays as plain HEVC, which is what
                    // the raw-hvcC probe judges; the exemption is for the dvh1 route it is not on.
                    // AE#532: a record the RPU corrected is not on that route either, and its base layer
                    // is standard Main10, so the gate judges it the way it judges any Profile 7 / 8.
                    dvProfile: presentsDolbyVisionBaseLayer ? nil : (correctedDVProfile ?? dvProfile),
-                   canHardwareDecode: { VTCapabilityProbe.canHardwareDecode(codecpar: codecpar) })
-            }
-            var routesSoftware = forcesSoftware()
-            // AE#348: with the pre-flight gate beside the load, this probe's throwaway session can open while
-            // the panel switches, which the serial order never did. Only a refusal changes the route, so a
-            // refusal taken then is asked again once the panel has settled, where the serial order asked it.
-            if routesSoftware, !panelRoutingSettled {
-                try await settlePanelRouting(ownsProbe: true)
-                routesSoftware = forcesSoftware()
-            }
-            if routesSoftware {
+                   canHardwareDecode: { VTCapabilityProbe.canHardwareDecode(codecpar: codecpar) }) {
                 useSoftwarePath = true
                 EngineLog.emit(
                     "[AetherEngine] codec=\(detectedCodecID.rawValue) not hardware-decodable by "
@@ -5755,6 +5543,216 @@ public final class AetherEngine: ObservableObject {
             EngineLog.emit("[AetherEngine] video plays in the software overlay over an AVPlayer placeholder "
                            + "(codec=\(detectedCodecID.rawValue))", category: .engine)
         }
+        // 4. The output plan, then the display (docs/startup-determinism.md, steps 2 and 3). Everything the
+        // display and the session are told is decided above, from the probe, so nothing below runs a
+        // VideoToolbox session or reads a packet while the panel switches, and the master-or-media answer is
+        // fixed before the session is built.
+        //
+        // The criteria use the effective format, so a non-DV panel isn't asked to switch to dvh1.
+        // #133: when apply() reports the criteria are already active (same-format zap), the panel never
+        // starts a switch, so the post-load play-gate waitForSwitch() below has nothing to settle and would
+        // otherwise burn its full ~3s cap on unobservable-DV panels. Skip it in exactly that case.
+        var criteriaUnchanged = false
+        var criteriaRequestedSwitch = false
+        // AE#348: the pre-flight gate of a VOD load whose plan leaves the panel answer to the settled panel,
+        // running beside the load instead of in front of it.
+        var preflightGate: Task<Void, Never>?
+        defer { preflightGate?.cancel() }
+        // A track that will play as APAC (TrueHD Atmos, or DTS-HD MA the probe labels DTS:X) plays with the
+        // Atmos activator; started before the panel switch, so the TV's format banner after it already sees
+        // Atmos, and held through the startup (`followAtmosOutput`).
+        if probeOpened, resolvedInitialAudio >= 0, let par = probe.stream(at: resolvedInitialAudio)?.pointee.codecpar,
+           HLSVideoEngine.probeAnticipatesAPAC(
+               rendering: options.objectAudioRendering, codecID: par.pointee.codec_id,
+               profile: par.pointee.profile, sampleRate: par.pointee.sample_rate) {
+            anticipateAtmosOutput()
+        }
+        switch Self.loadDisplayCriteriaAction(engineWritesCriteria: options.engineWritesDisplayCriteria, audioOnlyPath: false) {
+        case .applyFresh:
+            if options.isLive { liveDisplayRange = LiveDisplayRangeLatch(openedIn: effectiveFormat, frameRate: snappedRate) }
+            let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
+            switch displayCriteria.apply(
+                format: effectiveFormat,
+                frameRate: snappedRate,
+                codecTag: codecTag,
+                omitColorExtensions: options.omitCriteriaColorExtensions
+            ) {
+            case .willSwitch:
+                criteriaRequestedSwitch = true
+                // A live zap waits for the panel here, in front of the session, as it always has.
+                if !Self.preflightGateRunsBesideLoad(isLive: options.isLive) {
+                    await displayCriteria.waitForSwitch(consumesRecord: false,
+                                                        isCurrent: { self.loadGeneration == gen })
+                    // Superseded during panel handshake: close local probe and unwind.
+                    if loadGeneration != gen {
+                        probe.markClosed()
+                        if probeOpened {
+                            BlockingWork.detached { [probe] in probe.close() }
+                        }
+                        try checkLoadCurrent(gen)
+                    }
+                }
+            case .applied:
+                break
+            case .unchanged:
+                criteriaUnchanged = true
+            }
+        case .clearStale:
+            // Suppressed host: the load seam preserved the criteria (#128 follow-up), and AVKit writes its
+            // own from the AVPlayerItem formatDescription later. Clear a leftover engine criteria now
+            // (didApply-gated no-op for hosts that always suppress) so the two writers can't fight.
+            resetDisplayCriteriaRespectingOthers()
+            // #339: AVKit's write lands inside loadNative, so the observation has to be armed before the
+            // load rather than when the play gate opens. After reset(), so a switch back to the default
+            // mode is not recorded as this session's. Audio-only loads reach clearStale too and have no
+            // panel handshake to observe.
+            if !options.engineWritesDisplayCriteria { displayCriteria.armSwitchObservation() }
+        }
+        // #361: the display has been asked for this session's output (or the path asks it nothing). The switch
+        // itself runs beside the session from here and is waited for before the start.
+        recordStartupCheckpoint(.displayPrepared, generation: startupGen)
+
+        // The panel's readout, for the label and the reload route (`sessionPanelHDRReadout`).
+        //      tvOS exposes only one combined isDisplayCriteriaMatchingEnabled toggle; no API distinguishes
+        //      Match Dynamic Range from Match Frame Rate. A user with rate-only matching reports the flag true,
+        //      host passes matchContentEnabled=true, but the panel stays SDR. The old supportsHDR gate routed
+        //      via the master playlist with VIDEO-RANGE=PQ and AVPlayer rejected -11848/-11868.
+        //
+        //      Reading currentEDRHeadroom once the switch has ended is the only authoritative check: headroom
+        //      > 1.0 means the panel accepted HDR (range matching on); == 1.0 means refused.
+        //
+        //      Suppressed-criteria hosts fall back to the caller's pre-load panelIsInHDRMode snapshot
+        //      (AVKit fires criteria later from the AVPlayerItem formatDescription).
+        //      AE#459: the host's assertion is an OR term over that readout on every platform, not just
+        //      where criteria are suppressed. The readout answers only around a dynamic-range transition,
+        //      so a panel parked in HDR never proves itself and one tvOS 27 box stopped answering at all;
+        //      a host that knows better says so, and a wrong claim costs the -11848 fallback, not the item.
+        var criteriaPanelReadout: Bool?
+        var panelHDRAfterHandshake = false
+        var panelReadoutTaken = false
+        func readSettledPanel() {
+            panelReadoutTaken = true
+            criteriaPanelReadout =
+                options.awaitsInboundCriteriaWrite ? nil : displayCriteria.currentPanelIsHDR()
+            panelHDRAfterHandshake = Self.sessionPanelPresentsHDR(
+                hostAsserts: options.panelIsInHDRMode, criteriaReadout: criteriaPanelReadout)
+            sessionPanelHDRReadout = criteriaPanelReadout
+            sessionObservedDisplayCaps = observedDisplayCaps
+            // Only when an assertion actually claims something: a line that fires on every load stops being
+            // read, and this one has to be legible next to the rejection a wrong claim can produce.
+            if options.panelIsInHDRMode || options.panelPresentsDolbyVision {
+                EngineLog.emit(
+                    "[DisplayCriteria] host assertion in force: panelIsInHDRMode="
+                    + "\(options.panelIsInHDRMode) panelPresentsDolbyVision=\(options.panelPresentsDolbyVision)"
+                    + " (observed: panelReadout="
+                    + (criteriaPanelReadout.map { "\($0)" } ?? "suppressed")
+                    + " supportsDolbyVision=\(observedDisplayCaps.supportsDolbyVision))",
+                    category: .session)
+            }
+            #if os(iOS) || os(macOS)
+            // The iPhone built-in display has no HDMI Match-Content handshake; it renders HDR/DV natively
+            // whenever the system reports it eligible. effectiveFormat is already clamped to displayCapabilities
+            // (the same signal that drives the served DV/HDR stream), so publish it directly. Gating on
+            // panelHDRAfterHandshake (false on iOS, kept for media-playlist routing) wrongly relabelled every
+            // HDR/DV title as SDR in Stats for Nerds.
+            //
+            // AE#493: macOS belongs on this branch for the same reason and was on the tvOS one. It composites
+            // EDR per window with no display mode switch, so there is no handshake to read and
+            // `currentPanelIsHDR()` is a hard `false` off tvOS, which labelled every HDR title on an XDR
+            // display SDR. `panelIsInHDRMode` is not the fix there: the panel-mode question is the tvOS
+            // question, and asking it of a window is the wrong question.
+            videoFormat = effectiveFormat
+            #else
+            videoFormat = Self.presentedVideoFormat(
+                effectiveFormat: effectiveFormat,
+                panelPresentsHDR: panelHDRAfterHandshake,
+                sourceCarriesHDR10Plus: sourceCarriesHDR10PlusMetadata)
+            #endif
+            // An item that already reported its sample entry keeps the upgrade it earned (#515).
+            if let itemFormat = nativeHost?.detectedVideoFormat { applyDolbyVisionLabelUpgrade(itemFormat: itemFormat) }
+        }
+
+        // AE#459: the ROUTE may assume more than the LABEL may claim. The label stays conservative; the route
+        // offers an unproven but HDR-eligible display the master and lets AVFoundation's acceptance be the
+        // readout `UIScreen` has been measured getting wrong on a panel that was demonstrably presenting HDR.
+        // Live is excluded: its fallback is a rejoin at the edge rather than a restored position, and that
+        // cost has not been measured.
+        let attemptWhenUnproven = options.attemptsHDRMasterOnUnprovenPanel && !options.isLive
+        let provenForWrite = !options.awaitsInboundCriteriaWrite && displayCriteria.engineHDRCriteriaInForce
+            && displayCriteria.panelIsProvenToEngageHDR()
+        var routingPanelHDR = false
+        var plannedPanelIsInHDRMode: Bool?
+        var resolvePanelRouting: (() async throws -> Bool)?
+        switch Self.plannedPanelRouting(
+            hostAsserts: options.panelIsInHDRMode,
+            provenForWrite: provenForWrite,
+            attemptWhenUnproven: attemptWhenUnproven,
+            displayEligibleForHDR: observedDisplayCaps.supportsHDR,
+            panelRefusedHDRMaster: Self.panelRefusedHDRMaster,
+            switchRequested: criteriaRequestedSwitch && Self.preflightGateRunsBesideLoad(isLive: options.isLive)) {
+        case .decided(let routesAsHDR, let waitsForSwitchEnd):
+            routingPanelHDR = routesAsHDR
+            plannedPanelIsInHDRMode = routesAsHDR
+            if routesAsHDR, !(options.panelIsInHDRMode || provenForWrite) {
+                EngineLog.emit(
+                    "[DisplayCriteria] panel unproven but HDR-eligible: serving the master and letting "
+                    + "AVPlayer answer (refusal costs one in-place media fallback)",
+                    category: .session)
+            }
+            // AE#667: AVPlayer answers an unproven master for the mode the panel is in NOW, so it is handed
+            // the master once the switch has ended. The session is prepared meanwhile.
+            if waitsForSwitchEnd {
+                resolvePanelRouting = { [displayCriteria] in
+                    EngineLog.emit(
+                        "[DisplayCriteria] unproven HDR master waits for the switch to end before it is "
+                        + "served (#667)",
+                        category: .session)
+                    await displayCriteria.waitForSwitch(consumesRecord: false, settleCap: .awaitObservedEnd,
+                                                        isCurrent: { self.loadGeneration == gen })
+                    try self.checkLoadCurrent(gen)
+                    return routesAsHDR
+                }
+            }
+        case .atSettledPanel:
+            // The settled panel answers: after the pre-flight gate for VOD, which runs beside the session's
+            // preparation, or now for a live zap, whose gate ran in front of it.
+            func settleRouting(ownsProbe: Bool) async throws {
+                if let gate = preflightGate {
+                    preflightGate = nil
+                    await gate.value
+                    if loadGeneration != gen {
+                        if ownsProbe {
+                            probe.markClosed()
+                            if probeOpened {
+                                BlockingWork.detached { [probe] in probe.close() }
+                            }
+                        }
+                        try checkLoadCurrent(gen)
+                    }
+                }
+                readSettledPanel()
+                routingPanelHDR = Self.sessionRoutesAsHDRPanel(
+                    panelPresentsHDR: panelHDRAfterHandshake,
+                    attemptWhenUnproven: attemptWhenUnproven,
+                    displayEligibleForHDR: observedDisplayCaps.supportsHDR,
+                    panelRefusedHDRMaster: Self.panelRefusedHDRMaster)
+            }
+            if criteriaRequestedSwitch, Self.preflightGateRunsBesideLoad(isLive: options.isLive) {
+                // #339: consumesRecord: false, the play gate after loadNative is entitled to the same
+                // start/end timestamps; spending them here made it pay Stage 1's grace for a settled switch.
+                preflightGate = Task { [displayCriteria] in
+                    await displayCriteria.waitForSwitch(consumesRecord: false,
+                                                        isCurrent: { self.loadGeneration == gen })
+                }
+                resolvePanelRouting = {
+                    try await settleRouting(ownsProbe: false)
+                    return routingPanelHDR
+                }
+            } else {
+                try await settleRouting(ownsProbe: true)
+            }
+        }
+
         do {
             // Native path: pass the probe Demuxer to loadNative so HLSVideoEngine.start() skips
             // avformat_open_input + find_stream_info (~1-3 s saved on slow CDN). The cue prewarm
@@ -5783,10 +5781,8 @@ public final class AetherEngine: ObservableObject {
                 liveRejoin: options.isLiveRejoin,
                 preopenedDemuxer: probeOpened ? probe : nil,
                 generation: gen,
-                resolvePanelRouting: panelRoutingSettled ? nil : {
-                    try await settlePanelRouting(ownsProbe: false)
-                    return routingPanelHDR
-                }
+                plannedPanelIsInHDRMode: plannedPanelIsInHDRMode,
+                resolvePanelRouting: resolvePanelRouting
             )
             playbackBackend = .native
             activeVideoDecoder = nativeVideoDecoderLabel(codecID: detectedCodecID)
@@ -5796,6 +5792,11 @@ public final class AetherEngine: ObservableObject {
             // demuxed-audio sources). Without this a post-load language check would reload the track already playing.
             syncPublishedAudioStateFromNativeSession()
             presentCurrentLayer()
+            // The start's preroll runs while the display switches (docs/startup-determinism.md, step 4).
+            let startsPrerolled = Self.loadStartsPrerolled(
+                autostart: Self.loadPerformsAutostart(options), isLive: options.isLive,
+                readinessGateRuns: airPlayServedMasterToReceiver)
+            if startsPrerolled { nativeHost?.prerollForStart() }
             // Gate play() on panel handshake. With appliesPreferredDisplayCriteriaAutomatically=true,
             // AVKit drives the criteria write from the live AVPlayerItem's formatDescription (reads dvcC
             // via private CoreMedia hooks). waitForSwitch Stage 1 gives AVKit time to fire that write;
@@ -5821,6 +5822,8 @@ public final class AetherEngine: ObservableObject {
                 settleCap: options.isLive ? .standard : .awaitObservedEnd,
                 isCurrent: { self.loadGeneration == gen })
             try checkLoadCurrent(gen)
+            // The switch has ended: what the panel presents now is what the label states.
+            if !panelReadoutTaken { readSettledPanel() }
             // automaticallyWaitsToMinimizeStalling=true (default) handles play-before-ready.
             // A local start is a plain play(): a start that fails surfaces through the host's startup
             // path as a failure, and nothing changes the served format behind the criteria already
@@ -5840,6 +5843,18 @@ public final class AetherEngine: ObservableObject {
                    session.servingMasterPlaylist, !options.isLive {
                     try await runStartupReadinessGate(
                         session: session, position: startPosition ?? 0, gen: gen)
+                } else if startsPrerolled, let host = nativeHost {
+                    // One start, on both events: the switch has ended (the gate above) and the pipelines are
+                    // primed. Picture and programme audio start together at a host time the engine chose.
+                    switch await host.startPrerolled() {
+                    case .prerolled:
+                        EngineLog.emit("[AetherEngine] start: prerolled, the clock starts "
+                                       + "\(String(format: "%.0f", NativeAVPlayerHost.prerolledStartLeadSeconds * 1000)) ms "
+                                       + "ahead of the call", category: .engine)
+                    case .played(let reason):
+                        EngineLog.emit("[AetherEngine] start: play() (\(reason))", category: .engine)
+                    }
+                    try checkLoadCurrent(gen)
                 } else {
                     nativeHost?.play()
                 }

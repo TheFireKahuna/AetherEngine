@@ -133,7 +133,7 @@ struct MasterFallbackPositionTests {
             .appendingPathComponent("Sources/AetherEngine/AetherEngine.swift")
         let text = try #require(try? String(contentsOf: source, encoding: .utf8))
         let fn = try #require(text.range(of: "func fallBackToMediaPlaylist("))
-        let body = String(text[fn.lowerBound...].prefix(4000))
+        let body = String(text[fn.lowerBound...].prefix(6000))
         #expect(body.contains("host.mountedStartPosition"))
     }
 }

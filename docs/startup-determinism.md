@@ -1,7 +1,8 @@
 # Deterministic startup
 
-Status: proposal, revised 2026-10-24 against the code on `feat/fel-apac` and the tvOS 27.2 SDK
-(Xcode 27.2, 27B5038j). The readiness gate change (step 7 of the order of work) and part of step 1 are done.
+Status: built 2026-10-26 on `research/12bit-fel` against the tvOS 27.2 SDK (Xcode 27.2, 27B5038j), every video
+title on the native route (the software overlay and the FEL overlay over AVPlayer). Not yet measured on the
+device; see "On the device".
 
 ## Why
 
@@ -17,61 +18,6 @@ The same title, on the same Apple TV, starts differently from one load to the ne
 The work was the same each time. The outcome changed because unrelated things changed speed, and the safety
 timers turned "slow" into a different route. A step should begin when its inputs exist, each input should be
 produced before the step that needs it, and timers should only detect failure.
-
-## Today's startup, as the code runs it
-
-Paths are under `Sources/AetherEngine/`. Times are from the 06:14 load, seconds from `load()`.
-
-| When | What | Where |
-|---|---|---|
-| 0.00 | `dispatched`; previous session torn down | `AetherEngine.swift:4362`, `:4386` |
-| 0.03 to 0.10 | `sourceOpened`, `containerOpened`, `streamsProbed` from the probe's open progress | `AetherEngine.swift:4659` |
-| 0.10 | P5 RPU audit, display capabilities composed once, `effectiveFormat` clamped to them | `:4615`, `:4716`, `:4748` |
-| 0.12 | Atmos activator started in programme mode (plays while `state == .loading`) for TrueHD Atmos and DTS-HD MA labelled DTS:X | `:5110`, `AtmosOutputActivator.swift:217` |
-| 0.12 | criteria written: `effectiveFormat`, `snappedRate`, `dvh1` if Dolby Vision. Nothing about the route, the variant or the refusal latch goes in | `:5116`, `DisplayCriteriaController.swift:752` |
-| 0.12 | pre-flight gate started beside the load (`preflightGateRunsBesideLoad`, VOD) | `:5130` |
-| 0.1 to 2.2 | routing: interlace and SPS checks, MVC, dual-layer/FEL decision (reads up to 256 packets for the EL type), VideoToolbox capability probe (a throwaway hardware `VTDecompressionSession`) | `:5313` to `:5561` |
-| 2.21 | `displayPrepared`: `settlePanelRouting` waits for the pre-flight gate, which releases at the **2 s cap** (`stage2CapMs`) mid-switch, then reads the panel (`currentPanelIsHDR`) | `:5188`, `DisplayCriteriaController.swift:134`, `:1167` |
-| 2.30 | `routed` | `:5643` |
-| 2.3 | `HLSVideoEngine.start()` / `prepare()` builds the plan and the server and starts the producer, which cuts ahead (default 10 segments); `serve(panelIsInHDRMode:)` picks master or media playlist | `AetherEngine+Loading.swift:1372`, `HLSVideoEngine.swift:2406`, `:2420` |
-| 2.3 | indexed subtitle fill and sidecar fill start (12 lanes through `HTTPDiscIOReader`, outside `OriginRequestBudget`) | `Loading.swift:1445`, `:1447` |
-| 2.3 | `currentAVPlayer` assigned: the activator re-attaches to the AVPlayer and, since the player is paused, **pauses the silent Atmos stream** | `Loading.swift:1497`, `AtmosOutputActivator.swift:139`, `:154` |
-| 2.39 | `sessionConstructed`; `AVPlayerItem` created, `replaceCurrentItem`, mount seek | `Loading.swift:1943`, `NativeAVPlayerHost.swift:582`, `:921`, `:974` |
-| ~3.0 | item `readyToPlay`, layer `isReadyForDisplay` (about 0.6 s after the item, **without `play()`**) | 2026-10-22 logs |
-| 3.08 | `modeSwitchEnd`; the play gate (`waitForSwitch(.awaitObservedEnd)`, 6 s budget) releases; `play()`; the activator resumes | `AetherEngine.swift:5801`, `:5833` |
-| 3.56 | `ready`, `presenting` | `Loading.swift:241`, `:124` |
-
-Three different gates touch the switch: the pre-flight (2 s cap), the #667 wait for an unproven HDR master, and the
-play gate. A P7 FEL with `LoadOptions.felOverlay` (the 06:14 load) is on this native route: AVPlayer plays the base
-layer and APAC audio, and `FelOverlayRenderer` composes the enhancement layer over it (`AetherEngine.swift:5450`).
-The software route (FEL without the overlay, interlaced H.264, MPEG-2, VC-1, VP9, AV1 on tvOS, forward-only
-sources) has no play gate at all: it plays as soon as `loadSoftware` returns (`AetherEngine.swift:5736`).
-
-The checkpoint order above (displayPrepared before routed) is the P7 dual-layer and FEL order. On other HDR loads
-`routed` is recorded first and the routing read moves into `loadNative` via `resolvePanelRouting`; the late
-`displayPrepared` is then dropped by `StartupProgress.advanced` as out of order.
-
-## Where the variability comes from
-
-1. **The criteria are written before the plan exists.** They ignore the master or media choice, the
-   `panelRefusedHDRMaster` latch and the software route. When the route then differs (a media fallback), a second
-   switch follows, which is what took the HDMI audio route down at 04:34.
-2. **The load continues on a cap, not on the event.** The pre-flight gate releases at 2 s mid-switch. For P7 FEL
-   titles the producer only starts after that release (`start()` at `Loading.swift:1392`), so AE#348's overlap is
-   lost exactly on the titles that need it most.
-3. **The Atmos activator is off when the switch ends.** Started at 0.12 s, it is paused at 2.3 s when it follows
-   the paused AVPlayer, and resumes at `play()`, the moment the switch ends and the sink reads the link. Programme
-   audio then followed 1.66 s after the switch at 06:01 and 0.49 s at 06:14. On a reused native host
-   (`currentAVPlayer` unchanged, so its `didSet` never fires), the programme-mode activator releases when the state
-   becomes `.playing` and nothing re-attaches it for the rest of the session.
-4. **Readiness waits on renditions AVPlayer selects itself.** A FORCED=YES subtitle is resolved by readyToPlay
-   (`appliesMediaSelectionCriteriaAutomatically`), and a forced OCR rendition still fills progressively, so its
-   requests can be held up to `subtitleRequestWaitSeconds` (1 s) while the reading advances.
-5. **Load-time background reads compete with the producer.** The indexed subtitle fill (12 lanes, over-fetching
-   about 500 MB per load through the adaptive chunk growth) and the sidecar fill start before the item exists.
-   Atmos confirmation (after `play()`, opt-in) and the I-frame reader (lazy) are not on the startup path.
-6. **The panel proof does not survive a relaunch.** `panelProvenToEngageHDR` lives in memory on the engine's
-   `DisplayCriteriaController`, so every cold launch routes an unproven panel.
 
 ## What the platform gives us (tvOS 27.2 SDK)
 
@@ -113,14 +59,14 @@ since tvOS 17; the newer pieces are concurrency, Observation and metrics.
 
 **Audio**
 - `AVAudioSession.maximumOutputNumberOfChannels` is the documented HDMI channel capability; the audio route does
-  not consult it today.
+  not consult it.
 - `AVAudioSession.renderingMode` reads `notApplicable` on this HDMI route throughout playback in every log, so it
   cannot confirm Atmos. No API reports whether the sink is showing or capable of Atmos.
 
 **Measuring**
 - `AVMetricEventStream` (tvOS 18) on the item gives `AVMetricPlayerItemInitialLikelyToKeepUpEvent`,
   `AVMetricHLSPlaylistRequestEvent`, `AVMetricHLSMediaSegmentRequestEvent` and, since tvOS 26, the variant
-  switch's video, audio and subtitle renditions. That is the precise, Apple-defined readout for step 8.
+  switch's video, audio and subtitle renditions. `AVPlayerItemMetricsLog` logs them per native item; it is the readout for the device measurement below.
 
 ## Principles
 
@@ -130,122 +76,119 @@ since tvOS 17; the newer pieces are concurrency, Observation and metrics.
 - Timers detect failure and report it. They never select a different route because something was slow.
 - One start: picture and programme audio begin once, together, at a moment the engine chose.
 
-## Proposed startup
+## The startup, step by step
 
-### Step 1: Know the content
+Every video load runs these steps in this order (`AetherEngine.loadSession`, `loadNative`).
 
-- **Requires:** the container header.
-- **Produces:** tracks, codecs, frame rate, field order, HDR and Dolby Vision signalling, the audio track that
-  will play, the P5 RPU audit.
-- **Gate:** `streamsProbed`. Already deterministic.
+### 1. Know the content
 
-### Step 2: Decide the output plan, before any write
+The probe gives tracks, codecs, frame rate, field order, HDR and Dolby Vision signalling, the audio track and the
+P5 RPU audit. Checkpoints `sourceOpened`, `containerOpened`, `streamsProbed`.
 
-| Decision | Inputs | Before the switch? |
-|---|---|---|
-| Native or software | probe facts, the VideoToolbox capability session | yes. AE#348 kept VideoToolbox work out of the switch; here it runs before the write, so there is no switch to keep it out of |
-| Dolby Vision handling (P7 FEL overlay or dual layer, P8.1, P5) | `DualLayerRouteDecision` (EL packets, up to 256), `CodecRoute` | yes; the EL read is real I/O, measured as part of this step |
-| Output frame rate | probe rate, deinterlace option | yes |
-| Audio route (passthrough, bridge, APAC bed, objects) | codec, profile, DTS:X verdict, `objectAudioRendering`, `maximumOutputNumberOfChannels` | yes |
-| Atmos activator | the audio route plays APAC and every output port is HDMI | yes |
-| Master or media playlist | whether the panel presents HDR here | only when the panel is proven: the proof, persisted (below), or the refusal latch |
-| Criteria (range, rate, codec tag) | the rows above | yes, from them: a session the plan routes to the media playlist asks for the range it will present |
+### 2. Decide the route, before the display is asked anything
 
-- **Produces:** one immutable `StartupPlan` value (route, DV handling, variant, criteria, audio route, activator).
-  Today these are mutable locals in `loadSession` (`useSoftwarePath`, `felOverlayWanted`, `elType`,
-  `routingPanelHDR`) plus `CodecRoute`, `PreparedServe`, `AppliedCriteria` and `SessionLoadContract`; the plan
-  bundles what they decide and is passed down instead of re-read.
-- **The one input that may need the switch:** master or media on an unproven panel. Persist the proof (and the
-  refusal) across launches, keyed to the display, and clear it on
-  `AVDisplayManagerModeSwitchSettingsChangedNotification` and `AVPlayer.eligibleForHDRPlaybackDidChangeNotification`.
-  With no proof, the plan commits to the master (`attemptsHDRMasterOnUnprovenPanel`) and serves it only after the
-  switch ends (the existing #667 wait, now the rule for that case alone). A refusal is the existing in-place
-  media fallback (#98), reported, and recorded for later loads.
-- **Gate:** the plan is complete. Nothing after it changes the plan except a reported failure.
+Native or overlay, the dual-layer decision (its EL probe reads up to 256 packets), the VideoToolbox capability
+gate, the interlace refute probe, the IPT refusal. All of it runs before the criteria write, so no VideoToolbox
+session opens and no packet is read while the panel switches; the AE#348 rule that settled the panel first for
+these probes has nothing left to guard. Checkpoint `routed`.
 
-### Step 3: Ask for the output and start production
+### 3. Ask the display, and plan the playlist
 
-In this order, with no wait between:
+In this order, with no wait between them:
 
-1. Start the Atmos activator if the plan has one. It stays on, unpaused, from here until the programme is playing
-   (step 6), across the item's creation and the switch end; it then follows the AVPlayer as today. On a reused
-   host it re-attaches explicitly rather than through `currentAVPlayer`'s `didSet`.
-2. Write the criteria once (`DisplayCriteriaController.apply`, which already arms the switch observation before
-   the write).
-3. `HLSVideoEngine.prepare()`: plan, server, producer. This no longer waits behind a gate on any route.
-4. Make every rendition AVPlayer may select itself answerable at once: the forced rendition is filled first and
-   its requests are not held during startup.
-5. Leave the indexed subtitle text fill and the sidecar fill for step 6.
+1. The Atmos activator starts for a track the probe says plays as APAC (`anticipateAtmosOutput`).
+2. The criteria are written once (`DisplayCriteriaController.apply`, which arms the switch observation first).
+   Checkpoint `displayPrepared`: the display has been asked; its switch runs beside everything below.
+3. The master-or-media answer is planned (`plannedPanelRouting`). Every input but the panel readout exists now:
+   eligibility, the AE#588 refusal latch, the host's `attemptsHDRMasterOnUnprovenPanel` and `panelIsInHDRMode`,
+   and the panel proof. The readout changes the route only on an eligible, unlatched display the load may not
+   offer the master on trust, so:
+   - **decided, master:** an eligible, unlatched display the load may attempt, or one the proof or the host's
+     assertion says presents HDR. An unproven master is served once the switch has ended (#667).
+   - **decided, media:** an ineligible display, or a latched refusal.
+   - **at the settled panel:** an unproven display the load may not attempt (the host declined it, or a live
+     load). The pre-flight gate runs beside the session for VOD, in front of it for live, as before.
 
-### Step 4: Create the item and preroll, during the switch
+The planned answer goes to the session (`HLSVideoEngine.plannedPanelIsInHDRMode`), which knows from `prepare()` on
+which playlist it will serve (`plannedServesMaster`). Anything the session builds that depends on that choice can be
+built for it in `prepare()`; nothing that could change it waits for the panel.
 
-- **Requires:** the criteria written, the producer started, and the variant known (immediately when proven;
-  after the switch for an unproven master).
-- **Does:** `serve()`, create and assign the `AVPlayerItem`, mount seek, then once `AVPlayer.status` is
-  readyToPlay, `await player.preroll(atRate: 1)`.
-- **Gate:** preroll returned. NO is not a route change: it means "start without it", and is logged with
-  `reasonForWaitingToPlay`.
-- The 2026-10-22 logs show the item reaching readyToPlay and the layer ready for display about 0.6 s after the
-  item, without `play()`. That contradicts the comment at `NativeAVPlayerHost.swift:1975` ("item.status never
-  advances past .unknown until AVPlayer is told to play"); preroll is verified on device before the comment changes.
+**The panel proof** (`PanelProof`) is the display having been seen engaging HDR for an engine HDR write. It is
+stored between launches under the output configuration it was earned in (`isDisplayCriteriaMatchingEnabled`,
+`eligibleForHDRPlayback`), so a cold launch on a proven display serves its master without the #667 wait. It is
+forgotten when that configuration changes (`AVDisplayManagerModeSwitchSettingsChanged`,
+`eligibleForHDRPlaybackDidChange`) or when AVFoundation refuses an HDR master (#98). Range matching turned off with
+frame-rate matching kept reports through neither notification; a stale proof there costs one in-place media
+fallback, and that refusal forgets it.
 
-### Step 5: Wait for the display
+The refusal latch stays in memory and clears on a return from the background (AE#588): it describes an output
+configuration the user can only change by leaving the app.
 
-- **Requires:** the criteria written. Runs alongside steps 3 and 4.
-- **Gate:** `AVDisplayManagerModeSwitchEndNotification`, or `isDisplayModeSwitchInProgress` false for a switch
-  whose end is never announced. The existing shortcuts stay, because each is a documented "no switch": Match
-  Content off (`isDisplayCriteriaMatchingEnabled` false) and unchanged criteria (#133).
-- **Failure detector:** `observedEndCapMs` (6 s; the measured maximum is 3.55 s). Reaching it is reported as a
-  display failure and the start proceeds.
-- The 2 s `stage2CapMs` release is no longer on the load path: nothing in steps 3 and 4 waits for the switch.
+### 4. Build the session and the item, during the switch
 
-### Step 6: Start
+`prepare()` builds the plan, the server and the producer, and the producer cuts ahead. `serve` follows at once for a
+decided plan, after the switch's end for an unproven master, after the settled panel otherwise. The `AVPlayerItem`
+is created and assigned (criteria first, item second, as Tech Talk 503 asks), the mount seek is issued, and the
+start's preroll is asked for (`NativeAVPlayerHost.prerollForStart`): it begins as soon as the item is ready and its
+mount seek has landed. Checkpoint `sessionConstructed`.
 
-- **Requires:** step 4 and step 5, in either order.
-- **Does:** Apple's prerolled start. With preroll returned YES: set `automaticallyWaitsToMinimizeStalling` false,
-  `setRate(1, time: .invalid, atHostTime: hostNow + lead)`, and set it back to true once `timeControlStatus` is
-  `.playing`, so stalls during the session keep auto-wait's recovery. Programme audio and picture start on the same
-  timebase at a host time the engine chose, a fixed `lead` after the switch end. With preroll NO, a plain `play()`
-  (auto-wait left on), logged. Then hand the activator to the AVPlayer and start the deferred fills.
-- **To verify on device:** that toggling the flag around the start is accepted (the header neither allows nor
-  forbids it), the smallest `lead` that starts on time, and that `play()` after preroll is actually slower or
-  more variable than the host-time start (not measured; the "minimal latency" in the header is unquantified).
-- **Software route:** the same gate before `softwareHost.play()`, which today has none; its synchronizer already
-  prerolls and can start at a host time.
+The Atmos activator follows the AVPlayer from here, and while the engine is still loading a session that plays
+APAC it keeps the silent Atmos stream playing over the paused player and across the item swap
+(`AtmosOutputActivator.hostVerdict`). A reused player re-attaches it explicitly.
 
-### Timers in the new design
+For an overlay session the producer holds the first segment of a run until the overlay's decoder has its first
+picture (`OverlayDecodeTap.awaitRunStart`), so AVPlayer's readiness already includes the overlay's.
 
-| Timer | Today | New role |
-|---|---|---|
-| `stage2CapMs` (2 s) | releases the load mid-switch | off the load path |
-| `observedEndCapMs` (6 s) | upper bound on the play gate | failure detector for step 5 |
-| Readiness gate (#35) | done: AirPlay receivers only | unchanged |
-| #98 media fallback on -11868 / -11848 | reactive, any load | unchanged; on a proven panel it should not fire, and when it does it is a reported failure |
-| Subtitle request hold (1 s while reading advances) | can hold a forced rendition at startup | not applied to the forced rendition during startup |
+### 5. Wait for the display
 
-## The Atmos label
+The play gate (`waitForSwitch`, `.awaitObservedEnd` for VOD) waits for `modeSwitchEnd`, or the in-progress flag
+clearing for a switch that never announces its end. Match Content off and unchanged criteria (#133) have nothing to
+wait for. `observedEndCapMs` (6 s) bounds it and is reported when reached.
 
-The LG reads the audio as the HDMI link comes back after the switch. Today the silent Atmos stream is paused at
-exactly that moment on the native route (variability item 3). With step 3 the activator is on through the switch
-end on every APAC route, and the programme starts at the same point after it. One test settles what the LG shows.
+Then the panel is read for the label (`readSettledPanel`): what the panel presents once the switch has ended.
 
-## Order of work
+### 6. Start once
 
-1. Activator continuity: on from step 3 to the programme playing; explicit re-attach on a reused host. Small,
-   independent, and the most likely cause of the missing Atmos label.
-2. `StartupPlan` (step 2), with the criteria derived from it.
-3. Persisted panel proof and refusal, with invalidation.
-4. Producer and item off the pre-flight gate (steps 3 and 4); the #667 wait only for an unproven master.
-5. Preroll, after confirming on device that the item reaches readyToPlay before `play()`.
-6. One start on both events (step 6), on both routes.
-7. Done: readiness gate for AirPlay receivers only.
-8. Defer the indexed and sidecar fills to after the start, and fix the index fill's over-fetch.
-9. Measure on device with `AVMetricEventStream` and the #361 checkpoints: start latency against today, and the LG
-   banner.
+`NativeAVPlayerHost.startPrerolled()`:
+- **preroll finished:** auto-wait off, `setRate(rate, time: .invalid, atHostTime: now + 10 ms)`, auto-wait back on at
+  the first `.playing` (or at a `.paused` the start stalled into, which is restarted with auto-wait). Picture,
+  programme audio and the overlay (it reads the item's clock) start together. Apple's own prerolled start
+  (AVMediaSelectionDemo, `prerollPlayersAndStartPlayback`).
+- **preroll still running:** waited for; it ends when the pipelines hold what the start needs, which a `play()`
+  would wait for too.
+- **item not ready, or preroll interrupted:** a plain `play()`, logged with the reason.
 
-## Housekeeping found on the way
+Live loads keep their own start (AE#440), a paused mount does not start (#124), and a master handed to an AirPlay
+receiver runs the readiness gate (#227). Then `state = .playing`, and the activator follows the playing player.
 
-- `availableHDRModes` is deprecated in tvOS 26.
-- The tvOS 27 SDK deprecates the global `Notification.Name.AVPlayerItem…` names in favour of
-  `AVPlayerItem.timeJumpedNotification` and its siblings.
-- The engine's `NativeAVPlayerHost.swift:1975` comment is contradicted by the logs (step 4).
+## Timers
+
+| Timer | Role |
+|---|---|
+| `stage2CapMs` (2 s) | the pre-flight gate of a plan left to the settled panel, and live; off every decided load's path |
+| `observedEndCapMs` (6 s) | the play gate's bound; reaching it is logged |
+| #667 wait | an unproven master's serve, until the switch it asked for ends |
+| Readiness gate (#35) | AirPlay receivers only |
+| #98 media fallback | reactive; a display refusal also forgets the proof |
+| Overlay run start (5 s) | an overlay decoder with no first picture; released and logged |
+
+## On the device
+
+Not yet measured. To check on the Apple TV and the LG G5:
+
+1. The LG banner shows Dolby Vision and Atmos on an APAC title (the activator held through the switch's end).
+2. `start: prerolled` in the log on VOD loads, and the gap from `modeSwitchEnd` to the first frame across loads.
+3. Toggling `automaticallyWaitsToMinimizeStalling` around the start is accepted (no stall, no exception).
+4. A cold launch on the proven display: `panel proven to engage HDR by a stored proof`, and no #667 wait.
+5. A decided master served right after the write, before the switch has started, is accepted.
+6. `AVPlayerItemMetricsLog`'s `first likely to keep up` against the #361 checkpoints.
+
+## Still open
+
+- **The FEL overlay's first picture.** `FelCompositionSource` waits per frame for its enhancement picture while
+  there is time, and composes the residual off once there is not. A FEL run's first segment is not held for the
+  enhancement layer the way an overlay decode's is, so the first frames after a start can lack it.
+- **The demuxed audio rendition** (`docs/demuxed-audio.md`): `plannedServesMaster` is the answer its shape is
+  chosen from in `prepare()`; a session whose plan was left to the settled panel keeps the muxed shape, which plays
+  from either playlist.
+
