@@ -171,7 +171,7 @@ struct ProducerDeterminismTests {
 }
 
 /// The samples of a segment's fragments, read for a diff that says where two segments part.
-private struct Fragments {
+struct Fragments {
     struct Sample: Equatable {
         let decodeTime: Int64
         let duration: UInt32

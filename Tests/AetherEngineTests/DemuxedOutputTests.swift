@@ -87,6 +87,36 @@ struct DemuxedOutputTests {
         #expect(!media.contains("audio"))
     }
 
+    @Test("the joined view is one moof of a traf per track over one mdat, every sample as the renditions cut it",
+          .timeLimit(.minutes(2)), arguments: ["aac.mkv", "truehd.mkv", "eac3.mp4"])
+    func joinedView(_ clip: String) throws {
+        let url = Self.fixture(clip)
+        try #require(FileManager.default.fileExists(atPath: url.path),
+                     "run Scripts/fetch-fixtures.sh to generate Fixtures/determinism/")
+        let engine = HLSVideoEngine(url: url, dvModeAvailable: false)
+        engine.plannedPanelIsInHDRMode = false
+        _ = try engine.start()
+        defer { engine.stop() }
+        try #require(engine.outputShape == .demuxed)
+        #expect(engine.mediaPlaylistURL?.lastPathComponent == "muxed.m3u8", "the playlist that plays alone is the joined view")
+        let provider = try #require(engine.provider)
+        let joinedInit = try #require(provider.muxedInitSegment(versionID: 0))
+        let scales = Fragments.timescales(init: joinedInit)
+        #expect(scales[1] != nil && scales[2] != nil, "both tracks in the joined init: \(scales)")
+        for index in 1..<4 {
+            let video = try #require(provider.mediaSegment(at: index))
+            let audio = try #require(VideoSegmentProvider.drain(provider.audioSegmentSource(at: index, onSlow: nil)))
+            let joined = try #require(VideoSegmentProvider.drain(provider.muxedSegmentSource(at: index, onSlow: nil)))
+            let d = [UInt8](joined)
+            let top = Self.boxes(d, 0..<d.count).map(\.type).filter { $0 != "emsg" }
+            #expect(top == ["moof", "mdat"], "seg\(index): \(top)")
+            let j = Fragments(joined), v = Fragments(video), a = Fragments(audio)
+            #expect(j.tracks[1]?.samples == v.tracks[1]?.samples, "seg\(index): the video's samples")
+            #expect(j.tracks[2]?.samples == a.tracks[1]?.samples, "seg\(index): the audio's samples, as track 2")
+            #expect(j.tracks[2]?.tfdt == a.tracks[1]?.tfdt && j.tracks[1]?.tfdt == v.tracks[1]?.tfdt)
+        }
+    }
+
     @Test("the audio rendition's requests wait for the producer rather than restart it", .timeLimit(.minutes(2)))
     func audioRequestsDoNotRestart() throws {
         let url = Self.fixture("aac.mkv")

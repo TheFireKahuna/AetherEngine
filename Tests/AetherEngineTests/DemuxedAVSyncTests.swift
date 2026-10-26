@@ -69,5 +69,21 @@ struct DemuxedAVSyncTests {
         let offset = ((click + audioOrigin) - (flash + videoOrigin)) * 48_000
         #expect(abs(offset - delay * 48_000) <= clip.toleranceSamples,
                 "audio is \(offset) samples off the picture, asked \(delay * 48_000)")
+
+        // The joined view, the playlist that plays without a master: the same click on the same frame, read from one
+        // file whose one moof carries both tracks.
+        let joined = try Data(contentsOf: base.appendingPathComponent("muxed-init.mp4"))
+            + Data(contentsOf: base.appendingPathComponent("muxed0.mp4"))
+        let joinedFile = dir.appendingPathComponent("demuxed-joined-\(UUID().uuidString).mp4")
+        try joined.write(to: joinedFile)
+        defer { try? FileManager.default.removeItem(at: joinedFile) }
+        let both = await withCheckedContinuation { (continuation: CheckedContinuation<(Double?, Double?), Never>) in
+            Thread.detachNewThread { continuation.resume(returning: AVSyncTests.measure(joinedFile)) }
+        }
+        let joinedFlash = try #require(both.0, "no white frame decoded from the joined view")
+        let joinedClick = try #require(both.1, "no click decoded from the joined view")
+        let origins = AVSyncTests.firstTfdtSeconds(joined)
+        let joinedOffset = ((joinedClick + (origins.audio ?? 0)) - (joinedFlash + (origins.video ?? 0))) * 48_000
+        #expect(abs(joinedOffset - offset) <= 0.5, "the joined view plays \(joinedOffset) samples, the renditions \(offset)")
     }
 }

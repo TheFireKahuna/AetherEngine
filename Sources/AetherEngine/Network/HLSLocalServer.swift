@@ -38,6 +38,11 @@ protocol HLSSegmentProvider: AnyObject {
     func audioInitSegment() -> Data?
     /// The audio rendition's segment `index`, as `mediaSegmentSource(at:onSlow:)` serves the video's. Default nil.
     func audioSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource?
+    /// The joined view's init for a video init version (`FMP4Join`): the playlist a demuxed session plays from
+    /// without a master. Default nil.
+    func muxedInitSegment(versionID: Int) -> Data?
+    /// The joined view's segment `index`. Default nil.
+    func muxedSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource?
 
     var segmentCount: Int { get }
     func segmentDuration(at index: Int) -> Double
@@ -192,6 +197,8 @@ extension HLSSegmentProvider {
     var servesAudioRendition: Bool { false }
     func audioInitSegment() -> Data? { nil }
     func audioSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource? { nil }
+    func muxedInitSegment(versionID: Int) -> Data? { nil }
+    func muxedSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource? { nil }
     var staticMasterPlaylistBody: String? { nil }
     var firstVisibleSegmentIndex: Int { 0 }
     func segmentIsDiscontinuous(at index: Int) -> Bool { false }
@@ -398,7 +405,13 @@ final class HLSLocalServer: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard port > 0 else { return nil }
-        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/\(livePlaylistPrefix)media.m3u8")
+        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/\(livePlaylistPrefix)\(standaloneMediaPlaylistName)")
+    }
+
+    /// The media playlist that plays without a master: the variant's own, or a demuxed session's joined view, whose
+    /// variant playlist is its video alone (docs/demuxed-audio.md).
+    var standaloneMediaPlaylistName: String {
+        provider?.servesAudioRendition == true ? "muxed.m3u8" : "media.m3u8"
     }
 
     /// HDR-preserving reduced master (#98): source VIDEO-RANGE kept, no SUPPLEMENTAL-CODECS
@@ -1180,9 +1193,10 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             return send404(fd: fd, path: normalizedPath, reason: "no masterCodecs")
 
-        case "/media.m3u8", "/audio.m3u8":
-            let rendition: MediaRendition = normalizedPath == "/audio.m3u8" ? .audio : .video
-            if rendition == .audio, provider?.servesAudioRendition != true {
+        case "/media.m3u8", "/audio.m3u8", "/muxed.m3u8":
+            let rendition: MediaRendition = normalizedPath == "/audio.m3u8" ? .audio
+                : normalizedPath == "/muxed.m3u8" ? .muxed : .video
+            if rendition != .video, provider?.servesAudioRendition != true {
                 return send404(fd: fd, path: normalizedPath, reason: "no audio rendition (muxed audio)")
             }
             // For live: hold until at least one segment exists (-12888 fires immediately on empty live playlist; AVPlayer never re-polls).
@@ -1320,6 +1334,13 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             return send200(fd: fd, path: normalizedPath, data: data, contentType: "video/mp4")
 
+        case "/muxed-init.mp4":
+            stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
+            guard let data = provider?.muxedInitSegment(versionID: 0), !data.isEmpty else {
+                return send404(fd: fd, path: normalizedPath, reason: "muxed-init.mp4 not available")
+            }
+            return send200(fd: fd, path: normalizedPath, data: data, contentType: "video/mp4")
+
         case "/audio-init.mp4":
             stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
             guard let data = provider?.audioInitSegment(), !data.isEmpty else {
@@ -1338,6 +1359,14 @@ final class HLSLocalServer: @unchecked Sendable {
                            contentType: "video/mp4")
 
         default:
+            // The joined view's versioned init, the video's version N joined with the audio's init.
+            if normalizedPath.hasPrefix("/muxed-init"), normalizedPath.hasSuffix(".mp4"),
+               let v = Int(normalizedPath.dropFirst("/muxed-init".count).dropLast(".mp4".count)), v > 0 {
+                guard let data = provider?.muxedInitSegment(versionID: v), !data.isEmpty else {
+                    return send404(fd: fd, path: normalizedPath, reason: "muxed-init\(v).mp4 not available")
+                }
+                return send200(fd: fd, path: normalizedPath, data: data, contentType: "video/mp4")
+            }
             // Versioned init for SSAI program switches: /init<N>.mp4 (N>0).
             if normalizedPath.hasPrefix("/init"),
                normalizedPath.hasSuffix(".mp4") {
@@ -1364,17 +1393,25 @@ final class HLSLocalServer: @unchecked Sendable {
         }
     }
 
-    /// The media renditions the server serves segments of (docs/demuxed-audio.md): the variant's video (or, muxed,
-    /// video and audio) as `seg<N>.mp4`, and the demuxed shape's audio as `audio<N>.mp4`.
+    /// The media playlists the server serves (docs/demuxed-audio.md): the variant's video (or, muxed, video and
+    /// audio) as `seg<N>.mp4`; the demuxed shape's audio as `audio<N>.mp4`; and its joined view, the two in one file
+    /// per segment (`FMP4Join`), as `muxed<N>.mp4`, for playing without a master.
     enum MediaRendition: Sendable {
-        case video, audio
-        var name: String { self == .video ? "seg" : "audio" }
+        case video, audio, muxed
+        var name: String {
+            switch self {
+            case .video: return "seg"
+            case .audio: return "audio"
+            case .muxed: return "muxed"
+            }
+        }
+        var playlistPath: String { self == .video ? "/media.m3u8" : "/\(name).m3u8" }
     }
 
-    /// A segment path's rendition and index text: `/seg<N>.mp4` or `/audio<N>.mp4`.
+    /// A segment path's rendition and index text: `/seg<N>.mp4`, `/audio<N>.mp4` or `/muxed<N>.mp4`.
     static func segmentRoute(_ path: String) -> (rendition: MediaRendition, index: Substring)? {
         guard path.hasSuffix(".mp4") else { return nil }
-        for rendition in [MediaRendition.video, .audio] where path.hasPrefix("/\(rendition.name)") {
+        for rendition in [MediaRendition.video, .audio, .muxed] where path.hasPrefix("/\(rendition.name)") {
             return (rendition, path.dropFirst(rendition.name.count + 1).dropLast(".mp4".count))
         }
         return nil
@@ -1412,9 +1449,12 @@ final class HLSLocalServer: @unchecked Sendable {
             _ = self.writeAll(fd: fd, parts: [Self.chunkedResponseHeader(contentType: "video/mp4")],
                               path: "\(normalizedPath) [early header]")
         }
-        let source = rendition == .video
-            ? provider?.mediaSegmentSource(at: index, onSlow: onSlow)
-            : provider?.audioSegmentSource(at: index, onSlow: onSlow)
+        let source: SegmentSource?
+        switch rendition {
+        case .video: source = provider?.mediaSegmentSource(at: index, onSlow: onSlow)
+        case .audio: source = provider?.audioSegmentSource(at: index, onSlow: onSlow)
+        case .muxed: source = provider?.muxedSegmentSource(at: index, onSlow: onSlow)
+        }
         // A segment being written: commit the chunked header (unless the slow-serve
         // signal already did) and send each fragment as it lands. An abandoned segment
         // ends the connection without the final chunk, so AVPlayer retries it rather
@@ -2301,10 +2341,12 @@ final class HLSLocalServer: @unchecked Sendable {
         } else {
             prefix = ""
         }
-        // The audio rendition keeps one init across a program switch: only the video's is versioned.
+        // The audio rendition keeps one init across a program switch: only the video's is versioned, and the joined
+        // view's follows it.
+        let initName = rendition == .muxed ? "muxed-init" : "init"
         let initURI: (Int) -> String = rendition == .audio
             ? { _ in "\(prefix)audio-init.mp4" }
-            : { v in v == 0 ? "\(prefix)init.mp4" : "\(prefix)init\(v).mp4" }
+            : { v in v == 0 ? "\(prefix)\(initName).mp4" : "\(prefix)\(initName)\(v).mp4" }
         let segURI: (Int) -> String = { idx in "\(prefix)\(rendition.name)\(idx).mp4" }
         let initVersion: (Int) -> Int = { rendition == .audio ? 0 : provider.initVersionID(forSegment: $0) }
         // Initial EXT-X-MAP emitted before the loop so a discontinuity on seg0 is still directly before its #EXTINF (RFC/Apple: session map precedes first segment's tags).
