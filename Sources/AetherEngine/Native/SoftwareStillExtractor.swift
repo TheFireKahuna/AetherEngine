@@ -143,6 +143,8 @@ final class SoftwareStillExtractor: @unchecked Sendable {
         let deadline = ContinuousClock.now.advanced(by: .milliseconds(750))
         feedRun { isCancelled() || (reportTime != nil && ContinuousClock.now >= deadline)
             || (!precise && collector.hasFrame) }
+        // The frames decoded reach the collector as their GPU finish completes: all of them before it is read.
+        decoder.awaitDelivered()
 
         let didRefine = precise && collector.coversTarget
         let selected = reportTime != nil && didRefine ? collector.refinedBest : collector.best
@@ -181,8 +183,7 @@ final class SoftwareStillExtractor: @unchecked Sendable {
     /// next run has to draw from. Keep at most two: before/after the target, or
     /// the earliest fallback and the candidate after an evicted target.
     ///
-    /// `onFrame` is `@Sendable` and the decoder calls it from its own drain, so the box is locked
-    /// even though the run itself is serial.
+    /// `onFrame` is `@Sendable` and the decoder calls it from its delivery queue, so the box is locked.
     private final class FrameCollector: @unchecked Sendable {
         private let lock = NSLock()
         private let target: Double

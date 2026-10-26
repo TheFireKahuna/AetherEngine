@@ -2,9 +2,14 @@ import Foundation
 import Metal
 import QuartzCore
 import os
+import LibDeinterlace
+#if MLSubtitleUpscale
+import LibMLSubUpscaler
+#endif
 
-/// The engine's own compute work on the GPU (the FEL composition, the software decoders' finishing pass), submitted
-/// one way whichever Metal the system has: Metal 4 where it is available (`MTL4CommandQueue`, command allocators and
+/// Every compute submission of the engine and the libraries it encodes for (the FEL composition, the software
+/// decoders' finishing pass with LibDeinterlace's passes in it, the subtitle compositor, LibMLSubUpscaler's passes),
+/// submitted one way whichever Metal the system has: Metal 4 where it is available (`MTL4CommandQueue`, command allocators and
 /// argument tables reused frame after frame, residency sets, explicit barriers, one commit for a batch), Metal 3
 /// before it (unretained command buffers, residency sets, a concurrent encoder with memory barriers).
 ///
@@ -67,6 +72,10 @@ struct GPUBatchResult: Sendable {
 
 /// Work for one commit. Not thread-safe: one caller encodes it, then commits it once.
 protocol GPUBatch: AnyObject {
+    /// Before the first pass: the batch's work waits on the GPU until `event` reaches `value`.
+    func wait(for event: MTLEvent, value: UInt64)
+    /// `event` set to `value` once the batch's work has completed on the GPU.
+    func signal(_ event: MTLEvent, value: UInt64)
     /// A compute pass in this batch; the previous one, if still open, is ended first.
     func makePass() -> ComputePass?
     /// Ends the open pass and commits the batch. `completion` runs once, off the caller's thread, on a serial queue
@@ -74,11 +83,20 @@ protocol GPUBatch: AnyObject {
     func commit(_ completion: @escaping @Sendable (GPUBatchResult) -> Void)
 }
 
+/// The libraries' pass protocols, which every ``ComputePass`` is, so a library encodes straight into an engine pass.
+#if MLSubtitleUpscale
+typealias LibraryPasses = DeinterlacePass & SubtitleUpscalePass
+#else
+typealias LibraryPasses = DeinterlacePass
+#endif
+
 /// A compute pass, encoded the same way on either Metal. Resources bound are made resident for the batch.
-protocol ComputePass: AnyObject {
+protocol ComputePass: LibraryPasses {
     func setPipeline(_ pipeline: MTLComputePipelineState)
     func setTexture(_ texture: MTLTexture, index: Int)
     func setBuffer(_ buffer: MTLBuffer, offset: Int, index: Int)
+    /// `bytes` copied into the batch and bound at `index`, as a small constant argument (Metal 4 has no `setBytes`).
+    func setBytes(_ bytes: UnsafeRawBufferPointer, index: Int)
     func dispatchThreads(_ grid: MTLSize, threadsPerThreadgroup: MTLSize)
     func dispatchThreadgroups(_ groups: MTLSize, threadsPerThreadgroup: MTLSize)
     func dispatchThreadgroups(indirectBuffer: MTLBuffer, offset: Int, threadsPerThreadgroup: MTLSize)
@@ -90,6 +108,7 @@ protocol ComputePass: AnyObject {
 
 extension ComputePass {
     func setBuffer(_ buffer: MTLBuffer, index: Int) { setBuffer(buffer, offset: 0, index: index) }
+    func setValue<T>(_ value: T, index: Int) { withUnsafeBytes(of: value) { setBytes($0, index: index) } }
 }
 
 protocol GPUBackend: AnyObject, Sendable {
@@ -105,6 +124,35 @@ private enum Bindings {
     static let stamps = 16
 }
 
+/// A batch's small constant arguments (``ComputePass/setBytes(_:index:)``): copied into a shared buffer the batch's
+/// context keeps until its work has completed, at 16-byte steps. Grows by a new buffer when one fills; the largest is
+/// kept for the next batch.
+private final class Uploads {
+    private let device: MTLDevice
+    private var buffers: [MTLBuffer] = []
+    private var cursor = 0
+
+    init(device: MTLDevice) { self.device = device }
+
+    func reset() {
+        if buffers.count > 1 { buffers = [buffers.last!] }
+        cursor = 0
+    }
+
+    func copy(_ bytes: UnsafeRawBufferPointer) -> (buffer: MTLBuffer, offset: Int)? {
+        let length = max(16, (bytes.count + 15) & ~15)
+        if buffers.last.map({ cursor + length > $0.length }) ?? true {
+            guard let made = device.makeBuffer(length: max(64 * 1024, length), options: .storageModeShared) else { return nil }
+            buffers.append(made)
+            cursor = 0
+        }
+        let buffer = buffers.last!
+        if let base = bytes.baseAddress { (buffer.contents() + cursor).copyMemory(from: base, byteCount: bytes.count) }
+        defer { cursor += length }
+        return (buffer, cursor)
+    }
+}
+
 // MARK: - Metal 4
 
 @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
@@ -113,6 +161,9 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
     private let device: MTLDevice
     private let queue: MTL4CommandQueue
     private let frequency: Double
+    /// Holds a batch's queue-level event waits, its commit and its event signals together, so another batch's commit
+    /// never falls between them.
+    private let commitOrder = NSLock()
     /// Command memory, command buffers, bindings and residency, reused: a context goes back to the pool when its
     /// batch has completed, so its allocator is never reset under work the GPU still reads.
     private let pool = OSAllocatedUnfairLock<[Context]>(initialState: [])
@@ -123,6 +174,7 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
         let table: MTL4ArgumentTable
         let residency: MTLResidencySet
         let stamps: MTL4CounterHeap?
+        let uploads: Uploads
 
         init?(device: MTLDevice) {
             let tableDescriptor = MTL4ArgumentTableDescriptor()
@@ -139,6 +191,7 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
             self.table = table
             self.residency = residency
             stamps = try? device.makeCounterHeap(descriptor: heapDescriptor)
+            uploads = Uploads(device: device)
         }
     }
 
@@ -157,13 +210,14 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
         guard let context = pool.withLock({ $0.popLast() }) ?? Context(device: device) else { return nil }
         context.allocator.reset()
         context.residency.removeAllAllocations()
+        context.uploads.reset()
         context.commandBuffer.beginCommandBuffer(allocator: context.allocator)
         context.commandBuffer.useResidencySet(context.residency)
         return Batch(backend: self, context: context, timed: timed && context.stamps != nil, ordered: orderedAfterEarlierWork)
     }
 
     fileprivate func finish(_ context: Context, completion: @escaping @Sendable (GPUBatchResult) -> Void,
-                            labels: [String]) {
+                            labels: [String], waits: [(MTLEvent, UInt64)], signals: [(MTLEvent, UInt64)]) {
         context.commandBuffer.endCommandBuffer()
         context.residency.commit()
         let options = MTL4CommitOptions()
@@ -174,7 +228,13 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
             completion(GPUBatchResult(gpuStart: feedback.gpuStartTime, gpuEnd: feedback.gpuEndTime,
                                       error: feedback.error?.localizedDescription, stamps: stamps))
         }
-        queue.commit([context.commandBuffer], options: options)
+        // Events are queue operations on Metal 4: a wait holds back the work committed after it, a signal fires once
+        // the work committed before it has completed.
+        commitOrder.withLock {
+            for (event, value) in waits { queue.waitForEvent(event, value: value) }
+            queue.commit([context.commandBuffer], options: options)
+            for (event, value) in signals { queue.signalEvent(event, value: value) }
+        }
     }
 
     private static func stamps(_ heap: MTL4CounterHeap?, labels: [String], frequency: Double) -> [(label: String, ms: Double)] {
@@ -195,6 +255,8 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
         var ordered: Bool
         var open: Pass?
         var labels: [String] = []
+        var waits: [(MTLEvent, UInt64)] = []
+        var signals: [(MTLEvent, UInt64)] = []
 
         init(backend: Metal4Backend, context: Context, timed: Bool, ordered: Bool) {
             self.backend = backend
@@ -202,6 +264,9 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
             self.timed = timed
             self.ordered = ordered
         }
+
+        func wait(for event: MTLEvent, value: UInt64) { waits.append((event, value)) }
+        func signal(_ event: MTLEvent, value: UInt64) { signals.append((event, value)) }
 
         func makePass() -> ComputePass? {
             open?.end()
@@ -222,7 +287,7 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
         func commit(_ completion: @escaping @Sendable (GPUBatchResult) -> Void) {
             open?.end()
             open = nil
-            backend.finish(context, completion: completion, labels: labels)
+            backend.finish(context, completion: completion, labels: labels, waits: waits, signals: signals)
         }
     }
 
@@ -246,6 +311,11 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
         func setBuffer(_ buffer: MTLBuffer, offset: Int, index: Int) {
             batch.context.residency.addAllocation(buffer)
             batch.context.table.setAddress(buffer.gpuAddress + UInt64(offset), index: index)
+        }
+
+        func setBytes(_ bytes: UnsafeRawBufferPointer, index: Int) {
+            guard let upload = batch.context.uploads.copy(bytes) else { return }
+            setBuffer(upload.buffer, offset: upload.offset, index: index)
         }
 
         func dispatchThreads(_ grid: MTLSize, threadsPerThreadgroup: MTLSize) {
@@ -296,8 +366,10 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
     final class Context: @unchecked Sendable {
         let residency: MTLResidencySet?
         let samples: MTLCounterSampleBuffer?
+        let uploads: Uploads
 
         init(device: MTLDevice, counters: MTLCounterSet?) {
+            uploads = Uploads(device: device)
             if #available(macOS 15, iOS 18, tvOS 18, visionOS 2, *) {
                 residency = try? device.makeResidencySet(descriptor: MTLResidencySetDescriptor())
             } else {
@@ -330,6 +402,7 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
         // Unretained: every caller keeps its resources alive until the completion has run.
         guard let commandBuffer = queue.makeCommandBufferWithUnretainedReferences() else { return nil }
         let context = pool.withLock { $0.popLast() } ?? Context(device: device, counters: timestampCounters)
+        context.uploads.reset()
         if #available(macOS 15, iOS 18, tvOS 18, visionOS 2, *), let residency = context.residency {
             residency.removeAllAllocations()
             commandBuffer.useResidencySet(residency)
@@ -348,6 +421,7 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
         var open: Pass?
         /// A timed batch's encoders, each sampled at its start and end: (label of the work it ends with, sample index).
         var labels: [String] = []
+        var signals: [(MTLEvent, UInt64)] = []
 
         init(backend: Metal3Backend, commandBuffer: MTLCommandBuffer, context: Context, timed: Bool) {
             self.backend = backend
@@ -355,6 +429,9 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
             self.context = context
             self.timed = timed
         }
+
+        func wait(for event: MTLEvent, value: UInt64) { commandBuffer.encodeWaitForEvent(event, value: value) }
+        func signal(_ event: MTLEvent, value: UInt64) { signals.append((event, value)) }
 
         func makePass() -> ComputePass? {
             open?.end()
@@ -381,6 +458,7 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
         func commit(_ completion: @escaping @Sendable (GPUBatchResult) -> Void) {
             open?.end()
             open = nil
+            for (event, value) in signals { commandBuffer.encodeSignalEvent(event, value: value) }
             if #available(macOS 15, iOS 18, tvOS 18, visionOS 2, *) { context.residency?.commit() }
             let labels = labels
             let context = context
@@ -449,6 +527,11 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
             resident(buffer)
             buffers[index] = (buffer, offset)
             encoder?.setBuffer(buffer, offset: offset, index: index)
+        }
+
+        func setBytes(_ bytes: UnsafeRawBufferPointer, index: Int) {
+            guard let upload = batch.context.uploads.copy(bytes) else { return }
+            setBuffer(upload.buffer, offset: upload.offset, index: index)
         }
 
         func dispatchThreads(_ grid: MTLSize, threadsPerThreadgroup: MTLSize) {

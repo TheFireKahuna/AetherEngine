@@ -39,7 +39,7 @@ struct StillColorspaceTests {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let writer = try DisplayBufferWriter(device: device, streamIs10Bit: false, twelveBit420: .p010Dithered,
                                              containerHDRStatic: .none, logTag: "test")
-        let buffer = try #require(writer.finish(frame))
+        let buffer = try #require(writer.finishAndWait(frame))
         let image = try #require(StillRenderer().image(buffer, width: width, height: height))
         let space = try #require(image.colorSpace)
         var pixels = [UInt8](repeating: 0, count: width * height * 4)

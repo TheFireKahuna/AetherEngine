@@ -13,12 +13,31 @@ import LibDeinterlace
 /// (`PlanarFrameFinisher`) turns each into the display buffer; the CPU never touches the pixels after decode.
 final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
+    // Threading. The stream's state (the codec context, the writer and finisher, the deinterlacer's window, inverse
+    // telecine, the film cadence, every counter below) belongs to the decode thread: `decode(packet:epoch:)` and
+    // `drainForEndOfStream()`, which run under `gate`. Nothing else takes `gate` but `close()`, once, to wait out the call
+    // in progress before it tears the state down; the frame path takes no lock any other thread contends for. A host's
+    // `flush()`, the discard switch and the skip threshold are small control state the decode thread reads at its next
+    // call (`control`, `skipLock`). A finished frame reaches the host through `delivery`, in decode order, from the
+    // GPU's completion: the decode thread never waits on the GPU.
+
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
-    /// Where the decoder writes its pictures and the GPU pass that turns them into display buffers. Made at `open`;
-    /// guarded by `lock`, like everything `emit` touches.
+    /// Where the decoder writes its pictures and the GPU pass that turns them into display buffers. Made at `open`.
     private var writer: DisplayBufferWriter?
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
-    var onFrame: DecodedFrameHandler?
+    /// The host's callback, called on `delivery`'s queue with no lock of this decoder's held.
+    var onFrame: DecodedFrameHandler? {
+        get { delivery.currentOnFrame }
+        set { delivery.setOnFrame(newValue) }
+    }
+    /// Finished frames to the host, by ticket, a flush's earlier frames dropped by epoch. Up to two frames (a frame's
+    /// two fields) per finisher submission in flight.
+    private let delivery = OrderedDelivery(maxFramesInFlight: 2 * PlanarFrameFinisher.slotCount, maxLayerSkew: 0,
+                                           label: "engine.sw.delivery")
+    /// The next frame's ticket and the epoch the numbering is for: every epoch numbers its frames from 0, as
+    /// `flush()` resets the delivery line to 0.
+    private var nextTicket: UInt64 = 0
+    private var ticketEpoch: UInt64 = 0
 
     /// Fires once (demux thread) on first HDR10+ side data; engine flips videoFormat to .hdr10Plus.
     private var seenHDR10Plus = false
@@ -26,7 +45,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
 
     /// AE#658: fires (decode thread) on the first displayed frame and whenever the decoded format or the
-    /// display buffer's format changes. Guarded by `lock`, like everything `emit` reads.
+    /// display buffer's format changes.
     var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)?
     private var decodedFormatKey: DecodedFormatKey?
     private var reportedFormatKey: DecodedFormatKey?
@@ -45,16 +64,15 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     /// #177: first sane non-square SAR of the stream. Once latched, every frame attaches this value;
     /// interlaced sources can oscillate SAR per-field and a garbage AVCodecContext value (1088:1 seen
-    /// in the field) must never flicker the display geometry. Guarded by `lock` (set inside emit).
+    /// in the field) must never flicker the display geometry.
     private var latchedSAR: AVRational?
     private var loggedSARLatch = false
     /// #290: one line per stream when a declared SAR is dropped for the aspect it produces, so a
     /// smeared picture names its own cause instead of looking like a renderer bug.
     private var loggedSARReject = false
 
-    /// Skip pre-seek frames; decoded for reference but not converted.
-    /// Guarded by `skipLock` not `lock`: emit() runs with `lock` held, so a same-lock accessor would deadlock.
-    /// CMTime is multi-word: old unsynchronized access was a torn-read candidate.
+    /// Skip pre-seek frames; decoded for reference but not converted. Set by the host, read by the decode thread, under
+    /// `skipLock` (CMTime is multi-word).
     var skipUntilPTS: CMTime? {
         get { skipLock.lock(); defer { skipLock.unlock() }; return _skipUntilPTS }
         set { skipLock.lock(); _skipUntilPTS = newValue; skipLock.unlock() }
@@ -71,26 +89,28 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// film run) is not handed the late pictures at all: it starts over on the first picture that is not
     /// late, as it does after a seek, so the pictures it shows keep their timestamps and cadence.
     func discardsNonReferencePictures(_ discard: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let ctx = codecContext else { return }
-        ctx.pointee.skip_frame = discard && !carriesDecodedCaptions ? AVDISCARD_NONREF : AVDISCARD_DEFAULT
-        if discard, window?.isActive == true || inverseTelecine != nil || filmCadence?.isActive == true {
-            chainRestartPending = true
-        }
+        control.withLock { $0.discard = discard }
     }
 
     /// Late pictures are bypassing the consecutive-picture chain, which starts over on the first one that is
-    /// not late (`discardsNonReferencePictures`). Guarded by `lock`.
+    /// not late (`discardsNonReferencePictures`).
     private var chainRestartPending = false
-    /// The stream's decoded pictures have carried A53 captions. Guarded by `lock`.
+    /// The stream's decoded pictures have carried A53 captions.
     private var carriesDecodedCaptions = false
 
-    /// AE#492: guarded by `lock`, the same one `flush()` and `decode(packet:epoch:)` take.
-    private var _feedEpoch: UInt64 = 0
-    var feedEpoch: UInt64 {
-        lock.lock(); defer { lock.unlock() }; return _feedEpoch
+    /// What the host's calls leave for the decode thread: the feed epoch (AE#492), a reset `flush()` asks for, the
+    /// discard switch, and `close()`.
+    private struct Control {
+        var epoch: UInt64 = 0
+        var resetPending = false
+        var resetFilterGraph = false
+        var discard: Bool?
+        var closed = false
     }
+    private let control = OSAllocatedUnfairLock(initialState: Control())
+    var feedEpoch: UInt64 { control.withLock { $0.epoch } }
+    /// Whether `epoch` is still the feed's, for the decode thread between frames.
+    private func isCurrent(_ epoch: UInt64) -> Bool { control.withLock { !$0.closed && $0.epoch == epoch } }
     private let skipLock = NSLock()
 
     /// Clear the skip threshold only if it is still the one we acted on.
@@ -102,27 +122,25 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         skipLock.unlock()
     }
 
-    /// Protects codecContext across the demux thread (decode) and main thread (close/flush).
-    private let lock = NSLock()
+    /// Held by the decode thread for each call; `close()` takes it once (see Threading, above).
+    private let gate = NSLock()
 
     /// The deinterlacer's schedule for interlaced MPEG-2 / VC-1 / MPEG-4 / H.264 (DVD rips, broadcast): FFmpeg's bwdif,
     /// the arithmetic on the GPU (``PlanarFrameFinisher/Field``). Made at `open`; engaged by the first interlaced
-    /// frame, after which every frame goes through it. Guarded by `lock`.
+    /// frame, after which every frame goes through it.
     private var window: BwdifWindow?
     /// The source format's reader for the deinterlacer and the planar format it writes, per decoded format; nil
-    /// where the deinterlacer does not take the format (logged once). Guarded by `lock`.
+    /// where the deinterlacer does not take the format (logged once).
     private var deinterlaceFormats: [Int32: (layout: PictureLayout, planar: AVPixelFormat)?] = [:]
 
     /// Deinterlacer cadence from LoadOptions. Set by the host BEFORE `open`.
     var deinterlaceConfig = DeinterlaceConfig()
 
-    /// Soft telecine: film runs re-timed onto the film rate's own grid (``FilmCadence``). Made at `open`. Guarded by
-    /// `lock`.
+    /// Soft telecine: film runs re-timed onto the film rate's own grid (``FilmCadence``). Made at `open`.
     private var filmCadence: FilmCadence?
 
     /// Film in interlaced carriage (`deinterlaceConfig.film`): every picture through ``InverseTelecine`` instead of the
-    /// deinterlacer. Made on the first picture, when its format and size are ones inverse telecine takes. Guarded by
-    /// `lock`.
+    /// deinterlacer. Made on the first picture, when its format and size are ones inverse telecine takes.
     private var inverseTelecine: InverseTelecine?
     private var loggedTelecineRefusal = false
 
@@ -282,21 +300,20 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// reach the display buffer as an untagged picture, so an HDR10 file decoded in software lost its
     /// PQ / BT.2020 attachments while the same file through the hardware decoder (which reads
     /// `codecpar`) kept them. Made in `open`, before the host can feed a packet; applied to each frame
-    /// on the decode thread under `lock`, where it learns which fields the bitstream states itself.
+    /// on the decode thread, where it learns which fields the bitstream states itself.
     private var colourFill = ColourBackfill(container: .unspecified)
 
-    /// Deinterlaced frames dropped for carrying no PTS (see the drop site in decode()). Guarded by `lock`.
+    /// Deinterlaced frames dropped for carrying no PTS (see the drop site in decode()).
     private var droppedUntimestampedFields = 0
 
     /// #407: frames whose PTS was reconstructed from `best_effort_timestamp` (see the repair site
-    /// in drainDecodedFrames()). Guarded by `lock`.
+    /// in drainDecodedFrames()).
     private var repairedTimestamps = 0
 
     /// #220: a send failure that survives the drain-and-retry is release-visible once per
     /// decoder, so a wedge that is a genuine decode error is distinguishable in a field log
     /// from one that is not.
     private var loggedSendFailure = false
-    private var loggedFinishFailure = false
 
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
         guard let codecpar = stream.pointee.codecpar else {
@@ -442,23 +459,19 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// every subsequent send hit the same wall: video wedged permanently until a seek flushed
     /// the decoder, while audio kept playing.
     func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64? = nil) {
-        lock.lock()
-        // AE#492: a packet decided on before a flush must not be sent after it. Checked here rather
-        // than at the caller because only this lock orders the two: `flush()` takes it to retire the
-        // epoch, so either the send happens first and the flush drops what it produced, or the flush
-        // happens first and the send never runs.
-        if let epoch, epoch != _feedEpoch { lock.unlock(); return }
-        guard let ctx = codecContext else { lock.unlock(); return }
+        gate.lock()
+        defer { gate.unlock() }
+        // AE#492: a packet decided on before a flush is not sent after it. A flush that lands after this check
+        // leaves the packet's frames on the retired epoch, which delivery drops, and its reset clears the decoder at
+        // the next call.
+        guard let current = takeControl(), let ctx = codecContext else { return }
+        if let epoch, epoch != current { return }
         var sendRet = avcodec_send_packet(ctx, packet)
-        lock.unlock()
-
         if Self.disposition(forSendResult: sendRet) == .drainAndRetry {
-            drainDecodedFrames()
-            lock.lock()
-            // Audit DEC-1: the drain drops the lock between frames, so a flush can land in it.
-            if let epoch, epoch != _feedEpoch { lock.unlock(); return }
-            sendRet = codecContext == nil ? FFmpegErr.einval : avcodec_send_packet(ctx, packet)
-            lock.unlock()
+            drainDecodedFrames(ctx, epoch: current)
+            // Audit DEC-1: a flush can land in the drain.
+            guard isCurrent(current) else { return }
+            sendRet = avcodec_send_packet(ctx, packet)
         }
         if Self.disposition(forSendResult: sendRet) == .dropped, !loggedSendFailure {
             loggedSendFailure = true
@@ -466,24 +479,58 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                            category: .swPlayback)
         }
         // Drain regardless: a dropped packet does not invalidate frames the decoder already holds.
-        drainDecodedFrames()
+        drainDecodedFrames(ctx, epoch: current)
+    }
+
+    /// What the host's calls have left since the decode thread's last call, applied on the decode thread: a flush's
+    /// reset (the decoder's buffers, the consecutive-picture chains) and the discard switch. The current epoch, or nil
+    /// once the decoder is closed. Caller holds `gate`.
+    private func takeControl() -> UInt64? {
+        let pending = control.withLock { c -> Control in
+            defer { c.resetPending = false; c.resetFilterGraph = false; c.discard = nil }
+            return c
+        }
+        guard !pending.closed else { return nil }
+        if pending.resetPending {
+            // Deinterlacer temporal references are stale across seeks.
+            if pending.resetFilterGraph {
+                window?.reset()
+                inverseTelecine?.reset()
+            }
+            filmCadence?.reset()
+            chainRestartPending = false
+            if let ctx = codecContext { avcodec_flush_buffers(ctx) }
+        }
+        if let discard = pending.discard, let ctx = codecContext {
+            ctx.pointee.skip_frame = discard && !carriesDecodedCaptions ? AVDISCARD_NONREF : AVDISCARD_DEFAULT
+            if discard, window?.isActive == true || inverseTelecine != nil || filmCadence?.isActive == true {
+                chainRestartPending = true
+            }
+        }
+        return pending.epoch
+    }
+
+    /// The next delivery ticket of `epoch`'s line, which starts at 0. Decode thread.
+    private func takeTicket(_ epoch: UInt64) -> UInt64 {
+        if epoch != ticketEpoch {
+            ticketEpoch = epoch
+            nextTicket = 0
+        }
+        defer { nextTicket &+= 1 }
+        return nextTicket
     }
 
     /// Pull every frame the decoder can currently produce, through the deinterlacer when one is
     /// active. Exits on EAGAIN (needs more input) or EOF, the same condition the receive loop
     /// has always used.
-    private func drainDecodedFrames() {
-        lock.lock()
-        guard let ctx = codecContext else { lock.unlock(); return }
+    private func drainDecodedFrames(_ ctx: UnsafeMutablePointer<AVCodecContext>, epoch: UInt64) {
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
-        guard let f = frame else { lock.unlock(); return }
-        lock.unlock()
+        guard let f = frame else { return }
 
-        while true {
-            lock.lock()
-            guard codecContext != nil else { lock.unlock(); break }
+        // A flush between frames retires the rest: its reset clears the decoder at the next call.
+        while isCurrent(epoch) {
             let ret = avcodec_receive_frame(ctx, f)
-            guard ret >= 0 else { lock.unlock(); break }
+            guard ret >= 0 else { break }
 
             // AE#499: fill the fields the VUI left open from the container's declaration BEFORE any
             // consumer reads the frame, for the same reason the timestamp repair below runs here.
@@ -536,7 +583,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             if chainRestartPending {
                 if let threshold = skipUntilPTS,
                    CMTimeCompare(SourceTimestampBounds.cmTime(ticks: f.pointee.pts, timeBase: timeBase), threshold) < 0 {
-                    lock.unlock()
                     continue
                 }
                 window?.reset()
@@ -546,26 +592,22 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             }
 
             if let ivtc = inverseTelecine(for: f), let picture = hold(f) {
-                render(ivtc.push(picture).map { .picture($0.picture, pts: $0.pts) }, timeBase: ivtc.outputTimeBase)
-                lock.unlock()
+                render(ivtc.push(picture).map { .picture($0.picture, pts: $0.pts) }, timeBase: ivtc.outputTimeBase, epoch: epoch)
                 continue
             }
             let isInterlaced = (f.pointee.flags & AV_FRAME_FLAG_INTERLACED) != 0
             if let window, isInterlaced || window.isActive, let picture = hold(f) {
-                render(window.push(picture), timeBase: window.outputTimeBase)
-                lock.unlock()
+                render(window.push(picture), timeBase: window.outputTimeBase, epoch: epoch)
                 continue
             }
-            // emit() must stay under `lock`: close() releases the pool and the plans under the same lock.
-            emit(f, timeBase: timeBase)
-            lock.unlock()
+            emit(f, timeBase: timeBase, epoch: epoch)
         }
 
         av_frame_free(&frame)
     }
 
     /// The inverse-telecine chain for `f`'s stream when the load found film in it: made on the first picture, nil (and one
-    /// log line) when its format or size is not one inverse telecine takes. Caller holds `lock`.
+    /// log line) when its format or size is not one inverse telecine takes. Decode thread.
     private func inverseTelecine(for f: UnsafePointer<AVFrame>) -> InverseTelecine? {
         if let inverseTelecine { return inverseTelecine }
         guard let film = deinterlaceConfig.film, !loggedTelecineRefusal, let writer, let ctx = codecContext else { return nil }
@@ -594,7 +636,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// `f` held for the deinterlacer: a reference to the frame and where its planes are (the decoder's own slab, or a
     /// copy in one for rawvideo and libavcodec's paletted buffers). Nil when the deinterlacer does not take the
     /// format or the picture (planes under 3 columns or 4 lines, as FFmpeg's bwdif), which then goes out as decoded.
-    /// Caller holds `lock`.
+    /// Decode thread.
     private func hold(_ f: UnsafeMutablePointer<AVFrame>) -> BwdifWindow.Picture? {
         guard let allocator = writer?.allocator, deinterlaceFormat(f) != nil, let held = av_frame_clone(f) else { return nil }
         if let slab = allocator.slab(of: held), let planes = PlanarFrameFinisher.planes(of: held, in: slab) {
@@ -632,11 +674,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     /// Writes the window's outputs, all in one GPU submission, and emits them in order. Pictures before a seek's
     /// target and pictures without a timestamp (yadif's second field is `cur + next`, missing when either is) are not
-    /// written. Caller holds `lock`, as for `emit`.
-    private func render(_ outputs: [BwdifWindow.Output], timeBase tb: AVRational) {
+    /// written. Each output takes its delivery ticket here, in order, and reaches the host when the submission completes;
+    /// the pictures are held until then. Decode thread.
+    private func render(_ outputs: [BwdifWindow.Output], timeBase tb: AVRational, epoch: UInt64) {
         guard !outputs.isEmpty, let finisher = writer?.finisher else { return }
         var jobs: [PlanarFrameFinisher.Job] = []
-        var emits: [(frame: UnsafeMutablePointer<AVFrame>, pts: Int64, buffer: CVPixelBuffer)] = []
+        var emits: [(ticket: UInt64, frame: DeliveredFrame)] = []
         var held: [BwdifWindow.Picture] = []
         for output in outputs {
             let picture: BwdifWindow.Picture, pts: Int64
@@ -670,23 +713,31 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                                                    parity: parity, fieldParity: fieldParity, intra: intra),
                                       layout: formats.layout))
             }
-            guard let prepared else { continue }
+            guard let prepared, let frame = deliverable(picture.frame, timeBase: tb, pts: pts, buffer: prepared.buffer)
+            else { continue }
             jobs.append(.init(source: source, plan: prepared.plan, width: Int(picture.frame.pointee.width),
                               height: Int(picture.frame.pointee.height), buffer: prepared.buffer))
-            emits.append((picture.frame, pts, prepared.buffer))
+            emits.append((takeTicket(epoch), frame))
             held.append(picture)
         }
         guard !jobs.isEmpty else { return }
-        guard finisher.finish(jobs) else {
-            if !loggedFinishFailure {
-                loggedFinishFailure = true
+        let delivery = delivery
+        let failureLogged = finishFailureLogged
+        nonisolated(unsafe) let pictures = held
+        let tickets = emits
+        finisher.finish(jobs) { ok in
+            withExtendedLifetime(pictures) {}
+            if !ok, failureLogged.withLock({ logged in defer { logged = true }; return !logged }) {
                 EngineLog.emit("[SWDecoder] GPU deinterlace and finish failed (logged once)", category: .swPlayback)
             }
-            return
+            for e in tickets {
+                if ok { delivery.fulfil(ticket: e.ticket, epoch: epoch, e.frame) } else { delivery.skip(ticket: e.ticket, epoch: epoch) }
+            }
         }
-        for e in emits { emit(e.frame, timeBase: tb, pts: e.pts, finished: e.buffer) }
-        withExtendedLifetime(held) {}
     }
+
+    /// A deinterlaced or telecine-recovered picture's failed finish is logged once; set from the completion queue.
+    private let finishFailureLogged = OSAllocatedUnfairLock(initialState: false)
 
     /// End of source or a live seam: deliver what libavcodec and the deinterlacer still hold, then
     /// leave both ready to decode again. The protocol default did nothing here, so the host's
@@ -699,74 +750,79 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// the caller's `flush()`: the still extractor's `flush(resetFilterGraph: false)` would otherwise
     /// keep a graph that can never take another frame. The epoch is not moved, this is not a seek.
     func drainForEndOfStream() {
-        lock.lock()
-        guard let ctx = codecContext else { lock.unlock(); return }
-        let epoch = _feedEpoch
+        gate.lock()
+        guard let epoch = takeControl(), let ctx = codecContext else { gate.unlock(); return }
         var sendRet = avcodec_send_packet(ctx, nil)
-        lock.unlock()
         if Self.disposition(forSendResult: sendRet) == .drainAndRetry {
-            drainDecodedFrames()
-            lock.lock()
-            sendRet = codecContext == nil ? FFmpegErr.einval : avcodec_send_packet(ctx, nil)
-            lock.unlock()
+            drainDecodedFrames(ctx, epoch: epoch)
+            sendRet = avcodec_send_packet(ctx, nil)
         }
         // Exits on AVERROR_EOF once the decoder has handed over its last frame.
-        if sendRet >= 0 { drainDecodedFrames() }
-
-        lock.lock()
-        defer { lock.unlock() }
-        guard codecContext != nil else { return }
+        if sendRet >= 0 { drainDecodedFrames(ctx, epoch: epoch) }
         // A flush that landed during the drain retired this stream; its frames are not owed.
-        if epoch == _feedEpoch, let window, window.isActive {
-            render(window.finish(), timeBase: window.outputTimeBase)
+        if isCurrent(epoch), let window, window.isActive {
+            render(window.finish(), timeBase: window.outputTimeBase, epoch: epoch)
         }
-        if epoch == _feedEpoch, let ivtc = inverseTelecine {
-            render(ivtc.push(nil).map { .picture($0.picture, pts: $0.pts) }, timeBase: ivtc.outputTimeBase)
+        if isCurrent(epoch), let ivtc = inverseTelecine {
+            render(ivtc.push(nil).map { .picture($0.picture, pts: $0.pts) }, timeBase: ivtc.outputTimeBase, epoch: epoch)
         }
         window?.reset()
         inverseTelecine?.reset()
         filmCadence?.reset()
         avcodec_flush_buffers(ctx)
+        let finisher = writer?.finisher
+        gate.unlock()
+        // Every frame owed is out before this returns: the GPU's last submissions, then their delivery.
+        finisher?.waitUntilIdle()
+        delivery.barrier()
     }
 
-    /// Convert + deliver one decoded (or deinterlaced) frame: skip threshold, pixel buffer
-    /// extraction, HDR10+ side data, onFrame. Shared by the direct and deinterlaced paths.
-    /// `tb` is the time_base the frame's PTS rides on: the stream time_base for direct frames,
-    /// `BwdifWindow.outputTimeBase` for deinterlaced ones (halved, as FFmpeg's bwdif does; with
-    /// send_field the fields sit on odd/even ticks, so rescaling into the stream base would
-    /// collapse each pair to duplicate timestamps). `pts` replaces the frame's own (a deinterlaced picture's, on the
-    /// deinterlacer's base) and `finished` is its display buffer, already written.
-    private func emit(_ f: UnsafeMutablePointer<AVFrame>, timeBase tb: AVRational, pts: Int64? = nil,
-                      finished: CVPixelBuffer? = nil) {
-        // Per-frame autorelease pool: the decode/feed loops are single long-running dispatch
-        // blocks, so without this, ObjC transients (Metal command buffers, CV bridging)
-        // accumulate in the block's last-resort pool and only pop at session end, AFTER close()
-        // tore the session down, crashing the pop with an over-release (EXC_BAD_ACCESS in
-        // AutoreleasePoolPage::releaseUntil on engine.sw.feed), and bloating memory for the
-        // whole channel visit meanwhile.
-        autoreleasepool { emitInner(f, timeBase: tb, pts: pts ?? f.pointee.pts, finished: finished) }
+    /// Returns once every frame decoded so far has reached the host (or been dropped by a flush): the GPU's submissions
+    /// so far, then their delivery. For offline callers that read what `onFrame` collected (the probe, stills), never on a
+    /// playback path. Not from `onFrame` itself.
+    func awaitDelivered() {
+        gate.lock()
+        let finisher = writer?.finisher
+        gate.unlock()
+        finisher?.waitUntilIdle()
+        delivery.barrier()
     }
 
-    private func emitInner(_ f: UnsafeMutablePointer<AVFrame>, timeBase tb: AVRational, pts: Int64, finished: CVPixelBuffer?) {
+    /// One decoded frame to the host: past the skip threshold, prepared (its display buffer, with the stream's sample
+    /// aspect), its ticket taken, and its finish submitted; it reaches the host when the GPU completes. Decode thread.
+    private func emit(_ f: UnsafeMutablePointer<AVFrame>, timeBase tb: AVRational, epoch: UInt64) {
+        // Per-frame autorelease pool: the decode/feed loops are single long-running dispatch blocks, so without this,
+        // ObjC transients (Metal command buffers, CV bridging) accumulate in the block's last-resort pool and only pop at
+        // session end, after close() tore the session down.
+        autoreleasepool {
+            guard let writer,
+                  let prepared = prepare(f, planFormat: AVPixelFormat(rawValue: f.pointee.format),
+                                         interlaced: f.pointee.flags & AV_FRAME_FLAG_INTERLACED != 0,
+                                         grain: FilmGrainParameters(frame: f) != nil),
+                  let frame = deliverable(f, timeBase: tb, pts: f.pointee.pts, buffer: prepared.buffer) else { return }
+            let ticket = takeTicket(epoch)
+            let delivery = delivery
+            writer.finish(f, into: prepared) { written in
+                guard let written else { return delivery.skip(ticket: ticket, epoch: epoch) }
+                delivery.fulfil(ticket: ticket, epoch: epoch, DeliveredFrame(buffer: written, pts: frame.pts,
+                                                                             hdr10Data: frame.hdr10Data, dmNAL: nil))
+            }
+        }
+    }
+
+    /// What the host gets for a frame, or nil when it is before the skip threshold: its time on `tb`, the base `pts`
+    /// rides on (the stream's for a decoded frame, `BwdifWindow.outputTimeBase` for a deinterlaced one, halved as
+    /// FFmpeg's bwdif does, so send_field's fields keep distinct ticks), and its HDR10+ data. Reports the display
+    /// buffer's format. Decode thread.
+    private func deliverable(_ f: UnsafeMutablePointer<AVFrame>, timeBase tb: AVRational, pts: Int64,
+                             buffer: CVPixelBuffer) -> DeliveredFrame? {
         let cmPTS = SourceTimestampBounds.cmTime(ticks: pts, timeBase: tb)
         if let threshold = skipUntilPTS, cmPTS.isValid {
-            if CMTimeCompare(cmPTS, threshold) < 0 {
-                return
-            }
+            if CMTimeCompare(cmPTS, threshold) < 0 { return nil }
             // Compare-and-clear: a concurrent seek can install a new threshold; blindly nil-ing would discard it.
             clearSkip(ifStillAt: threshold)
         }
-
-        let pixelBuffer: CVPixelBuffer
-        if let finished {
-            pixelBuffer = finished
-        } else {
-            guard let made = finishFrame(f) else { return }
-            pixelBuffer = made
-        }
-
-        reportDecodedFormat(pixelBuffer: pixelBuffer)
-
+        reportDecodedFormat(pixelBuffer: buffer)
         // HDR10+: read dynamic metadata from post-decode AVFrame side data (T.35 SEI bytes).
         // Can't reuse the VT path's packet-side stash; this decoder owns its own packet flow.
         let hdr10PlusData = extractHDR10PlusBytes(from: f)
@@ -774,8 +830,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             seenHDR10Plus = true
             onFirstHDR10PlusDetected?()
         }
-
-        onFrame?(pixelBuffer, cmPTS, hdr10PlusData)
+        return DeliveredFrame(buffer: SendableBuffer(value: buffer), pts: cmPTS, hdr10Data: hdr10PlusData, dmNAL: nil)
     }
 
     /// #544: `resetFilterGraph: false` keeps the deinterlace graph across the flush. The still
@@ -789,20 +844,16 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
 
     func flush(resetFilterGraph: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        // AE#492: retires every packet a caller had already decided to send. Bumped under the lock,
-        // so a feed that has not reached `avcodec_send_packet` yet is refused from here on.
-        _feedEpoch &+= 1
-        // Deinterlacer temporal references are stale across seeks; drop the graph (lazily rebuilt on next interlaced frame).
-        if resetFilterGraph {
-            window?.reset()
-            inverseTelecine?.reset()
+        // AE#492: retires every packet a caller had already decided to send, and every frame not yet delivered. The
+        // delivery line is reset in the same step the epoch moves, so no frame of the new epoch can reach it first; the
+        // decode thread applies the reset itself at its next call.
+        control.withLock { c in
+            c.epoch &+= 1
+            c.resetPending = true
+            c.resetFilterGraph = c.resetFilterGraph || resetFilterGraph
+            delivery.resetAsync(epoch: c.epoch, nextTicket: 0)
         }
-        filmCadence?.reset()
-        chainRestartPending = false
-        guard let ctx = codecContext else { return }
-        avcodec_flush_buffers(ctx)
+        delivery.barrier()
     }
 
     /// Serialise HDR10+ dynamic metadata from AVFrame side data to T.35 SEI bytes (kCMSampleAttachmentKey_HDR10PlusPerFrameData).
@@ -835,7 +886,15 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
 
     func close() {
-        lock.lock()
+        control.withLock { c in
+            c.closed = true
+            c.epoch &+= 1
+            delivery.resetAsync(epoch: c.epoch, nextTicket: 0)
+        }
+        delivery.setOnFrame(nil)
+        // The one wait on the decode thread: its call in progress ends before the state goes. GPU work still in flight
+        // holds its own references (the finisher's slots, the held pictures) and is dropped at delivery.
+        gate.lock()
         window?.reset()
         inverseTelecine = nil
         if codecContext != nil {
@@ -843,9 +902,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         codecContext = nil
         writer = nil
-        // Nil onFrame inside the lock: emit() reads it under the same lock; unsynchronized write is a data race.
-        onFrame = nil
-        lock.unlock()
+        gate.unlock()
+        delivery.barrier()
     }
 
     deinit {
@@ -869,18 +927,13 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - AVFrame → CVPixelBuffer (GPU finisher)
 
-    /// The display buffer for one decoded picture (``DisplayBufferWriter/finish(_:)``), with the stream's sample aspect.
-    private func finishFrame(_ frame: UnsafeMutablePointer<AVFrame>) -> CVPixelBuffer? {
-        guard let pb = writer?.finish(frame) else { return nil }
-        attachPixelAspectRatio(from: frame, to: pb)
-        return pb
-    }
-
-    /// The finisher's plan and display buffer for `frame` (``DisplayBufferWriter/prepare(_:planFormat:interlaced:)``),
-    /// with the stream's sample aspect.
-    private func prepare(_ frame: UnsafeMutablePointer<AVFrame>, planFormat: AVPixelFormat,
-                         interlaced: Bool) -> (plan: PlanarFrameFinisher.Plan, buffer: CVPixelBuffer)? {
-        guard let prepared = writer?.prepare(frame, planFormat: planFormat, interlaced: interlaced) else { return nil }
+    /// The finisher's plan and display buffer for `frame` (``DisplayBufferWriter/prepare(_:planFormat:interlaced:grain:)``),
+    /// with the stream's sample aspect attached before any GPU work is committed for it.
+    private func prepare(_ frame: UnsafeMutablePointer<AVFrame>, planFormat: AVPixelFormat, interlaced: Bool,
+                         grain: Bool = false) -> (plan: PlanarFrameFinisher.Plan, buffer: CVPixelBuffer)? {
+        guard let prepared = writer?.prepare(frame, planFormat: planFormat, interlaced: interlaced, grain: grain) else {
+            return nil
+        }
         attachPixelAspectRatio(from: frame, to: prepared.buffer)
         return prepared
     }

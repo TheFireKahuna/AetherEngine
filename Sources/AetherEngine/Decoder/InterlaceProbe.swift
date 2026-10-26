@@ -134,7 +134,8 @@ enum InterlaceProbe {
     ) -> FilmCarriage? {
         guard let stream = demuxer.stream(at: streamIndex), let device = MTLCreateSystemDefaultDevice(),
               let allocator = DecodeFrameAllocator(device: device),
-              let kernels = try? DeinterlaceKernels(device: device) else { return nil }
+              let submitter = GPUSubmitter(device: device, label: "InterlaceProbe") else { return nil }
+        let kernels = DeinterlaceKernels(submission: DeinterlaceGPU(submitter))
         var pictures: [BwdifWindow.Picture] = []
         var shape: (format: AVPixelFormat, width: Int, height: Int)?
         var carriage = AVRational(num: 0, den: 1)

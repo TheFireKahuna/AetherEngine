@@ -275,27 +275,54 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     }
 
     let device: MTLDevice
-    let queue: MTLCommandQueue
+    /// Every submission of this finisher, LibDeinterlace's included.
+    let submitter: GPUSubmitter
     private let textureCache: CVMetalTextureCache
-    /// Constant luminance: the counter and coordinates of the pixels the fast path flagged, and the indirect dispatch
-    /// arguments for their recompute. Grown to the picture size, kept between frames.
-    private var flagged: MTLBuffer?
-    private let dispatchArguments: MTLBuffer
-    /// The last plan's luma table, uploaded once.
+    /// Bound where a kernel declares a buffer the plan does not use (the film grain tables without grain, the
+    /// constant-luminance list outside that mode). Never written.
+    private let placeholder: MTLBuffer
+    /// The last plan's luma table, uploaded once. Never written after it is made: a new table is a new buffer, and a
+    /// submission keeps the one it read (``Slot/retained``).
     private var lumaTable: (values: [Float], buffer: MTLBuffer)?
 
-    /// LibDeinterlace's kernels, on this finisher's device.
+    /// What a submission's GPU work reads after its commit, the CPU's writes into it included: a slot is taken for each
+    /// submission and given back by its completion, so the next frame never writes what the last one's work still
+    /// reads. Up to ``slotCount`` submissions are in flight; a further one waits for a slot.
+    private final class Slot: @unchecked Sendable {
+        /// Scratch pictures, one per field, grown to the largest field seen.
+        var scratch: [MTLBuffer] = []
+        /// Film grain tables, one per job, with what each holds: a repeated set (`show_existing_frame`) is not written
+        /// again.
+        var grain: [(buffer: MTLBuffer, holds: GrainKey?)] = []
+        /// Constant luminance, one per such job: the counter and coordinates of the pixels the fast path flagged, and
+        /// the indirect dispatch arguments for their recompute.
+        var lists: [MTLBuffer] = []
+        var arguments: [MTLBuffer] = []
+        /// What the work reads that its caller does not hold: the display buffers' textures, the luma table.
+        var retained: [AnyObject] = []
+    }
+
+    static let slotCount = 3
+    private let slotLock = NSLock()
+    private var freeSlots: [Slot] = []
+    private let slotsAvailable = DispatchSemaphore(value: PlanarFrameFinisher.slotCount)
+    private let inFlight = DispatchGroup()
+
+    /// LibDeinterlace's kernels, submitting through this finisher's submitter.
     let kernels: DeinterlaceKernels
 
     init(device: MTLDevice) throws {
         self.device = device
-        kernels = try DeinterlaceKernels(device: device)
-        guard let queue = device.makeCommandQueue() else { throw FinisherError.unavailable("no command queue") }
-        self.queue = queue
-        guard let arguments = device.makeBuffer(length: 16, options: .storageModePrivate) else {
+        guard let submitter = GPUSubmitter(device: device, label: "PlanarFrameFinisher") else {
+            throw FinisherError.unavailable("no GPU submission")
+        }
+        self.submitter = submitter
+        kernels = DeinterlaceKernels(submission: DeinterlaceGPU(submitter))
+        guard let placeholder = device.makeBuffer(length: 16, options: .storageModePrivate) else {
             throw FinisherError.unavailable("no buffer")
         }
-        dispatchArguments = arguments
+        self.placeholder = placeholder
+        freeSlots = (0..<Self.slotCount).map { _ in Slot() }
         var cache: CVMetalTextureCache?
         guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess, let cache
         else { throw FinisherError.unavailable("no texture cache") }
@@ -335,11 +362,11 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     }
 
     /// Writes the `width` x `height` picture in `planes` into `buffer` (a bi-planar buffer of the plan's output
-    /// format) and waits for the GPU. False when the planes break the plan's alignment, a texture cannot be made
-    /// for the buffer, or the GPU reports an error.
+    /// format): ``finish(_:completion:)`` for one job.
     func finish(_ planes: Planes, plan: Plan, width: Int, height: Int, into buffer: CVPixelBuffer,
-                grain: FilmGrainParameters? = nil) -> Bool {
-        finish([Job(source: .picture(planes), plan: plan, width: width, height: height, buffer: buffer, grain: grain)])
+                grain: FilmGrainParameters? = nil, completion: @escaping @Sendable (Bool) -> Void) {
+        finish([Job(source: .picture(planes), plan: plan, width: width, height: height, buffer: buffer, grain: grain)],
+               completion: completion)
     }
 
     // MARK: - Deinterlacing
@@ -411,53 +438,68 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         return (offsets, linesizes, max(length, 64))
     }
 
-    /// Scratch pictures, one per field of a submission, grown to the largest field seen and kept.
-    private var scratch: [MTLBuffer] = []
-
-    private func scratchBuffer(_ index: Int, length: Int) -> MTLBuffer? {
-        while scratch.count <= index {
+    private func scratchBuffer(_ slot: Slot, _ index: Int, length: Int) -> MTLBuffer? {
+        while slot.scratch.count <= index {
             guard let made = device.makeBuffer(length: length, options: .storageModeShared) else { return nil }
-            scratch.append(made)
+            slot.scratch.append(made)
         }
-        if scratch[index].length < length {
+        if slot.scratch[index].length < length {
             guard let made = device.makeBuffer(length: length, options: .storageModeShared) else { return nil }
-            scratch[index] = made
+            slot.scratch[index] = made
         }
-        return scratch[index]
+        return slot.scratch[index]
     }
 
-    /// Encodes `field`'s bwdif (LibDeinterlace) into the scratch picture `scratchIndex`, which it returns.
-    private func encodeField(_ field: Field, width: Int, height: Int, scratchIndex: Int,
-                             encoder: MTLComputeCommandEncoder) -> Planes? {
+    /// Encodes `field`'s bwdif (LibDeinterlace) into the slot's scratch picture `scratchIndex`, which it returns.
+    private func encodeField(_ field: Field, width: Int, height: Int, slot: Slot, scratchIndex: Int,
+                             pass: ComputePass) -> Planes? {
         let layout = Self.scratchLayout(layout: field.layout, width: width, height: height)
-        guard let buffer = scratchBuffer(scratchIndex, length: layout.length) else { return nil }
+        guard let buffer = scratchBuffer(slot, scratchIndex, length: layout.length) else { return nil }
         let out = Planes(buffer: buffer, offsets: layout.offsets, linesizes: layout.linesizes)
-        guard kernels.encodeBwdif(field.bwdif, layout: field.layout, width: width, height: height, into: out, encoder: encoder)
+        guard kernels.encodeBwdif(field.bwdif, layout: field.layout, width: width, height: height, into: out, pass: pass)
         else { return nil }
         return out
     }
 
     // MARK: - Submission
 
-    /// Writes every job and waits for the GPU once. The deinterlacer's dispatches of all the fields run together,
-    /// then, after one barrier, the finisher's dispatches of all the jobs: one command buffer, one wait, the GPU
-    /// filled by the work of both fields of a frame. A constant-luminance job, whose second and third dispatches read
-    /// the first's list, gets a command buffer of its own. False when any job fails.
-    func finish(_ jobs: [Job]) -> Bool {
-        var ok = true
-        let together = jobs.filter { !usesList($0.plan) }
-        if !together.isEmpty { ok = run(together, concurrent: true) && ok }
-        for job in jobs where usesList(job.plan) { ok = run([job], concurrent: false) && ok }
-        return ok
+    /// Writes every job in one batch and calls `completion` once, with whether every job was written: from the GPU's
+    /// completion (on its queue, which must not be blocked: hand off), or on the caller's thread when a job cannot be
+    /// encoded. The deinterlacer's dispatches of all the fields run together, then, after one barrier, the finisher's
+    /// dispatches of all the jobs, the GPU filled by the work of both fields of a frame; a constant-luminance job, whose
+    /// second and third dispatches read the first's list, comes last behind barriers of its own. Waits for a slot
+    /// when ``slotCount`` submissions are in flight. The caller keeps the jobs' sources and buffers alive until
+    /// `completion`.
+    func finish(_ jobs: [Job], completion: @escaping @Sendable (Bool) -> Void) {
+        guard !jobs.isEmpty else { return completion(true) }
+        slotsAvailable.wait()
+        let slot = slotLock.withLock { freeSlots.removeLast() }
+        slot.retained.removeAll()
+        let giveBack: @Sendable () -> Void = { [self] in
+            slotLock.withLock { freeSlots.append(slot) }
+            slotsAvailable.signal()
+        }
+        guard let batch = submitter.makeBatch() else {
+            giveBack()
+            return completion(false)
+        }
+        let encoded = encode(jobs, slot: slot, batch: batch)
+        inFlight.enter()
+        batch.commit { [self] result in
+            giveBack()
+            inFlight.leave()
+            completion(encoded && result.error == nil)
+        }
     }
+
+    /// Blocks until every submission made so far has completed: for the end of a stream, never per frame.
+    func waitUntilIdle() { inFlight.wait() }
 
     /// Codes above 12 bits go straight to the exact path in the kernel (PF_EXACT_ONLY): no list, no second pass.
     private func usesList(_ plan: Plan) -> Bool { plan.mode == .constantLuminance && plan.components[0][4] <= 12 }
 
-    private func run(_ jobs: [Job], concurrent: Bool) -> Bool {
-        guard let commands = queue.makeCommandBuffer(),
-              let encoder = commands.makeComputeCommandEncoder(dispatchType: concurrent ? .concurrent : .serial)
-        else { return false }
+    private func encode(_ jobs: [Job], slot: Slot, batch: GPUBatch) -> Bool {
+        guard let pass = batch.makePass() else { return false }
         var sources: [Planes] = []
         var fields = 0
         for job in jobs {
@@ -465,53 +507,66 @@ final class PlanarFrameFinisher: @unchecked Sendable {
             case .picture(let planes):
                 sources.append(planes)
             case .field(let field):
-                guard let planes = encodeField(field, width: job.width, height: job.height, scratchIndex: fields, encoder: encoder) else {
-                    encoder.endEncoding()
-                    return false
-                }
+                guard let planes = encodeField(field, width: job.width, height: job.height, slot: slot, scratchIndex: fields,
+                                               pass: pass) else { return false }
                 fields += 1
                 sources.append(planes)
             }
         }
-        if fields > 0 { encoder.memoryBarrier(scope: .buffers) }
-        var textures: [CVMetalTexture] = []
-        for (index, (job, planes)) in zip(jobs, sources).enumerated() {
-            guard let grain = grainTables(job.grain, plan: job.plan, width: job.width, height: job.height, index: index),
-                  let made = encodeFinish(planes, plan: job.plan, width: job.width, height: job.height, into: job.buffer,
-                                          grain: grain, encoder: encoder) else {
-                encoder.endEncoding()
-                return false
+        if fields > 0 { pass.barrier() }
+        var lists = 0
+        let order = jobs.indices.filter { !usesList(jobs[$0].plan) } + jobs.indices.filter { usesList(jobs[$0].plan) }
+        for index in order {
+            let job = jobs[index]
+            guard let grain = grainTables(job.grain, plan: job.plan, width: job.width, height: job.height, slot: slot, index: index)
+            else { return false }
+            var list: (counter: MTLBuffer, arguments: MTLBuffer)?
+            if usesList(job.plan) {
+                guard let made = listBuffers(slot, lists, capacity: job.width * job.height) else { return false }
+                list = made
+                lists += 1
             }
-            textures += made
+            guard encodeFinish(sources[index], plan: job.plan, width: job.width, height: job.height, into: job.buffer,
+                               grain: grain, list: list, slot: slot, pass: pass) else { return false }
         }
-        encoder.endEncoding()
-        commands.commit()
-        commands.waitUntilCompleted()
-        withExtendedLifetime((textures, sources.map(\.buffer))) {}
-        return commands.status == .completed
+        return true
     }
 
-    /// Encodes one picture's finishing dispatches; returns the buffer's textures, which must outlive the work.
+    /// The slot's list `index` for a constant-luminance job of `capacity` pixels, its counter zeroed.
+    private func listBuffers(_ slot: Slot, _ index: Int, capacity: Int) -> (counter: MTLBuffer, arguments: MTLBuffer)? {
+        while slot.lists.count <= index {
+            guard let list = device.makeBuffer(length: 4 * (capacity + 1), options: .storageModeShared),
+                  let arguments = device.makeBuffer(length: 16, options: .storageModePrivate) else { return nil }
+            slot.lists.append(list)
+            slot.arguments.append(arguments)
+        }
+        if slot.lists[index].length < 4 * (capacity + 1) {
+            guard let list = device.makeBuffer(length: 4 * (capacity + 1), options: .storageModeShared) else { return nil }
+            slot.lists[index] = list
+        }
+        slot.lists[index].contents().storeBytes(of: UInt32(0), as: UInt32.self)
+        return (slot.lists[index], slot.arguments[index])
+    }
+
+    /// Encodes one picture's finishing dispatches, the buffer's textures kept in the slot until the work completes.
+    /// `list` is a constant-luminance job's.
     private func encodeFinish(_ planes: Planes, plan: Plan, width: Int, height: Int, into buffer: CVPixelBuffer,
-                              grain: MTLBuffer, encoder: MTLComputeCommandEncoder) -> [CVMetalTexture]? {
+                              grain: MTLBuffer, list: (counter: MTLBuffer, arguments: MTLBuffer)?, slot: Slot,
+                              pass: ComputePass) -> Bool {
         for p in 0..<4 where plan.planeAlignment[p] > 1 {
             guard planes.offsets[p] % UInt32(plan.planeAlignment[p]) == 0,
-                  planes.linesizes[p] % UInt32(plan.planeAlignment[p]) == 0 else { return nil }
+                  planes.linesizes[p] % UInt32(plan.planeAlignment[p]) == 0 else { return false }
         }
         let wide = plan.wideOutput
         guard let pipeline = try? pipeline(for: plan),
               let luma = texture(buffer, plane: 0, format: wide ? .r16Uint : .r8Uint),
               let chroma = texture(buffer, plane: 1, format: wide ? .rg16Uint : .rg8Uint),
               let lumaTexture = CVMetalTextureGetTexture(luma), let chromaTexture = CVMetalTextureGetTexture(chroma)
-        else { return nil }
+        else { return false }
+        slot.retained += [luma, chroma]
 
-        let constantLuminance = usesList(plan)
+        let constantLuminance = list != nil
         let capacity = width * height
-        if constantLuminance, (flagged?.length ?? 0) < 4 * (capacity + 1) {
-            flagged = device.makeBuffer(length: 4 * (capacity + 1), options: .storageModeShared)
-        }
-        guard let list = constantLuminance ? flagged : (flagged ?? dispatchArguments) else { return nil }
-        if constantLuminance { list.contents().storeBytes(of: UInt32(0), as: UInt32.self) }
 
         // PFFrame: twelve 32-bit words, then the double-float rows, constant-luminance and transfer constants (float2,
         // 8-byte aligned from offset 48), the near-tie bound and the list capacity.
@@ -521,23 +576,24 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         for value in plan.rows + plan.cl + plan.tp + [plan.tieBound] { withUnsafeBytes(of: value) { frame.append(contentsOf: $0) } }
         withUnsafeBytes(of: UInt32(constantLuminance ? capacity : 0)) { frame.append(contentsOf: $0) }
 
-        encoder.setComputePipelineState(pipeline)
-        encoder.setBuffer(planes.buffer, offset: 0, index: 0)
-        frame.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 1) }
-        encoder.setBuffer(list, offset: 0, index: 2)
-        encoder.setBuffer(grain, offset: 0, index: 5)
+        pass.setPipeline(pipeline)
+        pass.setBuffer(planes.buffer, offset: 0, index: 0)
+        frame.withUnsafeBytes { pass.setBytes($0, index: 1) }
+        pass.setBuffer(list?.counter ?? placeholder, offset: 0, index: 2)
+        pass.setBuffer(grain, offset: 0, index: 5)
         if !plan.lumaTable.isEmpty {
             if lumaTable?.values != plan.lumaTable {
                 guard let made = device.makeBuffer(bytes: plan.lumaTable, length: 4 * plan.lumaTable.count, options: .storageModeShared)
-                else { return nil }
+                else { return false }
                 lumaTable = (plan.lumaTable, made)
             }
-            encoder.setBuffer(lumaTable!.buffer, offset: 0, index: 4)
+            slot.retained.append(lumaTable!.buffer)
+            pass.setBuffer(lumaTable!.buffer, offset: 0, index: 4)
         } else {
-            encoder.setBuffer(list, offset: 0, index: 4)
+            pass.setBuffer(placeholder, offset: 0, index: 4)
         }
-        encoder.setTexture(lumaTexture, index: 0)
-        encoder.setTexture(chromaTexture, index: 1)
+        pass.setTexture(lumaTexture, index: 0)
+        pass.setTexture(chromaTexture, index: 1)
         let w = pipeline.threadExecutionWidth
         // Convert and constant luminance run one thread per source chroma sample (its block of pixels).
         let blocks = plan.mode == .convert || plan.mode == .constantLuminance
@@ -545,55 +601,55 @@ final class PlanarFrameFinisher: @unchecked Sendable {
             ? MTLSize(width: (width + (1 << Int(plan.sourceLog2[0])) - 1) >> Int(plan.sourceLog2[0]),
                       height: (height + (1 << Int(plan.sourceLog2[1])) - 1) >> Int(plan.sourceLog2[1]), depth: 1)
             : MTLSize(width: chromaTexture.width, height: chromaTexture.height, depth: 1)
-        encoder.dispatchThreads(grid, threadsPerThreadgroup: MTLSize(width: w, height: max(1, pipeline.maxTotalThreadsPerThreadgroup / w), depth: 1))
-        if constantLuminance {
+        pass.dispatchThreads(grid, threadsPerThreadgroup: MTLSize(width: w, height: max(1, pipeline.maxTotalThreadsPerThreadgroup / w), depth: 1))
+        if let list {
             // The flagged pixels, sized on the GPU: one thread turns the count into indirect arguments, then each
-            // flagged pixel is recomputed in double-float. This job's encoder is serial, so the dispatches run in order.
+            // flagged pixel is recomputed in double-float, each step behind a barrier on the one before.
             guard let prepare = try? self.pipeline(for: plan, function: "pf_cl_prepare"),
-                  let correct = try? self.pipeline(for: plan, function: "pf_cl_correct") else { return nil }
-            encoder.setComputePipelineState(prepare)
-            encoder.setBuffer(dispatchArguments, offset: 0, index: 3)
-            encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
-            encoder.setComputePipelineState(correct)
-            encoder.setBuffer(lumaTable!.buffer, offset: 0, index: 4)
-            encoder.dispatchThreadgroups(indirectBuffer: dispatchArguments, indirectBufferOffset: 0,
-                                         threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+                  let correct = try? self.pipeline(for: plan, function: "pf_cl_correct") else { return false }
+            pass.barrier()
+            pass.setPipeline(prepare)
+            pass.setBuffer(list.arguments, offset: 0, index: 3)
+            pass.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            pass.barrier()
+            pass.setPipeline(correct)
+            pass.setBuffer(lumaTable!.buffer, offset: 0, index: 4)
+            pass.dispatchThreadgroups(indirectBuffer: list.arguments, offset: 0,
+                                      threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         }
-        return [luma, chroma]
+        return true
     }
 
     // MARK: - Film grain
 
-    /// The film grain tables of each job of a submission (``FilmGrainSynthesis``), grown to the largest frame and kept,
-    /// with what each holds: a repeated set (`show_existing_frame`) is not written again.
-    private var grainBuffers: [(buffer: MTLBuffer, holds: GrainKey?)] = []
-
-    private struct GrainKey: Equatable {
+    fileprivate struct GrainKey: Equatable {
         var parameters: FilmGrainParameters
         var width: Int
         var height: Int
     }
 
-    /// Job `index`'s grain tables, written for `grain` at `width` x `height`; for a plan without grain, a placeholder
-    /// the kernel never reads. Nil when the plan wants grain and the job carries none, or no buffer can be made.
-    private func grainTables(_ grain: FilmGrainParameters?, plan: Plan, width: Int, height: Int, index: Int) -> MTLBuffer? {
-        guard plan.grain else { return dispatchArguments }
+    /// Job `index`'s grain tables in `slot` (``FilmGrainSynthesis``), written for `grain` at `width` x `height`; for a
+    /// plan without grain, a placeholder the kernel never reads. Nil when the plan wants grain and the job carries none,
+    /// or no buffer can be made.
+    private func grainTables(_ grain: FilmGrainParameters?, plan: Plan, width: Int, height: Int, slot: Slot,
+                             index: Int) -> MTLBuffer? {
+        guard plan.grain else { return placeholder }
         guard let grain else { return nil }
         let length = FilmGrainSynthesis.bufferLength(width: width, height: height)
-        while grainBuffers.count <= index {
+        while slot.grain.count <= index {
             guard let made = device.makeBuffer(length: length, options: .storageModeShared) else { return nil }
-            grainBuffers.append((made, nil))
+            slot.grain.append((made, nil))
         }
-        if grainBuffers[index].buffer.length < length {
+        if slot.grain[index].buffer.length < length {
             guard let made = device.makeBuffer(length: length, options: .storageModeShared) else { return nil }
-            grainBuffers[index] = (made, nil)
+            slot.grain[index] = (made, nil)
         }
         let key = GrainKey(parameters: grain, width: width, height: height)
-        if grainBuffers[index].holds != key {
-            FilmGrainSynthesis.write(grain, width: width, height: height, into: grainBuffers[index].buffer.contents())
-            grainBuffers[index].holds = key
+        if slot.grain[index].holds != key {
+            FilmGrainSynthesis.write(grain, width: width, height: height, into: slot.grain[index].buffer.contents())
+            slot.grain[index].holds = key
         }
-        return grainBuffers[index].buffer
+        return slot.grain[index].buffer
     }
 
     private func texture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat) -> CVMetalTexture? {

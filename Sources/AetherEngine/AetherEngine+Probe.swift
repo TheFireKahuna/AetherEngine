@@ -418,11 +418,9 @@ extension AetherEngine {
         let decoder = SoftwareVideoDecoder()
         // Probe decodes a handful of frames and throws them away; it reports the decoder's own pictures.
         decoder.deinterlaces = false
-        // Class for captured-by-reference mutable accumulators; the onFrame closure fires SYNCHRONOUSLY on this same
-        // thread inside avcodec_send_packet / receive_frame (the probe drives decode inline, no demux thread). The
-        // DecodedFrameHandler is @Sendable for the off-actor playback path, so this single-threaded capture is an
-        // honest @unchecked Sendable exception.
-        final class Accum: @unchecked Sendable {
+        // What the frames say, filled on the decoder's delivery queue as each frame's GPU finish completes and read by
+        // this thread, so under a lock; read for the result once every frame decoded has been delivered.
+        struct Accum {
             var framesDecoded = 0
             var firstFramePixelFormat: String?
             var firstFrameWidth: Int = 0
@@ -432,15 +430,12 @@ extension AetherEngine {
             /// diagnostic rather than an allocation.
             var frameTimesSeconds: [Double] = []
         }
-        let accum = Accum()
+        let state = OSAllocatedUnfairLock(initialState: Accum())
 
         do {
             try decoder.open(stream: stream) { pixelBuffer, pts, _ in
-                accum.framesDecoded += 1
-                if accum.frameTimesSeconds.count < Self.probeFrameTimeCap {
-                    accum.frameTimesSeconds.append(pts.seconds)
-                }
-                if accum.firstFramePixelFormat == nil {
+                let first = state.withLock { $0.firstFramePixelFormat == nil }
+                let described: (format: String, width: Int, height: Int, color: String)? = first ? {
                     let pfType = CVPixelBufferGetPixelFormatType(pixelBuffer)
                     let bytes: [UInt8] = [
                         UInt8((pfType >> 24) & 0xff),
@@ -450,15 +445,24 @@ extension AetherEngine {
                     ]
                     let printable = bytes.map { ($0 >= 0x20 && $0 < 0x7f) ? $0 : 0x2e }
                     let fourCC = String(bytes: printable, encoding: .ascii) ?? "????"
-                    accum.firstFramePixelFormat = "\(fourCC) (0x\(String(pfType, radix: 16)))"
-                    accum.firstFrameWidth = CVPixelBufferGetWidth(pixelBuffer)
-                    accum.firstFrameHeight = CVPixelBufferGetHeight(pixelBuffer)
-                    accum.firstFrameColor = [
-                        kCVImageBufferColorPrimariesKey,
-                        kCVImageBufferTransferFunctionKey,
-                        kCVImageBufferYCbCrMatrixKey,
-                    ].map { (CVBufferCopyAttachment(pixelBuffer, $0, nil) as? String) ?? "-" }
-                        .joined(separator: " / ")
+                    return ("\(fourCC) (0x\(String(pfType, radix: 16)))", CVPixelBufferGetWidth(pixelBuffer),
+                            CVPixelBufferGetHeight(pixelBuffer),
+                            [kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrixKey]
+                                .map { (CVBufferCopyAttachment(pixelBuffer, $0, nil) as? String) ?? "-" }
+                                .joined(separator: " / "))
+                }() : nil
+                let seconds = pts.seconds
+                state.withLock { accum in
+                    accum.framesDecoded += 1
+                    if accum.frameTimesSeconds.count < Self.probeFrameTimeCap {
+                        accum.frameTimesSeconds.append(seconds)
+                    }
+                    if accum.firstFramePixelFormat == nil, let described {
+                        accum.firstFramePixelFormat = described.format
+                        accum.firstFrameWidth = described.width
+                        accum.firstFrameHeight = described.height
+                        accum.firstFrameColor = described.color
+                    }
                 }
             }
         } catch {
@@ -484,7 +488,7 @@ extension AetherEngine {
         var packetsFedToDecoder = 0
         var firstError: String?
 
-        while packetsRead < maxPackets, accum.framesDecoded < maxPackets {
+        while packetsRead < maxPackets, state.withLock({ $0.framesDecoded }) < maxPackets {
             do {
                 guard let packet = try demuxer.readPacket() else {
                     break  // EOF
@@ -503,7 +507,9 @@ extension AetherEngine {
                 break
             }
         }
+        decoder.awaitDelivered()
         decoder.flush()
+        let accum = state.withLock { $0 }
 
         return SoftwareDecodeProbeResult(
             codecName: codecName,
