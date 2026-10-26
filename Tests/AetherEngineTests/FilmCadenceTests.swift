@@ -14,8 +14,9 @@ struct FilmCadenceTests {
     private static let tb90k = AVRational(num: 1, den: 90000)
 
     /// Feeds (pts, repeat_pict, interlaced) and returns the timestamps out.
-    private static func run(_ pictures: [(Int64, Int32, Bool)], carriage: AVRational = ntsc) -> [Int64] {
-        let cadence = FilmCadence(timeBase: tb90k)
+    private static func run(_ pictures: [(Int64, Int32, Bool)], carriage: AVRational = ntsc,
+                            filmCoded: Bool = false) -> [Int64] {
+        let cadence = FilmCadence(timeBase: tb90k, filmCoded: filmCoded)
         return pictures.map { cadence.retime(pts: $0.0, interlaced: $0.2, repeatPict: $0.1, carriage: carriage) }
     }
 
@@ -39,6 +40,28 @@ struct FilmCadenceTests {
         // The pictures that confirm the run keep their own timestamps; from the fourth on, the grid.
         #expect(Array(out.prefix(3)) == input.prefix(3).map(\.0))
         for n in 3..<out.count { #expect(out[n] == Self.slot(n, anchor: 130505), "picture \(n)") }
+    }
+
+    @Test("a stream the load found to be film is on the grid from its first picture, whichever field it starts on")
+    func filmCodedFromTheFirstPicture() {
+        for skip in 0..<4 {
+            let input = Array(Self.fieldTimeline(20 + skip, start: 130505).dropFirst(skip))
+            let out = Self.run(input, filmCoded: true)
+            let anchor = input[0].0
+            for n in 0..<out.count {
+                #expect(out[n] == anchor + Self.slot(n), "starting \(skip) pictures in, picture \(n)")
+                #expect(abs(out[n] - input[n].0) <= 751, "within half a field of the field timeline, picture \(n)")
+            }
+        }
+    }
+
+    @Test("a stream the load found to be film still ends a run on a picture that breaks it, and starts the next there")
+    func filmCodedBreak() {
+        var input = Self.fieldTimeline(12)
+        for n in 6..<12 { input[n].0 += 90000 }
+        let out = Self.run(input, filmCoded: true)
+        for n in 0..<6 { #expect(out[n] == Self.slot(n)) }
+        for n in 6..<12 { #expect(out[n] == input[6].0 + Self.slot(n - 6), "picture \(n)") }
     }
 
     @Test("x264's pulldown timestamps (0, 4, 6, 8 fields in a cycle) are still the film run")

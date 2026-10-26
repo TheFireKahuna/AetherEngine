@@ -677,6 +677,9 @@ public final class AetherEngine: ObservableObject {
     /// Film in interlaced carriage, found by the load's sample (docs/software-route-gpu.md 6.4); the software host's
     /// decoder takes it in `DeinterlaceConfig.film`.
     var loadFilmCarriage: FilmCarriage? = nil
+    /// Soft telecine, found by the load's sample (docs/software-route-gpu.md 6.1); the decoder takes it in
+    /// `DeinterlaceConfig.softTelecine`.
+    var loadSoftTelecine = false
 
     /// `LoadOptions.felOverlay` was decided for this load: a FEL on the native route, its enhancement
     /// layer composed over AVPlayer's picture by `softwareOverlay`.
@@ -5023,6 +5026,7 @@ public final class AetherEngine: ObservableObject {
         // and seekable only, the sample moves the read position of the demuxer the session reuses.
         var filmRate: Double?
         loadFilmCarriage = nil
+        loadSoftTelecine = false
         if Self.filmDetection, probeOpened, !options.isLive, probe.isSourceSeekable, probe.videoStreamIndex >= 0,
            Self.carriesSoftTelecine(codecID: detectedCodecID, contentRate: detectedRate) {
             let videoIdx = probe.videoStreamIndex
@@ -5038,6 +5042,7 @@ public final class AetherEngine: ObservableObject {
             }
             if let rate {
                 filmRate = Double(rate.num) / Double(rate.den)
+                loadSoftTelecine = true
                 EngineLog.emit("[AetherEngine] soft telecine: film at \(rate.num)/\(rate.den) in "
                                + String(format: "%.3f", detectedRate ?? 0) + " fps carriage; the panel goes to the film rate",
                                category: .engine)
