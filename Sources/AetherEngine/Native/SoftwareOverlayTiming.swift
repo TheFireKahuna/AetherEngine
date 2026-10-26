@@ -2,19 +2,20 @@ import Foundation
 import AVFoundation
 import os
 import QuartzCore
+import IOSurface
+import CoreMedia
 #if os(macOS)
 import AppKit
 #endif
 
 /// The software overlay's timing as its pictures reach the screen: what a frame costs us, how early it reaches the
-/// renderer, and when the renderer actually displayed it.
+/// renderer, and how its picture fared on screen.
 ///
-/// The last comes from the renderer itself (`AVVideoPerformanceMetrics`), read at every refresh: how many frames it
-/// displayed and dropped, and the time accumulated between each displayed frame's presentation time and when it was
-/// displayed, which is never negative. A frame displayed at the first refresh at or after its time is less than a
-/// refresh late, at any display rate; a refresh or more late it missed that refresh, and the frame before it stayed
-/// on screen in its place. Its presentation time is its item time, so the delay is also the picture against the
-/// item's clock, the audio's.
+/// The last comes from each picture's buffer coming back (``SurfaceReturnWatch``): the compositor holds a buffer in
+/// use while it shows it and lets go once the next picture has replaced it, so the time between two pictures' returns
+/// is how long the second stayed on screen, in whole refreshes at any display rate (at a matched rate one each; two is
+/// a repeat, a picture whose buffer was never used was never shown). A return measured against the next picture's own
+/// time is the release lag, constant, plus how late the next picture came on: its spread is the jitter on screen.
 final class OverlayTiming: @unchecked Sendable {
     private let lock = NSLock()
     private var pictureMs: [Double] = []
@@ -28,17 +29,14 @@ final class OverlayTiming: @unchecked Sendable {
     private var refreshTimes: (first: Double, last: Double, count: Int)?
     /// The refresh interval as the display link gives it, `targetTimestamp - timestamp`.
     private var statedRefresh: Double?
-    /// The renderer's last totals, and the window's frames by how they were displayed.
-    private var rendererTotals: (frames: Int, dropped: Int, delay: Double)?
-    private var onTheirRefresh = 0
-    private var late = 0
-    private var dropped = 0
-    /// Each displayed frame's delay after its presentation time, in ms; a reading that covered several frames
-    /// gives their mean.
-    private var delayMs: [Double] = []
-    /// The least single-frame delay seen in the window: the delay of a frame on its refresh, the floor a reading
-    /// covering several frames is measured from.
-    private var leastDelay: Double?
+    /// The last picture returned: its item time, and the host and item clocks at its return.
+    private var lastReturn: (item: Double, host: Double, clock: Double)?
+    /// Pictures by the refreshes they stayed on screen, returned out of order, and never used.
+    private var onScreen: [Int: Int] = [:]
+    private var outOfOrder: [(item: Double, after: Double)] = []
+    private var neverShown = 0
+    /// Each return measured from the next picture's item time, in ms.
+    private var replacedMs: [Double] = []
 
     func made(ms: Double, leadMs lead: Double, frameDuration: Double?) {
         lock.withLock {
@@ -62,38 +60,28 @@ final class OverlayTiming: @unchecked Sendable {
         }
     }
 
-    /// The renderer's totals since it was created (`AVVideoPerformanceMetrics`): frames, frames dropped, and the
-    /// accumulated delay of the displayed ones in seconds. `refresh` is the display's refresh interval. Readings
-    /// can arrive out of order; an older one is ignored.
-    func rendererTotals(frames: Int, dropped totalDropped: Int, delay: Double, refresh: Double) {
+    /// The picture at `item` (item seconds) came back from the compositor at `host` (host seconds), the item clock
+    /// then reading `clock`; `next` is the item time of the picture after it, when one is queued. Only while the clock
+    /// runs at about real time does the time between returns count as time on screen (not across a pause, a seek or
+    /// a scan).
+    func returned(item: Double, host: Double, clock: Double, next: Double?) {
         lock.withLock {
-            guard let last = rendererTotals else {
-                rendererTotals = (frames, totalDropped, delay)
-                return
-            }
-            guard frames >= last.frames, totalDropped >= last.dropped, delay >= last.delay else {
-                if frames < last.frames { rendererTotals = (frames, totalDropped, delay) }
-                return
-            }
-            rendererTotals = (frames, totalDropped, delay)
-            let newlyDropped = totalDropped - last.dropped
-            let shown = frames - last.frames - newlyDropped
-            dropped += newlyDropped
-            guard shown > 0, refresh > 0 else { return }
-            let added = delay - last.delay
-            if shown == 1 {
-                delayMs.append(added * 1000)
-                leastDelay = min(leastDelay ?? added, added)
-                if added >= refresh { late += 1 } else { onTheirRefresh += 1 }
-            } else {
-                delayMs.append(added / Double(shown) * 1000)
-                let excess = added - Double(shown) * min(leastDelay ?? 0, refresh)
-                let missed = min(shown, max(0, Int((excess / refresh).rounded())))
-                late += missed
-                onTheirRefresh += shown - missed
-            }
+            defer { lastReturn = (item, host, clock) }
+            if let next { replacedMs.append((clock - next) * 1000) }
+            guard let last = lastReturn else { return }
+            if item < last.item { outOfOrder.append((item, last.item)); return }
+            let hostSpan = host - last.host, itemSpan = clock - last.clock
+            guard let refresh = statedRefresh, refresh > 0, hostSpan > 0, itemSpan / hostSpan > 0.5, itemSpan / hostSpan < 2
+            else { return }
+            onScreen[Int((hostSpan / refresh).rounded()), default: 0] += 1
         }
     }
+
+    /// A picture whose buffer the compositor never took: it was never on screen.
+    func neverUsed() { lock.withLock { neverShown += 1 } }
+
+    /// The presentation started over (a seek): the next return measures nothing against the last.
+    func restarted() { lock.withLock { lastReturn = nil } }
 
     /// One reading of the three clocks, at a display refresh.
     func clocks(host: Double, audio: Double?, item: Double, playing: Bool) {
@@ -154,14 +142,17 @@ final class OverlayTiming: @unchecked Sendable {
                 pictureMs.removeAll(keepingCapacity: true)
                 leadMs.removeAll(keepingCapacity: true)
                 refreshMs.removeAll(keepingCapacity: true)
-                delayMs.removeAll(keepingCapacity: true)
-                onTheirRefresh = 0
-                late = 0
-                dropped = 0
-                leastDelay = nil
+                replacedMs.removeAll(keepingCapacity: true)
+                onScreen.removeAll()
+                outOfOrder.removeAll()
+                neverShown = 0
             }
-            return "displayed (the renderer's timing): on their refresh \(onTheirRefresh), a refresh or more late \(late), "
-                + "dropped \(dropped); delay after their time \(Self.spread(delayMs)); "
+            let refreshes = onScreen.keys.sorted().map { "\($0): \(onScreen[$0]!)" }.joined(separator: ", ")
+            let disorder = outOfOrder.prefix(4).map { String(format: "%.3f after %.3f s", $0.item, $0.after) }
+            return "on screen (buffers returned): pictures by refreshes on screen [\(refreshes)], "
+                + "out of order \(outOfOrder.count)\(disorder.isEmpty ? "" : " (\(disorder.joined(separator: ", ")))"), "
+                + "never shown \(neverShown); "
+                + "replaced after the next picture's time \(Self.spread(replacedMs)); "
                 + "refresh interval \(Self.spread(refreshMs)); picture \(Self.spread(pictureMs)); lead \(Self.spread(leadMs))"
         }
     }
@@ -171,6 +162,88 @@ final class OverlayTiming: @unchecked Sendable {
         guard !values.isEmpty else { return "-" }
         let sorted = values.sorted()
         return String(format: "%.1f/%.1f/%.1f ms", sorted.first!, sorted[sorted.count / 2], sorted.last!)
+    }
+}
+
+/// The overlay's pictures as the compositor gives their buffers back: each enqueued picture's IOSurface is watched,
+/// and once the compositor has held it in use (`IOSurfaceIsInUse`, the count a buffer pool waits on before it reuses a
+/// surface) and let it go, the picture has been on screen and replaced. Read every millisecond on a thread of its
+/// own. A buffer never taken within `neverUsedAfter` was never shown; pictures flushed by a restart are dropped
+/// unwatched.
+final class SurfaceReturnWatch: @unchecked Sendable {
+    static let pollInterval = 0.001
+    static let neverUsedAfter = 2.0
+
+    private struct Watched {
+        let surface: IOSurfaceRef
+        let item: Double
+        let since: CFTimeInterval
+        var used = false
+    }
+
+    private let lock = NSLock()
+    private var watched: [Watched] = []
+    private var thread: Thread?
+    private let itemTimebase: CMTimebase
+    private let timing: OverlayTiming
+
+    init(itemTimebase: CMTimebase, timing: OverlayTiming) {
+        self.itemTimebase = itemTimebase
+        self.timing = timing
+    }
+
+    func watch(_ surface: IOSurfaceRef, item: Double) {
+        lock.withLock { watched.append(Watched(surface: surface, item: item, since: CACurrentMediaTime())) }
+    }
+
+    /// The layer was flushed: what it held is never shown.
+    func clear() {
+        lock.withLock { watched.removeAll() }
+        timing.restarted()
+    }
+
+    func start() {
+        let thread = Thread { [self] in
+            while !Thread.current.isCancelled {
+                Thread.sleep(forTimeInterval: Self.pollInterval)
+                poll()
+            }
+        }
+        thread.qualityOfService = .userInteractive
+        thread.name = "aether.software-overlay.surface-returns"
+        thread.start()
+        self.thread = thread
+    }
+
+    func stop() { thread?.cancel() }
+
+    private func poll() {
+        let now = CACurrentMediaTime()
+        var returned: [(item: Double, next: Double?)] = []
+        var neverUsed = 0
+        lock.withLock {
+            var kept: [Watched] = []
+            for var entry in watched {
+                if IOSurfaceIsInUse(entry.surface) {
+                    entry.used = true
+                    kept.append(entry)
+                } else if entry.used {
+                    returned.append((entry.item, nil))
+                } else if now - entry.since > Self.neverUsedAfter {
+                    neverUsed += 1
+                } else {
+                    kept.append(entry)
+                }
+            }
+            watched = kept
+            let waiting = kept.map(\.item)
+            returned = returned.sorted { $0.item < $1.item }.map { r in (r.item, waiting.filter { $0 > r.item }.min()) }
+        }
+        guard !returned.isEmpty || neverUsed > 0 else { return }
+        let clock = CMSyncConvertTime(CMTime(seconds: now, preferredTimescale: 1_000_000_000),
+                                      from: CMClockGetHostTimeClock(), to: itemTimebase).seconds
+        for r in returned { timing.returned(item: r.item, host: now, clock: clock, next: r.next) }
+        for _ in 0..<neverUsed { timing.neverUsed() }
     }
 }
 

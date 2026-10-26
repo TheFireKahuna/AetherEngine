@@ -119,6 +119,8 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
     private var boundsObservation: NSKeyValueObservation?
     private var gravityObservation: NSKeyValueObservation?
     private let timing = OverlayTiming()
+    /// The pictures' buffers coming back from the compositor: how they fared on screen (``SurfaceReturnWatch``).
+    private var returns: SurfaceReturnWatch?
     /// The renderer's own stages per frame: the refresh on the render queue, taking AVPlayer's frame, handing it to
     /// the source, and the made picture's hop back to the render queue.
     private let stages = StageTimes()
@@ -200,6 +202,9 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         readyObservation = nil
         item.add(output)
         self.itemTimebase = itemTimebase
+        let returns = SurfaceReturnWatch(itemTimebase: itemTimebase, timing: timing)
+        returns.start()
+        self.returns = returns
         audioClock = Self.audioOutputClock() ?? CMTimebaseCopyUltimateSourceClock(itemTimebase)
         var timebase: CMTimebase?
         CMTimebaseCreateWithSourceTimebase(allocator: kCFAllocatorDefault, sourceTimebase: itemTimebase, timebaseOut: &timebase)
@@ -274,6 +279,7 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         gravityObservation = nil
         displayLink?.stop()
         displayLink = nil
+        returns?.stop()
         if let jumpObserver { NotificationCenter.default.removeObserver(jumpObserver) }
         jumpObserver = nil
         if let item, item.outputs.contains(output) { item.remove(output) }
@@ -584,18 +590,10 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         lastPulled = frameTime
     }
 
-    /// This refresh: the renderer's totals of what it displayed and when (``OverlayTiming``), and the clocks.
+    /// This refresh's interval, and the clocks (``OverlayTiming``).
     private func measure(at timestamp: CFTimeInterval, duration: CFTimeInterval, itemTimebase: CMTimebase) {
         let playing = CMTimebaseGetRate(itemTimebase) != 0
         timing.refresh(at: timestamp, stated: duration)
-        if playing {
-            let timing = self.timing
-            videoRenderer.loadVideoPerformanceMetrics { metrics in
-                guard let metrics else { return }
-                timing.rendererTotals(frames: metrics.totalNumberOfFrames, dropped: metrics.numberOfDroppedFrames,
-                                      delay: metrics.totalAccumulatedFrameDelay, refresh: duration)
-            }
-        }
         timing.clocks(host: CMClockGetTime(CMClockGetHostTimeClock()).seconds,
                       audio: audioClock.map { CMClockGetTime($0).seconds },
                       item: CMTimebaseGetTime(itemTimebase).seconds, playing: playing)
@@ -607,6 +605,7 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         EngineLog.emit("[SoftwareOverlay] restart: \(reason); \(queued.count) queued, \(making) being made, last taken "
                        + (lastPulled.isValid ? String(format: "%.3f s", lastPulled.seconds) : "none"), category: .swPlayback)
         rendererIO.flush(removingDisplayedImage: false)
+        returns?.clear()
         videoRenderer.presentationTimeExpectation = .monotonicallyIncreasing
         lastPulled = .invalid
         lastQueued = .invalid
@@ -642,7 +641,12 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
             return
         }
         lastQueued = presentation
-        if !followsHost { queued.append(presentation) }
+        if !followsHost {
+            queued.append(presentation)
+            if let surface = CVPixelBufferGetIOSurface(picture)?.takeUnretainedValue() {
+                returns?.watch(surface, item: frameTime.seconds)
+            }
+        }
         countersLock.withLock { _counters.presented += 1 }
         onPresented?(frameTime, picture)
     }

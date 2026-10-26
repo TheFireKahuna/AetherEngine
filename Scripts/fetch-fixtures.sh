@@ -470,6 +470,17 @@ avsync_clip pcm.mkv "$AVSYNC_STEREO" -c:a pcm_s24le
 avsync_clip truehd.mkv "$AVSYNC_51" -c:a truehd -strict -2
 avsync_clip opus.mkv "$AVSYNC_STEREO" -c:a libopus
 avsync_clip mp3.mkv "$AVSYNC_STEREO" -c:a libmp3lame
+# The same frame and click with MPEG-2 video, which AVPlayer cannot decode: the session decodes it and the software
+# overlay shows it, so the picture's time comes through the overlay and the click's through the HLS route.
+ffmpeg -hide_banner -loglevel error -y -f lavfi -i "$AVSYNC_V" -f lavfi -i "$AVSYNC_STEREO" \
+    -c:v mpeg2video -q:v 4 -bf 2 -g 48 -pix_fmt yuv420p -c:a aac -b:a 192k "$FIXTURES_DIR/avsync/mpeg2-overlay.mkv"
+# The overlay's pictures read back off the screen (OverlayScreenTimingTests): MPEG-2 carrying each frame's number as
+# a 12-bit barcode across the top half (least significant bit on the left) and the white frame of the clips above in
+# the bottom half, with the same click at 1.000 s.
+AVSYNC_BARCODE="color=black:s=640x360:r=24:d=15,format=yuv420p,geq=lum='if(lt(Y,H/2),16+219*mod(floor(N/pow(2,floor(X*12/W))),2),if(eq(N,24),235,16))':cb=128:cr=128"
+ffmpeg -hide_banner -loglevel error -y -f lavfi -i "$AVSYNC_BARCODE" \
+    -f lavfi -i "aevalsrc='$AVSYNC_CLICK|$AVSYNC_CLICK':s=48000:d=15" \
+    -c:v mpeg2video -q:v 2 -bf 2 -g 48 -pix_fmt yuv420p -c:a aac -b:a 192k "$FIXTURES_DIR/avsync/mpeg2-barcode.mkv"
 # FFmpeg's DTS encoder delays its output by one frame (512 samples) and declares no padding, so FFmpeg's
 # own decode puts a click at 48 000 one frame late: the DTS clip's click goes in a frame early.
 AVSYNC_DTS_CLICK="if(between(n,47488,47631),0.8*sin(2*PI*1000*(n-47488)/48000),0)"
