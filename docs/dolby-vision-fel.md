@@ -310,8 +310,15 @@ layer (every retail FEL title's layout); a 1:1 enhancement layer is not detected
 width or height is unknown (not positive) is refused rather than budgeted at zero. A 24p UHD FEL master needs 80% of the budget. What is measured: the Mac soak runs in the PR
 description (M2 Pro, debug `aetherctl`), and, from earlier development builds on an Apple TV 4K 2nd
 generation, the composer's GPU time of 12.9-14.3 ms per frame against a 41.7 ms frame at 23.976 fps
-(§4.2, a debug build and a previous iteration of the pipeline, not this stack). The 311 Mpx/s ceiling,
-and 30 fps as a margin above 24p, are an assumption until the Apple TV run of this stack. UHD at 60 fps
+(§4.2, a debug build and a previous iteration of the pipeline, not this stack). On an Apple TV 4K (3rd
+generation, A15, tvOS 27.2, Release, sv22, `FelComposerDeviceBenchmarkTests`, 2026-10-27) a UHD composition
+back to back costs 5.9 ms of GPU time (luma 1.8, chroma 4.1). Paced the way playback submits it the same
+work reads 6.8 ms at a batch every 8 ms, 15.8 at 16.7 ms, 20.5 at 25 ms and 17.0 at 41.7 ms (one 24p frame):
+the GPU's clock follows its load, and one composition a frame with the overlay's third of a second of lead
+gives it no reason to rise. So the 18-25 ms the playing overlay's `gpu` stage shows is the work at a low
+clock, not its cost; the cost at full clock is 5.9 ms, 14% of a 24p frame, and the stretched time is
+headroom. The 311 Mpx/s ceiling, and 30 fps as a margin above 24p, are an assumption until a 30 fps
+title is run. UHD at 60 fps
 (200%) and 8K fall back.
 
 A Profile 7 load logs exactly one line, whichever way it goes (other sources log nothing here):
