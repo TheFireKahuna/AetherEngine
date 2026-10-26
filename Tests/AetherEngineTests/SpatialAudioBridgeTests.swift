@@ -25,6 +25,10 @@ struct SpatialAudioBridgeTests {
         let framesPerAU = 40
         var skipAfterReset: Int
         var dropAt: (push: Int, count: Int)?
+        /// The stream clock (TrueHD's output_timing, below 2^16) at the first input frame since the last reset,
+        /// or nil for a stream without one; it counts on with the input from there without wrapping, as the
+        /// real decoder's `clockFrame` does, and only its value modulo 2^16 is the stream's.
+        var clockAtReset: Int64?
         private var pushes = 0
         private var skipped = 0
         private var inputFrames: Int64 = 0
@@ -34,9 +38,10 @@ struct SpatialAudioBridgeTests {
         private let planes: [UnsafeMutablePointer<Float>] = (0..<3).map { _ in .allocate(capacity: 1 << 16) }
         private var t = 0
 
-        init(skipAfterReset: Int, dropAt: (push: Int, count: Int)? = nil) {
+        init(skipAfterReset: Int, dropAt: (push: Int, count: Int)? = nil, clockAtReset: Int64? = nil) {
             self.skipAfterReset = skipAfterReset
             self.dropAt = dropAt
+            self.clockAtReset = clockAtReset
         }
         deinit { planes.forEach { $0.deallocate() } }
 
@@ -76,7 +81,8 @@ struct SpatialAudioBridgeTests {
                 updates: [.init(frameOffset: 0, rampFrames: b.frames,
                                 states: [.init(), .init(), .init(position: SIMD3(x, 0.5, 1))])],
                 sourcePts: b.stamp?.0, sourcePtsInputFrame: b.stamp?.1 ?? 0,
-                clockFrame: nil, gridFrames: framesPerAU)
+                clockFrame: clockAtReset.map { $0 + b.offset }, gridFrames: framesPerAU,
+                clockModulus: clockAtReset.map { _ in 1 << 16 })
         }
 
         func reset() { skipped = 0; inputFrames = 0; blocks = []; pushes = 0; stamp = nil }
@@ -474,6 +480,92 @@ struct SpatialAudioBridgeTests {
         #expect(after.frameOffset == 50 && after.rampFrames == 200, "past the cut it only moves")
         let done = update.droppingFirst(400)
         #expect(done.frameOffset == 0 && done.rampFrames == 0, "a ramp over before the cut is a jump to its target")
+    }
+
+    /// Feeds 20 ms packets (24 access units) with the given timestamps on a 1/1000 time base.
+    private func feed(_ bridge: some AudioTranscodingBridge, pts: [Int64]) throws -> [Int64] {
+        var out: [Int64] = []
+        var payload = [UInt8](repeating: 0, count: 24)
+        for t in pts {
+            guard let pkt = av_packet_alloc() else { continue }
+            defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
+            payload.withUnsafeMutableBytes { raw in
+                _ = av_new_packet(pkt, 24)
+                pkt.pointee.data.update(from: raw.bindMemory(to: UInt8.self).baseAddress!, count: 24)
+            }
+            pkt.pointee.pts = t
+            pkt.pointee.dts = t
+            for fp in try bridge.feed(packet: pkt) {
+                out.append(fp.pointee.pts)
+                var p: UnsafeMutablePointer<AVPacket>? = fp
+                trackedPacketFree(&p)
+            }
+        }
+        return out + drain(bridge)
+    }
+
+    /// A TrueHD stream from 0 whose clock reads 17 104 at its start, as measured on a library title, and a run
+    /// of it from 3600 s.
+    static let clockHead: Int64 = -17_104
+    static let runStartMs: Int64 = 3_600_000
+    @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
+    private func clockedBridge(clock: Bool) throws -> SpatialAudioBridge {
+        let start = Self.runStartMs * 48
+        let decoder = SyntheticDecoder(skipAfterReset: 0, clockAtReset: clock ? (start - Self.clockHead) % (1 << 16) : nil)
+        let bridge = try SpatialAudioBridge(srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: decoder)
+        bridge.setSourceStart(0)
+        if clock { bridge.setStreamClock(headOffset: Self.clockHead) }
+        return bridge
+    }
+
+    /// 100 packets from 3600 s: exact, or drifting up to 2 ms off and snapping back, the first one 96 ms early
+    /// (the first packet after a seek in a library title).
+    static func runTimestamps(drifting: Bool) -> [Int64] {
+        (0..<100).map { i in
+            let exact = runStartMs + Int64(i) * 20
+            guard drifting else { return exact }
+            if i == 0 { return exact - 96 }
+            return exact - Int64(i % 6) / 3 - (i % 25 == 0 ? 2 : 0)
+        }
+    }
+
+    @Test("the stream's clock places every block where exact timestamps put it, whatever the timestamps say")
+    func clockPlacesRegardlessOfTimestamps() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let exactOnGrid = try clockedBridge(clock: false), byClock = try clockedBridge(clock: true),
+            byClockDrifting = try clockedBridge(clock: true), onGridDrifting = try clockedBridge(clock: false)
+        defer { [exactOnGrid, byClock, byClockDrifting, onGridDrifting].forEach { $0.close() } }
+        let reference = try feed(exactOnGrid, pts: Self.runTimestamps(drifting: false))
+        #expect(reference.first == Self.runStartMs * 48)
+        #expect(try feed(byClock, pts: Self.runTimestamps(drifting: false)) == reference)
+        #expect(try feed(byClockDrifting, pts: Self.runTimestamps(drifting: true)) == reference)
+        // The grid has only the timestamps to go on.
+        #expect(try feed(onGridDrifting, pts: Self.runTimestamps(drifting: true)) != reference)
+    }
+
+    @Test("where the timestamps part from the clock for good, a splice, the rest of the run follows the timestamps")
+    func clockPartsAtASplice() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try clockedBridge(clock: true)
+        defer { bridge.close() }
+        // The container's timeline jumps 1 s ahead after packet 50; the stream's clock runs on.
+        let pts = (0..<100).map { i in Self.runStartMs + Int64(i) * 20 + (i < 50 ? 0 : 1_000) }
+        let out = try feed(bridge, pts: pts)
+        let end = (pts.last! + 20) * 48
+        // The last packet, presented 2048 frames before its stamp, reaches where the timestamps end.
+        #expect(abs(out.last! + 1024 - 2048 - end) < 1024)
+    }
+
+    @Test("a clock difference is brought into the wrap's window around zero")
+    func clockWindow() {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let m: Int64 = 1 << 16
+        #expect(SpatialAudioBridge.nearest(0, modulus: m) == 0)
+        #expect(SpatialAudioBridge.nearest(m + 5, modulus: m) == 5)
+        #expect(SpatialAudioBridge.nearest(-5, modulus: m) == -5)
+        #expect(SpatialAudioBridge.nearest(m / 2, modulus: m) == -m / 2)
+        #expect(SpatialAudioBridge.nearest(m / 2 - 1, modulus: m) == m / 2 - 1)
+        #expect(SpatialAudioBridge.nearest(-3 * m - 7, modulus: m) == -7)
     }
 
     @Test("a span the decoder drops is filled, so everything after it keeps its timestamp")

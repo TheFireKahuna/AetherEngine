@@ -132,6 +132,16 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     private var runBreakPending = false
     /// No stream start was given, so nothing can be placed; logged once.
     private var reportedNoSourceStart = false
+    /// Where the stream's own clock (TrueHD's output_timing) reads zero, counted from the stream's start, in
+    /// 48 kHz frames (`setStreamClock`); nil where the stream has no clock or its head could not be read.
+    /// With it, a block that carries the clock is placed by the clock, and timestamps only choose its window.
+    private var clockHeadOffset: Int64?
+    /// The run's last block placed by the clock: its position and its clock frame.
+    private var clockAnchor: (position: Int64, clock: Int64)?
+    /// Blocks in a row whose timestamp sits beyond the noise from where the clock places them.
+    private var clockDisagreements = 0
+    /// The clock and the timestamps parted for good, a splice: the grid places the rest of the run.
+    private var clockParted = false
     private var encoderStartFrame: Int64?
     private var encoderFramesIn: Int64 = 0
     /// Where a VOD segment's run puts the encoder's first frame (`startRun(atFrame:segment:)`), until the
@@ -439,6 +449,9 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
 #endif
         grid?.restart()
         runBreakPending = false
+        clockAnchor = nil
+        clockDisagreements = 0
+        clockParted = false
         encoderStartFrame = nil
         encoderFramesIn = 0
         pendingTrimFrames = 0
@@ -458,6 +471,17 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         opLock.lock()
         defer { opLock.unlock() }
         outputOffsetSeconds = seconds
+    }
+
+    /// Where the stream's clock reads zero from its start (`clockHeadOffset`), measured off the stream's
+    /// head: the first decoded block's `inputFrameOffset` less its `clockFrame`.
+    func setStreamClock(headOffset: Int64?) {
+        opLock.lock()
+        defer { opLock.unlock() }
+        clockHeadOffset = headOffset
+        clockAnchor = nil
+        clockDisagreements = 0
+        clockParted = false
     }
 
     func setSourceStart(_ pts: Int64?) {
@@ -620,8 +644,13 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
 #endif
 
     /// Caller holds `opLock`. Where `block` plays on the source timeline (48 kHz frames), or nil
-    /// while its run has had no timestamp.
+    /// while its run has had no timestamp: by the stream's clock where it has one, else on the grid.
     private func position(of block: ObjectAudioDecodedBlock) -> Int64? {
+        switch clockPlacement(of: block) {
+        case .placed(let position): return position
+        case .unplaced: return nil
+        case .notByClock: break
+        }
         if grid == nil {
             guard let sourceStart else {
                 if !reportedNoSourceStart {
@@ -639,9 +668,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             runBreakPending = false
             if block.clockFrame == nil { grid?.restart() }
         }
-        let estimate = block.sourcePts.map {
-            av_rescale_q($0, srcTimeBase, encoderTimeBase) + block.inputFrameOffset - block.sourcePtsInputFrame
-        }
+        let estimate = estimatedPosition(of: block)
         let (placement, restarted) = grid!.place(relative: block.clockFrame ?? block.inputFrameOffset, estimate: estimate)
         if restarted {
             // A timestamp no grid point of the run allows: the stream was cut here.
@@ -654,6 +681,71 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         }
         guard case .position(let at) = placement else { return nil }
         return at
+    }
+
+    /// Where `block` plays by the last container timestamp at or before it (48 kHz frames), nil before any.
+    private func estimatedPosition(of block: ObjectAudioDecodedBlock) -> Int64? {
+        block.sourcePts.map {
+            av_rescale_q($0, srcTimeBase, encoderTimeBase) + block.inputFrameOffset - block.sourcePtsInputFrame
+        }
+    }
+
+    private enum ClockPlacement {
+        case placed(Int64)
+        case unplaced
+        /// No clock to place by (none in the stream, not measured, or parted from the timestamps).
+        case notByClock
+    }
+
+    /// Caller holds `opLock`. Where the stream's clock puts `block`: its clock frame on the stream's start
+    /// (`clockHeadOffset`), in the window of the clock's wrap nearest the run's last block, or for a run's
+    /// first block its timestamp, which may be off by up to half the wrap (0.68 s at 48 kHz). A run of
+    /// `SourceGrid.phaseShiftTimestamps` blocks whose timestamps sit beyond the noise from it is a splice,
+    /// the clock no longer continuous with the container's timeline: the grid places the rest.
+    private func clockPlacement(of block: ObjectAudioDecodedBlock) -> ClockPlacement {
+        guard let head = clockHeadOffset, !clockParted, let clock = block.clockFrame,
+              let modulus = block.clockModulus, modulus > 0, let sourceStart else { return .notByClock }
+        if runBreakPending {
+            // The decoder started over: its clock is the stream's again from its next major sync, and the
+            // run's last block says nothing about the gap.
+            runBreakPending = false
+            clockAnchor = nil
+        }
+        let estimate = estimatedPosition(of: block)
+        let reference: Int64
+        if let anchor = clockAnchor {
+            // Only the clock modulo its wrap is the stream's, so the step from the last block is too.
+            reference = anchor.position + Self.nearest(clock - anchor.clock, modulus: modulus)
+        } else if let estimate {
+            reference = estimate
+        } else {
+            return .unplaced
+        }
+        let mapped = av_rescale_q(sourceStart, srcTimeBase, encoderTimeBase) + head + clock
+        let position = reference + Self.nearest(mapped - reference, modulus: modulus)
+        if let estimate {
+            let noise = SourceGrid.noise(tolerance: AudioContinuity.tolerance(sourceTimeBase: srcTimeBase,
+                                                                               sampleRate: Int32(Self.sampleRate)))
+            clockDisagreements = abs(position - estimate) > noise ? clockDisagreements + 1 : 0
+            if clockDisagreements >= SourceGrid.phaseShiftTimestamps {
+                clockParted = true
+                clockAnchor = nil
+                grid?.restart()
+                EngineLog.emit(
+                    "[SpatialAudioBridge] the stream's clock and its timestamps parted by "
+                    + "\(String(format: "%+.3f", Double(estimate - position) / Double(Self.sampleRate))) s "
+                    + "(a splice); the rest of the run is placed on the grid", category: .session)
+                return .notByClock
+            }
+        }
+        clockAnchor = (position, clock)
+        return .placed(position)
+    }
+
+    /// `difference` brought into the wrap's window around zero, [-modulus/2, modulus/2).
+    static func nearest(_ difference: Int64, modulus: Int64) -> Int64 {
+        let r = ((difference % modulus) + modulus) % modulus
+        return r >= (modulus + 1) / 2 ? r - modulus : r
     }
 
     /// Continue the encoder's input at `target` (a source position in 48 kHz frames): a short gap

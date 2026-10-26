@@ -36,6 +36,10 @@ struct ObjectAudioDecodedBlock {
     /// Frames per coded frame of the stream (a TrueHD access unit, a DTS frame): the step of the
     /// grid its frames sit on (`SourceGrid`).
     var gridFrames: Int
+    /// Where `clockFrame` repeats, in this block's frames: what the bitstream's clock holds before it
+    /// wraps (TrueHD's output_timing, 2^16 frames at the stream's rate). Only `clockFrame` modulo this
+    /// is the stream's; nil without a clock.
+    var clockModulus: Int64? = nil
 }
 
 /// A decoder that turns an object-audio bitstream (TrueHD with Atmos, DTS:X) into signals plus the
