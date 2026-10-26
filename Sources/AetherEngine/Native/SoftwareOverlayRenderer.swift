@@ -64,6 +64,8 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         public var late = 0
         /// Frames AVPlayer decoded that no refresh was chosen for.
         public var skipped = 0
+        /// Refreshes passed over because a later one was already waiting behind them.
+        public var staleRefreshes = 0
         /// Longest picture and longest gap between refreshes since the last log line, in ms.
         public var maxPictureMs = 0.0
         public var maxRefreshGapMs = 0.0
@@ -84,6 +86,8 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
     private var displayLink: OverlayDisplayLink?
     private var outputDelegate: OverlayOutputDelegate?
     private var lastNewFrame = CACurrentMediaTime()
+    /// The latest refresh the display link has handed to the render queue.
+    private let latestRefresh = OSAllocatedUnfairLock(initialState: UInt64(0))
     private var jumpObserver: NSObjectProtocol?
     private var readyObservation: NSKeyValueObservation?
     private var boundsObservation: NSKeyValueObservation?
@@ -186,7 +190,19 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
             let shownSurface = self.layer.sampleBufferRenderer.displayedPixelBuffer()
                 .flatMap { CVPixelBufferGetIOSurface($0)?.takeUnretainedValue() }
                 .map { IOSurfaceGetID($0) }
-            self.queue.async { self.refresh(at: timestamp, target: targetTimestamp, shownSurface: shownSurface) }
+            let sequence = self.latestRefresh.withLock { latest -> UInt64 in
+                latest &+= 1
+                return latest
+            }
+            self.queue.async {
+                // Only the newest refresh chooses a frame. A render queue held up (a compose slot, a long
+                // picture) would otherwise work through every refresh queued meanwhile, each choosing a frame
+                // for a moment already gone, and the picture would trail the audio by however many had piled up for as
+                // long as the queue stayed that far behind.
+                let stale = self.latestRefresh.withLock({ $0 }) != sequence
+                if stale { self.countersLock.withLock { self._counters.staleRefreshes += 1 } }
+                self.refresh(at: timestamp, target: targetTimestamp, shownSurface: shownSurface, choosesFrame: !stale)
+            }
         }
         let delegate = OverlayOutputDelegate { [weak self] in
             self?.lastNewFrame = CACurrentMediaTime()
@@ -259,7 +275,10 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
     /// One display refresh. `timestamp` is when the last frame displayed and `target` when the next one does,
     /// so `target - timestamp` is the actual refresh interval. What is on screen is measured; the frame for the
     /// refresh after `target` is chosen and made (one refresh of time to make it).
-    private func refresh(at timestamp: CFTimeInterval, target: CFTimeInterval, shownSurface: IOSurfaceID?) {
+    /// A stale refresh (`choosesFrame` false) is still measured, so the timing log sees every refresh, but
+    /// chooses no frame.
+    private func refresh(at timestamp: CFTimeInterval, target: CFTimeInterval, shownSurface: IOSurfaceID?,
+                         choosesFrame: Bool) {
         guard let itemTimebase else { return }
         let duration = target - timestamp
         if let lastRefresh {
@@ -268,6 +287,7 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         lastRefresh = timestamp
         measure(at: timestamp, duration: duration, shownSurface: shownSurface, itemTimebase: itemTimebase)
         logCountersIfDue()
+        guard choosesFrame else { return }
 
         // The documented use of the output: the item time for a coming refresh, and its frame if it is new.
         let presentAt = target + duration
@@ -492,6 +512,7 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
             return c
         }
         EngineLog.emit("[SoftwareOverlay] pulled \(c.pulled), presented \(c.presented), skipped \(c.skipped), late \(c.late), "
+                       + "stale refreshes \(c.staleRefreshes), "
                        + "not ready \(c.notReady), failed \(c.failed), "
                        + String(format: "max picture %.0f ms, max refresh gap %.0f ms; ", c.maxPictureMs, c.maxRefreshGapMs)
                        + source.logSummary(),
