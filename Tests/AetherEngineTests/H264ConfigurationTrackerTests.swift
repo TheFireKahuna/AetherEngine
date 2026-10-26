@@ -158,6 +158,7 @@ struct H264ConfigurationTrackerTests {
             if pkt.pointee.stream_index == dem.videoStreamIndex { decoder.decode(packet: pkt) }
             var owned: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&owned)
         }
+        decoder.awaitDelivered()
         #expect(result.frames.count == 72)
         #expect(Array(result.frames.prefix(24)) == Array(repeating: "128x96", count: 24))
         #expect(Array(result.frames.dropFirst(24).prefix(24)) == Array(repeating: "192x128", count: 24))
@@ -223,10 +224,11 @@ struct H264ConfigurationTrackerTests {
         try await engine.load(url: file, startPosition: 2.0,
             options: LoadOptions(suppressDisplayCriteria: true, autoplay: false))
         // The producer can discover the configuration change after load returns. Wait for
-        // the asynchronous takeover to settle before inspecting its route, event and position.
-        try await waitFor { engine.softwareHost != nil && engine.state == .paused }
+        // the asynchronous takeover to settle before inspecting its route, event and position:
+        // the session's video moves into the software overlay, over AVPlayer's placeholder.
+        try await waitFor { engine.nativeVideoSession?.overlayDecodeTap != nil && engine.state == .paused }
         #expect(engine.loadedOptions.preferredDecodePath == .software)
-        #expect(engine.softwareHost != nil)
+        #expect(engine.softwareHost == nil)
         #expect(events.count == 1)
         #expect(events.first?.absorbedFailure.underlyingDomain == SoftwarePathEscalation.videoConfigurationErrorDomain)
         #expect(events.first?.positionSeconds == 2.0)

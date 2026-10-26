@@ -59,6 +59,7 @@ struct SoftwareDecoderRangeTests {
             var p: UnsafeMutablePointer<AVPacket>? = pkt
             trackedPacketFree(&p)
         }
+        decoder.awaitDelivered()
         let buffer = try #require(box.first)
         #expect(CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
