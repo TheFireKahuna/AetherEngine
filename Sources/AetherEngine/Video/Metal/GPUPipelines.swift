@@ -25,12 +25,14 @@ final class GPUPipelines: @unchecked Sendable {
 
     private init(device: MTLDevice) {
         self.device = device
+        #if !targetEnvironment(simulator)
         if #available(macOS 26, iOS 26, tvOS 26, visionOS 26, *), device.supportsFamily(.metal4),
            let compiler = try? device.makeCompiler(descriptor: MTL4CompilerDescriptor()) {
             maker = Metal4PipelineMaker(device: device, compiler: compiler)
-        } else {
-            maker = Metal3PipelineMaker(device: device)
+            return
         }
+        #endif
+        maker = Metal3PipelineMaker(device: device)
     }
 
     /// `function` of `library`, specialised with `constants` (nil: a function without any), as a compute pipeline.
@@ -46,6 +48,8 @@ private protocol PipelineMaker: Sendable {
               archive: URL?) throws -> MTLComputePipelineState
 }
 
+// The simulators' SDKs have no Metal 4.
+#if !targetEnvironment(simulator)
 @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
 private final class Metal4PipelineMaker: PipelineMaker, @unchecked Sendable {
     private let device: MTLDevice
@@ -105,6 +109,7 @@ private final class Metal4PipelineMaker: PipelineMaker, @unchecked Sendable {
         return loaded?.archive
     }
 }
+#endif
 
 /// Metal 3 takes no Metal 4 archive: the device compiles.
 private final class Metal3PipelineMaker: PipelineMaker, @unchecked Sendable {
