@@ -123,7 +123,7 @@ enum InterlaceProbe {
     }
 
     /// Film in interlaced carriage (docs/software-route-gpu.md 6.4): decodes a sample, holds its pictures in slabs and
-    /// classifies them (``classifyFilm(_:kernels:allocator:format:width:height:timeBase:frameRate:)``). Nil for video, a
+    /// classifies them (``classifyFilm(_:submission:allocator:format:width:height:timeBase:frameRate:)``). Nil for video, a
     /// format inverse telecine does not take, a short sample or no Metal device. Moves the demuxer's read position.
     static func filmCarriage(
         demuxer: Demuxer,
@@ -135,7 +135,6 @@ enum InterlaceProbe {
         guard let stream = demuxer.stream(at: streamIndex), let device = MTLCreateSystemDefaultDevice(),
               let allocator = DecodeFrameAllocator(device: device),
               let submitter = GPUSubmitter(device: device, label: "InterlaceProbe") else { return nil }
-        let kernels = DeinterlaceKernels(submission: DeinterlaceGPU(submitter))
         var pictures: [BwdifWindow.Picture] = []
         var shape: (format: AVPixelFormat, width: Int, height: Int)?
         var carriage = AVRational(num: 0, den: 1)
@@ -151,7 +150,7 @@ enum InterlaceProbe {
             return true
         }
         guard sample.failure == nil, let shape, carriage.num > 0, carriage.den > 0 else { return nil }
-        return classifyFilm(pictures, kernels: kernels, allocator: allocator, format: shape.format, width: shape.width,
+        return classifyFilm(pictures, submission: DeinterlaceGPU(submitter), allocator: allocator, format: shape.format, width: shape.width,
                             height: shape.height, timeBase: stream.pointee.time_base, frameRate: carriage)
     }
 
@@ -159,23 +158,37 @@ enum InterlaceProbe {
     /// (calc_combed_score at least `combpel`): no picture combed and the pictures flagged interlaced is 2:2; combed
     /// pictures that the matcher makes progressive, with a duplicate in every full cycle of five, is 3:2; anything else
     /// is video (nil). Needs three cycles of pictures.
-    static func classifyFilm(_ pictures: [BwdifWindow.Picture], kernels: DeinterlaceKernels, allocator: DecodeFrameAllocator,
+    static func classifyFilm(_ pictures: [BwdifWindow.Picture], submission: DeinterlaceGPU, allocator: DecodeFrameAllocator,
                              format: AVPixelFormat, width: Int, height: Int, timeBase: AVRational,
                              frameRate: AVRational) -> FilmCarriage? {
         guard pictures.count >= 15, InverseTelecine.takes(format: format, width: width, height: height),
               let layout = PictureLayout(format: format) else { return nil }
+        let kernels = DeinterlaceKernels(submission: submission)
         func combed(_ p: PlaneSet) -> Bool {
             (kernels.combScore(src: p, other: p, srcParity: 0, layout: layout, width: width, height: height,
-                               cthresh: FieldMatcher.cthresh) ?? Int.max) >= FieldMatcher.combpel
+                               cthresh: InverseTelecine.cthresh) ?? Int.max) >= InverseTelecine.combpel
         }
         if !pictures.contains(where: { combed($0.storage.planes) }) {
             return pictures.allSatisfy(\.interlaced) ? .segmented22 : nil
         }
         guard let chain = InverseTelecine(kernels: kernels, makePicture: SoftwareVideoDecoder.slabMaker(allocator), format: format,
                                           width: width, height: height, timeBase: timeBase, frameRate: frameRate) else { return nil }
-        var out: [(picture: BwdifWindow.Picture, pts: Int64)] = []
-        for p in pictures { out += chain.push(p) }
-        let cycles = chain.decimator?.cycles ?? 0, duplicates = chain.decimator?.cyclesWithDuplicate ?? 0
+        // The sample through the chain, a batch a picture, waited for once: the decisions are read back at the end.
+        var outputs: [InverseTelecine.Output] = []
+        var held: [BwdifWindow.Picture] = []
+        let done = DispatchGroup()
+        for p in pictures {
+            guard let batch = submission.submitter.makeBatch(orderedAfterEarlierWork: true), let pass = batch.makePass() else { break }
+            let pushed = chain.push(p, into: pass)
+            outputs += pushed.outputs
+            held += pushed.touched
+            done.enter()
+            batch.commit { _ in done.leave() }
+        }
+        done.wait()
+        withExtendedLifetime(held) {}
+        let out = outputs.filter { chain.resolve($0) != nil }
+        let cycles = chain.cycles, duplicates = chain.cyclesWithDuplicate
         let stillCombed = out.filter { combed($0.picture.storage.planes) }.count
         if cycles >= 2, duplicates == cycles, stillCombed * 10 <= out.count { return .pulldown32 }
         return nil

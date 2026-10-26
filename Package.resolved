@@ -1,5 +1,5 @@
 {
-  "originHash" : "afbce7a713a98b09622bd0e29e09bcf0f3e2bd00ef4b84686056e680ca8b7605",
+  "originHash" : "ed6cd91e89cf5353537acee49f10800ec06bca4dbea6f51373a187e6bf3c0186",
   "pins" : [
     {
       "identity" : "ffmpegbuild",
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/TheFireKahuna/LibDeinterlace",
       "state" : {
-        "revision" : "15fd2e515226a38d0b4cf73086f1917dd8d84c33",
-        "version" : "1.1.0"
+        "revision" : "ff51a6c87e58baa1b97cecaaa57508c10718e82e",
+        "version" : "1.2.0"
       }
     },
     {
@@ -26,15 +26,6 @@
       "state" : {
         "revision" : "0173d6c9825497edecbb4fc756be4958032fa101",
         "version" : "2.2.0-fire.3"
-      }
-    },
-    {
-      "identity" : "libmlsubupscaler",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/TheFireKahuna/LibMLSubUpscaler",
-      "state" : {
-        "revision" : "c87b6cd373fa2b9764656458f830dfd118b8acb7",
-        "version" : "1.2.0"
       }
     },
     {

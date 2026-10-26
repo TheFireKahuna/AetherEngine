@@ -60,7 +60,7 @@ final class DisplayBufferWriter {
     /// A declared colour value CoreVideo has no constant for is named once.
     private var loggedUnmappedColor = false
     /// A failed GPU finish is logged once; set from the completion queue.
-    private let finishFailureLogged = OSAllocatedUnfairLock(initialState: false)
+    private let finishFailureLogged = OnceFlag()
 
     init(device: MTLDevice, streamIs10Bit: Bool, twelveBit420: SoftwareVideoDecoder.TwelveBit420Output,
          containerHDRStatic: HDRStaticMetadata, logTag: String) throws {
@@ -117,7 +117,7 @@ final class DisplayBufferWriter {
         finisher.finish(planes, plan: prepared.plan, width: width, height: height, into: prepared.buffer,
                         grain: FilmGrainParameters(frame: frame)) { ok in
             held.release()
-            if !ok, failureLogged.withLock({ logged in defer { logged = true }; return !logged }) {
+            if !ok, failureLogged.claim() {
                 EngineLog.emit("[\(tag)] GPU finish failed (logged once)", category: .swPlayback)
             }
             completion(ok ? written : nil)
