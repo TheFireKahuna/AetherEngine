@@ -371,12 +371,20 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         writer = made
         filmCadence = AetherEngine.filmDetection
             ? FilmCadence(timeBase: timeBase, filmCoded: deinterlaceConfig.softTelecine) : nil
+        let declaresInterlacing = VideoRoutingPolicy.interlacedFieldOrders.contains(codecpar.pointee.field_order)
         if deinterlaces {
             window = BwdifWindow(timeBase: timeBase, fieldRate: deinterlaceConfig.fieldRate == .field)
-            // A stream that declares interlacing makes the deinterlacer's pipelines now (inverse telecine's too, for a
-            // format it takes), off this thread, so its first field does not wait for them.
-            if VideoRoutingPolicy.interlacedFieldOrders.contains(codecpar.pointee.field_order) {
-                DispatchQueue.global(qos: .userInitiated).async { made.finisher.kernels.prewarm([sourceFormat]) }
+        }
+        // The pipelines this stream's first pictures will use, made now off this thread, so none waits for a compile:
+        // the finish of its own pictures (grained too for AV1, whose grain only its pictures declare), of the
+        // deinterlacer's fields and inverse telecine's outputs where it interlaces, and the deinterlacer's own.
+        if sourceFormat != AV_PIX_FMT_NONE {
+            let plans = Self.expectedPlans(codecpar, writer: made, deinterlaces: deinterlaces)
+            let film = deinterlaces && declaresInterlacing && deinterlaceConfig.film != nil
+            let deinterlacer = deinterlaces && declaresInterlacing
+            DispatchQueue.global(qos: .userInitiated).async {
+                for plan in plans { made.finisher.prewarm(plan, choosesSource: film) }
+                if deinterlacer { made.finisher.kernels.prewarm([sourceFormat]) }
             }
         }
 
@@ -1001,6 +1009,27 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
 
     // MARK: - AVFrame → CVPixelBuffer (GPU finisher)
+
+    /// The finisher's plans the first pictures of the stream `codecpar` describes will take, by what it declares: its
+    /// own pictures (grained too for AV1, whose grain only its pictures carry), and where it declares interlacing the
+    /// deinterlacer's fields when `deinterlaces`, its interlaced pictures as they are otherwise. Inverse telecine's
+    /// outputs are pictures of the stream's own plan. On the decoding thread (the writer's).
+    static func expectedPlans(_ codecpar: UnsafePointer<AVCodecParameters>, writer: DisplayBufferWriter,
+                              deinterlaces: Bool) -> [PlanarFrameFinisher.Plan] {
+        let format = AVPixelFormat(rawValue: codecpar.pointee.format)
+        var expected: [(planFormat: AVPixelFormat, interlaced: Bool, grain: Bool)] = [(format, false, false)]
+        if codecpar.pointee.codec_id == AV_CODEC_ID_AV1 { expected.append((format, false, true)) }
+        if VideoRoutingPolicy.interlacedFieldOrders.contains(codecpar.pointee.field_order) {
+            if deinterlaces, let planar = PlanarFrameFinisher.planarEquivalent(of: format) {
+                expected.append((planar, false, false))
+            } else {
+                expected.append((format, true, false))
+            }
+        }
+        return writer.expectedPlans(format: format, colour: ColorDescription(decoding: codecpar),
+                                    colorRange: codecpar.pointee.color_range, chromaLocation: codecpar.pointee.chroma_location,
+                                    width: Int(codecpar.pointee.width), height: Int(codecpar.pointee.height), expected: expected)
+    }
 
     /// The finisher's plan and display buffer for `frame` (``DisplayBufferWriter/prepare(_:planFormat:interlaced:grain:)``),
     /// with the stream's sample aspect attached before any GPU work is committed for it.
