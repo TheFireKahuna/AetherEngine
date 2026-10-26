@@ -2741,8 +2741,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             builtInPanelEngagesOnDemand: Self.builtInPanelEngagesOnDemand,
             frameRateKnown: frameRate != nil,
             videoCodecNeedsMasterSignaling: videoCodecNeedsMasterSignaling,
-            // The HLS Authoring Specification serves audio as a rendition (9.5, 9.6), and a rendition lives in
-            // the master: any audio is a reason to serve one where it plays.
+            // Audio is served as a rendition of its own, and a rendition lives in the master: any audio is a reason
+            // to serve one where it plays.
             hasAudioRendition: carriesAudio,
             hasIFrameRendition: iFrameCandidate.isServed)
         return (useMaster, iFrameCandidate, stillsAvailable)
