@@ -80,6 +80,9 @@ constant uint FC_BITDEPTH_RGB  [[function_constant(29)]];
 constant uint FC_TRANSFER      [[function_constant(30)]];
 // AV1 film grain (FilmGrainShaderSource) on every sample read, from the tables in buffer 5.
 constant bool FC_GRAIN         [[function_constant(31)]];
+// The source is one of two pictures of one layout, chosen on the GPU (inverse telecine's window passes its weave
+// through): `alt` when the word at `chosen` is nonzero.
+constant bool FC_CHOSEN_SOURCE [[function_constant(32)]];
 
 constant bool PF_DITHER = FC_FRACTION_BITS > 0u;
 constant uint PF_BLOCK_W = 1u << FC_OUT_LOG2_W;
@@ -312,6 +315,10 @@ static inline uint pf_r2(device const uchar* s, constant PFFrame& f, uint x, uin
 }
 
 // The picture and the film grain tables (bound to a placeholder when FC_GRAIN is off).
+static inline device const uchar* pf_source(device const uchar* src, device const uchar* alt, device const uint* chosen) {
+    return FC_CHOSEN_SOURCE && chosen[0] != 0u ? alt : src;
+}
+
 struct pf_src {
     device const uchar* p;
     device const uchar* g;
@@ -785,10 +792,12 @@ kernel void pf_finish(device const uchar*            src     [[buffer(0)]],
                       device atomic_uint*             list    [[buffer(2)]],
                       device const pf_luma_entry*     lut     [[buffer(4)]],
                       device const uchar*             grain   [[buffer(5)]],
+                      device const uchar*             alt     [[buffer(6)]],
+                      device const uint*              chosen  [[buffer(7)]],
                       texture2d<uint, access::write>  out_y   [[texture(0)]],
                       texture2d<uint, access::write>  out_c   [[texture(1)]],
                       uint2                           gid     [[thread_position_in_grid]]) {
-    pf_src s = pf_src{src, grain};
+    pf_src s = pf_src{pf_source(src, alt, chosen), grain};
     if (FC_MODE == 4u || FC_MODE == 5u) {
         // gid is a source chroma sample; its block of pixels.
         uint2 base = gid * uint2(PF_SRC_BW, PF_SRC_BH);
@@ -900,10 +909,12 @@ kernel void pf_cl_correct(device const uchar*            src     [[buffer(0)]],
                           device atomic_uint*             list    [[buffer(2)]],
                           device const pf_luma_entry*     lut     [[buffer(4)]],
                           device const uchar*             grain   [[buffer(5)]],
+                          device const uchar*             alt     [[buffer(6)]],
+                          device const uint*              chosen  [[buffer(7)]],
                           texture2d<uint, access::write>  out_y   [[texture(0)]],
                           texture2d<uint, access::write>  out_c   [[texture(1)]],
                           uint                            gid     [[thread_position_in_grid]]) {
-    pf_src s = pf_src{src, grain};
+    pf_src s = pf_src{pf_source(src, alt, chosen), grain};
     uint count = min(atomic_load_explicit(&list[0], memory_order_relaxed), f.list_capacity);
     if (gid >= count) { return; }
     uint packed = atomic_load_explicit(&list[1u + gid], memory_order_relaxed);
