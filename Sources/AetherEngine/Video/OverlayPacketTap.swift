@@ -274,7 +274,9 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
             let clock = Double(clockMs) / 1000
             state.unlock()
             guard let (packet, restart) = next else { continue }
-            decoder?.decode(packet, restarting: restart, clock: clock, timeBase: tb)
+            // A pool per unit: this thread's own drains only when it exits, and a picture's buffers and Metal objects
+            // would otherwise stay alive for the whole playback.
+            autoreleasepool { decoder?.decode(packet, restarting: restart, clock: clock, timeBase: tb) }
             var copy: UnsafeMutablePointer<AVPacket>? = packet
             trackedPacketFree(&copy)
         }
