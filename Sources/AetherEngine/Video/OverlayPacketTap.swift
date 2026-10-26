@@ -32,6 +32,10 @@ protocol OverlayTapDecoder: AnyObject {
 /// clock outside what has been fed (a seek, a new run) restarts it at the keyframe before the clock, the random-access
 /// points the segments are cut on. Units are kept `keepBehindSeconds` behind the clock, so a backward seek into
 /// segments the session still has cached (which the producer does not cut again) finds its packets.
+///
+/// A unit's packet is kept on disk (``SpilledPackets``), and only what the overlay asks of a unit stays in memory, so
+/// how far ahead the producer cuts costs disk, not memory. The producer parks while the tap is full
+/// (``hasRoomAhead``), so a unit it cuts ahead is never dropped before the clock reaches it.
 final class OverlayPacketTap<Info>: @unchecked Sendable {
 
     struct Unit: @unchecked Sendable {
@@ -48,8 +52,13 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
     }
 
     static var keepBehindSeconds: Double { 60 }
-    /// Ceiling on held units, about four minutes at 24p, whatever the producer's window.
-    static var maxEntries: Int { 6000 }
+    /// Units the tap holds before the producer parks (``hasRoomAhead``): the minute kept behind the clock and about
+    /// seven more ahead at 24p, which clears the furthest a subtitle consumer has the producer read
+    /// (`AetherEngine.subtitleReadAheadCeilingSeconds`).
+    static var maxEntries: Int { 12_000 }
+    /// Past this the tap drops units, those furthest from the clock first: only reached while the producer cannot
+    /// park, within the forward window AVPlayer is owed.
+    static var hardMaxEntries: Int { maxEntries + maxEntries / 4 }
 
     let decodeAheadSeconds: Double
     /// A clock this far behind the decode window has jumped back: the decode is past where it is needed. More than a
@@ -65,9 +74,10 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         let ptsMs: Int64
         let isKey: Bool
         let info: Info
-        var packet: UnsafeMutablePointer<AVPacket>?
+        let packet: SpilledPackets.Ref?
     }
 
+    private let spill = SpilledPackets()
     private let state = NSCondition()
     private var entries: [Int: Entry] = [:]            // by arrival sequence
     private var seqByPts: [Int64: Int] = [:]           // the latest cut of each presentation time
@@ -76,6 +86,8 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
     private var clockMs: Int64 = 0
     private var closed = false
     private var nextSeq = 0
+    /// The bytes of the packets the kept units hold on disk.
+    private var storedBytes = 0
 
     // Producer side, only touched by the one producer feeding at a time.
     private var lastRecordedDts: Int64?
@@ -101,12 +113,13 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         state.lock()
         guard !closed else { state.unlock(); return }
         closed = true
-        for entry in entries.values { var packet = entry.packet; trackedPacketFree(&packet) }
         entries.removeAll()
         seqByPts.removeAll()
         decoded.removeAll()
+        storedBytes = 0
         state.broadcast()
         state.unlock()
+        spill.close()
     }
 
     // MARK: - Producer
@@ -126,16 +139,20 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
     /// replaces the earlier cut.
     func insert(pts: Int64, timeBase: AVRational, isKey: Bool, info: Info, packet: UnsafeMutablePointer<AVPacket>?) {
         let ptsMs = Int64((Double(pts) * av_q2d(timeBase) * 1000).rounded())
+        var packet = packet
+        let stored = packet.flatMap { spill.write($0) }
+        trackedPacketFree(&packet)
         state.lock()
         defer { state.unlock() }
-        guard !closed else { var packet = packet; trackedPacketFree(&packet); return }
+        guard !closed else { return }
         self.timeBase = timeBase
         let seq = nextSeq
         nextSeq += 1
-        if let stale = seqByPts[ptsMs], var old = entries.removeValue(forKey: stale) { trackedPacketFree(&old.packet) }
-        entries[seq] = Entry(seq: seq, run: run, ptsMs: ptsMs, isKey: isKey, info: info, packet: packet)
+        if let stale = seqByPts[ptsMs], let old = entries.removeValue(forKey: stale) { storedBytes -= old.packet?.length ?? 0 }
+        entries[seq] = Entry(seq: seq, run: run, ptsMs: ptsMs, isKey: isKey, info: info, packet: stored)
+        storedBytes += stored?.length ?? 0
         seqByPts[ptsMs] = seq
-        if entries.count > Self.maxEntries { trimLocked() }
+        if entries.count > Self.hardMaxEntries { trimLocked() }
         state.broadcast()
     }
 
@@ -257,9 +274,16 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         return Double(clockMs) / 1000
     }
 
-    var held: (units: Int, decoded: Int) {
+    var held: (units: Int, decoded: Int, bytes: Int) {
         state.lock(); defer { state.unlock() }
-        return (entries.count, decoded.count)
+        return (entries.count, decoded.count, storedBytes)
+    }
+
+    /// Whether the producer may cut another unit: false once the tap holds ``maxEntries``, until the clock moves
+    /// on and the units it passes are dropped.
+    var hasRoomAhead: Bool {
+        state.lock(); defer { state.unlock() }
+        return entries.count < Self.maxEntries
     }
 
     // MARK: - Decoder
@@ -273,18 +297,19 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
             let tb = timeBase
             let clock = Double(clockMs) / 1000
             state.unlock()
-            guard let (packet, restart) = next else { continue }
+            guard let (stored, restart) = next else { continue }
+            var packet = SpilledPackets.read(stored)
+            guard let unit = packet else { continue }
             // A pool per unit: this thread's own drains only when it exits, and a picture's buffers and Metal objects
             // would otherwise stay alive for the whole playback.
-            autoreleasepool { decoder?.decode(packet, restarting: restart, clock: clock, timeBase: tb) }
-            var copy: UnsafeMutablePointer<AVPacket>? = packet
-            trackedPacketFree(&copy)
+            autoreleasepool { decoder?.decode(unit, restarting: restart, clock: clock, timeBase: tb) }
+            trackedPacketFree(&packet)
         }
     }
 
-    /// The next access unit to decode (a copy), and whether it starts a new decode. Nil when the decoder is far
+    /// Where the next access unit to decode is kept, and whether it starts a new decode. Nil when the decoder is far
     /// enough ahead, or the producer has not cut what comes next. Caller holds `state`.
-    private func nextPacketLocked() -> (UnsafeMutablePointer<AVPacket>, Bool)? {
+    private func nextPacketLocked() -> (SpilledPackets.Ref, Bool)? {
         let aheadMs = Int64(decodeAheadSeconds * 1000)
         let newestPictureMs = decoded.keys.max()
         let entry: Entry
@@ -309,7 +334,7 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
             guard let key = keyframeLocked(beforeOrAt: clockMs) else { return nil }
             entry = key; restart = true
         }
-        guard let packet = entry.packet, let copy = av_packet_clone(packet) else {
+        guard let packet = entry.packet else {
             lastFed = (entry.seq, entry.run)   // nothing to decode for this unit; step past it
             return nil
         }
@@ -321,7 +346,7 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         }
         lastFed = (entry.seq, entry.run)
         runLastPtsMs = max(runLastPtsMs, entry.ptsMs)
-        return (copy, restart)
+        return (packet, restart)
     }
 
     /// Whether the decode is short of the clock and a keyframe at or before the clock lies past everything fed:
@@ -361,13 +386,13 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         decoded = decoded.filter { $0.key >= shown }
     }
 
-    /// Drops decoded pictures the clock has passed, units further behind than `keepBehindSeconds`, and over the
-    /// ceiling those furthest from the clock. Caller holds `state`.
+    /// Drops decoded pictures the clock has passed, units further behind than `keepBehindSeconds`, and past
+    /// ``hardMaxEntries`` those furthest from the clock. Caller holds `state`.
     private func trimLocked() {
         trimDecodedLocked()
         let floor = clockMs - Int64(Self.keepBehindSeconds * 1000)
         var drop = entries.values.filter { $0.ptsMs < floor }.map(\.seq)
-        let excess = entries.count - drop.count - Self.maxEntries
+        let excess = entries.count - drop.count - Self.hardMaxEntries
         if excess > 0 {
             let dropped = Set(drop)
             drop += entries.values.filter { !dropped.contains($0.seq) }
@@ -375,9 +400,9 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
                 .prefix(excess).map(\.seq)
         }
         for seq in drop {
-            guard var entry = entries.removeValue(forKey: seq) else { continue }
+            guard let entry = entries.removeValue(forKey: seq) else { continue }
             if seqByPts[entry.ptsMs] == seq { seqByPts.removeValue(forKey: entry.ptsMs) }
-            trackedPacketFree(&entry.packet)
+            storedBytes -= entry.packet?.length ?? 0
         }
     }
 }

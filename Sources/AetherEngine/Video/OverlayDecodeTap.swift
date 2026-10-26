@@ -96,7 +96,10 @@ final class OverlayDecodeTap: @unchecked Sendable {
         units.advance(to: seconds)
     }
 
-    var held: (units: Int, decoded: Int) { units.held }
+    var held: (units: Int, decoded: Int, bytes: Int) { units.held }
+
+    /// Whether the producer may hand over another packet (``OverlayPacketTap/hasRoomAhead``).
+    var hasRoomAhead: Bool { units.hasRoomAhead }
 
     /// The run shift of the unit a caption's picture came from, read through the tap once it exists.
     private final class UnitShifts: @unchecked Sendable {

@@ -644,7 +644,8 @@ Sources/AetherEngine/
 │   ├── SegmentCache.swift                   Native path: producer/consumer segment store with backpressure, scrub-aware eviction + byte-budgeted VOD backward retention (restart-free back-seeks)
 │   ├── VTCapabilityProbe.swift              AV1 system-decode probe + per-format `canHardwareDecode` HW-decodability check for H.264 / HEVC profiles (Intel Macs, older chips, #2); gates codec routing (VP9 / VP8 / MPEG-4 Part 2 / MPEG-2 / VC-1 and interlaced H.264 always route SW, see VideoRoutingPolicy)
 │   ├── LiveCadencePolicy.swift              Turns the observed arrival cadence into the two LL-HLS decisions (served TARGETDURATION, blocking-reload eligibility), re-evaluated on every manifest render, instead of trusting a bursty origin's own number
-│   ├── PrefetchDiskBudget.swift             Disk bound for an opt-in whole-source prefetch: the hard window is never evicted, so the budget bounds only what lives outside it (#207)
+│   ├── PrefetchDiskBudget.swift             Disk bound for what the producer keeps ahead: the segments past the consumer's target and an overlay tap's units count against the session budget, and a full tap parks it too, never inside the ten segments AVPlayer is owed (#207)
+│   ├── SpilledPackets.swift                 The overlay taps' access units on disk until the clock reaches them: written once when cut, read back on the decode thread, in unlinked chunk files
 │   └── RetentionClaims.swift                Process-wide ledger of the running sessions' disk allowances: a new session is sized from the free space minus what the others may still write, so concurrent engines cannot each claim a quarter of the same space (#687)
 └── View/
     └── AetherPlayerView.swift               Polymorphic surface: hosts either AVPlayerLayer (native) or AVSampleBufferDisplayLayer (SW)

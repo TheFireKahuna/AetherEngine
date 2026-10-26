@@ -69,6 +69,22 @@ struct PrefetchDiskBudgetDecisionTests {
         #expect(PrefetchDiskBudget.shouldPark(forwardBytes: 5_000, budgetBytes: 1_000,
                                               head: 100, consumerTarget: 90) == true)
     }
+
+    @Test("what an overlay tap keeps for the units cut counts against the same budget")
+    func overlayBytesCount() {
+        #expect(PrefetchDiskBudget.shouldPark(forwardBytes: 600, overlayBytes: 399, budgetBytes: 1_000,
+                                              head: 100, consumerTarget: 80) == false)
+        #expect(PrefetchDiskBudget.shouldPark(forwardBytes: 600, overlayBytes: 400, budgetBytes: 1_000,
+                                              head: 100, consumerTarget: 80) == true)
+    }
+
+    @Test("a full overlay tap parks the producer, budget or not, but never inside the consumer's lead")
+    func fullTapParks() {
+        #expect(PrefetchDiskBudget.shouldPark(forwardBytes: 0, overlayFull: true, budgetBytes: 0,
+                                              head: 100, consumerTarget: 80) == true)
+        #expect(PrefetchDiskBudget.shouldPark(forwardBytes: 0, overlayFull: true, budgetBytes: 0,
+                                              head: 100, consumerTarget: 91) == false)
+    }
 }
 
 @Suite("SegmentCache prefetch footprint")
