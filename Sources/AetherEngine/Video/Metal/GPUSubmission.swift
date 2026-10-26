@@ -43,6 +43,14 @@ final class GPUSubmitter: @unchecked Sendable {
         backend.makeBatch(timed: timed, orderedAfterEarlierWork: orderedAfterEarlierWork)
     }
 
+    /// `function` of `library`, specialised with `constants`, as a compute pipeline: on Metal 4, made by the
+    /// submitter's compiler, which takes it from `archive` (a Metal 4 binary archive built ahead of time for this GPU and
+    /// OS release) when it holds it and compiles it otherwise; on Metal 3, compiled by the device.
+    func makeComputePipeline(library: MTLLibrary, function: String, constants: MTLFunctionConstantValues,
+                             archive: URL?) throws -> MTLComputePipelineState {
+        try backend.makeComputePipeline(library: library, function: function, constants: constants, archive: archive)
+    }
+
     /// A fence, for passes of this submitter's queue that depend on one another without the queue being ordered
     /// (``ComputePass/updateFence(_:)``, ``ComputePass/waitForFence(_:)``).
     func makeFence() -> MTLFence? { device.makeFence() }
@@ -126,6 +134,8 @@ extension ComputePass {
 protocol GPUBackend: AnyObject, Sendable {
     var api: String { get }
     func makeBatch(timed: Bool, orderedAfterEarlierWork: Bool) -> GPUBatch?
+    func makeComputePipeline(library: MTLLibrary, function: String, constants: MTLFunctionConstantValues,
+                             archive: URL?) throws -> MTLComputePipelineState
 }
 
 /// Bounds of what any of the engine's kernels binds: buffers up to index 8 (LibDeinterlace), textures up to 3.
@@ -207,14 +217,52 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
         }
     }
 
+    /// Makes every pipeline, looking in the archives it is given first.
+    private let compiler: MTL4Compiler
+    /// The archives loaded so far, by file; nil for one Metal refused (built for another OS release or GPU), logged once.
+    private let archives = OSAllocatedUnfairLock<[URL: Archive?]>(initialState: [:])
+    /// Only read once loaded (pipelines taken from it), which Metal allows from any thread.
+    private struct Archive: @unchecked Sendable { let archive: MTL4Archive }
+
+    func makeComputePipeline(library: MTLLibrary, function: String, constants: MTLFunctionConstantValues,
+                             archive: URL?) throws -> MTLComputePipelineState {
+        let named = MTL4LibraryFunctionDescriptor()
+        named.name = function
+        named.library = library
+        let specialised = MTL4SpecializedFunctionDescriptor()
+        specialised.functionDescriptor = named
+        specialised.constantValues = constants
+        let descriptor = MTL4ComputePipelineDescriptor()
+        descriptor.computeFunctionDescriptor = specialised
+        let options = MTL4CompilerTaskOptions()
+        if let archive, let loaded = loadArchive(archive) { options.lookupArchives = [loaded] }
+        return try compiler.makeComputePipelineState(descriptor: descriptor, compilerTaskOptions: options)
+    }
+
+    private func loadArchive(_ url: URL) -> MTL4Archive? {
+        if let known = archives.withLock({ $0[url] }) { return known?.archive }
+        let loaded: Archive?
+        do {
+            loaded = Archive(archive: try device.makeArchive(url: url))
+        } catch {
+            loaded = nil
+            EngineLog.emit("[GPUSubmitter] pipeline archive \(url.lastPathComponent) not used: \(error.localizedDescription)",
+                           category: .engine)
+        }
+        archives.withLock { $0[url] = loaded }
+        return loaded?.archive
+    }
+
     init?(device: MTLDevice, label: String) {
         // Feedback on Metal's own queue: a queue handed to the descriptor (`feedbackQueue`, declared `assign`) is
         // released by the command queue's dealloc without having been retained (tvOS / macOS 27.2).
         let descriptor = MTL4CommandQueueDescriptor()
         descriptor.label = label
-        guard let queue = try? device.makeMTL4CommandQueue(descriptor: descriptor) else { return nil }
+        guard let queue = try? device.makeMTL4CommandQueue(descriptor: descriptor),
+              let compiler = try? device.makeCompiler(descriptor: MTL4CompilerDescriptor()) else { return nil }
         self.device = device
         self.queue = queue
+        self.compiler = compiler
         frequency = Double(device.queryTimestampFrequency())
     }
 
@@ -447,6 +495,12 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
     }
 
     fileprivate func recycle(_ context: Context) { pool.withLock { $0.append(context) } }
+
+    /// Metal 3 takes no Metal 4 archive: the device compiles.
+    func makeComputePipeline(library: MTLLibrary, function: String, constants: MTLFunctionConstantValues,
+                             archive: URL?) throws -> MTLComputePipelineState {
+        try device.makeComputePipelineState(function: library.makeFunction(name: function, constantValues: constants))
+    }
 
     private final class Batch: GPUBatch {
         let backend: Metal3Backend
