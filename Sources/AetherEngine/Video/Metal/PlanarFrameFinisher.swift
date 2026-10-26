@@ -295,7 +295,6 @@ final class PlanarFrameFinisher: @unchecked Sendable {
 
     enum FinisherError: Error { case unavailable(String) }
 
-    private static let library = OSAllocatedUnfairLock<[ObjectIdentifier: MTLLibrary]>(initialState: [:])
     private static let pipelines = OSAllocatedUnfairLock<[PipelineKey: MTLComputePipelineState]>(initialState: [:])
 
     private struct PipelineKey: Hashable {
@@ -364,22 +363,8 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         textureCache = cache
     }
 
-    private static func library(for device: MTLDevice) throws -> MTLLibrary {
-        if let cached = Self.library.withLock({ $0[ObjectIdentifier(device)] }) { return cached }
-        let options = MTLCompileOptions()
-        // IEEE rounding throughout: the rounding steps are H.273's Round.
-        options.mathMode = .safe
-        let made = try device.makeLibrary(source: PlanarFrameShaderSource.source, options: options)
-        return Self.library.withLock { cache in
-            if let first = cache[ObjectIdentifier(device)] { return first }
-            cache[ObjectIdentifier(device)] = made
-            return made
-        }
-    }
-
-    /// Makes every pipeline a job of `plan` uses (the finish; grain's synthesis, the constant-luminance recompute where
-    /// the plan has them; with `choosesSource`, inverse telecine's variant reading either of two pictures and decimate's
-    /// gate), so a picture of it waits for none. Thread-safe: for a background queue when a stream opens.
+    /// Makes every pipeline a job of `plan` uses, so a picture of it waits for none; with `choosesSource`, inverse
+    /// telecine's variant too. Thread-safe: for a background queue when a stream opens.
     func prewarm(_ plan: Plan, choosesSource: Bool = false) {
         var variants = [plan]
         if choosesSource {
@@ -388,19 +373,120 @@ final class PlanarFrameFinisher: @unchecked Sendable {
             variants.append(chosen)
         }
         for variant in variants {
-            var functions = ["pf_finish"]
-            if variant.grain { functions.append("fg_synthesize") }
-            if usesList(variant) { functions += ["pf_cl_prepare", "pf_cl_correct"] }
-            if variant.choosesSource { functions.append("pf_gate") }
-            for function in functions { _ = try? pipeline(for: variant, function: function) }
+            for function in Self.functions(of: variant) { _ = try? pipeline(for: variant, function: function) }
         }
     }
 
-    /// The pipeline specialised for `plan`, compiled on first use and shared by every finisher in the process.
+    /// The functions a job of `plan` dispatches: the finish; grain's synthesis and the constant-luminance recompute
+    /// where the plan has them; decimate's gate for a picture chosen on the GPU.
+    static func functions(of plan: Plan) -> [String] {
+        var functions = ["pf_finish"]
+        if plan.grain { functions.append("fg_synthesize") }
+        if usesList(plan) { functions += ["pf_cl_prepare", "pf_cl_correct"] }
+        if plan.choosesSource { functions.append("pf_gate") }
+        return functions
+    }
+
+    /// The functions that read no function constant: one pipeline each, whatever the plan.
+    static let unspecialised: Set<String> = ["fg_synthesize", "pf_cl_prepare", "pf_gate"]
+
+    /// The pipeline of `name` for `plan`, made on first use and shared by every finisher in the process.
     func pipeline(for plan: Plan, function name: String = "pf_finish") throws -> MTLComputePipelineState {
-        let key = PipelineKey(device: ObjectIdentifier(device), function: name, constants: plan.specialisation)
-        if let ready = Self.pipelines.withLock({ $0[key] }) { return ready }
-        let lib = try Self.library(for: device)
+        try Self.pipeline(for: plan, function: name, device: device)
+    }
+
+    static func pipeline(for plan: Plan, function name: String, device: MTLDevice) throws -> MTLComputePipelineState {
+        let plain = unspecialised.contains(name)
+        let key = PipelineKey(device: ObjectIdentifier(device), function: name, constants: plain ? [] : plan.specialisation)
+        if let ready = pipelines.withLock({ $0[key] }) { return ready }
+        let made = try GPUPipelines.shared(for: device).make(library: EngineShaders.library(for: device), function: name,
+                                                             constants: plain ? nil : constants(plan),
+                                                             archive: EngineShaders.archive)
+        // The first one made is every caller's: a pipeline another thread made meanwhile is dropped, never put in its
+        // place, as work already encoded holds the cached one without retaining it.
+        return pipelines.withLock { cache in
+            if let first = cache[key] { return first }
+            cache[key] = made
+            return made
+        }
+    }
+
+    // MARK: - The planned set
+
+    /// The plans of the pictures software decode meets, worked out ahead of any stream: the formats its decoders write
+    /// (MPEG-2, H.264, VC-1, AV1, the intermediate codecs, the semi-planar layouts), both ranges, 8- and 10-bit streams,
+    /// progressive and interlaced, with and without film grain, every chroma siting and the three common matrices; and
+    /// inverse telecine's variant of each 8-bit planar picture. Their pipelines are the engine's archive
+    /// (``EngineShaders/archive``) and what ``prewarmPlanned(device:)`` makes; a stream outside the set makes its own
+    /// when it opens.
+    static let plannedSet: [Plan] = {
+        let formats: [AVPixelFormat] = [
+            AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUV444P,
+            AV_PIX_FMT_YUV420P10LE, AV_PIX_FMT_YUV422P10LE, AV_PIX_FMT_YUV444P10LE, AV_PIX_FMT_YUV420P12LE,
+            AV_PIX_FMT_YUV444P12LE, AV_PIX_FMT_NV12, AV_PIX_FMT_P010LE, AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY10LE,
+        ]
+        let telecined: Set<AVPixelFormat> = [AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUV422P,
+                                             AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUV444P]
+        let matrices = [kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+                        kCVImageBufferYCbCrMatrix_ITU_R_2020]
+        var seen = Set<[UInt32]>()
+        var plans: [Plan] = []
+        func add(_ plan: Plan) { if seen.insert(plan.specialisation).inserted { plans.append(plan) } }
+        for format in formats {
+            for range in [AVCOL_RANGE_MPEG, AVCOL_RANGE_JPEG] {
+                for interlaced in [false, true] {
+                    for grain in [false, true] {
+                        for tenBit in [false, true] {
+                            let output = SoftwareVideoDecoder.outputFormat(
+                                pixelFormat: format.rawValue, colorRange: range, streamIs10Bit: tenBit,
+                                twelveBit420: SoftwareVideoDecoder.twelveBit420Output, interlaced: interlaced)
+                            for location in (0...6).map({ AVChromaLocation(rawValue: $0) }) {
+                                for matrix in matrices {
+                                    guard var plan = PlanarFrameFinisher.plan(source: format, output: output,
+                                                               sourceFullRange: range == AVCOL_RANGE_JPEG,
+                                                               chromaLocation: location, matrix: matrix,
+                                                               interlaced: interlaced, grain: grain) else { continue }
+                                    add(plan)
+                                    if telecined.contains(format), !interlaced, !grain {
+                                        plan.choosesSource = true
+                                        add(plan)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return plans
+    }()
+
+    /// Makes every pipeline of ``plannedSet`` on `device`, so the streams it covers open with theirs made: from the
+    /// archive where the device takes it, compiled otherwise. For a background thread at launch.
+    static func prewarmPlanned(device: MTLDevice) {
+        for plan in plannedSet {
+            for function in functions(of: plan) { _ = try? pipeline(for: plan, function: function, device: device) }
+        }
+    }
+
+    /// Every distinct pipeline of ``plannedSet``, as the archive records it: `function` of `library`, with its constants
+    /// (nil for a function that reads none).
+    static func archivedRequests(library: MTLLibrary) -> [(function: String, constants: MTLFunctionConstantValues?)] {
+        var seen = Set<PipelineKey>()
+        var requests: [(function: String, constants: MTLFunctionConstantValues?)] = []
+        for plan in plannedSet {
+            for function in functions(of: plan) {
+                let plain = unspecialised.contains(function)
+                let key = PipelineKey(device: ObjectIdentifier(library.device), function: function,
+                                      constants: plain ? [] : plan.specialisation)
+                if seen.insert(key).inserted { requests.append((function, plain ? nil : constants(plan))) }
+            }
+        }
+        return requests
+    }
+
+    /// `plan`'s function constants, as its pipelines are specialised.
+    static func constants(_ plan: Plan) -> MTLFunctionConstantValues {
         let values = MTLFunctionConstantValues()
         var boolIndices: Set<Int> = [20, 21, 22, 23, 31, 32]
         for (index, value) in plan.specialisation.enumerated() {
@@ -412,15 +498,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
                 values.setConstantValue(&word, type: .uint, index: index)
             }
         }
-        let function = try lib.makeFunction(name: name, constantValues: values)
-        let made = try device.makeComputePipelineState(function: function)
-        // The first one made is every caller's: a pipeline another thread made meanwhile is dropped, never put in its
-        // place, as work already encoded holds the cached one without retaining it.
-        return Self.pipelines.withLock { cache in
-            if let first = cache[key] { return first }
-            cache[key] = made
-            return made
-        }
+        return values
     }
 
     /// Writes the `width` x `height` picture in `planes` into `buffer` (a bi-planar buffer of the plan's output
@@ -585,7 +663,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     func waitUntilIdle() { inFlight.wait() }
 
     /// Codes above 12 bits go straight to the exact path in the kernel (PF_EXACT_ONLY): no list, no second pass.
-    private func usesList(_ plan: Plan) -> Bool { plan.mode == .constantLuminance && plan.components[0][4] <= 12 }
+    private static func usesList(_ plan: Plan) -> Bool { plan.mode == .constantLuminance && plan.components[0][4] <= 12 }
 
     private func encode(_ jobs: [Job], slot: Slot, pass: ComputePass) -> Bool {
         let jobs = jobs.map { job in
@@ -643,12 +721,12 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         }
         if fields > 0 || synthesised || gates.contains(where: { $0 != nil }) { pass.barrier() }
         var lists = 0
-        let order = jobs.indices.filter { !usesList(jobs[$0].plan) } + jobs.indices.filter { usesList(jobs[$0].plan) }
+        let order = jobs.indices.filter { !Self.usesList(jobs[$0].plan) } + jobs.indices.filter { Self.usesList(jobs[$0].plan) }
         for index in order {
             let job = jobs[index]
             let grain = grains[index]
             var list: (counter: MTLBuffer, arguments: MTLBuffer)?
-            if usesList(job.plan) {
+            if Self.usesList(job.plan) {
                 guard let made = listBuffers(slot, lists, capacity: job.width * job.height) else { return false }
                 list = made
                 lists += 1

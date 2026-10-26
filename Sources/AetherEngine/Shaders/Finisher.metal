@@ -1,43 +1,16 @@
-import Foundation
+// The GPU finisher (PlanarFrameFinisher): a software-decoded picture into its display buffer in one pass. The
+// equations are docs/colour-representation.md's; the numbers in parentheses below are its equation numbers.
+//
+// One kernel, specialised per source format with function constants: the component layout, the read width, the range,
+// the output depth and the path are all compile-time values, so each format gets a kernel with its branches and address
+// arithmetic folded away. One thread per output chroma sample writes that sample and the luma block it covers (2x2 for
+// 4:2:0, 2x1 for 4:2:2, 1x1 for 4:4:4).
 
-/// Metal source for ``PlanarFrameFinisher``. The equations are docs/colour-representation.md's (H.273); the
-/// numbers in parentheses below are H.273's.
-///
-/// One kernel, specialised per source format with function constants: the component layout, the read width,
-/// the range, the output depth and the path are all compile-time values, so each format gets a kernel with its
-/// branches and address arithmetic folded away. One thread per output chroma sample writes that sample and the
-/// luma block it covers (2x2 for 4:2:0, 2x1 for 4:2:2, 1x1 for 4:4:4).
-enum PlanarFrameShaderSource {
-    static let source: String = template.replacingOccurrences(of: "/*PF_TABLES*/", with: tables)
-        .replacingOccurrences(of: "/*PF_GRAIN*/", with: FilmGrainShaderSource.source)
-
-    /// The double-float constants and the exp2 / log2 tables, computed in double and written as hex float pairs, so
-    /// the kernel's values are exactly the host's.
-    static let tables: String = {
-        func split(_ v: Double) -> String {
-            let hi = Float(v)
-            return "float2(\(String(format: "%a", Double(hi)))f, \(String(format: "%a", Double(Float(v - Double(hi)))))f)"
-        }
-        var lines: [String] = []
-        let ln2: Double = Foundation.log(2.0)
-        let constants: [(String, Double)] = [("PF_LN2", ln2), ("PF_LOG2E", 1 / ln2), ("PF_INV3", 1.0 / 3), ("PF_INV5", 1.0 / 5),
-                                             ("PF_INV6", 1.0 / 6), ("PF_INV12", 1.0 / 12), ("PF_INV24", 1.0 / 24),
-                                             ("PF_INV120", 1.0 / 120)]
-        for (name, value) in constants {
-            lines.append("constant float2 \(name) = \(split(value));")
-        }
-        // 2^(j / 64), j = -32 ... 32.
-        lines.append("constant float2 PF_EXP2_T[65] = { " + (-32...32).map { split(pow(2, Double($0) / 64)) }.joined(separator: ", ") + " };")
-        // c_i ~ 1 / x for x in [1 + i / 128, 1 + (i + 1) / 128), and log2(1 / c_i) of that float c_i.
-        let c = (0..<128).map { Float(1 / (1 + (Double($0) + 0.5) / 128)) }
-        lines.append("constant float PF_LOG_C[128] = { " + c.map { String(format: "%af", Double($0)) }.joined(separator: ", ") + " };")
-        lines.append("constant float2 PF_LOG_L[128] = { " + c.map { split(-log2(Double($0))) }.joined(separator: ", ") + " };")
-        return lines.joined(separator: "\n")
-    }()
-
-    static let template = """
 #include <metal_stdlib>
 using namespace metal;
+
+// IEEE rounding throughout: the rounding steps are H.273's Round.
+#pragma METAL fp math_mode(safe)
 
 // MARK: - Specialisation
 
@@ -78,7 +51,7 @@ constant uint FC_MATRIX        [[function_constant(28)]];
 constant uint FC_BITDEPTH_RGB  [[function_constant(29)]];
 // Constant luminance: the stream's TransferCharacteristics (1, 4, 5, 6, 7, 8, 13, 14, 15, 16 or 18).
 constant uint FC_TRANSFER      [[function_constant(30)]];
-// AV1 film grain (FilmGrainShaderSource) on every sample read, from the tables in buffer 5.
+// AV1 film grain (FilmGrain.h) on every sample read, from the tables in buffer 5.
 constant bool FC_GRAIN         [[function_constant(31)]];
 // The source is one of two pictures of one layout, chosen on the GPU (inverse telecine's window passes its weave
 // through): `alt` when the word at `chosen` is nonzero.
@@ -220,7 +193,109 @@ static inline pf_df pf_sqrt(pf_df a) {
     return pf_add(pf_df_f(s), pf_df_f(e.hi / (2.0f * s)));
 }
 
-/*PF_TABLES*/
+// The double-float constants and the exp2 / log2 tables: each value computed in double and written as the float
+// nearest it and the float nearest the remainder (hex, so exact). Their derivation is in ShaderTablesTests.
+constant float2 PF_LN2 = float2(0x1.62e43p-1f, -0x1.05c61p-29f);
+constant float2 PF_LOG2E = float2(0x1.715476p+0f, 0x1.4ae0cp-26f);
+constant float2 PF_INV3 = float2(0x1.555556p-2f, -0x1.555556p-27f);
+constant float2 PF_INV5 = float2(0x1.99999ap-3f, -0x1.99999ap-29f);
+constant float2 PF_INV6 = float2(0x1.555556p-3f, -0x1.555556p-28f);
+constant float2 PF_INV12 = float2(0x1.555556p-4f, -0x1.555556p-29f);
+constant float2 PF_INV24 = float2(0x1.555556p-5f, -0x1.555556p-30f);
+constant float2 PF_INV120 = float2(0x1.111112p-7f, -0x1.dddddep-32f);
+constant float2 PF_EXP2_T[65] = {
+    float2(0x1.6a09e6p-1f, 0x1.9fcef4p-27f), float2(0x1.6dfb24p-1f, -0x1.cd72e8p-28f), float2(0x1.71f75ep-1f, 0x1.1d8beep-26f),
+    float2(0x1.75feb6p-1f, -0x1.37b306p-26f), float2(0x1.7a1148p-1f, -0x1.829fdp-26f), float2(0x1.7e2f34p-1f, -0x1.261634p-26f),
+    float2(0x1.82589ap-1f, -0x1.accc7cp-27f), float2(0x1.868d9ap-1f, -0x1.2edb44p-27f), float2(0x1.8ace54p-1f, 0x1.15506ep-28f),
+    float2(0x1.8f1aeap-1f, -0x1.baa232p-27f), float2(0x1.93737cp-1f, -0x1.e64744p-26f), float2(0x1.97d82ap-1f, -0x1.0d8d8p-32f),
+    float2(0x1.9c4918p-1f, 0x1.51f848p-28f), float2(0x1.a0c668p-1f, -0x1.2886a6p-27f), float2(0x1.a5503cp-1f, -0x1.b83b54p-26f),
+    float2(0x1.a9e6b6p-1f, -0x1.50c048p-26f), float2(0x1.ae89fap-1f, -0x1.a94b14p-27f), float2(0x1.b33a2cp-1f, -0x1.ec3a82p-27f),
+    float2(0x1.b7f77p-1f, -0x1.a09438p-26f), float2(0x1.bcc1eap-1f, -0x1.f687c6p-26f), float2(0x1.c199bep-1f, -0x1.3d56b2p-28f),
+    float2(0x1.c67f12p-1f, 0x1.cafa2ap-26f), float2(0x1.cb720ep-1f, -0x1.8837ccp-28f), float2(0x1.d072d4p-1f, 0x1.40f13p-26f),
+    float2(0x1.d5818ep-1f, -0x1.822dbcp-28f), float2(0x1.da9e6p-1f, 0x1.ed9942p-28f), float2(0x1.dfc974p-1f, -0x1.908c94p-26f),
+    float2(0x1.e502eep-1f, 0x1.e2cffep-27f), float2(0x1.ea4afap-1f, 0x1.52486cp-28f), float2(0x1.efa1bep-1f, 0x1.cc2b44p-26f),
+    float2(0x1.f50766p-1f, -0x1.246ebp-27f), float2(0x1.fa7c18p-1f, 0x1.9e90d8p-29f), float2(0x1p+0f, 0x0p+0f),
+    float2(0x1.02c9a4p+0f, -0x1.887fap-28f), float2(0x1.059b0ep+0f, -0x1.9d4f52p-25f), float2(0x1.087452p+0f, -0x1.e2990ep-26f),
+    float2(0x1.0b5586p+0f, 0x1.9f3122p-25f), float2(0x1.0e3ec4p+0f, -0x1.a585ccp-25f), float2(0x1.11301ep+0f, -0x1.fdb496p-25f),
+    float2(0x1.1429aap+0f, 0x1.d525bcp-25f), float2(0x1.172b84p+0f, -0x1.c15742p-27f), float2(0x1.1a35bep+0f, 0x1.6df96ep-25f),
+    float2(0x1.1d4874p+0f, -0x1.d2e8cap-25f), float2(0x1.2063b8p+0f, 0x1.0c519ap-25f), float2(0x1.2387a6p+0f, 0x1.ceac48p-25f),
+    float2(0x1.26b456p+0f, 0x1.789f38p-26f), float2(0x1.29e9ep+0f, -0x1.5c0424p-25f), float2(0x1.2d285ap+0f, 0x1.b900c2p-26f),
+    float2(0x1.306fep+0f, 0x1.4636e2p-25f), float2(0x1.33c08cp+0f, -0x1.b37d2p-25f), float2(0x1.371a74p+0f, -0x1.18aac6p-25f),
+    float2(0x1.3a7db4p+0f, -0x1.634c02p-25f), float2(0x1.3dea64p+0f, 0x1.824684p-25f), float2(0x1.4160a2p+0f, 0x1.f72e2ap-28f),
+    float2(0x1.44e086p+0f, 0x1.8624b4p-30f), float2(0x1.486a2cp+0f, -0x1.47d866p-25f), float2(0x1.4bfdaep+0f, -0x1.593abcp-25f),
+    float2(0x1.4f9b28p+0f, -0x1.2c5a6cp-25f), float2(0x1.5342b6p+0f, -0x1.2c561p-25f), float2(0x1.56f474p+0f, -0x1.295b04p-25f),
+    float2(0x1.5ab07ep+0f, -0x1.5bd5ecp-27f), float2(0x1.5e76f2p+0f, -0x1.4a5bd8p-25f), float2(0x1.6247ecp+0f, -0x1.f8b55p-25f),
+    float2(0x1.662388p+0f, 0x1.2a9112p-27f), float2(0x1.6a09e6p+0f, 0x1.9fcef4p-26f)
+};
+constant float PF_LOG_C[128] = {
+    0x1.fe01fep-1f, 0x1.fa11cap-1f, 0x1.f6310ap-1f, 0x1.f25f64p-1f, 0x1.ee9c8p-1f, 0x1.eae808p-1f,
+    0x1.e741aap-1f, 0x1.e3a918p-1f, 0x1.e01e02p-1f, 0x1.dca01ep-1f, 0x1.d92f22p-1f, 0x1.d5cac8p-1f,
+    0x1.d272cap-1f, 0x1.cf26e6p-1f, 0x1.cbe6dap-1f, 0x1.c8b266p-1f, 0x1.c5894ep-1f, 0x1.c26b54p-1f,
+    0x1.bf583ep-1f, 0x1.bc4fd6p-1f, 0x1.b951e2p-1f, 0x1.b65e2ep-1f, 0x1.b37484p-1f, 0x1.b094b4p-1f,
+    0x1.adbe88p-1f, 0x1.aaf1d2p-1f, 0x1.a82e66p-1f, 0x1.a5741p-1f, 0x1.a2c2a8p-1f, 0x1.a01a02p-1f,
+    0x1.9d79f2p-1f, 0x1.9ae24ep-1f, 0x1.9852fp-1f, 0x1.95cbbp-1f, 0x1.934c68p-1f, 0x1.90d4f2p-1f,
+    0x1.8e6528p-1f, 0x1.8bfce8p-1f, 0x1.899c1p-1f, 0x1.87427cp-1f, 0x1.84f00cp-1f, 0x1.82a4ap-1f,
+    0x1.806018p-1f, 0x1.7e2256p-1f, 0x1.7beb3ap-1f, 0x1.79baa6p-1f, 0x1.779082p-1f, 0x1.756cacp-1f,
+    0x1.734f0cp-1f, 0x1.713786p-1f, 0x1.6f2602p-1f, 0x1.6d1a62p-1f, 0x1.6b149p-1f, 0x1.691474p-1f,
+    0x1.6719f4p-1f, 0x1.6524f8p-1f, 0x1.63356cp-1f, 0x1.614b36p-1f, 0x1.5f6644p-1f, 0x1.5d867cp-1f,
+    0x1.5babccp-1f, 0x1.59d62p-1f, 0x1.58056p-1f, 0x1.56397cp-1f, 0x1.54725ep-1f, 0x1.52aff6p-1f,
+    0x1.50f22ep-1f, 0x1.4f38f6p-1f, 0x1.4d843cp-1f, 0x1.4bd3eep-1f, 0x1.4a27fap-1f, 0x1.488052p-1f,
+    0x1.46dce4p-1f, 0x1.453d9ep-1f, 0x1.43a274p-1f, 0x1.420b52p-1f, 0x1.40782ep-1f, 0x1.3ee8f4p-1f,
+    0x1.3d5d9ap-1f, 0x1.3bd60ep-1f, 0x1.3a5244p-1f, 0x1.38d22ep-1f, 0x1.3755bep-1f, 0x1.35dce6p-1f,
+    0x1.34679ap-1f, 0x1.32f5cep-1f, 0x1.318776p-1f, 0x1.301c82p-1f, 0x1.2eb4eap-1f, 0x1.2d50ap-1f,
+    0x1.2bef98p-1f, 0x1.2a91cap-1f, 0x1.293726p-1f, 0x1.27dfa4p-1f, 0x1.268b38p-1f, 0x1.2539d8p-1f,
+    0x1.23eb7ap-1f, 0x1.22a012p-1f, 0x1.215798p-1f, 0x1.201202p-1f, 0x1.1ecf44p-1f, 0x1.1d8f56p-1f,
+    0x1.1c523p-1f, 0x1.1b17c6p-1f, 0x1.19e012p-1f, 0x1.18ab08p-1f, 0x1.1778a2p-1f, 0x1.1648d6p-1f,
+    0x1.151b9ap-1f, 0x1.13f0e8p-1f, 0x1.12c8b8p-1f, 0x1.11a302p-1f, 0x1.107fbcp-1f, 0x1.0f5eep-1f,
+    0x1.0e4066p-1f, 0x1.0d2446p-1f, 0x1.0c0a78p-1f, 0x1.0af2f8p-1f, 0x1.09ddbap-1f, 0x1.08cabcp-1f,
+    0x1.07b9f2p-1f, 0x1.06ab5ap-1f, 0x1.059eeap-1f, 0x1.04949cp-1f, 0x1.038c6cp-1f, 0x1.02865p-1f,
+    0x1.018244p-1f, 0x1.00804p-1f
+};
+constant float2 PF_LOG_L[128] = {
+    float2(0x1.709c48p-8f, 0x1.23fcf8p-34f), float2(0x1.13632ep-6f, 0x1.630c22p-31f), float2(0x1.c9366p-6f, 0x1.9d1fcep-31f),
+    float2(0x1.3ed31p-5f, -0x1.2fa6ccp-30f), float2(0x1.985bfp-5f, 0x1.53e2dp-30f), float2(0x1.f1389p-5f, 0x1.0f52cp-31f),
+    float2(0x1.24b5bcp-4f, 0x1.e1dbfcp-32f), float2(0x1.507b7ep-4f, 0x1.5fc276p-29f), float2(0x1.7beee8p-4f, -0x1.cdf958p-32f),
+    float2(0x1.a7111cp-4f, -0x1.54419ap-29f), float2(0x1.d1e35p-4f, 0x1.49ed6ap-29f), float2(0x1.fc66a2p-4f, -0x1.65f5bp-29f),
+    float2(0x1.134e1cp-3f, 0x1.b90988p-28f), float2(0x1.284294p-3f, -0x1.98c96cp-28f), float2(0x1.3d1142p-3f, 0x1.aceb7cp-28f),
+    float2(0x1.51bab8p-3f, -0x1.ff71fcp-28f), float2(0x1.663f6ap-3f, -0x1.a62c8p-29f), float2(0x1.7a9feap-3f, -0x1.3a371cp-29f),
+    float2(0x1.8edcb4p-3f, 0x1.04b388p-28f), float2(0x1.a2f634p-3f, 0x1.faa88ep-29f), float2(0x1.b6ecf6p-3f, 0x1.ac13c6p-31f),
+    float2(0x1.cac166p-3f, -0x1.493584p-28f), float2(0x1.de7402p-3f, 0x1.a8a376p-28f), float2(0x1.f2052ep-3f, -0x1.e222eep-29f),
+    float2(0x1.02babap-2f, 0x1.b763dap-31f), float2(0x1.0c629ap-2f, 0x1.62369ap-27f), float2(0x1.15fa64p-2f, 0x1.93bec4p-29f),
+    float2(0x1.1f8262p-2f, -0x1.e5f032p-27f), float2(0x1.28fab6p-2f, -0x1.dc7296p-27f), float2(0x1.326394p-2f, 0x1.c4714cp-27f),
+    float2(0x1.3bbd38p-2f, 0x1.f99a2cp-30f), float2(0x1.4507d2p-2f, 0x1.00e3acp-28f), float2(0x1.4e438cp-2f, -0x1.c1399ap-27f),
+    float2(0x1.577094p-2f, 0x1.9ed7acp-28f), float2(0x1.608f1cp-2f, -0x1.a9017ap-27f), float2(0x1.699f5p-2f, -0x1.e0d6d8p-27f),
+    float2(0x1.72a162p-2f, 0x1.429dep-28f), float2(0x1.7b957ap-2f, 0x1.b85fe8p-27f), float2(0x1.847bcp-2f, 0x1.cab9b2p-27f),
+    float2(0x1.8d5466p-2f, 0x1.dc9d62p-28f), float2(0x1.961f9p-2f, 0x1.d0fcb4p-27f), float2(0x1.9edd68p-2f, -0x1.27e212p-28f),
+    float2(0x1.a78e14p-2f, 0x1.0d226ep-27f), float2(0x1.b031bcp-2f, -0x1.17f9dcp-27f), float2(0x1.b8c88ap-2f, 0x1.8ebf14p-28f),
+    float2(0x1.c152aap-2f, -0x1.833ed8p-28f), float2(0x1.c9d02cp-2f, -0x1.d5eb6p-30f), float2(0x1.d2414cp-2f, 0x1.ff686p-27f),
+    float2(0x1.daa624p-2f, -0x1.21ccf2p-27f), float2(0x1.e2fed8p-2f, -0x1.900b1cp-27f), float2(0x1.eb4b82p-2f, 0x1.b1e394p-29f),
+    float2(0x1.f38c58p-2f, 0x1.08855ap-29f), float2(0x1.fbc16ep-2f, 0x1.12937cp-28f), float2(0x1.01f572p-1f, -0x1.ddf4dap-28f),
+    float2(0x1.06047p-1f, 0x1.58d6c8p-27f), float2(0x1.0a0dc4p-1f, -0x1.a9246p-32f), float2(0x1.0e1176p-1f, 0x1.72cc08p-27f),
+    float2(0x1.120f9ep-1f, 0x1.2ff8c2p-27f), float2(0x1.160842p-1f, 0x1.765de2p-26f), float2(0x1.19fb7cp-1f, 0x1.3ec9ccp-29f),
+    float2(0x1.1de952p-1f, 0x1.5ea11ep-26f), float2(0x1.21d1d4p-1f, -0x1.019b22p-27f), float2(0x1.25b516p-1f, -0x1.198684p-27f),
+    float2(0x1.29931ep-1f, 0x1.524392p-26f), float2(0x1.2d6c02p-1f, 0x1.eb8abp-29f), float2(0x1.313fc8p-1f, -0x1.48b242p-26f),
+    float2(0x1.350e84p-1f, -0x1.6a19dcp-26f), float2(0x1.38d83ep-1f, 0x1.9fcba4p-27f), float2(0x1.3c9d06p-1f, 0x1.052d22p-28f),
+    float2(0x1.405ce8p-1f, 0x1.ff88a4p-27f), float2(0x1.4417f4p-1f, 0x1.72f24ap-28f), float2(0x1.47ce3p-1f, -0x1.15b65p-26f),
+    float2(0x1.4b7faap-1f, 0x1.90522ep-29f), float2(0x1.4f2c74p-1f, 0x1.fe7132p-27f), float2(0x1.52d492p-1f, -0x1.7c71fp-33f),
+    float2(0x1.567818p-1f, 0x1.4444ecp-26f), float2(0x1.5a1708p-1f, 0x1.26e67p-28f), float2(0x1.5db178p-1f, -0x1.3585f4p-27f),
+    float2(0x1.614768p-1f, -0x1.2b101cp-29f), float2(0x1.64d8ecp-1f, 0x1.d93414p-27f), float2(0x1.68660cp-1f, -0x1.079b64p-26f),
+    float2(0x1.6beedp-1f, 0x1.23d7ecp-27f), float2(0x1.6f7346p-1f, 0x1.4195fap-26f), float2(0x1.72f37ap-1f, 0x1.85be1cp-26f),
+    float2(0x1.766f74p-1f, 0x1.3f956cp-26f), float2(0x1.79e73cp-1f, 0x1.1af9p-26f), float2(0x1.7d5adcp-1f, -0x1.702a4ap-26f),
+    float2(0x1.80ca64p-1f, -0x1.5c25c8p-27f), float2(0x1.8435d6p-1f, -0x1.95d2ep-27f), float2(0x1.879d4p-1f, -0x1.443746p-30f),
+    float2(0x1.8b00aep-1f, -0x1.b212bep-26f), float2(0x1.8e601ep-1f, 0x1.dc1494p-29f), float2(0x1.91bba8p-1f, -0x1.84b7ep-29f),
+    float2(0x1.95134cp-1f, 0x1.8ff7p-28f), float2(0x1.986716p-1f, 0x1.dd5cf4p-26f), float2(0x1.9bb71p-1f, -0x1.1cb09cp-26f),
+    float2(0x1.9f033ep-1f, -0x1.383bccp-26f), float2(0x1.a24baep-1f, -0x1.35eef4p-28f), float2(0x1.a59064p-1f, 0x1.cbbfap-29f),
+    float2(0x1.a8d168p-1f, 0x1.b3624ap-26f), float2(0x1.ac0ecap-1f, 0x1.ca61acp-28f), float2(0x1.af488cp-1f, 0x1.eaac94p-27f),
+    float2(0x1.b27eb4p-1f, 0x1.dfa15p-29f), float2(0x1.b5b15p-1f, 0x1.532d24p-27f), float2(0x1.b8e062p-1f, -0x1.f08b14p-26f),
+    float2(0x1.bc0bf6p-1f, 0x1.52db08p-29f), float2(0x1.bf341p-1f, -0x1.e4cb58p-30f), float2(0x1.c258bap-1f, -0x1.3a3a86p-28f),
+    float2(0x1.c57ap-1f, -0x1.34cf58p-26f), float2(0x1.c897e2p-1f, -0x1.4cda88p-28f), float2(0x1.cbb268p-1f, -0x1.04d0ecp-30f),
+    float2(0x1.cec998p-1f, 0x1.b750e2p-26f), float2(0x1.d1dd82p-1f, -0x1.76871ap-26f), float2(0x1.d4ee24p-1f, -0x1.20f0cep-26f),
+    float2(0x1.d7fb88p-1f, -0x1.822888p-26f), float2(0x1.db05b4p-1f, 0x1.b886cap-26f), float2(0x1.de0cb4p-1f, 0x1.6f7b0ep-26f),
+    float2(0x1.e11084p-1f, 0x1.dd0d9ap-27f), float2(0x1.e41138p-1f, 0x1.4174b4p-29f), float2(0x1.e70ec8p-1f, 0x1.82b848p-29f),
+    float2(0x1.ea094ap-1f, -0x1.dad53p-26f), float2(0x1.ed00b4p-1f, -0x1.5f3888p-29f), float2(0x1.eff518p-1f, 0x1.f2fdccp-29f),
+    float2(0x1.f2e67ap-1f, 0x1.e12726p-28f), float2(0x1.f5d4dap-1f, -0x1.6762p-26f), float2(0x1.f8c046p-1f, -0x1.92b0b4p-27f),
+    float2(0x1.fba8bep-1f, 0x1.3ff56p-26f), float2(0x1.fe8e5p-1f, -0x1.1bdb9p-26f)
+};
 
 // 2^a: a = n + j / 64 + r, 2^(j/64) from PF_EXP2_T, and e^t - 1 for t = r ln 2 (|t| <= ln 2 / 128). Only t + t^2 / 2
 // needs double-float: the rest of the series, t^3 ( 1/6 + t / 24 + t^2 / 120 ), is under 2.7e-8, where float32's
@@ -331,7 +406,7 @@ static inline uint pf_plane_sample(pf_src s, constant PFFrame& f, uint plane, ui
     return pf_r2(s.p, f, x, y);
 }
 
-/*PF_GRAIN*/
+#include "FilmGrain.h"
 
 // A sample of plane `plane` with its film grain. Grain is a property of the plane (AV1's planes 0, 1, 2), not of the
 // component the finisher reads it as. Chroma takes the un-noised luma at its site. Kept inline: outlined, it is a call
@@ -924,6 +999,4 @@ kernel void pf_cl_correct(device const uchar*            src     [[buffer(0)]],
     pf_cl_signals(f, e, pf_resample(s, f, p), ey, epb, epr);
     pf_cl_exact(ey, epb, epr, pf_df{e.ly.x, e.ly.y}, f, words);
     pf_write_codes(out_y, out_c, p, pf_round_codes_df(words));
-}
-"""
 }

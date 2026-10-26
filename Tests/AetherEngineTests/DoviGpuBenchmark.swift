@@ -12,18 +12,18 @@ struct DoviGpuBenchmark {
     static let enabled = ProcessInfo.processInfo.environment["DOVI_BENCH"] == "1"
 
     @Test("UHD composition GPU time per kernel", .enabled(if: enabled, "set DOVI_BENCH=1"))
-    func uhdKernelTimes() {
-        let report = FelComposerBenchmark.run()
+    func uhdKernelTimes() throws {
+        let report = FelComposerBenchmark.run(source: try ShaderFiles.dolbyVisionFEL())
         #expect(!report.contains("[bench] failed"))
         #expect(!report.contains("DIFFERS"), "a composition variant differs from the baseline")
     }
 
-    /// The composition's kernels one at a time, for a GPU counter recording (``FelComposerBenchmark/profile(emit:)``):
+    /// The composition's kernels one at a time, for a GPU counter recording (``FelComposerBenchmark/profile(source:emit:)``):
     /// only with `DOVI_PROFILE=1`.
     @Test("composition kernels run one at a time for a GPU counter recording",
           .enabled(if: ProcessInfo.processInfo.environment["DOVI_PROFILE"] == "1", "set DOVI_PROFILE=1"))
-    func profileStretches() {
-        #expect(!FelComposerBenchmark.profile().contains("[profile] failed"))
+    func profileStretches() throws {
+        #expect(!FelComposerBenchmark.profile(source: try ShaderFiles.dolbyVisionFEL()).contains("[profile] failed"))
     }
 }
 #endif

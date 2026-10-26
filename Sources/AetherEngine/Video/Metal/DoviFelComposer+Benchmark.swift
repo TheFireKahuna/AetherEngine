@@ -21,18 +21,36 @@ public enum FelComposerBenchmark {
 
     /// One `[bench]` line per variant and output mode, then the paced compositions, each handed to `emit` as it is
     /// measured and all of them returned. Each composition variant's output is compared with the baseline's, bit for
-    /// bit. `allVariants` false times the baseline and the memory floor alone: on an Apple TV every variant's shader
-    /// compile costs tens of seconds.
-    public static func run(allVariants: Bool = true, sv22Only: Bool = false, emit: (String) -> Void = { print($0) }) -> String {
+    /// bit. The baseline is the shipped kernels; the memory floor and the bisection variants are edits of `source`,
+    /// the composer's Metal source (Sources/AetherFELShaders/Shaders/DolbyVisionFEL.metal), compiled here, so without it
+    /// the baseline alone is timed. `allVariants` false times the baseline and the memory floor alone: on an Apple TV
+    /// every variant's shader compile costs tens of seconds.
+    public static func run(allVariants: Bool = true, sv22Only: Bool = false, source: String? = nil,
+                           emit: (String) -> Void = { print($0) }) -> String {
         var lines: [String] = []
         func say(_ line: String) { lines.append(line); emit(line) }
         do {
             let rig = try Rig()
             say("[bench] device \(rig.device.name), \(rig.gpu.api), \(width)x\(height), median of \(iterations)")
-            let base = DoviShaderSource.source
-            let quick: [(String, String)] = [("baseline     ", base), ("FLOOR (I/O)  ", try patched(base, floorOnly))]
-            let variants: [(String, String)] = !allVariants ? quick : [
-                ("baseline     ", base),
+            func measure(_ variants: [(String, Kernels)]) throws -> String {
+                var reference: [String: [UInt16]] = [:]
+                // Two passes, the first unreported: it brings the GPU to a steady clock and compiles everything.
+                for pass in 0..<2 {
+                    for (label, kernels) in variants {
+                        let reported = try report(label, kernels, rig: rig, reference: &reference, sv22Only: sv22Only)
+                        if pass == 1 { reported.forEach(say) }
+                    }
+                }
+                for gap in pacedGaps { say(try paced(rig: rig, gapSeconds: gap, perBuffer: 1)) }
+                // Playback's batches: two frames every two 24p frames, then three every three.
+                say(try paced(rig: rig, gapSeconds: frameSeconds * 2, perBuffer: 2))
+                say(try paced(rig: rig, gapSeconds: frameSeconds * 3, perBuffer: 3))
+                return lines.joined(separator: "\n")
+            }
+            let shipped: [(String, Kernels)] = [("baseline     ", .shipped)]
+            guard let base = source else { return try measure(shipped) }
+            let quick: [(String, Kernels)] = shipped + [("FLOOR (I/O)  ", try patched(base, floorOnly))]
+            let variants: [(String, Kernels)] = !allVariants ? quick : shipped + [
                 ("device-lut   ", try patched(base, deviceLut)),
                 ("lazy-dither  ", try patched(base, lazyDither)),
                 ("all          ", try patched(base, deviceLut + lazyDither)),
@@ -49,18 +67,7 @@ public enum FelComposerBenchmark {
                 ("c: no int sum", try patched(base, chromaNoIntSum)),
                 ("c: no fl. sum", try patched(base, chromaNoFloatSum)),
             ]
-            var reference: [String: [UInt16]] = [:]
-            // Two passes, the first unreported: it brings the GPU to a steady clock and compiles everything.
-            for pass in 0..<2 {
-                for (label, source) in variants {
-                    let reported = try report(label, source: source, rig: rig, reference: &reference, sv22Only: sv22Only)
-                    if pass == 1 { reported.forEach(say) }
-                }
-            }
-            for gap in pacedGaps { say(try paced(rig: rig, gapSeconds: gap, perBuffer: 1)) }
-            // Playback's batches: two frames every two 24p frames, then three every three.
-            say(try paced(rig: rig, gapSeconds: frameSeconds * 2, perBuffer: 2))
-            say(try paced(rig: rig, gapSeconds: frameSeconds * 3, perBuffer: 3))
+            return try measure(variants)
         } catch {
             say("[bench] failed: \(error)")
         }
@@ -70,8 +77,8 @@ public enum FelComposerBenchmark {
     /// For a GPU counter recording (Instruments' Metal GPU Counters): each kernel of the sv22 composition, and two
     /// bisection variants, run back to back for `profileSeconds`, one after another in a fixed order with
     /// `profileGapSeconds` of idle GPU between them, so each busy stretch of the recording is one kernel's. Each stretch
-    /// is handed to `emit` as it starts.
-    public static func profile(emit: (String) -> Void = { print($0); fflush(stdout) }) -> String {
+    /// is handed to `emit` as it starts. The bisection stretches are edits of `source`, the composer's Metal source.
+    public static func profile(source base: String, emit: (String) -> Void = { print($0); fflush(stdout) }) -> String {
         var lines: [String] = []
         let start = CACurrentMediaTime()
         func say(_ line: String) { lines.append(line); emit(line) }
@@ -80,22 +87,21 @@ public enum FelComposerBenchmark {
             let rig = try Rig()
             say("[profile] rig built at \(elapsed())")
             try setMode(rig, dither: .fullPrecision, chroma422: true)
-            let base = DoviShaderSource.source
-            // name, label, source, luma (else chroma + 4:2:2), the exact MMR pipelines. A pipeline's registers are
+            // name, label, kernels, luma (else chroma + 4:2:2), the exact MMR pipelines. A pipeline's registers are
             // set when it is compiled, for every path in it, so one stretch covers a kernel's rarer paths too (luma's
             // MMR branch); the exact MMR sums are pipelines of their own.
             // Each stretch's source is patched only when the stretch is asked for.
-            let known: [(String, String, () throws -> String, Kind, Bool)] = [
-                ("luma", "luma", { base }, .luma, false),
-                ("chroma", "chroma + 4:2:2", { base }, .chromaAnd422, false),
-                ("chroma-exact", "chroma + 4:2:2, exact MMR pipeline", { base }, .chromaAnd422, true),
+            let known: [(String, String, () throws -> Kernels, Kind, Bool)] = [
+                ("luma", "luma", { .shipped }, .luma, false),
+                ("chroma", "chroma + 4:2:2", { .shipped }, .chromaAnd422, false),
+                ("chroma-exact", "chroma + 4:2:2, exact MMR pipeline", { .shipped }, .chromaAnd422, true),
                 ("chroma-nommr", "chroma + 4:2:2, no MMR", { try patched(base, chromaNoMmr) }, .chromaAnd422, false),
                 ("chroma-nocoef", "chroma + 4:2:2, MMR coefficients not loaded",
                  { try patched(base, [("    int c = simd_shuffle(loaded, i);", "    int c = int(i) * 7 + 1;")]) }, .chromaAnd422, false),
                 ("chroma-noresid", "chroma + 4:2:2, no EL residual", { try patched(base, chromaNoResidual) }, .chromaAnd422, false),
                 ("chroma-1tap", "chroma + 4:2:2, base luma one tap", { try patched(base, chromaOneTap) }, .chromaAnd422, false),
-                ("chroma-only", "chroma alone (sv22's 4:2:0 intermediate)", { base }, .chroma, false),
-                ("422", "sv22's 4:2:0 -> 4:2:2 step alone", { base }, .step422, false),
+                ("chroma-only", "chroma alone (sv22's 4:2:0 intermediate)", { .shipped }, .chroma, false),
+                ("422", "sv22's 4:2:0 -> 4:2:2 step alone", { .shipped }, .step422, false),
                 // Chroma alone with code taken out of the source, so the pipeline loses its registers too.
                 ("cx-nommr", "chroma alone, no MMR code",
                  { try patched(base, [("    bool pending = need;\n", "    bool pending = need;\n    return;\n")]) }, .chroma, false),
@@ -117,8 +123,7 @@ public enum FelComposerBenchmark {
             let planes = try Planes(rig, out: out)
             // Every pipeline compiled before the first stretch, so a recording started at "ready" holds kernels only.
             let compiled = try stretches.map { stretch -> DoviFelComposer.SharedPipelines.Kernels in
-                let kernels = try DoviFelComposer.SharedPipelines.compile(device: rig.device, source: stretch.1)
-                    .kernels(.init(blueNoise: false, mmrExact: stretch.3))
+                let kernels = try stretch.1.pipelines(rig.device).kernels(.init(blueNoise: false, mmrExact: stretch.3))
                 say("[profile] \(stretch.0) compiled at \(elapsed())")
                 return kernels
             }
@@ -438,9 +443,9 @@ public enum FelComposerBenchmark {
         return out
     }
 
-    static func report(_ label: String, source: String, rig: Rig, reference: inout [String: [UInt16]],
+    static func report(_ label: String, _ kernels: Kernels, rig: Rig, reference: inout [String: [UInt16]],
                        sv22Only: Bool = false) throws -> [String] {
-        let pipes = try DoviFelComposer.SharedPipelines.compile(device: rig.device, source: source)
+        let pipes = try kernels.pipelines(rig.device)
         let p010 = try require(makeBuffer(width, height, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange), "no P010 output")
         let sv22 = try require(makeBuffer(width, height, kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange), "no sv22 output")
         var lines: [String] = []
@@ -478,8 +483,7 @@ public enum FelComposerBenchmark {
     /// composition.
     static func paced(rig: Rig, gapSeconds: Double = frameSeconds, perBuffer: Int = 1) throws -> String {
         try setMode(rig, dither: .fullPrecision, chroma422: true)
-        let kernels = try DoviFelComposer.SharedPipelines.compile(device: rig.device, source: DoviShaderSource.source)
-            .kernels(.init(blueNoise: false))
+        let kernels = try Kernels.shipped.pipelines(rig.device).kernels(.init(blueNoise: false))
         let out = try require(makeBuffer(width, height, kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange), "no sv22 output")
         let planes = try Planes(rig, out: out)
         var samples: [Double] = []
@@ -510,13 +514,27 @@ public enum FelComposerBenchmark {
     /// `source` with each (old, new) applied at every occurrence; throws if an `old` does not occur, so a variant
     /// cannot silently measure the baseline. Every occurrence, because the 4:2:0 and 4:2:2 chroma kernels share
     /// some lines (the quantisation, the residual gate) and a variant applies to both.
-    static func patched(_ source: String, _ edits: [(String, String)]) throws -> String {
+    /// The kernels a measurement runs: the shipped ones, or the composer's source with edits, compiled here.
+    enum Kernels {
+        case shipped
+        case patched(String)
+
+        func pipelines(_ device: MTLDevice) throws -> DoviFelComposer.SharedPipelines {
+            switch self {
+            case .shipped: try DoviFelComposer.SharedPipelines.getOrCreate(device: device)
+            case .patched(let source):
+                try DoviFelComposer.SharedPipelines.make(library: device.makeLibrary(source: source, options: nil), archive: nil)
+            }
+        }
+    }
+
+    static func patched(_ source: String, _ edits: [(String, String)]) throws -> Kernels {
         var s = source
         for (a, b) in edits {
             guard s.contains(a) else { throw BenchmarkError(description: "variant edit not found: \(a.prefix(60))") }
             s = s.replacingOccurrences(of: a, with: b)
         }
-        return s
+        return .patched(s)
     }
 
     /// LUT in device memory: per-thread indices into `constant` memory serialise on Apple GPUs.

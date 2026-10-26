@@ -113,9 +113,18 @@ let package = Package(
                 .product(name: "LibDeinterlace", package: "LibDeinterlace"),
                 .product(name: "TrueHD", package: "LibTrueHD", condition: .when(traits: ["TrueHDObjectAudio"])),
                 .product(name: "LibMLSubUpscaler", package: "LibMLSubUpscaler", condition: .when(traits: ["MLSubtitleUpscale"])),
+                .target(name: "AetherFELShaders", condition: .when(traits: ["DualLayerDolbyVision"])),
             ],
-            // Silent E-AC-3 Atmos that `AtmosOutputActivator` loops beside an APAC track on tvOS.
-            resources: [.copy("Resources/silent-atmos.mp4")],
+            // Included by Finisher.metal, not a resource of its own.
+            exclude: ["Shaders/FilmGrain.h"],
+            resources: [
+                // Silent E-AC-3 Atmos that `AtmosOutputActivator` loops beside an APAC track on tvOS.
+                .copy("Resources/silent-atmos.mp4"),
+                // The GPU kernels, compiled into the bundle's default.metallib when the package builds.
+                .process("Shaders"),
+                // Their pipelines translated for the Apple TV 4K's A15 (Scripts/build-shader-archive.sh).
+                .copy("Resources/AetherEngine-pipelines.metallib"),
+            ],
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("AVKit"),
@@ -124,6 +133,12 @@ let package = Package(
                 .linkedFramework("VideoToolbox"),
                 .linkedFramework("AudioToolbox"),
             ]
+        ),
+        // The Dolby Vision FEL composer's kernels, only with the DualLayerDolbyVision trait.
+        .target(
+            name: "AetherFELShaders",
+            path: "Sources/AetherFELShaders",
+            resources: [.process("Shaders")]
         ),
         .target(
             name: "AetherEngineSMB",
@@ -137,6 +152,12 @@ let package = Package(
             name: "aetherctl",
             dependencies: ["AetherEngine", "AetherEngineSMB"],
             path: "Sources/aetherctl"
+        ),
+        // The build's tool for the engine's pipeline archive (Scripts/build-shader-archive.sh); never a product.
+        .executableTarget(
+            name: "ShaderHarvest",
+            dependencies: ["AetherEngine"],
+            path: "Sources/ShaderHarvest"
         ),
         // The samples in Examples/ are drop-in files rather than apps, so nothing used to
         // compile them and they could rot the way prose rots, except a reader trusts them

@@ -263,19 +263,19 @@ struct DoviDitherTests {
         return out
     }
 
+    /// The shader's `dovi_blue_noise_64`, row by row.
     static var blueNoiseRanks: [Int] {
-        DoviShaderSource.blueNoiseRows.flatMap { row -> [Int] in
-            stride(from: 0, to: row.count, by: 3).map { i in
-                let a = row.index(row.startIndex, offsetBy: i)
-                return Int(row[a..<row.index(a, offsetBy: 3)], radix: 16)!
-            }
+        get throws {
+            let source = try ShaderFiles.dolbyVisionFEL()
+            let start = try #require(source.range(of: "dovi_blue_noise_64[4096] = {"))
+            let end = try #require(source.range(of: "};", range: start.upperBound..<source.endIndex))
+            return source[start.upperBound..<end.lowerBound].split(whereSeparator: { ", \n".contains($0) }).compactMap { Int($0) }
         }
     }
 
     @Test("the blue-noise map holds every rank once, so its thresholds average exactly 0.5, and its local means are flat")
-    func blueNoiseTableShape() {
-        let ranks = Self.blueNoiseRanks
-        #expect(DoviShaderSource.blueNoiseRows.count == 64)
+    func blueNoiseTableShape() throws {
+        let ranks = try Self.blueNoiseRanks
         #expect(ranks.sorted() == Array(0..<4096), "not a permutation of 0...4095")
         // Blue noise has almost no low-frequency content, so 8x8 block means sit close to the tile mean
         // (2047.5): this map spreads them by 41.5, a shuffled table (white noise) by about 160.
@@ -318,7 +318,7 @@ struct DoviDitherTests {
         let bayer = Self.readAll(try run(.bayer8x8, frame: 0), plane: 0, components: 1, component: 0)
         #expect(y0 != bayer)
         // The thresholds below 0.5 are exactly ranks 0...2047, so at residue 2 the luma plane is the map's lower half.
-        let ranks = Self.blueNoiseRanks
+        let ranks = try Self.blueNoiseRanks
         #expect(y0 == ranks.map { $0 >= 2048 ? 501 : 500 }, "the luma plane is not the map at offset (0, 0)")
         let cb = Self.readAll(f0, plane: 1, components: 2, component: 0)
         let cr = Self.readAll(f0, plane: 1, components: 2, component: 1)

@@ -7,7 +7,7 @@ Usage: card.py verify [--out DIR] [--modes m1,m2]  run `aetherctl feltest --prob
        card.py preview [--out DIR]                 out/card_preview_<outcome>.png (1920x1080) and out/CARD.md
        card.py bullseye [--out DIR]                model statistics for p7fel_bullseye, plus feltest probes
 
-The model reads the dither tables from the engine's own shader source (DoviShaderSource.swift) and mirrors
+The model reads the dither tables from the engine's own shader source (DolbyVisionFEL.metal) and mirrors
 dovi_compose_luma: identity polynomial (vdr = 4 * BL), bilinear centre-aligned EL upsampling rounded half up,
 DoviFelComposer.inverseNlq, then the output quantiser of each mode. feltest needs the engine's DualLayerDolbyVision
 trait; it is run from the AetherEngine root with DEVELOPER_DIR set to Xcode (override with $DEVELOPER_DIR).
@@ -25,7 +25,7 @@ import gen_pulse as gp
 
 HERE = Path(__file__).resolve().parent
 ENGINE = HERE.parents[2]
-SHADER = ENGINE / "Sources/AetherEngine/Video/Metal/DoviShaderSource.swift"
+SHADER = ENGINE / "Sources/AetherFELShaders/Shaders/DolbyVisionFEL.metal"
 MODES = ["p010-round", "p010", "p010-bluenoise", "p010-full", "sv22"]
 
 
@@ -34,9 +34,8 @@ def shader_tables():
     src = SHADER.read_text()
     m = re.search(r"dovi_bayer_8x8\[64\] = \{(.*?)\};", src, re.S)
     bayer = np.array([float(a) / float(b) for a, b in re.findall(r"([\d.]+)f/([\d.]+)f", m.group(1))])
-    m = re.search(r"blueNoiseRows[^=]*= \[(.*?)\]", src, re.S)
-    rows = re.findall(r'"([0-9a-f]{192})"', m.group(1))
-    blue = np.array([int(r[i:i + 3], 16) for r in rows for i in range(0, 192, 3)])
+    m = re.search(r"dovi_blue_noise_64\[4096\] = \{(.*?)\};", src, re.S)
+    blue = np.array([int(v) for v in re.findall(r"\d+", m.group(1))])
     assert bayer.size == 64 and blue.size == 4096, (bayer.size, blue.size)
     return bayer.reshape(8, 8), blue.reshape(64, 64)
 
