@@ -20,6 +20,15 @@
       }
     },
     {
+      "identity" : "libmlsubupscaler",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/TheFireKahuna/LibMLSubUpscaler",
+      "state" : {
+        "revision" : "c87b6cd373fa2b9764656458f830dfd118b8acb7",
+        "version" : "1.2.0"
+      }
+    },
+    {
       "identity" : "libtruehd",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/TheFireKahuna/LibTrueHD",
