@@ -29,8 +29,18 @@ enum AudioRouteDescription {
         let ports = session.currentRoute.outputs.map(portDescription).joined(separator: ", ")
         return "output=\(session.outputNumberOfChannels) preferred=\(session.preferredOutputNumberOfChannels) "
             + "max=\(session.maximumOutputNumberOfChannels) rendering=\(renderingModeName(session.renderingMode)) "
-            + "multichannelContent=\(session.supportsMultichannelContent) ports=[\(ports)] "
-            + "latency=\(String(format: "%.0f", session.outputLatency * 1000))ms "
+            + "multichannelContent=\(session.supportsMultichannelContent) ports=[\(ports)] " + (latency() ?? "")
+        #else
+        return nil
+        #endif
+    }
+
+    /// `latency=…ms io=…ms`: the route's output latency and the session's I/O buffer duration, as the system
+    /// reports them now; nil where there is no `AVAudioSession`.
+    static func latency() -> String? {
+        #if os(iOS) || os(tvOS)
+        let session = AVAudioSession.sharedInstance()
+        return "latency=\(String(format: "%.1f", session.outputLatency * 1000))ms "
             + "io=\(String(format: "%.1f", session.ioBufferDuration * 1000))ms"
         #else
         return nil
