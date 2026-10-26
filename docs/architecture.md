@@ -586,7 +586,7 @@ Sources/AetherEngine/
 │   └── WebVTTSegmentParser.swift            One parsed WebVTT segment of a live SUBTITLES rendition: cue times are in the segment's own local clock (a counter providers run for days), and placement comes from the playlist geometry rather than the `X-TIMESTAMP-MAP` the spec offers (#359)
 ├── Shaders/                                 The GPU kernels, compiled into the bundle's default.metallib when the package builds
 │   ├── Finisher.metal                       The finisher's kernel (`pf_finish`, specialised per plan with function constants), the constant-luminance recompute, decimate's gate
-│   ├── FilmGrain.h                          AV1 film grain: `fg_synthesize` (templates, scaling tables, block offsets) and the per-sample grain the finisher reads through
+│   ├── FilmGrain.h                          AV1 film grain: the synthesis kernels by role (templates, scaling tables, block offsets) and the per-sample grain the finisher reads through
 │   └── Fill.metal                           `ComputePass.fill` on the Metal 3 backend
 ├── Resources/
 │   ├── AetherEngine-pipelines.metallib      The planned pipelines translated for the A15 on tvOS 27.0 (`Scripts/build-shader-archive.sh`)

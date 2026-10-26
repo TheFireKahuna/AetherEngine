@@ -1,6 +1,6 @@
 // AV1 film grain synthesis (AV1 7.18.3), the CPU's part: the grain buffer's layout, the header and the synthesis
 // arguments of a frame's parameters; the GPU synthesises the templates, the scaling tables and the block offsets into
-// the buffer (fg_synthesize, Shaders/FilmGrain.h). The structure follows dav1d's
+// the buffer (the fg_* kernels of Shaders/FilmGrain.h). The structure follows dav1d's
 // src/filmgrain_tmpl.c and src/fg_apply_tmpl.c:
 //
 // Copyright © 2018, Niklas Haas
@@ -133,9 +133,9 @@ struct FilmGrainParameters: Hashable, Sendable {
 }
 
 /// The per-frame tables, laid out as Shaders/FilmGrain.h reads them (its FG_* constants): a header the CPU writes, and
-/// the templates, scaling tables and block offsets the GPU synthesises in the frame's own batch (`fg_synthesize`). AV1's
-/// generator is serial (one LFSR stream, a causal auto-regressive filter), and the GPU takes it exactly: each draw's
-/// LFSR state jumped to directly (the shader's FG_JUMP), the filter run as a wavefront, the tables in closed form.
+/// the templates, scaling tables and block offsets the GPU synthesises in the frame's own batch. AV1's generator
+/// is serial (one LFSR stream, a causal auto-regressive filter), and the GPU takes it exactly: each run of draws' LFSR
+/// state jumped to directly (the shader's FG_JUMP), the filter run as a wavefront, the tables in closed form.
 enum FilmGrainSynthesis {
     static let templateWidth = 82
     static let templateHeight = 73
@@ -167,7 +167,7 @@ enum FilmGrainSynthesis {
     }
 
     /// Writes the header of one `width` x `height` frame of `p` at `buffer`, which holds `bufferLength(width:height:)`
-    /// bytes; the templates, the scaling tables and the block offsets are the GPU's (`fg_synthesize`, from
+    /// bytes; the templates, the scaling tables and the block offsets are the GPU's (the synthesis kernels, from
     /// ``synthesisArguments(_:width:height:)``).
     static func writeHeader(_ p: FilmGrainParameters, width: Int, height: Int, into buffer: UnsafeMutableRawPointer) {
         let header = buffer.bindMemory(to: Int32.self, capacity: headerWords)
@@ -193,7 +193,7 @@ enum FilmGrainSynthesis {
         set(.bitDepthMinus8, depthMinus8)
     }
 
-    /// `fg_synthesize`'s argument (FGParams in the shader) for one `width` x `height` frame of `p`.
+    /// The synthesis kernels' argument (FGParams in the shader) for one `width` x `height` frame of `p`.
     static func synthesisArguments(_ p: FilmGrainParameters, width: Int, height: Int) -> [UInt8] {
         var bytes: [UInt8] = []
         func words(_ values: [Int]) { for v in values { withUnsafeBytes(of: UInt32(truncatingIfNeeded: v)) { bytes += $0 } } }

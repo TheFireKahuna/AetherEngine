@@ -311,12 +311,16 @@ of every picture. The target is the specification's Option 1, bit for bit.
 - **Decoder**: `AV_CODEC_EXPORT_DATA_FILM_GRAIN` on libdav1d (the wrapper then turns `apply_grain` off,
   `libdav1d.c:280`); each frame's `AV_FRAME_DATA_FILM_GRAIN_PARAMS` travels with it to the finisher.
 - **Synthesis, on the GPU, per parameter set** (2026-10-26; it was CPU work before): the CPU writes a 32-word header
-  and passes the set (208 bytes) as a constant argument; one threadgroup of 256 (`fg_synthesize`) draws the templates
-  (each LFSR draw reached directly by GF(2) jump matrices, so the draws are independent), runs each auto-regression
-  as a wavefront (the anti-diagonal `x + (lag + 1) y` goes once every earlier one has, a thread a row), and writes the
-  scaling tables and the block offsets. It is encoded beside the deinterlacer's fields, behind the barrier they share
-  with the finishes, and only when a slot's tables do not already hold the set (a repeated `show_existing_frame`
-  costs nothing); a batch that fails marks its tables as holding nothing.
+  and passes the set (208 bytes) as a constant argument. The kernels split the work by role: `fg_luma` (one
+  threadgroup: the luma template's draws, then its auto-regression), `fg_chroma_draws` (Cb and Cr, a threadgroup
+  each), `fg_scaling` (a thread a table entry) and `fg_offsets` (a thread a block row) run at once; after one barrier,
+  `fg_chroma_regress` runs both chroma auto-regressions at once, reading the finished luma template. Each thread's run
+  of draws starts with one jump of the LFSR by GF(2) jump matrices and then steps it; each auto-regression is a
+  wavefront (the anti-diagonal `x + (lag + 1) y` goes once every earlier one has, a thread a row). The synthesis is a
+  pass of its own in the frame's batch, beside the deinterlacer's fields, and the finishes wait on its fence; it is
+  encoded only when a slot's tables do not already hold the set (a repeated `show_existing_frame` costs nothing), and
+  a batch that fails marks its tables as holding nothing. On the M4 Pro a lag-3 10-bit 4:2:0 set takes 0.89 ms of GPU
+  time (1.25 ms as one threadgroup), lag-2 8-bit 4:2:2 0.52 ms (0.82); the luma auto-regression is the critical path.
 - **Application, on the GPU**: the noise at a sample is a pure function of the templates, its block's offsets and its
   left / upper neighbours' in the overlap, so one function in the shader source computes the grained value of any
   sample. The finisher's reader calls it for every tap it reads (chroma taps with the un-noised luma at their own
@@ -338,12 +342,12 @@ of every picture. The target is the specification's Option 1, bit for bit.
 ### 5.5 Built and measured
 
 - `Video/FilmGrain/`: `FilmGrainParameters` (from `AV_FRAME_DATA_FILM_GRAIN_PARAMS`), `FilmGrainSynthesis` (the
-  buffer's layout, its header and the synthesis arguments) and `Shaders/FilmGrain.h` (`fg_synthesize`, the LFSR jump
+  buffer's layout, its header and the synthesis arguments) and `Shaders/FilmGrain.h` (the synthesis kernels, the LFSR jump
   matrices and the per-sample `fg_*`). The finisher's `pf_c0..2` read through `pf_grained` under `FC_GRAIN`
   (function constant 31), so every path (pack, resample, grey, RGB, convert, constant luminance) takes grain on the
   samples it reads. `DisplayBufferWriter.install` turns on `AV_CODEC_EXPORT_DATA_FILM_GRAIN` for libdav1d only (H.264 /
   HEVC grain is H.274's, which libavcodec applies).
-- A15 (offline counts, `research/a15-registers`): `fg_synthesize` 30 registers; the grained finish 16 to 18 at 8, 10
+- A15 (offline counts, `research/a15-registers`): the synthesis kernels 8 to 24 registers; the grained finish 16 to 18 at 8, 10
   and 12 bits, 4:2:0 and 4:4:4, no stack or calls (`pf_grained` is forced inline: outlined, it was six calls a pixel).
 - `FilmGrainTests`: the display writer's picture with the GPU's grain equals its picture of libdav1d's grained output,
   picture digest for picture digest. Argon (`AETHER_ARGON=1`, opt-in; `AETHER_ARGON_DIRS` / `AETHER_ARGON_STREAMS`
@@ -634,17 +638,17 @@ the source, held to their derivation by `ShaderTablesTests`.
 
 Every pipeline is made by `GPUPipelines`, one per device for the process: on Metal 4 one compiler, the request's archive
 first (`MTL4Archive` itself, so a miss is known: it is compiled and logged as `[GPUPipelines] <function> not in
-<archive>`), on Metal 3 the device. Functions that read no function constant (`fg_synthesize`, `pf_cl_prepare`,
+<archive>`), on Metal 3 the device. Functions that read no function constant (the grain synthesis kernels, `pf_cl_prepare`,
 `pf_gate`) are one pipeline each, not one per plan.
 
 The planned set (`PlanarFrameFinisher.plannedSet`) is 74 finisher plans: the 62 of Order of work 3 and inverse
-telecine's variants of the 8-bit planar ones; with grain's synthesis and decimate's gate, 76 pipelines, and the FEL
+telecine's variants of the 8-bit planar ones; with grain's synthesis and decimate's gate, 80 pipelines, and the FEL
 composer's 12 (every variant it tells apart). `Scripts/build-shader-archive.sh` builds the package for tvOS devices in
-Release, records those 88 with a Metal 4 compiler (`ShaderHarvest`) and translates them for the A15 on tvOS 27.0 into
+Release, records those 92 with a Metal 4 compiler (`ShaderHarvest`) and translates them for the A15 on tvOS 27.0 into
 `Resources/AetherEngine-pipelines.metallib` (6.3 MB, 3.4 MB compressed; `metal-tt`'s compression options change
 nothing). The archive is bound to the exact libraries: Xcode's Release build of the package and `swift build`'s compile
 the kernels to the same bytes (measured), a Debug build does not. Rerun the script after any shader change and for a
-new tvOS release. On the Mac, the same chain translated for its own GPU served all 88 from the archive.
+new tvOS release. On the Mac, the same chain translated for its own GPU served every pipeline of the set (88 then) from the archive.
 
 At launch the app calls `AetherEngine.prewarmSoftwareDecode()` (the planned set and LibDeinterlace's common formats,
 about 150 pipelines) and `prewarmDualLayerDolbyVision()`, at utility priority.
@@ -687,8 +691,8 @@ about 150 pipelines) and `prewarmDualLayerDolbyVision()`, at utility priority.
    434 distinct pipelines became 62, the kernel and its per-pixel cost unchanged. Moving data-only constants into the
    frame's arguments was rejected: it adds registers and work to every pixel for a first-launch saving.
 4. Done (9.5): the engine's own shaders precompiled, the A15 archive of the planned set, a prewarm at app launch.
-5. Grain synthesis split by role across threadgroups (the luma wavefront, the chroma draws, the scaling tables and
-   the offsets at once, then both chroma wavefronts), in a pass of its own beside the field bwdif.
+5. Done (5.3): grain synthesis split by role, in a pass of its own beside the field bwdif; 29% less GPU time for a
+   lag-3 4:2:0 set on the M4 Pro.
 6. A queue-level residency set for the long-lived allocations (slabs, pool buffers, tables), leaving only per-batch
    transients in each batch's set.
 7. The PiP subtitle compositor's `CIContext` replaced by a blend kernel on the layer; Sodalite's log-export QR code

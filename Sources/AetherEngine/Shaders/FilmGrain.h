@@ -1,6 +1,6 @@
-// AV1 film grain (AV1 7.18.3) on the GPU, included by Finisher.metal: fg_synthesize, which writes a frame's templates, scaling tables and
-// block offsets into its grain buffer, and the per-sample functions the finisher's reader calls for every sample it
-// takes, over those tables. The block sampling and overlap blending follow dav1d's
+// AV1 film grain (AV1 7.18.3) on the GPU, included by Finisher.metal: the synthesis kernels, which write a frame's
+// templates, scaling tables and block offsets into its grain buffer, and the per-sample functions the finisher's reader
+// calls for every sample it takes, over those tables. The block sampling and overlap blending follow dav1d's
 // src/filmgrain_tmpl.c (sample_lut, fgy_32x32xn_c, fguv_32x32xn_c):
 //
 // Copyright © 2018, Niklas Haas
@@ -316,12 +316,6 @@ static inline int fg_next(thread uint& state, uint bits) {
     return int((state >> (16u - bits)) & ((1u << bits) - 1u));
 }
 
-// Draw n (from 1) of the LFSR seeded with `seed`, `bits` wide.
-static inline int fg_draw(uint seed, uint n, uint bits) {
-    uint state = fg_jump(seed, n - 1u);
-    return fg_next(state, bits);
-}
-
 struct FGParams {
     uint seed;
     uint bit_depth;
@@ -410,60 +404,106 @@ static inline uint fg_scale(constant uchar* pts, uint count, uint bitDepth, uint
     return uint((start + fg_floor_shift(int(pad >> 1) + rem * range, shiftX)) & 0xFF);
 }
 
-// A frame's templates, scaling tables and block offsets into its grain buffer, after the header the CPU wrote. One
-// threadgroup of FG_THREADS.
-kernel void fg_synthesize(device uchar*       g   [[buffer(0)]],
-                          constant FGParams&  p   [[buffer(1)]],
-                          uint                tid [[thread_index_in_threadgroup]]) {
+// The synthesis of a frame's templates, scaling tables and block offsets into its grain buffer (after the header the CPU
+// wrote), split by role so independent parts run at once: fg_luma, fg_chroma_draws, fg_scaling and fg_offsets together,
+// then, once the luma template is done, fg_chroma_regress for both chroma planes. Each template's draws are a run per
+// thread: one jump to the run's start, then a step per draw.
+
+// Thread `tid`'s run of `n` draws, [x, y).
+static inline uint2 fg_run(uint n, uint tid) {
+    uint per = (n + FG_THREADS - 1u) / FG_THREADS;
+    uint start = min(n, tid * per);
+    return uint2(start, min(n, start + per));
+}
+
+// The luma template: its draws, then its auto-regressive filter. Zero when luma has no points. One threadgroup of
+// FG_THREADS.
+kernel void fg_luma(device uchar*       g   [[buffer(0)]],
+                    constant FGParams&  p   [[buffer(1)]],
+                    uint                tid [[thread_index_in_threadgroup]]) {
     threadgroup short luma[FG_TW * FG_TH];
-    threadgroup short chroma[FG_TW * FG_TH];
-    int lo = -(128 << (p.bit_depth - 8u)), hi = (128 << (p.bit_depth - 8u)) - 1;
     device short* templates = (device short*)(g + FG_TEMPLATES);
     uint plane = uint(FG_TW * FG_TH);
-
-    // Luma: no points, no grain, and no luma term for chroma; the template is zero.
-    for (uint i = tid; i < plane; i += FG_THREADS) {
-        luma[i] = p.active_y != 0u ? short(fg_round2(int(FG_GAUSS[fg_draw(p.seed, i + 1u, 11u)]), p.shift)) : short(0);
+    if (p.active_y == 0u) {
+        for (uint i = tid; i < plane; i += FG_THREADS) { templates[i] = 0; }
+        return;
     }
+    int lo = -(128 << (p.bit_depth - 8u)), hi = (128 << (p.bit_depth - 8u)) - 1;
+    uint2 run = fg_run(plane, tid);
+    uint state = fg_jump(p.seed, run.x);
+    for (uint i = run.x; i < run.y; ++i) { luma[i] = short(fg_round2(int(FG_GAUSS[fg_next(state, 11u)]), p.shift)); }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (p.active_y != 0u) { fg_regress(luma, luma, p.ar_y, p, FG_TW, FG_TH, false, lo, hi, tid); }
+    fg_regress(luma, luma, p.ar_y, p, FG_TW, FG_TH, false, lo, hi, tid);
     for (uint i = tid; i < plane; i += FG_THREADS) { templates[i] = luma[i]; }
+}
 
-    // Cb then Cr, each from its own seed, on its subsampled template (the stride stays the luma template's).
-    int cw = p.sx != 0u ? FG_SUB_TW : FG_TW, ch = p.sy != 0u ? FG_SUB_TH : FG_TH;
-    for (uint c = 0u; c < 2u; ++c) {
-        if ((c == 0u ? p.active_cb : p.active_cr) == 0u) { continue; }
-        uint seed = p.seed ^ (c == 0u ? 0xb524u : 0x49d8u);
-        for (uint i = tid; i < uint(cw * ch); i += FG_THREADS) {
-            uint y = i / uint(cw), x = i % uint(cw);
-            chroma[y * uint(FG_TW) + x] = short(fg_round2(int(FG_GAUSS[fg_draw(seed, i + 1u, 11u)]), p.shift));
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        fg_regress(chroma, luma, c == 0u ? p.ar_cb : p.ar_cr, p, cw, ch, true, lo, hi, tid);
-        for (uint i = tid; i < uint(cw * ch); i += FG_THREADS) {
-            uint y = i / uint(cw), x = i % uint(cw);
-            templates[(1u + c) * plane + y * uint(FG_TW) + x] = chroma[y * uint(FG_TW) + x];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // The scaling tables. Chroma scaled from luma reads luma's, which is all 0 with no luma points.
-    uint size = 1u << p.bit_depth;
-    for (uint e = tid; e < 3u * size; e += FG_THREADS) {
-        uint table = e / size, index = e % size;
-        uint count = table == 0u ? p.y_points : (table == 1u ? p.cb_points : p.cr_points);
-        bool written = table == 0u ? (p.active_y != 0u || p.from_luma != 0u) : count > 0u;
-        if (!written) { continue; }
-        constant uchar* pts = table == 0u ? p.y_pts : (table == 1u ? p.cb_pts : p.cr_pts);
-        g[FG_SCALING + table * FG_SCALING_STRIDE + index] = uchar(fg_scale(pts, count, p.bit_depth, index));
-    }
-
-    // One 8-bit draw a 32 x 32 luma block, from an LFSR re-seeded every block row.
-    for (uint row = tid; row < p.block_rows; row += FG_THREADS) {
-        uint state = p.seed ^ (((row * 37u + 178u) & 0xFFu) << 8) ^ ((row * 173u + 105u) & 0xFFu);
-        for (uint col = 0u; col < p.block_columns; ++col) {
-            g[FG_OFFSETS + row * p.block_columns + col] = uchar(fg_next(state, 8u));
-        }
+// A chroma template's draws, before its filter: Cb in threadgroup 0, Cr in 1, each from its own seed, on its subsampled
+// template (the stride stays the luma template's).
+kernel void fg_chroma_draws(device uchar*       g   [[buffer(0)]],
+                            constant FGParams&  p   [[buffer(1)]],
+                            uint                c   [[threadgroup_position_in_grid]],
+                            uint                tid [[thread_index_in_threadgroup]]) {
+    if ((c == 0u ? p.active_cb : p.active_cr) == 0u) { return; }
+    device short* t = (device short*)(g + FG_TEMPLATES) + (1u + c) * uint(FG_TW * FG_TH);
+    uint cw = p.sx != 0u ? uint(FG_SUB_TW) : uint(FG_TW), ch = p.sy != 0u ? uint(FG_SUB_TH) : uint(FG_TH);
+    uint2 run = fg_run(cw * ch, tid);
+    uint state = fg_jump(p.seed ^ (c == 0u ? 0xb524u : 0x49d8u), run.x);
+    for (uint i = run.x; i < run.y; ++i) {
+        t[(i / cw) * uint(FG_TW) + i % cw] = short(fg_round2(int(FG_GAUSS[fg_next(state, 11u)]), p.shift));
     }
 }
 
+// A chroma template's auto-regressive filter, with its luma term from the finished luma template: Cb in threadgroup 0,
+// Cr in 1. After fg_luma and fg_chroma_draws.
+kernel void fg_chroma_regress(device uchar*       g   [[buffer(0)]],
+                              constant FGParams&  p   [[buffer(1)]],
+                              uint                c   [[threadgroup_position_in_grid]],
+                              uint                tid [[thread_index_in_threadgroup]]) {
+    if ((c == 0u ? p.active_cb : p.active_cr) == 0u) { return; }
+    threadgroup short luma[FG_TW * FG_TH];
+    threadgroup short chroma[FG_TW * FG_TH];
+    device short* templates = (device short*)(g + FG_TEMPLATES);
+    uint plane = uint(FG_TW * FG_TH);
+    int lo = -(128 << (p.bit_depth - 8u)), hi = (128 << (p.bit_depth - 8u)) - 1;
+    int cw = p.sx != 0u ? FG_SUB_TW : FG_TW, ch = p.sy != 0u ? FG_SUB_TH : FG_TH;
+    if (p.active_y != 0u) {
+        for (uint i = tid; i < plane; i += FG_THREADS) { luma[i] = templates[i]; }
+    }
+    device short* t = templates + (1u + c) * plane;
+    for (uint i = tid; i < uint(cw * ch); i += FG_THREADS) {
+        uint y = i / uint(cw), x = i % uint(cw);
+        chroma[y * uint(FG_TW) + x] = t[y * uint(FG_TW) + x];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    fg_regress(chroma, luma, c == 0u ? p.ar_cb : p.ar_cr, p, cw, ch, true, lo, hi, tid);
+    for (uint i = tid; i < uint(cw * ch); i += FG_THREADS) {
+        uint y = i / uint(cw), x = i % uint(cw);
+        t[y * uint(FG_TW) + x] = chroma[y * uint(FG_TW) + x];
+    }
+}
+
+// The scaling tables, a thread an entry over 3 x 2^BitDepth. Chroma scaled from luma reads luma's, which is all 0 with no
+// luma points.
+kernel void fg_scaling(device uchar*       g   [[buffer(0)]],
+                       constant FGParams&  p   [[buffer(1)]],
+                       uint                e   [[thread_position_in_grid]]) {
+    uint size = 1u << p.bit_depth;
+    if (e >= 3u * size) { return; }
+    uint table = e / size, index = e % size;
+    uint count = table == 0u ? p.y_points : (table == 1u ? p.cb_points : p.cr_points);
+    bool written = table == 0u ? (p.active_y != 0u || p.from_luma != 0u) : count > 0u;
+    if (!written) { return; }
+    constant uchar* pts = table == 0u ? p.y_pts : (table == 1u ? p.cb_pts : p.cr_pts);
+    g[FG_SCALING + table * FG_SCALING_STRIDE + index] = uchar(fg_scale(pts, count, p.bit_depth, index));
+}
+
+// One 8-bit draw a 32 x 32 luma block, from an LFSR re-seeded every block row: a thread a row.
+kernel void fg_offsets(device uchar*       g   [[buffer(0)]],
+                       constant FGParams&  p   [[buffer(1)]],
+                       uint                row [[thread_position_in_grid]]) {
+    if (row >= p.block_rows) { return; }
+    uint state = p.seed ^ (((row * 37u + 178u) & 0xFFu) << 8) ^ ((row * 173u + 105u) & 0xFFu);
+    for (uint col = 0u; col < p.block_columns; ++col) {
+        g[FG_OFFSETS + row * p.block_columns + col] = uchar(fg_next(state, 8u));
+    }
+}
