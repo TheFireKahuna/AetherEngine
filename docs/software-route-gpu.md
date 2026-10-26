@@ -637,11 +637,14 @@ passthrough source) compiles into the per-dispatch preamble, not the per-pixel b
 - **The finisher's speed on the Apple TV** is unmeasured (all figures are M4 Pro), and so are the grain's cost
   (the synthesis kernel's span, the per-sample application inside the finisher) and the software route's frame timing
   since 9.2 (to be read from the overlay's counters against the build before it).
-- **Wrong finisher output under load (a correctness bug, open).** Only in test runs with several suites in one process,
-  most often the first after a rebuild (a cold shader cache): a finish runs as one GPU thread with nonsense constants
-  (luma left as it was but for two samples, chroma 255), the catch-up suite's two decodes differ, the soft-telecine
-  stream delivers short. Alone, cold or warm, the same tests pass; a stale Core Video texture is ruled out. Seen since
-  the layer's per-batch uploads (9.1).
+- **GPU-wide timeouts in several-suite test runs (open).** Intermittently, most often in the first run after a rebuild,
+  every command buffer in flight fails at once, on every queue, with `MTL4CommandQueueErrorTimeout` (Metal 3 runs fail
+  the same way), about 100 to 500 ms after starting: finishes that write nothing or a pixel, decoders that deliver short.
+  Instrumented (2026-10-26), the failed batches are all small (a 64x48 or 1080p finish, bwdif fields, a gated finish),
+  their constant uploads intact, their GPU-written gate arguments what the CPU asked for, and Metal 4 captures argument
+  tables per dispatch (checked); 2,400 gated and 1,600 plain finishes from many finishers at once are all right, and
+  shader validation finds nothing. So they look like bystanders of a hang elsewhere: another GPU user in the test
+  process, or another process (a tvOS Simulator was running on the Mac). Next: a run with the Simulator closed.
 - **The archives on the device**: whether the A15 takes the libraries' pipelines from them (a launch logging misses).
 - **Device checks still owed**: part 7's AV1 HDR scrub thumbnails; live HEVC through the #365 sample conversion and a
   mid-stream parameter-set change; a live SDR to HDR programme switch (the panel switching once, AVPlayer playing on
