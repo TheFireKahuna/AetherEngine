@@ -313,8 +313,17 @@ struct MatroskaCueIndexTests {
     func demandLead() {
         #expect(AetherEngine.subtitleReadAhead(base: 300, playhead: 100, requested: nil) == 300)
         #expect(AetherEngine.subtitleReadAhead(base: 300, playhead: 100, requested: 200) == 300)
-        #expect(AetherEngine.subtitleReadAhead(base: 240, playhead: 100, requested: 450)
-                == 350 + AetherEngine.subtitleDemandMarginSeconds)
+        #expect(AetherEngine.subtitleReadAhead(base: 240, playhead: 100, requested: 384)
+                == 284 + AetherEngine.subtitleDemandMarginSeconds)
+    }
+
+    @Test("a request run on to the end of the title is followed only to the ceiling")
+    func demandLeadCeiling() {
+        let ceiling = AetherEngine.subtitleReadAheadCeilingSeconds
+        #expect(AetherEngine.subtitleReadAhead(base: 270, playhead: 2020, requested: 7844) == ceiling)
+        #expect(AetherEngine.subtitleReadAhead(base: 300, playhead: 100, requested: 100 + ceiling) == ceiling)
+        #expect(ceiling > AetherEngine.nativeSubtitleReadAheadSeconds)
+        #expect(ceiling > AetherEngine.subtitleOCRReadAheadSeconds)
     }
 
     @Test("the store keeps the furthest window the player asked for, on the source axis")

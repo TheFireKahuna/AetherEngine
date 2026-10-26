@@ -3910,12 +3910,19 @@ public final class AetherEngine: ObservableObject {
     /// it asked for, so the next request finds its window read.
     nonisolated static let subtitleDemandMarginSeconds: Double = 30
 
+    /// The furthest a feeder follows the player's subtitle requests: AVKit's reading of a rendition about four
+    /// minutes past the video it has buffered (about a minute), plus the margin. A request beyond it is one the
+    /// player made because its earlier windows were answered at once (an empty window is answered without
+    /// waiting, and the player moves straight on to the next), which can run to the end of the title; following
+    /// it would read, cut and hold the whole title ahead of the clock.
+    nonisolated static let subtitleReadAheadCeilingSeconds: Double = 360
+
     /// A feeder's read-ahead: `base`, or further when the player has asked for windows ending at
-    /// `requested` (source axis). AVKit reads a subtitle rendition about four minutes ahead of the video
-    /// it fetches, further than a fixed lead reaches.
+    /// `requested` (source axis), up to ``subtitleReadAheadCeilingSeconds``. AVKit reads a subtitle rendition
+    /// about four minutes ahead of the video it fetches, further than a fixed lead reaches.
     nonisolated static func subtitleReadAhead(base: Double, playhead: Double, requested: Double?) -> Double {
         guard let requested, requested.isFinite else { return base }
-        return max(base, requested - playhead + subtitleDemandMarginSeconds)
+        return max(base, min(requested - playhead + subtitleDemandMarginSeconds, subtitleReadAheadCeilingSeconds))
     }
 
     /// Source-time flush window for ASS cue batching (#56). Previously each event triggered a MainActor.run hop;
