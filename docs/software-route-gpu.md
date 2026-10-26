@@ -1,12 +1,14 @@
 # The software route: one GPU pass, inside the native player
 
-Status: written 2026-10-24 on `research/12bit-fel`, updated 2026-10-25. The GPU cutover is done: a software-decoded
+Status: written 2026-10-24 on `research/12bit-fel`, updated 2026-10-26. The GPU cutover is done: a software-decoded
 picture reaches the display, and every still, in one GPU pass with no CPU pass over its pixels. Parts 2 (the GPU
 finisher and H.273 colour) and 3 (AV1 into the slabs) are built; parts 4 (bwdif on the GPU) and 6 (film in
-interlaced carriage) are built and verified on device; part 5 (AV1 film grain) is built and bit exact on the Argon
-streams; part 7 (stills) is built, its device check open. Part 8 records the mid-stream colour fixes part 5's
-conformance run led to. Part 1 (one overlay for every picture AVPlayer cannot show) is open. The colour equations are in
-[colour-representation.md](colour-representation.md).
+interlaced carriage) are built and verified on device; part 5 (AV1 film grain, its synthesis on the GPU since
+2026-10-26) is built and bit exact on the Argon streams; part 7 (stills) is built, its device check open. Part 8
+records the mid-stream colour fixes part 5's conformance run led to. Part 9 (2026-10-26) is the one GPU submission
+layer every GPU user goes through, the software decoder's frame path without CPU waits, and the libraries' binary ABI;
+built, not yet run on the TV. Part 1 (one overlay for every picture AVPlayer cannot show) is open. What is left is in
+"Order of work" at the end. The colour equations are in [colour-representation.md](colour-representation.md).
 
 What still passes over pixels on the CPU, each on purpose:
 
@@ -308,14 +310,17 @@ of every picture. The target is the specification's Option 1, bit for bit.
 
 - **Decoder**: `AV_CODEC_EXPORT_DATA_FILM_GRAIN` on libdav1d (the wrapper then turns `apply_grain` off,
   `libdav1d.c:280`); each frame's `AV_FRAME_DATA_FILM_GRAIN_PARAMS` travels with it to the finisher.
-- **CPU, per frame** (inherently serial, about 20k samples): the three templates (LFSR, AR filter), the LUTs expanded
-  to `2^BitDepth` entries, the block offsets (one LFSR per stripe, a few hundred values). Cached on the parameter
-  set and seed (a repeated `show_existing_frame` costs nothing).
-- **GPU**: the noise at a sample is a pure function of the templates, its block's offsets and its left / upper
-  neighbours' in the overlap, so one function in the shader source computes the grained value of any sample. The
-  finisher's reader calls it for every tap it reads (chroma taps with the un-noised luma at their own site), so the
-  grain is inside the one pass, and stills (Part 7) get it with no work of their own. A second kernel writes grained
-  planes with the same function: the conformance path, and what the finisher's grained output is tested against.
+- **Synthesis, on the GPU, per parameter set** (2026-10-26; it was CPU work before): the CPU writes a 32-word header
+  and passes the set (208 bytes) as a constant argument; one threadgroup of 256 (`fg_synthesize`) draws the templates
+  (each LFSR draw reached directly by GF(2) jump matrices, so the draws are independent), runs each auto-regression
+  as a wavefront (the anti-diagonal `x + (lag + 1) y` goes once every earlier one has, a thread a row), and writes the
+  scaling tables and the block offsets. It is encoded beside the deinterlacer's fields, behind the barrier they share
+  with the finishes, and only when a slot's tables do not already hold the set (a repeated `show_existing_frame`
+  costs nothing); a batch that fails marks its tables as holding nothing.
+- **Application, on the GPU**: the noise at a sample is a pure function of the templates, its block's offsets and its
+  left / upper neighbours' in the overlap, so one function in the shader source computes the grained value of any
+  sample. The finisher's reader calls it for every tap it reads (chroma taps with the un-noised luma at their own
+  site), so the grain is inside the one pass, and stills (Part 7) get it with no work of their own.
 - Integer arithmetic in `int32` throughout (AR sums reach about 6.3 million, the 12-bit chroma combination about
   1 million). `Round2` and `>> 6` of a negative value need floor semantics: tested explicitly, not assumed of MSL.
 
@@ -332,14 +337,20 @@ of every picture. The target is the specification's Option 1, bit for bit.
 
 ### 5.5 Built and measured
 
-- `Video/FilmGrain/`: `FilmGrainParameters` (from `AV_FRAME_DATA_FILM_GRAIN_PARAMS`), `FilmGrainSynthesis` (templates,
-  LUTs, offsets, written straight into a shared buffer, about 57 KB at 4K, rewritten only when the set changes) and
-  `FilmGrainShaderSource` (`fg_*`). The finisher's `pf_c0..2` read through `pf_grained` under `FC_GRAIN` (function
-  constant 31), so every path (pack, resample, grey, RGB, convert, constant luminance) takes grain on the samples it
-  reads; `fg_planes` writes the grained planes for conformance. `DisplayBufferWriter.install` turns on
-  `AV_CODEC_EXPORT_DATA_FILM_GRAIN` for libdav1d only (H.264 / HEVC grain is H.274's, which libavcodec applies).
-- `FilmGrainTests`: the finisher with grain equals libdav1d's grained picture through the finisher, at 4:2:0, 4:2:2 and
-  4:4:4 output. Argon (`AETHER_ARGON=1`, opt-in, about two minutes): 1508 of the 1512 grain streams give `md5_ref`.
+- `Video/FilmGrain/`: `FilmGrainParameters` (from `AV_FRAME_DATA_FILM_GRAIN_PARAMS`), `FilmGrainSynthesis` (the
+  buffer's layout, its header and the synthesis arguments, the LFSR jump matrices) and `FilmGrainShaderSource`
+  (`fg_synthesize` and the per-sample `fg_*`). The finisher's `pf_c0..2` read through `pf_grained` under `FC_GRAIN`
+  (function constant 31), so every path (pack, resample, grey, RGB, convert, constant luminance) takes grain on the
+  samples it reads. `DisplayBufferWriter.install` turns on `AV_CODEC_EXPORT_DATA_FILM_GRAIN` for libdav1d only (H.264 /
+  HEVC grain is H.274's, which libavcodec applies).
+- A15 (offline counts, `research/a15-registers`): `fg_synthesize` 30 registers; the grained finish 16 to 18 at 8, 10
+  and 12 bits, 4:2:0 and 4:4:4, no stack or calls (`pf_grained` is forced inline: outlined, it was six calls a pixel).
+- `FilmGrainTests`: the display writer's picture with the GPU's grain equals its picture of libdav1d's grained output,
+  picture digest for picture digest. Argon (`AETHER_ARGON=1`, opt-in; `AETHER_ARGON_DIRS` / `AETHER_ARGON_STREAMS`
+  narrow it): all 13 directories pass. A stream whose colour the writer refuses (ST 428 primaries, reserved matrices)
+  is counted as refused, not compared. Run it in batches of a few directories: each decode is wrapped in an
+  autorelease pool (one directory peaked at 6.8 GB without, 1.5 GB with), and all 13 at once still take several GB.
+  Before the writer path, the grained planes against `md5_ref` gave 1508 of 1512.
 - The four others are not grain: FFmpeg's `libdav1d_init_params` (upstream master too) updates the colourspace only
   when a sequence header carries a colour description, so a later header without one keeps the earlier matrix
   instead of AV1's `MC_UNSPECIFIED`. Frames after such a switch arrive labelled RGB (and as `gbrp` at 4:4:4), so
@@ -408,20 +419,34 @@ reference is FFmpeg's `fieldmatch` (VapourSynth VFM) at its defaults: `order=aut
 (still combed) is deinterlaced by bwdif at frame rate (`deint=interlaced`, FFmpeg's documented recipe with bwdif in
 yadif's place).
 
-- **GPU:** the per-pixel stages are integer: the field difference map (`build_diff_map`), the match accumulations
-  (`compare_fields`), the comb mask and its block counts (`calc_combed_score`), the luma differences of the scene
-  check. They run as kernels that write exact integer partial sums.
-- **CPU:** the decisions: `compare_fields`'s single-precision ratios, `checkmm`, the scene check, the match. The
-  same float operations in the same order give the same results.
-- **Output:** a weave of two fields: a copy, written into the scratch picture by the same first dispatch that runs
-  bwdif, then finished as any picture.
+Everything runs on the GPU, the decisions included, with no read back before the next picture (LibDeinterlace
+2.0.0, from 2026-10-26):
+
+- **Statistics**, from the decoded pictures alone, in a pass that may run beside earlier batches' work: the luma
+  differences per 8 x 8 cell (`iv_luma`), the field difference map (`fm_diffmap`, `build_diff_map`) and the match
+  accumulations (`fm_accumulate`, `compare_fields`), as exact integer partial sums.
+- **The scene test** (`iv_scene`): fieldmatch reads comb scores only on a scene change (`combmatch=sc`), so the test
+  also writes the comb kernel's indirect dispatch, every cell or none; `iv_comb` counts the three weaves' combed pixels
+  only then.
+- **The decision** (`iv_match_decide`): `compare_fields`'s single-precision ratios (the same float operations in the
+  same order, compiled with IEEE math), `checkmm`, the combed verdict, into the picture's record; and bwdif's window
+  decision for the picture before it, which writes bwdif's threadgroups into that picture's record: all of them to
+  deinterlace, none to pass the weave through. A passed-through picture is not copied: its readers (decimate's block
+  sums, the finisher) bind both pictures and choose by the record.
+- **The weave** (`iv_weave`), **bwdif** (`pf_bwdif`, indirect from the record), **decimate** (`iv_blocks`,
+  `iv_decimate`): the cycle decision writes each picture's kept word, and the finisher's job for a dropped picture
+  dispatches nothing (`pf_gate`).
+- **Ordering**: a push's two passes are ordered by fences (statistics, the chain's state, and one per set of working
+  buffers against its last reader), not by ordering every batch after all earlier work; a caller's pass reading the
+  outputs waits on `InverseTelecine.fence`. The CPU reads the decisions only in the batch's completion (whether a
+  picture goes out, its timestamp).
 
 ### 6.3 Decimation
 
 The reference is FFmpeg's `decimate` (VapourSynth VDecimate) at its defaults: `cycle=5`, `dupthresh=1.1`,
 `scthresh=15`, `blockx=blocky=32`, `chroma=1`, `mixed=0`. Per cycle of five matched pictures it drops the one most
-like its predecessor (block sums of absolute differences: GPU partial sums, CPU decision) and stamps the four kept
-on the decimated time base (`dec_tb = 1001/24000` from 29.97). Panel rate 24000/1001.
+like its predecessor (block sums of absolute differences and the decision, both on the GPU, 6.2) and stamps the four
+kept on the decimated time base (`dec_tb = 1001/24000` from 29.97). Panel rate 24000/1001.
 
 ### 6.4 Engagement
 
@@ -538,6 +563,65 @@ with one init, so following it needs the change points before the playlist is se
 joins whose container already carries the first part's colour for every player, and the case is rare. VIDEO-RANGE and
 CODECS stay as the master declared them at load.
 
+## Part 9. One GPU submission layer; the frame path without waits; the libraries' ABI (built, 2026-10-26)
+
+### 9.1 The layer
+
+`GPUSubmitter` (`Video/Metal/GPUSubmission.swift`) is the only way GPU work is submitted, by the engine and by the
+libraries it encodes for. Metal 4 where the device has it (`MTL4CommandQueue`, command allocators, argument tables and
+residency sets reused from batch to batch, explicit barriers), Metal 3 otherwise (unretained command buffers, a
+concurrent encoder, memory barriers); the Apple TV 4K 2nd generation (A12) has no Metal 4 and takes the Metal 3 path.
+
+- One queue per client, so no client holds up another: the FEL composer, each finisher, the subtitle upscaler (whose
+  per-window event waits would otherwise stall video).
+- A `GPUBatch` is one commit: passes, events waited on before it and signalled after it, one completion that only
+  hands off. A `ComputePass` has bindings by index, small constant arguments (`setBytes`, a per-batch upload area,
+  which Metal 4 needs), direct and indirect dispatches, `fill` (the encoder's own on Metal 4; a fill kernel in the same
+  encoder on Metal 3, so neither splits a pass), barriers, and fences (`waitForFence`, `updateFence`) for passes that
+  depend on one another without ordering the whole queue. Barriers and fences name the dispatch and blit stages.
+- Pipelines: `makeComputePipeline(library:function:constants:archive:)`. On Metal 4 one `MTL4Compiler` per submitter
+  makes them, looking in the request's Metal 4 binary archive first (each archive loaded once; one Metal refuses is
+  logged and not used); a function with no constants is a plain descriptor, with constants a specialisation, as the
+  archives were recorded. On Metal 3 the device compiles.
+
+### 9.2 The software decoder's frame path
+
+Per frame the decode thread decodes into a slab, looks up the cached plan, takes a pool buffer, takes a ticket and
+encodes one batch (grain synthesis, inverse telecine or bwdif, the finish), commits, and moves on. Nothing on that path
+waits for the GPU or reads its results back. The GPU's completion returns the finisher slot (three in flight before
+back-pressure, which is waited for outside any lock) and hands the frame to `OrderedDelivery`, which delivers by ticket
+in decode order, drops old epochs, and skips a failed frame's ticket. `flush()` bumps an atomic epoch and the decode
+thread applies the reset itself; `close()` is one handshake. End of stream waits for the finisher to go idle (the
+in-flight group is left only after the completion has handed its frame on) and then for delivery. Offline callers
+(the probe, stills) wait on the same path. The overlay's decode thread drains an autorelease pool per access unit.
+
+### 9.3 The libraries' ABI
+
+LibDeinterlace 2.0.0 and LibMLSubUpscaler 2.0.0 ship as committed XCFrameworks (tvOS, iOS, macOS, visionOS, devices
+and simulators, dSYMs), FFmpegBuild-style: the root package is a `binaryTarget`, the source package with its tests
+and build in `Development/`. Built with library evolution, so the `.swiftinterface` is a stable ABI (a rebuilt
+LibDeinterlace drops into an app, as LGPL-2.1 asks); public enums are `@frozen` only where no further case can exist.
+Each library owns no queue and makes no pipeline: its submission protocol has the caller's batches, passes and
+`makeComputePipeline(_:)`. Shaders are `.metal` resources compiled into each slice's `default.metallib`, with the math
+mode in the source (`#pragma METAL fp math_mode(safe)` in LibDeinterlace, whose float ratios must equal the C's);
+nothing compiles Metal source at run time.
+
+The tvOS device slice of each carries a Metal 4 binary archive for the A15 (`applegpu_g14p`): the build records every
+pipeline the library prewarms with a Metal 4 compiler and pipeline-data-set serializer, from that slice's own
+`default.metallib`, and `metal-tt` translates the script (`.mtl4-json`). On the Mac's GPU the same chain serves all
+68 of LibDeinterlace's pipelines from the archive. Limits, measured: Metal takes an archive only on the OS release it
+targets (built for 27.0 it loads on 27.0.1; 26.0 and 27.2 are refused), so tvOS 28 compiles until the frameworks are
+rebuilt; Metal 4 scripts do not target the A12, and classic archives cannot be specialised offline, so the A12 compiles
+its pipelines at prewarm. `DeinterlaceKernels.prewarm(_:)` and `SubtitleUpscaler.prewarm(_:submission:)` make them
+early.
+
+### 9.4 Kernels and registers
+
+Every kernel is checked offline for its A15 register allocation, spills, calls and outlined code
+(`research/a15-registers/regs.py`, with `dump-finisher.py` for the engine's interpolated source): none spills. Per-frame
+choices are function constants or indirect dispatches written on the GPU; a choice uniform over a dispatch (the
+passthrough source) compiles into the per-dispatch preamble, not the per-pixel body.
+
 ## Banked
 
 - **Zero-copy rawvideo** by allocating its packets in slabs. Worth it only if a local or loopback producer ever feeds
@@ -550,11 +634,35 @@ CODECS stay as the master declared them at load.
   `cardov` card test has to be repeated to show the sub-10-bit steps reach the panel on the native route.
 - **dav1d throughput on the A15** at 4K 10-bit (with and without film grain) is unmeasured; it sets the decode-ahead
   the segment gating needs.
-- **The finisher's speed on the Apple TV** is unmeasured (all figures are M4 Pro), and so is the grain's cost
-  (the per-frame tables on the CPU, the per-sample synthesis inside the finisher).
+- **The finisher's speed on the Apple TV** is unmeasured (all figures are M4 Pro), and so are the grain's cost
+  (the synthesis kernel's span, the per-sample application inside the finisher) and the software route's frame timing
+  since 9.2 (to be read from the overlay's counters against the build before it).
+- **Wrong finisher output under load (a correctness bug, open).** Only in test runs with several suites in one process,
+  most often the first after a rebuild (a cold shader cache): a finish runs as one GPU thread with nonsense constants
+  (luma left as it was but for two samples, chroma 255), the catch-up suite's two decodes differ, the soft-telecine
+  stream delivers short. Alone, cold or warm, the same tests pass; a stale Core Video texture is ruled out. Seen since
+  the layer's per-batch uploads (9.1).
+- **The archives on the device**: whether the A15 takes the libraries' pipelines from them (a launch logging misses).
 - **Device checks still owed**: part 7's AV1 HDR scrub thumbnails; live HEVC through the #365 sample conversion and a
   mid-stream parameter-set change; a live SDR to HDR programme switch (the panel switching once, AVPlayer playing on
   across it). The live ones need a probe sequence that serves a growing MPEG-TS.
 - **The `DolbyVisionStillReshaping` trait**: whether its CPU converter stays (7).
 - **ICtCp tagging** relies on CoreVideo's own `ITU_R_2100_ICtCp` tag (code point 14, absent from the public headers);
   whether tvOS's display layer decodes it correctly is untested.
+
+## Order of work
+
+1. The wrong finisher output under load (open questions): the only known correctness bug.
+2. One TV run for the device checks: the software route's frame timing against the overlay's counters, the archives'
+   hits, the subtitle upscaler's first run on the device.
+3. The finisher's variants collapsed: per-format data into the frame's constants, one pipeline per code path.
+4. The engine's own shaders precompiled (the finisher, the FEL composer): `.metal` resources, archives through the
+   layer's pipeline call, a prewarm at app launch. After 3, which cuts the pipelines to archive.
+5. Grain synthesis split by role across threadgroups (the luma wavefront, the chroma draws, the scaling tables and
+   the offsets at once, then both chroma wavefronts), in a pass of its own beside the field bwdif.
+6. A queue-level residency set for the long-lived allocations (slabs, pool buffers, tables), leaving only per-batch
+   transients in each batch's set.
+7. The PiP subtitle compositor's `CIContext` replaced by a blend kernel on the layer; Sodalite's log-export QR code
+   drawn on the CPU.
+8. Two long-running threads still drain no autorelease pool per iteration: the HLS segment producer's pump and the
+   loopback audio reader.
