@@ -3066,7 +3066,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             return (language: audioLanguage, name: name)
         }
         if audioIsAtmosStreamCopy { return (language: nil, name: Self.untaggedAtmosRenditionName) }
-        // A rendition of its own is declared whatever it states (HLS Authoring Specification 8.9).
+        // A rendition of its own is declared whatever it states: the master is where it is named.
         return audioRendition != nil ? (language: nil, name: Self.untaggedRenditionName) : nil
     }
 

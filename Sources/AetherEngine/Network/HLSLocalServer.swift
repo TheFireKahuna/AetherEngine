@@ -1918,7 +1918,7 @@ final class HLSLocalServer: @unchecked Sendable {
             streamInfAttrs.append("HDCP-LEVEL=\(hdcp)")
         }
         // AE#458: the audio rendition tag is the ONLY place AVFoundation reads an audio language from on an HLS
-        // asset (muxed audio's tag carries no URI, RFC 8216 4.3.4.2.1): measured on
+        // asset, muxed audio's tag included, which names no URI: measured on
         // macOS 26, an fMP4 whose mdhd reads "deu" still reports languageCode=nil and builds no audible
         // selection group at all, so every UI over that group (AVKit's audio menu) shows "Not Specified".
         // MP4SegmentMuxer writes the mdhd too, but that is not what fixes the label.
@@ -1931,8 +1931,8 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         if let audio = audioRendition {
             var audioAttrs = ["TYPE=AUDIO", "GROUP-ID=\"aud\"", "NAME=\"\(audio.name)\""]
-            // A rendition of its own states its language whatever it is (HLS Authoring Specification 8.10);
-            // muxed audio's tag is there only for the language and channels it can state.
+            // A rendition of its own states its language whatever it is; muxed audio's tag is there only for the
+            // language and channels it can state.
             if let language = audio.language ?? (provider.servesAudioRendition ? "und" : nil) {
                 audioAttrs.append("LANGUAGE=\"\(language)\"")
             }
@@ -1945,8 +1945,8 @@ final class HLSLocalServer: @unchecked Sendable {
             if let channels = provider.masterAudioChannels {
                 audioAttrs.append("CHANNELS=\"\(channels)\"")
             }
-            // Demuxed, the audio is a rendition of its own (9.5, 9.6); muxed, it is in the variant's segments
-            // and the tag names no URI (RFC 8216 4.3.4.2.1).
+            // Demuxed, the audio is a rendition of its own; muxed, it is in the variant's segments and the tag
+            // names no URI.
             if provider.servesAudioRendition { audioAttrs.append("URI=\"audio.m3u8\"") }
             lines.append("#EXT-X-MEDIA:\(audioAttrs.joined(separator: ","))")
         }
@@ -2211,7 +2211,7 @@ final class HLSLocalServer: @unchecked Sendable {
     }
 
     /// A rendition's media playlist. The audio rendition's lists the video's indices, durations and
-    /// discontinuities from the same snapshot (HLS Authoring Specification 8.2, 8.3, 8.15), with its own init.
+    /// discontinuities from the same snapshot, so the two play as one timeline, with its own init.
     static func buildMediaPlaylistText(provider: HLSSegmentProvider,
                                         subResourceBaseURL: URL? = nil, generation: Int? = nil,
                                         rendition: MediaRendition = .video) -> String {

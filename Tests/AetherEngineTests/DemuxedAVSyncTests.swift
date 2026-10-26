@@ -5,7 +5,7 @@ import Testing
 
 /// `AVSyncTests` for the demuxed shape (docs/demuxed-audio.md): the white frame read from the video rendition and
 /// the click from the audio rendition, each placed at its own first `tfdt`, as AVPlayer synchronises renditions by
-/// their media timestamps (RFC 8216 6.2.4).
+/// their media timestamps.
 @Suite("Audio against video, the audio a rendition of its own", .serialized)
 struct DemuxedAVSyncTests {
 

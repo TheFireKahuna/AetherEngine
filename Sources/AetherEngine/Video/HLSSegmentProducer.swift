@@ -2628,8 +2628,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     /// Serves indices `[first, end)` of the audio rendition as fragments with no sample, each at its segment's
-    /// start on the audio track's timeline: their time holds no audio, and the playlist lists every index
-    /// (HLS Authoring Specification 8.3).
+    /// start on the audio track's timeline: their time holds no audio, and the playlist lists every index the
+    /// video's does.
     private func serveEmptyAudio(_ file: Rendition, from first: Int, to end: Int) {
         guard file.track == .audio, first < end, let atb = file.audioTimeBase, atb.den > 0 else { return }
         let shift = videoShiftPts == Int64.min ? 0 : videoShiftPts

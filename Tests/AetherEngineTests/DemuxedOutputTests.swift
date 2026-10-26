@@ -73,7 +73,7 @@ struct DemuxedOutputTests {
         let master = try String(contentsOf: playback, encoding: .utf8)
         let audioTag = try #require(master.split(separator: "\n").first { $0.hasPrefix("#EXT-X-MEDIA:TYPE=AUDIO") })
         #expect(audioTag.contains("URI=\"audio.m3u8\""))
-        #expect(audioTag.contains("LANGUAGE="), "a rendition of its own states its language (8.10)")
+        #expect(audioTag.contains("LANGUAGE="), "a rendition of its own states its language")
         let base = playback.deletingLastPathComponent()
         let media = try String(contentsOf: base.appendingPathComponent("media.m3u8"), encoding: .utf8)
         let audio = try String(contentsOf: base.appendingPathComponent("audio.m3u8"), encoding: .utf8)

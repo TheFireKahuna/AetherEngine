@@ -1095,8 +1095,8 @@ final class MP4SegmentMuxer {
 
     /// A fragment of `trackID` with no sample, its decode time `baseMediaDecodeTime`: what an audio
     /// rendition serves for an index whose time holds no audio (`HLSOutputShape.demuxed`), so its playlist
-    /// still covers every index (HLS Authoring Specification 8.3) and the next segment's decode time
-    /// follows on. ISO/IEC 14496-12 allows a track fragment without a run.
+    /// still covers every index, as the video's does, and the next segment's decode time follows on. A
+    /// track fragment may carry no run.
     static func emptyFragment(trackID: UInt32, sequence: UInt32, baseMediaDecodeTime: UInt64) -> Data {
         func box(_ type: String, _ body: [UInt8]) -> [UInt8] {
             let size = UInt32(8 + body.count)
