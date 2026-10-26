@@ -163,6 +163,92 @@ extension HLSVideoEngine {
         return runs
     }
 
+    /// Packets and bytes the TrueHD clock measurement may peek. Peeked packets stay resident until the
+    /// producer reads them, as for the TrueHD verdict (`trueHDVerdictByteBudget`); the stream's first restart
+    /// header normally comes within its first few hundred access units.
+    static let trueHDClockPacketBudget = 16_384
+    static let trueHDClockByteBudget = 64 << 20
+
+    /// Where a TrueHD stream's own clock reads zero, counted from the stream's start, in frames at its rate
+    /// (`StreamClockPlacement.headOffset`), for the bridges that place by it. The stream's first access unit is
+    /// its start, and FFmpeg's decoder states each restart header's output_timing on its frame
+    /// (`mlp_output_timing`), so decoding the stream from its first packet gives it exactly: the access units
+    /// before the first frame that states it, times the unit's samples, less what it states. One value for the
+    /// stream, the same whichever segment a run starts at. Nil where the head is out of reach (live, a side
+    /// audio demuxer the producer positions itself, a stream that states no start, nothing stated within the
+    /// budget, a frame that does not sit where that count puts it), and the grid then places as before.
+    func trueHDClockHeadOffset(audioStream: UnsafeMutablePointer<AVStream>, audioDemuxer: Demuxer,
+                               streamIndex: Int32) -> Int64? {
+        let start = audioStream.pointee.start_time
+        let tb = audioStream.pointee.time_base
+        guard audioStream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_TRUEHD,
+              !isLiveSession, audioDemuxer === demuxer, start != Int64.min, tb.den > 0,
+              let codec = avcodec_find_decoder(AV_CODEC_ID_TRUEHD) else { return nil }
+        let started = DispatchTime.now()
+        func measure() -> (offset: Int64?, atHead: Bool) {
+            var context = avcodec_alloc_context3(codec)
+            var frame = av_frame_alloc()
+            defer { avcodec_free_context(&context); av_frame_free(&frame) }
+            guard let context, let frame,
+                  avcodec_parameters_to_context(context, audioStream.pointee.codecpar) >= 0 else { return (nil, false) }
+            context.pointee.pkt_timebase = tb
+            guard avcodec_open2(context, codec, nil) >= 0 else { return (nil, false) }
+            var offset: Int64?
+            var atHead: Bool?
+            var units: Int64 = 0, heldBytes = 0
+            try? audioDemuxer.peekPackets(maxPackets: Self.trueHDClockPacketBudget) { packet in
+                heldBytes += Int(max(packet.pointee.size, 0))
+                if heldBytes > Self.trueHDClockByteBudget { return true }
+                guard packet.pointee.stream_index == streamIndex, packet.pointee.size > 0 else { return false }
+                if atHead == nil {
+                    // Only a read from the stream's first packet counts its access units from the start.
+                    atHead = packet.pointee.pts == start
+                    if atHead == false { return true }
+                }
+                var frames: Int64 = 0
+                if avcodec_send_packet(context, packet) >= 0 {
+                    while avcodec_receive_frame(context, frame) >= 0 {
+                        defer { av_frame_unref(frame) }
+                        let unit = AudioBridge.trueHDAccessUnitFrames(rate: frame.pointee.sample_rate)
+                        if let entry = av_dict_get(frame.pointee.metadata, "mlp_output_timing", nil, 0),
+                           let timing = Int64(String(cString: entry.pointee.value)) {
+                            let position = (units + frames) * unit
+                            // The frame sits where the count puts it, to the container's noise: one access unit
+                            // a packet, as every container the engine reads carries TrueHD.
+                            let stated = av_rescale_q(packet.pointee.pts &- start, tb,
+                                                      AVRational(num: 1, den: frame.pointee.sample_rate))
+                            let noise = SourceGrid.noise(tolerance: AudioContinuity.tolerance(
+                                sourceTimeBase: tb, sampleRate: frame.pointee.sample_rate))
+                            if abs(stated - position) <= noise { offset = position - timing }
+                            return true
+                        }
+                        frames += 1
+                    }
+                }
+                units += max(frames, 1)
+                return false
+            }
+            return (offset, atHead ?? false)
+        }
+        var result = measure()
+        var seeked = false
+        if !result.atHead {
+            seeked = audioDemuxer.seek(to: start, streamIndex: streamIndex, atOrBefore: true)
+            result = seeked ? measure() : (nil, false)
+        }
+        if seeked || initialProducerBaseIndex > 0 {
+            seekToInitialProducerStart(audioDemuxer)
+            demuxerAtInitialProducerStart = true
+        }
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1e6
+        EngineLog.emit(
+            "[HLSVideoEngine] TrueHD clock "
+            + (result.offset.map { "reads zero \($0) frames from the stream's start (\(String(format: "%.0f", ms)) ms)" }
+               ?? "not read off the stream's head (\(String(format: "%.0f", ms)) ms); placing on the grid"),
+            category: .session)
+        return result.offset
+    }
+
     func handleBridgeDecodedNothing(streamIndex: Int32, summary: String) {
         if isLiveSession {
             onLiveAudioDecodesNothing?(streamIndex, summary)
@@ -345,11 +431,15 @@ extension HLSVideoEngine {
                 }
                 let watchesDecoder = sideAudioDemuxer == nil
                 let streamIndex = sourceAudioStreamIndex
+                let clockHeadOffset = trueHDClockHeadOffset(audioStream: audioStream, audioDemuxer: audioDemuxer,
+                                                            streamIndex: sourceAudioStreamIndex)
+                bridge.setStreamClock(headOffset: clockHeadOffset)
                 let delivered = segmentRuns(template: bridge, sourceStream: audioStream) { [weak self, audioBridgeMode, isLiveSession] in
                     let run = try AudioBridge(srcCodecpar: audioStream.pointee.codecpar,
                                               srcTimeBase: audioStream.pointee.time_base,
                                               mode: audioBridgeMode, followsSourceContinuity: !isLiveSession,
                                               announces: false)
+                    run.setStreamClock(headOffset: clockHeadOffset)
                     if watchesDecoder {
                         run.onDecoderProducedNothing = { [weak self] stats in
                             self?.handleBridgeDecodedNothing(streamIndex: streamIndex, summary: stats.summary)

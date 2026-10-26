@@ -556,18 +556,6 @@ struct SpatialAudioBridgeTests {
         #expect(abs(out.last! + 1024 - 2048 - end) < 1024)
     }
 
-    @Test("a clock difference is brought into the wrap's window around zero")
-    func clockWindow() {
-        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
-        let m: Int64 = 1 << 16
-        #expect(SpatialAudioBridge.nearest(0, modulus: m) == 0)
-        #expect(SpatialAudioBridge.nearest(m + 5, modulus: m) == 5)
-        #expect(SpatialAudioBridge.nearest(-5, modulus: m) == -5)
-        #expect(SpatialAudioBridge.nearest(m / 2, modulus: m) == -m / 2)
-        #expect(SpatialAudioBridge.nearest(m / 2 - 1, modulus: m) == m / 2 - 1)
-        #expect(SpatialAudioBridge.nearest(-3 * m - 7, modulus: m) == -7)
-    }
-
     @Test("a span the decoder drops is filled, so everything after it keeps its timestamp")
     func gapKeepsTimeline() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }

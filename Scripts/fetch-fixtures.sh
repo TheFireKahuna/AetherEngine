@@ -483,16 +483,20 @@ determinism_clip opus.mkv "$DET_ST" -c:a libopus -b:a 128k
 determinism_clip dts.mkv "$DET_51" -c:a dca -strict -2
 determinism_clip truehd.mkv "$DET_51" -c:a truehd -strict -2
 
-# DTS with timestamps that fall behind their frames and snap back, the way a DTS-HD MA remux in the
-# library carries them (research/dts-timing): every 60 frames, about 2 ms off at worst, the audio itself
-# continuous. Remuxed from the clips above, so the bitstream is the same and only the timestamps differ.
-echo "→ avsync/dts-drift.mkv, determinism/dts-drift.mkv (DTS, timestamps drifting off their frames)"
-DTS_DRIFT="setts=pts=PTS-round(mod(N\,60)*32/25/48000/TB):dts=DTS-round(mod(N\,60)*32/25/48000/TB)"
-dts_drift() {  # <from> <to>
-    ffmpeg -hide_banner -loglevel error -y -i "$1" -map 0 -c copy -bsf:a "$DTS_DRIFT" "$2"
+# Audio with timestamps that fall behind their frames and snap back, the way a remux in the library
+# carries them (research/dts-timing): about 2 ms off at worst, the audio itself continuous. Remuxed from
+# the clips above, so the bitstream is the same and only the timestamps differ.
+echo "→ avsync/{dts,truehd}-drift.mkv, determinism/{dts,truehd}-drift.mkv (timestamps drifting off their frames)"
+audio_drift() {  # <from> <to> <packets per snap> <samples behind at the snap>
+    local expr="round(mod(N\\,$3)*$4/$3/48000/TB)"
+    ffmpeg -hide_banner -loglevel error -y -i "$1" -map 0 -c copy -bsf:a "setts=pts=PTS-$expr:dts=DTS-$expr" "$2"
 }
-dts_drift "$FIXTURES_DIR/avsync/dts.mkv" "$FIXTURES_DIR/avsync/dts-drift.mkv"
-dts_drift "$FIXTURES_DIR/determinism/dts.mkv" "$FIXTURES_DIR/determinism/dts-drift.mkv"
+for d in avsync determinism; do
+    # DTS: a 512-sample frame a packet, 32 samples behind per 25 of them (as measured), back every 60.
+    audio_drift "$FIXTURES_DIR/$d/dts.mkv" "$FIXTURES_DIR/$d/dts-drift.mkv" 60 77
+    # TrueHD: a 40-sample access unit a packet, 96 samples behind over 600 of them (half a second).
+    audio_drift "$FIXTURES_DIR/$d/truehd.mkv" "$FIXTURES_DIR/$d/truehd-drift.mkv" 600 96
+done
 
 echo ""
 echo "Done. Try:"
