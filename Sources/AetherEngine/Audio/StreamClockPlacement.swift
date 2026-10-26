@@ -28,8 +28,9 @@ final class StreamClockAnchors: @unchecked Sendable {
 /// A run of `SourceGrid.phaseShiftTimestamps` frames whose timestamps sit beyond the noise from where the anchor places
 /// them is a splice: the clock is on another stretch. Where another anchor places them within the noise, the run
 /// carries on by it. Where none does, the stretch is new: the clock parts from the run, which the caller places by its
-/// timestamps, and the frames that follow are read for the stretch's anchor (their timestamp less their clock, the
-/// value the most of them allow within half a tick, ``mostAllowed(_:halfWidth:)``), kept for the runs after it.
+/// timestamps, and the frames that follow are read for the stretch's anchor (their timestamp less their clock: the
+/// window the most of them allow within half a tick, ``mostAllowed(_:halfWidth:)``, and the value on their lattice
+/// in it, ``value(in:readings:halfWidth:)``), kept for the runs after it.
 struct StreamClockPlacement {
     let anchors: StreamClockAnchors
     /// The anchor this run places by, chosen at its first frame.
@@ -119,7 +120,8 @@ struct StreamClockPlacement {
         guard read.count >= Self.learningReadings else { return }
         readings = nil
         // Only the anchor modulo the clock's wrap is the stream's: kept in the wrap's window around the load's.
-        let learned = Self.middle(of: Self.mostAllowed(read, halfWidth: max(1, tick / 2))) * scale
+        let halfWidth = max(1, tick / 2)
+        let learned = Self.value(in: Self.mostAllowed(read, halfWidth: halfWidth), readings: read, halfWidth: halfWidth) * scale
         let reference = anchors.all.first ?? learned
         anchors.learn(reference + Self.nearest(learned - reference, modulus: modulus * scale))
     }
@@ -161,11 +163,23 @@ struct StreamClockPlacement {
         return range
     }
 
-    /// The middle of what the readings allow: readings exactly on a value allow [x - halfWidth, x + halfWidth), whose
-    /// middle is x.
-    static func middle(of allowed: ClosedRange<Int64>) -> Int64 {
-        allowed.lowerBound + (allowed.upperBound - allowed.lowerBound + 1) / 2
+    /// The value `readings` place in `allowed`, the window they allow (``mostAllowed(_:halfWidth:)``). A reading is a
+    /// timestamp, a whole number of ticks, less a clock position, the value plus whole access units, so the readings
+    /// that allow the window all lie on one lattice through the value: with a millisecond's tick (48 frames) and
+    /// 40-frame units, every eighth frame. The window is narrower than the lattice's step, so it holds the value alone.
+    /// Where the readings share no step, the window's middle (readings exactly on a value allow [x - halfWidth,
+    /// x + halfWidth), whose middle is x).
+    static func value(in allowed: ClosedRange<Int64>, readings: [Int64], halfWidth: Int64) -> Int64 {
+        let middle = allowed.lowerBound + (allowed.upperBound - allowed.lowerBound + 1) / 2
+        let agreeing = readings.filter { $0 + halfWidth > allowed.lowerBound && $0 - halfWidth <= allowed.upperBound }
+        guard let first = agreeing.first else { return middle }
+        let step = agreeing.reduce(Int64(0)) { gcd($0, abs($1 - first)) }
+        guard step > 1 else { return middle }
+        let onLattice = allowed.filter { ($0 - first) % step == 0 }
+        return onLattice.count == 1 ? onLattice[0] : middle
     }
+
+    private static func gcd(_ a: Int64, _ b: Int64) -> Int64 { b == 0 ? a : gcd(b, a % b) }
 
     /// `difference` brought into the wrap's window around zero, [-modulus/2, modulus/2).
     static func nearest(_ difference: Int64, modulus: Int64) -> Int64 {

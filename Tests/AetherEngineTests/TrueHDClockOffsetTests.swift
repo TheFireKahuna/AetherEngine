@@ -5,7 +5,8 @@ import AetherLibavutil
 @testable import AetherEngine
 
 /// Where a TrueHD stream's own clock reads zero on its timeline (`HLSVideoEngine.trueHDClockOffset`): counted from its
-/// head where its timestamps allow that, the middle of what they allow where its first packet is stamped apart.
+/// head where its timestamps allow that, the value their lattice puts in what they allow where its first packet is
+/// stamped apart.
 @Suite("TrueHD clock offset")
 struct TrueHDClockOffsetTests {
 
@@ -38,8 +39,8 @@ struct TrueHDClockOffsetTests {
         let base = try #require(try Self.offset(plain).offset)
         let moved = try #require(try Self.offset(apart).offset)
         // Every packet but the first is 5 ms (240 frames at 48 kHz) later; the timestamps allow an eight-frame window,
-        // and the offset is its middle.
-        #expect(abs(moved - base - 240) <= 4, "offset \(base) on the clip, \(moved) with every packet but the first 5 ms later")
+        // and their lattice puts the offset in it exactly.
+        #expect(moved - base == 240, "offset \(base) on the clip, \(moved) with every packet but the first 5 ms later")
     }
 
     @Test("timestamps a millisecond off either way leave the count from the head standing")
@@ -55,7 +56,7 @@ struct TrueHDClockOffsetTests {
         try #require(FileManager.default.fileExists(atPath: plain.path), "run Scripts/fetch-fixtures.sh")
         let counted = try #require(try Self.offset(plain).offset)
         let later = try #require(try Self.offset(plain, from: 1).offset)
-        #expect(abs(later - counted) <= 4)
+        #expect(later == counted)
     }
 
     /// Library titles' samples, not in the repository: `AE_TRUEHD_OFFSET_SAMPLES` names a directory of `.mka` files cut

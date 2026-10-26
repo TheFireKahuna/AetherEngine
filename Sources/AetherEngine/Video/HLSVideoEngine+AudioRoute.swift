@@ -221,7 +221,7 @@ extension HLSVideoEngine {
     ///   before the first restart header, times the unit's samples, less its clock, is the offset to the frame.
     /// The count stands where the timestamps allow it. Where they do not, the first packet is the one stamped apart (a
     /// library title's sat at zero, 5.3 ms ahead of a gap its clock runs straight through), and the offset is the
-    /// middle of what they allow, within four frames. A survey of seven TrueHD titles found every other stamp within
+    /// value their lattice puts in what they allow (`StreamClockPlacement.value(in:readings:halfWidth:)`). A survey of seven TrueHD titles found every other stamp within
     /// a millisecond of its access unit, spread both ways. The clock wraps at 2^16, so the readings are taken in the
     /// wrap's window around the first.
     static func trueHDClockOffset(audioStream: UnsafeMutablePointer<AVStream>, demuxer: Demuxer, streamIndex: Int32)
@@ -286,7 +286,7 @@ extension HLSVideoEngine {
             let near = first + StreamClockPlacement.nearest(counted - first, modulus: 1 << 16)
             if allowed.contains(near) { return (counted, readings.count, apart, true, head) }
         }
-        return (StreamClockPlacement.middle(of: allowed), readings.count, apart, false, head)
+        return (StreamClockPlacement.value(in: allowed, readings: window, halfWidth: halfTick), readings.count, apart, false, head)
     }
 
     func handleBridgeDecodedNothing(streamIndex: Int32, summary: String) {
