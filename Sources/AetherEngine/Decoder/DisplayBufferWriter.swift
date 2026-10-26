@@ -1,6 +1,7 @@
 import Foundation
 import CoreVideo
 import Metal
+import os
 import AetherLibavcodec
 import AetherLibavutil
 
@@ -58,7 +59,8 @@ final class DisplayBufferWriter {
     private var loggedOutputFormat: OutputFormat?
     /// A declared colour value CoreVideo has no constant for is named once.
     private var loggedUnmappedColor = false
-    private var loggedFinishFailure = false
+    /// A failed GPU finish is logged once; set from the completion queue.
+    private let finishFailureLogged = OSAllocatedUnfairLock(initialState: false)
 
     init(device: MTLDevice, streamIs10Bit: Bool, twelveBit420: SoftwareVideoDecoder.TwelveBit420Output,
          containerHDRStatic: HDRStaticMetadata, logTag: String) throws {
@@ -87,36 +89,73 @@ final class DisplayBufferWriter {
         }
     }
 
-    /// The display buffer for one decoded picture, written by the GPU from the picture's own memory. Nil (and one log
-    /// line per kind) when the finisher cannot write this frame's format into the output.
-    func finish(_ frame: UnsafeMutablePointer<AVFrame>) -> CVPixelBuffer? {
+    /// A decoded picture's own planes (``prepare(_:planFormat:interlaced:grain:)``) written by the GPU into
+    /// `prepared`'s display buffer. `completion` gets the buffer once the GPU has written it, or nil when it could not
+    /// be (one log line), from the GPU's completion queue (hand off, never block), or on the caller's thread when the
+    /// work could not be encoded. The picture's memory is held until then by a reference of the writer's own.
+    func finish(_ frame: UnsafeMutablePointer<AVFrame>, into prepared: (plan: PlanarFrameFinisher.Plan, buffer: CVPixelBuffer),
+                completion: @escaping @Sendable (SendableBuffer?) -> Void) {
         let width = Int(frame.pointee.width), height = Int(frame.pointee.height)
-        let interlaced = (frame.pointee.flags & AV_FRAME_FLAG_INTERLACED) != 0
-        let grain = FilmGrainParameters(frame: frame)
-        guard let (plan, pb) = prepare(frame, planFormat: AVPixelFormat(rawValue: frame.pointee.format), interlaced: interlaced,
-                                       grain: grain != nil)
-        else { return nil }
-
         // The decoder's own slab, or (rawvideo, libavcodec's paletted buffers) a copy of the picture in one.
         let planes: PlanarFrameFinisher.Planes
         var copied: DecodeFrameAllocator.Slab?
-        if let slab = allocator.slab(of: frame), let own = PlanarFrameFinisher.planes(of: frame, in: slab) {
+        var reference: UnsafeMutablePointer<AVFrame>?
+        if let slab = allocator.slab(of: frame), let own = PlanarFrameFinisher.planes(of: frame, in: slab),
+           let held = av_frame_clone(frame) {
             planes = own
+            reference = held
         } else if let copy = allocator.copy(frame) {
             planes = copy.planes
             copied = copy.slab
         } else {
-            return nil
+            return completion(nil)
         }
-        defer { if let copied { allocator.release(copied) } }
-        guard finisher.finish(planes, plan: plan, width: width, height: height, into: pb, grain: grain) else {
-            if !loggedFinishFailure {
-                loggedFinishFailure = true
-                EngineLog.emit("[\(logTag)] GPU finish failed (logged once)", category: .swPlayback)
+        let held = HeldPicture(frame: reference, copy: copied, allocator: allocator)
+        let written = SendableBuffer(value: prepared.buffer)
+        let tag = logTag
+        let failureLogged = finishFailureLogged
+        finisher.finish(planes, plan: prepared.plan, width: width, height: height, into: prepared.buffer,
+                        grain: FilmGrainParameters(frame: frame)) { ok in
+            held.release()
+            if !ok, failureLogged.withLock({ logged in defer { logged = true }; return !logged }) {
+                EngineLog.emit("[\(tag)] GPU finish failed (logged once)", category: .swPlayback)
             }
-            return nil
+            completion(ok ? written : nil)
         }
-        return pb
+    }
+
+    /// The display buffer for one decoded picture, prepared and finished, waited for: for offline callers (stills), never
+    /// on a playback path. Nil (and one log line per kind) when the finisher cannot write this frame's format into the
+    /// output, or the GPU could not.
+    func finishAndWait(_ frame: UnsafeMutablePointer<AVFrame>) -> CVPixelBuffer? {
+        guard let prepared = prepare(frame, planFormat: AVPixelFormat(rawValue: frame.pointee.format),
+                                     interlaced: frame.pointee.flags & AV_FRAME_FLAG_INTERLACED != 0,
+                                     grain: FilmGrainParameters(frame: frame) != nil) else { return nil }
+        let done = DispatchSemaphore(value: 0)
+        let result = OSAllocatedUnfairLock<SendableBuffer?>(initialState: nil)
+        finish(frame, into: prepared) { buffer in
+            result.withLock { $0 = buffer }
+            done.signal()
+        }
+        done.wait()
+        return result.withLock { $0 }?.value
+    }
+
+    /// A finished picture's memory, held until its GPU work completes: a reference to the decoder's frame, or the slab
+    /// it was copied into.
+    private final class HeldPicture: @unchecked Sendable {
+        private var frame: UnsafeMutablePointer<AVFrame>?
+        private let copy: DecodeFrameAllocator.Slab?
+        private let allocator: DecodeFrameAllocator
+
+        init(frame: UnsafeMutablePointer<AVFrame>?, copy: DecodeFrameAllocator.Slab?, allocator: DecodeFrameAllocator) {
+            (self.frame, self.copy, self.allocator) = (frame, copy, allocator)
+        }
+
+        func release() {
+            av_frame_free(&frame)
+            if let copy { allocator.release(copy) }
+        }
     }
 
     /// The finisher's plan for `frame` and the display buffer it writes, tagged with the frame's colour. `planFormat` is

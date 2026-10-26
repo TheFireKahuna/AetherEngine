@@ -1,5 +1,3 @@
-// Only with the DualLayerDolbyVision trait (off by default).
-#if DualLayerDolbyVision
 import Foundation
 import CoreMedia
 import CoreVideo
@@ -120,7 +118,8 @@ final class OrderedDelivery: @unchecked Sendable {
     private var peakPendingCount: Int = 0
 
     private struct PendingEntry {
-        let frame: DeliveredFrame
+        /// Nil for a ticket given up (``skip(ticket:epoch:)``): its place goes, nothing is emitted.
+        let frame: DeliveredFrame?
         let signpostID: OSSignpostID
     }
 
@@ -173,6 +172,18 @@ final class OrderedDelivery: @unchecked Sendable {
                 return
             }
             pending[ticket] = PendingEntry(frame: frame, signpostID: signpostID)
+            updatePendingCounts()
+            drainReady()
+        }
+    }
+
+    /// Gives up a ticket whose frame will never come (its GPU work failed), so the frames behind it go out without
+    /// waiting for the stall guard. Same epoch rule as ``fulfil(ticket:epoch:_:)``.
+    func skip(ticket: UInt64, epoch callerEpoch: UInt64) {
+        let signpostID = OSSignpostID(log: Self.signpostLog)
+        queue.async { [self] in
+            guard callerEpoch == epoch, ticket >= nextToEmit else { return }
+            pending[ticket] = PendingEntry(frame: nil, signpostID: signpostID)
             updatePendingCounts()
             drainReady()
         }
@@ -246,8 +257,10 @@ final class OrderedDelivery: @unchecked Sendable {
             if let entry = pending.removeValue(forKey: nextToEmit) {
                 nextToEmit &+= 1
                 stallLogPending = false
-                emit(entry.frame)
-                os_signpost(.end, log: Self.signpostLog, name: "Delivery", signpostID: entry.signpostID)
+                if let frame = entry.frame {
+                    emit(frame)
+                    os_signpost(.end, log: Self.signpostLog, name: "Delivery", signpostID: entry.signpostID)
+                }
                 continue
             }
             guard pending.count > stallThreshold else { break }
@@ -279,7 +292,9 @@ final class OrderedDelivery: @unchecked Sendable {
         #if DEBUG
         dispatchPrecondition(condition: .onQueue(queue))
         #endif
+        #if DualLayerDolbyVision
         DoviDisplayMetadata.attach(rpuNAL: frame.dmNAL, to: frame.buffer.value)
+        #endif
         onFrame?(frame.buffer.value, frame.pts, frame.hdr10Data)
     }
 
@@ -332,4 +347,3 @@ final class OrderedDelivery: @unchecked Sendable {
     var hasOnFrameForTesting: Bool { queue.sync { onFrame != nil } }
     var currentOnFrame: DecodedFrameHandler? { queue.sync { onFrame } }
 }
-#endif

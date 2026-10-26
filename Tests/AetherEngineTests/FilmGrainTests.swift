@@ -56,7 +56,7 @@ struct FilmGrainTests {
                 if !libdav1dGrain {
                     #expect(writer.allocator.slab(of: frame!) != nil, "decoded in place, no copy")
                 }
-                out.append(try bytes(of: try #require(writer.finish(frame!))))
+                out.append(try bytes(of: try #require(writer.finishAndWait(frame!))))
                 av_frame_unref(frame)
             }
         }

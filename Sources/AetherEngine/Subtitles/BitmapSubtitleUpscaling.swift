@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import Metal
 #if MLSubtitleUpscale
 @_exported import LibMLSubUpscaler
 #endif
@@ -170,7 +171,12 @@ final class BitmapSubtitleUpscaling: @unchecked Sendable {
     private func upscalerLocked() throws -> SubtitleUpscaler {
         try lock.withLock {
             if let made = upscaler { return made }
-            let made = try SubtitleUpscaler(configuration: .balanced)
+            // A queue of the upscaler's own: its windows' event waits hold back only its own work, never the video's.
+            guard let device = MTLCreateSystemDefaultDevice(),
+                  let submitter = GPUSubmitter(device: device, label: "SubtitleUpscaler") else {
+                throw SubtitleUpscaler.UpscaleError.unavailable("no GPU submission")
+            }
+            let made = try SubtitleUpscaler(configuration: .balanced, submission: SubtitleUpscaleGPU(submitter))
             try made.prepare()
             upscaler = made
             return made

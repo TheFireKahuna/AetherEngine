@@ -631,7 +631,7 @@ final class FrameDecodeContext: @unchecked Sendable {
     /// or the finisher's from the decoder's slab.
     private func displayBuffer(_ f: UnsafeMutablePointer<AVFrame>) -> CVPixelBuffer? {
         noteDecoder(hardware: f.pointee.format == AV_PIX_FMT_VIDEOTOOLBOX.rawValue)
-        guard f.pointee.format == AV_PIX_FMT_VIDEOTOOLBOX.rawValue else { return writer?.finish(f) }
+        guard f.pointee.format == AV_PIX_FMT_VIDEOTOOLBOX.rawValue else { return writer?.finishAndWait(f) }
         guard let raw = f.pointee.data.3 else { return nil }
         let buffer = Unmanaged<CVPixelBuffer>.fromOpaque(UnsafeRawPointer(raw)).takeUnretainedValue()
         let tags = ColorAttachments.presented(ColorDescription(frame: UnsafePointer(f)),

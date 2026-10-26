@@ -2,6 +2,7 @@ import Foundation
 import CoreVideo
 import Metal
 import Testing
+import os
 import AetherLibavutil
 @testable import AetherEngine
 
@@ -149,6 +150,19 @@ struct PlanarFrameFinisherTests {
 
     // MARK: - Harness
 
+    /// One picture through the finisher, waited for.
+    static func finished(_ finisher: PlanarFrameFinisher, _ planes: PlanarFrameFinisher.Planes, plan: PlanarFrameFinisher.Plan,
+                         width: Int, height: Int, into buffer: CVPixelBuffer) -> Bool {
+        let done = DispatchSemaphore(value: 0)
+        let written = OSAllocatedUnfairLock(initialState: false)
+        finisher.finish(planes, plan: plan, width: width, height: height, into: buffer) { ok in
+            written.withLock { $0 = ok }
+            done.signal()
+        }
+        done.wait()
+        return written.withLock { $0 }
+    }
+
     private func finishFlat(_ format: AVPixelFormat, value: UInt16) throws -> [UInt16] {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let allocator = try #require(DecodeFrameAllocator(device: device))
@@ -166,7 +180,7 @@ struct PlanarFrameFinisherTests {
         let (planes, slab) = try #require(allocator.copy(f))
         defer { allocator.release(slab) }
         let pb = try makeBuffer(output, width: 64, height: 64)
-        #expect(finisher.finish(planes, plan: plan, width: 64, height: 64, into: pb))
+        #expect(Self.finished(finisher, planes, plan: plan, width: 64, height: 64, into: pb))
         return readPlane(pb, plane: 0).map { UInt16($0) }
     }
 
@@ -236,7 +250,7 @@ struct PlanarFrameFinisherTests {
         let (planes, slab) = try #require(allocator.copy(f))
         defer { allocator.release(slab) }
         let pb = try makeBuffer(output, width: width, height: height)
-        #expect(finisher.finish(planes, plan: plan, width: width, height: height, into: pb), "\(c)")
+        #expect(Self.finished(finisher, planes, plan: plan, width: width, height: height, into: pb), "\(c)")
 
         let reference = Reference(frame: f, desc: desc, output: output, sourceFullRange: sourceFullRange,
                                   location: c.location, matrix: matrix, representation: representation)
