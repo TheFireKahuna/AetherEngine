@@ -37,6 +37,13 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         let picture: CVPixelBuffer?
     }
 
+    /// A decoded picture with its own time, exact, and in whole milliseconds as units are keyed.
+    struct Picture: @unchecked Sendable {
+        let picture: CVPixelBuffer
+        let time: CMTime
+        let seconds: Double
+    }
+
     static var keepBehindSeconds: Double { 60 }
     /// Ceiling on held units, about four minutes at 24p, whatever the producer's window.
     static var maxEntries: Int { 6000 }
@@ -58,7 +65,7 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
     private let state = NSCondition()
     private var entries: [Int: Entry] = [:]            // by arrival sequence
     private var seqByPts: [Int64: Int] = [:]           // the latest cut of each presentation time
-    private var decoded: [Int64: CVPixelBuffer] = [:]  // by the picture's own time, ms
+    private var decoded: [Int64: Picture] = [:]  // by the picture's own time, ms
     private var timeBase = AVRational(num: 1, den: 1000)
     private var clockMs: Int64 = 0
     private var closed = false
@@ -135,10 +142,19 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         defer { state.unlock() }
         for key in [ms, ms - 1, ms + 1] {
             if let seq = seqByPts[key], let entry = entries[seq] {
-                return Unit(info: entry.info, picture: decoded[key])
+                return Unit(info: entry.info, picture: decoded[key]?.picture)
             }
         }
         return nil
+    }
+
+    /// The time of the first unit cut after `seconds` (item time), in whole milliseconds as units are keyed; nil
+    /// while none is cut.
+    func unitTime(after seconds: Double) -> Double? {
+        let ms = Int64((seconds * 1000).rounded())
+        state.lock()
+        defer { state.unlock() }
+        return seqByPts.keys.filter { $0 > ms }.min().map { Double($0) / 1000 }
     }
 
     /// Where AVPlayer's clock is (item time): what the decoder works toward and what is kept around it.
@@ -169,7 +185,7 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
     /// Once held, nothing is shown until no picture is overdue at all, so a decoder hovering at the limit does not
     /// alternate held and late pictures. Where nothing lies between the decoder's newest picture and the clock (a
     /// gap in the stream, its end) the picture is the one on screen however old, and is shown.
-    func picture(atOrBefore seconds: Double) -> (picture: CVPixelBuffer, seconds: Double)? {
+    func picture(atOrBefore seconds: Double) -> Picture? {
         let ms = Int64((seconds * 1000).rounded())
         state.lock()
         guard let candidate = decoded.filter({ $0.key <= ms }).max(by: { $0.key < $1.key }) else {
@@ -182,7 +198,21 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
         let note = catchUp.note(behindMs: behind ? overdueMs : nil, now: CACurrentMediaTime())
         state.unlock()
         if let note { EngineLog.emit("[OverlayPacketTap] \(note)", category: .swPlayback) }
-        return behind ? nil : (candidate.value, Double(candidate.key) / 1000)
+        return behind ? nil : candidate.value
+    }
+
+    /// The pictures to queue for display after `last` (the newest queued, nil when none is), in order: the one on
+    /// screen at `seconds` (item time) by ``picture(atOrBefore:)``'s rule, when it is newer than `last`, and every
+    /// picture decoded after it. Empty while that rule holds the picture on screen. A picture whose successor is
+    /// already due is never on screen, so none before the one at `seconds` is offered.
+    func pictures(after last: CMTime?, atOrBefore seconds: Double) -> [Picture] {
+        guard let current = picture(atOrBefore: seconds) else { return [] }
+        let currentMs = Int64((current.seconds * 1000).rounded())
+        state.lock()
+        let later = decoded.filter { $0.key > currentMs }.sorted { $0.key < $1.key }.map(\.value)
+        state.unlock()
+        guard let last else { return [current] + later }
+        return ([current] + later).filter { CMTimeCompare($0.time, last) > 0 }
     }
 
     /// One stretch of the decoder behind the clock, from the refreshes that asked for a picture: how long the
@@ -304,7 +334,7 @@ final class OverlayPacketTap<Info>: @unchecked Sendable {
     private func store(_ picture: CVPixelBuffer, at time: CMTime) {
         let ms = Int64((time.seconds * 1000).rounded())
         state.lock()
-        decoded[ms] = picture
+        decoded[ms] = Picture(picture: picture, time: time, seconds: Double(ms) / 1000)
         trimDecodedLocked()
         state.unlock()
     }

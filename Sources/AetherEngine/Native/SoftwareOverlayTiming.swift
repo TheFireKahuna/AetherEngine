@@ -7,20 +7,19 @@ import AppKit
 #endif
 
 /// The software overlay's timing as its pictures reach the screen: what a frame costs us, how early it reaches the
-/// renderer, and how many display refreshes it actually stays on screen. The last is the cadence the viewer
-/// sees: at a matched refresh rate every frame should stay exactly one refresh; two is a hold, a frame never
-/// seen is a skip. A frame on time from us and held or skipped on screen spent the difference in the
-/// compositor, which has no timing API of its own.
+/// renderer, and when the renderer actually displayed it.
+///
+/// The last comes from the renderer itself (`AVVideoPerformanceMetrics`), read at every refresh: how many frames it
+/// displayed and dropped, and the time accumulated between each displayed frame's presentation time and when it was
+/// displayed, which is never negative. A frame displayed at the first refresh at or after its time is less than a
+/// refresh late, at any display rate; a refresh or more late it missed that refresh, and the frame before it stayed
+/// on screen in its place. Its presentation time is its item time, so the delay is also the picture against the
+/// item's clock, the audio's.
 final class OverlayTiming: @unchecked Sendable {
     private let lock = NSLock()
     private var pictureMs: [Double] = []
     private var leadMs: [Double] = []
     private var refreshMs: [Double] = []
-    /// Refreshes on screen -> frames.
-    private var holds: [Int: Int] = [:]
-    private var skipped = 0
-    private var lastShown: Double?
-    private var lastShownRefreshes = 0
     private var lastRefresh: CFTimeInterval?
     private var frameDuration: Double?
     /// First and last (host, audio, item) reading while playing, and the refresh count between them.
@@ -29,8 +28,17 @@ final class OverlayTiming: @unchecked Sendable {
     private var refreshTimes: (first: Double, last: Double, count: Int)?
     /// The refresh interval as the display link gives it, `targetTimestamp - timestamp`.
     private var statedRefresh: Double?
-    /// The displayed frame's item time minus the item clock at that refresh: the picture against the audio.
-    private var offsetMs: [Double] = []
+    /// The renderer's last totals, and the window's frames by how they were displayed.
+    private var rendererTotals: (frames: Int, dropped: Int, delay: Double)?
+    private var onTheirRefresh = 0
+    private var late = 0
+    private var dropped = 0
+    /// Each displayed frame's delay after its presentation time, in ms; a reading that covered several frames
+    /// gives their mean.
+    private var delayMs: [Double] = []
+    /// The least single-frame delay seen in the window: the delay of a frame on its refresh, the floor a reading
+    /// covering several frames is measured from.
+    private var leastDelay: Double?
 
     func made(ms: Double, leadMs lead: Double, frameDuration: Double?) {
         lock.withLock {
@@ -40,12 +48,10 @@ final class OverlayTiming: @unchecked Sendable {
         }
     }
 
-    /// One display refresh: `shown` is the presentation time of the frame on screen, nil when none is.
-    /// While the clock stands still (paused, scrubbing) nothing is counted.
-    func refresh(at timestamp: CFTimeInterval, stated: CFTimeInterval, shown: Double?, offsetMs offset: Double?, playing: Bool) {
+    /// One display refresh, `stated` its interval by the display link.
+    func refresh(at timestamp: CFTimeInterval, stated: CFTimeInterval) {
         lock.withLock {
             if stated > 0 { statedRefresh = stated }
-            if playing, let offset { offsetMs.append(offset) }
             if let lastRefresh { refreshMs.append((timestamp - lastRefresh) * 1000) }
             lastRefresh = timestamp
             if let times = refreshTimes {
@@ -53,24 +59,39 @@ final class OverlayTiming: @unchecked Sendable {
             } else {
                 refreshTimes = (timestamp, timestamp, 1)
             }
-            guard playing, let shown else {
-                lastShown = nil
-                lastShownRefreshes = 0
+        }
+    }
+
+    /// The renderer's totals since it was created (`AVVideoPerformanceMetrics`): frames, frames dropped, and the
+    /// accumulated delay of the displayed ones in seconds. `refresh` is the display's refresh interval. Readings
+    /// can arrive out of order; an older one is ignored.
+    func rendererTotals(frames: Int, dropped totalDropped: Int, delay: Double, refresh: Double) {
+        lock.withLock {
+            guard let last = rendererTotals else {
+                rendererTotals = (frames, totalDropped, delay)
                 return
             }
-            if shown == lastShown {
-                lastShownRefreshes += 1
+            guard frames >= last.frames, totalDropped >= last.dropped, delay >= last.delay else {
+                if frames < last.frames { rendererTotals = (frames, totalDropped, delay) }
                 return
             }
-            if let last = lastShown {
-                holds[lastShownRefreshes, default: 0] += 1
-                if let frameDuration, frameDuration > 0, shown > last {
-                    let missing = Int(((shown - last) / frameDuration).rounded()) - 1
-                    if missing > 0, missing < 12 { skipped += missing }
-                }
+            rendererTotals = (frames, totalDropped, delay)
+            let newlyDropped = totalDropped - last.dropped
+            let shown = frames - last.frames - newlyDropped
+            dropped += newlyDropped
+            guard shown > 0, refresh > 0 else { return }
+            let added = delay - last.delay
+            if shown == 1 {
+                delayMs.append(added * 1000)
+                leastDelay = min(leastDelay ?? added, added)
+                if added >= refresh { late += 1 } else { onTheirRefresh += 1 }
+            } else {
+                delayMs.append(added / Double(shown) * 1000)
+                let excess = added - Double(shown) * min(leastDelay ?? 0, refresh)
+                let missed = min(shown, max(0, Int((excess / refresh).rounded())))
+                late += missed
+                onTheirRefresh += shown - missed
             }
-            lastShown = shown
-            lastShownRefreshes = 1
         }
     }
 
@@ -132,15 +153,16 @@ final class OverlayTiming: @unchecked Sendable {
             defer {
                 pictureMs.removeAll(keepingCapacity: true)
                 leadMs.removeAll(keepingCapacity: true)
-                offsetMs.removeAll(keepingCapacity: true)
                 refreshMs.removeAll(keepingCapacity: true)
-                holds.removeAll()
-                skipped = 0
+                delayMs.removeAll(keepingCapacity: true)
+                onTheirRefresh = 0
+                late = 0
+                dropped = 0
+                leastDelay = nil
             }
-            let held = holds.filter { $0.key >= 3 }.values.reduce(0, +)
-            return "on screen: 1 refresh \(holds[1] ?? 0), 2 refreshes \(holds[2] ?? 0), 3+ \(held), skipped \(skipped); "
-                + "refresh interval \(Self.spread(refreshMs)); picture \(Self.spread(pictureMs)); "
-                + "lead \(Self.spread(leadMs)); picture vs audio clock \(Self.spread(offsetMs))"
+            return "displayed (the renderer's timing): on their refresh \(onTheirRefresh), a refresh or more late \(late), "
+                + "dropped \(dropped); delay after their time \(Self.spread(delayMs)); "
+                + "refresh interval \(Self.spread(refreshMs)); picture \(Self.spread(pictureMs)); lead \(Self.spread(leadMs))"
         }
     }
 
@@ -251,9 +273,15 @@ final class OverlayDisplayLink: NSObject, @unchecked Sendable {
 }
 
 /// The video output's pull delegate: AVFoundation says new frames are coming, so a paused display link
-/// resumes (the header's sample for quiescing a display link driving an `AVPlayerItemVideoOutput`).
+/// resumes (the header's sample for quiescing a display link driving an `AVPlayerItemVideoOutput`), and says when
+/// the output starts a new sequence (a seek, a change of direction), so frames queued from the old one go.
 final class OverlayOutputDelegate: NSObject, AVPlayerItemOutputPullDelegate, @unchecked Sendable {
     private let onWillChange: () -> Void
-    init(onWillChange: @escaping () -> Void) { self.onWillChange = onWillChange }
+    private let onFlushed: () -> Void
+    init(onWillChange: @escaping () -> Void, onFlushed: @escaping () -> Void) {
+        self.onWillChange = onWillChange
+        self.onFlushed = onFlushed
+    }
     func outputMediaDataWillChange(_ sender: AVPlayerItemOutput) { onWillChange() }
+    func outputSequenceWasFlushed(_ output: AVPlayerItemOutput) { onFlushed() }
 }

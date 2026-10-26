@@ -89,8 +89,15 @@ final class FelEnhancementTap: @unchecked Sendable {
         units.unit(at: seconds).map { Frame(enhancement: $0.picture, params: $0.info) }
     }
 
+    /// The time of the frame AVPlayer is served after `seconds` (item time), in whole milliseconds; nil while the
+    /// producer has not cut it.
+    func frameTime(after seconds: Double) -> Double? { units.unitTime(after: seconds) }
+
     /// Where AVPlayer's clock is (item time): what the decoder works toward and what is kept around it.
     func advance(to seconds: Double) { units.advance(to: seconds) }
+
+    /// Where the decode works toward, in item seconds.
+    var clockSeconds: Double { units.clockSeconds }
 
     var held: (accessUnits: Int, decoded: Int) {
         let held = units.held
