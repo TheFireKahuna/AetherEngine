@@ -6,14 +6,14 @@ import Foundation
 /// the position that died, and the stage-2 chain refills the same segment. Against a transient that
 /// is exactly right. Against a segment Apple's parser refuses on its merits it is a loop, and the
 /// reporter's capture shows it ending the session with the replacement item dying 62 ms after the
-/// first. `SoftwarePlaybackHost` decodes with libavcodec, which skips such a frame and plays on, and
-/// it reads the demuxer directly rather than the loopback HLS, so it steps around a local-server
-/// wedge too.
+/// first. The rebuild moves the video into the software overlay, as `load` routes a stream AVPlayer
+/// cannot decode: AVPlayer is handed the placeholder instead of the video it refused, and the engine's
+/// own decoder draws the picture, skipping a frame it cannot decode and playing on.
 ///
 /// The rebuild is `reloadAtCurrentPosition(applying:)`, which keeps the session: same playhead, same
 /// subtitle carryover, same external-track registry. Its own `decodePathRefusal` is what decides
-/// whether the software path can serve this source at all, so a source it cannot serve costs a
-/// refusal here rather than a second dead session.
+/// whether the overlay can show this source at all, so a source it cannot show costs a refusal here
+/// rather than a second dead session.
 extension AetherEngine {
     @MainActor
     func handleVODVideoConfigurationChange(session: HLSVideoEngine, epoch: UInt64,
@@ -37,7 +37,7 @@ extension AetherEngine {
     }
 
 
-    /// Rebuild this session on the software path, once, because the native one refused the media.
+    /// Rebuild this session with its video in the software overlay, once, because AVPlayer refused the media.
     /// `expectedGeneration` is the session the failure was raised under (audit LIF-103).
     @MainActor
     func escalateToSoftwarePath(_ request: SoftwarePathEscalation.Request, expectedGeneration: UInt64) async {
@@ -75,8 +75,8 @@ extension AetherEngine {
             : "AVPlayer refused the media (\(request.domain)/\(request.code))"
         EngineLog.emit(
             "[AetherEngine] #561 \(verdict) at "
-            + "\(String(format: "%.2f", resumesAt))s; rebuilding this session on the "
-            + "software path, which decodes it with libavcodec instead"
+            + "\(String(format: "%.2f", resumesAt))s; rebuilding this session with its video in the "
+            + "software overlay, which the engine's own decoder draws"
             + (duringStartup ? " (the waiting load follows it)" : "") + ": \(request.message)",
             category: .engine
         )
@@ -90,7 +90,7 @@ extension AetherEngine {
         do {
             try await rebuild.value
             EngineLog.emit(
-                "[AetherEngine] #561 rebuilt on the software path", category: .engine)
+                "[AetherEngine] #561 rebuilt with the video in the software overlay", category: .engine)
         } catch is CancellationError {
             // Audit CORE-1: a stop() or a new load() superseded the rebuild. The session this
             // failure belonged to is gone, and `.error` would land on whatever replaced it.
@@ -113,7 +113,7 @@ extension AetherEngine {
             // The rung is gone and the failure was never surfaced, so it has to be surfaced here or
             // the session would sit on a picture that stopped with nothing said.
             EngineLog.emit(
-                "[AetherEngine] #561 the software path cannot serve this session (\(error)); "
+                "[AetherEngine] #561 the software overlay cannot serve this session (\(error)); "
                 + "surfacing the original failure",
                 category: .engine
             )
@@ -121,7 +121,7 @@ extension AetherEngine {
         }
     }
 
-    /// Start a rebuild of this session that the engine decided on itself (AE#561 software path, AE#641
+    /// Start a rebuild of this session that the engine decided on itself (AE#561 software overlay, AE#641
     /// video-only), in a shape a `load()` still waiting on the session's startup can follow.
     ///
     /// AE#629: that load is about to be superseded by the rebuild's own. It follows the rebuild instead
