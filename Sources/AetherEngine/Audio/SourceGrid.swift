@@ -21,6 +21,16 @@ import AetherLibavutil
 ///
 /// So a run's audio sits where continuous playback puts it, to the frame, whatever the container
 /// rounded and wherever the run began.
+///
+/// A container timestamp is not always good to its tick: a remux can carry timestamps that drift from
+/// their frames and snap back, measured up to 112 frames (2.3 ms) off at 48 kHz on a millisecond base
+/// with the audio continuous underneath. `noise` bounds that at three ticks. A lattice longer than twice
+/// the noise (a DTS, AAC, AC-3 or MP3 frame on Matroska; any lattice on a sample-exact container) is a
+/// long one, and there a timestamp only picks the frame: it rounds to the nearest lattice point, and a
+/// run moves only when a timestamp names a different frame (a cut) or sits beyond the noise for
+/// `phaseShiftTimestamps` timestamps in a row without doing so (the frames moved off the lattice by
+/// less than a frame). Noise within the bound never moves a run; a shift within it is absorbed. A
+/// shorter lattice (a TrueHD access unit, an E-AC-3 block, an Opus frame) keeps the narrowing above.
 struct SourceGrid {
     /// Where the stream's first coded frame sits, in frames.
     let origin: Int64
@@ -40,6 +50,22 @@ struct SourceGrid {
     private static func latticeTolerance(step: Int64, tolerance: Int64) -> Int64 {
         step > 1 ? 2 * tolerance - 1 : tolerance
     }
+
+    /// How far a container timestamp may sit from its frame and still be read as that frame's: three
+    /// ticks (`tolerance` is one tick and a sample).
+    static func noise(tolerance: Int64) -> Int64 { 3 * tolerance }
+
+    /// Whether a lattice is longer than twice the noise, so a timestamp's nearest point is its frame.
+    static func isLong(lattice: Int64, tolerance: Int64) -> Bool { lattice > 2 * noise(tolerance: tolerance) }
+
+    /// Consecutive timestamps beyond the noise from a long-lattice run's point, all naming its frames, that
+    /// say the frames moved off the lattice by less than a frame.
+    static let phaseShiftTimestamps = 8
+
+    /// A long lattice's run: how far its frames sit off the stream's lattice (zero until an edit moves
+    /// them), and the timestamps in a row beyond the noise from it.
+    private var phase: Int64 = 0
+    private var offPhase: [Int64] = []
 
     /// The run's relative position of its first frame, and the grid offsets (in steps, from the
     /// point `origin` puts that frame on) still consistent with every timestamp the run has seen.
@@ -69,6 +95,8 @@ struct SourceGrid {
         steps = nil
         chosen = nil
         step = lattice
+        phase = 0
+        offPhase.removeAll()
     }
 
     enum Placement: Equatable {
@@ -82,6 +110,9 @@ struct SourceGrid {
     /// frame (`estimate`, output frames) if the container gave one. Returns whether the timestamp
     /// started a new run because the old one allowed it nowhere.
     mutating func place(relative: Int64, estimate: Int64?) -> (Placement, restarted: Bool) {
+        if Self.isLong(lattice: lattice, tolerance: tolerance) {
+            return placeOnLongLattice(relative: relative, estimate: estimate)
+        }
         var restarted = false
         if let estimate {
             let first = self.first ?? relative
@@ -123,16 +154,58 @@ struct SourceGrid {
         return (.position(origin + placed * step + (relative - first)), restarted)
     }
 
+    /// `place` on a long lattice: the run's first frame is lattice point `chosen` (counted from `origin`
+    /// plus the run's `phase`), every timestamp rounds to the frame it names, and only a timestamp naming
+    /// another frame, or a stretch of them beyond the noise, moves the run.
+    private mutating func placeOnLongLattice(relative: Int64, estimate: Int64?) -> (Placement, restarted: Bool) {
+        var restarted = false
+        if let estimate {
+            let offset = relative - (first ?? relative)
+            if offset % lattice == 0 {
+                let noise = Self.noise(tolerance: tolerance)
+                // The lattice point this timestamp names for the run's first frame, and how far off it it sits.
+                let named = Self.floorDiv(estimate - origin - phase + lattice / 2, lattice) - offset / lattice
+                let residual = estimate - (origin + phase + (named + offset / lattice) * lattice)
+                if chosen == nil || named != chosen {
+                    // The run's first timestamp, or a cut: the run starts here, on the lattice unless this
+                    // timestamp sits beyond the noise from it, which only an edit at another phase puts it.
+                    restarted = chosen != nil || abs(residual) > noise
+                    if abs(residual) > noise { phase += residual }
+                    first = relative
+                    chosen = Self.floorDiv(estimate - origin - phase + lattice / 2, lattice)
+                    offPhase.removeAll()
+                } else if abs(residual) > noise {
+                    offPhase.append(residual)
+                    if offPhase.count >= Self.phaseShiftTimestamps {
+                        // Every timestamp of the stretch names the run's frames from beyond the noise: the
+                        // frames moved off the lattice, by their mean.
+                        restarted = true
+                        phase += offPhase.reduce(0, +) / Int64(offPhase.count)
+                        first = relative
+                        chosen = Self.floorDiv(estimate - origin - phase + lattice / 2, lattice)
+                        offPhase.removeAll()
+                    }
+                } else {
+                    offPhase.removeAll()
+                }
+                steps = chosen.map { $0...$0 }
+            }
+        }
+        guard let first, let chosen else { return (.unplaced, restarted) }
+        return (.position(origin + phase + chosen * lattice + (relative - first)), restarted)
+    }
+
     /// Where a coded frame whose own container timestamp is `estimate` starts, for a stream whose
     /// every frame carries one (a stream-copied packet): the lattice point that timestamp names. A
-    /// lattice longer than the span a rounded timestamp can name (`latticeTolerance` either side)
-    /// leaves one point in it, so the timestamp alone decides, and every packet is placed by itself,
-    /// the same way whichever packet a run began at. Where the lattice is no longer than that span
-    /// (none of the codecs stream-copied: they are 256 frames or more, the Matroska span 194 at
-    /// 48 kHz) or is every frame, the timestamp names no single point and is the position; so is one
-    /// with no point in its span, a frame cut off the lattice (`place`'s rule for the same).
+    /// lattice longer than the span a timestamp can name leaves one point in it, so the timestamp alone
+    /// decides, and every packet is placed by itself, the same way whichever packet a run began at. The
+    /// span is the noise either side on a long lattice, a rounded timestamp's (`latticeTolerance`) on a
+    /// shorter one. Where the lattice is no longer than that span or is every frame, the timestamp names
+    /// no single point and is the position; so is one with no point in its span, a frame cut off the
+    /// lattice (`place`'s rule for the same).
     static func position(estimate: Int64, origin: Int64, lattice: Int64, tolerance: Int64) -> Int64 {
-        let window = latticeTolerance(step: lattice, tolerance: tolerance)
+        let window = isLong(lattice: lattice, tolerance: tolerance)
+            ? noise(tolerance: tolerance) : latticeTolerance(step: lattice, tolerance: tolerance)
         guard lattice > 2 * window else { return estimate }
         let point = origin + floorDiv(estimate - origin + lattice / 2, lattice) * lattice
         return abs(point - estimate) <= window ? point : estimate
@@ -151,8 +224,11 @@ struct SourceGrid {
     /// FLAC stream's block size when its STREAMINFO says min = max), and 1, every frame, where frames
     /// can start on any sample (PCM, Vorbis, a variable-block FLAC stream) or the length is not stated.
     /// `sampleRate` is the decoded stream's, which a container can leave unstated until the first
-    /// frame (TrueHD).
-    static func lattice(codecpar: UnsafePointer<AVCodecParameters>, sampleRate: Int32) -> Int64 {
+    /// frame (TrueHD). `decodedFrameSamples` is the length of the stream's first decoded frame, for a codec
+    /// whose frame length the container need not state: Matroska leaves a DTS stream's `frame_size` unset,
+    /// and a DTS frame's length is in its own header (32 × (NBLKS+1) samples, the same on every normal frame).
+    static func lattice(codecpar: UnsafePointer<AVCodecParameters>, sampleRate: Int32,
+                        decodedFrameSamples: Int64? = nil) -> Int64 {
         let par = codecpar.pointee
         switch par.codec_id {
         case AV_CODEC_ID_AAC: return 1024
@@ -163,7 +239,7 @@ struct SourceGrid {
             let base: Int32 = sampleRate % 44_100 == 0 ? 44_100 : 48_000
             return max(40 * Int64(sampleRate / base), 1)
         case AV_CODEC_ID_MP3, AV_CODEC_ID_MP2, AV_CODEC_ID_DTS:
-            return max(Int64(par.frame_size), 1)
+            return par.frame_size > 0 ? Int64(par.frame_size) : max(decodedFrameSamples ?? 1, 1)
         case AV_CODEC_ID_FLAC:
             // STREAMINFO: min and max block size, 16 bits each, first.
             guard par.extradata_size >= 4, let e = par.extradata else { return 1 }
