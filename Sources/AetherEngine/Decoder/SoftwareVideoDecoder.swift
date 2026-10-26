@@ -752,20 +752,23 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// One decoded picture (nil: the end of the stream) through inverse telecine and the finish of the film pictures it
     /// releases, in one batch: the chain's work first (its decisions taken on the GPU), the finishes behind it. Each film
     /// picture takes its ticket here, in order; whether it goes out, and at what timestamp, is read when the batch
-    /// completes (decimate drops one in five, and the skip threshold applies to the timestamp it gets). The batch starts
-    /// after the earlier ones, whose state the chain's work reads. Decode thread.
+    /// completes (decimate drops one in five, and the skip threshold applies to the timestamp it gets). The chain's
+    /// fences order its work after the earlier batches' chain work, whose state it reads, and the finishes after it.
+    /// Decode thread.
     private func telecine(_ ivtc: InverseTelecine, _ picture: BwdifWindow.Picture?, epoch: UInt64) {
         guard let finisher = writer?.finisher else { return }
-        finisher.finish(orderedAfterEarlierWork: true) { pass in
-            let pushed = ivtc.push(picture, into: pass)
+        finisher.finish { batch in
+            let pushed = ivtc.push(picture, into: DeinterlaceGPU.batch(batch))
             var jobs: [PlanarFrameFinisher.Job] = []
             var films: [(ticket: UInt64, output: InverseTelecine.Output, buffer: SendableBuffer, hdr10: Data?)] = []
             for output in pushed.outputs {
                 let frame = output.picture.frame
                 guard let prepared = prepare(frame, planFormat: AVPixelFormat(rawValue: frame.pointee.format), interlaced: false)
                 else { continue }
+                // Decimate's drop is decided on the GPU in this batch; the dropped picture's finish dispatches nothing.
                 jobs.append(.init(source: .picture(output.picture.storage.planes), plan: prepared.plan,
-                                  width: Int(frame.pointee.width), height: Int(frame.pointee.height), buffer: prepared.buffer))
+                                  width: Int(frame.pointee.width), height: Int(frame.pointee.height), buffer: prepared.buffer,
+                                  kept: output.kept))
                 reportDecodedFormat(pixelBuffer: prepared.buffer)
                 films.append((takeTicket(epoch), output, SendableBuffer(value: prepared.buffer), extractHDR10PlusBytes(from: frame)))
             }
@@ -776,7 +779,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             nonisolated(unsafe) let tickets = films
             nonisolated(unsafe) let chain = ivtc
             let failureLogged = finishFailureLogged
-            return (jobs, { [weak self] failure in
+            return (jobs, ivtc.fence, { [weak self] failure in
                 withExtendedLifetime(held) {}
                 if let failure, failureLogged.claim() {
                     EngineLog.emit("[SWDecoder] GPU inverse telecine and finish failed: \(failure) (logged once)",

@@ -874,6 +874,17 @@ kernel void pf_finish(device const uchar*            src     [[buffer(0)]],
     out_c.write(uint4(pf_container(cb, 2u * gid.x, gid.y), pf_container(cr, 2u * gid.x + 1u, gid.y), 0u, 0u), gid);
 }
 
+// A finish's threadgroups as the GPU decided earlier in the batch: all of them when the 64-bit word says the picture
+// goes out, none when it is dropped.
+kernel void pf_gate(device const uint* word      [[buffer(0)]],
+                    constant uint4&    groups    [[buffer(1)]],
+                    device uint*       arguments [[buffer(3)]]) {
+    bool kept = (word[0] | word[1]) != 0u;
+    arguments[0] = kept ? groups.x : 0u;
+    arguments[1] = kept ? groups.y : 0u;
+    arguments[2] = kept ? groups.z : 0u;
+}
+
 // The pixels the fast path flagged, as indirect dispatch arguments for pf_cl_correct (64 threads a group).
 kernel void pf_cl_prepare(device atomic_uint* list [[buffer(2)]], device uint* arguments [[buffer(3)]],
                           constant PFFrame& f [[buffer(1)]]) {

@@ -301,6 +301,8 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         /// the indirect dispatch arguments for their recompute.
         var lists: [MTLBuffer] = []
         var arguments: [MTLBuffer] = []
+        /// Indirect threadgroup counts, one per job whose dispatch the GPU decides (``Job/kept``).
+        var gates: [MTLBuffer] = []
         /// What the work reads that its caller does not hold: the display buffers' textures, the luma table.
         var retained: [AnyObject] = []
     }
@@ -394,6 +396,9 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         var buffer: CVPixelBuffer
         /// The frame's AV1 film grain, for a plan with `grain`.
         var grain: FilmGrainParameters? = nil
+        /// A 64-bit word written earlier in the batch (inverse telecine's decimate): the job is written when it is
+        /// nonzero and dispatches nothing when it is zero, decided on the GPU.
+        var kept: (buffer: MTLBuffer, offset: Int)? = nil
     }
 
     /// The planar little-endian format holding `source`'s components at their depths and subsampling, which is what
@@ -475,33 +480,34 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     /// `completion`.
     func finish(_ jobs: [Job], completion: @escaping @Sendable (_ failure: String?) -> Void) {
         guard !jobs.isEmpty else { return completion(nil) }
-        if !finish(orderedAfterEarlierWork: false, { _ in (jobs, completion) }) { completion("no batch could be made") }
+        if !finish({ _ in (jobs, nil, completion) }) { completion("no batch could be made") }
     }
 
-    /// ``finish(_:completion:)`` behind work of the caller's own: `encode` encodes into the batch's pass first (inverse
-    /// telecine) and returns the jobs to write after it, behind a barrier, with the completion. `orderedAfterEarlierWork`
-    /// starts the batch only once this finisher's earlier batches have finished, for a caller whose work carries state
-    /// from one batch to the next. False, with `encode` never called, when no batch could be made.
+    /// ``finish(_:completion:)`` behind work of the caller's own: `encode` encodes passes of its own into the batch
+    /// first (inverse telecine) and returns the jobs to write after them, the fence the finish's pass waits on before
+    /// reading what they wrote, and the completion. False, with `encode` never called, when no batch could be made.
     @discardableResult
-    func finish(orderedAfterEarlierWork: Bool,
-                _ encode: (ComputePass) -> (jobs: [Job], completion: @Sendable (_ failure: String?) -> Void)) -> Bool {
+    func finish(_ encode: (GPUBatch) -> (jobs: [Job], after: MTLFence?,
+                                         completion: @Sendable (_ failure: String?) -> Void)) -> Bool {
         let slot = slots[nextSlot]
         nextSlot = (nextSlot + 1) % slots.count
         slot.free.wait()
         slot.retained.removeAll()
         let giveBack: @Sendable () -> Void = { slot.free.signal() }
-        guard let batch = submitter.makeBatch(orderedAfterEarlierWork: orderedAfterEarlierWork) else {
+        guard let batch = submitter.makeBatch() else {
             giveBack()
             return false
         }
-        guard let pass = batch.makePass() else {
-            // Committed empty, so its command memory goes back to the pool.
-            batch.commit { _ in giveBack() }
-            return false
+        let (jobs, after, completion) = encode(batch)
+        let encoded: Bool
+        if jobs.isEmpty {
+            encoded = true
+        } else if let pass = batch.makePass() {
+            if let after { pass.waitForFence(after) }
+            encoded = self.encode(jobs, slot: slot, pass: pass)
+        } else {
+            encoded = false
         }
-        let (jobs, completion) = encode(pass)
-        if !jobs.isEmpty { pass.barrier() }
-        let encoded = self.encode(jobs, slot: slot, pass: pass)
         inFlight.enter()
         batch.commit { [inFlight] result in
             let failure = encoded ? result.error : "a job could not be encoded"
@@ -553,7 +559,23 @@ final class PlanarFrameFinisher: @unchecked Sendable {
             }
             grains.append(tables.buffer)
         }
-        if fields > 0 || synthesised { pass.barrier() }
+        // Each gated job's threadgroups from its word, beside the fields and the synthesis, behind the same barrier.
+        var gates: [MTLBuffer?] = []
+        for job in jobs {
+            guard let kept = job.kept else { gates.append(nil); continue }
+            guard let gate = try? pipeline(for: job.plan, function: "pf_gate"),
+                  let shape = finishDispatch(job.plan, width: job.width, height: job.height, into: job.buffer),
+                  let arguments = gateBuffer(slot, gates.compactMap { $0 }.count) else { return false }
+            var groups: [UInt32] = [UInt32((shape.grid.width + shape.group.width - 1) / shape.group.width),
+                                    UInt32((shape.grid.height + shape.group.height - 1) / shape.group.height), 1, 0]
+            pass.setPipeline(gate)
+            pass.setBuffer(kept.buffer, offset: kept.offset, index: 0)
+            groups.withUnsafeMutableBytes { pass.setBytes(UnsafeRawBufferPointer($0), index: 1) }
+            pass.setBuffer(arguments, offset: 0, index: 3)
+            pass.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            gates.append(arguments)
+        }
+        if fields > 0 || synthesised || gates.contains(where: { $0 != nil }) { pass.barrier() }
         var lists = 0
         let order = jobs.indices.filter { !usesList(jobs[$0].plan) } + jobs.indices.filter { usesList(jobs[$0].plan) }
         for index in order {
@@ -566,7 +588,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
                 lists += 1
             }
             guard encodeFinish(sources[index], plan: job.plan, width: job.width, height: job.height, into: job.buffer,
-                               grain: grain, list: list, slot: slot, pass: pass) else { return false }
+                               grain: grain, list: list, gate: gates[index], slot: slot, pass: pass) else { return false }
         }
         return true
     }
@@ -587,17 +609,40 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         return (slot.lists[index], slot.arguments[index])
     }
 
+    /// The slot's gate `index`: three threadgroup counts for one gated job.
+    private func gateBuffer(_ slot: Slot, _ index: Int) -> MTLBuffer? {
+        while slot.gates.count <= index {
+            guard let made = device.makeBuffer(length: 16, options: .storageModePrivate) else { return nil }
+            slot.gates.append(made)
+        }
+        return slot.gates[index]
+    }
+
+    /// The finish's grid and threadgroup: convert and constant luminance run one thread per source chroma sample (its
+    /// block of pixels), the others one per sample of the buffer's chroma plane.
+    private func finishDispatch(_ plan: Plan, width: Int, height: Int, into buffer: CVPixelBuffer) -> (grid: MTLSize, group: MTLSize)? {
+        guard let pipeline = try? pipeline(for: plan) else { return nil }
+        let w = pipeline.threadExecutionWidth
+        let blocks = plan.mode == .convert || plan.mode == .constantLuminance
+        let grid = blocks
+            ? MTLSize(width: (width + (1 << Int(plan.sourceLog2[0])) - 1) >> Int(plan.sourceLog2[0]),
+                      height: (height + (1 << Int(plan.sourceLog2[1])) - 1) >> Int(plan.sourceLog2[1]), depth: 1)
+            : MTLSize(width: CVPixelBufferGetWidthOfPlane(buffer, 1), height: CVPixelBufferGetHeightOfPlane(buffer, 1), depth: 1)
+        return (grid, MTLSize(width: w, height: max(1, pipeline.maxTotalThreadsPerThreadgroup / w), depth: 1))
+    }
+
     /// Encodes one picture's finishing dispatches, the buffer's textures kept in the slot until the work completes.
-    /// `list` is a constant-luminance job's.
+    /// `list` is a constant-luminance job's; `gate` the GPU's threadgroup counts for a gated job.
     private func encodeFinish(_ planes: Planes, plan: Plan, width: Int, height: Int, into buffer: CVPixelBuffer,
-                              grain: MTLBuffer, list: (counter: MTLBuffer, arguments: MTLBuffer)?, slot: Slot,
-                              pass: ComputePass) -> Bool {
+                              grain: MTLBuffer, list: (counter: MTLBuffer, arguments: MTLBuffer)?, gate: MTLBuffer?,
+                              slot: Slot, pass: ComputePass) -> Bool {
         for p in 0..<4 where plan.planeAlignment[p] > 1 {
             guard planes.offsets[p] % UInt32(plan.planeAlignment[p]) == 0,
                   planes.linesizes[p] % UInt32(plan.planeAlignment[p]) == 0 else { return false }
         }
         let wide = plan.wideOutput
         guard let pipeline = try? pipeline(for: plan),
+              let shape = finishDispatch(plan, width: width, height: height, into: buffer),
               let luma = texture(buffer, plane: 0, format: wide ? .r16Uint : .r8Uint),
               let chroma = texture(buffer, plane: 1, format: wide ? .rg16Uint : .rg8Uint),
               let lumaTexture = CVMetalTextureGetTexture(luma), let chromaTexture = CVMetalTextureGetTexture(chroma)
@@ -633,14 +678,11 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         }
         pass.setTexture(lumaTexture, index: 0)
         pass.setTexture(chromaTexture, index: 1)
-        let w = pipeline.threadExecutionWidth
-        // Convert and constant luminance run one thread per source chroma sample (its block of pixels).
-        let blocks = plan.mode == .convert || plan.mode == .constantLuminance
-        let grid = blocks
-            ? MTLSize(width: (width + (1 << Int(plan.sourceLog2[0])) - 1) >> Int(plan.sourceLog2[0]),
-                      height: (height + (1 << Int(plan.sourceLog2[1])) - 1) >> Int(plan.sourceLog2[1]), depth: 1)
-            : MTLSize(width: chromaTexture.width, height: chromaTexture.height, depth: 1)
-        pass.dispatchThreads(grid, threadsPerThreadgroup: MTLSize(width: w, height: max(1, pipeline.maxTotalThreadsPerThreadgroup / w), depth: 1))
+        if let gate {
+            pass.dispatchThreadgroups(indirectBuffer: gate, offset: 0, threadsPerThreadgroup: shape.group)
+        } else {
+            pass.dispatchThreads(shape.grid, threadsPerThreadgroup: shape.group)
+        }
         if let list {
             // The flagged pixels, sized on the GPU: one thread turns the count into indirect arguments, then each
             // flagged pixel is recomputed in double-float, each step behind a barrier on the one before.
