@@ -104,6 +104,9 @@ protocol ComputePass: LibraryPasses {
     func dispatchThreads(_ grid: MTLSize, threadsPerThreadgroup: MTLSize)
     func dispatchThreadgroups(_ groups: MTLSize, threadsPerThreadgroup: MTLSize)
     func dispatchThreadgroups(indirectBuffer: MTLBuffer, offset: Int, threadsPerThreadgroup: MTLSize)
+    /// Every byte of `range` (offset and length multiples of 4) set to `value`, ordered by ``barrier()`` and fences as a
+    /// dispatch is: the encoder's own fill on Metal 4, a fill kernel in the same encoder on Metal 3.
+    func fill(_ buffer: MTLBuffer, range: Range<Int>, value: UInt8)
     /// Every dispatch after this sees every write before it.
     func barrier()
     /// The dispatches after this wait until `fence` has been updated, by the last pass committed to this queue before
@@ -341,13 +344,22 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
                                          threadsPerThreadgroup: threadsPerThreadgroup)
         }
 
-        func barrier() {
-            encoder.barrier(afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch, visibilityOptions: .device)
+        func fill(_ buffer: MTLBuffer, range: Range<Int>, value: UInt8) {
+            guard !range.isEmpty else { return }
+            batch.context.residency.addAllocation(buffer)
+            encoder.fill(buffer: buffer, range: range, value: value)
         }
 
-        func waitForFence(_ fence: MTLFence) { encoder.waitForFence(fence, beforeEncoderStages: .dispatch) }
+        // The pass's work is dispatches and fills (the blit stage).
+        private static let stages: MTLStages = [.dispatch, .blit]
 
-        func updateFence(_ fence: MTLFence) { encoder.updateFence(fence, afterEncoderStages: .dispatch) }
+        func barrier() {
+            encoder.barrier(afterEncoderStages: Self.stages, beforeEncoderStages: Self.stages, visibilityOptions: .device)
+        }
+
+        func waitForFence(_ fence: MTLFence) { encoder.waitForFence(fence, beforeEncoderStages: Self.stages) }
+
+        func updateFence(_ fence: MTLFence) { encoder.updateFence(fence, afterEncoderStages: Self.stages) }
 
         func timestamp(_ label: String) {
             guard batch.timed, let heap = batch.context.stamps, batch.labels.count + 1 < Bindings.stamps else { return }
@@ -375,6 +387,17 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
     private let stageBoundaryStamps: Bool
     /// A CPU and a GPU timestamp read together at start-up: with a later pair, the GPU tick's length.
     fileprivate let origin: (cpu: MTLTimestamp, gpu: MTLTimestamp)
+    /// ComputePass.fill as a dispatch: Metal 3 fills only in a blit encoder, which would end the pass.
+    fileprivate let fillPipeline: MTLComputePipelineState
+
+    private static let fillSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+    kernel void gpu_fill(device uint* words [[buffer(0)]], constant uint2& fill [[buffer(1)]],
+                         uint gid [[thread_position_in_grid]]) {
+        if (gid < fill.x) { words[gid] = fill.y; }
+    }
+    """
 
     final class Context: @unchecked Sendable {
         let residency: MTLResidencySet?
@@ -397,7 +420,10 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
     }
 
     init?(device: MTLDevice, label: String) {
-        guard let queue = device.makeCommandQueue() else { return nil }
+        guard let queue = device.makeCommandQueue(),
+              let function = (try? device.makeLibrary(source: Self.fillSource, options: nil))?.makeFunction(name: "gpu_fill"),
+              let fillPipeline = try? device.makeComputePipelineState(function: function) else { return nil }
+        self.fillPipeline = fillPipeline
         queue.label = label
         self.device = device
         self.queue = queue
@@ -557,6 +583,22 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
             resident(indirectBuffer)
             encoder?.dispatchThreadgroups(indirectBuffer: indirectBuffer, indirectBufferOffset: offset,
                                           threadsPerThreadgroup: threadsPerThreadgroup)
+        }
+
+        func fill(_ buffer: MTLBuffer, range: Range<Int>, value: UInt8) {
+            guard !range.isEmpty, let encoder else { return }
+            resident(buffer)
+            let words = UInt32(range.count / 4), word = UInt32(value) * 0x0101_0101
+            encoder.setComputePipelineState(batch.backend.fillPipeline)
+            encoder.setBuffer(buffer, offset: range.lowerBound, index: 0)
+            var arguments = (words, word)
+            encoder.setBytes(&arguments, length: 8, index: 1)
+            encoder.dispatchThreads(MTLSize(width: Int(words), height: 1, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: min(256, batch.backend.fillPipeline.maxTotalThreadsPerThreadgroup),
+                                                                   height: 1, depth: 1))
+            // The caller's state as it was.
+            if let pipeline { encoder.setComputePipelineState(pipeline) }
+            for index in 0...1 { if let (buffer, offset) = buffers[index] { encoder.setBuffer(buffer, offset: offset, index: index) } }
         }
 
         func barrier() { encoder?.memoryBarrier(scope: [.buffers, .textures]) }
