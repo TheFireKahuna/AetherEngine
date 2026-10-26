@@ -29,13 +29,8 @@ final class OverlayDecodeTap: @unchecked Sendable {
     /// The source decodes on VideoToolbox.
     let decodesInHardware: Bool
 
-    /// A clock the player moved within this long is AVPlayer's; otherwise the producer's run start stands in for it.
-    static let playerClockSeconds = 0.5
-    /// A run whose start is this far from the clock is cut ahead of a playing clock: nothing waits for it.
-    static let runStartNearClockSeconds = 1.0
-
-    /// Where the current run starts (item seconds), the producer side's; the player's last clock move.
-    private let clock = OSAllocatedUnfairLock(initialState: (runStart: Double?.none, playerMoved: -Double.infinity))
+    /// Where the current run starts and whether the player has moved the clock since (`OverlayRunStart`).
+    private let runStart = OverlayRunStart()
 
     /// `parameters` and `timeBase` are the source stream's, `containerSAR` its container's sample aspect;
     /// `deinterlace` what the load decided for interlaced carriage. `onCaptions` takes the decoder's A53 captions
@@ -69,12 +64,7 @@ final class OverlayDecodeTap: @unchecked Sendable {
     func keep(_ packet: UnsafePointer<AVPacket>, timeBase: AVRational, shiftSeconds: Double) {
         guard packet.pointee.pts != Int64.min, let copy = av_packet_clone(packet) else { return }
         let seconds = Double(packet.pointee.pts) * av_q2d(timeBase)
-        let newRun = units.beginsRun(dts: packet.pointee.dts)
-        let playerIdle = clock.withLock { state -> Bool in
-            guard newRun || state.runStart == nil else { return false }
-            state.runStart = seconds
-            return CACurrentMediaTime() - state.playerMoved > Self.playerClockSeconds
-        }
+        let playerIdle = runStart.noteUnit(at: seconds, opensRun: units.beginsRun(dts: packet.pointee.dts))
         units.insert(pts: packet.pointee.pts, timeBase: timeBase, isKey: packet.pointee.flags & AV_PKT_FLAG_KEY != 0,
                      info: shiftSeconds, packet: copy)
         if playerIdle { units.advance(to: seconds) }
@@ -84,14 +74,9 @@ final class OverlayDecodeTap: @unchecked Sendable {
     /// the segment holding it is what AVPlayer prerolls the placeholder on and then starts its clock. True when the
     /// picture is there or nothing needs to wait; false after `timeout` or once `shouldStop` says so.
     func awaitRunStart(timeout: TimeInterval, shouldStop: () -> Bool) -> Bool {
-        guard let start = clock.withLock({ $0.runStart }),
-              abs(units.clockSeconds - start) < Self.runStartNearClockSeconds else { return true }
-        let deadline = Date().addingTimeInterval(timeout)
-        while !units.hasPicture(near: start, toleranceSeconds: PictureTapDecoder.shownBeforeClockSeconds) {
-            if shouldStop() || Date() > deadline { return false }
-            Thread.sleep(forTimeInterval: 0.005)
-        }
-        return true
+        runStart.awaitPicture(clockSeconds: units.clockSeconds, timeout: timeout, hasPicture: {
+            units.hasPicture(near: $0, toleranceSeconds: PictureTapDecoder.shownBeforeClockSeconds)
+        }, shouldStop: shouldStop)
     }
 
     /// The picture on screen at `seconds` (item time) and its own time, nil before the decoder reaches it.
@@ -107,7 +92,7 @@ final class OverlayDecodeTap: @unchecked Sendable {
 
     /// Where AVPlayer's clock is (item time).
     func advance(to seconds: Double) {
-        clock.withLock { $0.playerMoved = CACurrentMediaTime() }
+        runStart.notePlayerMoved()
         units.advance(to: seconds)
     }
 

@@ -136,8 +136,11 @@ The Atmos activator follows the AVPlayer from here, and while the engine is stil
 APAC it keeps the silent Atmos stream playing over the paused player and across the item swap
 (`AtmosOutputActivator.hostVerdict`). A reused player re-attaches it explicitly.
 
-For an overlay session the producer holds the first segment of a run until the overlay's decoder has its first
-picture (`OverlayDecodeTap.awaitRunStart`), so AVPlayer's readiness already includes the overlay's.
+For an overlay session the producer holds the first segment of a run until the overlay's decoder has the picture at
+the run's start: the software overlay's picture (`OverlayDecodeTap.awaitRunStart`), or the FEL overlay's
+enhancement picture (`FelEnhancementTap.awaitRunStart`). Before AVPlayer moves its clock, the decoder works toward
+the run's start (`OverlayRunStart`). AVPlayer's readiness, and so the preroll, already includes the overlay's, and a
+FEL start opens on the full composed picture.
 
 ### 5. Wait for the display
 
@@ -170,7 +173,7 @@ receiver runs the readiness gate (#227). Then `state = .playing`, and the activa
 | #667 wait | an unproven master's serve, until the switch it asked for ends |
 | Readiness gate (#35) | AirPlay receivers only |
 | #98 media fallback | reactive; a display refusal also forgets the proof |
-| Overlay run start (5 s) | an overlay decoder with no first picture; released and logged |
+| Overlay run start (5 s) | an overlay or FEL enhancement decoder with no picture for the run's start; released and logged |
 
 ## On the device
 
@@ -182,12 +185,10 @@ Not yet measured. To check on the Apple TV and the LG G5:
 4. A cold launch on the proven display: `panel proven to engage HDR by a stored proof`, and no #667 wait.
 5. A decided master served right after the write, before the switch has started, is accepted.
 6. `AVPlayerItemMetricsLog`'s `first likely to keep up` against the #361 checkpoints.
+7. On a FEL title, `overlay run start: first picture decoded` and no `residualOff` count at the start.
 
-## Still open
+## Handed on
 
-- **The FEL overlay's first picture.** `FelCompositionSource` waits per frame for its enhancement picture while
-  there is time, and composes the residual off once there is not. A FEL run's first segment is not held for the
-  enhancement layer the way an overlay decode's is, so the first frames after a start can lack it.
 - **The demuxed audio rendition** (`docs/demuxed-audio.md`): `plannedServesMaster` is the answer its shape is
   chosen from in `prepare()`; a session whose plan was left to the settled panel keeps the muxed shape, which plays
   from either playlist.
