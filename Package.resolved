@@ -1,12 +1,12 @@
 {
-  "originHash" : "a4ce73d5471a016fefef6bedd1ee028cf6e762ca999b60805fb36adc22e02a0e",
+  "originHash" : "afbce7a713a98b09622bd0e29e09bcf0f3e2bd00ef4b84686056e680ca8b7605",
   "pins" : [
     {
       "identity" : "ffmpegbuild",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/TheFireKahuna/FFmpegBuild",
       "state" : {
-        "revision" : "6a2d3af66eddc417a1ee95add60f867475c34054",
+        "revision" : "aaa58e4f8d1a0f58694f4547bfc07822b8d84fef",
         "version" : "3.10.1"
       }
     },

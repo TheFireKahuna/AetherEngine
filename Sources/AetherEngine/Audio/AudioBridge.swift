@@ -311,6 +311,13 @@ final class AudioBridge: @unchecked Sendable {
     /// The stream's frames on its lattice from its first coded frame (`SourceGrid`), at the decoded
     /// rate; built at the first frame once `setSourceStart` has given the start.
     private var grid: SourceGrid?
+    /// A TrueHD stream's own clock against its start (`setStreamClock`); nil for a stream without one, or
+    /// whose head could not be read. With it every decoded frame is placed by the clock (`StreamClockPlacement`)
+    /// and the grid only takes over where the clock parts from the timestamps.
+    private var streamClock: StreamClockPlacement?
+    /// The clock of the next frame the decoder hands over, counted on one access unit a frame from the last
+    /// output_timing it stated (`mlp_output_timing`); nil until the decoder states one.
+    private var nextClock: Int64?
     private var sourceStart: Int64?
     /// What the grid needs of the source stream: its codec, frame length and delay. A copy, freed in
     /// `cleanup`.
@@ -850,6 +857,35 @@ final class AudioBridge: @unchecked Sendable {
         pendingTrimSamples = 0
         continuityBreakCause = nil
         runBreakPending = true
+        streamClock?.restart()
+        nextClock = nil
+    }
+
+    /// Where a TrueHD stream's clock reads zero, counted from its start, in frames at the stream's rate
+    /// (`StreamClockPlacement.headOffset`), read off the stream's head; nil for none.
+    func setStreamClock(headOffset: Int64?) {
+        opLock.lock()
+        defer { opLock.unlock() }
+        streamClock = headOffset.map(StreamClockPlacement.init(headOffset:))
+        nextClock = nil
+    }
+
+    /// The samples a TrueHD access unit holds at `rate`: 40 at 44.1 or 48 kHz, 80 at 88.2 or 96, 160 above.
+    static func trueHDAccessUnitFrames(rate: Int32) -> Int64 {
+        let base: Int32 = rate % 44_100 == 0 ? 44_100 : 48_000
+        return 40 * Int64(max(rate / base, 1))
+    }
+
+    /// Caller holds `opLock`. The clock of `frame`, the next the decoder handed over: the output_timing it
+    /// states, or the last one counted on by an access unit. Advances the count past it.
+    private func clock(of frame: UnsafeMutablePointer<AVFrame>) -> Int64? {
+        guard streamClock != nil else { return nil }
+        let unit = Self.trueHDAccessUnitFrames(rate: frame.pointee.sample_rate)
+        let stated = av_dict_get(frame.pointee.metadata, "mlp_output_timing", nil, 0)
+            .flatMap { Int64(String(cString: $0.pointee.value)) }
+        let clock = stated ?? nextClock
+        nextClock = clock.map { ($0 + unit) % (1 << 16) }
+        return clock
     }
 
     func startRun(atFrame frame: Int64, segment: Range<Int64>) {
@@ -898,10 +934,31 @@ final class AudioBridge: @unchecked Sendable {
         if runBreakPending {
             runBreakPending = false
             grid?.restart()
+            streamClock?.breakRun()
             runFrames = 0
         }
         let frames = Int64(frame.pointee.nb_samples)
         runFrames += frames
+        if var placement = streamClock, !placement.parted, let clock = clock(of: frame), let sourceStart {
+            defer { streamClock = placement }
+            let noise = SourceGrid.noise(tolerance: AudioContinuity.tolerance(sourceTimeBase: srcTimeBase, sampleRate: rate))
+            switch placement.place(clock: clock, modulus: 1 << 16, scale: 1,
+                                   origin: SourceGrid.origin(start: sourceStart, timeBase: srcTimeBase, sampleRate: rate,
+                                                             initialPadding: parameters.pointee.initial_padding),
+                                   estimate: ts.map { av_rescale_q($0, srcTimeBase, AVRational(num: 1, den: rate)) },
+                                   noise: noise) {
+            case .position(let start): return start
+            case .unplaced: return nil
+            case .parted(let ahead):
+                grid?.restart()
+                runFrames = frames
+                continuityBreakCause = continuityBreakCause ?? "a splice in the source"
+                EngineLog.emit(
+                    "[AudioBridge] the stream's clock and its timestamps parted by "
+                    + "\(String(format: "%+.3f", Double(ahead) / Double(rate))) s (a splice); "
+                    + "the rest of the run is placed on the grid", category: .session)
+            }
+        }
         let end = ts.map { av_rescale_q($0, srcTimeBase, AVRational(num: 1, den: rate)) + frames }
         let (placement, restarted) = grid!.place(relative: runFrames, estimate: end)
         if restarted {
@@ -1184,6 +1241,10 @@ final class AudioBridge: @unchecked Sendable {
                 stats.lastDecodeErrorCode = sendRet
                 continuityBreakCause = "a packet the decoder rejected"
                 runBreakPending = true
+                // The rejected access unit still took its place on the stream's clock.
+                if let next = nextClock {
+                    nextClock = (next + Self.trueHDAccessUnitFrames(rate: dec.pointee.sample_rate)) % (1 << 16)
+                }
                 // Skippable single-packet rejections, decoder stays usable for the next packet:
                 //   invalidData = corrupt source packet (glitchy live MPEG-TS, broken mp2 header);
                 //   einval (-22) = a DTS-HD MA XLL frame that residual-codes channels without a usable core
