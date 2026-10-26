@@ -1066,6 +1066,51 @@ extension AetherEngine {
         routesAsHDR && !panelPresentsHDR && switchRunning
     }
 
+    /// Whether a native load's start is the prerolled one: an autostarting VOD load the AirPlay readiness gate
+    /// does not start. A live join keeps its own start (AE#440), and the gate plays to poll readiness.
+    nonisolated static func loadStartsPrerolled(autostart: Bool, isLive: Bool, readinessGateRuns: Bool) -> Bool {
+        autostart && !isLive && !readinessGateRuns
+    }
+
+    /// The startup plan's master-or-media answer, decided before the display switch
+    /// (docs/startup-determinism.md, step 2).
+    enum PlannedPanelRouting: Equatable {
+        /// The route is known now. `waitsForSwitchEnd`: an unproven master, served once the switch it
+        /// asked for has ended (#667).
+        case decided(routesAsHDR: Bool, waitsForSwitchEnd: Bool)
+        /// Only the settled panel can answer: an unproven, HDR-eligible display the load may not offer the
+        /// master to on trust (the host declined the attempt, or a live load).
+        case atSettledPanel
+    }
+
+    /// What `sessionRoutesAsHDRPanel` will answer, asked before the switch. Every input but the panel readout
+    /// exists before the criteria write, and the readout changes the answer only on an eligible, unlatched
+    /// display the load may not offer the master on trust; there a proof or the host's assertion stands in
+    /// for it, and without either the answer waits for the settled panel.
+    ///
+    /// `provenForWrite`: the engine's own HDR criteria are in force and the display is proven to engage HDR
+    /// for them. `switchRequested`: the write asked for a switch that has not been seen to end.
+    nonisolated static func plannedPanelRouting(
+        hostAsserts: Bool,
+        provenForWrite: Bool,
+        attemptWhenUnproven: Bool,
+        displayEligibleForHDR: Bool,
+        panelRefusedHDRMaster: Bool,
+        switchRequested: Bool
+    ) -> PlannedPanelRouting {
+        let presents = hostAsserts || provenForWrite
+        if sessionRoutesAsHDRPanel(panelPresentsHDR: presents, attemptWhenUnproven: attemptWhenUnproven,
+                                   displayEligibleForHDR: displayEligibleForHDR,
+                                   panelRefusedHDRMaster: panelRefusedHDRMaster) {
+            return .decided(routesAsHDR: true, waitsForSwitchEnd: unprovenMasterAwaitsSwitchEnd(
+                routesAsHDR: true, panelPresentsHDR: presents, switchRunning: switchRequested))
+        }
+        if !displayEligibleForHDR || panelRefusedHDRMaster {
+            return .decided(routesAsHDR: false, waitsForSwitchEnd: false)
+        }
+        return .atSettledPanel
+    }
+
     /// AE#541: the HDR route of an in-place rebuild, composed from the same two decisions the load makes.
     ///
     /// The readout and the display's eligibility are the load's, because the rebuild runs no handshake to

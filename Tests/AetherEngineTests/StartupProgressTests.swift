@@ -77,9 +77,9 @@ struct StartupProgressTests {
         #expect(begin().stage == .connecting)
         #expect(StartupProgress(generation: 1, checkpoint: .sourceOpened).stage == .openingContainer)
         #expect(StartupProgress(generation: 1, checkpoint: .containerOpened).stage == .analyzingStreams)
-        #expect(StartupProgress(generation: 1, checkpoint: .streamsProbed).stage == .preparingDisplay)
-        #expect(StartupProgress(generation: 1, checkpoint: .displayPrepared).stage == .selectingRoute)
-        #expect(StartupProgress(generation: 1, checkpoint: .routed).stage == .buildingSession)
+        #expect(StartupProgress(generation: 1, checkpoint: .streamsProbed).stage == .selectingRoute)
+        #expect(StartupProgress(generation: 1, checkpoint: .routed).stage == .preparingDisplay)
+        #expect(StartupProgress(generation: 1, checkpoint: .displayPrepared).stage == .buildingSession)
         #expect(StartupProgress(generation: 1, checkpoint: .sessionConstructed).stage == .preparingPlayback)
         #expect(StartupProgress(generation: 1, checkpoint: .ready).stage == .awaitingFirstFrame)
         #expect(StartupProgress(generation: 1, checkpoint: .presenting).stage == .presenting)
@@ -89,7 +89,7 @@ struct StartupProgressTests {
     func ladderOrder() {
         #expect(StartupCheckpoint.allCases == [
             .dispatched, .sourceOpened, .containerOpened, .streamsProbed,
-            .displayPrepared, .routed, .sessionConstructed, .ready, .presenting,
+            .routed, .displayPrepared, .sessionConstructed, .ready, .presenting,
         ])
         #expect(StartupCheckpoint.dispatched < StartupCheckpoint.presenting)
     }

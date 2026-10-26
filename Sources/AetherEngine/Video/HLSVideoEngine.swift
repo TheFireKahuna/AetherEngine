@@ -75,6 +75,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Whether the panel was already in HDR at load time (`currentEDRHeadroom > 1`). When true,
     /// master-playlist routing is safe regardless of `matchContentEnabled` (AetherEngine#4).
     private let panelIsInHDRMode: Bool
+    /// The load's panel answer when its startup plan decided it before the display switch: the session is
+    /// prepared for the playlist it implies (`plannedServesMaster`) and `serve(panelIsInHDRMode:)` serves it.
+    /// nil leaves the answer to `serve(panelIsInHDRMode:)`, from the settled panel.
+    var plannedPanelIsInHDRMode: Bool?
+    /// The playlist `serve(panelIsInHDRMode:)` will hand AVPlayer, known from `prepare()` on when the load
+    /// planned the panel answer: true for the master, false for the media playlist, nil until `serve`.
+    private(set) var plannedServesMaster: Bool?
 
     /// `dvModeAvailable || keepDvh1TagWithoutDV`; DV routing branches key off this.
     var effectiveDvMode: Bool { dvModeAvailable || keepDvh1TagWithoutDV }
@@ -2497,6 +2504,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
             subtitlePacketStore.noteHarvestAnchor(
                 at: Double(plan[openIndex].startPts) * Double(tb.num) / Double(tb.den))
         }
+        if let planned = plannedPanelIsInHDRMode {
+            plannedServesMaster = playlistDecision(
+                codecpar: codecpar, demuxer: dem, frameRate: frameRate, servedAudioLanguage: servedAudioLanguage,
+                servedAudioIsAtmosStreamCopy: servedAudioIsAtmosStreamCopy, videoRange: videoRange,
+                panelIsInHDRMode: planned).useMaster
+        }
         prod.start()
         preparedServe = PreparedServe(
             codecpar: codecpar, demuxer: dem, plan: plan, segmentCache: segmentCache, server: srv,
@@ -2545,8 +2558,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // the standard sourceIsHDR && panelReadyForHDR check routes them correctly.
         // #15: a SUBTITLES rendition lives only in a master; the pure decision below forces the
         // master for routing-safe subtitled sources so PiP can show subtitles.
-        let stillsAvailable = FrameDecodeContext.yieldsStill(
-            dolbyVisionNoBaseLayer: FrameDecodeContext.isDVNoBaseLayer(codecpar: codecpar))
+        // The load's planned answer wins over a later one: the session was prepared for it (`plannedServesMaster`).
+        let panelIsInHDRMode = plannedPanelIsInHDRMode ?? panelIsInHDRMode
+        let decision = playlistDecision(codecpar: codecpar, demuxer: dem, frameRate: frameRate,
+                                        servedAudioLanguage: servedAudioLanguage,
+                                        servedAudioIsAtmosStreamCopy: servedAudioIsAtmosStreamCopy,
+                                        videoRange: videoRange, panelIsInHDRMode: panelIsInHDRMode)
+        let stillsAvailable = decision.stillsAvailable
         yieldsStills = stillsAvailable
         previewNeedsCompositor = FrameDecodeContext.isDVNoBaseLayer(codecpar: codecpar)
         if !stillsAvailable {
@@ -2554,19 +2572,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                            + "(DolbyVisionStillReshaping trait off): no scrub thumbnails or I-frame stills; "
                            + "scrub previews and the held picture go through the system compositor", category: .session)
         }
-        // AE#682: decided before the routing below, because an I-frame rendition is one of the
-        // reasons to serve a master at all.
-        let iFrameCandidate = IFrameRenditionEligibility.candidate(.init(
-            requested: iFramePlaylistRequested,
-            isLive: isLiveSession,
-            planBoundariesClaimRandomAccess: planBoundariesClaimRandomAccess,
-            seeksToTimeWithoutIndex: dem.seeksToTimeWithoutIndex,
-            sequentialOrigin: sequentialOrigin,
-            heldSourceConnection: openProfile.avioHeldConnection,
-            originIsSerial: sourceReopenableByURL
-                && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
-            secondReaderAvailable: sourceReopenableByURL || customKeyframeReader != nil,
-            stillsUnavailable: !stillsAvailable))
+        let iFrameCandidate = decision.iFrameCandidate
         // A scrub still past the resident window reads off the source by the same rule, whether or not the
         // rendition was asked for.
         if case .served(let timeline) = IFrameRenditionEligibility.candidate(.init(
@@ -2597,25 +2603,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
             originIsSerial: sourceReopenableByURL
                 && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
             secondReaderAvailable: sourceReopenableByURL)) == .served(.keyframes)
-        let hasNativeSubs = enableNativeSubtitleTrackForSession && !nativeSubtitleCueStoresForSession.isEmpty
-        // AE#187: tvOS HW HEVC needs the codec advertised in a master's CODECS attribute; a bare media
-        // playlist (H.264 is fine media-direct) fails the item with tracks count=0 / -12848. Scope to
-        // tvOS: iOS/macOS build the HEVC track from the init hvcC media-direct and are left unperturbed.
-        #if os(tvOS)
-        let videoCodecNeedsMasterSignaling = codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
-        #else
-        let videoCodecNeedsMasterSignaling = false
-        #endif
-        let useMasterPlaylist = AetherEngine.forceMasterPlaylistForTesting
-            || Self.resolveUseMasterPlaylist(
-            videoRange: videoRange, effectiveDvMode: effectiveDvMode,
-            panelIsInHDRMode: panelIsInHDRMode, displaySupportsHDR: displaySupportsHDR,
-            hasNativeSubs: hasNativeSubs,
-            builtInPanelEngagesOnDemand: Self.builtInPanelEngagesOnDemand,
-            frameRateKnown: frameRate != nil,
-            videoCodecNeedsMasterSignaling: videoCodecNeedsMasterSignaling,
-            hasAudioRendition: servedAudioLanguage != nil || servedAudioIsAtmosStreamCopy,
-            hasIFrameRendition: iFrameCandidate.isServed)
+        let useMasterPlaylist = decision.useMaster
+        if let planned = plannedServesMaster, planned != useMasterPlaylist {
+            EngineLog.emit("[HLSVideoEngine] planned playlist (\(planned ? "master" : "media")) differs from the "
+                           + "one served (\(useMasterPlaylist ? "master" : "media"))", category: .session)
+        }
         let resolvedURL: URL? = useMasterPlaylist
             ? srv.playlistURL
             : srv.mediaPlaylistURL
@@ -2647,6 +2639,52 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.servedDolbyVisionConversion = convertP7ToProfile81 ? .profile7ToProfile81 : nil
         EngineLog.emit("[HLSVideoEngine] serving on \(url.absoluteString) (dvModeAvailable=\(dvModeAvailable) effectiveDvMode=\(effectiveDvMode) panelIsHDR=\(panelIsInHDRMode) displaySupportsHDR=\(displaySupportsHDR) matchContent=\(matchContentEnabled) sourceIsHDR=\(videoRange != .sdr || effectiveDvMode) useMaster=\(useMasterPlaylist) videoRange=\(videoRange) dvVariant=\(dvVariant) audioLang=\(servedAudioLanguage ?? "none"))")
         return url
+    }
+
+    /// Which playlist AVPlayer is handed, from facts `prepare()` already has and the panel answer.
+    ///
+    /// Side-effect free, so `prepare()` can ask it for a load that decided the panel answer before the display
+    /// switch (`plannedPanelIsInHDRMode`) and `serve(panelIsInHDRMode:)` asks it again with the same inputs.
+    private func playlistDecision(
+        codecpar: UnsafeMutablePointer<AVCodecParameters>, demuxer dem: Demuxer, frameRate: Double?,
+        servedAudioLanguage: String?, servedAudioIsAtmosStreamCopy: Bool, videoRange: HLSVideoRange,
+        panelIsInHDRMode: Bool
+    ) -> (useMaster: Bool, iFrameCandidate: IFrameRenditionEligibility.Verdict, stillsAvailable: Bool) {
+        let stillsAvailable = FrameDecodeContext.yieldsStill(
+            dolbyVisionNoBaseLayer: FrameDecodeContext.isDVNoBaseLayer(codecpar: codecpar))
+        // AE#682: decided before the routing below, because an I-frame rendition is one of the
+        // reasons to serve a master at all.
+        let iFrameCandidate = IFrameRenditionEligibility.candidate(.init(
+            requested: iFramePlaylistRequested,
+            isLive: isLiveSession,
+            planBoundariesClaimRandomAccess: planBoundariesClaimRandomAccess,
+            seeksToTimeWithoutIndex: dem.seeksToTimeWithoutIndex,
+            sequentialOrigin: sequentialOrigin,
+            heldSourceConnection: openProfile.avioHeldConnection,
+            originIsSerial: sourceReopenableByURL
+                && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
+            secondReaderAvailable: sourceReopenableByURL || customKeyframeReader != nil,
+            stillsUnavailable: !stillsAvailable))
+        let hasNativeSubs = enableNativeSubtitleTrackForSession && !nativeSubtitleCueStoresForSession.isEmpty
+        // AE#187: tvOS HW HEVC needs the codec advertised in a master's CODECS attribute; a bare media
+        // playlist (H.264 is fine media-direct) fails the item with tracks count=0 / -12848. Scope to
+        // tvOS: iOS/macOS build the HEVC track from the init hvcC media-direct and are left unperturbed.
+        #if os(tvOS)
+        let videoCodecNeedsMasterSignaling = codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
+        #else
+        let videoCodecNeedsMasterSignaling = false
+        #endif
+        let useMaster = AetherEngine.forceMasterPlaylistForTesting
+            || Self.resolveUseMasterPlaylist(
+            videoRange: videoRange, effectiveDvMode: effectiveDvMode,
+            panelIsInHDRMode: panelIsInHDRMode, displaySupportsHDR: displaySupportsHDR,
+            hasNativeSubs: hasNativeSubs,
+            builtInPanelEngagesOnDemand: Self.builtInPanelEngagesOnDemand,
+            frameRateKnown: frameRate != nil,
+            videoCodecNeedsMasterSignaling: videoCodecNeedsMasterSignaling,
+            hasAudioRendition: servedAudioLanguage != nil || servedAudioIsAtmosStreamCopy,
+            hasIFrameRendition: iFrameCandidate.isServed)
+        return (useMaster, iFrameCandidate, stillsAvailable)
     }
 
     /// Built-in panels that engage EDR on demand once HDR content renders; the tvOS SDR-parked-
