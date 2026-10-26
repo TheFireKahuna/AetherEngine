@@ -27,10 +27,14 @@ final class GPUSubmitter: @unchecked Sendable {
 
     init?(device: MTLDevice, label: String) {
         self.device = device
+        #if !targetEnvironment(simulator)
         if #available(macOS 26, iOS 26, tvOS 26, visionOS 26, *), device.supportsFamily(.metal4),
            let backend = Metal4Backend(device: device, label: label) {
             self.backend = backend
-        } else if let backend = Metal3Backend(device: device, label: label) {
+            return
+        }
+        #endif
+        if let backend = Metal3Backend(device: device, label: label) {
             self.backend = backend
         } else {
             return nil
@@ -174,6 +178,8 @@ private final class Uploads {
 
 // MARK: - Metal 4
 
+// The simulators' SDKs have no Metal 4.
+#if !targetEnvironment(simulator)
 @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
 private final class Metal4Backend: GPUBackend, @unchecked Sendable {
     let api = "Metal 4"
@@ -388,6 +394,7 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
         }
     }
 }
+#endif
 
 // MARK: - Metal 3
 
