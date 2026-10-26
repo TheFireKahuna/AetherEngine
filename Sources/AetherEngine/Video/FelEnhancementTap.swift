@@ -123,10 +123,13 @@ final class FelEnhancementTap: @unchecked Sendable {
     /// Where the decode works toward, in item seconds.
     var clockSeconds: Double { units.clockSeconds }
 
-    var held: (accessUnits: Int, decoded: Int) {
+    var held: (accessUnits: Int, decoded: Int, bytes: Int) {
         let held = units.held
-        return (held.units, held.decoded)
+        return (held.units, held.decoded, held.bytes)
     }
+
+    /// Whether the producer may cut another unit (``OverlayPacketTap/hasRoomAhead``).
+    var hasRoomAhead: Bool { units.hasRoomAhead }
 }
 
 /// The enhancement layer's VideoToolbox decoder, opened from the parameter sets of the first unit it is given.

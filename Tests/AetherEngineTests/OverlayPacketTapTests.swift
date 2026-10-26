@@ -174,3 +174,94 @@ struct OverlayPacketTapTests {
         #expect(Self.waitUntil(5) { tap.picture(atOrBefore: 13)?.seconds == 11.96 })
     }
 }
+
+/// What the tap keeps of a unit, and how much of it: the packet on disk, read back as it was cut, and the producer held
+/// once the tap is full rather than units ahead of the clock dropped.
+@Suite("Overlay packet tap storage")
+struct OverlayPacketTapStorageTests {
+
+    /// Records every packet it is fed: its timing, bytes and side data.
+    final class RecordingDecoder: OverlayTapDecoder, @unchecked Sendable {
+        struct Fed: Equatable { let pts: Int64; let dts: Int64; let duration: Int64; let flags: Int32; let bytes: [UInt8]; let side: [UInt8] }
+        let deliver: @Sendable (CVPixelBuffer, CMTime) -> Void
+        let picture: CVPixelBuffer
+        private let lock = NSLock()
+        private var _fed: [Fed] = []
+        var fed: [Fed] { lock.withLock { _fed } }
+
+        init(deliver: @escaping @Sendable (CVPixelBuffer, CMTime) -> Void) {
+            self.deliver = deliver
+            var buffer: CVPixelBuffer?
+            CVPixelBufferCreate(kCFAllocatorDefault, 16, 16, kCVPixelFormatType_32BGRA, nil, &buffer)
+            picture = buffer!
+        }
+
+        func decode(_ packet: UnsafeMutablePointer<AVPacket>, restarting: Bool, clock: Double, timeBase: AVRational) {
+            let p = packet.pointee
+            var sideSize = 0
+            let side = av_packet_get_side_data(packet, AV_PKT_DATA_DOVI_CONF, &sideSize)
+            lock.withLock {
+                _fed.append(Fed(pts: p.pts, dts: p.dts, duration: p.duration, flags: p.flags,
+                                bytes: Array(UnsafeBufferPointer(start: p.data, count: Int(p.size))),
+                                side: side.map { Array(UnsafeBufferPointer(start: $0, count: sideSize)) } ?? []))
+            }
+            deliver(picture, CMTime(value: p.pts, timescale: timeBase.den))
+        }
+
+        func close() {}
+    }
+
+    @Test("a unit is decoded from disk exactly as it was cut, side data included")
+    func unitRoundTrips() {
+        var decoder: RecordingDecoder?
+        let tap = OverlayPacketTap<Int>(decodeAheadSeconds: 0.2) { deliver in
+            let d = RecordingDecoder(deliver: deliver)
+            decoder = d
+            return d
+        }
+        defer { tap.close() }
+        let payload: [UInt8] = (0..<70_000).map { UInt8(truncatingIfNeeded: $0 &* 31) }
+        let side: [UInt8] = [1, 0, 10, 0x35, 0x77]
+        let packet = av_packet_alloc()!
+        _ = av_new_packet(packet, Int32(payload.count))
+        payload.withUnsafeBufferPointer { packet.pointee.data.update(from: $0.baseAddress!, count: $0.count) }
+        packet.pointee.pts = 0
+        packet.pointee.dts = -40
+        packet.pointee.duration = 40
+        packet.pointee.flags = AV_PKT_FLAG_KEY
+        let target = av_packet_new_side_data(packet, AV_PKT_DATA_DOVI_CONF, side.count)!
+        side.withUnsafeBufferPointer { target.update(from: $0.baseAddress!, count: $0.count) }
+        _ = tap.beginsRun(dts: -40)
+        tap.insert(pts: 0, timeBase: OverlayPacketTapTests.tb, isKey: true, info: 0, packet: packet)
+        tap.advance(to: 0)
+
+        #expect(OverlayPacketTapTests.waitUntil(2) { decoder?.fed.count == 1 })
+        #expect(decoder?.fed.first == RecordingDecoder.Fed(pts: 0, dts: -40, duration: 40, flags: AV_PKT_FLAG_KEY,
+                                                            bytes: payload, side: side))
+        #expect(tap.held.bytes > payload.count)
+    }
+
+    @Test("a full tap holds the producer and keeps every unit ahead of the clock; the clock moving on makes room")
+    func fullTapHoldsTheProducer() {
+        let (tap, _) = OverlayPacketTapTests.makeTap(seconds: 0, gop: 2)
+        defer { tap.close() }
+        let units = OverlayPacketTap<Int>.maxEntries
+        for i in 0..<(units + 100) {
+            let pts = Int64(i * 40)
+            let packet = av_packet_alloc()!
+            _ = av_new_packet(packet, 4)
+            packet.pointee.pts = pts
+            packet.pointee.dts = pts
+            _ = tap.beginsRun(dts: pts)
+            tap.insert(pts: pts, timeBase: OverlayPacketTapTests.tb, isKey: i % 50 == 0, info: i, packet: packet)
+        }
+        // Past its ceiling the producer is owed no more room, but nothing it already cut ahead is dropped.
+        #expect(tap.hasRoomAhead == false)
+        #expect(tap.held.units == units + 100)
+        #expect(tap.unit(at: Double(units + 99) * 0.04) != nil)
+        // The clock passing the first units by more than the minute kept behind drops them, which makes room.
+        tap.advance(to: OverlayPacketTap<Int>.keepBehindSeconds + 10)
+        #expect(tap.hasRoomAhead)
+        #expect(tap.unit(at: 0) == nil)
+    }
+}

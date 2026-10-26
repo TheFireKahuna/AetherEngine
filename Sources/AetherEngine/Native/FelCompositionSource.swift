@@ -91,7 +91,7 @@ final class FelCompositionSource: OverlayFrameSource, @unchecked Sendable {
 
     func logSummary() -> String {
         let held = tap.held
-        return "residual off \(residualOff), held \(held.accessUnits) units / \(held.decoded) decoded"
+        return "residual off \(residualOff), held \(held.accessUnits) units (\(held.bytes >> 20) MB on disk) / \(held.decoded) decoded"
     }
 
     /// An enhancement-sized picture the kernels can bind when the residual is off; its content is never read.

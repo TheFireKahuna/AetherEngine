@@ -2388,7 +2388,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Returns true on release, false when stop was requested.
     private func awaitPrefetchDiskBudgetRelease(head: Int, context: String,
                                                 detectWedge: Bool = false) -> Bool {
-        guard prefetchDiskBudgetBytes > 0 else { return true }
+        guard prefetchDiskBudgetBytes > 0 || holdsOverlayRunStart else { return true }
         var parked = 0
         var nextLogAt = Self.prefetchDiskParkLogThresholdSeconds
         // AE#528: same wakeup-is-not-a-second correction as the advance park; this loop's own doc
@@ -2404,6 +2404,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         while !checkShouldStop() {
             if cache.awaitPrefetchDiskHeadroom(head: head,
                                                budgetBytes: prefetchDiskBudgetBytes,
+                                               overlay: overlayTapHolding,
                                                timeout: 1.0) {
                 if parked >= Self.prefetchDiskParkLogThresholdSeconds {
                     EngineLog.emit(
@@ -2423,8 +2424,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 EngineLog.emit(
                     "[HLSSegmentProducer] #207 prefetch disk PARK (\(context)) head=\(head) "
                     + "cacheTarget=\(cache.targetIndex) forward=\(cache.forwardBytes / (1 << 20)) MiB "
-                    + "budget=\(prefetchDiskBudgetBytes / (1 << 20)) MiB parked=\(parked)s "
-                    + "(opt-in prefetch full; resumes as playback advances)",
+                    + "overlay=\(overlayTapHolding().bytes / (1 << 20)) MiB"
+                    + (overlayTapHolding().full ? " (tap full)" : "")
+                    + " budget=\(prefetchDiskBudgetBytes / (1 << 20)) MiB parked=\(parked)s "
+                    + "(the session's read-ahead is full; resumes as playback advances)",
                     category: .session
                 )
             }
@@ -2446,6 +2449,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
             }
         }
         return false
+    }
+
+    /// What the overlay's tap keeps for the units cut (``PrefetchDiskBudget``): its bytes on disk, and whether it is
+    /// full.
+    private func overlayTapHolding() -> (bytes: Int, full: Bool) {
+        #if DualLayerDolbyVision
+        if let felTap { return (felTap.held.bytes, !felTap.hasRoomAhead) }
+        #endif
+        if let overlayDecodeTap { return (overlayDecodeTap.held.bytes, !overlayDecodeTap.hasRoomAhead) }
+        return (0, false)
     }
 
     private func markBackpressureWedgeBroken() {

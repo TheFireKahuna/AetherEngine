@@ -564,6 +564,43 @@ In order, each step replacing a reader rather than adding one:
      store's frontier, `Issue416` with one writer. The walk's own suites are deleted with it.
    - **Logs.** `[SubtitleSource] the pump reads ahead for [...]`, `... read-ahead lapsed (reason=...)`,
      and `subReadAhead=270s subRead=41.2s` in the memprobe line.
+   - **What reading ahead may cost.** Reading ahead for subtitles means cutting ahead: the pump is the one
+     reader, so every segment it reads past AVPlayer's window it also cuts, with the audio bridge's decode,
+     render and encode, and with what an overlay keeps for each unit. That is the design (one reader, no
+     second fetch, nothing cut ahead wasted), and three rules keep its cost bounded and away from the
+     picture. Found on the Apple TV (2026-10-26): a Dolby Vision FEL title without subtitle Cues, its
+     forced PGS track followed after a 10 s skip, had the pump read to the end of the title. Its lead went
+     from 44 s to over 220 s and climbing, the FEL tap filled its 6000 units (about 85 KB each in memory),
+     malloc rose 370 MB, tvOS compressed the app's memory from 280 to 820 MB, and the overlay's refresh
+     stalled 90 to 170 ms several times every 10 s.
+     1. **A consumer follows the player's requests only so far.** A native rendition's and the OCR's lead
+        follow the furthest window AVKit has asked for, because AVKit reads a rendition about four minutes
+        past the video it has buffered. An empty window is answered without waiting, and AVKit then asks
+        for the next one at once, so a run of empty answers carries its requests to the end of the title.
+        The lead follows them to `subtitleReadAheadCeilingSeconds` (360 s: AVKit's reach in steady state
+        plus the 30 s margin) and no further. A request past it is for a window already answered, which
+        AVKit never asks for again, so reading toward it fills nothing. Test: `MatroskaCueIndexTests`
+        (`demandLeadCeiling`).
+     2. **What an overlay keeps for a unit is on disk, and its bound holds the producer.** The overlay's
+        tap (`OverlayPacketTap`: the FEL enhancement layer and its composer parameters, or a software
+        overlay's whole source packets) keeps every unit cut until the clock is a minute past it. Each
+        unit's packet is written once when it is cut (`SpilledPackets`: chunk files unlinked as they are
+        opened, a chunk's space back once no unit kept in it is) and read back on the decode thread
+        just before it is decoded; only the composer parameters stay in memory, a few KB a FEL unit.
+        The producer parks while the tap is full (12000 units, a minute behind and about seven ahead at
+        24p) or while the tap's bytes and the segments' together reach the session's retention budget
+        (`PrefetchDiskBudget`), never inside the ten segments AVPlayer is owed. So the tap never drops a
+        unit ahead of the clock that the producer will not cut again (before this, a full tap dropped the
+        units furthest from the clock, which were the ones ahead). Tests: `OverlayPacketTapStorageTests`,
+        `PrefetchDiskBudgetDecisionTests`.
+     3. **The work ahead runs below the picture.** The pump drops to utility QoS once it is comfortably
+        ahead of AVPlayer (`retunePumpQoS`), and the audio runs it cuts run on it; the overlay's render
+        queue is user-interactive. On the session above the pump had been at utility from 6 s in, so the
+        stalls came from memory pressure, not CPU, and rule 2 is their fix. There is no rate limit on the
+        pump: none has been measured to be needed.
+     **Check on device:** the scenario above (FEL, forced PGS on a file without subtitle Cues, a skip, a
+     few minutes): the producer's `#65 ledger` lead stays at the subtitle lead, `held N units (M MB on
+     disk)` stays under 12000, `mallocMB` flat, `stale refreshes` flat.
 
 When layer 3 is done the readers of a playing source are the pump, exact index reads, and nothing
 else; the ledger's per-reader lines should show exactly that.
