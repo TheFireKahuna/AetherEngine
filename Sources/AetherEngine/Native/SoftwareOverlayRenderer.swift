@@ -108,7 +108,10 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
 
     private let output: AVPlayerItemVideoOutput
     private weak var item: AVPlayerItem?
-    private let queue = DispatchQueue(label: "aether.software-overlay", qos: .userInteractive)
+    /// The render queue. It runs at every display refresh and rarely idles, so it drains an autorelease pool per block:
+    /// what a block's Objective-C calls autorelease (the output's frames, the renderer's enqueue, a composition's
+    /// command buffers) goes with the block, not when the queue's thread next idles.
+    private let queue = DispatchQueue(label: "aether.software-overlay", qos: .userInteractive, autoreleaseFrequency: .workItem)
     private var displayLink: OverlayDisplayLink?
     private var outputDelegate: OverlayOutputDelegate?
     private var lastNewFrame = CACurrentMediaTime()
