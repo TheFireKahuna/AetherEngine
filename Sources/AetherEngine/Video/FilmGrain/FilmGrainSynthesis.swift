@@ -111,6 +111,11 @@ struct FilmGrainParameters: Hashable, Sendable {
         clipToRestrictedRange = a.limit_output_range != 0
     }
 
+    /// The planes that take grain: luma with scaling points, chroma with its own or luma's.
+    var activeY: Bool { !yPoints.isEmpty }
+    var activeCb: Bool { !monochrome && (chromaScalingFromLuma || !cbPoints.isEmpty) }
+    var activeCr: Bool { !monochrome && (chromaScalingFromLuma || !crPoints.isEmpty) }
+
     /// Whether the shader takes these planes: planar, one plane per component, at 8, 10 or 12 bits, as libdav1d writes
     /// every AV1 picture.
     static func supports(_ format: AVPixelFormat) -> Bool {
@@ -126,9 +131,10 @@ struct FilmGrainParameters: Hashable, Sendable {
     }
 }
 
-/// The per-frame tables, laid out as `FilmGrainShaderSource` reads them. Everything here is serial by nature (one LFSR
-/// stream, a causal auto-regressive filter) and small: about 6,000 template samples a plane, a 2^BitDepth-entry table
-/// per plane, one byte per 32 x 32 block.
+/// The per-frame tables, laid out as `FilmGrainShaderSource` reads them: a header the CPU writes, and the templates,
+/// scaling tables and block offsets the GPU synthesises in the frame's own batch (`fg_synthesize`). AV1's generator is
+/// serial (one LFSR stream, a causal auto-regressive filter), and the GPU takes it exactly: each draw's LFSR state
+/// jumped to directly (``jumpColumns``), the filter run as a wavefront, the tables in closed form.
 enum FilmGrainSynthesis {
     static let templateWidth = 82
     static let templateHeight = 73
@@ -159,15 +165,13 @@ enum FilmGrainSynthesis {
         offsetsOffset + max(1, blocks(width) * blocks(height))
     }
 
-    /// Writes the tables for one `width` x `height` frame of `p` at `buffer`, which holds `bufferLength(width:height:)`
-    /// bytes.
-    static func write(_ p: FilmGrainParameters, width: Int, height: Int, into buffer: UnsafeMutableRawPointer) {
+    /// Writes the header of one `width` x `height` frame of `p` at `buffer`, which holds `bufferLength(width:height:)`
+    /// bytes; the templates, the scaling tables and the block offsets are the GPU's (`fg_synthesize`, from
+    /// ``synthesisArguments(_:width:height:)``).
+    static func writeHeader(_ p: FilmGrainParameters, width: Int, height: Int, into buffer: UnsafeMutableRawPointer) {
         let header = buffer.bindMemory(to: Int32.self, capacity: headerWords)
         header.update(repeating: 0, count: headerWords)
         let depthMinus8 = p.bitDepth - 8
-        let activeY = !p.yPoints.isEmpty
-        let activeCb = !p.monochrome && (p.chromaScalingFromLuma || !p.cbPoints.isEmpty)
-        let activeCr = !p.monochrome && (p.chromaScalingFromLuma || !p.crPoints.isEmpty)
         func set(_ word: Header, _ value: Int) { header[word.rawValue] = Int32(value) }
         set(.scalingShift, p.scalingShift)
         set(.minValue, p.clipToRestrictedRange ? 16 << depthMinus8 : 0)
@@ -175,9 +179,9 @@ enum FilmGrainSynthesis {
         set(.maxChroma, p.clipToRestrictedRange ? (p.identityMatrix ? 235 : 240) << depthMinus8 : (256 << depthMinus8) - 1)
         set(.overlap, p.overlap ? 1 : 0)
         set(.chromaScalingFromLuma, p.chromaScalingFromLuma ? 1 : 0)
-        set(.activeY, activeY ? 1 : 0)
-        set(.activeCb, activeCb ? 1 : 0)
-        set(.activeCr, activeCr ? 1 : 0)
+        set(.activeY, p.activeY ? 1 : 0)
+        set(.activeCb, p.activeCb ? 1 : 0)
+        set(.activeCr, p.activeCr ? 1 : 0)
         set(.cbMult, p.cbMult)
         set(.crMult, p.crMult)
         set(.cbLumaMult, p.cbLumaMult)
@@ -186,167 +190,47 @@ enum FilmGrainSynthesis {
         set(.crOffset, p.crOffset)
         set(.blockColumns, blocks(width))
         set(.bitDepthMinus8, depthMinus8)
+    }
 
-        let templates = UnsafeMutableBufferPointer(
-            start: (buffer + templatesOffset).bindMemory(to: Int16.self, capacity: 3 * templateWidth * templateHeight),
-            count: 3 * templateWidth * templateHeight)
-        let plane = templateWidth * templateHeight
-        let luma = UnsafeMutableBufferPointer(rebasing: templates[0..<plane])
-        generateLuma(p, into: luma)
-        if activeCb { generateChroma(p, cr: false, luma: UnsafeBufferPointer(luma), into: UnsafeMutableBufferPointer(rebasing: templates[plane..<2 * plane])) }
-        if activeCr { generateChroma(p, cr: true, luma: UnsafeBufferPointer(luma), into: UnsafeMutableBufferPointer(rebasing: templates[2 * plane..<3 * plane])) }
-
-        let scaling = (buffer + scalingOffset).bindMemory(to: UInt8.self, capacity: 3 * scalingStride)
-        // Chroma scaled from luma reads luma's table, which is all 0 with no luma points: chroma is still clipped.
-        if activeY || p.chromaScalingFromLuma { generateScaling(p.yPoints, bitDepth: p.bitDepth, into: scaling) }
-        if !p.cbPoints.isEmpty { generateScaling(p.cbPoints, bitDepth: p.bitDepth, into: scaling + scalingStride) }
-        if !p.crPoints.isEmpty { generateScaling(p.crPoints, bitDepth: p.bitDepth, into: scaling + 2 * scalingStride) }
-
-        writeOffsets(seed: p.seed, width: width, height: height,
-                     into: (buffer + offsetsOffset).bindMemory(to: UInt8.self, capacity: blocks(width) * blocks(height)))
+    /// `fg_synthesize`'s argument (FGParams in the shader) for one `width` x `height` frame of `p`.
+    static func synthesisArguments(_ p: FilmGrainParameters, width: Int, height: Int) -> [UInt8] {
+        var bytes: [UInt8] = []
+        func words(_ values: [Int]) { for v in values { withUnsafeBytes(of: UInt32(truncatingIfNeeded: v)) { bytes += $0 } } }
+        func padded(_ values: [UInt8], _ count: Int) { bytes += values + Array(repeating: 0, count: count - values.count) }
+        words([Int(p.seed), p.bitDepth, 4 - (p.bitDepth - 8) + p.grainScaleShift, p.arCoeffLag, p.arCoeffShift,
+               p.subsamplingX, p.subsamplingY, p.yPoints.count / 2, p.cbPoints.count / 2, p.crPoints.count / 2,
+               p.chromaScalingFromLuma ? 1 : 0, p.activeY ? 1 : 0, p.activeCb ? 1 : 0, p.activeCr ? 1 : 0,
+               blocks(width), blocks(height)])
+        padded(p.yPoints, 28)
+        padded(p.cbPoints, 20)
+        padded(p.crPoints, 20)
+        padded(p.arCoeffsY.map { UInt8(bitPattern: $0) }, 24)
+        padded(p.arCoeffsCb.map { UInt8(bitPattern: $0) }, 25)
+        padded(p.arCoeffsCr.map { UInt8(bitPattern: $0) }, 25)
+        while bytes.count % 4 != 0 { bytes.append(0) }
+        return bytes
     }
 
     // MARK: - Random numbers (7.18.3.2)
 
-    /// The 16-bit LFSR.
-    struct Random {
-        var state: UInt32
-
-        init(_ seed: UInt32) { state = seed }
-
-        @inline(__always)
-        mutating func next(_ bits: Int) -> Int {
-            let r = state
+    /// The 16-bit LFSR's step, a linear map over GF(2): draw n's state is its n-th power applied to the seed. Columns of
+    /// the step's 2^j-th powers, j = 0 ... 12 (a template's 5,986 draws), for the shader's jumps (`fg_jump`): column b
+    /// is the state bit b alone becomes.
+    static let jumpColumns: [[UInt16]] = {
+        func step(_ r: UInt32) -> UInt32 {
             let bit = (r ^ (r >> 1) ^ (r >> 3) ^ (r >> 12)) & 1
-            state = (r >> 1) | (bit << 15)
-            return Int((state >> UInt32(16 - bits)) & ((1 << UInt32(bits)) - 1))
+            return (r >> 1) | (bit << 15)
         }
-    }
-
-    @inline(__always)
-    static func round2(_ x: Int, _ shift: Int) -> Int { (x + ((1 << shift) >> 1)) >> shift }
-
-    // MARK: - Grain templates (7.18.3.3)
-
-    static func generateLuma(_ p: FilmGrainParameters, into buf: UnsafeMutableBufferPointer<Int16>) {
-        let w = templateWidth, h = templateHeight
-        // No luma points: luma takes no grain and chroma's auto-regression no luma term, so the template is never read.
-        guard !p.yPoints.isEmpty else { buf.update(repeating: 0); return }
-        var random = Random(UInt32(p.seed))
-        let shift = 4 - (p.bitDepth - 8) + p.grainScaleShift
-        for i in 0..<(w * h) { buf[i] = Int16(round2(Int(gaussianSequence[random.next(11)]), shift)) }
-        let (grainMin, grainMax) = grainRange(p.bitDepth)
-        let lag = p.arCoeffLag
-        let coefficients = p.arCoeffsY.map(Int.init)
-        for y in 3..<h {
-            for x in 3..<(w - 3) {
-                var sum = 0, k = 0
-                rows: for dy in -lag...0 {
-                    for dx in -lag...lag {
-                        if dy == 0 && dx == 0 { break rows }
-                        sum += coefficients[k] * Int(buf[(y + dy) * w + x + dx])
-                        k += 1
-                    }
-                }
-                buf[y * w + x] = Int16(clamp(Int(buf[y * w + x]) + round2(sum, p.arCoeffShift), grainMin, grainMax))
-            }
+        func apply(_ columns: [UInt16], _ v: UInt16) -> UInt16 {
+            var out: UInt16 = 0
+            for b in 0..<16 where v & (1 << b) != 0 { out ^= columns[b] }
+            return out
         }
-    }
-
-    static func generateChroma(_ p: FilmGrainParameters, cr: Bool, luma: UnsafeBufferPointer<Int16>,
-                               into buf: UnsafeMutableBufferPointer<Int16>) {
-        let stride = templateWidth
-        let w = p.subsamplingX != 0 ? subTemplateWidth : templateWidth
-        let h = p.subsamplingY != 0 ? subTemplateHeight : templateHeight
-        var random = Random(UInt32(p.seed) ^ (cr ? 0x49d8 : 0xb524))
-        let shift = 4 - (p.bitDepth - 8) + p.grainScaleShift
-        for y in 0..<h {
-            for x in 0..<w { buf[y * stride + x] = Int16(round2(Int(gaussianSequence[random.next(11)]), shift)) }
+        var powers: [[UInt16]] = [(0..<16).map { UInt16(step(UInt32(1) << $0)) }]
+        for _ in 1..<13 {
+            let m = powers.last!
+            powers.append(m.map { apply(m, $0) })
         }
-        let (grainMin, grainMax) = grainRange(p.bitDepth)
-        let lag = p.arCoeffLag
-        let coefficients = (cr ? p.arCoeffsCr : p.arCoeffsCb).map(Int.init)
-        let sx = p.subsamplingX, sy = p.subsamplingY
-        for y in 3..<h {
-            for x in 3..<(w - 3) {
-                var sum = 0, k = 0
-                rows: for dy in -lag...0 {
-                    for dx in -lag...lag {
-                        if dy == 0 && dx == 0 {
-                            // The current sample: the luma template's, averaged over the subsampling.
-                            guard !p.yPoints.isEmpty else { break rows }
-                            var l = 0
-                            let lumaX = ((x - 3) << sx) + 3, lumaY = ((y - 3) << sy) + 3
-                            for i in 0...sy { for j in 0...sx { l += Int(luma[(lumaY + i) * templateWidth + lumaX + j]) } }
-                            sum += round2(l, sx + sy) * coefficients[k]
-                            break rows
-                        }
-                        sum += coefficients[k] * Int(buf[(y + dy) * stride + x + dx])
-                        k += 1
-                    }
-                }
-                buf[y * stride + x] = Int16(clamp(Int(buf[y * stride + x]) + round2(sum, p.arCoeffShift), grainMin, grainMax))
-            }
-        }
-    }
-
-    static func grainRange(_ bitDepth: Int) -> (Int, Int) {
-        let centre = 128 << (bitDepth - 8)
-        return (-centre, centre - 1)
-    }
-
-    @inline(__always)
-    static func clamp(_ v: Int, _ lo: Int, _ hi: Int) -> Int { min(max(v, lo), hi) }
-
-    // MARK: - Scaling (7.18.3.4, and scale_lut of 7.18.3.5 expanded to every code)
-
-    /// The 2^bitDepth-entry table of the piecewise-linear scaling function through `points` ((value, scaling) pairs).
-    static func generateScaling(_ points: [UInt8], bitDepth: Int, into scaling: UnsafeMutablePointer<UInt8>) {
-        let shiftX = bitDepth - 8
-        let size = 1 << bitDepth
-        let count = points.count / 2
-        guard count > 0 else { scaling.update(repeating: 0, count: size); return }
-        func x(_ i: Int) -> Int { Int(points[2 * i]) }
-        func y(_ i: Int) -> Int { Int(points[2 * i + 1]) }
-        scaling.update(repeating: UInt8(y(0)), count: x(0) << shiftX)
-        for i in 0..<(count - 1) {
-            let bx = x(i), by = y(i), dx = x(i + 1) - bx, dy = y(i + 1) - by
-            // Divide first, then multiply (AV1 7.18.3.4).
-            let delta = dy * ((0x10000 + (dx >> 1)) / dx)
-            var d = 0x8000
-            for k in 0..<dx {
-                scaling[(bx + k) << shiftX] = UInt8(truncatingIfNeeded: by + (d >> 16))
-                d += delta
-            }
-        }
-        let last = x(count - 1) << shiftX
-        (scaling + last).update(repeating: UInt8(y(count - 1)), count: size - last)
-        guard shiftX > 0 else { return }
-        // Between two 8-bit entries, Round2( (end - start) * rem, BitDepth - 8 ) as scale_lut interpolates.
-        let pad = 1 << shiftX, rnd = pad >> 1
-        for i in 0..<(count - 1) {
-            let bx = x(i) << shiftX, dx = (x(i + 1) << shiftX) - bx
-            var k = 0
-            while k < dx {
-                let start = Int(scaling[bx + k]), range = Int(scaling[bx + k + pad]) - start
-                var r = rnd
-                for n in 1..<pad {
-                    r += range
-                    scaling[bx + k + n] = UInt8(truncatingIfNeeded: start + (r >> shiftX))
-                }
-                k += pad
-            }
-        }
-    }
-
-    // MARK: - Block offsets (7.18.3.5)
-
-    /// One 8-bit draw per 32 x 32 luma block, from an LFSR re-seeded every block row; all planes share it.
-    static func writeOffsets(seed: UInt16, width: Int, height: Int, into offsets: UnsafeMutablePointer<UInt8>) {
-        let columns = blocks(width)
-        for row in 0..<blocks(height) {
-            var random = Random(UInt32(seed) ^ (UInt32((row * 37 + 178) & 0xFF) << 8) ^ UInt32((row * 173 + 105) & 0xFF))
-            for column in 0..<columns { offsets[row * columns + column] = UInt8(random.next(8)) }
-        }
-    }
+        return powers
+    }()
 }

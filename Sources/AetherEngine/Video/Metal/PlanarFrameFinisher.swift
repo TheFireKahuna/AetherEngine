@@ -367,7 +367,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     /// Writes the `width` x `height` picture in `planes` into `buffer` (a bi-planar buffer of the plan's output
     /// format): ``finish(_:completion:)`` for one job.
     func finish(_ planes: Planes, plan: Plan, width: Int, height: Int, into buffer: CVPixelBuffer,
-                grain: FilmGrainParameters? = nil, completion: @escaping @Sendable (Bool) -> Void) {
+                grain: FilmGrainParameters? = nil, completion: @escaping @Sendable (_ failure: String?) -> Void) {
         finish([Job(source: .picture(planes), plan: plan, width: width, height: height, buffer: buffer, grain: grain)],
                completion: completion)
     }
@@ -466,16 +466,16 @@ final class PlanarFrameFinisher: @unchecked Sendable {
 
     // MARK: - Submission
 
-    /// Writes every job in one batch and calls `completion` once, with whether every job was written: from the GPU's
-    /// completion (on its queue, which must not be blocked: hand off), or on the caller's thread when a job cannot be
-    /// encoded. The deinterlacer's dispatches of all the fields run together, then, after one barrier, the finisher's
+    /// Writes every job in one batch and calls `completion` once, with nil when every job was written or why not: from
+    /// the GPU's completion (on its queue, which must not be blocked: hand off), or on the caller's thread when a job
+    /// cannot be encoded. The deinterlacer's dispatches of all the fields run together, then, after one barrier, the finisher's
     /// dispatches of all the jobs, the GPU filled by the work of both fields of a frame; a constant-luminance job, whose
     /// second and third dispatches read the first's list, comes last behind barriers of its own. Waits for a slot
     /// when ``slotCount`` submissions are in flight. The caller keeps the jobs' sources and buffers alive until
     /// `completion`.
-    func finish(_ jobs: [Job], completion: @escaping @Sendable (Bool) -> Void) {
-        guard !jobs.isEmpty else { return completion(true) }
-        if !finish(orderedAfterEarlierWork: false, { _ in (jobs, completion) }) { completion(false) }
+    func finish(_ jobs: [Job], completion: @escaping @Sendable (_ failure: String?) -> Void) {
+        guard !jobs.isEmpty else { return completion(nil) }
+        if !finish(orderedAfterEarlierWork: false, { _ in (jobs, completion) }) { completion("no batch could be made") }
     }
 
     /// ``finish(_:completion:)`` behind work of the caller's own: `encode` encodes into the batch's pass first (inverse
@@ -484,7 +484,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     /// from one batch to the next. False, with `encode` never called, when no batch could be made.
     @discardableResult
     func finish(orderedAfterEarlierWork: Bool,
-                _ encode: (ComputePass) -> (jobs: [Job], completion: @Sendable (Bool) -> Void)) -> Bool {
+                _ encode: (ComputePass) -> (jobs: [Job], completion: @Sendable (_ failure: String?) -> Void)) -> Bool {
         let slot = slots[nextSlot]
         nextSlot = (nextSlot + 1) % slots.count
         slot.free.wait()
@@ -504,9 +504,12 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         let encoded = self.encode(jobs, slot: slot, pass: pass)
         inFlight.enter()
         batch.commit { [inFlight] result in
+            let failure = encoded ? result.error : "a job could not be encoded"
+            // Tables whose synthesis did not complete hold nothing a later job may reuse.
+            if failure != nil { for index in slot.grain.indices { slot.grain[index].holds = nil } }
             giveBack()
             inFlight.leave()
-            completion(encoded && result.error == nil)
+            completion(failure)
         }
         return true
     }
@@ -531,13 +534,31 @@ final class PlanarFrameFinisher: @unchecked Sendable {
                 sources.append(planes)
             }
         }
-        if fields > 0 { pass.barrier() }
+        // Each grained job's tables, synthesised on the GPU (when its parameters changed) alongside the fields: one
+        // barrier for both before the finishes read them.
+        var grains: [MTLBuffer] = []
+        var synthesised = false
+        for (index, job) in jobs.enumerated() {
+            guard let tables = grainTables(job.grain, plan: job.plan, width: job.width, height: job.height, slot: slot, index: index)
+            else { return false }
+            if let grain = job.grain, tables.synthesise {
+                guard let synthesize = try? pipeline(for: job.plan, function: "fg_synthesize") else { return false }
+                pass.setPipeline(synthesize)
+                pass.setBuffer(tables.buffer, offset: 0, index: 0)
+                FilmGrainSynthesis.synthesisArguments(grain, width: job.width, height: job.height).withUnsafeBytes {
+                    pass.setBytes($0, index: 1)
+                }
+                pass.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                synthesised = true
+            }
+            grains.append(tables.buffer)
+        }
+        if fields > 0 || synthesised { pass.barrier() }
         var lists = 0
         let order = jobs.indices.filter { !usesList(jobs[$0].plan) } + jobs.indices.filter { usesList(jobs[$0].plan) }
         for index in order {
             let job = jobs[index]
-            guard let grain = grainTables(job.grain, plan: job.plan, width: job.width, height: job.height, slot: slot, index: index)
-            else { return false }
+            let grain = grains[index]
             var list: (counter: MTLBuffer, arguments: MTLBuffer)?
             if usesList(job.plan) {
                 guard let made = listBuffers(slot, lists, capacity: job.width * job.height) else { return false }
@@ -646,12 +667,13 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         var height: Int
     }
 
-    /// Job `index`'s grain tables in `slot` (``FilmGrainSynthesis``), written for `grain` at `width` x `height`; for a
-    /// plan without grain, a placeholder the kernel never reads. Nil when the plan wants grain and the job carries none,
-    /// or no buffer can be made.
+    /// Job `index`'s grain tables in `slot` (``FilmGrainSynthesis``) for `grain` at `width` x `height`: its header
+    /// written, and `synthesise` when the GPU has to make the templates, scaling tables and offsets (a set the slot does
+    /// not already hold; `show_existing_frame` repeats one). For a plan without grain, a placeholder the kernel never
+    /// reads. Nil when the plan wants grain and the job carries none, or no buffer can be made.
     private func grainTables(_ grain: FilmGrainParameters?, plan: Plan, width: Int, height: Int, slot: Slot,
-                             index: Int) -> MTLBuffer? {
-        guard plan.grain else { return placeholder }
+                             index: Int) -> (buffer: MTLBuffer, synthesise: Bool)? {
+        guard plan.grain else { return (placeholder, false) }
         guard let grain else { return nil }
         let length = FilmGrainSynthesis.bufferLength(width: width, height: height)
         while slot.grain.count <= index {
@@ -663,11 +685,10 @@ final class PlanarFrameFinisher: @unchecked Sendable {
             slot.grain[index] = (made, nil)
         }
         let key = GrainKey(parameters: grain, width: width, height: height)
-        if slot.grain[index].holds != key {
-            FilmGrainSynthesis.write(grain, width: width, height: height, into: slot.grain[index].buffer.contents())
-            slot.grain[index].holds = key
-        }
-        return slot.grain[index].buffer
+        guard slot.grain[index].holds != key else { return (slot.grain[index].buffer, false) }
+        FilmGrainSynthesis.writeHeader(grain, width: width, height: height, into: slot.grain[index].buffer.contents())
+        slot.grain[index].holds = key
+        return (slot.grain[index].buffer, true)
     }
 
     private func texture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat) -> CVMetalTexture? {

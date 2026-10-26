@@ -155,8 +155,8 @@ struct PlanarFrameFinisherTests {
                          width: Int, height: Int, into buffer: CVPixelBuffer) -> Bool {
         let done = DispatchSemaphore(value: 0)
         let written = OSAllocatedUnfairLock(initialState: false)
-        finisher.finish(planes, plan: plan, width: width, height: height, into: buffer) { ok in
-            written.withLock { $0 = ok }
+        finisher.finish(planes, plan: plan, width: width, height: height, into: buffer) { failure in
+            written.withLock { $0 = failure == nil }
             done.signal()
         }
         done.wait()
