@@ -514,7 +514,7 @@ struct SpatialAudioBridgeTests {
         let decoder = SyntheticDecoder(skipAfterReset: 0, clockAtReset: clock ? (start - Self.clockHead) % (1 << 16) : nil)
         let bridge = try SpatialAudioBridge(srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: decoder)
         bridge.setSourceStart(0)
-        if clock { bridge.setStreamClock(headOffset: Self.clockHead) }
+        if clock { bridge.setStreamClock(anchors: StreamClockAnchors(headOffset: Self.clockHead)) }
         return bridge
     }
 

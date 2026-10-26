@@ -862,11 +862,11 @@ final class AudioBridge: @unchecked Sendable {
     }
 
     /// Where a TrueHD stream's clock reads zero, counted from its start, in frames at the stream's rate
-    /// (`StreamClockPlacement.headOffset`), read off the stream's head; nil for none.
-    func setStreamClock(headOffset: Int64?) {
+    /// (`StreamClockAnchors`), shared by the session's runs; nil for none.
+    func setStreamClock(anchors: StreamClockAnchors?) {
         opLock.lock()
         defer { opLock.unlock() }
-        streamClock = headOffset.map(StreamClockPlacement.init(headOffset:))
+        streamClock = anchors.map(StreamClockPlacement.init(anchors:))
         nextClock = nil
     }
 
@@ -939,24 +939,26 @@ final class AudioBridge: @unchecked Sendable {
         }
         let frames = Int64(frame.pointee.nb_samples)
         runFrames += frames
-        if var placement = streamClock, !placement.parted, let clock = clock(of: frame), let sourceStart {
+        if var placement = streamClock, let clock = clock(of: frame), let sourceStart {
             defer { streamClock = placement }
             let noise = SourceGrid.noise(tolerance: AudioContinuity.tolerance(sourceTimeBase: srcTimeBase, sampleRate: rate))
             switch placement.place(clock: clock, modulus: 1 << 16, scale: 1,
                                    origin: SourceGrid.origin(start: sourceStart, timeBase: srcTimeBase, sampleRate: rate,
                                                              initialPadding: parameters.pointee.initial_padding),
                                    estimate: ts.map { av_rescale_q($0, srcTimeBase, AVRational(num: 1, den: rate)) },
-                                   noise: noise) {
+                                   noise: noise, tick: av_rescale_q(1, srcTimeBase, AVRational(num: 1, den: rate))) {
             case .position(let start): return start
             case .unplaced: return nil
+            case .byTimestamps: break
             case .parted(let ahead):
                 grid?.restart()
                 runFrames = frames
                 continuityBreakCause = continuityBreakCause ?? "a splice in the source"
                 EngineLog.emit(
                     "[AudioBridge] the stream's clock and its timestamps parted by "
-                    + "\(String(format: "%+.3f", Double(ahead) / Double(rate))) s (a splice); "
-                    + "the rest of the run is placed on the grid", category: .session)
+                    + "\(String(format: "%+.3f", Double(ahead) / Double(rate))) s (a splice to a stretch no anchor "
+                    + "fits); the rest of the run is placed on the grid, and the stretch's anchor read from it",
+                    category: .session)
             }
         }
         let end = ts.map { av_rescale_q($0, srcTimeBase, AVRational(num: 1, den: rate)) + frames }

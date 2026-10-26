@@ -308,8 +308,9 @@ extension HLSVideoEngine {
         let bridge: SpatialAudioBridge
         /// A decoder for each segment's run, made as the session's own.
         let makeDecoder: () throws -> ObjectAudioDecoding
-        /// The stream's clock against its start, for a source whose bitstream carries one (TrueHD).
-        var clockHeadOffset: Int64?
+        /// The stream's clock against its start, for a source whose bitstream carries one (TrueHD): one store of
+        /// anchors for the session's bridge and every run.
+        var clockAnchors: StreamClockAnchors?
         do {
             let decoder: ObjectAudioDecoding
             switch source {
@@ -322,8 +323,8 @@ extension HLSVideoEngine {
                         : try TrueHDObjectAudioDecoder(dialogueGain: dialogueGain)
                 }
                 decoder = try makeDecoder()
-                clockHeadOffset = trueHDClockHeadOffset(audioStream: audioStream, audioDemuxer: audioDemuxer,
-                                                        streamIndex: sourceAudioStreamIndex)
+                clockAnchors = trueHDClockHeadOffset(audioStream: audioStream, audioDemuxer: audioDemuxer,
+                                                     streamIndex: sourceAudioStreamIndex).map(StreamClockAnchors.init(headOffset:))
                 #else
                 return nil
                 #endif
@@ -373,7 +374,7 @@ extension HLSVideoEngine {
             bridge = try SpatialAudioBridge(
                 srcTimeBase: audioStream.pointee.time_base, layout: layout, decoder: decoder,
                 objectOutput: source == .trueHDAtmos && APACObjectOutputSwitch.isOn)
-            bridge.setStreamClock(headOffset: clockHeadOffset)
+            bridge.setStreamClock(anchors: clockAnchors)
         } catch {
             EngineLog.emit(
                 "[HLSVideoEngine] ERROR: \(source.name) rendering unavailable (\(error)); keeping the channel bridge",
@@ -394,7 +395,7 @@ extension HLSVideoEngine {
             let run = try SpatialAudioBridge(srcTimeBase: audioStream.pointee.time_base, layout: layout,
                                              decoder: try makeDecoder(), objectOutput: objectOutput,
                                              sessionLevels: levels)
-            run.setStreamClock(headOffset: clockHeadOffset)
+            run.setStreamClock(anchors: clockAnchors)
             if watchesDecoder {
                 run.onDecoderProducedNothing = { [weak self] stats in
                     self?.handleBridgeDecodedNothing(streamIndex: streamIndex, summary: stats.summary)

@@ -466,11 +466,11 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     }
 
     /// Where the stream's clock reads zero, counted from its start, in frames at the stream's own rate
-    /// (`StreamClockPlacement.headOffset`), read off the stream's head; nil for none.
-    func setStreamClock(headOffset: Int64?) {
+    /// (`StreamClockAnchors`), shared by the session's runs; nil for none.
+    func setStreamClock(anchors: StreamClockAnchors?) {
         opLock.lock()
         defer { opLock.unlock() }
-        streamClock = headOffset.map(StreamClockPlacement.init(headOffset:))
+        streamClock = anchors.map(StreamClockPlacement.init(anchors:))
     }
 
     func setSourceStart(_ pts: Int64?) {
@@ -690,7 +690,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// start and the block's timestamp counted in 48 kHz frames and the clock as the decoder states it (divided
     /// down for a 96 or 192 kHz stream). A splice parts the clock: the grid places the rest of the run.
     private func clockPlacement(of block: ObjectAudioDecodedBlock) -> ClockPlacement {
-        guard var clock = streamClock, !clock.parted, let frame = block.clockFrame,
+        guard var clock = streamClock, let frame = block.clockFrame,
               let modulus = block.clockModulus, modulus > 0, let sourceStart else { return .notByClock }
         defer { streamClock = clock }
         if runBreakPending {
@@ -702,17 +702,21 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
                                                                            sampleRate: Int32(Self.sampleRate)))
         switch clock.place(clock: frame, modulus: modulus, scale: (1 << 16) / modulus,
                            origin: av_rescale_q(sourceStart, srcTimeBase, encoderTimeBase),
-                           estimate: estimatedPosition(of: block), noise: noise) {
+                           estimate: estimatedPosition(of: block), noise: noise,
+                           tick: av_rescale_q(1, srcTimeBase, encoderTimeBase)) {
         case .position(let position):
             return .placed(position)
         case .unplaced:
             return .unplaced
+        case .byTimestamps:
+            return .notByClock
         case .parted(let frames):
             grid?.restart()
             EngineLog.emit(
                 "[SpatialAudioBridge] the stream's clock and its timestamps parted by "
                 + "\(String(format: "%+.3f", Double(frames) / Double(Self.sampleRate))) s "
-                + "(a splice); the rest of the run is placed on the grid", category: .session)
+                + "(a splice to a stretch no anchor fits); the rest of the run is placed on the grid, and the stretch's "
+                + "anchor read from it", category: .session)
             return .notByClock
         }
     }
