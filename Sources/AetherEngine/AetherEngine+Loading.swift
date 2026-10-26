@@ -1380,10 +1380,6 @@ extension AetherEngine {
         // The startup plan's answer, when it had one before the display switch: `prepare()` builds the session for
         // the playlist it implies, and `serve` hands AVPlayer that playlist.
         session.plannedPanelIsInHDRMode = plannedPanelIsInHDRMode
-        // docs/demuxed-audio.md: a session that has to play from the media playlist is prepared for it, with its
-        // audio muxed.
-        session.servesMediaPlaylistOnly = servesMediaPlaylistAfterRefusal
-        session.servesMediaPlaylistOnlyForHDR = airPlayReceiverRefusesHDRMaster
 
         // session.start() opens its own Demuxer + prewarm seek (~1-3 s on slow CDN); detach so @MainActor doesn't block.
         var playbackURL: URL

@@ -85,19 +85,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// How this session's output carries its audio (`HLSOutputShape`), decided in `prepare()` before the first
     /// producer is built, from the playlist the load planned.
     private(set) var outputShape: HLSOutputShape = .muxed
-    /// Set before `prepare()` by a rebuild that must play from the media playlist: a master the display or a
-    /// receiver refused for a demuxed session, whose own media playlist is its video alone. The session is
-    /// planned for the media playlist, so it carries its audio muxed.
-    var servesMediaPlaylistOnly = false
-    /// The same for an HDR source only: an AirPlay receiver remembered as refusing HDR masters takes the media
-    /// playlist for one (`AirPlayPlaylistDecision`).
-    var servesMediaPlaylistOnlyForHDR = false
-
-    /// Whether this source must be planned for the media playlist (`servesMediaPlaylistOnly`,
-    /// `servesMediaPlaylistOnlyForHDR`).
-    private func plansMediaPlaylistOnly(videoRange: HLSVideoRange) -> Bool {
-        servesMediaPlaylistOnly || (servesMediaPlaylistOnlyForHDR && videoRange != .sdr)
-    }
     /// The demuxed shape's audio rendition: its segments, on the video's indices. Nil when muxed. Guarded by
     /// `restartLock` with `cache`.
     var audioRenditionCache: SegmentCache?
@@ -2391,9 +2378,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // first producer is built. The audio the source carries stands in for the cascade's verdict: the cascade
         // can only take audio away, and a master without an audio group plays a session left video-only.
         let carriesAudio = audioStreamIndex >= 0
-        if plansMediaPlaylistOnly(videoRange: videoRange) {
-            plannedServesMaster = false
-        } else if let planned = plannedPanelIsInHDRMode {
+        if let planned = plannedPanelIsInHDRMode {
             plannedServesMaster = playlistDecision(
                 codecpar: codecpar, demuxer: dem, frameRate: frameRate, carriesAudio: carriesAudio,
                 videoRange: videoRange, panelIsInHDRMode: planned).useMaster
@@ -2647,8 +2632,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
             secondReaderAvailable: sourceReopenableByURL)) == .served(.keyframes)
         // A demuxed session's audio is a rendition, which only a master names: it was prepared for the master.
-        let useMasterPlaylist = outputShape == .demuxed
-            || (decision.useMaster && !plansMediaPlaylistOnly(videoRange: videoRange))
+        let useMasterPlaylist = outputShape == .demuxed || decision.useMaster
         if let planned = plannedServesMaster, planned != useMasterPlaylist {
             EngineLog.emit("[HLSVideoEngine] planned playlist (\(planned ? "master" : "media")) differs from the "
                            + "one served (\(useMasterPlaylist ? "master" : "media"))", category: .session)

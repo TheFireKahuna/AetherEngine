@@ -1538,6 +1538,29 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return audio.fetchSource(index: index, timeout: forwardBackpressureWaitSeconds, progressive: fetchesProgressively)
     }
 
+    // MARK: - The joined view (demuxed shape, played without a master)
+
+    func muxedInitSegment(versionID: Int) -> Data? {
+        guard let audio = audioRendition, let video = initSegment(versionID: versionID),
+              let audioInit = audio.fetchInit(timeout: 30.0) else { return nil }
+        return FMP4Join.initSegment(video: video, audio: audioInit)
+    }
+
+    /// Segment `index` of both renditions joined (`FMP4Join`). The video's request is the one that moves the
+    /// producer, as from `media.m3u8`; the audio of an index is cut with it, a moment after (both need the source
+    /// read to the next boundary), and the join waits for it as AVPlayer would from the audio rendition.
+    func muxedSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource? {
+        guard let audioRendition,
+              let video = Self.drain(mediaSegmentSource(at: index, onSlow: onSlow)),
+              let audio = Self.drain(audioSegmentSource(at: index, onSlow: nil)),
+              let videoInit = initSegment(versionID: initVersionID(forSegment: index)),
+              let audioInit = audioRendition.fetchInit(timeout: 30.0),
+              let videoTimescale = FMP4Join.timescale(ofInit: videoInit),
+              let audioTimescale = FMP4Join.timescale(ofInit: audioInit) else { return nil }
+        return FMP4Join.mediaSegment(video: video, audio: audio, videoTimescale: videoTimescale,
+                                     audioTimescale: audioTimescale).map { .data($0) }
+    }
+
     /// File URL for sendfile(2) fast path. Drives same side effects as mediaSegment(at:);
     /// without handleTargetChange the sendfile path would skip producer restarts on out-of-range fetches.
     func mediaSegmentURL(at index: Int) -> URL? {
