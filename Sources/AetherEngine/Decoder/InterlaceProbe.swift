@@ -178,8 +178,8 @@ enum InterlaceProbe {
         var held: [BwdifWindow.Picture] = []
         let done = DispatchGroup()
         for p in pictures {
-            guard let batch = submission.submitter.makeBatch(orderedAfterEarlierWork: true), let pass = batch.makePass() else { break }
-            let pushed = chain.push(p, into: pass)
+            guard let batch = submission.submitter.makeBatch() else { break }
+            let pushed = chain.push(p, into: DeinterlaceGPU.batch(batch))
             outputs += pushed.outputs
             held += pushed.touched
             done.enter()

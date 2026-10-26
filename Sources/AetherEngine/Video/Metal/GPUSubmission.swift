@@ -43,6 +43,10 @@ final class GPUSubmitter: @unchecked Sendable {
         backend.makeBatch(timed: timed, orderedAfterEarlierWork: orderedAfterEarlierWork)
     }
 
+    /// A fence, for passes of this submitter's queue that depend on one another without the queue being ordered
+    /// (``ComputePass/updateFence(_:)``, ``ComputePass/waitForFence(_:)``).
+    func makeFence() -> MTLFence? { device.makeFence() }
+
     /// Commits `batch` and waits for it: for offline callers (tests, probes, stills), never on a playback path.
     @discardableResult
     func commitAndWait(_ batch: GPUBatch) -> GPUBatchResult {
@@ -102,6 +106,11 @@ protocol ComputePass: LibraryPasses {
     func dispatchThreadgroups(indirectBuffer: MTLBuffer, offset: Int, threadsPerThreadgroup: MTLSize)
     /// Every dispatch after this sees every write before it.
     func barrier()
+    /// The dispatches after this wait until `fence` has been updated, by the last pass committed to this queue before
+    /// this one that updates it (none: no wait), and see its writes.
+    func waitForFence(_ fence: MTLFence)
+    /// `fence` updated once every dispatch encoded in this pass so far has completed.
+    func updateFence(_ fence: MTLFence)
     /// In a timed batch, the GPU time of the work since the last stamp, under `label`; nothing otherwise.
     func timestamp(_ label: String)
 }
@@ -336,6 +345,10 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
             encoder.barrier(afterEncoderStages: .dispatch, beforeEncoderStages: .dispatch, visibilityOptions: .device)
         }
 
+        func waitForFence(_ fence: MTLFence) { encoder.waitForFence(fence, beforeEncoderStages: .dispatch) }
+
+        func updateFence(_ fence: MTLFence) { encoder.updateFence(fence, afterEncoderStages: .dispatch) }
+
         func timestamp(_ label: String) {
             guard batch.timed, let heap = batch.context.stamps, batch.labels.count + 1 < Bindings.stamps else { return }
             batch.labels.append(label)
@@ -496,6 +509,8 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
         private var pipeline: MTLComputePipelineState?
         private var textures: [Int: MTLTexture] = [:]
         private var buffers: [Int: (MTLBuffer, Int)] = [:]
+        /// The fences this pass waits on, waited on again by the encoder a timestamp starts.
+        private var waits: [MTLFence] = []
 
         init(batch: Batch) { self.batch = batch }
 
@@ -546,12 +561,20 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
 
         func barrier() { encoder?.memoryBarrier(scope: [.buffers, .textures]) }
 
+        func waitForFence(_ fence: MTLFence) {
+            waits.append(fence)
+            encoder?.waitForFence(fence)
+        }
+
+        func updateFence(_ fence: MTLFence) { encoder?.updateFence(fence) }
+
         /// Ends the timed encoder, which samples the work since it began, and starts the next with the same bindings.
         func timestamp(_ label: String) {
             guard batch.timed, batch.labels.count < Bindings.stamps else { return }
             batch.labels.append(label)
             encoder?.endEncoding()
             encoder = batch.makeEncoder()
+            for fence in waits { encoder?.waitForFence(fence) }
             if let pipeline { encoder?.setComputePipelineState(pipeline) }
             for (index, texture) in textures { encoder?.setTexture(texture, index: index) }
             for (index, (buffer, offset)) in buffers { encoder?.setBuffer(buffer, offset: offset, index: index) }
