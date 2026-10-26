@@ -84,8 +84,8 @@ struct OverlayScreenTimingTests {
     }
 
     @Test("every picture's buffer is taken by the compositor and given back", .enabled(if: enabled),
-          .timeLimit(.minutes(2)))
-    func buffersReturnedOnScreen() async throws {
+          .timeLimit(.minutes(2)), arguments: [false, true])
+    func buffersReturnedOnScreen(fullScreen: Bool) async throws {
         try #require(FileManager.default.fileExists(atPath: Self.fixture.path), "run Scripts/fetch-fixtures.sh")
         let screen = try #require(NSScreen.main)
         let lines = OSAllocatedUnfairLock(initialState: [String]())
@@ -103,11 +103,14 @@ struct OverlayScreenTimingTests {
         let deadline = Date().addingTimeInterval(30)
         while engine.softwareOverlay == nil, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
         let renderer = try #require(engine.softwareOverlay)
+        // In a window the window server composites the layer with the rest of the desktop; covering the screen it
+        // can show it directly.
         let size = CGSize(width: 640, height: 360)
-        let window = NSWindow(contentRect: CGRect(origin: CGPoint(x: screen.frame.midX - size.width / 2,
-                                                                  y: screen.frame.midY - size.height / 2), size: size),
-                              styleMask: [.borderless], backing: .buffered, defer: false)
-        window.level = .floating
+        let frame = fullScreen ? screen.frame
+            : CGRect(origin: CGPoint(x: screen.frame.midX - size.width / 2, y: screen.frame.midY - size.height / 2), size: size)
+        let window = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.level = fullScreen ? .screenSaver : .floating
+        window.backgroundColor = .black
         window.isReleasedWhenClosed = false
         let content = try #require(window.contentView)
         content.wantsLayer = true

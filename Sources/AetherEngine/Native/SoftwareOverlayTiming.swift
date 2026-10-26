@@ -35,6 +35,8 @@ final class OverlayTiming: @unchecked Sendable {
     private var onScreen: [Int: Int] = [:]
     private var outOfOrder: [(item: Double, after: Double)] = []
     private var neverShown = 0
+    /// Pictures whose return fell between two polls: the pool had reused the buffer before the watch saw it free.
+    private var unseen = 0
     /// Each return measured from the next picture's item time, in ms.
     private var replacedMs: [Double] = []
 
@@ -61,15 +63,17 @@ final class OverlayTiming: @unchecked Sendable {
     }
 
     /// The picture at `item` (item seconds) came back from the compositor at `host` (host seconds), the item clock
-    /// then reading `clock`; `next` is the item time of the picture after it, when one is queued. Only while the clock
-    /// runs at about real time does the time between returns count as time on screen (not across a pause, a seek or
-    /// a scan).
-    func returned(item: Double, host: Double, clock: Double, next: Double?) {
+    /// then reading `clock`; `next` is the item time of the picture after it, when one is queued. The time since the
+    /// last return is this picture's time on screen only when that return was the picture before it (`follows`: no
+    /// earlier picture still waiting), and only while the clock runs at about real time (not across a pause, a seek
+    /// or a scan).
+    func returned(item: Double, host: Double, clock: Double, next: Double?, follows: Bool) {
         lock.withLock {
             defer { lastReturn = (item, host, clock) }
             if let next { replacedMs.append((clock - next) * 1000) }
             guard let last = lastReturn else { return }
             if item < last.item { outOfOrder.append((item, last.item)); return }
+            guard follows else { return }
             let hostSpan = host - last.host, itemSpan = clock - last.clock
             guard let refresh = statedRefresh, refresh > 0, hostSpan > 0, itemSpan / hostSpan > 0.5, itemSpan / hostSpan < 2
             else { return }
@@ -79,6 +83,15 @@ final class OverlayTiming: @unchecked Sendable {
 
     /// A picture whose buffer the compositor never took: it was never on screen.
     func neverUsed() { lock.withLock { neverShown += 1 } }
+
+    /// A picture whose return the watch did not see: its buffer was reused before a poll found it free. The next
+    /// return measures no time on screen, since the last one seen is not the picture before it.
+    func returnUnseen() {
+        lock.withLock {
+            unseen += 1
+            lastReturn = nil
+        }
+    }
 
     /// The presentation started over (a seek): the next return measures nothing against the last.
     func restarted() { lock.withLock { lastReturn = nil } }
@@ -146,12 +159,13 @@ final class OverlayTiming: @unchecked Sendable {
                 onScreen.removeAll()
                 outOfOrder.removeAll()
                 neverShown = 0
+                unseen = 0
             }
             let refreshes = onScreen.keys.sorted().map { "\($0): \(onScreen[$0]!)" }.joined(separator: ", ")
             let disorder = outOfOrder.prefix(4).map { String(format: "%.3f after %.3f s", $0.item, $0.after) }
             return "on screen (buffers returned): pictures by refreshes on screen [\(refreshes)], "
                 + "out of order \(outOfOrder.count)\(disorder.isEmpty ? "" : " (\(disorder.joined(separator: ", ")))"), "
-                + "never shown \(neverShown); "
+                + "never shown \(neverShown), return not seen (buffer reused first) \(unseen); "
                 + "replaced after the next picture's time \(Self.spread(replacedMs)); "
                 + "refresh interval \(Self.spread(refreshMs)); picture \(Self.spread(pictureMs)); lead \(Self.spread(leadMs))"
         }
@@ -170,6 +184,11 @@ final class OverlayTiming: @unchecked Sendable {
 /// surface) and let it go, the picture has been on screen and replaced. Read every millisecond on a thread of its
 /// own. A buffer never taken within `neverUsedAfter` was never shown; pictures flushed by a restart are dropped
 /// unwatched.
+///
+/// A pool can reuse a surface within the millisecond between the compositor letting it go and the next poll, and the
+/// new picture's work marks it in use again: the return is never seen. A surface is only ever reused once it is free,
+/// so a surface enqueued again while an older picture on it is still watched closes that picture (``OverlayTiming/
+/// returnUnseen()``), and a return with an earlier picture still waiting measures no time on screen.
 final class SurfaceReturnWatch: @unchecked Sendable {
     static let pollInterval = 0.001
     static let neverUsedAfter = 2.0
@@ -193,7 +212,14 @@ final class SurfaceReturnWatch: @unchecked Sendable {
     }
 
     func watch(_ surface: IOSurfaceRef, item: Double) {
-        lock.withLock { watched.append(Watched(surface: surface, item: item, since: CACurrentMediaTime())) }
+        let id = IOSurfaceGetID(surface)
+        let reused = lock.withLock { () -> Int in
+            let before = watched.count
+            watched.removeAll { IOSurfaceGetID($0.surface) == id }
+            watched.append(Watched(surface: surface, item: item, since: CACurrentMediaTime()))
+            return before + 1 - watched.count
+        }
+        for _ in 0..<reused { timing.returnUnseen() }
     }
 
     /// The layer was flushed: what it held is never shown.
@@ -219,7 +245,7 @@ final class SurfaceReturnWatch: @unchecked Sendable {
 
     private func poll() {
         let now = CACurrentMediaTime()
-        var returned: [(item: Double, next: Double?)] = []
+        var returned: [(item: Double, next: Double?, follows: Bool)] = []
         var neverUsed = 0
         lock.withLock {
             var kept: [Watched] = []
@@ -228,7 +254,7 @@ final class SurfaceReturnWatch: @unchecked Sendable {
                     entry.used = true
                     kept.append(entry)
                 } else if entry.used {
-                    returned.append((entry.item, nil))
+                    returned.append((entry.item, nil, false))
                 } else if now - entry.since > Self.neverUsedAfter {
                     neverUsed += 1
                 } else {
@@ -237,12 +263,14 @@ final class SurfaceReturnWatch: @unchecked Sendable {
             }
             watched = kept
             let waiting = kept.map(\.item)
-            returned = returned.sorted { $0.item < $1.item }.map { r in (r.item, waiting.filter { $0 > r.item }.min()) }
+            returned = returned.sorted { $0.item < $1.item }.map { r in
+                (r.item, waiting.filter { $0 > r.item }.min(), !waiting.contains { $0 < r.item })
+            }
         }
         guard !returned.isEmpty || neverUsed > 0 else { return }
         let clock = CMSyncConvertTime(CMTime(seconds: now, preferredTimescale: 1_000_000_000),
                                       from: CMClockGetHostTimeClock(), to: itemTimebase).seconds
-        for r in returned { timing.returned(item: r.item, host: now, clock: clock, next: r.next) }
+        for r in returned { timing.returned(item: r.item, host: now, clock: clock, next: r.next, follows: r.follows) }
         for _ in 0..<neverUsed { timing.neverUsed() }
     }
 }
