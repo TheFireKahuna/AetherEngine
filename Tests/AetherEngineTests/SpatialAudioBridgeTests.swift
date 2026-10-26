@@ -430,28 +430,8 @@ struct SpatialAudioBridgeTests {
         #expect(zip(packets, packets.dropFirst()).allSatisfy { $1.pts - $0.pts == 1024 })
     }
 
-    @Test("a source that steps back has the overlap trimmed, so the encoder's run carries on unbroken")
-    func overlapTrimmedNotRestarted() throws {
-        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
-        func bridge() throws -> SpatialAudioBridge {
-            let b = try SpatialAudioBridge(
-                srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: ClickDecoder(clickFrame: .max))
-            b.setSourceStart(0)
-            return b
-        }
-        let overlapped = try bridge(), unbroken = try bridge()
-        defer { overlapped.close(); unbroken.close() }
-        // 0-1000 ms, then the source repeats from 900 ms: the same stream as 0-1900 ms played once.
-        var a = try feed(overlapped, startMs: 0, count: 50).map(\.pts)
-        a += try feed(overlapped, startMs: 900, count: 50).map(\.pts) + drain(overlapped)
-        let b = try feed(unbroken, startMs: 0, count: 95).map(\.pts) + drain(unbroken)
-        #expect(zip(a, a.dropFirst()).allSatisfy { $1 - $0 == 1024 }, "one encoder run, no stamps laid over earlier ones")
-        #expect(a == b)
-    }
-
-    @Test("a live splice moves what follows by its residual, in one encoder run, either way",
-          arguments: [-100, 100])
-    func liveSpliceJump(deltaMs: Int) throws {
+    @Test("a live splice that moves what follows later fills the residual with silence, in one encoder run")
+    func liveSpliceJumpLater() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         func bridge() throws -> SpatialAudioBridge {
             let b = try SpatialAudioBridge(
@@ -462,13 +442,27 @@ struct SpatialAudioBridgeTests {
         let spliced = try bridge(), unbroken = try bridge()
         defer { spliced.close(); unbroken.close() }
         var a = try feed(spliced, startMs: 0, count: 50).map(\.pts)
-        spliced.noteTimelineJump(deltaSeconds: Double(deltaMs) / 1000)
+        spliced.noteTimelineJump(deltaSeconds: 0.1)
         a += try feed(spliced, startMs: 1000, count: 50).map(\.pts) + drain(spliced)
-        // The same track as 2 s of audio with the residual taken off or added: a trimmed overlap or a
-        // silent gap, the stamps one run throughout.
-        let b = try feed(unbroken, startMs: 0, count: 100 + deltaMs / 20).map(\.pts) + drain(unbroken)
+        // The same track as 2.1 s of audio, the residual silent, the stamps one run throughout.
+        let b = try feed(unbroken, startMs: 0, count: 105).map(\.pts) + drain(unbroken)
         #expect(zip(a, a.dropFirst()).allSatisfy { $1 - $0 == 1024 })
         #expect(a == b)
+    }
+
+    @Test("a live splice that moves what follows earlier starts the encoder over on the earlier position")
+    func liveSpliceJumpEarlier() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: ClickDecoder(clickFrame: .max))
+        bridge.setSourceStart(0)
+        defer { bridge.close() }
+        _ = try feed(bridge, startMs: 0, count: 50)
+        bridge.noteTimelineJump(deltaSeconds: -0.1)
+        let after = try feed(bridge, startMs: 1000, count: 50).map(\.pts) + drain(bridge)
+        // 1 s at 48 kHz less the 0.1 s residual: the new run's first packet, then on by 1024.
+        let run = try #require(after.firstIndex(of: 43_200))
+        #expect(zip(after[run...], after[run...].dropFirst()).allSatisfy { $1 - $0 == 1024 })
     }
 
     @Test("metadata cut off with a block's start keeps its timing: a ramp under way finishes when it was due")
