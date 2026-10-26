@@ -61,18 +61,30 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
     private var _skipUntilPTS: CMTime?
 
-    /// Set per packet by a caller that knows the packet's picture would be too late to show: a picture no
-    /// other picture references is then dropped before it is decoded, so a decoder behind its clock catches
-    /// up at the cost of the references alone. Never while a chain that counts consecutive pictures is in
-    /// force (the deinterlacer's window, inverse telecine, a soft-telecine film run): a picture missing
-    /// from it would move the timestamps or the cadence of the ones it does show.
+    /// Set per packet by a caller that knows the packet's picture would be too late to show (it sets
+    /// `skipUntilPTS` to the first picture that is not): a picture no other picture references is then
+    /// dropped before it is decoded, so a decoder behind its clock catches up at the cost of the references
+    /// alone. A stream whose captions come out of its decoded pictures keeps every picture, since a dropped
+    /// one would take its caption bytes with it; it still catches up on what it does not convert.
+    ///
+    /// A chain that counts consecutive pictures (the deinterlacer's window, inverse telecine, a soft-telecine
+    /// film run) is not handed the late pictures at all: it starts over on the first picture that is not
+    /// late, as it does after a seek, so the pictures it shows keep their timestamps and cadence.
     func discardsNonReferencePictures(_ discard: Bool) {
         lock.lock()
         defer { lock.unlock() }
         guard let ctx = codecContext else { return }
-        let chainInForce = window?.isActive == true || inverseTelecine != nil || filmCadence?.isActive == true
-        ctx.pointee.skip_frame = discard && !chainInForce ? AVDISCARD_NONREF : AVDISCARD_DEFAULT
+        ctx.pointee.skip_frame = discard && !carriesDecodedCaptions ? AVDISCARD_NONREF : AVDISCARD_DEFAULT
+        if discard, window?.isActive == true || inverseTelecine != nil || filmCadence?.isActive == true {
+            chainRestartPending = true
+        }
     }
+
+    /// Late pictures are bypassing the consecutive-picture chain, which starts over on the first one that is
+    /// not late (`discardsNonReferencePictures`). Guarded by `lock`.
+    private var chainRestartPending = false
+    /// The stream's decoded pictures have carried A53 captions. Guarded by `lock`.
+    private var carriesDecodedCaptions = false
 
     /// AE#492: guarded by `lock`, the same one `flush()` and `decode(packet:epoch:)` take.
     private var _feedEpoch: UInt64 = 0
@@ -513,11 +525,24 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                let sd = av_frame_get_side_data(f, AV_FRAME_DATA_A53_CC),
                let sdData = sd.pointee.data, sd.pointee.size >= 3,
                f.pointee.pts != Int64.min, timeBase.den > 0 {
+                carriesDecodedCaptions = true
                 let extracted = CCDataParser.parseCCDataTriplets(bytes: sdData, count: Int(sd.pointee.size))
                 if !extracted.isEmpty {
                     let pts = Double(f.pointee.pts) * Double(timeBase.num) / Double(timeBase.den)
                     onA53(extracted, pts)
                 }
+            }
+
+            if chainRestartPending {
+                if let threshold = skipUntilPTS,
+                   CMTimeCompare(SourceTimestampBounds.cmTime(ticks: f.pointee.pts, timeBase: timeBase), threshold) < 0 {
+                    lock.unlock()
+                    continue
+                }
+                window?.reset()
+                inverseTelecine?.reset()
+                filmCadence?.reset()
+                chainRestartPending = false
             }
 
             if let ivtc = inverseTelecine(for: f), let picture = hold(f) {
@@ -775,6 +800,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             inverseTelecine?.reset()
         }
         filmCadence?.reset()
+        chainRestartPending = false
         guard let ctx = codecContext else { return }
         avcodec_flush_buffers(ctx)
     }
