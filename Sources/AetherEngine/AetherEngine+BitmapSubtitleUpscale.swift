@@ -8,6 +8,13 @@ extension AetherEngine {
         BitmapSubtitleUpscaling.prewarm()
     }
 
+    /// LibMLSubUpscaler's report of the upscaler's costs on this device (app open, first picture, steady state),
+    /// its GPU passes on the engine's own upscaler submission. For a device benchmark, never playback: it runs for
+    /// seconds. Nil without the `MLSubtitleUpscale` trait or a GPU.
+    public nonisolated static func bitmapSubtitleUpscalerBenchmark(iterations: Int = 40) -> String? {
+        BitmapSubtitleUpscaling.benchmark(iterations: iterations)
+    }
+
     /// The upscale a drain tick applies, nil when the build or the host asks for none.
     func bitmapSubtitleUpscaleRequest(playhead: Double) -> BitmapSubtitleUpscaling.Request? {
         guard AetherEngine.OptionalComponent.mlSubtitleUpscale.isBuiltIn, let size = bitmapSubtitlePixelSize else { return nil }

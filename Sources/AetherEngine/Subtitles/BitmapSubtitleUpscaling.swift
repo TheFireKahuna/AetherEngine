@@ -71,10 +71,27 @@ final class BitmapSubtitleUpscaling: @unchecked Sendable {
     }
     #endif
 
-    /// Loads the models at app open, in the background; `ready()` and the first tick then find them loaded.
+    #if MLSubtitleUpscale
+    /// The upscaler's submission, for the process: a queue of its own, so its windows' event waits hold back only its
+    /// work, never the video's. Its pipelines are made through it at app open.
+    private static let gpu: SubtitleUpscaleGPU? = MTLCreateSystemDefaultDevice()
+        .flatMap { GPUSubmitter(device: $0, label: "SubtitleUpscaler") }.map(SubtitleUpscaleGPU.init)
+    #endif
+
+    /// Makes the pipelines and loads the models at app open, in the background; `ready()` and the first tick then find
+    /// them made and loaded.
     static func prewarm() {
         #if MLSubtitleUpscale
-        SubtitleUpscaler.prewarm(.balanced)
+        if let gpu { SubtitleUpscaler.prewarm(.balanced, submission: gpu) }
+        #endif
+    }
+
+    /// LibMLSubUpscaler's benchmark on the upscaler's submission.
+    static func benchmark(iterations: Int) -> String? {
+        #if MLSubtitleUpscale
+        return gpu.map { SubtitleUpscaler.benchmark(iterations: iterations, submission: $0) }
+        #else
+        return nil
         #endif
     }
 
@@ -171,12 +188,8 @@ final class BitmapSubtitleUpscaling: @unchecked Sendable {
     private func upscalerLocked() throws -> SubtitleUpscaler {
         try lock.withLock {
             if let made = upscaler { return made }
-            // A queue of the upscaler's own: its windows' event waits hold back only its own work, never the video's.
-            guard let device = MTLCreateSystemDefaultDevice(),
-                  let submitter = GPUSubmitter(device: device, label: "SubtitleUpscaler") else {
-                throw SubtitleUpscaler.UpscaleError.unavailable("no GPU submission")
-            }
-            let made = try SubtitleUpscaler(configuration: .balanced, submission: SubtitleUpscaleGPU(submitter))
+            guard let gpu = Self.gpu else { throw SubtitleUpscaler.UpscaleError.unavailable("no GPU submission") }
+            let made = try SubtitleUpscaler(configuration: .balanced, submission: gpu)
             try made.prepare()
             upscaler = made
             return made
