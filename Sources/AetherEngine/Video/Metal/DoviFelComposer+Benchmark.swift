@@ -45,7 +45,6 @@ public enum FelComposerBenchmark {
                 ("l: no EL h   ", try patched(base, lumaNoHorizontal)),
                 ("l: no EL v   ", try patched(base, lumaNoVertical)),
                 ("l: no NLQ    ", try patched(base, lumaNoNlq)),
-                ("mmr-constant ", try patched(base, mmrConstant)),
                 ("c: no MMR sum", try patched(base, chromaNoMmrSum)),
                 ("c: no int sum", try patched(base, chromaNoIntSum)),
                 ("c: no fl. sum", try patched(base, chromaNoFloatSum)),
@@ -67,6 +66,132 @@ public enum FelComposerBenchmark {
         }
         return lines.joined(separator: "\n")
     }
+
+    /// For a GPU counter recording (Instruments' Metal GPU Counters): each kernel of the sv22 composition, and two
+    /// bisection variants, run back to back for `profileSeconds`, one after another in a fixed order with
+    /// `profileGapSeconds` of idle GPU between them, so each busy stretch of the recording is one kernel's. Each stretch
+    /// is handed to `emit` as it starts.
+    public static func profile(emit: (String) -> Void = { print($0); fflush(stdout) }) -> String {
+        var lines: [String] = []
+        let start = CACurrentMediaTime()
+        func say(_ line: String) { lines.append(line); emit(line) }
+        func elapsed() -> String { String(format: "%.1f s", CACurrentMediaTime() - start) }
+        do {
+            let rig = try Rig()
+            say("[profile] rig built at \(elapsed())")
+            try setMode(rig, dither: .fullPrecision, chroma422: true)
+            let base = DoviShaderSource.source
+            // name, label, source, luma (else chroma + 4:2:2), the exact MMR pipelines. A pipeline's registers are
+            // set when it is compiled, for every path in it, so one stretch covers a kernel's rarer paths too (luma's
+            // MMR branch); the exact MMR sums are pipelines of their own.
+            // Each stretch's source is patched only when the stretch is asked for.
+            let known: [(String, String, () throws -> String, Kind, Bool)] = [
+                ("luma", "luma", { base }, .luma, false),
+                ("chroma", "chroma + 4:2:2", { base }, .chromaAnd422, false),
+                ("chroma-exact", "chroma + 4:2:2, exact MMR pipeline", { base }, .chromaAnd422, true),
+                ("chroma-nommr", "chroma + 4:2:2, no MMR", { try patched(base, chromaNoMmr) }, .chromaAnd422, false),
+                ("chroma-nocoef", "chroma + 4:2:2, MMR coefficients not loaded",
+                 { try patched(base, [("    int c = simd_shuffle(loaded, i);", "    int c = int(i) * 7 + 1;")]) }, .chromaAnd422, false),
+                ("chroma-noresid", "chroma + 4:2:2, no EL residual", { try patched(base, chromaNoResidual) }, .chromaAnd422, false),
+                ("chroma-1tap", "chroma + 4:2:2, base luma one tap", { try patched(base, chromaOneTap) }, .chromaAnd422, false),
+                ("chroma-only", "chroma alone (sv22's 4:2:0 intermediate)", { base }, .chroma, false),
+                ("422", "sv22's 4:2:0 -> 4:2:2 step alone", { base }, .step422, false),
+                // Chroma alone with code taken out of the source, so the pipeline loses its registers too.
+                ("cx-nommr", "chroma alone, no MMR code",
+                 { try patched(base, [("    bool pending = need;\n", "    bool pending = need;\n    return;\n")]) }, .chroma, false),
+                ("cx-noel", "chroma alone, no EL code",
+                 { try patched(base, [("    int2 el_code = int2(0);\n    if (residual) {", "    int2 el_code = int2(0);\n    if (false) {")]) },
+                 .chroma, false),
+                ("cx-nopoly", "chroma alone, no polynomial code",
+                 { try patched(base, [("dovi_eval_curve(params.poly_cb, piece_cb, t1, shift)", "int(t1 >> 4)"),
+                                      ("dovi_eval_curve(params.poly_cr, piece_cr, t2, shift)", "int(t2 >> 4)")]) }, .chroma, false),
+                ("floor", "luma, memory floor", { try patched(base, floorOnly) }, .luma, false),
+            ]
+            let wanted = ProcessInfo.processInfo.environment["DOVI_PROFILE_STRETCHES"]?.split(separator: ",").map(String.init)
+                ?? ["luma", "chroma", "chroma-nommr", "floor"]
+            let stretches = try wanted.map { name in
+                let stretch = try require(known.first { $0.0 == name }, "no profile stretch named \(name)")
+                return (stretch.1, try stretch.2(), stretch.3, stretch.4)
+            }
+            let out = try require(makeBuffer(width, height, kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange), "no sv22 output")
+            let planes = try Planes(rig, out: out)
+            // Every pipeline compiled before the first stretch, so a recording started at "ready" holds kernels only.
+            let compiled = try stretches.map { stretch -> DoviFelComposer.SharedPipelines.Kernels in
+                let kernels = try DoviFelComposer.SharedPipelines.compile(device: rig.device, source: stretch.1)
+                    .kernels(.init(blueNoise: false, mmrExact: stretch.3))
+                say("[profile] \(stretch.0) compiled at \(elapsed())")
+                return kernels
+            }
+            // With `DOVI_PROFILE_TRIGGER` set, the stretches wait for that file to exist (a recording that has started),
+            // for at most `profileTriggerTimeout`, having made `<trigger>.ready` to say they are waiting.
+            if let trigger = ProcessInfo.processInfo.environment["DOVI_PROFILE_TRIGGER"] {
+                say("[profile] ready: waiting for \(trigger)")
+                // The recorder watches for this file: a line on stdout reaches it only when the test runner flushes.
+                FileManager.default.createFile(atPath: trigger + ".ready", contents: nil)
+                let deadline = CACurrentMediaTime() + profileTriggerTimeout
+                while !FileManager.default.fileExists(atPath: trigger), CACurrentMediaTime() < deadline {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+            } else {
+                say("[profile] ready: the first stretch starts in \(Int(profileLeadSeconds)) s")
+                Thread.sleep(forTimeInterval: profileLeadSeconds)
+            }
+            for (index, (label, _, kind, _)) in stretches.enumerated() {
+                let kernels = compiled[index]
+                let pipeline = kind == .luma ? kernels.luma : kind == .step422 ? kernels.chroma422 : kernels.chroma
+                say(String(format: "[profile] stretch %d: %@, %.0f s busy, then %.0f s idle; threadgroup limit %d, SIMD width %d",
+                           index + 1, label, profileSeconds, profileGapSeconds,
+                           pipeline.maxTotalThreadsPerThreadgroup, pipeline.threadExecutionWidth))
+                let end = CACurrentMediaTime() + profileSeconds
+                while CACurrentMediaTime() < end {
+                    let batch = try require(rig.gpu.makeBatch(), "no batch")
+                    let pass = try require(batch.makePass(), "no pass")
+                    for _ in 0..<dispatchesPerBuffer {
+                        switch kind {
+                        case .luma: encode(pass, rig, planes, pipeline: pipeline, luma: true, chroma422: nil)
+                        case .chromaAnd422: encode(pass, rig, planes, pipeline: pipeline, luma: false, chroma422: kernels.chroma422)
+                        case .chroma: encodeChroma420(pass, rig, planes, pipeline: pipeline)
+                        case .step422: encode422(pass, planes, pipeline: pipeline)
+                        }
+                        pass.barrier()
+                    }
+                    if let error = rig.gpu.commitAndWait(batch).error { throw BenchmarkError(description: error) }
+                }
+                Thread.sleep(forTimeInterval: profileGapSeconds)
+            }
+        } catch {
+            say("[profile] failed: \(error)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// What a profile stretch dispatches.
+    enum Kind { case luma, chromaAnd422, chroma, step422 }
+
+    /// The chroma kernel alone, writing sv22's 4:2:0 intermediate.
+    static func encodeChroma420(_ pass: ComputePass, _ rig: Rig, _ planes: Planes, pipeline: MTLComputePipelineState) {
+        pass.setTexture(planes.blY.0, index: 0); pass.setTexture(planes.blUV.0, index: 1)
+        pass.setBuffer(rig.params, index: 0)
+        pass.setBuffer(rig.nlq, index: 2)
+        pass.setBuffer(rig.mmr, index: 3)
+        pass.setPipeline(pipeline)
+        pass.setTexture(planes.elUV.0, index: 2)
+        pass.setTexture(planes.chroma420, index: 3)
+        pass.dispatchThreads(MTLSize(width: width / 2, height: height / 2, depth: 1), threadsPerThreadgroup: threadgroup(pipeline))
+    }
+
+    /// sv22's 4:2:0 -> 4:2:2 step alone, on the intermediate.
+    static func encode422(_ pass: ComputePass, _ planes: Planes, pipeline: MTLComputePipelineState) {
+        pass.setPipeline(pipeline)
+        pass.setTexture(planes.chroma420, index: 0); pass.setTexture(planes.outUV.0, index: 1)
+        pass.dispatchThreads(MTLSize(width: width / 2, height: height, depth: 1), threadsPerThreadgroup: threadgroup(pipeline))
+    }
+
+    static let profileSeconds = 0.3
+    static let profileGapSeconds = 0.2
+    /// Between "ready" and the first stretch, without a trigger file: time to start a recording.
+    static let profileLeadSeconds = 2.0
+    static let profileTriggerTimeout = 120.0
 
     struct BenchmarkError: Error, CustomStringConvertible {
         let description: String
@@ -112,11 +237,8 @@ public enum FelComposerBenchmark {
             base = try require(makeBuffer(width, height, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange), "no base buffer")
             enhancement = try require(makeBuffer(width / 2, height / 2, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange),
                                       "no enhancement buffer")
-            // Cheap deterministic noise, so neighbouring pixels differ like grain does.
-            func n(_ x: Int, _ y: Int) -> Int { Int((UInt32(truncatingIfNeeded: x &* 73_856_093 ^ y &* 19_349_663) >> 7) % 33) - 16 }
-            fill(base, y: { x, r in 64 + x * 876 / width + n(x, r) },
-                 uv: { x, r, c in 512 + (c == 0 ? (x * 2 * 300 / width) - 150 : (r * 2 * 300 / height) - 150) + n(x, r) / 2 })
-            fill(enhancement, y: { x, r in 512 + n(x, r) * 40 / 16 }, uv: { x, r, _ in 512 + n(r, x) * 20 / 16 })
+            try fill(base, enhancement: false, device: device, gpu: gpu, cache: self.cache)
+            try fill(enhancement, enhancement: true, device: device, gpu: gpu, cache: self.cache)
             let params = try clipAParams()
             self.params = try require(device.makeBuffer(length: DoviMetalParams.serializedSize, options: .storageModeShared),
                                       "no parameter buffer")
@@ -161,25 +283,62 @@ public enum FelComposerBenchmark {
         return b
     }
 
-    /// Fills a P010 buffer: plane 0 from `y(x, row)`, plane 1 from `uv(x, row, component)`, as 10-bit codes.
-    static func fill(_ b: CVPixelBuffer, y: (Int, Int) -> Int, uv: (Int, Int, Int) -> Int) {
-        CVPixelBufferLockBaseAddress(b, []); defer { CVPixelBufferUnlockBaseAddress(b, []) }
-        for plane in 0..<2 {
-            let base = CVPixelBufferGetBaseAddressOfPlane(b, plane)!
-            let stride = CVPixelBufferGetBytesPerRowOfPlane(b, plane) / 2
-            let w = CVPixelBufferGetWidthOfPlane(b, plane), h = CVPixelBufferGetHeightOfPlane(b, plane)
-            let p = base.assumingMemoryBound(to: UInt16.self)
-            for row in 0..<h {
-                for x in 0..<w {
-                    if plane == 0 {
-                        p[row * stride + x] = UInt16(min(max(y(x, row), 0), 1023) << 6)
-                    } else {
-                        p[row * stride + 2 * x] = UInt16(min(max(uv(x, row, 0), 0), 1023) << 6)
-                        p[row * stride + 2 * x + 1] = UInt16(min(max(uv(x, row, 1), 0), 1023) << 6)
-                    }
-                }
+    /// The test planes, written on the GPU (a 4K frame a pixel at a time took a minute in a Debug build): the base
+    /// layer a luma ramp across the frame with grain-like noise and chroma swept around neutral, the enhancement layer
+    /// +-40 codes of noise around 512, as 10-bit codes in a P010 buffer.
+    static let fillSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+    // Cheap deterministic noise, so neighbouring pixels differ like grain does.
+    static inline int rig_noise(uint x, uint y) { return int((((x * 73856093u) ^ (y * 19349663u)) >> 7) % 33u) - 16; }
+    static inline ushort rig_code(int v) { return ushort(clamp(v, 0, 1023) << 6); }
+    kernel void rig_fill(texture2d<ushort, access::write> y_tex [[texture(0)]],
+                         texture2d<ushort, access::write> uv_tex [[texture(1)]],
+                         constant uint3& dims [[buffer(0)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+        uint w = dims.x, h = dims.y;
+        bool el = dims.z != 0u;
+        if (gid.x >= w || gid.y >= h) { return; }
+        int n = rig_noise(gid.x, gid.y);
+        y_tex.write(ushort4(rig_code(el ? 512 + n * 40 / 16 : 64 + int(gid.x * 876u / w) + n), 0, 0, 0), gid);
+        if (gid.x < w / 2u && gid.y < h / 2u) {
+            int cb, cr;
+            if (el) {
+                cb = cr = 512 + rig_noise(gid.y, gid.x) * 20 / 16;
+            } else {
+                cb = 512 + int(gid.x * 2u * 300u / w) - 150 + n / 2;
+                cr = 512 + int(gid.y * 2u * 300u / h) - 150 + n / 2;
             }
+            uv_tex.write(ushort4(rig_code(cb), rig_code(cr), 0, 0), gid);
         }
+    }
+    """
+
+    static func fill(_ b: CVPixelBuffer, enhancement: Bool, device: MTLDevice, gpu: GPUSubmitter,
+                     cache: CVMetalTextureCache) throws {
+        let library = try device.makeLibrary(source: fillSource, options: nil)
+        let pipeline = try device.makeComputePipelineState(function: try require(library.makeFunction(name: "rig_fill"), "no fill kernel"))
+        func plane(_ index: Int, _ format: MTLPixelFormat) throws -> (MTLTexture, CVMetalTexture) {
+            var t: CVMetalTexture?
+            CVMetalTextureCacheCreateTextureFromImage(nil, cache, b, nil, format, CVPixelBufferGetWidthOfPlane(b, index),
+                                                      CVPixelBufferGetHeightOfPlane(b, index), index, &t)
+            let cv = try require(t, "no texture for plane \(index)")
+            return (try require(CVMetalTextureGetTexture(cv), "no Metal texture for plane \(index)"), cv)
+        }
+        let y = try plane(0, .r16Uint), uv = try plane(1, .rg16Uint)
+        var dims: SIMD3<UInt32> = [UInt32(CVPixelBufferGetWidth(b)), UInt32(CVPixelBufferGetHeight(b)), enhancement ? 1 : 0]
+        let dimsBuffer = try require(device.makeBuffer(bytes: &dims, length: MemoryLayout<SIMD3<UInt32>>.size, options: .storageModeShared),
+                                     "no fill parameters")
+        let batch = try require(gpu.makeBatch(), "no batch")
+        let pass = try require(batch.makePass(), "no pass")
+        pass.setPipeline(pipeline)
+        pass.setTexture(y.0, index: 0)
+        pass.setTexture(uv.0, index: 1)
+        pass.setBuffer(dimsBuffer, index: 0)
+        pass.dispatchThreads(MTLSize(width: Int(dims.x), height: Int(dims.y), depth: 1),
+                             threadsPerThreadgroup: MTLSize(width: 32, height: 8, depth: 1))
+        if let error = gpu.commitAndWait(batch).error { throw BenchmarkError(description: error) }
+        withExtendedLifetime((y.1, uv.1)) {}
     }
 
     static func texture(_ rig: Rig, _ b: CVPixelBuffer, plane: Int, _ format: MTLPixelFormat) throws -> (MTLTexture, CVMetalTexture) {
@@ -386,12 +545,12 @@ public enum FelComposerBenchmark {
     /// Luma: BL luma + one EL texel -> write. Chroma: the six BL luma taps, BL chroma, one EL texel -> write.
     static let floorOnly: [(String, String)] = [
         ("""
-    int bl_y = int(bl_y_tex.read(gid).r >> 6);
+    int bl_y = int(bl_y_tex.read(at).r >> 6);
 
     int h;
 """, """
-    int bl_y = int(bl_y_tex.read(gid).r >> 6);
-    {
+    int bl_y = int(bl_y_tex.read(at).r >> 6);
+    if (inside) {
         int e = int(el_y_tex.read(uint2(gid.x >> 1, gid.y >> 1)).r >> 6);
         out_y_tex.write(ushort4(ushort((bl_y + e) << 6), 0, 0, 0), gid);
         return;
@@ -399,11 +558,11 @@ public enum FelComposerBenchmark {
     int h;
 """),
         ("""
-    ushort4 bl_uv = bl_uv_tex.read(gid);
+    ushort4 bl_uv = bl_uv_tex.read(at);
     int bl_cb = int(bl_uv.r >> 6);
 """, """
-    ushort4 bl_uv = bl_uv_tex.read(gid);
-    {
+    ushort4 bl_uv = bl_uv_tex.read(at);
+    if (inside) {
         ushort e = el_uv_tex.read(uint2(gid.x >> 1, gid.y >> 1)).r;
         out_uv_tex.write(ushort4(ushort(bl_uv.r + ushort(bl_y) + e), bl_uv.g, 0, 0), gid);
         return;
@@ -423,7 +582,7 @@ public enum FelComposerBenchmark {
 """),
     ]
     static let chromaNoMmr: [(String, String)] = [
-        ("    if (curve.method[piece] == DOVI_MAPPING_MMR) {", "    if (false) {"),
+        ("    return piece >= 0 && curve.method[piece] == DOVI_MAPPING_MMR;", "    return false;"),
     ]
     static let lumaNoResidual: [(String, String)] = [
         ("    int el_code = 0;\n    if (residual) {", "    int el_code = 0;\n    if (false) {"),
@@ -439,25 +598,17 @@ public enum FelComposerBenchmark {
     static let lumaNoNlq: [(String, String)] = [
         ("        h += dovi_inv_nlq(nlq_lut, 0u, el_code);", "        h += el_code - 512;"),
     ]
-    /// The MMR table in constant memory: every lane of a SIMD-group almost always reads the same piece's coefficients.
-    static let mmrConstant: [(String, String)] = [
-        ("static inline int dovi_eval_mmr(device const int* k,", "static inline int dovi_eval_mmr(constant int* k,"),
-        ("    device const int* c = k + piece * DOVI_MMR_TABLE_PIECE_STRIDE;", "    constant int* c = k + piece * DOVI_MMR_TABLE_PIECE_STRIDE;"),
-        ("        device const float* f = (device const float*)(c + DOVI_MMR_TABLE_FLOAT_OFFSET);",
-         "        constant float* f = (constant float*)(c + DOVI_MMR_TABLE_FLOAT_OFFSET);"),
-        ("    device const int* mmr,", "    constant int* mmr,"),
-        ("    device const int*                      mmr_table     [[buffer(3)]],", "    constant int*                          mmr_table     [[buffer(3)]],"),
-    ]
-    /// MMR split: the terms formed but the piece not evaluated, and each of the evaluation's two sums left out.
+    /// MMR split: the terms formed but no coefficient read (each term folded into the sum's low word), and each of
+    /// the estimate path's two sums left out.
     static let chromaNoMmrSum: [(String, String)] = [
-        ("        return dovi_eval_mmr(mmr, piece, curve.order[piece], mmr_coef_shift, tt, ttf);",
-         "        return int(tt[20] ^ tt[13] ^ tt[6]) + int(ttf[20]);"),
+        ("static inline void dovi_mmr_add(thread DoviMmrSum &s, int c, uint t) {",
+         "static inline void dovi_mmr_add(thread DoviMmrSum &s, int c, uint t) {\n    s.acc.lo ^= t;\n    return;"),
     ]
     static let chromaNoIntSum: [(String, String)] = [
-        ("                    lo += uint(c[1u + i]) * tt[i];", "                    lo += uint(c[1u + i]);"),
+        ("        s.acc.lo += uint(c) * t;", "        s.acc.lo += uint(c);"),
     ]
     static let chromaNoFloatSum: [(String, String)] = [
-        ("                    e = fma(f[1u + i], ttf[i], e);", "                    e += f[1u + i];"),
+        ("        s.e = fma(float(c), float(t), s.e);", "        s.e += float(c);"),
     ]
     static let chromaNoResidual: [(String, String)] = [
         ("    if (residual && dovi_residual_at(params, gid.x * 2u)) {", "    if (false) {"),

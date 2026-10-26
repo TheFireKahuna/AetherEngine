@@ -160,9 +160,12 @@ final class DoviFelComposer: @unchecked Sendable {
         private let variantLock = NSLock()
         private var variantResults: [Variant: Result<Kernels, Error>] = [:]
 
-        /// One specialisation of the function constants: `dovi_fc_blue_noise` (0).
+        /// One specialisation of the function constants: `dovi_fc_blue_noise` (0), `dovi_fc_mmr_exact` (1).
         struct Variant: Hashable, Sendable {
             var blueNoise = false
+            /// The MMR sums kept as two exact words throughout, for a frame some piece of which the float estimate
+            /// cannot pin (`populateMmrTable`).
+            var mmrExact = false
         }
 
         /// The composition kernels of one ``Variant``, and sv22's 4:2:0 -> 4:2:2 step (no specialisation).
@@ -213,6 +216,8 @@ final class DoviFelComposer: @unchecked Sendable {
             let values = MTLFunctionConstantValues()
             var blueNoise = variant.blueNoise
             values.setConstantValue(&blueNoise, type: .bool, index: 0)
+            var mmrExact = variant.mmrExact
+            values.setConstantValue(&mmrExact, type: .bool, index: 1)
             return try library.makeFunction(name: name, constantValues: values)
         }
 
@@ -1016,8 +1021,11 @@ final class DoviFelComposer: @unchecked Sendable {
         }
         if outputMode == .sv22 { serialized.flags.insert(.chroma422) }
         serialized.serialize(into: rawBuffer)
-        // The blue-noise dither lives in its own specialisation of the kernels (`dovi_fc_blue_noise`).
-        guard let kernels = try? pipelines.kernels(SharedPipelines.Variant(blueNoise: serialized.ditherMode == .blueNoise)),
+        let mmrBuffer = mmrTableBuffers[paramSlot]
+        let mmrExact = Self.populateMmrTable(into: mmrBuffer.contents().assumingMemoryBound(to: Int32.self), params: serialized)
+        // The blue-noise dither and the exact MMR sums live in their own specialisations of the kernels.
+        guard let kernels = try? pipelines.kernels(SharedPipelines.Variant(blueNoise: serialized.ditherMode == .blueNoise,
+                                                                          mmrExact: mmrExact)),
               // The composition kernels upsample the EL with SIMD-group shuffles: whole threadgroups, 32 wide,
               // refused where the SIMD-group is not 32 lanes.
               let lumaThreads = Self.elUpsamplingThreadgroup(for: kernels.luma),
@@ -1042,8 +1050,6 @@ final class DoviFelComposer: @unchecked Sendable {
         populateLumaLut(into: lutBuffer.contents().assumingMemoryBound(to: Int32.self), params: metalParams)
         let nlqBuffer = nlqLutBuffers[paramSlot]
         Self.populateNlqLut(into: nlqBuffer.contents().assumingMemoryBound(to: Int32.self), params: serialized)
-        let mmrBuffer = mmrTableBuffers[paramSlot]
-        Self.populateMmrTable(into: mmrBuffer.contents().assumingMemoryBound(to: Int32.self), params: serialized)
 
         guard let pass = batch.makePass() else {
             returnParamSlot(paramSlot)
@@ -1144,39 +1150,50 @@ final class DoviFelComposer: @unchecked Sendable {
         fillNlq(ptr + 2 * nlqLutCodes, params.nlqCr)
     }
 
-    /// 32-bit words in the per-frame MMR table: Y, Cb, Cr, each `maxPieces` pieces of the constant, the 21
-    /// coefficients and the estimate flag, as `Int32`, then the same layout as `Float`.
-    static let mmrTablePieceStride = 1 + DoviMmrParams.coefficientsPerPiece + 1
-    static let mmrTableCount = 2 * 3 * DoviMmrParams.maxPieces * mmrTablePieceStride
+    /// 32-bit words in the per-frame MMR table: Y, Cb, Cr, each `mmrTablePieces` pieces of the constant and the 21
+    /// coefficients, as `Int32`. The last piece of each component is all zeros: a sample whose piece is not MMR sums
+    /// against it, so every sample runs the same code.
+    static let mmrTablePieceStride = 1 + DoviMmrParams.coefficientsPerPiece
+    static let mmrTablePieces = DoviMmrParams.maxPieces + 1
+    static let mmrTableCount = 3 * mmrTablePieces * mmrTablePieceStride
 
     /// The largest sum of |coefficient * term| for which the kernels pin the 64-bit MMR sum's high word from a float
-    /// estimate (`dovi_eval_mmr`): the estimate's error, (21 + 2) * 2^-24 of it, stays under 2^31.
+    /// estimate (the estimate pipelines, `dovi_fc_mmr_exact` false): the estimate's error, (21 + 2) * 2^-24 of it,
+    /// stays under 2^31.
     static let mmrEstimateBound = Double(1 << 49)
 
     /// Fills the MMR table the kernels read (`DOVI_MMR_TABLE_*` in the shader): per component and piece the
-    /// constant then the 21 coefficients, Q(coefficient_log2_denom), which the kernels multiply into the 64-bit
-    /// sum, and whether every term below 2^20 keeps the piece's sum of |coefficient * term|
-    /// within ``mmrEstimateBound``; then the coefficients' float values in the same layout.
-    static func populateMmrTable(into ptr: UnsafeMutablePointer<Int32>, params: DoviMetalParams) {
+    /// constant then the 21 coefficients, Q(coefficient_log2_denom), which the kernels multiply into the 64-bit sum
+    /// (and, on the estimate path, convert to float for the estimate). A piece's coefficients above its order are
+    /// written as zero, so the kernels add all 21 terms whatever the order and get the order's sum exactly.
+    ///
+    /// Returns whether the frame needs the exact pipelines: some MMR piece the kernels can reach (luma's only when
+    /// its curve is MMR) has a sum of |coefficient * term|, every term below 2^20, over ``mmrEstimateBound``.
+    @discardableResult
+    static func populateMmrTable(into ptr: UnsafeMutablePointer<Int32>, params: DoviMetalParams) -> Bool {
         let piece = mmrTablePieceStride
-        let floats = UnsafeMutableRawPointer(ptr + mmrTableCount / 2).assumingMemoryBound(to: Float.self)
         let ceiling = Double(1 << 20)
-        for (component, mmr) in [params.mmrY, params.mmrCb, params.mmrCr].enumerated() {
-            for p in 0..<DoviMmrParams.maxPieces {
-                let at = (component * DoviMmrParams.maxPieces + p) * piece
-                let base = ptr + at, f = floats + at
-                base[0] = mmr.constant[p]
-                f[0] = Float(mmr.constant[p])
-                var bound = abs(Double(mmr.constant[p])) * ceiling
+        var needsExact = false
+        let components = [(params.polyY, params.mmrY, params.flags.contains(.lumaMmr)),
+                          (params.polyCb, params.mmrCb, true), (params.polyCr, params.mmrCr, true)]
+        for (component, (curve, mmr, reachable)) in components.enumerated() {
+            for p in 0..<mmrTablePieces {
+                let at = (component * mmrTablePieces + p) * piece
+                let base = ptr + at
+                let isPiece = p < DoviMmrParams.maxPieces
+                let terms = isPiece ? 7 * min(Int(curve.order[p]), 3) : 0
+                base[0] = isPiece ? mmr.constant[p] : 0
+                var bound = abs(Double(base[0])) * ceiling
                 for t in 0..<DoviMmrParams.coefficientsPerPiece {
-                    base[1 + t] = mmr.coef[p][t]
-                    f[1 + t] = Float(mmr.coef[p][t])
-                    bound += abs(Double(mmr.coef[p][t])) * ceiling
+                    base[1 + t] = t < terms ? mmr.coef[p][t] : 0
+                    bound += abs(Double(base[1 + t])) * ceiling
                 }
-                base[piece - 1] = bound <= mmrEstimateBound ? 1 : 0
-                f[piece - 1] = 0
+                let used = isPiece && reachable && curve.numPivots >= 2 && p < Int(curve.numPivots) - 1
+                    && curve.method[p] == DoviMapping.mmr.rawValue
+                if used, bound > mmrEstimateBound { needsExact = true }
             }
         }
+        return needsExact
     }
 
     private static func fillNlq(_ ptr: UnsafeMutablePointer<Int32>, _ nlq: DoviNlqParams) {

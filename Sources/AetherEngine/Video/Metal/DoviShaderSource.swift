@@ -41,11 +41,13 @@ typedef int  dovi_i32;
 #define DOVI_MAPPING_POLYNOMIAL       0
 #define DOVI_MAPPING_MMR              1
 
-/* ---- per-frame MMR table (buffer 3): [Y, Cb, Cr][piece 0..7][constant, 21 coefficients, estimate flag] as int,
-        then the same layout again as float (the coefficients' float values; the flag slot unused) ---- */
-#define DOVI_MMR_TABLE_PIECE_STRIDE      23
-#define DOVI_MMR_TABLE_COMPONENT_STRIDE  (8 * DOVI_MMR_TABLE_PIECE_STRIDE)
-#define DOVI_MMR_TABLE_FLOAT_OFFSET      (3 * DOVI_MMR_TABLE_COMPONENT_STRIDE)
+/* ---- per-frame MMR table (buffer 3): [Y, Cb, Cr][piece 0..8][constant, 21 coefficients] as int. Piece 8 of each
+        component is all zeros, and a piece's coefficients above its order are zero: every sample sums all 21 terms
+        against some piece. ---- */
+#define DOVI_MMR_TABLE_PIECE_STRIDE      22
+#define DOVI_MMR_TABLE_PIECES            9
+#define DOVI_MMR_ZERO_PIECE              8
+#define DOVI_MMR_TABLE_COMPONENT_STRIDE  (DOVI_MMR_TABLE_PIECES * DOVI_MMR_TABLE_PIECE_STRIDE)
 
 /* ---- flags ---- */
 #define DOVI_FLAG_DISABLE_RESIDUAL    0x1u /* disable_residual_flag, or el_type == MEL */
@@ -182,6 +184,11 @@ constant float dovi_bayer_8x8[64] = {
 // time measured +2.5% UHD GPU time on an M4 Pro (0.743 -> 0.762 ms), with no blue-noise frame in sight.
 constant bool dovi_fc_blue_noise [[function_constant(0)]];
 
+// Function constant 1: the MMR sums kept as two exact words throughout (`dovi_acc_add`), for a frame with a piece the
+// float estimate cannot pin; false, the default, takes the estimate path for every piece. Chosen per frame by the
+// composer (`populateMmrTable`), so neither pipeline carries the other's path.
+constant bool dovi_fc_mmr_exact [[function_constant(1)]];
+
 // Blue-noise threshold in [0.5/4096, 4095.5/4096]: rank k of the 4096 cells maps to (k + 0.5) / 4096, so the
 // mean over the tile is exactly 0.5, the rounding bias of the undithered branch. A 10-bit code plus the
 // threshold needs 10 + 13 bits, inside float's 24, so floor(v + d) is exact. Each component reads the tile at
@@ -273,7 +280,7 @@ struct DoviAcc {
     uint lo;
 };
 
-// constant << 20, the constant term `coef * tt[0]` (`poly_coef[0] * (1 << 20)`).
+// constant << 20, the constant term: the coefficient against the term 1.0 in Q20 (`poly_coef[0] * (1 << 20)`).
 static inline DoviAcc dovi_acc_constant(int c) {
     return DoviAcc{ c >> 12, uint(c) << 20 };
 }
@@ -343,72 +350,107 @@ static inline int dovi_eval_poly(constant struct DoviPolynomialParams &curve, in
     return dovi_prediction(acc, curve.coef_shift[piece]);
 }
 
-// The MMR terms tt[1...21] for inputs already clamped to their pivots, up to `order`: the seven terms [s0, s1, s2,
-// s0s1, s0s2, s1s2, s0s1s2], then their squares, then their cubes (term * square), each product truncated back to
-// Q20. Cb and Cr read the same three inputs, so a chroma sample forms these once for both.
-static inline void dovi_mmr_terms(uint t0, uint t1, uint t2, uint order, thread uint* tt, thread float* ttf) {
-    tt[0] = t0;
-    tt[1] = t1;
-    tt[2] = t2;
-    tt[3] = dovi_mul_q20(t0, t1);
-    tt[4] = dovi_mul_q20(t0, t2);
-    tt[5] = dovi_mul_q20(t1, t2);
-    tt[6] = dovi_mul_q20(tt[3], t2);
-    if (order >= 2u) {
-        for (int j = 0; j < 7; ++j) {
-            tt[7 + j] = dovi_mul_q20(tt[j], tt[j]);
-        }
-    }
-    if (order >= 3u) {
-        for (int j = 0; j < 7; ++j) {
-            tt[14 + j] = dovi_mul_q20(tt[j], tt[7 + j]);
-        }
-    }
-    // The float values the estimate reads (exact: every term is below 2^24), formed once for Cb and Cr.
-    for (int j = 0; j < 21; ++j) {
-        ttf[j] = float(tt[j]);
+// One component's MMR sum. The sum vv is a 64-bit integer. On the estimate path (`dovi_fc_mmr_exact` false) its low
+// word is exact from wrapping 32-bit multiply-adds, one multiply per coefficient, and its high word is pinned by a
+// float estimate E of the same sum, the coefficients' float values against the exact terms (every term is below
+// 2^24, so its float value is exact; each coefficient's float value is converted where it is used, the same rounding
+// the CPU's bound assumes): with A = sum of |c * t|, E is within (n + 2) * 2^-24 * A of vv in whatever order the
+// terms are added, and for A <= 2^49 that is under 2^31, so hi = rint((E - lo) / 2^32) is vv's high word exactly. The
+// CPU bounds A for every piece the frame can reach with the term ceiling 2^20; a frame with a piece it cannot bound
+// gets the exact pipelines, which carry both words through two-word products for any coefficient. Either way the
+// sum does not depend on the order its terms arrive in, and a zero coefficient adds exactly nothing.
+struct DoviMmrSum {
+    DoviAcc acc;
+    float e;
+};
+
+// Coefficient c against the term t (Q20; the constant is coefficient 0 against 1 << 20, 1.0).
+static inline void dovi_mmr_add(thread DoviMmrSum &s, int c, uint t) {
+    if (dovi_fc_mmr_exact) {
+        dovi_acc_add(s.acc, c, t);
+    } else {
+        s.acc.lo += uint(c) * t;
+        s.e = fma(float(c), float(t), s.e);
     }
 }
 
-// MMR piece: the constant and the order's terms against their coefficients. `k` is this component's slice
-// of the per-frame MMR table (`populateMmrTable`): per piece the constant, the 21 coefficients, Q(coef_shift), and
-// whether the estimate below is safe for the piece.
+// The sum's 16-bit prediction.
+static inline int dovi_mmr_end(thread const DoviMmrSum &s, uint coef_shift) {
+    if (dovi_fc_mmr_exact) {
+        return dovi_prediction(s.acc, coef_shift);
+    }
+    int hi = int(rint((s.e - float(s.acc.lo)) * 0x1p-32f));
+    return dovi_prediction(DoviAcc{ hi, s.acc.lo }, coef_shift);
+}
+
+// Coefficient i of this pass's piece, from the lane that loaded it (`dovi_mmr_shared`), or 0 for a lane whose piece
+// is another pass's. Every lane takes part in the shuffle.
+static inline int dovi_mmr_coef(int loaded, ushort i, bool mine) {
+    int c = simd_shuffle(loaded, i);
+    return mine ? c : 0;
+}
+
+// Term j of the seven [s0, s1, s2, s0s1, s0s2, s1s2, s0s1s2], its square and its cube (term * square), each product
+// truncated back to Q20, against coefficients 1 + j, 8 + j and 15 + j of `a`'s piece (and, with `Both`, `b`'s).
+template <bool Both>
+static inline void dovi_mmr_feed(thread DoviMmrSum &a, int ka, thread DoviMmrSum &b, int kb, bool mine,
+                                 ushort j, uint term) {
+    uint square = dovi_mul_q20(term, term);
+    uint cube = dovi_mul_q20(term, square);
+    dovi_mmr_add(a, dovi_mmr_coef(ka, ushort(1 + j), mine), term);
+    dovi_mmr_add(a, dovi_mmr_coef(ka, ushort(8 + j), mine), square);
+    dovi_mmr_add(a, dovi_mmr_coef(ka, ushort(15 + j), mine), cube);
+    if (Both) {
+        dovi_mmr_add(b, dovi_mmr_coef(kb, ushort(1 + j), mine), term);
+        dovi_mmr_add(b, dovi_mmr_coef(kb, ushort(8 + j), mine), square);
+        dovi_mmr_add(b, dovi_mmr_coef(kb, ushort(15 + j), mine), cube);
+    }
+}
+
+// The MMR sums of this sample's pieces, `piece_a` of `table_a` (and with `Both`, `piece_b` of `table_b`: Cb and Cr
+// read the same three inputs), with the coefficients shared across the SIMD-group instead of every lane loading its
+// own: in each pass the first lane still pending names a piece (pair), lane L loads coefficient L of it (the
+// constant, then the 21), and every term takes its coefficient from that lane by shuffle. A lane whose pieces are
+// the pass's adds them; any other adds zero coefficients, exactly nothing, and waits for a later pass. A group on
+// one piece, as nearly every one is, takes one pass. `need` false (no MMR piece, or outside the picture) never
+// counts as pending. Every lane of the SIMD-group must be here: the shuffles read every lane.
 //
-// The sum vv is a 64-bit integer. Its low word is exact from wrapping 32-bit multiply-adds, one multiply per
-// coefficient. Its high word is pinned by a float estimate E of the same sum, the coefficients' float values against
-// the exact terms: with A = sum of |c * t|, E is within (n + 2) * 2^-24 * A of vv, and for A <= 2^49 that is under
-// 2^31, so hi = rint((E - lo) / 2^32) is vv's high word exactly. The CPU bounds A per piece with the term ceiling
-// 2^20 and sets the flag; a piece it cannot bound takes the two-word product path, exact for any coefficient.
-static inline int dovi_eval_mmr(device const int* k, int piece, uint order, uint coef_shift, thread const uint* tt,
-                                thread const float* ttf) {
-    device const int* c = k + piece * DOVI_MMR_TABLE_PIECE_STRIDE;
-    // Loops of fixed length, the order tested per block of seven: a loop bound known only at run time would keep
-    // tt[] in addressable memory instead of registers.
-    if (c[22] != 0) {
-        device const float* f = (device const float*)(c + DOVI_MMR_TABLE_FLOAT_OFFSET);
-        uint lo = uint(c[0]) << 20;
-        float e = f[0] * 1048576.0f;
-        for (uint o = 0u; o < 3u; ++o) {
-            if (o < order) {
-                for (uint j = 0u; j < 7u; ++j) {
-                    uint i = o * 7u + j;
-                    lo += uint(c[1u + i]) * tt[i];
-                    e = fma(f[1u + i], ttf[i], e);
-                }
-            }
+// Each term is formed once a pass, for all 21 coefficients (a piece's coefficients above its order are zero in the
+// table) and dropped once it is added: the sample holds three inputs, one term, two sums and one coefficient a
+// component, never its 21 terms or their coefficients.
+template <bool Both>
+static inline void dovi_mmr_shared(device const int* table_a, int piece_a, device const int* table_b, int piece_b,
+                                   bool need, uint t0, uint t1, uint t2, uint lane,
+                                   thread DoviMmrSum &a, thread DoviMmrSum &b) {
+    a = DoviMmrSum{ DoviAcc{ 0, 0u }, 0.0f };
+    b = DoviMmrSum{ DoviAcc{ 0, 0u }, 0.0f };
+    bool pending = need;
+    uint t01 = dovi_mul_q20(t0, t1);
+    while (true) {
+        uint waiting = uint(uint64_t(simd_ballot(pending)));
+        if (waiting == 0u) {
+            break;
         }
-        int hi = int(rint((e - float(lo)) * 0x1p-32f));
-        return dovi_prediction(DoviAcc{ hi, lo }, coef_shift);
-    }
-    DoviAcc acc = dovi_acc_constant(c[0]);
-    for (uint o = 0u; o < 3u; ++o) {
-        if (o < order) {
-            for (uint j = 0u; j < 7u; ++j) {
-                dovi_acc_add(acc, c[1u + o * 7u + j], tt[o * 7u + j]);
-            }
+        ushort leader = ushort(ctz(waiting));
+        int pass_a = simd_shuffle(piece_a, leader);
+        int pass_b = Both ? simd_shuffle(piece_b, leader) : 0;
+        bool mine = pending && piece_a == pass_a && (!Both || piece_b == pass_b);
+        uint k = min(lane, uint(DOVI_MMR_TABLE_PIECE_STRIDE - 1));
+        int ka = table_a[pass_a * DOVI_MMR_TABLE_PIECE_STRIDE + k];
+        int kb = Both ? table_b[pass_b * DOVI_MMR_TABLE_PIECE_STRIDE + k] : 0;
+        dovi_mmr_add(a, dovi_mmr_coef(ka, ushort(0), mine), 1u << 20);
+        if (Both) {
+            dovi_mmr_add(b, dovi_mmr_coef(kb, ushort(0), mine), 1u << 20);
         }
+        dovi_mmr_feed<Both>(a, ka, b, kb, mine, ushort(0), t0);
+        dovi_mmr_feed<Both>(a, ka, b, kb, mine, ushort(1), t1);
+        dovi_mmr_feed<Both>(a, ka, b, kb, mine, ushort(2), t2);
+        dovi_mmr_feed<Both>(a, ka, b, kb, mine, ushort(3), t01);
+        dovi_mmr_feed<Both>(a, ka, b, kb, mine, ushort(4), dovi_mul_q20(t0, t2));
+        dovi_mmr_feed<Both>(a, ka, b, kb, mine, ushort(5), dovi_mul_q20(t1, t2));
+        dovi_mmr_feed<Both>(a, ka, b, kb, mine, ushort(6), dovi_mul_q20(t01, t2));
+        pending = pending && !mine;
     }
-    return dovi_prediction(acc, coef_shift);
 }
 
 // The MMR inputs of a sample: luma (downsampled to the chroma site) and the two chroma values, each
@@ -426,30 +468,18 @@ static inline int dovi_curve_piece(constant struct DoviPolynomialParams &curve, 
     return curve.num_pivots < 2u ? -1 : dovi_select_piece(curve, t, shift);
 }
 
-// Whether `curve`'s `piece` is MMR, and that piece's order (0 when it is not).
-static inline uint dovi_mmr_order(constant struct DoviPolynomialParams &curve, int piece) {
-    return piece >= 0 && curve.method[piece] == DOVI_MAPPING_MMR ? curve.order[piece] : 0u;
+// Whether `curve`'s `piece` is MMR (piece -1, identity, is not).
+static inline bool dovi_is_mmr(constant struct DoviPolynomialParams &curve, int piece) {
+    return piece >= 0 && curve.method[piece] == DOVI_MAPPING_MMR;
 }
 
-// One component's 16-bit prediction from its own value t (Q20), in `piece` (`dovi_curve_piece`). An MMR piece reads
-// `tt`, the sample's MMR terms (dovi_mmr_terms), formed up to at least its order. Piece -1, num_pivots < 2, is the
-// parser's fail-safe for a curve it could not trust, and means identity: the base layer passes through untouched
-// (v = s << (16 - BL_bit_depth), the identity polynomial's exact value).
-static inline int dovi_eval_curve(
-    constant struct DoviPolynomialParams &curve,
-    int piece,
-    device const int* mmr,
-    uint mmr_coef_shift,
-    uint t,
-    thread const uint* tt,
-    thread const float* ttf,
-    uint shift)
-{
+// One component's 16-bit prediction from its own value t (Q20), in a `piece` (`dovi_curve_piece`) that is not MMR (an
+// MMR piece's is `dovi_mmr_end`). Piece -1, num_pivots < 2, is the parser's fail-safe for a curve it could not
+// trust, and means identity: the base layer passes through untouched (v = s << (16 - BL_bit_depth), the identity
+// polynomial's exact value).
+static inline int dovi_eval_curve(constant struct DoviPolynomialParams &curve, int piece, uint t, uint shift) {
     if (piece < 0) {
         return int(min(t >> 4, 0xffffu));
-    }
-    if (curve.method[piece] == DOVI_MAPPING_MMR) {
-        return dovi_eval_mmr(mmr, piece, curve.order[piece], mmr_coef_shift, tt, ttf);
     }
     return dovi_eval_poly(curve, piece, t, shift);
 }
@@ -666,29 +696,29 @@ kernel void dovi_compose_luma(
     if (residual) {
         el_code = dovi_el_luma(el_y_tex, gid, lane, uint2(params.el_width, params.el_height));
     }
-    if (gid.x >= params.bl_width || gid.y >= params.bl_height) {
-        return;
-    }
+    // A lane past the picture reads the edge and stays until the MMR's shuffles are done (they read every lane).
+    bool inside = gid.x < params.bl_width && gid.y < params.bl_height;
+    uint2 at = min(gid, uint2(params.bl_width - 1u, params.bl_height - 1u));
 
-    int bl_y = int(bl_y_tex.read(gid).r >> 6);
+    int bl_y = int(bl_y_tex.read(at).r >> 6);
 
     int h;
     if ((params.flags & DOVI_FLAG_LUMA_MMR) == 0u) {
         h = luma_lut[bl_y];
     } else {
         uint shift = dovi_q20_shift(params.bl_max);
-        ushort4 bl_uv = bl_uv_tex.read(uint2(gid.x >> 1, gid.y >> 1));
+        ushort4 bl_uv = bl_uv_tex.read(uint2(at.x >> 1, at.y >> 1));
         uint t = uint(bl_y) << shift;
-        uint tt[21];
-        float ttf[21];
         int piece = dovi_curve_piece(params.poly_y, t, shift);
-        uint order = dovi_mmr_order(params.poly_y, piece);
-        if (order > 0u) {
-            uint c0, c1, c2;
-            dovi_mmr_inputs(params, t, uint(bl_uv.r >> 6) << shift, uint(bl_uv.g >> 6) << shift, shift, c0, c1, c2);
-            dovi_mmr_terms(c0, c1, c2, order, tt, ttf);
-        }
-        h = dovi_eval_curve(params.poly_y, piece, mmr_table, params.mmr_y.coef_shift, t, tt, ttf, shift);
+        bool mmr = dovi_is_mmr(params.poly_y, piece);
+        uint c0, c1, c2;
+        dovi_mmr_inputs(params, t, uint(bl_uv.r >> 6) << shift, uint(bl_uv.g >> 6) << shift, shift, c0, c1, c2);
+        DoviMmrSum sum, unused;
+        dovi_mmr_shared<false>(mmr_table, piece, mmr_table, 0, inside && mmr, c0, c1, c2, lane, sum, unused);
+        h = mmr ? dovi_mmr_end(sum, params.mmr_y.coef_shift) : dovi_eval_curve(params.poly_y, piece, t, shift);
+    }
+    if (!inside) {
+        return;
     }
 
     if (residual && dovi_residual_at(params, gid.x)) {
@@ -737,9 +767,9 @@ kernel void dovi_compose_chroma(
                                       uint2(dovi_chroma_size(params.el_width), dovi_chroma_size(params.el_height)));
     }
 
-    if (gid.x >= uv_width || gid.y >= uv_height) {
-        return;
-    }
+    // A lane past the picture reads the edge and stays until the MMR's shuffles are done (they read every lane).
+    bool inside = gid.x < uv_width && gid.y < uv_height;
+    uint2 at = min(gid, uint2(uv_width - 1u, uv_height - 1u));
 
     // Base-layer luma at the chroma site, for the cross-component terms: [1 2 1]
     // around the even column in each of the cell's two rows, then the rows
@@ -747,12 +777,12 @@ kernel void dovi_compose_chroma(
     // Dolby-encoded streams agree with it: on one with order-3 MMR chroma the
     // coded residual matches it at about half the error of the plain vertical
     // 2-tap this kernel used before.
-    uint lx = min(gid.x * 2u, params.bl_width - 1u);
+    uint lx = min(at.x * 2u, params.bl_width - 1u);
     uint lxl = lx > 0u ? lx - 1u : 0u;
     uint lxr = min(lx + 1u, params.bl_width - 1u);
     int bl_y = 0;
     for (uint r = 0u; r < 2u; ++r) {
-        uint ly = min(gid.y * 2u + r, params.bl_height - 1u);
+        uint ly = min(at.y * 2u + r, params.bl_height - 1u);
         int row = int(bl_y_tex.read(uint2(lxl, ly)).r >> 6)
                 + 2 * int(bl_y_tex.read(uint2(lx, ly)).r >> 6)
                 + int(bl_y_tex.read(uint2(lxr, ly)).r >> 6);
@@ -760,25 +790,26 @@ kernel void dovi_compose_chroma(
     }
     bl_y = (bl_y + 1) >> 1;
 
-    ushort4 bl_uv = bl_uv_tex.read(gid);
+    ushort4 bl_uv = bl_uv_tex.read(at);
     int bl_cb = int(bl_uv.r >> 6);
     int bl_cr = int(bl_uv.g >> 6);
 
     uint shift = dovi_q20_shift(params.bl_max);
     uint t0 = uint(bl_y) << shift, t1 = uint(bl_cb) << shift, t2 = uint(bl_cr) << shift;
     int piece_cb = dovi_curve_piece(params.poly_cb, t1, shift), piece_cr = dovi_curve_piece(params.poly_cr, t2, shift);
-    uint order = max(dovi_mmr_order(params.poly_cb, piece_cb), dovi_mmr_order(params.poly_cr, piece_cr));
-    uint tt[21];
-    float ttf[21];
-    if (order > 0u) {
-        uint c0, c1, c2;
-        dovi_mmr_inputs(params, t0, t1, t2, shift, c0, c1, c2);
-        dovi_mmr_terms(c0, c1, c2, order, tt, ttf);
+    bool mmr_cb = dovi_is_mmr(params.poly_cb, piece_cb), mmr_cr = dovi_is_mmr(params.poly_cr, piece_cr);
+    // One pass over the terms feeds both sums; a component whose piece is not MMR sums against the zero piece.
+    uint c0, c1, c2;
+    dovi_mmr_inputs(params, t0, t1, t2, shift, c0, c1, c2);
+    DoviMmrSum sum_cb, sum_cr;
+    dovi_mmr_shared<true>(mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE, mmr_cb ? piece_cb : DOVI_MMR_ZERO_PIECE,
+                          mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE, mmr_cr ? piece_cr : DOVI_MMR_ZERO_PIECE,
+                          inside && (mmr_cb || mmr_cr), c0, c1, c2, lane, sum_cb, sum_cr);
+    int h_cb = mmr_cb ? dovi_mmr_end(sum_cb, params.mmr_cb.coef_shift) : dovi_eval_curve(params.poly_cb, piece_cb, t1, shift);
+    int h_cr = mmr_cr ? dovi_mmr_end(sum_cr, params.mmr_cr.coef_shift) : dovi_eval_curve(params.poly_cr, piece_cr, t2, shift);
+    if (!inside) {
+        return;
     }
-    int h_cb = dovi_eval_curve(params.poly_cb, piece_cb, mmr_table + DOVI_MMR_TABLE_COMPONENT_STRIDE,
-                               params.mmr_cb.coef_shift, t1, tt, ttf, shift);
-    int h_cr = dovi_eval_curve(params.poly_cr, piece_cr, mmr_table + 2 * DOVI_MMR_TABLE_COMPONENT_STRIDE,
-                               params.mmr_cr.coef_shift, t2, tt, ttf, shift);
 
     if (residual && dovi_residual_at(params, gid.x * 2u)) {
         if (cb_active) {
