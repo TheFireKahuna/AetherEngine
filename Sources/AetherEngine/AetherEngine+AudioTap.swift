@@ -82,8 +82,10 @@ extension AetherEngine {
 
     @MainActor
     private func makeNativeTapReader(controller: AudioTapController) -> LoopbackAudioReader? {
+        // The audio is in the audio rendition's segments when it is a rendition of its own, in the video's when
+        // muxed; the two share one index space.
         guard let session = nativeVideoSession,
-              let cache = session.cache,
+              let cache = session.audioRenditionCache ?? session.cache,
               let provider = session.provider,
               let yield = controller.makeYield() else { return nil }
         // Video-only source: no audio pipeline was built, nothing to tap.

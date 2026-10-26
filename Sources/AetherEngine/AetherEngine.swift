@@ -2802,6 +2802,36 @@ public final class AetherEngine: ObservableObject {
     /// session so a media reload that also fails cannot loop. Reset on each load.
     var masterFallbackUsed = false
 
+    /// A demuxed session whose master was refused plays from the media playlist from then on (docs/demuxed-audio.md):
+    /// it is rebuilt for it (`rebuildsForMediaPlaylist`), and so is every session-preserving rebuild after. A
+    /// load that is not one resets it.
+    var servesMediaPlaylistAfterRefusal = false
+
+    /// The media fallback of a session whose own media playlist cannot carry its audio: a demuxed session's is
+    /// its video alone, its audio a rendition only a master names. The session is rebuilt at the playhead
+    /// for the media playlist, which carries its audio muxed (`HLSVideoEngine.servesMediaPlaylistOnly`).
+    /// False for a muxed session, which swaps its item in place as before.
+    @MainActor
+    func rebuildsForMediaPlaylist(_ session: HLSVideoEngine, because reason: String) -> Bool {
+        guard session.outputShape == .demuxed else { return false }
+        servesMediaPlaylistAfterRefusal = true
+        EngineLog.emit("[AetherEngine] \(reason); the session's audio is a rendition the media playlist cannot "
+                       + "name, so it is rebuilt at the playhead to play from the media playlist, audio muxed",
+                       category: .session)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.reloadAtCurrentPosition()
+            } catch is CancellationError {
+            } catch {
+                self.publishError(PlaybackErrorInfo(kind: .masterPlaylistRejected,
+                                                    message: "media playlist rebuild failed: \(error)",
+                                                    underlyingDomain: nil, underlyingCode: nil))
+            }
+        }
+        return true
+    }
+
     /// #93 PiP skips: AVKit-side seeks (PiP +-15s buttons) bypass the engine seek API, so every landing
     /// the item states (`AVPlayerItemTimeJumpedNotification`) is checked, once settled, against the
     /// rendition's reading; one outside it replays the remembered rendition selection: its demand moves
@@ -3007,6 +3037,9 @@ public final class AetherEngine: ObservableObject {
         // VOD reloads where the rejected item was placed. That is not always where the session
         // started: the #93/#65 stage-2 recovery swaps a fresh item in at the position it held, and a
         // rejection of THAT item has to come back there, not rewind to the first mount.
+        if rebuildsForMediaPlaylist(session, because: "AVPlayer rejected the master (code=\(rejection.code))") {
+            return
+        }
         let position = host.mountedStartPosition ?? 0
         EngineLog.emit(
             "[AetherEngine] AVPlayer rejected the master (code=\(rejection.code)); falling back to "
@@ -3234,6 +3267,10 @@ public final class AetherEngine: ObservableObject {
                             category: .session)
                         return
                     }
+                }
+                if rebuildsForMediaPlaylist(session, because: "#35 readiness gate: the master never produced tracks") {
+                    masterFallbackUsed = true
+                    return
                 }
                 guard let mediaURL = session.mediaPlaylistURL else {
                     throw StartupGateFailure(message: startupGateFailureMessage(host))
@@ -4524,6 +4561,7 @@ public final class AetherEngine: ObservableObject {
         undecodableLiveAudioStreamIndices = Self.undecodableAudioStreamIndicesAcrossLoad(
             undecodableLiveAudioStreamIndices, sessionPreservingReload: sessionPreservingReloadInFlight)
         masterFallbackUsed = false
+        if !sessionPreservingReloadInFlight { servesMediaPlaylistAfterRefusal = false }
         nativeSubtitleReanchorTask?.cancel()
         nativeSubtitleReanchorTask = nil
         setPendingRecoverySeekTarget(nil)
@@ -7216,6 +7254,13 @@ public final class AetherEngine: ObservableObject {
     /// receiver's output format to HDR gets the offer again on the next launch.
     private var airPlayReceiversRefusingHDRMaster: Set<String> = []
 
+    /// Whether the session is AirPlaying to a receiver remembered as refusing HDR masters, which a load plans an
+    /// HDR source's media playlist for (`HLSVideoEngine.servesMediaPlaylistOnlyForHDR`).
+    var airPlayReceiverRefusesHDRMaster: Bool {
+        guard airPlayActive, let uid = Self.currentAirPlayReceiverUID() else { return false }
+        return airPlayReceiversRefusingHDRMaster.contains(uid)
+    }
+
     /// Route UID of the wireless AirPlay receiver currently holding the audio route, or nil.
     nonisolated static func currentAirPlayReceiverUID() -> String? {
         #if os(iOS)
@@ -7275,9 +7320,10 @@ public final class AetherEngine: ObservableObject {
             + (receiverUID != nil && session.servedSourceIsHDR
                ? ", and this receiver is remembered as refusing HDR masters" : "") + ")",
             category: .session)
+        airPlayServedMasterToReceiver = false
+        if rebuildsForMediaPlaylist(session, because: "the AirPlay receiver refused the master") { return }
         session.markServingMediaAfterFallback()
         nativeSubtitleRenditionsServed = false
-        airPlayServedMasterToReceiver = false
         // A live session rejoins its playlist at the player's join point (`LiveReloadPolicy`): a seek to the
         // armed position would point the item at the start of the window.
         host.swapItem(url: airPlayHostSwapped(mediaURL),
@@ -7422,10 +7468,15 @@ public final class AetherEngine: ObservableObject {
         guard airPlayActive else { return (url, session.servingMasterPlaylist) }
         let receiverUID = Self.currentAirPlayReceiverUID()
         let refusedBefore = receiverUID.map { airPlayReceiversRefusingHDRMaster.contains($0) } ?? false
-        let playlist = AirPlayPlaylistDecision.playlistForReceiver(
-            servingMasterPlaylist: session.servingMasterPlaylist,
-            sourceIsHDR: session.servedSourceIsHDR,
-            receiverRefusedHDRMaster: refusedBefore)
+        // A demuxed session's media playlist is its video alone: it is handed the master, and a refusal rebuilds
+        // it for the media playlist (`handleRefusedAirPlayMaster`). A load for a receiver remembered as refusing
+        // HDR masters plans an HDR source for the media playlist from the start (`servesMediaPlaylistOnlyForHDR`).
+        let playlist: AirPlayPlaylistDecision.ReceiverPlaylist = session.outputShape == .demuxed
+            ? .master
+            : AirPlayPlaylistDecision.playlistForReceiver(
+                servingMasterPlaylist: session.servingMasterPlaylist,
+                sourceIsHDR: session.servedSourceIsHDR,
+                receiverRefusedHDRMaster: refusedBefore)
         let carriesRenditions = AirPlayPlaylistDecision.carriesSubtitleRenditions(playlist)
         guard let lanURL = airPlayPlaybackURL(base: url, playlist: playlist) else {
             EngineLog.emit("[AirPlay] no LAN IP; keeping \(url.absoluteString)", category: .engine)
