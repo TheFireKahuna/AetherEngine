@@ -43,10 +43,11 @@ final class GPUSubmitter: @unchecked Sendable {
         backend.makeBatch(timed: timed, orderedAfterEarlierWork: orderedAfterEarlierWork)
     }
 
-    /// `function` of `library`, specialised with `constants`, as a compute pipeline: on Metal 4, made by the
+    /// `function` of `library`, specialised with `constants` (nil: a function without any), as a compute pipeline: on
+    /// Metal 4, made by the
     /// submitter's compiler, which takes it from `archive` (a Metal 4 binary archive built ahead of time for this GPU and
     /// OS release) when it holds it and compiles it otherwise; on Metal 3, compiled by the device.
-    func makeComputePipeline(library: MTLLibrary, function: String, constants: MTLFunctionConstantValues,
+    func makeComputePipeline(library: MTLLibrary, function: String, constants: MTLFunctionConstantValues?,
                              archive: URL?) throws -> MTLComputePipelineState {
         try backend.makeComputePipeline(library: library, function: function, constants: constants, archive: archive)
     }
@@ -134,7 +135,7 @@ extension ComputePass {
 protocol GPUBackend: AnyObject, Sendable {
     var api: String { get }
     func makeBatch(timed: Bool, orderedAfterEarlierWork: Bool) -> GPUBatch?
-    func makeComputePipeline(library: MTLLibrary, function: String, constants: MTLFunctionConstantValues,
+    func makeComputePipeline(library: MTLLibrary, function: String, constants: MTLFunctionConstantValues?,
                              archive: URL?) throws -> MTLComputePipelineState
 }
 
@@ -224,16 +225,21 @@ private final class Metal4Backend: GPUBackend, @unchecked Sendable {
     /// Only read once loaded (pipelines taken from it), which Metal allows from any thread.
     private struct Archive: @unchecked Sendable { let archive: MTL4Archive }
 
-    func makeComputePipeline(library: MTLLibrary, function: String, constants: MTLFunctionConstantValues,
+    func makeComputePipeline(library: MTLLibrary, function: String, constants: MTLFunctionConstantValues?,
                              archive: URL?) throws -> MTLComputePipelineState {
         let named = MTL4LibraryFunctionDescriptor()
         named.name = function
         named.library = library
-        let specialised = MTL4SpecializedFunctionDescriptor()
-        specialised.functionDescriptor = named
-        specialised.constantValues = constants
         let descriptor = MTL4ComputePipelineDescriptor()
-        descriptor.computeFunctionDescriptor = specialised
+        // As the library's build recorded it for the archive: a specialisation only where there are constants.
+        if let constants {
+            let specialised = MTL4SpecializedFunctionDescriptor()
+            specialised.functionDescriptor = named
+            specialised.constantValues = constants
+            descriptor.computeFunctionDescriptor = specialised
+        } else {
+            descriptor.computeFunctionDescriptor = named
+        }
         let options = MTL4CompilerTaskOptions()
         if let archive, let loaded = loadArchive(archive) { options.lookupArchives = [loaded] }
         return try compiler.makeComputePipelineState(descriptor: descriptor, compilerTaskOptions: options)
@@ -497,9 +503,16 @@ private final class Metal3Backend: GPUBackend, @unchecked Sendable {
     fileprivate func recycle(_ context: Context) { pool.withLock { $0.append(context) } }
 
     /// Metal 3 takes no Metal 4 archive: the device compiles.
-    func makeComputePipeline(library: MTLLibrary, function: String, constants: MTLFunctionConstantValues,
+    func makeComputePipeline(library: MTLLibrary, function: String, constants: MTLFunctionConstantValues?,
                              archive: URL?) throws -> MTLComputePipelineState {
-        try device.makeComputePipelineState(function: library.makeFunction(name: function, constantValues: constants))
+        let made: MTLFunction?
+        if let constants {
+            made = try library.makeFunction(name: function, constantValues: constants)
+        } else {
+            made = library.makeFunction(name: function)
+        }
+        guard let made else { throw MTLLibraryError(.functionNotFound, userInfo: [NSLocalizedDescriptionKey: "no function \(function)"]) }
+        return try device.makeComputePipelineState(function: made)
     }
 
     private final class Batch: GPUBatch {

@@ -47,6 +47,11 @@ final class SubtitleUpscaleGPU: SubtitleUpscaleSubmission, @unchecked Sendable {
         submitter.makeBatch(orderedAfterEarlierWork: true).map(Batch.init)
     }
 
+    func makeComputePipeline(_ request: SubtitleUpscalePipelineRequest) throws -> MTLComputePipelineState {
+        try submitter.makeComputePipeline(library: request.library, function: request.function, constants: nil,
+                                          archive: request.archive)
+    }
+
     private final class Batch: SubtitleUpscaleBatch {
         let batch: GPUBatch
         init(_ batch: GPUBatch) { self.batch = batch }

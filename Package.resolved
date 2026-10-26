@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/TheFireKahuna/LibMLSubUpscaler",
       "state" : {
-        "revision" : "c87b6cd373fa2b9764656458f830dfd118b8acb7",
-        "version" : "1.2.0"
+        "revision" : "e1b9f5a7f38104b5ed3e86b618ce8601f11022bd",
+        "version" : "2.0.0"
       }
     },
     {
