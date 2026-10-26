@@ -32,7 +32,7 @@ struct AVSyncTests {
 
     static let clips: [Clip] = ["aac.mkv", "aac.mp4", "aac.ts", "ac3.mkv", "ac3.ts", "eac3.mkv", "eac3.mp4",
                                 "flac.mkv", "pcm.mkv", "truehd.mkv", "opus.mkv", "mp3.mkv",
-                                "dts.mkv", "dts-drift.mkv", "truehd-drift.mkv"].map(Clip.init)
+                                "dts.mkv", "dts-drift.mkv", "truehd-jitter.mkv"].map(Clip.init)
 
     @Test("the click plays on the white frame", .timeLimit(.minutes(2)), arguments: clips)
     func clickOnFrame(_ clip: Clip) async throws {

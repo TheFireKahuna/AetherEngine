@@ -531,20 +531,28 @@ determinism_clip opus.mkv "$DET_ST" -c:a libopus -b:a 128k
 determinism_clip dts.mkv "$DET_51" -c:a dca -strict -2
 determinism_clip truehd.mkv "$DET_51" -c:a truehd -strict -2
 
-# Audio with timestamps that fall behind their frames and snap back, the way a remux in the library
-# carries them (research/dts-timing): about 2 ms off at worst, the audio itself continuous. Remuxed from
-# the clips above, so the bitstream is the same and only the timestamps differ.
-echo "→ avsync/{dts,truehd}-drift.mkv, determinism/{dts,truehd}-drift.mkv (timestamps drifting off their frames)"
+# Audio whose timestamps are off their frames the ways the library's remuxes carry them, the audio itself continuous.
+# Remuxed from the clips above, so the bitstream is the same and only the timestamps differ.
+# - DTS (research/dts-timing): timestamps falling behind their frames and snapping back, about 2 ms off at worst.
+# - TrueHD (a survey of seven titles): stamps a millisecond off either way on scattered packets, and on one title
+#   the first packet stamped 5 ms ahead of the rest.
+echo "→ avsync/{dts-drift,truehd-jitter,truehd-firststamp}.mkv, determinism/{dts-drift,truehd-jitter}.mkv"
 audio_drift() {  # <from> <to> <packets per snap> <samples behind at the snap>
     local expr="round(mod(N\\,$3)*$4/$3/48000/TB)"
     ffmpeg -hide_banner -loglevel error -y -i "$1" -map 0 -c copy -bsf:a "setts=pts=PTS-$expr:dts=DTS-$expr" "$2"
 }
+TRUEHD_JITTER="if(eq(mod(N\\,7)\\,3)\\,1\\,if(eq(mod(N\\,11)\\,5)\\,-1\\,0))*0.001/TB"
 for d in avsync determinism; do
     # DTS: a 512-sample frame a packet, 32 samples behind per 25 of them (as measured), back every 60.
     audio_drift "$FIXTURES_DIR/$d/dts.mkv" "$FIXTURES_DIR/$d/dts-drift.mkv" 60 77
-    # TrueHD: a 40-sample access unit a packet, 96 samples behind over 600 of them (half a second).
-    audio_drift "$FIXTURES_DIR/$d/truehd.mkv" "$FIXTURES_DIR/$d/truehd-drift.mkv" 600 96
+    # TrueHD: a 40-sample access unit a packet; one packet in seven a millisecond late, one in eleven early.
+    ffmpeg -hide_banner -loglevel error -y -i "$FIXTURES_DIR/$d/truehd.mkv" -map 0 -c copy \
+        -bsf:a "setts=pts=PTS+$TRUEHD_JITTER:dts=DTS+$TRUEHD_JITTER" "$FIXTURES_DIR/$d/truehd-jitter.mkv"
 done
+# TrueHD whose first packet is stamped apart from the rest: every packet but the first 5 ms later.
+ffmpeg -hide_banner -loglevel error -y -i "$FIXTURES_DIR/avsync/truehd.mkv" -map 0 -c copy \
+    -bsf:a "setts=pts=if(eq(N\\,0)\\,PTS\\,PTS+0.005/TB):dts=if(eq(N\\,0)\\,DTS\\,DTS+0.005/TB)" \
+    "$FIXTURES_DIR/avsync/truehd-firststamp.mkv"
 
 echo ""
 echo "Done. Try:"
