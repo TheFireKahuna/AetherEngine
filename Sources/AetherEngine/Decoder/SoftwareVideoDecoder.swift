@@ -373,11 +373,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             ? FilmCadence(timeBase: timeBase, filmCoded: deinterlaceConfig.softTelecine) : nil
         if deinterlaces {
             window = BwdifWindow(timeBase: timeBase, fieldRate: deinterlaceConfig.fieldRate == .field)
-            // A stream that declares interlacing compiles the deinterlacer's pipeline now, off this thread, so its first
-            // field does not wait for the compiler.
-            if VideoRoutingPolicy.interlacedFieldOrders.contains(codecpar.pointee.field_order),
-               let layout = PictureLayout(format: sourceFormat) {
-                DispatchQueue.global(qos: .userInitiated).async { _ = try? made.finisher.kernels.pipeline(for: layout, function: "pf_bwdif") }
+            // A stream that declares interlacing makes the deinterlacer's pipelines now (inverse telecine's too, for a
+            // format it takes), off this thread, so its first field does not wait for them.
+            if VideoRoutingPolicy.interlacedFieldOrders.contains(codecpar.pointee.field_order) {
+                DispatchQueue.global(qos: .userInitiated).async { made.finisher.kernels.prewarm([sourceFormat]) }
             }
         }
 

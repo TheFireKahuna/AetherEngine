@@ -18,6 +18,11 @@ final class DeinterlaceGPU: DeinterlaceSubmission, @unchecked Sendable {
 
     func makeBatch() -> (any DeinterlaceBatch)? { submitter.makeBatch().map(Batch.init) }
 
+    func makeComputePipeline(_ request: DeinterlacePipelineRequest) throws -> MTLComputePipelineState {
+        try submitter.makeComputePipeline(library: request.library, function: request.function, constants: request.constants,
+                                          archive: request.archive)
+    }
+
     /// `batch` as LibDeinterlace's, for the library to encode passes of its own into a batch the engine commits.
     static func batch(_ batch: GPUBatch) -> any DeinterlaceBatch { Batch(batch) }
 
