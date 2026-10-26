@@ -666,7 +666,7 @@ about 150 pipelines) and `prewarmDualLayerDolbyVision()`, at utility priority.
 - **dav1d throughput on the A15** at 4K 10-bit (with and without film grain) is unmeasured; it sets the decode-ahead
   the segment gating needs.
 - **The finisher's speed on the Apple TV** is unmeasured (all figures are M4 Pro), and so are the grain's cost
-  (the synthesis kernel's span, the per-sample application inside the finisher) and the software route's frame timing
+  (the synthesis kernels' span, the per-sample application inside the finisher) and the software route's frame timing
   since 9.2 (to be read from the overlay's counters against the build before it).
 - **GPU-wide timeouts in several-suite test runs: fixed (fa911014, LibDeinterlace 2.0.1).** Every command buffer in
   flight failing at once with Metal's timeout was a freed pipeline running on the GPU: two threads made the same
@@ -697,7 +697,10 @@ about 150 pipelines) and `prewarmDualLayerDolbyVision()`, at utility priority.
    the M4 Pro, a batch's own set (a rotating 3 of 12 4K slabs, tables, textures) costs 3.9 us to commit with its
    submission, against 2.7 us with slabs and tables in a set on the queue: about a microsecond a frame, for lifetime
    registration in every owner of a long-lived buffer.
-7. The PiP subtitle compositor's `CIContext` replaced by a blend kernel on the layer; Sodalite's log-export QR code
-   drawn on the CPU.
+7. Sodalite's log-export QR code drawn on the CPU (it is Core Image GPU work outside the layer). The PiP subtitle
+   compositor's `CIContext` (`SubtitleFrameCompositor`) is not ported: it belongs to `SampleBufferRenderer`, the
+   retired software host's, and goes with it. PiP for an overlay session is Part 1's (the overlay layer as the content
+   source, today only the old host builds `softwarePiPSource`), and the subtitles it needs, which AVPlayer draws on its
+   own layer only, are a blend kernel on the layer over the overlay's frames while PiP is up.
 8. Two long-running threads still drain no autorelease pool per iteration: the HLS segment producer's pump and the
    loopback audio reader.
