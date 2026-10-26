@@ -370,8 +370,11 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         // IEEE rounding throughout: the rounding steps are H.273's Round.
         options.mathMode = .safe
         let made = try device.makeLibrary(source: PlanarFrameShaderSource.source, options: options)
-        Self.library.withLock { $0[ObjectIdentifier(device)] = made }
-        return made
+        return Self.library.withLock { cache in
+            if let first = cache[ObjectIdentifier(device)] { return first }
+            cache[ObjectIdentifier(device)] = made
+            return made
+        }
     }
 
     /// Makes every pipeline a job of `plan` uses (the finish; grain's synthesis, the constant-luminance recompute where
@@ -411,8 +414,13 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         }
         let function = try lib.makeFunction(name: name, constantValues: values)
         let made = try device.makeComputePipelineState(function: function)
-        Self.pipelines.withLock { $0[key] = made }
-        return made
+        // The first one made is every caller's: a pipeline another thread made meanwhile is dropped, never put in its
+        // place, as work already encoded holds the cached one without retaining it.
+        return Self.pipelines.withLock { cache in
+            if let first = cache[key] { return first }
+            cache[key] = made
+            return made
+        }
     }
 
     /// Writes the `width` x `height` picture in `planes` into `buffer` (a bi-planar buffer of the plan's output
