@@ -353,29 +353,47 @@ final class SourceByteCache: @unchecked Sendable {
             return
         }
         source.version = source.version.merged(with: version)
-        if retention == .streamed, source.streamingReaders < 2,
-           !Self.nearEdge(offset: offset, count: Int64(data.count), size: source.version.size, edge: streamEdge) {
-            source.passedOverBytes += Int64(data.count)
-            scheduleReleaseLocked(key, source)
+        let count = Int64(data.count)
+        var pieces = [(offset: offset, data: data)]
+        if retention == .streamed, source.streamingReaders < 2 {
+            let parts = Self.edgeParts(offset: offset, count: count, size: source.version.size, edge: streamEdge)
+            // A delivery is as large as the transport batched it, megabytes when the reader falls
+            // behind, so only its bytes within the edges are kept. Copied out, so a pending piece does
+            // not hold the whole delivery's buffer beyond what the pending bound counts.
+            if parts != [offset..<(offset + count)] {
+                pieces = parts.map { part in
+                    let lower = data.startIndex + Int(part.lowerBound - offset)
+                    return (offset: part.lowerBound, data: data.subdata(in: lower..<(lower + part.count)))
+                }
+            }
+            source.passedOverBytes += count - parts.reduce(0) { $0 + Int64($1.count) }
+        }
+        for piece in pieces {
+            pendingWriteBytes += piece.data.count
+            source.pending.append(piece)
+            source.visible.insert(start: piece.offset, end: piece.offset + Int64(piece.data.count))
+            queuedWrites.append((source, key, piece.offset, piece.data))
+        }
+        scheduleReleaseLocked(key, source)
+        guard !pieces.isEmpty else {
             lock.unlock()
             return
         }
-        pendingWriteBytes += data.count
-        source.pending.append((offset, data))
-        source.visible.insert(start: offset, end: offset + Int64(data.count))
-        queuedWrites.append((source, key, offset, data))
-        scheduleReleaseLocked(key, source)
         let schedule = !drainScheduled
         drainScheduled = true
         lock.unlock()
         if schedule { writeQueue.async { [self] in drainWrites() } }
     }
 
-    /// Whether `count` bytes at `offset` reach within `edge` of either end. An unknown size has no
-    /// middle to pass over.
-    static func nearEdge(offset: Int64, count: Int64, size: Int64?, edge: Int64) -> Bool {
-        guard let size else { return true }
-        return offset < edge || offset + count > size - edge
+    /// The parts of `count` bytes at `offset` that lie within `edge` of either end, in order. An
+    /// unknown size has no middle to pass over, and a source no longer than two edges is all edge.
+    static func edgeParts(offset: Int64, count: Int64, size: Int64?, edge: Int64) -> [Range<Int64>] {
+        let end = offset + count
+        guard let size, size - edge > edge else { return [offset..<end] }
+        var parts: [Range<Int64>] = []
+        if offset < edge { parts.append(offset..<min(end, edge)) }
+        if end > size - edge { parts.append(max(offset, size - edge)..<end) }
+        return parts
     }
 
     /// Writes whatever has queued, until nothing has. On `writeQueue`.

@@ -333,11 +333,51 @@ struct SourceByteCacheTests {
         }
         cache.drainWritesForTesting()
         #expect(cache.heldLength(Self.source, at: 0, expectedSize: size) == 1000)
-        #expect(cache.heldLength(Self.source, at: edge - 1, expectedSize: size) == 1000)
+        // Straddling an edge keeps only the byte inside it.
+        #expect(cache.heldLength(Self.source, at: edge - 1, expectedSize: size) == 1)
         #expect(cache.heldLength(Self.source, at: size / 2, expectedSize: size) == 0)
         #expect(cache.heldLength(Self.source, at: edge + 999, expectedSize: size) == 0)
         #expect(cache.heldLength(Self.source, at: size - edge - 1000, expectedSize: size) == 0)
-        #expect(cache.heldLength(Self.source, at: size - edge - 999, expectedSize: size) == 1000)
+        #expect(cache.heldLength(Self.source, at: size - edge - 999, expectedSize: size) == 0)
+        #expect(cache.heldLength(Self.source, at: size - edge, expectedSize: size) == 1)
+    }
+
+    /// A reader that falls behind gets its stream in deliveries of megabytes, so one that starts at the
+    /// head, ends at the tail or spans both keeps its bytes within the edges and none of the middle.
+    @Test("A lone reader's delivery that crosses an edge keeps only its bytes within the edges")
+    func loneStreamClipsDeliveriesAtTheEdges() throws {
+        let size: Int64 = 8 << 20
+        let edge: Int64 = 1 << 20
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "source-cache-tests-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let body = Self.pattern(Int(size), seed: 23)
+        let crossings: [(offset: Int64, count: Int64)] = [(512 << 10, 3 << 20), (5 << 20, 3 << 20), (0, size)]
+        for crossing in crossings {
+            let cache = SourceByteCache(directory: dir, budget: .fixed(64 << 20), streamEdge: edge)
+            cache.readerOpened(Self.source, streams: true)
+            cache.noteVersion(SourceVersion(size: size), for: Self.source)
+            let range = Int(crossing.offset)..<Int(crossing.offset + crossing.count)
+            cache.store(body.subdata(in: range), at: crossing.offset, version: SourceVersion(), for: Self.source,
+                        retention: .streamed)
+            cache.drainWritesForTesting()
+            let head = max(0, min(crossing.offset + crossing.count, edge) - crossing.offset)
+            #expect(cache.heldLength(Self.source, at: crossing.offset, expectedSize: size) == head)
+            #expect(cache.heldLength(Self.source, at: edge, expectedSize: size) == 0)
+            #expect(cache.heldLength(Self.source, at: size - edge - 1, expectedSize: size) == 0)
+            let tailStart = max(crossing.offset, size - edge)
+            if crossing.offset + crossing.count > size - edge {
+                #expect(cache.heldLength(Self.source, at: tailStart, expectedSize: size) == size - tailStart)
+                let tail = try #require(cache.read(Self.source, at: tailStart, maxLength: Int(size - tailStart),
+                                                   expectedSize: size))
+                #expect(tail == body.subdata(in: Int(tailStart)..<Int(size)))
+            }
+            if head > 0 {
+                let kept = try #require(cache.read(Self.source, at: crossing.offset, maxLength: Int(head),
+                                                   expectedSize: size))
+                #expect(kept == body.subdata(in: Int(crossing.offset)..<Int(crossing.offset + head)))
+            }
+            #expect(cache.heldBytesForTesting(Self.source) == head + max(0, crossing.offset + crossing.count - tailStart))
+        }
     }
 
     @Test("Bytes asked for by position are kept wherever they are, and a stream of unknown size is kept")
