@@ -655,9 +655,12 @@ passthrough source) compiles into the per-dispatch preamble, not the per-pixel b
 1. The wrong finisher output under load (open questions): the only known correctness bug.
 2. One TV run for the device checks: the software route's frame timing against the overlay's counters, the archives'
    hits, the subtitle upscaler's first run on the device.
-3. The finisher's variants collapsed: per-format data into the frame's constants, one pipeline per code path.
+3. Done (47bb4f89): the finisher's variants reduced, not moved. Constants a plan never reads take one value (the
+   chroma siting only on resampled axes, as its class; big-endian only past a byte), so over a realistic stream set
+   434 distinct pipelines became 62, the kernel and its per-pixel cost unchanged. Moving data-only constants into the
+   frame's arguments was rejected: it adds registers and work to every pixel for a first-launch saving.
 4. The engine's own shaders precompiled (the finisher, the FEL composer): `.metal` resources, archives through the
-   layer's pipeline call, a prewarm at app launch. After 3, which cuts the pipelines to archive.
+   layer's pipeline call for a curated list of plans (the 62 above are its basis), a prewarm at app launch.
 5. Grain synthesis split by role across threadgroups (the luma wavefront, the chroma draws, the scaling tables and
    the offsets at once, then both chroma wavefronts), in a pass of its own beside the field bwdif.
 6. A queue-level residency set for the long-lived allocations (slabs, pool buffers, tables), leaving only per-batch
