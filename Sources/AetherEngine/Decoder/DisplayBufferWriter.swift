@@ -165,34 +165,65 @@ final class DisplayBufferWriter {
     func prepare(_ frame: UnsafeMutablePointer<AVFrame>, planFormat: AVPixelFormat,
                  interlaced: Bool, grain: Bool = false) -> (plan: PlanarFrameFinisher.Plan, buffer: CVPixelBuffer)? {
         let width = Int(frame.pointee.width), height = Int(frame.pointee.height)
-        guard width > 0, height > 0 else { return nil }
-        let format = AVPixelFormat(rawValue: frame.pointee.format)
-        let colour = ColorDescription(frame: frame)
+        guard width > 0, height > 0,
+              let resolved = plan(format: AVPixelFormat(rawValue: frame.pointee.format), planFormat: planFormat,
+                                  colour: ColorDescription(frame: frame), colorRange: frame.pointee.color_range,
+                                  chromaLocation: frame.pointee.chroma_location, width: width, height: height,
+                                  interlaced: interlaced, grain: grain) else { return nil }
+        var pixelBuffer: CVPixelBuffer?
+        guard let pool = bufferPool(width: width, height: height, format: resolved.output),
+              CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer) == kCVReturnSuccess,
+              let pb = pixelBuffer else { return nil }
+        attachColorSpace(from: frame, to: pb)
+        if let matrix = resolved.convertedMatrix { CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate) }
+        return (resolved.plan, pb)
+    }
+
+    /// The plans the pictures of a stream of this description will take (`expected`: each layout the finisher reads them
+    /// as, and whether interlaced and grained), worked out and kept, for their pipelines to be made before the first
+    /// picture (``PlanarFrameFinisher/prewarm(_:choosesSource:)``). On the decoding thread, as ``prepare`` is; logs
+    /// nothing, as no picture has arrived.
+    func expectedPlans(format: AVPixelFormat, colour: ColorDescription, colorRange: AVColorRange, chromaLocation: AVChromaLocation,
+                       width: Int, height: Int, expected: [(planFormat: AVPixelFormat, interlaced: Bool, grain: Bool)])
+        -> [PlanarFrameFinisher.Plan] {
+        expected.compactMap {
+            plan(format: format, planFormat: $0.planFormat, colour: colour, colorRange: colorRange, chromaLocation: chromaLocation,
+                 width: width, height: height, interlaced: $0.interlaced, grain: $0.grain, logs: false)?.plan
+        }
+    }
+
+    /// The finisher's plan for a picture of this description, its display buffer's format, and the matrix a converted
+    /// picture is tagged with: nil (and one log line per kind) when the picture cannot be represented or written.
+    private func plan(format: AVPixelFormat, planFormat: AVPixelFormat, colour: ColorDescription, colorRange: AVColorRange,
+                      chromaLocation: AVChromaLocation, width: Int, height: Int, interlaced: Bool, grain: Bool,
+                      logs: Bool = true) -> (plan: PlanarFrameFinisher.Plan, output: OutputFormat, convertedMatrix: CFString?)? {
         let representation = ColourRepresentation.resolve(format: format, matrix: colour.matrix, primaries: colour.primaries,
                                                           transfer: colour.transfer)
         if case .refused(let reason) = representation {
-            if refusedRepresentations.insert(reason).inserted {
+            if logs, refusedRepresentations.insert(reason).inserted {
                 EngineLog.emit("[\(logTag)] cannot represent this picture: \(reason); frames dropped", category: .swPlayback)
             }
             return nil
         }
         let outputFormat = SoftwareVideoDecoder.outputFormat(
-            pixelFormat: frame.pointee.format, colorRange: frame.pointee.color_range, streamIs10Bit: streamIs10Bit,
+            pixelFormat: format.rawValue, colorRange: colorRange, streamIs10Bit: streamIs10Bit,
             twelveBit420: twelveBit420, interlaced: interlaced, representation: representation)
-        logOutputFormat(outputFormat, source: av_get_pix_fmt_name(format).map { String(cString: $0) } ?? "?",
-                        colorRange: frame.pointee.color_range)
+        if logs {
+            logOutputFormat(outputFormat, source: av_get_pix_fmt_name(format).map { String(cString: $0) } ?? "?",
+                            colorRange: colorRange)
+        }
 
         let isJPEG = SoftwareVideoDecoder.isJPEGFormat(format)
         let isRGB = (av_pix_fmt_desc_get(format)?.pointee.flags ?? 0) & UInt64(AV_PIX_FMT_FLAG_RGB) != 0
         // H.273: VideoFullRangeFlag applies to R'G'B' codes too. An RGB frame is full range unless it says
         // video range; a Y'CbCr frame (YCgCo's R'G'B' codes included) is video range unless it, or its yuvj
         // format, says full.
-        let sourceFullRange = isRGB ? frame.pointee.color_range != AVCOL_RANGE_MPEG
-            : (frame.pointee.color_range == AVCOL_RANGE_JPEG || isJPEG)
+        let sourceFullRange = isRGB ? colorRange != AVCOL_RANGE_MPEG
+            : (colorRange == AVCOL_RANGE_JPEG || isJPEG)
         // A converted picture is encoded with, and tagged as, the matrix its primaries call for.
         let convertedMatrix = representation.converts ? ColourRepresentation.targetMatrix(primaries: colour.primaries) : nil
-        let matrix = convertedMatrix ?? ColorAttachments.presented(colour, frameSize: (frame.pointee.width, frame.pointee.height)).matrix
-        let location = SoftwareVideoDecoder.resolvedChromaLocation(frame.pointee.chroma_location, isJPEG: isJPEG)
+        let matrix = convertedMatrix ?? ColorAttachments.presented(colour, frameSize: (Int32(width), Int32(height))).matrix
+        let location = SoftwareVideoDecoder.resolvedChromaLocation(chromaLocation, isJPEG: isJPEG)
         let key = PlanKey(pixelFormat: planFormat.rawValue, output: outputFormat, sourceFullRange: sourceFullRange,
                           chromaLocation: UInt32(location.rawValue), matrix: matrix as String, interlaced: interlaced,
                           representation: representation, grain: grain)
@@ -205,7 +236,7 @@ final class DisplayBufferWriter {
             plans[key] = made
             plan = made
         } else {
-            if refusedPlans.insert(key).inserted {
+            if logs, refusedPlans.insert(key).inserted {
                 EngineLog.emit("[\(logTag)] cannot write \(av_get_pix_fmt_name(format).map { String(cString: $0) } ?? "?")"
                                + "\(interlaced ? " (interlaced)" : "")\(grain ? " with film grain" : "") as "
                                + "\(outputFormat.logDescription); frames dropped",
@@ -214,13 +245,7 @@ final class DisplayBufferWriter {
             return nil
         }
 
-        var pixelBuffer: CVPixelBuffer?
-        guard let pool = bufferPool(width: width, height: height, format: outputFormat),
-              CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer) == kCVReturnSuccess,
-              let pb = pixelBuffer else { return nil }
-        attachColorSpace(from: frame, to: pb)
-        if let convertedMatrix { CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, convertedMatrix, .shouldPropagate) }
-        return (plan, pb)
+        return (plan, outputFormat, convertedMatrix)
     }
 
     /// The pool the finisher writes display buffers into, for the given geometry, with `displayBufferAttributes`.

@@ -374,6 +374,25 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         return made
     }
 
+    /// Makes every pipeline a job of `plan` uses (the finish; grain's synthesis, the constant-luminance recompute where
+    /// the plan has them; with `choosesSource`, inverse telecine's variant reading either of two pictures and decimate's
+    /// gate), so a picture of it waits for none. Thread-safe: for a background queue when a stream opens.
+    func prewarm(_ plan: Plan, choosesSource: Bool = false) {
+        var variants = [plan]
+        if choosesSource {
+            var chosen = plan
+            chosen.choosesSource = true
+            variants.append(chosen)
+        }
+        for variant in variants {
+            var functions = ["pf_finish"]
+            if variant.grain { functions.append("fg_synthesize") }
+            if usesList(variant) { functions += ["pf_cl_prepare", "pf_cl_correct"] }
+            if variant.choosesSource { functions.append("pf_gate") }
+            for function in functions { _ = try? pipeline(for: variant, function: function) }
+        }
+    }
+
     /// The pipeline specialised for `plan`, compiled on first use and shared by every finisher in the process.
     func pipeline(for plan: Plan, function name: String = "pf_finish") throws -> MTLComputePipelineState {
         let key = PipelineKey(device: ObjectIdentifier(device), function: name, constants: plan.specialisation)
