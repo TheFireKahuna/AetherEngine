@@ -744,8 +744,18 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         }
         EngineLog.emit("[SoftwareOverlay] alongside playback (count, min/median/max per job): "
                        + (StageTimes.alongsidePlayback.drain() ?? "nothing"), category: .swPlayback)
+        // The layer follows the item's clock; AVPlayer's own display mapping (`itemTime(forHostTime:)`) is what its
+        // video path would show at a host time. Read at one instant, the difference is how far the two part.
+        var mapping = ""
+        if let itemTimebase {
+            let host = CACurrentMediaTime()
+            let clock = CMSyncConvertTime(CMTime(seconds: host, preferredTimescale: 1_000_000_000),
+                                          from: CMClockGetHostTimeClock(), to: itemTimebase)
+            mapping = String(format: "; item clock less AVPlayer's display mapping %+.1f ms",
+                             (clock - output.itemTime(forHostTime: host)).seconds * 1000)
+        }
         EngineLog.emit("[SoftwareOverlay] \(timing.drainClocks())"
-                       + (AudioRouteDescription.latency().map { "; audio output \($0)" } ?? ""), category: .swPlayback)
+                       + (AudioRouteDescription.latency().map { "; audio output \($0)" } ?? "") + mapping, category: .swPlayback)
         videoRenderer.loadVideoPerformanceMetrics { metrics in
             guard let metrics else { return }
             EngineLog.emit("[SoftwareOverlay] renderer metrics: frames \(metrics.totalNumberOfFrames), dropped \(metrics.numberOfDroppedFrames), "
