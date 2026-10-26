@@ -344,6 +344,8 @@ final class PlanarFrameFinisher: @unchecked Sendable {
 
     /// LibDeinterlace's kernels, submitting through this finisher's submitter.
     let kernels: DeinterlaceKernels
+    /// Updated by a batch's grain synthesis pass, which its finishes wait on.
+    private let synthesised: MTLFence
 
     init(device: MTLDevice) throws {
         self.device = device
@@ -356,6 +358,8 @@ final class PlanarFrameFinisher: @unchecked Sendable {
             throw FinisherError.unavailable("no buffer")
         }
         self.placeholder = placeholder
+        guard let synthesised = submitter.makeFence() else { throw FinisherError.unavailable("no fence") }
+        self.synthesised = synthesised
         slots = (0..<Self.slotCount).map { _ in Slot() }
         var cache: CVMetalTextureCache?
         guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess, let cache
@@ -381,14 +385,17 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     /// where the plan has them; decimate's gate for a picture chosen on the GPU.
     static func functions(of plan: Plan) -> [String] {
         var functions = ["pf_finish"]
-        if plan.grain { functions.append("fg_synthesize") }
+        if plan.grain { functions += synthesisFunctions }
         if usesList(plan) { functions += ["pf_cl_prepare", "pf_cl_correct"] }
         if plan.choosesSource { functions.append("pf_gate") }
         return functions
     }
 
     /// The functions that read no function constant: one pipeline each, whatever the plan.
-    static let unspecialised: Set<String> = ["fg_synthesize", "pf_cl_prepare", "pf_gate"]
+    static let unspecialised: Set<String> = Set(synthesisFunctions + ["pf_cl_prepare", "pf_gate"])
+
+    /// Film grain's synthesis, by role (``encodeSynthesis(_:pass:device:)``).
+    static let synthesisFunctions = ["fg_luma", "fg_chroma_draws", "fg_scaling", "fg_offsets", "fg_chroma_regress"]
 
     /// The pipeline of `name` for `plan`, made on first use and shared by every finisher in the process.
     func pipeline(for plan: Plan, function name: String = "pf_finish") throws -> MTLComputePipelineState {
@@ -396,12 +403,19 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     }
 
     static func pipeline(for plan: Plan, function name: String, device: MTLDevice) throws -> MTLComputePipelineState {
-        let plain = unspecialised.contains(name)
-        let key = PipelineKey(device: ObjectIdentifier(device), function: name, constants: plain ? [] : plan.specialisation)
+        unspecialised.contains(name) ? try pipeline(name, device: device) : try pipeline(name, plan: plan, device: device)
+    }
+
+    /// The pipeline of `name`, a function that reads no constant.
+    static func pipeline(_ name: String, device: MTLDevice) throws -> MTLComputePipelineState {
+        try pipeline(name, plan: nil, device: device)
+    }
+
+    private static func pipeline(_ name: String, plan: Plan?, device: MTLDevice) throws -> MTLComputePipelineState {
+        let key = PipelineKey(device: ObjectIdentifier(device), function: name, constants: plan?.specialisation ?? [])
         if let ready = pipelines.withLock({ $0[key] }) { return ready }
         let made = try GPUPipelines.shared(for: device).make(library: EngineShaders.library(for: device), function: name,
-                                                             constants: plain ? nil : constants(plan),
-                                                             archive: EngineShaders.archive)
+                                                             constants: plan.map(constants), archive: EngineShaders.archive)
         // The first one made is every caller's: a pipeline another thread made meanwhile is dropped, never put in its
         // place, as work already encoded holds the cached one without retaining it.
         return pipelines.withLock { cache in
@@ -640,9 +654,9 @@ final class PlanarFrameFinisher: @unchecked Sendable {
         let encoded: Bool
         if jobs.isEmpty {
             encoded = true
-        } else if let pass = batch.makePass() {
+        } else if let grains = grainTables(jobs, slot: slot, batch: batch), let pass = batch.makePass() {
             if let after { pass.waitForFence(after) }
-            encoded = self.encode(jobs, slot: slot, pass: pass)
+            encoded = self.encode(jobs, slot: slot, grains: grains, pass: pass)
         } else {
             encoded = false
         }
@@ -665,7 +679,74 @@ final class PlanarFrameFinisher: @unchecked Sendable {
     /// Codes above 12 bits go straight to the exact path in the kernel (PF_EXACT_ONLY): no list, no second pass.
     private static func usesList(_ plan: Plan) -> Bool { plan.mode == .constantLuminance && plan.components[0][4] <= 12 }
 
-    private func encode(_ jobs: [Job], slot: Slot, pass: ComputePass) -> Bool {
+    /// Every job's grain tables (a placeholder for a job without grain), the sets the slot does not already hold
+    /// synthesised in a pass of their own that updates ``synthesised``; `synthesised` true when the finishes must wait
+    /// for it. Nil when a job's tables cannot be made or the pass cannot be encoded.
+    private func grainTables(_ jobs: [Job], slot: Slot, batch: GPUBatch) -> (tables: [MTLBuffer], synthesised: Bool)? {
+        var tables: [MTLBuffer] = []
+        var sets: [Synthesis] = []
+        for (index, job) in jobs.enumerated() {
+            guard let made = grainTables(job.grain, plan: job.plan, width: job.width, height: job.height, slot: slot,
+                                         index: index) else { return nil }
+            if let grain = job.grain, made.synthesise {
+                sets.append(Synthesis(buffer: made.buffer,
+                                      arguments: FilmGrainSynthesis.synthesisArguments(grain, width: job.width, height: job.height),
+                                      bitDepth: grain.bitDepth, blockRows: FilmGrainSynthesis.blocks(job.height)))
+            }
+            tables.append(made.buffer)
+        }
+        guard !sets.isEmpty else { return (tables, false) }
+        guard let pass = batch.makePass(), Self.encodeSynthesis(sets, pass: pass, device: device) else { return nil }
+        pass.updateFence(synthesised)
+        return (tables, true)
+    }
+
+    /// One frame's grain to synthesise: its tables' buffer (the header already written), the kernels' argument
+    /// (``FilmGrainSynthesis/synthesisArguments(_:width:height:)``), its depth and its rows of 32 x 32 blocks.
+    struct Synthesis {
+        let buffer: MTLBuffer
+        let arguments: [UInt8]
+        let bitDepth: Int
+        let blockRows: Int
+    }
+
+    /// Each set's templates, scaling tables and block offsets into its buffer, by role: the luma template (its draws, then
+    /// its filter), both chroma templates' draws, the scaling tables and the block offsets at once, then, after one
+    /// barrier, both chroma templates' filters, which read the finished luma template. False when a pipeline cannot be
+    /// made.
+    static func encodeSynthesis(_ sets: [Synthesis], pass: ComputePass, device: MTLDevice) -> Bool {
+        guard let luma = try? pipeline("fg_luma", device: device),
+              let draws = try? pipeline("fg_chroma_draws", device: device),
+              let scaling = try? pipeline("fg_scaling", device: device),
+              let offsets = try? pipeline("fg_offsets", device: device),
+              let regress = try? pipeline("fg_chroma_regress", device: device) else { return false }
+        let group = MTLSize(width: 256, height: 1, depth: 1)
+        func bind(_ set: Synthesis, _ pipeline: MTLComputePipelineState) {
+            pass.setPipeline(pipeline)
+            pass.setBuffer(set.buffer, offset: 0, index: 0)
+            set.arguments.withUnsafeBytes { pass.setBytes($0, index: 1) }
+        }
+        for set in sets {
+            bind(set, luma)
+            pass.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: group)
+            bind(set, draws)
+            pass.dispatchThreadgroups(MTLSize(width: 2, height: 1, depth: 1), threadsPerThreadgroup: group)
+            bind(set, scaling)
+            pass.dispatchThreads(MTLSize(width: 3 << set.bitDepth, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+            bind(set, offsets)
+            pass.dispatchThreads(MTLSize(width: max(1, set.blockRows), height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        }
+        pass.barrier()
+        for set in sets {
+            bind(set, regress)
+            pass.dispatchThreadgroups(MTLSize(width: 2, height: 1, depth: 1), threadsPerThreadgroup: group)
+        }
+        return true
+    }
+
+    private func encode(_ jobs: [Job], slot: Slot, grains: (tables: [MTLBuffer], synthesised: Bool), pass: ComputePass) -> Bool {
         let jobs = jobs.map { job in
             var chosen = job
             chosen.plan.choosesSource = job.passthrough != nil
@@ -684,26 +765,7 @@ final class PlanarFrameFinisher: @unchecked Sendable {
                 sources.append(planes)
             }
         }
-        // Each grained job's tables, synthesised on the GPU (when its parameters changed) alongside the fields: one
-        // barrier for both before the finishes read them.
-        var grains: [MTLBuffer] = []
-        var synthesised = false
-        for (index, job) in jobs.enumerated() {
-            guard let tables = grainTables(job.grain, plan: job.plan, width: job.width, height: job.height, slot: slot, index: index)
-            else { return false }
-            if let grain = job.grain, tables.synthesise {
-                guard let synthesize = try? pipeline(for: job.plan, function: "fg_synthesize") else { return false }
-                pass.setPipeline(synthesize)
-                pass.setBuffer(tables.buffer, offset: 0, index: 0)
-                FilmGrainSynthesis.synthesisArguments(grain, width: job.width, height: job.height).withUnsafeBytes {
-                    pass.setBytes($0, index: 1)
-                }
-                pass.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-                synthesised = true
-            }
-            grains.append(tables.buffer)
-        }
-        // Each gated job's threadgroups from its word, beside the fields and the synthesis, behind the same barrier.
+        // Each gated job's threadgroups from its word, beside the fields, behind the same barrier.
         var gates: [MTLBuffer?] = []
         for job in jobs {
             guard let kept = job.kept else { gates.append(nil); continue }
@@ -719,12 +781,14 @@ final class PlanarFrameFinisher: @unchecked Sendable {
             pass.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
             gates.append(arguments)
         }
-        if fields > 0 || synthesised || gates.contains(where: { $0 != nil }) { pass.barrier() }
+        if fields > 0 || gates.contains(where: { $0 != nil }) { pass.barrier() }
+        // The grain tables, synthesised in their own pass beside this one.
+        if grains.synthesised { pass.waitForFence(synthesised) }
         var lists = 0
         let order = jobs.indices.filter { !Self.usesList(jobs[$0].plan) } + jobs.indices.filter { Self.usesList(jobs[$0].plan) }
         for index in order {
             let job = jobs[index]
-            let grain = grains[index]
+            let grain = grains.tables[index]
             var list: (counter: MTLBuffer, arguments: MTLBuffer)?
             if Self.usesList(job.plan) {
                 guard let made = listBuffers(slot, lists, capacity: job.width * job.height) else { return false }
