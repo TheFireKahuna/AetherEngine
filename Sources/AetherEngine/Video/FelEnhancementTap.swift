@@ -105,8 +105,8 @@ private final class EnhancementLayerDecoder: OverlayTapDecoder {
 
     init(deliver: @escaping @Sendable (CVPixelBuffer, CMTime) -> Void) { self.deliver = deliver }
 
-    func decode(_ packet: UnsafeMutablePointer<AVPacket>, restartingAt clock: Double?, timeBase: AVRational) {
-        if clock != nil { decoder?.flush() }
+    func decode(_ packet: UnsafeMutablePointer<AVPacket>, restarting: Bool, clock: Double, timeBase: AVRational) {
+        if restarting { decoder?.flush() }
         if decoder == nil { open(from: packet, timeBase: timeBase) }
         decoder?.decode(packet: packet)
     }

@@ -25,8 +25,8 @@ struct OverlayPacketTapTests {
             picture = buffer!
         }
 
-        func decode(_ packet: UnsafeMutablePointer<AVPacket>, restartingAt clock: Double?, timeBase: AVRational) {
-            lock.withLock { _fed.append((packet.pointee.pts, clock != nil)) }
+        func decode(_ packet: UnsafeMutablePointer<AVPacket>, restarting: Bool, clock: Double, timeBase: AVRational) {
+            lock.withLock { _fed.append((packet.pointee.pts, restarting)) }
             deliver(picture, CMTime(value: packet.pointee.pts, timescale: timeBase.den))
         }
 

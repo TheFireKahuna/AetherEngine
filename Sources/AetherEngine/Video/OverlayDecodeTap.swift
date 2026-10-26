@@ -142,7 +142,7 @@ private final class PictureTapDecoder: OverlayTapDecoder {
         decoder.onA53Captions = onCaptions
     }
 
-    func decode(_ packet: UnsafeMutablePointer<AVPacket>, restartingAt clock: Double?, timeBase: AVRational) {
+    func decode(_ packet: UnsafeMutablePointer<AVPacket>, restarting: Bool, clock: Double, timeBase: AVRational) {
         if !opened, !failed {
             do {
                 guard let parameters else { throw VideoDecoderError.noCodecParameters }
@@ -163,12 +163,18 @@ private final class PictureTapDecoder: OverlayTapDecoder {
             }
         }
         guard opened else { return }
-        if let clock {
-            decoder.flush()
-            let skip = CMTime(seconds: clock - Self.shownBeforeClockSeconds, preferredTimescale: 90_000)
+        // A picture this far before the clock is behind the one on screen by the time it decodes: after a restart,
+        // or while a decoder that fell behind catches up. It is not converted, and where nothing references it,
+        // not decoded either, so the decode reaches the clock as fast as the references allow.
+        let showable = clock - Self.shownBeforeClockSeconds
+        let skip = CMTime(seconds: showable, preferredTimescale: 90_000)
+        if restarting { decoder.flush() }
+        let late = packet.pointee.pts != Int64.min && Double(packet.pointee.pts) * av_q2d(timeBase) < showable
+        if restarting || late {
             (decoder as? SoftwareVideoDecoder)?.skipUntilPTS = skip
             (decoder as? HardwareVideoDecoder)?.skipUntilPTS = skip
         }
+        (decoder as? SoftwareVideoDecoder)?.discardsNonReferencePictures(late)
         decoder.decode(packet: packet, epoch: nil)
     }
 
