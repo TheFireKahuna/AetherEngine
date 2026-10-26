@@ -6,6 +6,7 @@ import CoreVideo
 import CoreMedia
 import Dovi
 import os
+import QuartzCore
 
 /// Hardware-accelerated Metal compute engine for Dolby Vision Profile 7 Full
 /// Enhancement Layer (FEL).
@@ -23,7 +24,8 @@ final class DoviFelComposer: @unchecked Sendable {
     private static let signpostLog = OSLog(subsystem: EngineLog.subsystem, category: "dovi.compose")
 
     private let device: MTLDevice
-    private let commandQueue: MTLCommandQueue
+    /// The engine's GPU submission (``GPUSubmitter``): Metal 4 where the system has it, Metal 3 before.
+    private let gpu: GPUSubmitter
     private var textureCache: CVMetalTextureCache?
 
     /// Lazily compiled and process-shared compute pipelines (dolby-vision-fel.md §5.6).
@@ -337,12 +339,11 @@ final class DoviFelComposer: @unchecked Sendable {
     #endif
 
     init?() {
-        guard let dev = MTLCreateSystemDefaultDevice(),
-              let queue = dev.makeCommandQueue() else {
+        guard let dev = MTLCreateSystemDefaultDevice(), let gpu = GPUSubmitter(device: dev, label: "DoviFelComposer") else {
             return nil
         }
         self.device = dev
-        self.commandQueue = queue
+        self.gpu = gpu
         self.supportsNonUniformThreadgroups = dev.supportsFamily(.apple4) || dev.supportsFamily(.mac2)
 
         var cache: CVMetalTextureCache?
@@ -511,37 +512,24 @@ final class DoviFelComposer: @unchecked Sendable {
         frameIndex: UInt32 = 0
     ) -> CVPixelBuffer? {
         // Takes an in-flight slot like `composeAsync`, so a parameter slot is never taken outside the semaphore
-        // that bounds them. Only tests, `aetherctl` and probes call this; playback uses `composeAsync`.
+        // that bounds them. Only tests, `aetherctl` and probes call this; playback uses `composeAsync`. A failed
+        // commit leaves the destination partly written: it is not a frame, so no frame is returned.
+        final class Result: @unchecked Sendable { var buffer: CVPixelBuffer? }
+        let done = DispatchSemaphore(value: 0)
+        let result = Result()
         acquireSlot()
-        defer { releaseInFlightSlot() }
-        guard let work = encodeCompose(baseBuffer: baseBuffer,
-                                       enhancementBuffer: enhancementBuffer,
-                                       params: params,
-                                       frameIndex: frameIndex) else {
-            return nil
-        }
-        defer { returnParamSlot(work.paramSlot) }
-        work.commandBuffer.commit()
-        work.commandBuffer.waitUntilCompleted()
-        if let failure = Self.commandBufferFailure(work.commandBuffer, forced: forcedCommandBufferFailure.withLock { $0 }) {
-            // The GPU did not finish writing the destination: it is not a frame, so no frame is returned.
-            Self.logOnce("[DoviFelComposer] Command buffer error: \(failure)")
-            return nil
-        }
-        _ = work.keepAlive
-        // Colour attachments are copied in `encodeCompose`, at encode time on
-        // this calling thread — nothing left to do here.
-        return work.destination
+        submit([Request(baseBuffer: baseBuffer, enhancementBuffer: enhancementBuffer, params: params,
+                        frameIndex: frameIndex) { buffer in
+            result.buffer = buffer
+            done.signal()
+        }])
+        done.wait()
+        return result.buffer
     }
 
     /// Test seam: makes every command buffer count as failed, so a test can drive the failure path without
     /// a GPU fault. Read once per command buffer; a plain unfair lock, never held across anything.
     let forcedCommandBufferFailure = OSAllocatedUnfairLock(initialState: false)
-
-    /// The command buffer's error, as text, or nil when it completed cleanly.
-    private static func commandBufferFailure(_ cb: MTLCommandBuffer, forced: Bool) -> String? {
-        forced ? "forced failure (test)" : cb.error?.localizedDescription
-    }
 
     /// Same composition, without blocking the caller on the GPU.
     ///
@@ -566,7 +554,9 @@ final class DoviFelComposer: @unchecked Sendable {
         frameIndex: UInt32 = 0,
         completion: @escaping @Sendable (CVPixelBuffer?) -> Void
     ) {
+        let waitStart = CACurrentMediaTime()
         acquireSlot()
+        stages.record("slot wait", ms: (CACurrentMediaTime() - waitStart) * 1000)
         composeAsyncWithAcquiredSlot(
             baseBuffer: baseBuffer,
             enhancementBuffer: enhancementBuffer,
@@ -640,104 +630,112 @@ final class DoviFelComposer: @unchecked Sendable {
         frameIndex: UInt32 = 0,
         completion: @escaping @Sendable (CVPixelBuffer?) -> Void
     ) {
-        let signpostID = OSSignpostID(log: Self.signpostLog)
-        os_signpost(.begin, log: Self.signpostLog, name: "Compose", signpostID: signpostID,
-                    "frame=%{public}u", frameIndex)
-        guard let work = encodeCompose(baseBuffer: baseBuffer,
-                                       enhancementBuffer: enhancementBuffer,
-                                       params: params,
-                                       frameIndex: frameIndex) else {
-            os_signpost(.end, log: Self.signpostLog, name: "Compose", signpostID: signpostID, "encode-failed")
-            releaseInFlightSlot()
-            completion(nil)
+        submit([Request(baseBuffer: baseBuffer, enhancementBuffer: enhancementBuffer, params: params,
+                        frameIndex: frameIndex, completion: completion)])
+    }
+
+    /// One composition, as ``submit(_:)`` takes it.
+    struct Request: @unchecked Sendable {
+        let baseBuffer: CVPixelBuffer
+        let enhancementBuffer: CVPixelBuffer
+        let params: DoviMetalParams
+        var frameIndex: UInt32 = 0
+        let completion: @Sendable (CVPixelBuffer?) -> Void
+    }
+
+    /// Encodes the requests in one batch and commits it; their slots come back, and their completions run, when the
+    /// batch has completed. The caller holds one slot per request.
+    private func submit(_ batch: [Request]) {
+        let encodeStart = CACurrentMediaTime()
+        let timed = batch.contains { $0.frameIndex % Self.timedEveryFrames == 0 }
+        guard let gpuBatch = gpu.makeBatch(timed: timed) else {
+            for request in batch {
+                releaseInFlightSlot()
+                request.completion(nil)
+            }
             return
         }
         // `textures` holds the CVMetalTextures; the source buffers are held
         // alongside them because a CVMetalTexture is not documented to keep the
         // pixel buffer it was made from alive, and the GPU reads both until the
-        // command buffer retires. Boxed because CoreVideo's types are not
+        // batch completes. Boxed because CoreVideo's types are not
         // `Sendable` and this crosses two queues: CoreVideo buffers are
         // themselves thread-safe, and only one queue touches the box at a time.
-        let frame = ComposedFrame(destination: work.destination,
-                                  source: baseBuffer,
-                                  enhancement: enhancementBuffer,
-                                  textures: work.keepAlive,
-                                  cache: textureCache)
-        // Captured as a value, not through `self?.`, before the handler below is
-        // even built: the whole point of `deliveryQueue` is that calling
-        // `completion` never depends on the composer still being alive, so there
-        // is no `self?.deliveryQueue ?? .global()`-shaped fallback to reach for
-        // if it were. `DispatchQueue` is a plain `Sendable`
-        // reference, so this costs nothing.
+        var encoded: [(work: EncodedFrame, frame: ComposedFrame, request: Request, signpost: OSSignpostID)] = []
+        for request in batch {
+            let signpostID = OSSignpostID(log: Self.signpostLog)
+            os_signpost(.begin, log: Self.signpostLog, name: "Compose", signpostID: signpostID,
+                        "frame=%{public}u", request.frameIndex)
+            guard let work = encodeCompose(baseBuffer: request.baseBuffer, enhancementBuffer: request.enhancementBuffer,
+                                           params: request.params, frameIndex: request.frameIndex, batch: gpuBatch) else {
+                os_signpost(.end, log: Self.signpostLog, name: "Compose", signpostID: signpostID, "encode-failed")
+                releaseInFlightSlot()
+                request.completion(nil)
+                continue
+            }
+            let frame = ComposedFrame(destination: work.destination, source: request.baseBuffer,
+                                      enhancement: request.enhancementBuffer, textures: work.keepAlive, cache: textureCache)
+            encoded.append((work, frame, request, signpostID))
+        }
+        // Nothing encoded: the batch is still committed, empty, so its resources go back to the submitter.
+        // Captured as values, not through `self?.`: the whole point of `deliveryQueue` is that calling `completion`
+        // never depends on the composer still being alive. The semaphore is held strongly so it outlives a composer
+        // released mid-flight: libdispatch traps if a semaphore is destroyed below its initial count.
         let deliveryQueue = self.deliveryQueue
-        let paramSlot = work.paramSlot
-        // Held strongly so it outlives a composer that is released mid-flight: libdispatch traps
-        // if a semaphore is destroyed below its initial count, and `self` is weak in the handler.
         let inFlightSemaphore = self.inFlight
         let forcedFailure = self.forcedCommandBufferFailure
-        work.commandBuffer.addCompletedHandler { [weak self] cb in
-            // Metal runs these handlers on ONE serial queue per command queue, so
-            // this block must never take a lock the caller above might be holding
-            // and must never block (dolby-vision-fel.md §4.3). The caller is inside
-            // `inFlight.wait()` while it holds the decoder's lock, and a `completion`
-            // that reached for that same lock would block here, which would
-            // stop every LATER handler from running, and one of those is the
-            // signal the caller is waiting for. Signalling first only defers that
-            // by a frame - it deadlocked on device after ~10s of playback.
-            //
-            // So: release the slot inline — nothing below this line can block —
-            // then hop to `deliveryQueue` for everything else, `completion`
-            // included, so Metal's shared queue never waits on it no matter what
-            // it does. In production `completion` is `DualLayerVideoDecoder.
-            // runCompose`'s closure, itself just a `queue.async` into
-            // `OrderedDelivery.fulfil`, so this hop is normally a hand-off from
-            // one non-blocking queue to another; `DoviComposeAsyncTests.
-            // doesNotDeadlockAgainstTheCallersLock` is what this hop exists for —
-            // it hands `composeAsync` a `completion` that deliberately blocks on
-            // a lock the caller holds, and only survives because that block runs
-            // off Metal's queue.
-            //
-            // This event marks the instant
-            // Metal actually invoked this handler — i.e. "GPU retired" —
-            // distinct from the "Compose" interval's `.end`, which only
-            // fires later, after the hop below has run. Without it, nothing
-            // in the signposts brackets the hand-off from Metal's queue to
-            // `deliveryQueue` on its own: Instruments could see "Compose"
-            // ran long but not whether that was GPU time or queueing delay
-            // hopping to the relay. It has to be the very first thing here,
-            // ahead of even `inFlight.signal()`, so it costs nothing on the
-            // must-never-block path (`os_signpost` does not block) and is
-            // not itself delayed by anything below it.
-            os_signpost(.event, log: Self.signpostLog, name: "Compose", signpostID: signpostID, "metal-completion-fired")
-            if let strongSelf = self {
-                strongSelf.returnParamSlot(paramSlot)
-                strongSelf.releaseInFlightSlot()
-            } else {
-                inFlightSemaphore.signal()
+        let stages = self.stages
+        let committed = OSAllocatedUnfairLock(initialState: 0.0)
+        let count = Double(max(encoded.count, 1))
+        let slots = encoded.map(\.work.paramSlot)
+        let deliveries = encoded.map { (frame: $0.frame, completion: $0.request.completion, signpost: $0.signpost) }
+        let commitTime = CACurrentMediaTime()
+        committed.withLock { $0 = commitTime }
+        if !encoded.isEmpty { stages.record("encode", ms: (commitTime - encodeStart) * 1000 / count) }
+        gpuBatch.commit { [weak self] result in
+            // The submitter runs this on one serial queue, so it must never block or take a lock a caller might
+            // hold (dolby-vision-fel.md §4.3): the caller is inside `inFlight.wait()` while it holds the decoder's
+            // lock, and the signal it waits for comes from a later completion. So the slots go back first, inline,
+            // and everything else, `completion` included, hops to `deliveryQueue`.
+            let handlerFired = CACurrentMediaTime()
+            for delivery in deliveries {
+                os_signpost(.event, log: Self.signpostLog, name: "Compose", signpostID: delivery.signpost, "metal-completion-fired")
             }
-            // Everything the hop needs pulled out of `cb` here, as plain
-            // Sendable values: `cb` itself is `any MTLCommandBuffer`, not
-            // Sendable, so it cannot cross into `deliveryQueue.async`'s
-            // closure directly, and `self` is captured once, strongly, into a
-            // fresh local rather than referenced from inside the nested
-            // closure (which is what the "captured var 'self' in
-            // concurrently-executing code" warning was about).
-            let errorDescription = Self.commandBufferFailure(cb, forced: forcedFailure.withLock { $0 })
-            let gpuMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000
+            for slot in slots {
+                if let strongSelf = self {
+                    strongSelf.returnParamSlot(slot)
+                    strongSelf.releaseInFlightSlot()
+                } else {
+                    inFlightSemaphore.signal()
+                }
+            }
+            guard !deliveries.isEmpty else { return }
+            let errorDescription = forcedFailure.withLock { $0 } ? "forced failure (test)" : result.error
+            let gpuMs = result.gpuMs / count
+            if result.gpuStart > 0 {
+                stages.record("gpu queue", ms: (result.gpuStart - committed.withLock { $0 }) * 1000)
+                stages.record("gpu", ms: gpuMs)
+                stages.record("gpu to handler", ms: (handlerFired - result.gpuEnd) * 1000)
+                for stamp in result.stamps where stamp.ms.isFinite {
+                    stages.record("\(stamp.label) (1 in \(Self.timedEveryFrames))", ms: stamp.ms)
+                }
+            }
             let composer = self
             deliveryQueue.async {
+                stages.record("handler to delivery", ms: (CACurrentMediaTime() - handlerFired) * 1000)
                 if let errorDescription {
                     Self.logOnce("[DoviFelComposer] Command buffer error: \(errorDescription)")
                 }
                 composer?.recordGPUTime(ms: gpuMs)
-                os_signpost(.end, log: Self.signpostLog, name: "Compose", signpostID: signpostID)
-                // A command buffer that errored leaves the destination partly written: deliver a failure,
-                // so the caller falls back to the base layer instead of showing garbage.
-                completion(errorDescription == nil ? frame.destination : nil)
-                frame.release()
+                for delivery in deliveries {
+                    os_signpost(.end, log: Self.signpostLog, name: "Compose", signpostID: delivery.signpost)
+                    // A batch that errored leaves the destination partly written: deliver a failure, so the caller
+                    // falls back to the base layer instead of showing garbage.
+                    delivery.completion(errorDescription == nil ? delivery.frame.destination : nil)
+                    delivery.frame.release()
+                }
             }
         }
-        work.commandBuffer.commit()
     }
 
     /// Compositions allowed to be outstanding at once. Sized against the pool's
@@ -913,19 +911,19 @@ final class DoviFelComposer: @unchecked Sendable {
     }
 
     private struct EncodedFrame {
-        let commandBuffer: MTLCommandBuffer
         let destination: CVPixelBuffer
         let keepAlive: [CVMetalTexture]
         let paramSlot: Int
     }
 
     /// Everything up to (not including) `commit`: pool rental, texture binding,
-    /// parameter upload and the two dispatches.
+    /// parameter upload and the dispatches, encoded in a pass of `batch`.
     private func encodeCompose(
         baseBuffer: CVPixelBuffer,
         enhancementBuffer: CVPixelBuffer,
         params: DoviMetalParams,
-        frameIndex: UInt32
+        frameIndex: UInt32,
+        batch: GPUBatch
     ) -> EncodedFrame? {
         let blW = CVPixelBufferGetWidth(baseBuffer)
         let blH = CVPixelBufferGetHeight(baseBuffer)
@@ -1047,58 +1045,46 @@ final class DoviFelComposer: @unchecked Sendable {
         let mmrBuffer = mmrTableBuffers[paramSlot]
         Self.populateMmrTable(into: mmrBuffer.contents().assumingMemoryBound(to: Int32.self), params: serialized)
 
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+        guard let pass = batch.makePass() else {
             returnParamSlot(paramSlot)
             return nil
         }
+        // Luma and chroma in one pass with no barrier between them: luma reads BL luma + BL chroma (a luma MMR
+        // curve would need it) and the EL luma, chroma reads BL luma + BL chroma and the EL chroma, and neither
+        // reads what the other writes (`outYTex` and `outUvTex` are separate planes), so the GPU runs them
+        // together. sv22's 4:2:2 step reads what the chroma pass wrote, behind a barrier. In a timed batch each
+        // kernel is stamped, each stamp waiting for the work before it, so each kernel's own time is read off it.
+        pass.setBuffer(paramBuffer, index: 0)
+        pass.setBuffer(lutBuffer, index: 1)
+        pass.setBuffer(nlqBuffer, index: 2)
+        pass.setBuffer(mmrBuffer, index: 3)
+        pass.setTexture(blYTex, index: 0)
+        pass.setTexture(blUvTex, index: 1)
 
-        // Every pass goes in one concurrent encoder. Luma reads BL luma + BL
-        // chroma (a luma MMR curve would need it) and the EL luma; chroma reads
-        // BL luma + BL chroma and the EL chroma. Neither reads what the other
-        // writes — `outYTex` and `outUvTex` are separate planes — so the barrier
-        // Metal puts between two serial encoders buys nothing and costs a full
-        // GPU sync point per frame. sv22's 4:2:2 step reads what the chroma pass
-        // wrote, behind a barrier on that one texture.
-        guard let encoder = commandBuffer.makeComputeCommandEncoder(dispatchType: .concurrent) else {
-            returnParamSlot(paramSlot)
-            return nil
-        }
+        pass.setPipeline(kernels.luma)
+        pass.setTexture(elYTex, index: 2)
+        pass.setTexture(outYTex, index: 3)
+        dispatch(pass, width: blW, height: blH, threadgroup: lumaThreads, wholeThreadgroups: true)
+        pass.timestamp("luma")
 
-        encoder.setComputePipelineState(kernels.luma)
-        encoder.setTexture(blYTex, index: 0)
-        encoder.setTexture(blUvTex, index: 1)
-        encoder.setTexture(elYTex, index: 2)
-        encoder.setTexture(outYTex, index: 3)
-        encoder.setBuffer(paramBuffer, offset: 0, index: 0)
-        encoder.setBuffer(lutBuffer, offset: 0, index: 1)
-        encoder.setBuffer(nlqBuffer, offset: 0, index: 2)
-        encoder.setBuffer(mmrBuffer, offset: 0, index: 3)
-        dispatch(encoder, width: blW, height: blH, threadgroup: lumaThreads, wholeThreadgroups: true)
-
-        encoder.setComputePipelineState(kernels.chroma)
-        encoder.setTexture(blYTex, index: 0)
-        encoder.setTexture(blUvTex, index: 1)
-        encoder.setTexture(elUvTex, index: 2)
-        encoder.setTexture(chroma420 ?? outUvTex, index: 3)
-        encoder.setBuffer(paramBuffer, offset: 0, index: 0)
-        encoder.setBuffer(nlqBuffer, offset: 0, index: 2)
-        encoder.setBuffer(mmrBuffer, offset: 0, index: 3)
-        dispatch(encoder, width: Self.chromaSize(blW), height: Self.chromaSize(blH), threadgroup: chromaThreads,
+        pass.setPipeline(kernels.chroma)
+        pass.setTexture(elUvTex, index: 2)
+        pass.setTexture(chroma420 ?? outUvTex, index: 3)
+        dispatch(pass, width: Self.chromaSize(blW), height: Self.chromaSize(blH), threadgroup: chromaThreads,
                  wholeThreadgroups: true)
+        pass.timestamp("chroma")
 
         if let chroma420 {
-            encoder.memoryBarrier(resources: [chroma420])
-            encoder.setComputePipelineState(kernels.chroma422)
-            encoder.setTexture(chroma420, index: 0)
-            encoder.setTexture(outUvTex, index: 1)
-            encoder.setBuffer(paramBuffer, offset: 0, index: 0)
-            dispatch(encoder, width: Self.chromaSize(blW), height: blH, threadgroup: threadgroupSize(for: kernels.chroma422),
+            pass.barrier()
+            pass.setPipeline(kernels.chroma422)
+            pass.setTexture(chroma420, index: 0)
+            pass.setTexture(outUvTex, index: 1)
+            dispatch(pass, width: Self.chromaSize(blW), height: blH, threadgroup: threadgroupSize(for: kernels.chroma422),
                      wholeThreadgroups: false)
+            pass.timestamp("4:2:2")
         }
 
-        encoder.endEncoding()
-
-        return EncodedFrame(commandBuffer: commandBuffer, destination: dst, keepAlive: keepAliveTextures, paramSlot: paramSlot)
+        return EncodedFrame(destination: dst, keepAlive: keepAliveTextures, paramSlot: paramSlot)
     }
 
     /// The 1024-entry luma prediction table when luma is polynomial (dolby-vision-fel.md §5.6): the 16-bit
@@ -1282,6 +1268,13 @@ final class DoviFelComposer: @unchecked Sendable {
         return nil
     }
 
+    /// Each composition's stages per frame, in host time: the wait for an in-flight slot, the CPU encode (texture
+    /// binding, pool rental, parameters), commit to the GPU starting it, the GPU's own time, the GPU finishing to
+    /// Metal's completion handler, and that handler to the delivery queue that calls `completion`.
+    let stages = StageTimes()
+    /// One composition in this many runs in a timed batch, its kernels' GPU times recorded one by one.
+    static let timedEveryFrames: UInt32 = 24
+
     private static let gpuTimeWindow = 120
     private let gpuTimeLock = NSLock()
     private var gpuTimeAccum: Double = 0
@@ -1369,23 +1362,18 @@ final class DoviFelComposer: @unchecked Sendable {
         }
         memset(outBuffer.contents(), 0, slots * 4)
 
-        guard let commandBuffer = commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+        let paramData = params.serialize()
+        guard let paramBuffer = paramData.withUnsafeBytes({ raw in
+                  raw.baseAddress.flatMap { device.makeBuffer(bytes: $0, length: raw.count, options: .storageModeShared) }
+              }),
+              let batch = gpu.makeBatch(), let pass = batch.makePass() else {
             return nil
         }
-        encoder.setComputePipelineState(pipeline)
-        let paramData = params.serialize()
-        paramData.withUnsafeBytes { raw in
-            if let ptr = raw.baseAddress {
-                encoder.setBytes(ptr, length: raw.count, index: 0)
-            }
-        }
-        encoder.setBuffer(outBuffer, offset: 0, index: 1)
-        dispatch(encoder, width: 1, height: 1, threadgroup: MTLSize(width: 1, height: 1, depth: 1), wholeThreadgroups: false)
-        encoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        guard commandBuffer.error == nil else { return nil }
+        pass.setPipeline(pipeline)
+        pass.setBuffer(paramBuffer, index: 0)
+        pass.setBuffer(outBuffer, index: 1)
+        dispatch(pass, width: 1, height: 1, threadgroup: MTLSize(width: 1, height: 1, depth: 1), wholeThreadgroups: false)
+        guard gpu.commitAndWait(batch).error == nil else { return nil }
 
         let ptr = outBuffer.contents().bindMemory(to: UInt32.self, capacity: slots)
         return Array(UnsafeBufferPointer(start: ptr, count: slots))
@@ -1403,7 +1391,7 @@ final class DoviFelComposer: @unchecked Sendable {
     /// `wholeThreadgroups` takes the second path whatever the device supports: the composition kernels' shuffles need
     /// every lane of a SIMD-group to run, the ones past the picture included (``elUpsamplingThreadgroup(for:)``).
     private func dispatch(
-        _ encoder: MTLComputeCommandEncoder,
+        _ encoder: ComputePass,
         width: Int,
         height: Int,
         threadgroup: MTLSize,

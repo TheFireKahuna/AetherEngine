@@ -35,4 +35,5 @@ final class DecodedPictureSource: OverlayFrameSource, @unchecked Sendable {
         let held = tap.held
         return "held \(held.units) units / \(held.decoded) decoded"
     }
+    func drainStageTimes() -> String? { nil }
 }

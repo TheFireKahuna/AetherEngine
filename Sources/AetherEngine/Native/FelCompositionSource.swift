@@ -4,6 +4,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import os
+import QuartzCore
 
 /// The overlay picture of a Profile 7 FEL on the native route: AVPlayer's base-layer frame (bit-identical to a
 /// VideoToolbox decode of the base layer, before any reshaping), paired by item time with its enhancement picture
@@ -56,7 +57,10 @@ final class FelCompositionSource: OverlayFrameSource, @unchecked Sendable {
 
     func makePicture(from base: CVPixelBuffer, at frameTime: CMTime,
                      done: @escaping @Sendable (CVPixelBuffer?) -> Void) -> Bool {
-        guard let frame = tap.frame(at: frameTime.seconds) else { return false }
+        let lookupStart = CACurrentMediaTime()
+        let frame = tap.frame(at: frameTime.seconds)
+        composer.stages.record("lookup", ms: (CACurrentMediaTime() - lookupStart) * 1000)
+        guard let frame else { return false }
         var params = frame.params
         let enhancement: CVPixelBuffer
         if let el = frame.enhancement {
@@ -73,6 +77,8 @@ final class FelCompositionSource: OverlayFrameSource, @unchecked Sendable {
         composer.composeAsync(baseBuffer: base, enhancementBuffer: enhancement, params: params, frameIndex: frameIndex, completion: done)
         return true
     }
+
+    func drainStageTimes() -> String? { composer.stages.drain() }
 
     func logSummary() -> String {
         let held = tap.held
