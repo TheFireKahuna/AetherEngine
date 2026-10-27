@@ -1,13 +1,13 @@
 {
-  "originHash" : "d92f37d07502845c43317db6f95111e8a97ee005f8cd3a59e2521da707eb622c",
+  "originHash" : "5a61da0e753aa79a3a40a77c51e03e46200138a4ae523a7ada62a278ae24b2a0",
   "pins" : [
     {
       "identity" : "ffmpegbuild",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/superuser404notfound/FFmpegBuild",
+      "location" : "https://github.com/TheFireKahuna/FFmpegBuild",
       "state" : {
-        "version" : "3.10.1"
         "revision" : "3f00cfcfa0a7912b123bdea4c78bf61805029c9a",
+        "version" : "3.10.1-fire.1"
       }
     },
     {
@@ -22,6 +22,17 @@
       "identity" : "libdovi",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/TheFireKahuna/LibDovi",
+      "state" : {
+        "revision" : "0173d6c9825497edecbb4fc756be4958032fa101",
+        "version" : "2.2.0-fire.3"
+      }
+    },
+    {
+      "identity" : "libmlsubupscaler",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/TheFireKahuna/LibMLSubUpscaler",
+      "state" : {
+      }
     },
       "state" : {
         "revision" : "c946b596944f03036c8caed2b7cb7726a47f32fc",
