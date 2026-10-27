@@ -15,6 +15,7 @@ the public-API contract.
 - **TrueHD Atmos as APAC objects, personal builds only** (`APACObjectOutput` trait, off by default, with
   `AETHER_APAC_OBJECTS=1`). Every element of the object presentation goes to APAC as a positioned object
   (the LFE on a bed) for tvOS to render, instead of the engine's speaker bed. Private AudioCodec properties
+  and APAC's PCM-carried metadata (`APACObjectEncoder`), so it is never shipped. Measured on the
   Mac against the engine's own render of the same exact decode: same level and speaker split. The playlist
   announces the stream as the 7.1.4 tier (`apac.31.03`, `CHANNELS="12"`) whatever its own profile: announced
   as `apac.05.00`, a tvOS 27.2 Apple TV delivered it as multichannel PCM instead of Dolby MAT. Zone masks
@@ -48,16 +49,40 @@ the public-API contract.
   coding when it codes them, and after a reset, under a lock it shares with the bed encoder's end of
   stream (`APACCodecGate`). This was the placement test that failed now and then beside the bridge suite.
 
+- **Object metadata applied as TS 103 420 and TS 103 448 specify**, by the engine's render and in object
+  APAC: snap to the 22.2 targets by weighted distance, distance to the room boundary, warp
+  mode, divergence, default and custom trims (the latter through LibTrueHD's
+  `truehd_atmos_decoder_get_trims`), the size panner, and ramps of ramp_duration + 1 frames. Checked against
+  Dolby's own 7.1 render fitted from the streams: point-object direction within a median 0.4 points and the
+  level equal to object gain plus default trim. Bed channels a layout lacks now fold as TS 103 448 table 6
+  has them, on the renderer and in object APAC: a 7.1 bed's sides and backs reach 5.1's surrounds at -3 dB
+  each instead of 0 dB (3 dB too loud together), and on stereo the centre plays at -3 dB and the backs,
+  tops and wides at -6 dB. An object with its elevation off comes down to ear level only on layouts with
+  height speakers (table 5), so on 2.0, 5.1 and 7.1 the default trim lowers it by its height again. A
+  screen-anchored object no longer snaps (5.1.2.2), every update restarts every object's ramp as
+  pseudocode 19 does (in films a restatement lands one frame before the ramp ends, so nothing is heard),
+  and a custom trim's front/back balance is applied, as a fader, which no specification defines.
+  In object APAC a ramp restarted mid-way steps on from the gain of the frame before it, as the speaker
+  bus does (it started one step ahead), and a sized object with its elevation off is rendered on the bus
+  on 7.1.4, where the system's size would spread it into the heights. A position exactly on a speaker
+  row or column gives its neighbour exactly 0 instead of 7.5e-8 (Float's cos(pi / 2)).
 
 - **Object size along each axis** (TS 103 448 pseudocodes 7-14 with object_width_X, _Y, _Z): OAMD width,
   depth and height each shape the spread, instead of the largest standing for all three. Apple's renderer
   takes one size for every axis, so on object APAC an object sized differently along its axes is rendered
   by the engine on the speaker bus. Matches an independent implementation of the clause to 1e-4.
 
+- **`LoadOptions.objectDialogueGain`**: dialogue enhancement, in dB, for elements a TrueHD Atmos stream
+  marks as dialogue (OAMD element 4), where the engine renders the objects itself. Applied as AC-4
+  specifies for object audio (TS 103 190-2 5.8.2.5): up to the most the stream allows, which is 0 dB when
+  it states no maximum, and TrueHD states none, so only a cut takes effect. No film surveyed (183 TrueHD
+  Atmos titles) marks its dialogue, so for now it changes nothing on real content.
 
 - **TrueHD Atmos at 96 and 192 kHz is rendered with its objects** instead of falling back to the channel
+  bridge's 7.1 without heights. The decoded elements are decimated to
   48 kHz right after decoding (`ObjectAudioDecimator`: linear-phase FIR, flat to 20 kHz, over 100 dB down
   from 28 kHz), with its delay taken up front so every frame and every metadata update keeps its time;
+  APAC encodes 48 kHz only. LibTrueHD reads such a stream's metadata timing in the units its
   payload interval implies (TS 103 420 5.3: 1536 per frame of metadata). Measuring it takes two
   payloads, so at the start of such a stream its first metadata comes one payload interval (up to
   32 ms) later, covered by the hold the engine already keeps; seeks within the stream reuse it.
@@ -151,6 +176,19 @@ the public-API contract.
   panel repeated a frame about every 42 s. A probe within 0.005 of 24.000 now snaps to 24; a Matroska track with
   DefaultDuration probes as an exact 24/1 or 24000/1001, so 23.976 sources and noisier probes keep 23.976.
 
+
+- **TrueHD Atmos is dialogue-normalised**, as a TrueHD decoder does: the presentation's stated dialogue
+  level is brought to -31 LKFS on the decoded elements, so the render and object APAC both play it. Of 183
+  TrueHD Atmos titles surveyed, 179 state -31 (no change); the others play 4 to 7 dB lower, as their
+  stream asks. The session log reports the gain when it is not 0 dB.
+
+- **LibTrueHD 4.0.0-fire.1** (API 3; `TrueHDObjectAudio`), on upstream 3.1.0, with matrix interpolation
+  compiled in so the elements decode exactly. Each object metadata update carries the trims and warp mode
+  in force for it, timed with it. The OAMD parser conforms to ETSI TS 103 420 and the Evolution container
+  to TS 102 366 Annex H, metadata at 96 and 192 kHz is timed in its own units, and elements carry their
+  dialogue indication. Each presentation states its dialogue level and each block its dynamic range
+  control state, read at every major sync; a stream whose last OAMD element is declared shorter than it
+  is no longer loses that element.
 
 - **LibDovi comes from this fork's TheFireKahuna/LibDovi 2.2.0-fire.1**, built from
   TheFireKahuna/dovi_tool at 2.3.4. Same crate version, 3.4.0, plus the unreleased level 253 support;

@@ -582,6 +582,11 @@ public struct LoadOptions: Sendable, Equatable {
     /// (`AetherEngine.OptionalComponent`).
     public var objectAudioRendering: ObjectAudioRendering
 
+    /// Dialogue enhancement for TrueHD Atmos objects, in dB: elements the stream marks as dialogue are raised or lowered by it,
+    /// as AC-4 specifies for object audio. A boost is limited to the most the stream allows, and
+    /// TrueHD streams state none, so only a cut (a negative value) takes effect, and only on a stream
+    /// that marks its dialogue, which no film surveyed does. Default 0.
+    public var objectDialogueGain: Float
     /// How a 3D source is presented where the system shows stereo (visionOS; elsewhere every source plays
     /// 2D as before). `.automatic` (default) keeps an MV-HEVC stream's second view and presents the frame
     /// packing a container declares; `.sideBySide` / `.overUnder` say what the file's name alone says (a
@@ -598,10 +603,6 @@ public struct LoadOptions: Sendable, Equatable {
 
     /// DVR rewind window in seconds; nil = live-only (seek is a no-op). Engine retains roughly this much past content disk-backed, bounded by the session disk budget (a quarter of the free space, at most 2 GiB), so a long window on a high-bitrate channel or a small volume holds less than it asks for. Suggested default: 1800. Ignored when `isLive == false`. Default nil.
     public var dvrWindowSeconds: Double?
-
-    /// Opt in to strict software DVR storage bounds and runtime capacity leases.
-    /// Nil preserves the default spool behavior.
-    public var softwareDVRRetention: SoftwareDVRRetentionOptions? = nil
 
     /// LL-HLS blocking-reload (`#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD`) override for live loopback sessions.
     /// nil (default) = auto: for a `LiveIngestSourceInfo` custom reader the engine derives eligibility from
@@ -1081,6 +1082,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.panelPresentsDolbyVision = panelPresentsDolbyVision
         self.audioBridgeMode = audioBridgeMode
         self.objectAudioRendering = objectAudioRendering
+        self.objectDialogueGain = objectDialogueGain
         self.stereoPresentation = stereoPresentation
         self.isLive = isLive
         self.audioOnly = audioOnly

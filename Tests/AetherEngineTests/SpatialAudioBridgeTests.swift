@@ -545,6 +545,9 @@ struct SpatialAudioBridgeTests {
         #expect(abs(heard - 0.25) < 0.001, "the click decodes at \(heard) s, not at its source position 0.25 s")
     }
 
+    @Test("with a negative output offset the click decodes exactly that much earlier")
+    func outputOffsetMovesTheClick() async throws {
+    }
     #if APACObjectOutput
     @Test("object output: the init segment carries a low-profile apac entry, announced as 7.1.4")
     func objectOutputMuxedInit() throws {

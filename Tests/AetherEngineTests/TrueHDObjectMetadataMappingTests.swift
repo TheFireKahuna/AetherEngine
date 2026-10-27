@@ -50,7 +50,7 @@ struct TrueHDObjectMetadataMappingTests {
         #expect(TrueHDObjectAudioDecoder.role(forSpeaker: TRUEHD_ATMOS_SPEAKER_UNKNOWN) == .object)
     }
 
-    @Test("an active elevated object keeps its position, gain and largest size dimension")
+    @Test("an element is prepared for panning: elevation switch, snap and zones")
     func guidePreparation() {
         // Elevation off: kept off the heights; snapped onto the nearest 22.2 target at ear level.
         let flags = TRUEHD_ATMOS_ELEMENT_ACTIVE | TRUEHD_ATMOS_ELEMENT_SNAP
@@ -150,6 +150,34 @@ struct TrueHDObjectMetadataMappingTests {
         let constrained = element(flags: TRUEHD_ATMOS_ELEMENT_ACTIVE | TRUEHD_ATMOS_ELEMENT_SNAP, position: (0.2, 0.1, 0.8),
                                   zone: TRUEHD_ATMOS_ZONE_SURROUND_ONLY)
         #expect(TrueHDObjectAudioDecoder.state(for: constrained).position == SIMD3(0, 0.5, 0))
+    }
+
+    @Test("dialogue enhancement as AC-4 5.8.2.5: G up to the stream's maximum, which is 0 dB when it states none")
+    func dialogueEnhancementRule() {
+        let db = { (g: Float) in 20 * log10(g) }
+        #expect(abs(db(TrueHDObjectAudioDecoder.dialogueEnhancement(gain: 6)) - 0) < 1e-5, "no maximum stated: no boost")
+        #expect(abs(db(TrueHDObjectAudioDecoder.dialogueEnhancement(gain: -6)) + 6) < 1e-5, "a cut always applies")
+        #expect(abs(db(TrueHDObjectAudioDecoder.dialogueEnhancement(gain: 6, maximum: 9)) - 6) < 1e-5)
+        #expect(abs(db(TrueHDObjectAudioDecoder.dialogueEnhancement(gain: 12, maximum: 9)) - 9) < 1e-5)
+    }
+
+    @Test("dialogue normalisation brings the stated dialogue level to -31 LKFS, and leaves a stream that states none")
+    func dialogueNormalisationGain() {
+        let db = { (level: Int32) in 20 * log10(TrueHDObjectAudioDecoder.normalisationGain(dialogueLevel: level)) }
+        #expect(abs(db(-27) + 4) < 1e-4)
+        #expect(abs(db(-24) + 7) < 1e-4)
+        #expect(db(-31) == 0)
+        #expect(db(0) == 0, "no dialogue level stated")
+    }
+
+    @Test("only an element marked as dialogue takes the dialogue gain")
+    func dialogueOnlyOnMarkedElements() {
+        let stream = TrueHDObjectAudioDecoder.StreamMetadata(dialogue: 0.5)
+        var e = element()
+        for (dialog, expected) in [(TRUEHD_ATMOS_DIALOG_DIALOGUE, Float(0.25)), (2, 0.5), (3, 0.5), (0, 0.5), (255, 0.5)] {
+            e.dialog = dialog
+            #expect(TrueHDObjectAudioDecoder.state(for: e, stream: stream).gain == expected, "dialog \(dialog)")
+        }
     }
 
     @Test("a screen-anchored object does not snap (TS 103 448 5.1.2.2)")

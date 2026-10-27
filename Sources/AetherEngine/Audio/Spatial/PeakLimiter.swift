@@ -13,6 +13,7 @@ import Foundation
 /// - Attack: the reduction eases in over the `attackFrames` before the frame that needs it, linear
 ///   in dB, so a peak is met by a gain already at its value instead of a step on it (a gain step is
 ///   broadband distortion). That look-ahead is the limiter's latency: output frame `p` is input frame
+///   `p`, handed on `attackFrames` later, and the bridge's timeline counts it.
 /// - Release: a reduction comes back at `releaseSeconds`' exponential rate (34.7 dB/s), the way a
 ///   peak envelope decaying by that time constant does, but never takes longer than
 ///   `releaseLimitSeconds`: one too deep to come back in that time at that rate (over 12.2 dB) comes

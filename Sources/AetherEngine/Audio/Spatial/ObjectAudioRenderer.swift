@@ -197,6 +197,7 @@ final class ObjectAudioRenderer {
     func markDiscontinuity() {
         for index in roles.indices {
             if rampRemaining[index] > 0 {
+                // The element holds where its ramp had got to.
                 let t = Float(rampTotal[index] - rampRemaining[index]) / Float(rampTotal[index])
                 for c in current[index].indices {
                     current[index][c] += (target[index][c] - current[index][c]) * t
@@ -253,6 +254,27 @@ final class ObjectAudioRenderer {
             cursor = end
         }
         // Updates stamped at or past the end of the block still take effect, for the next block.
+        for update in pending { apply(update) }
+    }
+
+    /// Take `frameCount` frames of metadata and ramps forward without mixing any audio: what
+    /// `render` does to the gains.
+    func advance(frameCount: Int, updates: [ObjectAudioMetadataUpdate]) {
+        var cursor = 0
+        var pending = updates[...]
+        while cursor < frameCount {
+            while let next = pending.first, next.frameOffset <= cursor {
+                apply(next)
+                pending = pending.dropFirst()
+            }
+            let end = min(frameCount, pending.first?.frameOffset ?? frameCount)
+            for index in roles.indices where rampRemaining[index] > 0 {
+                rampRemaining[index] -= min(rampRemaining[index], end - cursor)
+                if rampRemaining[index] == 0 { current[index] = target[index] }
+            }
+            age(end - cursor)
+            cursor = end
+        }
         for update in pending { apply(update) }
     }
 

@@ -407,7 +407,7 @@ extension HLSVideoEngine {
             case .trueHDAtmos where APACObjectOutputSwitch.isOn:
                 rendering = "elements sent as APAC objects (\(APACObjectOutputSwitch.variable), personal build)"
             case .trueHDAtmos:
-                rendering = "objects rendered into \(layout.rawValue)"
+                rendering = "decoded exactly, objects rendered into \(layout.rawValue)"
             case .dtsHDMasterAudio:
                 rendering = "bed and heights routed one to one into \(layout.rawValue)"
             }
