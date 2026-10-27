@@ -38,6 +38,8 @@ protocol OverlayFrameSource: AnyObject, Sendable {
     func pictures(after last: CMTime?, at itemSeconds: Double) -> [(picture: CVPixelBuffer, time: CMTime)]
     /// The source's own state, for the renderer's periodic log line.
     func logSummary() -> String
+    /// What the source's stages cost per frame since the last call (``StageTimes``), nil when it measures none.
+    func drainStageTimes() -> String?
 }
 
 /// Draws our own picture over an `AVPlayer` whose rendering is suppressed: a Profile 7 FEL's composition over the
@@ -126,6 +128,10 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
     private var gravityObservation: NSKeyValueObservation?
     private let timing = OverlayTiming()
     /// The pictures' buffers coming back from the compositor: how they fared on screen (``SurfaceReturnWatch``).
+    private var returns: SurfaceReturnWatch?
+    /// The renderer's own stages per frame: the refresh on the render queue, taking AVPlayer's frame, handing it to
+    /// the source, and the made picture's hop back to the render queue.
+    private let stages = StageTimes()
     private var itemTimebase: CMTimebase?
     /// The layer's control timebase: the item's, followed one for one, or the host clock while scanning.
     private var layerTimebase: CMTimebase?
@@ -134,6 +140,7 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
     private let lifecycle = NSLock()
     private var started = false
     private var stopped = false
+
     // Render-queue state.
     /// The layer follows the host clock (scanning) rather than the item's.
     private var followsHost = false
@@ -243,6 +250,7 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         logDecoderFormat(item: item)
         let link = OverlayDisplayLink { [weak self] timestamp, targetTimestamp in
             guard let self else { return }
+            let fired = CACurrentMediaTime()
             let sequence = self.latestRefresh.withLock { latest -> UInt64 in
                 latest &+= 1
                 return latest
@@ -252,7 +260,10 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
                 // picture) would otherwise work through every refresh queued meanwhile for nothing.
                 let stale = self.latestRefresh.withLock({ $0 }) != sequence
                 if stale { self.countersLock.withLock { self._counters.staleRefreshes += 1 } }
+                let start = CACurrentMediaTime()
+                self.stages.record("refresh wait", ms: (start - fired) * 1000)
                 self.refresh(at: timestamp, target: targetTimestamp, fills: !stale)
+                self.stages.record("refresh", ms: (CACurrentMediaTime() - start) * 1000)
             }
         }
         let delegate = OverlayOutputDelegate(onWillChange: { [weak self] in
@@ -727,6 +738,13 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
                        + source.logSummary(),
                        category: .swPlayback)
         EngineLog.emit("[SoftwareOverlay] \(timing.drain())", category: .swPlayback)
+        let stageTimes = [stages.drain(), source.drainStageTimes()].compactMap { $0 }
+        if !stageTimes.isEmpty {
+            EngineLog.emit("[SoftwareOverlay] per frame (count, min/median/max): \(stageTimes.joined(separator: ", "))",
+                           category: .swPlayback)
+        }
+        EngineLog.emit("[SoftwareOverlay] alongside playback (count, min/median/max per job): "
+                       + (StageTimes.alongsidePlayback.drain() ?? "nothing"), category: .swPlayback)
         // The layer follows the item's clock; AVPlayer's own display mapping (`itemTime(forHostTime:)`) is what its
         // video path would show at a host time. Read at one instant, the difference is how far the two part.
         var mapping = ""

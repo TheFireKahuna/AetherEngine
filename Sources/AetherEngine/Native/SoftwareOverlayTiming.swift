@@ -172,6 +172,11 @@ final class OverlayTiming: @unchecked Sendable {
     }
 
     /// min / median / max in ms.
+    static func spread(_ values: [Double]) -> String {
+        guard !values.isEmpty else { return "-" }
+        let sorted = values.sorted()
+        return String(format: "%.1f/%.1f/%.1f ms", sorted.first!, sorted[sorted.count / 2], sorted.last!)
+    }
 }
 
 /// The overlay's pictures as the compositor gives their buffers back: each enqueued picture's IOSurface is watched,
@@ -267,6 +272,40 @@ final class SurfaceReturnWatch: @unchecked Sendable {
                                       from: CMClockGetHostTimeClock(), to: itemTimebase).seconds
         for r in returned { timing.returned(item: r.item, host: now, clock: clock, next: r.next, follows: r.follows) }
         for _ in 0..<neverUsed { timing.neverUsed() }
+    }
+}
+
+/// What each stage of making an overlay picture costs per frame, min / median / max over a log window, in the
+/// order the stages were first recorded. A window nobody drains keeps only its latest samples.
+final class StageTimes: @unchecked Sendable {
+    /// The still and thumbnail work that shares the GPU and the video decoder with playback (I-frame stills, scrub
+    /// and chapter thumbnails, stills read off the source), each job's time; the overlay's log drains it beside its
+    /// own stages.
+    static let alongsidePlayback = StageTimes()
+
+    private static let maxSamples = 4096
+    private let lock = NSLock()
+    private var order: [String] = []
+    private var samples: [String: [Double]] = [:]
+
+    func record(_ stage: String, ms: Double) {
+        guard ms.isFinite else { return }
+        lock.withLock {
+            if samples[stage] == nil { order.append(stage) }
+            samples[stage, default: []].append(ms)
+            if samples[stage]!.count > Self.maxSamples { samples[stage]!.removeFirst(Self.maxSamples / 2) }
+        }
+    }
+
+    /// The window's stages, and a fresh window; nil when nothing was recorded.
+    func drain() -> String? {
+        lock.withLock {
+            defer { for stage in order { samples[stage]?.removeAll(keepingCapacity: true) } }
+            let parts = order.compactMap { stage in
+                samples[stage].flatMap { $0.isEmpty ? nil : "\(stage) \($0.count)x \(OverlayTiming.spread($0))" }
+            }
+            return parts.isEmpty ? nil : parts.joined(separator: ", ")
+        }
     }
 }
 

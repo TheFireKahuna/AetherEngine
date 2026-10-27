@@ -1,4 +1,5 @@
 // Sources/AetherEngine/Video/IFrameStillBuilder.swift
+import QuartzCore
 import Foundation
 import CoreGraphics
 import CoreMedia
@@ -146,6 +147,21 @@ final class IFrameStillBuilder: @unchecked Sendable {
 
     private func encode(at what: String, picture: () -> CVPixelBuffer?) -> Data? {
         do { try decoder.ensureOpen() } catch { return nil }
+        let decodeStart = CACurrentMediaTime()
+        let decoded = picture()
+        let encodeStart = CACurrentMediaTime()
+        StageTimes.alongsidePlayback.record("i-frame still decode", ms: (encodeStart - decodeStart) * 1000)
+        let encoded = decoded.flatMap { encoder.encode($0) }
+        if decoded != nil {
+            StageTimes.alongsidePlayback.record("i-frame still encode", ms: (CACurrentMediaTime() - encodeStart) * 1000)
+        }
+        guard let encoded else {
+            if !loggedFailure {
+                loggedFailure = true
+                EngineLog.emit("[IFrameStill] no still for \(what)", category: .session)
+            }
+            return nil
+        }
         return encoded
     }
 

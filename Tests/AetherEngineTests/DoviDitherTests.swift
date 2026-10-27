@@ -263,10 +263,32 @@ struct DoviDitherTests {
         return out
     }
 
+    /// The shader's `dovi_blue_noise_64`, row by row.
     static var blueNoiseRanks: [Int] {
+        get throws {
+            let source = try ShaderFiles.dolbyVisionFEL()
+            let start = try #require(source.range(of: "dovi_blue_noise_64[4096] = {"))
+            let end = try #require(source.range(of: "};", range: start.upperBound..<source.endIndex))
+            return source[start.upperBound..<end.lowerBound].split(whereSeparator: { ", \n".contains($0) }).compactMap { Int($0) }
+        }
     }
 
     @Test("the blue-noise map holds every rank once, so its thresholds average exactly 0.5, and its local means are flat")
+    func blueNoiseTableShape() throws {
+        let ranks = try Self.blueNoiseRanks
+        #expect(ranks.sorted() == Array(0..<4096), "not a permutation of 0...4095")
+        // Blue noise has almost no low-frequency content, so 8x8 block means sit close to the tile mean
+        // (2047.5): this map spreads them by 41.5, a shuffled table (white noise) by about 160.
+        var sq = 0.0
+        for by in 0..<8 { for bx in 0..<8 {
+            var sum = 0
+            for y in 0..<8 { for x in 0..<8 { sum += ranks[(by * 8 + y) * 64 + bx * 8 + x] } }
+            let d = Double(sum) / 64 - 2047.5
+            sq += d * d
+        } }
+        let sd = (sq / 64).squareRoot()
+        #expect(sd < 60, "8x8 block means spread by \(sd), not blue")
+    }
 
     @Test("blue-noise dither is unbiased: the 64x64 tile mean is the exact pre-rounding value, at every quarter-code residue")
     func blueNoiseMeanMatchesExactValue() throws {
@@ -296,6 +318,7 @@ struct DoviDitherTests {
         let bayer = Self.readAll(try run(.bayer8x8, frame: 0), plane: 0, components: 1, component: 0)
         #expect(y0 != bayer)
         // The thresholds below 0.5 are exactly ranks 0...2047, so at residue 2 the luma plane is the map's lower half.
+        let ranks = try Self.blueNoiseRanks
         #expect(y0 == ranks.map { $0 >= 2048 ? 501 : 500 }, "the luma plane is not the map at offset (0, 0)")
         let cb = Self.readAll(f0, plane: 1, components: 2, component: 0)
         let cr = Self.readAll(f0, plane: 1, components: 2, component: 1)

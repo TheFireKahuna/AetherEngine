@@ -1,13 +1,62 @@
 import Foundation
+import Metal
+import LibDeinterlace
 
 public extension AetherEngine {
 
+    /// Make the Dolby Vision Profile 7 FEL composer's GPU pipelines now, so the first composed frame
     /// does not wait for them.
+    ///
+    /// The composer makes its pipelines on the first FEL frame of a process. Its kernels ship compiled, and on
+    /// an Apple TV 4K (A15) running the tvOS release the engine's pipeline archive was built for, the pipelines
+    /// come from that archive in milliseconds; anywhere else they are compiled for the GPU, hundreds of
+    /// milliseconds the first time, then from Metal's shader cache until an app update or a cache purge. A host
+    /// that calls this at launch, or when a Profile 7 title is selected, spends that while the viewer is still in
+    /// its UI. It works at utility priority off Swift's cooperative pool and returns when the pipelines are ready;
+    /// a host need not wait for it.
+    ///
     /// Safe to call any number of times, and concurrently with playback: the compile happens once per
     /// process, and a composition that starts while it runs waits for it rather than compiling again.
+    ///
     /// - Returns: Whether the pipelines are ready. False without the `DualLayerDolbyVision` trait (there is
+    ///   nothing to warm), with no Metal device, or when a pipeline cannot be made; that failure is kept,
     ///   so the dual-layer route then plays the base layer exactly as it would have without the warm.
     @discardableResult
+    nonisolated static func prewarmDualLayerDolbyVision() async -> Bool {
+        #if DualLayerDolbyVision
+        // BlockingWork, not the cooperative pool: the compile blocks its thread for hundreds of milliseconds.
+        await BlockingWork.detached(priority: .utility) { DoviFelComposer.prewarmPipelines() }.value
+        #else
+        false
+        #endif
+    }
+
+    /// Make the GPU pipelines software decode uses now, so a stream that opens finds its own made.
+    ///
+    /// A software-decoded picture reaches the display through one GPU pass whose pipeline depends on its pixel
+    /// format, range and colour handling, with deinterlacing and inverse telecine passes before it for
+    /// interlaced and telecined streams. This makes those of the formats software decode meets (MPEG-2, H.264,
+    /// VC-1, AV1 and the intermediate codecs, 8 to 12 bits, every chroma siting, grain, interlacing), about a
+    /// hundred and fifty pipelines. On an Apple TV 4K (A15) running the tvOS release the pipeline archives were built for,
+    /// they come from the archives the engine and LibDeinterlace ship; anywhere else they are compiled, seconds
+    /// of GPU compiler time the first time, then from Metal's shader cache until an app update. A stream outside
+    /// this set makes its own when it opens. Works at utility priority off Swift's cooperative pool; a host
+    /// calls it once at launch and need not wait for it.
+    ///
+    /// - Returns: Whether there was a Metal device to warm.
+    @discardableResult
+    nonisolated static func prewarmSoftwareDecode() async -> Bool {
+        await BlockingWork.detached(priority: .utility) { () -> Bool in
+            guard let device = MTLCreateSystemDefaultDevice(),
+                  let submitter = GPUSubmitter(device: device, label: "Prewarm") else { return false }
+            let start = CFAbsoluteTimeGetCurrent()
+            PlanarFrameFinisher.prewarmPlanned(device: device)
+            DeinterlaceKernels(submission: DeinterlaceGPU(submitter)).prewarm()
+            EngineLog.emit(String(format: "[Prewarm] software decode pipelines ready after %.0f ms",
+                                  (CFAbsoluteTimeGetCurrent() - start) * 1000), category: .swPlayback)
+            return true
+        }.value
+    }
 
     /// The default number of source bytes a warm retains, 8 MB.
     ///

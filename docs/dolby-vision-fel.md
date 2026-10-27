@@ -102,10 +102,10 @@ flowchart LR
 
 | Stage | Code | Thread | What happens per frame |
 |---|---|---|---|
-| Routing | `VideoRoutingPolicy.requiresSoftwarePath`, `SoftwarePlaybackHost` decoder selection | load | Profile 7 + `preferDualLayerDolbyVision` + `dolbyVisionHandling` `.automatic` + VOD seekable source + hardware HEVC decode + `el_type` FEL + inside the real-time budget (§5.2) → software host, which picks `DualLayerVideoDecoder` (§5.2) |
+| Routing | `VideoRoutingPolicy.requiresSoftwarePath`, the overlay's decoder selection | load | Profile 7 + `preferDualLayerDolbyVision` + `dolbyVisionHandling` `.automatic` + VOD seekable source + hardware HEVC decode + `el_type` FEL + inside the real-time budget (§5.2) → the composed overlay, which picks `DualLayerVideoDecoder` (§5.2) |
 | Split | `DoviRpuConverter.separateDualLayers` | demux | RPU parsed into composer parameters and converted to an 8.1 NAL; EL NAL units copied into a new `AVPacket`; the BL packet goes to VideoToolbox untouched (it skips the `unspec` NAL units itself) |
 | Align | `DualLayerPictureAlignment.enhancementPTS` | demux, under the decoder's lock | each layer's display slot from its POC (`HEVCPictureOrderCount`); the EL packet takes the PTS of the BL picture in the same slot, so pairing by time pairs by picture order when the layers' GOPs differ. A layer whose sequence cannot be trusted (leading pictures of the opener, or more than 16 slots off its unit, or a seek before its next IRAP) keeps its access unit's PTS |
-| Decode | two `HardwareVideoDecoder`s | VideoToolbox output threads | asynchronous decode with temporal processing, P010 IOSurface buffers in decode order (the renderer's 4-frame reorder buffer restores display order, as for any VideoToolbox HEVC stream) |
+| Decode | two `HardwareVideoDecoder`s | VideoToolbox output threads | asynchronous decode with temporal processing, P010 IOSurface buffers, handed on in display order |
 | Pair | `DualLayerVideoDecoder.handleBaseLayerFrame` / `handleEnhancementLayerFrame` | VideoToolbox output threads, under the decoder's recursive lock | match the other layer by 90 kHz canonical PTS within ±300 ticks; a base-layer frame takes its ticket at arrival and is bypassed under it once K = 3 newer base-layer frames have arrived; waiting enhancement frames capped at 10; side data in a 32-entry ring; `hdr10Data` and the display-metadata NAL are resolved once here and travel with the ticket |
 | Compose | `DoviFelComposer.composeAsync` | caller, then Metal | wait for one of 3 in-flight slots, rent a P010 buffer (§5.6), copy colour attachments from the base layer, bind 6 texture-cache textures, serialize the parameter block, encode luma and chroma kernels in one concurrent encoder, commit |
 | Deliver | Metal completion handler → composer's `deliveryQueue` (composed frames) or the pairing call directly (a bypass) → `OrderedDelivery.fulfil` → `emit` | Metal's completion queue hands off immediately to the composer's own `.userInteractive` queue (§4.3's firewall, not an ordering mechanism), or the pairing thread for a bypass, then `OrderedDelivery`'s own `.userInteractive` queue — never the decoder lock | release the GPU slot inline, nothing else, on Metal's queue; everything else (error logging, GPU-time accounting, `completion`) hops off it first. Either path hands the frame to `OrderedDelivery` (§5.7): one serial queue orders composed and bypassed frames alike regardless of which queue called `fulfil`, drops anything tagged with an epoch a flush/close has since retired, and calls `onFrame` (renderer enqueue) with no decoder lock held |
@@ -114,16 +114,16 @@ A frame bypasses composition, and goes out as its base layer with its own DV met
 stream is not FEL, when MEL was detected, when no RPU parameters exist for its PTS, or when
 composition fails.
 
-**Kernels** (`DoviShaderSource.swift`). Luma: base code → piece selection → polynomial (evaluated in
+**Kernels** (`Sources/AetherFELShaders/Shaders/DolbyVisionFEL.metal`, compiled when the package builds). Luma: base code → piece selection → polynomial (evaluated in
 normalized float) or MMR when the luma curve uses MMR → plus the inverse-NLQ residual of the
 enhancement-layer luma, upsampled with one hardware-bilinear fetch →
 12-bit clamp → dither → 10-bit. Chroma: base chroma plus the base luma at the chroma site ([1 2 1] around
 the even column in each of the cell's two rows, rows averaged; DoViBaker's MMR input) → MMR → plus the residual from the enhancement chroma, upsampled with one
 hardware-bilinear fetch co-sited with the top-left luma sample (DoViBaker's phase) → dither.
 
-**Parameter ABI.** `DoviShaderSource.sharedStructs` on the GPU side, `DoviMetalParams.serialize` on
+**Parameter ABI.** The shader's `DOVI_SHARED_STRUCTS` block on the GPU side, `DoviMetalParams.serialize` on
 the Swift side. `DoviLayoutProbeTests` has the GPU read every sub-block back at the offset Swift wrote
-it to; `DoviShaderSyncTests` pins the serialized size and that every kernel is present.
+it to; `DoviShaderSyncTests` pins the serialized size and that the shipped library has every kernel.
 
 ### 3.1 Audio
 

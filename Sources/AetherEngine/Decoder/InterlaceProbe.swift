@@ -132,6 +132,9 @@ enum InterlaceProbe {
         packetBudget: Int = InterlaceProbe.packetBudget,
         wallClockBudget: TimeInterval = InterlaceProbe.wallClockBudget
     ) -> FilmCarriage? {
+        guard let stream = demuxer.stream(at: streamIndex), let device = MTLCreateSystemDefaultDevice(),
+              let allocator = DecodeFrameAllocator(device: device),
+              let submitter = GPUSubmitter(device: device, label: "InterlaceProbe") else { return nil }
         var pictures: [BwdifWindow.Picture] = []
         var shape: (format: AVPixelFormat, width: Int, height: Int)?
         var carriage = AVRational(num: 0, den: 1)
@@ -175,6 +178,8 @@ enum InterlaceProbe {
         var held: [BwdifWindow.Picture] = []
         let done = DispatchGroup()
         for p in pictures {
+            guard let batch = submission.submitter.makeBatch() else { break }
+            let pushed = chain.push(p, into: DeinterlaceGPU.batch(batch))
             outputs += pushed.outputs
             held += pushed.touched
             done.enter()

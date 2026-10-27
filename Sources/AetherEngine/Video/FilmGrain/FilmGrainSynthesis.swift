@@ -1,4 +1,5 @@
 // AV1 film grain synthesis (AV1 7.18.3), the CPU's part: the grain buffer's layout, the header and the synthesis
+// arguments of a frame's parameters; the GPU synthesises the templates, the scaling tables and the block offsets into
 // the buffer (the fg_* kernels of Shaders/FilmGrain.h). The structure follows dav1d's
 // src/filmgrain_tmpl.c and src/fg_apply_tmpl.c:
 //
@@ -131,6 +132,7 @@ struct FilmGrainParameters: Hashable, Sendable {
     }
 }
 
+/// The per-frame tables, laid out as Shaders/FilmGrain.h reads them (its FG_* constants): a header the CPU writes, and
 /// the templates, scaling tables and block offsets the GPU synthesises in the frame's own batch. AV1's generator
 /// is serial (one LFSR stream, a causal auto-regressive filter), and the GPU takes it exactly: each run of draws' LFSR
 /// state jumped to directly (the shader's FG_JUMP), the filter run as a wavefront, the tables in closed form.

@@ -495,7 +495,12 @@ Sources/AetherEngine/
 │   ├── SubtitleOCRPendingState.swift        Pending-composition end resolution for the OCR worker, mirroring the sidecar semantics: a composition still open at the next composition or clear event ends at that event's PTS
 │   ├── WebVTTCueSettings.swift              WebVTT cue settings (`line`, `position`, `align`) mapped onto `SubtitleTextPlacement`: libavcodec's decoder drops them from the ASS line it synthesises, the demuxer keeps them as packet side data (#233)
 │   └── WebVTTSegmentParser.swift            One parsed WebVTT segment of a live SUBTITLES rendition: cue times are in the segment's own local clock (a counter providers run for days), and placement comes from the playlist geometry rather than the `X-TIMESTAMP-MAP` the spec offers (#359)
+├── Shaders/                                 The GPU kernels, compiled into the bundle's default.metallib when the package builds
+│   ├── Finisher.metal                       The finisher's kernel (`pf_finish`, specialised per plan with function constants), the constant-luminance recompute, decimate's gate
 │   ├── FilmGrain.h                          AV1 film grain: the synthesis kernels by role (templates, scaling tables, block offsets) and the per-sample grain the finisher reads through
+├── Resources/
+│   ├── AetherEngine-pipelines.metallib.lzfse The planned pipelines translated for the A15 on tvOS 27.0, lzfse-packed (`Scripts/build-shader-archive.sh`)
+│   └── silent-atmos.mp4                     The silent E-AC-3 Atmos `AtmosOutputActivator` loops beside an APAC track
 ├── Video/
 │   ├── HLSVideoEngine.swift                 Native path: session orchestrator (start/stop, producer construction + restart, shift handling)
 │   ├── HLSVideoEngine+AudioRoute.swift      Native path: stream-copy -> bridge -> video-only audio cascade
@@ -512,11 +517,20 @@ Sources/AetherEngine/
 │   ├── DoviRpuSurvey.swift                  L1 / L2 display-metadata survey over a title's RPUs (no decode, no GPU); backs `aetherctl dvsurvey`
 │   ├── AetherEngine+FelProbe.swift          `DualLayerDolbyVision` trait: FEL decode probe backing `aetherctl feltest`, and the `--cycle-el` residual switch
 │   ├── AetherEngine+DolbyVisionTest.swift   DEBUG-only, `DualLayerDolbyVision` trait: `@_spi(Diagnostics)` hook (not host API) that arms the pin test from a debug menu or `aetherctl play --dv-pin`
-│   ├── Metal/                               `DualLayerDolbyVision` trait only
-│   │   ├── DoviFelComposer.swift            BL + EL + RPU composition: runtime-compiled pipelines, pooled P010 output, `composeAsync` bounded at `maxFramesInFlight` with completions on its own serial queue; RPU → `DoviMetalParams` parsing
-│   │   ├── DoviShaderSource.swift           Luma / chroma compose kernels (reshaping, inverse NLQ, bilinear EL upsampling, ordered dither) and the ABI layout probe, compiled at runtime
+│   ├── Metal/                               Every GPU submission, the software route's finisher, and (`DualLayerDolbyVision` trait) the FEL composer
+│   │   ├── GPUSubmission.swift              `GPUSubmitter`: the one submission layer (Metal 4 where the device has it, Metal 3 otherwise): batches, passes, uploads, events, fences, fills; a batch holds what it binds until it completes
+│   │   ├── GPUPipelines.swift               Every compute pipeline, made one way per device for the process: Metal 4 from the request's binary archive where it holds it (a miss compiled and logged), Metal 3 by the device
+│   │   ├── EngineShaders.swift              The engine's precompiled libraries (`Shaders/`, `AetherFELShaders`), loaded once per device; the A15 pipeline archive (tvOS devices) and the requests it is recorded from
+│   │   ├── GPUSubmission+Libraries.swift    The submitter as LibDeinterlace's and LibMLSubUpscaler's submissions (`DeinterlaceGPU`, `SubtitleUpscaleGPU`)
+│   │   ├── PlanarFrameFinisher.swift        The one pass between a software decoder and the display: a decoded picture into a bi-planar display buffer (H.273), with grain, deinterlaced fields, inverse telecine's chosen and gated outputs; slots, plans, the pipeline cache, the planned set (archive and launch prewarm)
+│   │   ├── ColourRepresentation.swift       What the finisher does with a picture's MatrixCoefficients: tag, convert or refuse (docs/colour-representation.md)
+│   │   ├── DoviFelComposer+Benchmark.swift  `DualLayerDolbyVision` trait: each composition kernel's GPU cost at UHD on the device it runs on
+│   │   ├── FelPlaybackBenchmark.swift       `DualLayerDolbyVision` trait: a FEL title played as the app plays it, timed by the overlay's own instruments
+│   │   ├── DoviFelComposer.swift            BL + EL + RPU composition: pipelines from the precompiled FEL library, pooled P010 output, `composeAsync` bounded at `maxFramesInFlight` with completions on its own serial queue; RPU → `DoviMetalParams` parsing
 │   │   ├── DoviIptConversion.swift          A profile 5 / AV1 10.0 RPU's display-management colour conversion (ycc_to_rgb with its offsets, rgb_to_lms, LMS to BT.2020) as `dovi_ipt_to_bt2020` takes it
 │   │   └── DoviMetalParams.swift            Swift mirror of the kernel parameter structs and their byte-exact serializer
+│   ├── FilmGrain/                           AV1 film grain on the GPU, bit exact to the specification (docs/software-route-gpu.md part 5)
+│   │   └── FilmGrainSynthesis.swift         `FilmGrainParameters` (a frame's, from libdav1d); the grain buffer's layout, its header and the synthesis arguments (the kernels are `Shaders/FilmGrain.h`)
 │   ├── Issue65LivelockBreakers.swift        Pure backpressure-wedge detection (`BackpressureWedgeDetector`) breaking the VOD HLS scrub-burst livelock (#65); `seekIsWedged` starvation check + `SeekResumeGuard` single-resume latch for the deadline-bounded seek
 │   ├── Issue99MuxerFailureRevive.swift      Bounded revive for a VOD pump that died with `muxerFailed` (#99): the first cut firing before any bridged audio reached the muxer (dec3 box) no longer ends the session
 │   ├── SlowServeSignal.swift                One-shot slow-serve timer arming the server's early chunked header (keeps TTFB under AVPlayer's ~3.5 s -12889 window, #93 round 3)
@@ -559,6 +573,8 @@ Sources/AetherEngineSMB/
 ├── ByteRangeSource.swift                    Random-access read-only byte-source protocol, isolates the network backend from cursor / seek logic for testability
 └── SMBIOReader.swift                        Bridges a ByteRangeSource into the engine's IOReader (blocking read via a happens-before semaphore edge)
 ```
+
+The `AetherFELShaders` target (`Sources/AetherFELShaders/`, the FEL composer's kernels in `Shaders/DolbyVisionFEL.metal`) is a dependency only with the `DualLayerDolbyVision` trait, so a build without it carries none of them. `ShaderHarvest` (`Sources/ShaderHarvest/`, never a product) records the archive's pipelines for `Scripts/build-shader-archive.sh`.
 
 The `aetherctl` CLI target (`Sources/aetherctl/`) is documented separately in [docs/cli.md](cli.md).
 
