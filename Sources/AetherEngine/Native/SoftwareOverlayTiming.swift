@@ -318,6 +318,8 @@ final class OverlayDisplayLink: NSObject, @unchecked Sendable {
     private var thread: Thread?
     private var link: CADisplayLink?
     private let pausedState = OSAllocatedUnfairLock(initialState: false)
+    /// The refresh rate asked of the display (``follow(contentFrameRate:)``), nil before the content's is known.
+    private let requestedRate = OSAllocatedUnfairLock<Float?>(initialState: nil)
 
     init(onRefresh: @escaping (_ timestamp: CFTimeInterval, _ targetTimestamp: CFTimeInterval) -> Void) {
         self.onRefresh = onRefresh
@@ -327,6 +329,7 @@ final class OverlayDisplayLink: NSObject, @unchecked Sendable {
         let thread = Thread { [self] in
             let link = makeLink()
             self.link = link
+            applyRate()
             link?.add(to: .current, forMode: .common)
             var fallback: Timer?
             if link == nil {
@@ -361,6 +364,41 @@ final class OverlayDisplayLink: NSObject, @unchecked Sendable {
     }
 
     @objc private func applyPaused() { link?.isPaused = pausedState.withLock { $0 } }
+
+    /// The fastest refresh a ProMotion panel runs at.
+    static let maximumRefreshRate = 120.0
+
+    /// The refresh rate for content at `fps`: its largest whole multiple up to ``maximumRefreshRate``, so every frame
+    /// stays on screen for the same number of refreshes (24p at 120 Hz is five each; at 60 Hz it alternates two and
+    /// three). A 23.976 or 29.97 stream counts as 24 or 30, whose multiple the panel's rate is.
+    static func refreshRate(forContentFrameRate fps: Double) -> Float {
+        let nominal = fps.rounded()
+        guard nominal >= 1, nominal <= maximumRefreshRate else { return Float(maximumRefreshRate) }
+        return Float(nominal * (maximumRefreshRate / nominal).rounded(.down))
+    }
+
+    /// Asks the display for the refresh rate of content at `fps` (iOS). AVPlayer does this for the video it renders
+    /// itself; with its rendering suppressed for the overlay, nothing else tells the system a film is playing, and an
+    /// iPhone measured 60 Hz under a 24p overlay. The range is pinned to the one rate: a panel left a range can settle
+    /// on a rate in between (80 Hz) that no frame rate divides. Above 60 Hz on an iPhone only when the app's
+    /// Info.plist sets `CADisableMinimumFrameDurationOnPhone`. tvOS takes its rate from the TV's mode switch instead.
+    func follow(contentFrameRate fps: Double) {
+        #if os(iOS)
+        let rate = Self.refreshRate(forContentFrameRate: fps)
+        guard requestedRate.withLock({ state in
+            defer { state = rate }
+            return state != rate
+        }), let thread else { return }
+        perform(#selector(applyRate), on: thread, with: nil, waitUntilDone: false)
+        #endif
+    }
+
+    @objc private func applyRate() {
+        #if os(iOS)
+        guard let rate = requestedRate.withLock({ $0 }) else { return }
+        link?.preferredFrameRateRange = CAFrameRateRange(minimum: rate, maximum: rate, preferred: rate)
+        #endif
+    }
 
     private func makeLink() -> CADisplayLink? {
         #if os(macOS)

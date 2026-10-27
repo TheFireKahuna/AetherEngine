@@ -624,7 +624,14 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
             if step > 0.005, step < 0.2 { frameSteps = (frameSteps.sum + step, frameSteps.count + 1) }
         }
         lastPulled = frameTime
+        if frameSteps.count >= Self.stepsForFrameRate, let frameDuration, frameDuration > 0 {
+            displayLink?.follow(contentFrameRate: 1 / frameDuration)
+        }
     }
+
+    /// Steps between pulled frames averaged before the display is asked for the content's refresh rate: enough that
+    /// whole-millisecond container timestamps settle on the rate.
+    static let stepsForFrameRate = 8
 
     /// This refresh's interval, and the clocks (``OverlayTiming``).
     private func measure(at timestamp: CFTimeInterval, duration: CFTimeInterval, itemTimebase: CMTimebase) {

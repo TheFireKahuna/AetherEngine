@@ -124,6 +124,13 @@ the public-API contract.
 
 ### Fixed
 
+- **The overlay asks an iPhone's ProMotion display for its film's refresh rate.** With AVPlayer's own rendering
+  suppressed for the overlay (a Profile 7 FEL composed over its base layer, a codec AVPlayer cannot decode), nothing
+  told the system a film was playing, and an iPhone 17 Pro Max ran a 24p overlay at 60 Hz: frames alternated two
+  and three refreshes, and measured one to five. The overlay's display link now asks, once the frame rate is
+  measured, for the rate's largest whole multiple up to 120 Hz (120 Hz for 24p and 30p, 100 Hz for 25p), pinned to
+  that one rate. An iPhone app reaches above 60 Hz only with `CADisableMinimumFrameDurationOnPhone` in its
+  Info.plist. tvOS is unchanged: the TV's mode switch sets its rate.
 - **The audio tap delivers audio on TrueHD Atmos and DTS:X sessions.** Their loopback audio is APAC, which
   libavcodec cannot decode, so the tap's stream stayed empty for the whole session. The tap now decodes APAC
   with AudioToolbox, from the cookie the init segment carries, and downmixes the bed to its mono 48 kHz format
