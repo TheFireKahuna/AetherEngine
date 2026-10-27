@@ -6,14 +6,13 @@ import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
 
-/// Audio-only playback host (lean sibling of `SoftwarePlaybackHost`): FFmpeg decode -> `AVSampleBufferAudioRenderer`
+/// Audio-only playback host: FFmpeg decode -> `AVSampleBufferAudioRenderer`
 /// for sources with no video track, skipping video decoder/display/HDR/HLS/muxer/loopback. The synchronizer is the
-/// master clock; `seekClock(to:rate:)` anchors it once on the first decoded packet (SoftwarePlaybackHost clock-arming
-/// pattern), then `currentTime` is polled at 4 Hz off the synchronizer.
+/// master clock; `seekClock(to:rate:)` anchors it once on the first decoded packet, then `currentTime` is polled at 4 Hz off the synchronizer.
 @MainActor
 final class AudioPlaybackHost {
 
-    // MARK: - Published state (mirrors SoftwarePlaybackHost surface)
+    // MARK: - Published state
 
     @Published private(set) var isReady: Bool = false
     @Published private(set) var currentTime: Double = 0
@@ -37,15 +36,15 @@ final class AudioPlaybackHost {
     /// the wrong thread for it. Serial and separate from `demuxQueue`, whose block never returns.
     private let seekQueue = DispatchQueue(label: "engine.audio.seek", qos: .userInitiated)
 
-    /// Read-deadline budget for a reposition (#254). Matches `SoftwarePlaybackHost`.
+    /// Read-deadline budget for a reposition (#254).
     private static let seekBudgetSeconds: TimeInterval = 8.0
 
     /// True while a reposition is awaiting `seekQueue`; gates the 250 ms tick so it cannot republish
     /// the pre-seek synchronizer position over the target this seek already committed to.
     private var seekInFlight = false
 
-    /// Transport intent for the reposition currently in flight (#292; mirrors
     /// `SoftwarePlaybackHost.inFlightSeekResumeIntent`). A seek entering while another is suspended in
+    /// Transport intent for the reposition currently in flight (#292). A seek entering while another is suspended in
     /// its off-main reposition (#254) must not read the `isPlaying` its predecessor cleared.
     private var inFlightSeekResumeIntent = false
 
@@ -59,7 +58,7 @@ final class AudioPlaybackHost {
 
     private var audioStreamIndex: Int32 = -1
 
-    /// 250 ms mirror of currentTimeSeconds into published currentTime (matches SoftwarePlaybackHost).
+    /// 250 ms mirror of currentTimeSeconds into published currentTime.
     private var timeTimer: AnyCancellable?
 
     private var lastRate: Float = 1.0
@@ -93,14 +92,14 @@ final class AudioPlaybackHost {
     /// Latched once the first `play()` has spun up the demux loop.
     private var demuxLoopStarted: Bool = false
 
-    /// True between pause() and next play() so play() resumes the synchronizer rate (mirrors SoftwarePlaybackHost.pausedByHost).
+    /// True between pause() and next play() so play() resumes the synchronizer rate.
     private var pausedByHost: Bool = false
 
     /// #694: latched when end of media parks the clock (AE#374 on this host). Keeps `play()` from
     /// restarting a clock the source stopped; a seek clears it.
     private var didParkClockAtEnd = false
 
-    /// Shared clock-armed latch (mirrors SoftwarePlaybackHost._clockArmed): demux loop arms once on first decoded
+    /// Shared clock-armed latch: demux loop arms once on first decoded
     /// packet; seek() anchors directly and sets this so the loop doesn't snap back to the stale initial anchor.
     nonisolated(unsafe) private var _clockArmed = false
     nonisolated private var clockArmed: Bool {
@@ -112,6 +111,7 @@ final class AudioPlaybackHost {
     /// the demux loop when it anchors the clock on a first sample that lies past the load anchor (an Ogg
     /// radio stream's granule position, an audio-only TS that joined mid-broadcast). 0 for a source that
     /// starts where it was asked to. Same meaning and same policy as `SoftwarePlaybackHost.clockSessionZero`.
+    /// starts where it was asked to.
     nonisolated(unsafe) private var _sessionZeroSeconds: Double = 0
     nonisolated private var sessionZeroSeconds: Double {
         get { flagsLock.lock(); defer { flagsLock.unlock() }; return _sessionZeroSeconds }
@@ -182,6 +182,13 @@ final class AudioPlaybackHost {
         self.audioStreamIndex = resolvedAudioIdx
         self.audioOutput = AudioOutput()
         self.audioOutput?.volume = volume
+        self.audioOutput?.onRendererFailed = { [weak self] error in
+            Task { @MainActor in
+                guard let self, !self.stopRequested else { return }
+                EngineLog.emit("[AudioHost] audio renderer failed: \(error)", category: .swPlayback)
+                self.onRendererFailed?(.audio, error)
+            }
+        }
 
         if let start = startPosition, start.isFinite, start > 0 {
             // #254: same off-main, deadline-bounded reposition the transport seek uses. Also load()'s
@@ -268,7 +275,7 @@ final class AudioPlaybackHost {
     }
 
     func setRate(_ newRate: Float) {
-        // #436: zero is a pause, not a speed; see SoftwarePlaybackHost.setRate.
+        // #436: zero is a pause, not a speed.
         if newRate == 0 {
             pause()
             return
@@ -284,8 +291,8 @@ final class AudioPlaybackHost {
     }
 
     /// #254: the demuxer reposition is awaited off the main actor, for the reason
-    /// `Demuxer.seekBounded(to:anchorStreamIndex:timeout:on:isSuperseded:)` documents. Same defect as
     /// `SoftwarePlaybackHost.seek`, same shape, only without the video half.
+    /// `Demuxer.seekBounded(to:anchorStreamIndex:timeout:on:isSuperseded:)` documents.
     @discardableResult
     func seek(to seconds: Double) async -> Demuxer.RepositionOutcome {
         guard let dem = demuxer else { return .stalled }
@@ -334,13 +341,14 @@ final class AudioPlaybackHost {
             return outcome
         }
         // #292: read the intent at the landing, not what this seek captured on entry, so a `pause()` or
-        // `play()` issued during the reposition still decides (mirrors SoftwarePlaybackHost).
+        // `play()` issued during the reposition still decides.
         if inFlightSeekResumeIntent {
             audioOutput?.seekClock(to: targetTime, rate: lastRate)
             isPlaying = true
         } else {
             // Paused seek: anchor at target rate 0 so play() resumes from the SEEK position not the stale
             // pre-seek clock (mirrors SoftwarePlaybackHost's VOD path).
+            // pre-seek clock.
             audioOutput?.seekClock(to: targetTime, rate: 0)
             pausedByHost = true
         }
@@ -642,6 +650,20 @@ final class AudioPlaybackHost {
             + "\(String(format: "%.3f", aOut.currentTimeSeconds))s",
             category: .swPlayback
         )
+    }
+
+    // MARK: - Renderer failure
+
+    /// The renderer failing, reported to the engine, which owns the escalation (`RendererRecoveryLadder`) as it does
+    /// for the software host. Main actor.
+    var onRendererFailed: ((FailedRenderer, String) -> Void)?
+
+    /// The ladder's first step for this host, whose one renderer is audio: a new one in its place, under the running
+    /// clock (`AudioOutput.replaceFailedRenderer`). False when there is no output to replace it in.
+    func replaceFailedAudioRenderer() -> Bool {
+        guard !stopRequested, let audioOutput else { return false }
+        audioOutput.replaceFailedRenderer()
+        return true
     }
 
     // MARK: - Time updates

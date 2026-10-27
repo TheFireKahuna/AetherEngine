@@ -792,6 +792,11 @@ if first == "play" {
         t.start()
         #endif
     }
+    // `--legacy-renderer-attach`: attach renderers with addRenderer/removeRenderer instead of the 27 receivers, for A/B.
+    if takeFlag("--legacy-renderer-attach", from: &rest) {
+        AetherEngine.usesSampleBufferReceivers = false
+        print("[aetherctl] renderer attach: legacy addRenderer/removeRenderer")
+    }
     // `--fel-output <mode>`: the FEL composer's output buffer (p010, p010-round, p010-bluenoise, p010-full, sv22), for the 12-bit experiment.
     if let mode = takeStringFlag("--fel-output", from: &rest) {
         #if !DualLayerDolbyVision

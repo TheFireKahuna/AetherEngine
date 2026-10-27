@@ -26,6 +26,46 @@ the public-API contract.
 
 ### Fixed
 
+- **A placeholder stream never reaches an AirPlay receiver.** AVPlayer handed a receiver the stream of a
+  for those sessions, the picture stays on the device and the audio follows the route, and
+- **A retained paused session recovers a failed overlay layer on its return** (AE#870). With
+  suspended stayed black until a picture was refused; it is flushed on the return to the foreground.
+
+- **A media services reset is recovered from when it happens.** The reset only flagged the next load, so a
+  session open at the time ran on dead objects until something failed: a native item with -11819, a software
+  renderer climbing the recovery ladder one step at a time, or nothing at all while paused, and the Atmos output
+  activator stayed gone for the rest of the title. Now, per the platform contract (QA1749): the session's
+  category, mode, policy and multichannel content are declared again unconditionally; an open session in the
+  foreground is rebuilt at its position, keeping its transport state; a load in flight is rebuilt when it exits;
+  in the background or with nothing open the next load consumes the reset, as before. While the server is lost
+  (up to 10 s) or the reset is being recovered from, renderer failures and -11819 item failures are taken for
+  its symptoms rather than recovered one by one, and the startup gate leaves its dead item to the rebuild. A
+  -11819 that no reset accompanies within 2 s is published as before and logged, since the startup gate reads a
+  bare one as a cold Dolby Vision handshake.
+
+- **A failed renderer is recovered, or reported.** A failed audio renderer on the audio-only route was a
+  debug-only log line under a clock that ran on in silence. A renderer that stays
+  failed now climbs a ladder, each step taken only when the one before it did not hold within a minute: a
+  reposition to the playhead, whose flush is the documented reset; a rebuild of the session at its position,
+  with new renderers, since a failed audio renderer is terminal by its header; then the session's failure
+  (`audioSessionFailed`), where the host app sees it. The audio renderer's status is observed, so a failure while nothing is being fed is seen at once.
+
+- **The audio-only route follows an output reconfiguration.** When the output is set up for another format under
+  the audio renderer (`AVSampleBufferAudioRendererOutputConfigurationDidChange`: the Atmos activator's keep-alive
+  player starting beside an APAC session, an HDMI input switch, a soundbar power cycle) the renderer kept playing
+  into it, which its header calls suboptimal rendering. It is now flushed and given its queue again from the
+  playhead, as the header prescribes, which configures the output for the enqueued format; a compressed stream
+  gets the buffer before as a decode-only primer.
+
+- **Every load declares its audio session.** The category, mode and route-sharing policy were declared once,
+  at init, and a host that redeclared the process-wide session in between kept it that way: Sodalite's music
+  player set `.playback`/`.default` before every track, which also dropped the `.longFormAudio` policy HDMI
+  route negotiation relies on (#24), and every video after it played on that session until relaunch. Each load
+  now declares `.moviePlayback` (`.default` for `audioOnly`), the policy and multichannel content on the session
+  transition queue, ahead of its own activation, changing nothing when they already hold. New
+  `reactivateAudioSession()` makes the session active again for a resume on the paths the engine owns it
+  (software, audio-only) and leaves the native path to AVKit, for hosts that called `setActive` themselves.
+
 - **An audio tap consumer that falls behind is told where it lost audio (AE#864, thanks @qoli).** The tap stream
   shed its oldest queued buffer when full, and the buffer received next was already queued, so it arrived without
   `discontinuity` and a host read contiguous PCM across a gap of seconds. The queue now keeps what it holds, drops

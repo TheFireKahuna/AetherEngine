@@ -28,6 +28,12 @@ final class HeldStillPresenter {
 
     var isShowing: Bool { layer != nil || playerLayer != nil }
 
+    /// tvOS 27: the still's own synchronizer and the receiver its frame goes through, since the renderer's own
+    /// enqueue and flush are deprecated there. The synchronizer never runs: the frame is stamped at its time, zero.
+    /// Typed `AnyObject` because the receiver type exists only on 27.
+    private var stillSynchronizer: AVSampleBufferRenderSynchronizer?
+    private var stillReceiver: AnyObject?
+
     /// The compositor form of `show`: a muted player seeks frame-exactly to `offset` past the video
     /// track's first frame, on the player's own clock (AVFoundation applies the init's edit list, so the
     /// file's raw timestamps are not that clock), behind an invisible layer that turns visible once the
@@ -89,7 +95,15 @@ final class HeldStillPresenter {
     func show(_ frame: CVPixelBuffer, gravity: AVLayerVideoGravity, isHDR: Bool,
               on host: CALayer?, bounds: CGRect) -> Bool {
         clear()
-        guard let host, let sample = Self.sample(frame) else { return false }
+        let throughReceiver: Bool
+        if #available(tvOS 27, iOS 27, macOS 27, visionOS 27, *) {
+            throughReceiver = AudioOutput.usesSampleBufferReceivers
+        } else {
+            throughReceiver = false
+        }
+        // On a synchronizer the frame is timed rather than shown immediately: the renderer's header advises
+        // against `DisplayImmediately` together with a synchronizer or control timebase.
+        guard let host, let sample = Self.sample(frame, displayImmediately: !throughReceiver) else { return false }
         let still = AVSampleBufferDisplayLayer()
         still.videoGravity = gravity
         if #available(tvOS 26.0, iOS 26.0, macOS 26.0, visionOS 26.0, *) {
@@ -103,7 +117,15 @@ final class HeldStillPresenter {
         CATransaction.setDisableActions(true)
         host.addSublayer(still)
         still.frame = bounds
-        still.sampleBufferRenderer.enqueue(sample)
+        if #available(tvOS 27, iOS 27, macOS 27, visionOS 27, *), throughReceiver {
+            let synchronizer = AVSampleBufferRenderSynchronizer()
+            let receiver = synchronizer.sampleBufferReceiver(adding: still.sampleBufferRenderer)
+            _ = receiver.enqueueImmediately(.handingOver(sample))
+            stillSynchronizer = synchronizer
+            stillReceiver = receiver
+        } else {
+            still.sampleBufferRenderer.enqueue(sample)
+        }
         layer = still
         CATransaction.commit()
         return true
@@ -124,7 +146,19 @@ final class HeldStillPresenter {
         CATransaction.setDisableActions(true)
         still.removeFromSuperlayer()
         CATransaction.commit()
-        still.sampleBufferRenderer.flush()
+        if #available(tvOS 27, iOS 27, macOS 27, visionOS 27, *),
+           let receiver = stillReceiver as? AVSampleBufferVideoRenderer.Receiver, let synchronizer = stillSynchronizer {
+            receiver.flush()
+            nonisolated(unsafe) let handedOver = receiver
+            BlockingWork.detached {
+                nonisolated(unsafe) let receiver = handedOver
+                _ = await synchronizer.removeReceiver(receiver, at: .invalid)
+            }
+        } else {
+            still.sampleBufferRenderer.flush()
+        }
+        stillReceiver = nil
+        stillSynchronizer = nil
         layer = nil
     }
 
@@ -133,7 +167,8 @@ final class HeldStillPresenter {
         playerLayer?.frame = bounds
     }
 
-    private static func sample(_ frame: CVPixelBuffer) -> CMSampleBuffer? {
+    /// The frame as a sample at time zero; `displayImmediately` for a layer with no timebase.
+    private static func sample(_ frame: CVPixelBuffer, displayImmediately: Bool) -> CMSampleBuffer? {
         var description: CMVideoFormatDescription?
         guard CMVideoFormatDescriptionCreateForImageBuffer(
             allocator: kCFAllocatorDefault, imageBuffer: frame, formatDescriptionOut: &description
@@ -145,7 +180,8 @@ final class HeldStillPresenter {
             allocator: kCFAllocatorDefault, imageBuffer: frame, formatDescription: description,
             sampleTiming: &timing, sampleBufferOut: &sample
         ) == noErr, let sample else { return nil }
-        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
+        if displayImmediately,
+           let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
            CFArrayGetCount(attachments) > 0 {
             let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
             CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),

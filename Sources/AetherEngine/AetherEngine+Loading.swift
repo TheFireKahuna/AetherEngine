@@ -301,9 +301,15 @@ extension AetherEngine {
             .compactMap { $0 }
             .sink { [weak self] info in
                 guard let self else { return }
-                self.publishError(Self.reclassifiedForCredentialRefusal(
-                    info, refusal: self.sessionRequestHeaders.recentCredentialRefusal(
-                        within: HLSVideoEngine.rateLimitVerdictWindowSeconds)))
+                let publish: @MainActor (PlaybackErrorInfo) -> Void = { [weak self] info in
+                    guard let self else { return }
+                    self.publishError(Self.reclassifiedForCredentialRefusal(
+                        info, refusal: self.sessionRequestHeaders.recentCredentialRefusal(
+                            within: HLSVideoEngine.rateLimitVerdictWindowSeconds)))
+                }
+                // AE#597: a media services reset fails the session's objects with -11819; its recovery answers it.
+                if self.takeOverMediaServicesResetFailure(info, publish: publish) { return }
+                publish(info)
             }
             .store(in: &cancellables)
         didReachEnd
@@ -1982,6 +1988,19 @@ extension AetherEngine {
         logAudibleReadback(host: host)
     }
 
+    /// Make the session active again before a resume, on the paths where the engine owns it.
+    ///
+    /// For a host that resumes after the system deactivated the session (a pause, a return from the background).
+    /// The software and audio-only paths own their session and get the same activation a load gives them, queued
+    /// behind any release still in flight. The native path gets nothing: AVKit activates it there, and an activation
+    /// from the host latches an idle HDMI link at stereo (#24). Calling `setActive` directly bypasses both.
+    public func reactivateAudioSession() async {
+        #if os(iOS) || os(tvOS)
+        guard audioHost != nil || audioAVPlayerActive else { return }
+        await activateRendererAudioSession()
+        #endif
+    }
+
     /// The active audio track's channel count from the published track list, nil when unknown.
     /// `audioSourceStreamIndex` is accepted because during a reload (track change) `activeAudioTrackIndex`
     /// is temporarily nil (cleared by stopInternal), so the published property cannot be relied on.
@@ -1993,7 +2012,7 @@ extension AetherEngine {
         return nil
     }
 
-    /// Activate AVAudioSession for renderer paths (SoftwarePlaybackHost, audio hosts) that have no AVPlayerViewController. Native path deliberately skips this: AVKit activates per playback so tvOS can auto-negotiate the HDMI route (issue #24).
+    /// Activate AVAudioSession for the audio host, which has no AVPlayerViewController. Native path deliberately skips this: AVKit activates per playback so tvOS can auto-negotiate the HDMI route (issue #24).
     ///
     /// Called once per load, and again when an interruption ends on a renderer path (AE#549): these
     /// paths own the session, so nobody else hands it back to them.
@@ -2090,7 +2109,6 @@ extension AetherEngine {
         host.preferDualLayerDolbyVision = loadedOptions.preferDualLayerDolbyVision
         host.elType = elType ?? sourceElType
         host.objectAudioRendering = loadedOptions.objectAudioRendering
-        host.setAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens
         if isLive { host.liveEdgeCushionSeconds = loadedOptions.liveEdgeCushionSeconds }
         // AE#813: a live ingest delivers whole segments, and the host's holdback follows their length.
         if isLive, let ingest = customReader as? LiveIngestSourceInfo {
@@ -2312,6 +2330,10 @@ extension AetherEngine {
         await activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
         try checkLoadCurrent(generation)
         let host = AudioPlaybackHost()
+        host.onRendererFailed = { [weak self, weak host] which, error in
+            guard let self, let host, self.audioHost === host else { return }
+            self.climbRendererRecovery(which, error: error)
+        }
         self.audioHost = host
         applyDesiredVolume(to: host)
         applyDesiredRate(to: host)

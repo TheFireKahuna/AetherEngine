@@ -98,13 +98,12 @@ struct AudioOutputFlushEpochTests {
     /// 27 SDKs move the same condition into the enqueue call itself) would make the feed thread wait on a
     /// lock it already holds, and every later `flush()` / `stop()` / `seekClock()` with it.
     @Test("an automatic-flush notification posted from inside enqueue does not hang the feed",
-          .timeLimit(.minutes(1)))
-    func automaticFlushPostedInsideEnqueueDoesNotDeadlock() async throws {
-        let output = AudioOutput()
+          .timeLimit(.minutes(1)), arguments: audioOutputPaths)
+    func automaticFlushPostedInsideEnqueueDoesNotDeadlock(throughReceivers: Bool) async throws {
+        let output = AudioOutput(throughReceivers: throughReceivers)
         let box = BufferBox(try #require(makeBuffer(pts: 1)))
         output.afterRendererEnqueueForTesting = { [unowned output] in
-            NotificationCenter.default.post(name: .AVSampleBufferAudioRendererWasFlushedAutomatically,
-                                            object: output.renderer)
+            postAutomaticFlush(of: output.renderer)
         }
         let returned = Returned()
         let feed = Thread {
@@ -116,6 +115,11 @@ struct AudioOutputFlushEpochTests {
         // A feed thread parked on a lock it holds itself never returns; the time limit reports that.
         try await waitFor { returned.isSet }
 
+        // The receiver reports the flush with the enqueue after it: the feed carries on, and that is what delivers it.
+        if output.usesReceiver {
+            output.afterRendererEnqueueForTesting = nil
+            output.enqueue(sampleBuffer: try #require(makeBuffer(pts: 2)))
+        }
         try await waitFor { output.automaticFlushCount == 1 }
         #expect(output.automaticFlushCount == 1, "the flush still happens, serialized with enqueueing")
     }

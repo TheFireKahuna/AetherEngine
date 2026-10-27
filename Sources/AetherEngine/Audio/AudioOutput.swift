@@ -2,12 +2,24 @@ import Foundation
 import AVFoundation
 import CoreMedia
 import QuartzCore
+import os
 
 /// Audio output via AVSampleBufferAudioRenderer + AVSampleBufferRenderSynchronizer. The synchronizer is the
 /// **master clock** for the whole player: video frames check synchronizer.currentTime() to decide presentation.
 final class AudioOutput: @unchecked Sendable {
 
-    let renderer: AVSampleBufferAudioRenderer
+    /// The renderer playing now, and the calls the output makes to it (`AudioRendererIO`: the tvOS 27 receiver, or
+    /// the renderer's own calls before 27). A failed one is replaced (`replaceFailedRenderer()`). Code holding `lock`
+    /// uses `io`; everything else reads `renderer`, which never waits on `lock` (held across renderer calls, and taken
+    /// by callbacks a renderer may post from inside them).
+    var renderer: AVSampleBufferAudioRenderer {
+        rendererSlot.withLockUnchecked { $0 }
+    }
+    /// Guarded by `lock`, and changed only together with `rendererSlot`.
+    private var io: AudioRendererIO {
+        didSet { let current = io.renderer; rendererSlot.withLockUnchecked { $0 = current } }
+    }
+    private let rendererSlot: OSAllocatedUnfairLock<AVSampleBufferAudioRenderer>
     let synchronizer: AVSampleBufferRenderSynchronizer
 
     /// AE#395: the renderers' axis. Every time this object takes or returns is on the source axis;
@@ -16,8 +28,6 @@ final class AudioOutput: @unchecked Sendable {
     let timeline = RendererTimeline()
 
     private let lock = NSLock()
-    @MainActor private var attachedVideoLayer: AVSampleBufferDisplayLayer?
-    @MainActor private var videoLayerRemovalTask: Task<Void, Never>?
 
     /// AE#464: the host's audio presentation offset, applied to every buffer on its way into the
     /// renderer. Guarded because the host writes it from the main actor while the demux thread reads
@@ -37,23 +47,72 @@ final class AudioOutput: @unchecked Sendable {
         return _epoch
     }
 
-    init() {
-        renderer = AVSampleBufferAudioRenderer()
-        synchronizer = AVSampleBufferRenderSynchronizer()
-        synchronizer.addRenderer(renderer)
+    /// Whether renderers are driven through the tvOS / macOS 27 synchronizer receivers
+    /// (`sampleBufferReceiver(adding:)`, then the receiver's enqueue, flush and events) rather than the renderer calls
+    /// the 27 SDKs deprecate for Swift. The receivers wrap the same renderers (`research/renderer-receiver`), so this
+    /// changes the API, not the media path. Process-wide, read when a renderer is attached; a switch back to the old
+    /// calls for A/B on a device, since the attach path is where tvOS has failed before (-12080, #351). Earlier
+    /// systems always use the old calls.
+    static var usesSampleBufferReceivers: Bool {
+        get { receiverSwitch.withLock { $0 } }
+        set { receiverSwitch.withLock { $0 = newValue } }
+    }
+    private static let receiverSwitch = OSAllocatedUnfairLock(initialState: true)
 
-        // Spatial audio for AirPods Pro/Max and HomePod: renderer spatializes multichannel when system-enabled.
-        renderer.allowedAudioSpatializationFormats = .multichannel
+    /// Whether this output's renderers are driven through the 27 receivers: `usesSampleBufferReceivers` when it was
+    /// built, so a replacement renderer goes the same way as the first.
+    let throughReceivers: Bool
 
-        // Rate changes ride the synchronizer timebase, and this renderer's algorithm is what decides
-        // whether they keep pitch (#434). Pinned here, while the timebase is still stopped.
-        AudioRatePolicy.apply(to: renderer)
-        observeAutomaticFlush()
+    /// `throughReceivers` defaults to `usesSampleBufferReceivers`; tests pin it to exercise both paths side by side.
+    init(throughReceivers: Bool = AudioOutput.usesSampleBufferReceivers) {
+        self.throughReceivers = throughReceivers
+        let renderer = AVSampleBufferAudioRenderer()
+        let synchronizer = AVSampleBufferRenderSynchronizer()
+        Self.configure(renderer, volume: 1)
+        self.synchronizer = synchronizer
+        rendererSlot = OSAllocatedUnfairLock(uncheckedState: renderer)
+        let target = EventTarget()
+        eventSink = { io, event in target.output?.handle(event, from: io) }
+        io = AudioRendererIO(renderer: renderer, joining: synchronizer, throughReceiver: throughReceivers,
+                             onEvent: eventSink)
+        target.output = self
     }
 
     deinit {
-        if let automaticFlushObserver {
-            NotificationCenter.default.removeObserver(automaticFlushObserver)
+        io.detach(from: synchronizer)
+    }
+
+    /// What every renderer this output plays through is set up with, before it joins the synchronizer.
+    private static func configure(_ renderer: AVSampleBufferAudioRenderer, volume: Float) {
+        renderer.volume = volume
+        // Spatial audio for AirPods Pro/Max and HomePod: renderer spatializes multichannel when system-enabled.
+        renderer.allowedAudioSpatializationFormats = .multichannel
+        // Rate changes ride the synchronizer timebase, and this renderer's algorithm is what decides
+        // whether they keep pitch (#434). Pinned here, before the renderer is under a running timebase.
+        AudioRatePolicy.apply(to: renderer)
+    }
+
+    /// Where every renderer's events go. The first IO is built before `self` can be captured, so the sink finds
+    /// its output through a weak reference set once init is done; a renderer cannot report before it is fed.
+    private let eventSink: @Sendable (AudioRendererIO, AudioRendererEvent) -> Void
+    private final class EventTarget: @unchecked Sendable {
+        weak var output: AudioOutput?
+    }
+
+    /// Every event is handled on `automaticFlushQueue`: the thread it arrives on may be inside `enqueue`, under
+    /// `lock`. An event from a renderer that has since been replaced is not the playing one's: acting on it would
+    /// throw away its successor's refeed.
+    private func handle(_ event: AudioRendererEvent, from source: AudioRendererIO) {
+        automaticFlushQueue.async { [weak self] in
+            guard let self else { return }
+            switch event {
+            case .flushedAutomatically(let at):
+                self.flushAfterAutomaticFlush(by: source, droppedFrom: at)
+            case .outputConfigurationChanged:
+                self.reenqueueAfterOutputConfigurationChange(from: source)
+            case .failed:
+                self.reportRendererFailure(of: source)
+            }
         }
     }
 
@@ -68,17 +127,17 @@ final class AudioOutput: @unchecked Sendable {
     /// A session that is silent on one route while its clock runs at 1.00 has nothing else that could
     /// say whether the renderer is playing what it was given, and the renderer error was only ever
     /// logged in DEBUG builds.
+    /// Whether the renderer playing now is driven through a 27 receiver (false before 27 whatever was asked).
+    var usesReceiver: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return io.usesReceiver
+    }
+
     var diagRendererState: String {
-        let status: String
-        switch renderer.status {
-        case .rendering: status = "rendering"
-        case .failed: status = "failed"
-        case .unknown: status = "unknown"
-        @unknown default: status = "?"
-        }
-        let sufficient = renderer.hasSufficientMediaDataForReliablePlaybackStart ? "y" : "n"
-        let error = (renderer.error as NSError?).map { "\($0.domain)/\($0.code)" } ?? "-"
-        return "\(status)/\(sufficient)/\(error)"
+        lock.lock()
+        defer { lock.unlock() }
+        return io.diagnosticState
     }
 
     /// AE#549: how often this renderer has flushed itself, for the diagnostic line.
@@ -88,12 +147,35 @@ final class AudioOutput: @unchecked Sendable {
         return _automaticFlushCount
     }
 
-    private var automaticFlushObserver: NSObjectProtocol?
     private var _automaticFlushCount = 0
 
-    /// Where the AE#549 flush runs. The posting thread must never wait on `lock`: `enqueue` holds it
-    /// across `renderer.enqueue` (DEC-106), and a renderer that posts from inside that call would make the
-    /// feed thread wait on a lock it already holds, with every `flush()` / `stop()` / `seekClock()` behind it.
+    /// What the renderer holds: every buffer delivered since the one the clock is in, as delivered (on the
+    /// renderer axis, offset applied), plus the one before it as a compressed stream's pre-roll. The same
+    /// objects the renderer holds, so keeping them costs references, not audio. Guarded by `lock`.
+    private var queued: [CMSampleBuffer] = []
+    /// A backstop for a clock that never advances while the feed does; the lead caps it long before this.
+    private static let queuedLimit = 4096
+
+    /// How often the output was reconfigured under the renderer, for the diagnostic line. Guarded by `lock`.
+    private var _outputReconfigurationCount = 0
+    var outputReconfigurationCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _outputReconfigurationCount
+    }
+
+    /// Called once when the renderer fails, off the main actor, with its error. A failed audio renderer is terminal
+    /// "from which recovery is not always possible" (its header), and silent: the clock it drives runs on. Seen when it
+    /// happens, even while nothing is being fed (paused, or the lead full), through the renderer's failure event; and
+    /// on every enqueue, since a renderer that stays failed across a flush has no change to report. `flush()` rearms
+    /// it, so a recovery that does not hold reports again. Set before the feed starts.
+    var onRendererFailed: (@Sendable (String) -> Void)?
+    /// Guarded by `lock`.
+    private var reportedRendererFailure = false
+
+    /// Where every renderer event is handled. The thread an event arrives on must never wait on `lock`: `enqueue`
+    /// holds it across the renderer's enqueue (DEC-106), and a renderer that posts from inside that call would make
+    /// the feed thread wait on a lock it already holds, with every `flush()` / `stop()` / `seekClock()` behind it.
     private let automaticFlushQueue = DispatchQueue(label: "engine.audio.autoflush")
 
     /// AE#549: the renderer throws its queue away when the route changes under it, and posts the
@@ -111,90 +193,113 @@ final class AudioOutput: @unchecked Sendable {
     /// The line is also the witness the field log lacked. Across an automatic flush the timebase
     /// keeps RUNNING at its rate, so a session that froze did not freeze because of this, and only a
     /// log carrying both can tell the two apart.
-    private func observeAutomaticFlush() {
-        automaticFlushObserver = NotificationCenter.default.addObserver(
-            forName: .AVSampleBufferAudioRendererWasFlushedAutomatically,
-            object: renderer,
-            queue: nil
-        ) { [weak self] note in
-            guard let self else { return }
-            let flushedFrom = (note.userInfo?[AVSampleBufferAudioRendererFlushTimeKey] as? NSValue)
-                .map { self.timeline.sourceTime(forRenderer: $0.timeValue).seconds }
-            automaticFlushQueue.async { [weak self] in
-                guard let self else { return }
-                lock.lock()
-                _automaticFlushCount += 1
-                let count = _automaticFlushCount
-                renderer.flush()
-                lock.unlock()
-                EngineLog.emit(
-                    "[AudioOutput] AE#549 renderer flushed itself (#\(count)): "
-                    + "dropped from \(flushedFrom.map { String(format: "%.3f", $0) } ?? "unknown")s, "
-                    + "clock at \(String(format: "%.3f", currentTimeSeconds))s rate=\(rate); "
-                    + "audio returns once the feed reaches the clock",
-                    category: .swPlayback
-                )
-            }
+    private func flushAfterAutomaticFlush(by source: AudioRendererIO, droppedFrom: CMTime?) {
+        let flushedFrom = droppedFrom.map { timeline.sourceTime(forRenderer: $0).seconds }
+        lock.lock()
+        guard io === source else {
+            lock.unlock()
+            return
         }
-    }
-
-    /// Add the video renderer to the synchronizer for automatic A/V sync + frame pacing. The display layer's
-    /// `sampleBufferRenderer`, never the layer: addRenderer(layer) still type-checks but on tvOS 26+ fails with
-    /// FigVideoQueueRemote err=-12080 after the first enqueue. The layer is main-actor isolated in the 27 SDKs,
-    /// hence the isolation here (#351).
-    @MainActor
-    func attachVideoLayer(_ displayLayer: AVSampleBufferDisplayLayer) {
-        precondition(videoLayerRemovalTask == nil, "Await video layer removal before attaching again")
-        guard attachedVideoLayer !== displayLayer else { return }
-        precondition(attachedVideoLayer == nil, "An audio output owns only one video layer")
-        synchronizer.addRenderer(displayLayer.sampleBufferRenderer)
-        attachedVideoLayer = displayLayer
+        _automaticFlushCount += 1
+        let count = _automaticFlushCount
+        io.flush()
+        // What it held is gone; an output reconfiguration after this has nothing of it to put back.
+        queued.removeAll()
+        // A compressed stream picks up mid-run here, where its decoder starts cold: the packet
+        // before the next one goes in again first, decoded only to prime (see `enqueue`).
+        primeAfterAutomaticFlush = lastCompressedDelivery != nil
+        lock.unlock()
+        EngineLog.emit(
+            "[AudioOutput] AE#549 renderer flushed itself (#\(count)): "
+            + "dropped from \(flushedFrom.map { String(format: "%.3f", $0) } ?? "unknown")s, "
+            + "clock at \(String(format: "%.3f", currentTimeSeconds))s rate=\(rate); "
+            + "audio returns once the feed reaches the clock",
+            category: .swPlayback
+        )
     }
 
     /// Retire the old session's layer without blocking the caller. SoftwarePlaybackHost creates a
-    /// fresh renderer for every new session, so the retired layer is never reused by its successor. The task
-    /// retains this output, its synchronizer, and the layer until AVFoundation finishes removal; cancellation
-    /// must not release them early. A caller that needs to reuse this same layer must await the returned task.
-    /// The injected operation lets tests hold the completion while checking main-actor responsiveness/lifetime.
-    @MainActor
-    @discardableResult
-    func detachVideoLayer(
-        _ displayLayer: AVSampleBufferDisplayLayer,
-        removeRenderer: @escaping @MainActor (AVSampleBufferRenderSynchronizer, AVSampleBufferDisplayLayer) async -> Void = AudioOutput.removeVideoRenderer
-    ) -> Task<Void, Never>? {
-        guard attachedVideoLayer === displayLayer else { return nil }
-        if let videoLayerRemovalTask { return videoLayerRemovalTask }
-        let task = Task { @MainActor [self, displayLayer] in
-            await removeRenderer(synchronizer, displayLayer)
-            attachedVideoLayer = nil
-            videoLayerRemovalTask = nil
-            withExtendedLifetime((self, displayLayer)) {}
+    /// The output was configured for another format under the renderer (`…OutputConfigurationDidChange`): another
+    /// client played something else (the Atmos activator's keep-alive player starting beside an APAC session), or
+    /// the HDMI sink came back from an input switch or a power cycle in a different mode. The renderer keeps
+    /// playing into that configuration, which the header calls suboptimal rendering: multichannel PCM where the
+    /// source is Atmos, or fewer channels. Its remedy is to flush and enqueue again from the playhead, which
+    /// configures the output for the enqueued format.
+    ///
+    /// Unlike AE#549's automatic flush, the audio is still here to enqueue again: `queued` holds what the renderer
+    /// held. It goes back in from the buffer the clock is in, the one before it first as a decode-only primer for a
+    /// compressed stream, so the gap is the renderer's restart, not the lead. Under `lock`, so the feed's next
+    /// buffer lands after them; off the posting thread, for the reason `automaticFlushQueue` gives. `source`, when
+    /// given, is the renderer that reported it; a replaced one's report is ignored.
+    func reenqueueAfterOutputConfigurationChange(from source: AudioRendererIO? = nil) {
+        lock.lock()
+        if let source, source !== io {
+            lock.unlock()
+            return
         }
-        videoLayerRemovalTask = task
-        return task
+        _outputReconfigurationCount += 1
+        let count = _outputReconfigurationCount
+        let now = synchronizer.currentTime()
+        let refeed = Self.refeed(queued, at: now)
+        io.flush()
+        for buffer in refeed {
+            _ = io.enqueue(buffer)
+            #if DEBUG
+            rendererEnqueueObserverForTesting?(buffer)
+            #endif
+        }
+        // The primer above stands in for the one an automatic flush would have asked for.
+        primeAfterAutomaticFlush = false
+        lock.unlock()
+        EngineLog.emit(
+            "[AudioOutput] output reconfigured under the renderer (#\(count)): flushed and enqueued "
+            + "\(refeed.count) buffer(s) again from the clock at "
+            + "\(String(format: "%.3f", timeline.sourceSeconds(forRenderer: now.seconds)))s rate=\(rate)",
+            category: .swPlayback)
     }
 
-    @MainActor
-    private static func removeVideoRenderer(
-        from synchronizer: AVSampleBufferRenderSynchronizer,
-        displayLayer: AVSampleBufferDisplayLayer
-    ) async {
-        await withCheckedContinuation { continuation in
-            // Invalid time requests immediate removal, independent of a stopped/reset timebase.
-            // Only the continuation crosses into AVFoundation's completion queue.
-            // AVFoundation reports false for an absent renderer or a superseded removal.
-            // This is the attachment's only remover and duplicate requests share its task,
-            // so no second removal can supersede it; either result finishes retirement.
-            synchronizer.removeRenderer(displayLayer.sampleBufferRenderer, at: .invalid) { _ in
-                continuation.resume()
-            }
+    /// What goes back in after an output reconfiguration at renderer time `now`: every buffer that ends after
+    /// `now`, in order, and before them, for a compressed stream, the buffer before the first of those as a
+    /// decode-only primer. Pure, so the choice is checkable without a renderer.
+    nonisolated static func refeed(_ queued: [CMSampleBuffer], at now: CMTime) -> [CMSampleBuffer] {
+        guard let first = queued.firstIndex(where: { endTime(of: $0) > now }) else { return [] }
+        var out = Array(queued[first...])
+        if first > 0, isCompressed(queued[first]), isCompressed(queued[first - 1]),
+           let primer = decodeOnlyCopy(queued[first - 1]) {
+            out.insert(primer, at: 0)
         }
+        return out
     }
 
+    /// `queued` with what the clock at `now` has finished with dropped: everything before the buffer the clock
+    /// is in, except the one just before it, which is that buffer's pre-roll.
+    nonisolated static func pruned(_ queued: [CMSampleBuffer], at now: CMTime, limit: Int) -> [CMSampleBuffer] {
+        let current = queued.firstIndex(where: { endTime(of: $0) > now }) ?? queued.count
+        let drop = max(current - 1, queued.count - limit, 0)
+        return drop == 0 ? queued : Array(queued.dropFirst(drop))
+    }
+
+    nonisolated static func endTime(of buffer: CMSampleBuffer) -> CMTime {
+        let start = CMSampleBufferGetPresentationTimeStamp(buffer)
+        let duration = CMSampleBufferGetDuration(buffer)
+        return duration.isValid ? CMTimeAdd(start, duration) : start
+    }
+
+    /// Kept here as well as on the renderer, so a replacement plays at the volume its predecessor was set to.
     var volume: Float {
-        get { renderer.volume }
-        set { renderer.volume = newValue }
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _volume
+        }
+        set {
+            lock.lock()
+            defer { lock.unlock() }
+            _volume = newValue
+            io.renderer.volume = newValue
+        }
     }
+    private var _volume: Float = 1
 
     /// Set playback speed (0.5-2.0). Hosts own rate state (lastRate/pausedByHost); this object is stateless about it.
     func setRate(_ rate: Float) {
@@ -237,13 +342,118 @@ final class AudioOutput: @unchecked Sendable {
     /// AE#464: set the audio presentation offset. Positive presents audio later than video, which on
     /// this path means stamping its samples further ahead on the synchronizer's timeline: at clock
     /// time t the renderer then plays what was recorded at t minus the offset, while the video layer
-    /// still presents t. Applied to buffers enqueued from here on; the samples already inside the
-    /// renderer keep the previous offset until something flushes them.
-    func setPresentationOffset(seconds: Double) {
+    /// still presents t.
+    ///
+    /// A change takes effect `offsetChangeLead` past the clock rather than after the lead already queued
+    /// (seconds of audio). The renderer's partial flush is what its header documents for replacing media
+    /// scheduled in the future without interrupting playback: everything from the first buffer past that point
+    /// is flushed and enqueued again shifted by the change, while what plays before it is left alone. A later
+    /// offset leaves a gap of the change there; an earlier one skips as much, the buffers it would put on top of
+    /// audio still queued being dropped, behind a decode-only primer for a compressed stream. Under `lock`, so the
+    /// feed's next buffer, stamped with the new offset, lands after them. A renderer that declines keeps its queue
+    /// and the change applies from the next buffer, as before; one that does not answer in time is flushed whole
+    /// and fed again from the clock, because its queue is no longer known.
+    ///
+    /// Returns whether the change is in force from `offsetChangeLead` on, so nothing else need re-anchor for it:
+    /// false only when the renderer declined the partial flush.
+    @discardableResult
+    func setPresentationOffset(seconds: Double) -> Bool {
         lock.lock()
-        defer { lock.unlock() }
+        let previous = presentationOffset
         presentationOffset = seconds == 0 ? .zero : CMTime(seconds: seconds, preferredTimescale: 90000)
         loggedOffsetInEffect = false
+        let change = CMTimeSubtract(presentationOffset, previous)
+        let now = synchronizer.currentTime()
+        let threshold = CMTimeAdd(now, CMTime(seconds: Self.offsetChangeLead, preferredTimescale: 90000))
+        guard change != .zero, let first = queued.firstIndex(where: {
+            CMSampleBufferGetPresentationTimeStamp($0) >= threshold
+        }) else {
+            // Nothing queued past the lead: the next buffer carries the new offset, which is as soon as it can be.
+            lock.unlock()
+            return true
+        }
+        let from = CMSampleBufferGetPresentationTimeStamp(queued[first])
+        let line: String
+        let inForce: Bool
+        switch partialFlush(from) {
+        case .flushed:
+            let shifted = Self.shiftedTail(Array(queued[first...]), by: change, notBefore: from)
+            queued.removeSubrange(first...)
+            enqueueAgainLocked(shifted)
+            inForce = true
+            line = "applied at once: flushed from \(String(format: "%.3f", timeline.sourceSeconds(forRenderer: from.seconds)))s "
+                + "and enqueued \(shifted.count) buffer(s) again shifted by \(String(format: "%+.0f", change.seconds * 1000)) ms"
+        case .refused:
+            inForce = false
+            line = "the renderer declined the partial flush; it applies from the next buffer"
+        case .unanswered:
+            let shifted = Self.shiftedTail(Self.refeed(queued, at: now), by: change, notBefore: now)
+            io.flush()
+            queued.removeAll()
+            enqueueAgainLocked(shifted)
+            inForce = true
+            line = "the partial flush went unanswered; flushed whole and enqueued \(shifted.count) buffer(s) again "
+                + "from the clock"
+        }
+        lock.unlock()
+        EngineLog.emit("[AudioOutput] AE#464 audio delay changed to \(String(format: "%+.0f", seconds * 1000)) ms, "
+                       + line, category: .swPlayback)
+        return inForce
+    }
+
+    /// `setPresentationOffset` for a session that is playing, run on the output's own queue so the partial flush is
+    /// waited for there, holding the feed (which has seconds of lead) and never the caller's actor.
+    func changePresentationOffset(seconds: Double) async -> Bool {
+        await withCheckedContinuation { (done: CheckedContinuation<Bool, Never>) in
+            automaticFlushQueue.async { [self] in
+                done.resume(returning: setPresentationOffset(seconds: seconds))
+            }
+        }
+    }
+
+    /// How far past the clock an offset change takes effect: beyond the route's output latency (138 ms on the
+    /// measured HDMI route), so the partial flush is not "too close to the current time" for the renderer, and
+    /// the change is heard within about a quarter of a second.
+    static let offsetChangeLead: Double = 0.25
+
+    /// Enqueues `buffers` and records them as queued, as the feed would. Called with `lock` held.
+    private func enqueueAgainLocked(_ buffers: [CMSampleBuffer]) {
+        for buffer in buffers {
+            _ = io.enqueue(buffer)
+            // A primer is the renderer's, not part of what it holds to play.
+            if !Self.isTrimmedWhole(buffer) { queued.append(buffer) }
+            #if DEBUG
+            rendererEnqueueObserverForTesting?(buffer)
+            #endif
+        }
+        // The feed's next compressed packet follows the last one put back, not the one it replaced.
+        if let last = buffers.last(where: { !Self.isTrimmedWhole($0) }), Self.isCompressed(last) {
+            lastCompressedDelivery = last
+        }
+    }
+
+    /// `tail` moved by `change`, without the buffers that would start before `notBefore` (an earlier offset would
+    /// put them on top of audio still queued there). For a compressed stream whose head was dropped, the last
+    /// dropped buffer goes in first as a decode-only primer, so the decoder that continues there is not cold.
+    /// Pure, so the choice is checkable without a renderer.
+    nonisolated static func shiftedTail(_ tail: [CMSampleBuffer], by change: CMTime,
+                                        notBefore: CMTime) -> [CMSampleBuffer] {
+        let shifted = tail.map { retimed($0, by: change) }
+        guard let keep = shifted.firstIndex(where: { CMSampleBufferGetPresentationTimeStamp($0) >= notBefore }) else {
+            return []
+        }
+        var out = Array(shifted[keep...])
+        if keep > 0, isCompressed(shifted[keep - 1]), let primer = decodeOnlyCopy(shifted[keep - 1]) {
+            out.insert(primer, at: 0)
+        }
+        return out
+    }
+
+    /// Whether `buffer` plays nothing: a decode-only primer.
+    nonisolated static func isTrimmedWhole(_ buffer: CMSampleBuffer) -> Bool {
+        guard let trim = CMGetAttachment(buffer, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
+                                         attachmentModeOut: nil) as? NSDictionary else { return false }
+        return CMTimeMakeFromDictionary(trim) >= CMSampleBufferGetDuration(buffer)
     }
 
     /// Enqueue a decoded audio CMSampleBuffer. Always enqueues (renderer buffers internally); gating on
@@ -280,12 +490,45 @@ final class AudioOutput: @unchecked Sendable {
                 + String(format: "%+.0f ms", offset.seconds * 1000)
                 + String(format: " (sample at %.3fs delivered at %.3fs)", source, source + offset.seconds)
         }
-        renderer.enqueue(delivered)
+        let previousCompressed = lastCompressedDelivery
+        if compressed, primeAfterAutomaticFlush, let last = previousCompressed, let primer = Self.decodeOnlyCopy(last) {
+            _ = io.enqueue(primer)
+        }
+        var report = io.enqueue(delivered)
+        let enqueuedInto = io
+        var automaticFlushLine: String?
+        if report.flushedAutomatically {
+            // AE#549 through the tvOS 27 receiver, which reports the renderer's automatic flush only on the enqueue
+            // after it: this buffer is the first the renderer took since. The header's advice, a flush serialized
+            // with enqueueing, happens here, in that order: the queue is emptied of whatever slipped in, then this
+            // buffer goes in again on its own, behind a decode-only primer (the packet before it) for a compressed
+            // stream, whose decoder restarts cold mid-run.
+            _automaticFlushCount += 1
+            io.flush()
+            queued.removeAll()
+            if compressed, let last = previousCompressed, let primer = Self.decodeOnlyCopy(last) {
+                _ = io.enqueue(primer)
+                #if DEBUG
+                rendererEnqueueObserverForTesting?(primer)
+                #endif
+            }
+            let again = io.enqueue(delivered)
+            report.failure = report.failure ?? again.failure
+            automaticFlushLine = "[AudioOutput] AE#549 renderer flushed itself (#\(_automaticFlushCount)), reported "
+                + "with the next buffer: flushed and enqueued it again at "
+                + "\(String(format: "%.3f", timeline.sourceSeconds(forRenderer: CMSampleBufferGetPresentationTimeStamp(delivered).seconds)))s; "
+                + "clock at \(String(format: "%.3f", timeline.sourceSeconds(forRenderer: synchronizer.currentTime().seconds)))s"
+        }
+        let failure = report.failure
+        queued.append(delivered)
+        queued = Self.pruned(queued, at: synchronizer.currentTime(), limit: Self.queuedLimit)
         #if DEBUG
         afterRendererEnqueueForTesting?()
         #endif
         lock.unlock()
         if let offsetLine { EngineLog.emit(offsetLine, category: .swPlayback) }
+        if let automaticFlushLine { EngineLog.emit(automaticFlushLine, category: .swPlayback) }
+        if failure != nil { reportRendererFailure(of: enqueuedInto) }
 
         #if DEBUG
         // Once per session: first enqueue + any renderer rejection, to distinguish "nothing enqueued" from
@@ -298,12 +541,12 @@ final class AudioOutput: @unchecked Sendable {
             let sr = fmt.map { "\($0.mSampleRate)Hz" } ?? "?"
             let ch = fmt.map { "\($0.mChannelsPerFrame)ch" } ?? "?"
             let count = CMSampleBufferGetNumSamples(sampleBuffer)
-            EngineLog.emit("[AudioOutput] first enqueue: \(sr) \(ch), \(count) samples, renderer.error=\(String(describing: renderer.error))", category: .swPlayback)
+            EngineLog.emit("[AudioOutput] first enqueue: \(sr) \(ch), \(count) samples, renderer=\(failure ?? "accepted")", category: .swPlayback)
         }
         #endif
         // Unconditional: a format the renderer refuses (a compressed or APAC route) otherwise plays
         // silence with nothing in a release log to say why.
-        if !_loggedRendererError, let err = renderer.error {
+        if !_loggedRendererError, let err = failure {
             _loggedRendererError = true
             let fmt = CMSampleBufferGetFormatDescription(sampleBuffer).flatMap {
                 CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee
@@ -312,6 +555,85 @@ final class AudioOutput: @unchecked Sendable {
             EngineLog.emit("[AudioOutput] ERROR: renderer error on format \(id): \(err)", category: .swPlayback)
         }
         return true
+    }
+
+    #if DEBUG
+    /// Test-only: asks the renderer for the partial flush of an offset change without
+    /// `AudioRendererIO.partialFlushTimeout`, whose answer on a loaded machine comes after it and turns `.flushed` into
+    /// `.unanswered`. Called with `lock` held.
+    var partialFlushForTesting: ((AudioRendererIO, CMTime) -> AudioRendererIO.PartialFlush)?
+    #endif
+
+    /// The renderer's answer to a partial flush from `time` on. Called with `lock` held.
+    private func partialFlush(_ time: CMTime) -> AudioRendererIO.PartialFlush {
+        #if DEBUG
+        if let partialFlushForTesting { return partialFlushForTesting(io, time) }
+        #endif
+        return io.flush(fromSourceTime: time)
+    }
+
+    /// Reports `failed` once, if it is still the renderer playing: a replaced renderer's late report is not a failure
+    /// of the one that took over.
+    private func reportRendererFailure(of failed: AudioRendererIO) {
+        lock.lock()
+        let first = !reportedRendererFailure && failed === io
+        if first { reportedRendererFailure = true }
+        lock.unlock()
+        guard first else { return }
+        let error = failed.failureDescription
+        EngineLog.emit("[AudioOutput] renderer failed: \(error)", category: .swPlayback)
+        onRendererFailed?(error)
+    }
+
+    /// How often a failed renderer was replaced, for the diagnostic line and tests. Guarded by `lock`.
+    private var _rendererReplacementCount = 0
+    var rendererReplacementCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _rendererReplacementCount
+    }
+
+    /// A failed audio renderer is replaced, not flushed. Its header calls the failed status terminal "from which
+    /// recovery is not always possible" and, unlike the video renderer's, names no reset; a flush does not bring one
+    /// back (macOS 27: still failed after a flush and valid PCM, `research/renderer-receiver`). The synchronizer takes
+    /// renderers in and out while its rate is non-zero, so the cutover happens under the running clock and leaves it
+    /// and the video renderer where they are:
+    ///
+    /// 1. a new renderer, set up like the first (volume, spatialization, rate algorithm), joins the synchronizer;
+    /// 2. it is given again what the failed one held from the buffer the clock is in on (`refeed`, primer included),
+    ///    under `lock`, so the feed's next buffer lands after them, into it;
+    /// 3. the failed renderer leaves the synchronizer, at once.
+    ///
+    /// The gap is the new renderer's start, not the lead. Its failures are reported afresh; anything the failed one
+    /// reports from here on is not. Returns how many buffers went in again.
+    @discardableResult
+    func replaceFailedRenderer() -> Int {
+        let fresh = AVSampleBufferAudioRenderer()
+        lock.lock()
+        let failed = io
+        Self.configure(fresh, volume: _volume)
+        io = AudioRendererIO(renderer: fresh, joining: synchronizer, throughReceiver: throughReceivers,
+                             onEvent: eventSink)
+        let now = synchronizer.currentTime()
+        let refeed = Self.refeed(queued, at: now)
+        for buffer in refeed {
+            _ = io.enqueue(buffer)
+            #if DEBUG
+            rendererEnqueueObserverForTesting?(buffer)
+            #endif
+        }
+        // The primer above, if any, stands in for one an automatic flush of the failed renderer asked for.
+        primeAfterAutomaticFlush = false
+        reportedRendererFailure = false
+        _rendererReplacementCount += 1
+        let count = _rendererReplacementCount
+        lock.unlock()
+        failed.detach(from: synchronizer)
+        EngineLog.emit(
+            "[AudioOutput] failed renderer replaced (#\(count)): \(refeed.count) buffer(s) enqueued again from the "
+            + "clock at \(String(format: "%.3f", timeline.sourceSeconds(forRenderer: now.seconds)))s rate=\(rate)",
+            category: .swPlayback)
+        return refeed.count
     }
 
     #if DEBUG
@@ -393,7 +715,9 @@ final class AudioOutput: @unchecked Sendable {
     /// video renderer; in background-audio-only mode (video dropped) it paces on this instead, so it does
     /// not buffer the rest of the file unbounded.
     var isReadyForMoreMediaData: Bool {
-        renderer.isReadyForMoreMediaData
+        lock.lock()
+        defer { lock.unlock() }
+        return io.isReadyForMoreMediaData
     }
 
     /// Flush the audio renderer (call on seek).
@@ -401,16 +725,19 @@ final class AudioOutput: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         _epoch &+= 1
-        renderer.flush()
+        io.flush()
+        queued.removeAll()
+        reportedRendererFailure = false
     }
 
     func stop() {
         lock.lock()
         defer { lock.unlock() }
         _epoch &+= 1
-        endPreroll()
+        queued.removeAll()
+        disarmPreroll()
         synchronizer.setRate(0.0, time: .zero)
-        renderer.flush()
+        io.flush()
     }
 
     /// Atomically jump the master clock to a time and resume at a rate. The ONLY way the clock is (re)anchored:
@@ -420,25 +747,33 @@ final class AudioOutput: @unchecked Sendable {
         // Asked before taking `lock`: the gate reads the video renderer's state under its own lock.
         let preroll = rate > 0 ? videoPrerollSatisfied?(time.seconds) : nil
         let progress = preroll == false ? videoPrerollProgress?() : nil
+        // Read before `lock` too: the route's latency is an audio-session query.
+        let lead = preroll == true ? Self.currentPrerollStartLead() : 0
         lock.lock()
         defer { lock.unlock() }
         EngineLog.emit("[AudioOutput] seekClock to=\(String(format: "%.3f", time.seconds)) rate=\(rate)", category: .swPlayback)
-        endPreroll()
-        switch preroll {
-        case nil:
+        disarmPreroll()
+        guard let preroll else {
             synchronizer.setRate(rate, time: timeline.rendererTime(forSource: time))
-        case true?:
-            startAfterPreroll(rate: rate, time: time)
-        case false?:
-            synchronizer.setRate(0, time: timeline.rendererTime(forSource: time))
-            let gen = prerollGeneration
-            prerollRate = rate
-            let started = CACurrentMediaTime()
-            _onPrerollTransition?(PrerollTransition(generation: gen, event: .began))
-            let wait = PrerollWait(gen: gen, time: time, started: started,
-                                   progress: progress, progressAt: started)
-            prerollQueue.async { [weak self] in self?.pollPreroll(wait) }
+            return
         }
+        if preroll {
+            startAfterPreroll(rate: rate, time: time, lead: lead)
+            return
+        }
+        synchronizer.setRate(0, time: timeline.rendererTime(forSource: time))
+        let gen = prerollGeneration
+        prerollRate = rate
+        prerollTime = time
+        prerollStarted = CACurrentMediaTime()
+        prerollProgress = progress
+        prerollProgressAt = prerollStarted
+        prerollWake.withLock { $0 = PrerollWake(generation: gen) }
+        _onPrerollTransition?(PrerollTransition(generation: gen, event: .began))
+        // The fallback: one tick at the timeout, cancelled by whatever ends the wait first.
+        armPrerollTimer(gen: gen, after: prerollTimeoutOverride ?? Self.prerollTimeout)
+        // Frames handed over between the question above and now told nobody: ask once more.
+        videoPrerollAdvanced()
     }
 
     // MARK: - Video preroll
@@ -454,7 +789,8 @@ final class AudioOutput: @unchecked Sendable {
     /// frames at every start and every seek on an Apple TV 4K (A12). With the preroll, `seekClock`
     /// anchors at rate 0, and the clock starts at the requested rate and the same source time once
     /// the renderer is ready, or after `prerollTimeout`. A pause, a rate change or another seek in the
-    /// meantime cancels the start; `stop()` too.
+    /// meantime cancels the start; `stop()` too. The gate is asked again only when the renderer hands
+    /// a frame over (``videoPrerollAdvanced()``), not on a timer.
     var videoPrerollSatisfied: (@Sendable (Double) -> Bool?)? {
         get { lock.lock(); defer { lock.unlock() }; return _videoPrerollSatisfied }
         set { lock.lock(); _videoPrerollSatisfied = newValue; lock.unlock() }
@@ -487,24 +823,87 @@ final class AudioOutput: @unchecked Sendable {
     /// How long a preroll may hold the clock with the decoder producing nothing. A decoder that never
     /// delivers must not freeze playback.
     static let prerollTimeout: Double = 2
-
     /// How long a preroll may hold the clock while the decoder is still producing frames. 4K AV1 in
     /// libdav1d on an Apple TV 4K (A15) took 2.9 to 3.9 s from a seek to its first frame at the target,
     /// so a plain 2 s timeout started the clock 0.6 to 1.6 s ahead of the picture and dropped what it
     /// owed (#800).
     static let prerollProgressCap: Double = 6
 
-    /// How far ahead of now a prerolled start is scheduled. On tvOS the synchronizer lives in another
-    /// process, and the display path learns of a rate change about as late as the audio route's output
-    /// latency (138 ms measured on HDMI): a clock started "now" has already run that far when the first
-    /// frames are judged, and the ones due inside that window drop (3 to 5 a start on the A12 even with
-    /// the queue full). Scheduling the start 250 ms out took starts and seeks to 0 drops in every run
-    /// (8 of 8, 150 s soaks with 5 seeks; 500 ms was no better).
-    static let prerollStartLead: Double = 0.25
+    /// Whether a hold that is not ready yet waits on: inside `prerollTimeout` of its start or of the
+    /// decoder's last frame, and never past `prerollProgressCap`.
+    static func prerollKeepsWaiting(waited: Double, sinceProgress: Double) -> Bool {
+        waited < prerollProgressCap && sinceProgress < prerollTimeout
+    }
+    /// Tests that prove a start came from a handover set this long, so the fallback timer cannot fire
+    /// while a loaded test runner is still between its steps. Set before `seekClock`.
+    var prerollTimeoutOverride: Double?
+
+    /// How far ahead of now a prerolled start is scheduled, at most. On tvOS the synchronizer lives in
+    /// another process, and the display path learns of a rate change about as late as the audio route's
+    /// output latency (138 ms measured on HDMI): a clock started "now" has already run that far when the
+    /// first frames are judged, and the ones due inside that window drop (3 to 5 a start on the A12 even
+    /// with the queue full). Scheduling the start 250 ms out took starts and seeks to 0 drops in every
+    /// run (8 of 8, 150 s soaks with 5 seeks; 500 ms was no better).
+    ///
+    /// The ceiling, not the lead: ``prerollStartLead(outputLatency:)`` follows the route, so a start on
+    /// a route faster than that HDMI sink is not held for latency it does not have. Never longer than
+    /// this, because a buffered AirPlay route reports seconds of latency the display path does not wait
+    /// for, and because 250 ms is the measured, drop-free figure.
+    static let prerollStartLeadCeiling: Double = 0.25
+
+    /// What the lead adds to the route's output latency: 112 ms, so the measured HDMI route (138 ms)
+    /// gets exactly the 250 ms that was validated on it. Process-wide and settable, for tuning on a device
+    /// against the renderer's dropped-frame count (`AetherEngine.prerollStartMargin`).
+    static var prerollStartMargin: Double {
+        get { prerollStartMarginSwitch.withLock { $0 } }
+        set { prerollStartMarginSwitch.withLock { $0 = max(0, newValue) } }
+    }
+    private static let prerollStartMarginSwitch = OSAllocatedUnfairLock(initialState: 0.112)
+
+    /// The prerolled start's lead for a route reporting `outputLatency` seconds: that latency plus the
+    /// margin, capped at the ceiling. Without a latency (no `AVAudioSession`, as on macOS), the ceiling.
+    static func prerollStartLead(outputLatency: Double?, margin: Double = prerollStartMargin) -> Double {
+        guard let latency = outputLatency, latency.isFinite, latency >= 0 else { return prerollStartLeadCeiling }
+        return min(prerollStartLeadCeiling, latency + max(0, margin))
+    }
+
+    /// ``prerollStartLead(outputLatency:)`` for the current audio route.
+    static func currentPrerollStartLead() -> Double {
+        #if os(iOS) || os(tvOS)
+        prerollStartLead(outputLatency: AVAudioSession.sharedInstance().outputLatency)
+        #else
+        prerollStartLead(outputLatency: nil)
+        #endif
+    }
+
+    /// The lead the last prerolled start was scheduled with, in seconds; nil before the first.
+    var lastPrerollStartLead: Double? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _lastPrerollStartLead
+    }
+    private var _lastPrerollStartLead: Double?  // guarded by lock
 
     private var prerollGeneration = 0  // guarded by lock
     private var prerollRate: Float?  // guarded by lock; non-nil while a preroll waits: the rate it starts at
+    private var prerollTime = CMTime.invalid  // guarded by lock; the source time a waiting preroll starts at
+    private var prerollStarted: CFTimeInterval = 0  // guarded by lock
+    private var prerollTimer: DispatchSourceTimer?  // guarded by lock; the waiting preroll's timeout
+    /// The decoder's frame count (`videoPrerollProgress`) as the waiting preroll last read it, and when it
+    /// last saw it move (its start before that). Guarded by lock.
+    private var prerollProgress: UInt64?
+    private var prerollProgressAt: CFTimeInterval = 0
     private let prerollQueue = DispatchQueue(label: "aether.audio.preroll", qos: .userInteractive)
+
+    /// What a handover needs to know to wake a waiting preroll, behind its own lock so the decode
+    /// thread never waits on `lock` (held across synchronizer calls, which are IPC on tvOS). Taken
+    /// inside `lock` when a preroll is armed or disarmed, and alone everywhere else; never the
+    /// other way round. `queued` coalesces a burst of handovers into one evaluation.
+    private struct PrerollWake {
+        var generation: Int?
+        var queued = false
+    }
+    private let prerollWake = OSAllocatedUnfairLock(initialState: PrerollWake())
 
     /// Whether a preroll holds the clock at rate 0 to start it later. A host must not read that
     /// standing clock as stalled (AE#549) and restart it.
@@ -514,75 +913,122 @@ final class AudioOutput: @unchecked Sendable {
         return prerollRate != nil
     }
 
-    private struct PrerollWait: Sendable {
-        let gen: Int
-        let time: CMTime
-        let started: CFTimeInterval
-        var progress: UInt64?
-        var progressAt: CFTimeInterval
-    }
-
-    /// Whether a hold that is not ready yet waits on: inside `prerollTimeout` of its start or of the
-    /// decoder's last frame, and never past `prerollProgressCap`.
-    static func prerollKeepsWaiting(waited: Double, sinceProgress: Double) -> Bool {
-        waited < prerollProgressCap && sinceProgress < prerollTimeout
-    }
-
-    private func pollPreroll(_ wait: PrerollWait) {
-        // A pause, seek or stop since: this chain is over. Without the check every cancelled preroll
-        // polled on at 500 Hz, taking both locks, until its gate opened or it timed out.
-        lock.lock()
-        let current = prerollGeneration == wait.gen && prerollRate != nil
-        lock.unlock()
-        guard current else { return }
-        let ready = videoPrerollSatisfied?(wait.time.seconds) != false
-        let now = CACurrentMediaTime()
-        var wait = wait
-        if let count = videoPrerollProgress?(), count != wait.progress {
-            if wait.progress != nil { wait.progressAt = now }
-            wait.progress = count
-        }
-        let waited = now - wait.started
-        if !ready, Self.prerollKeepsWaiting(waited: waited, sinceProgress: now - wait.progressAt) {
-            let next = wait
-            prerollQueue.asyncAfter(deadline: .now() + .milliseconds(2)) { [weak self] in
-                self?.pollPreroll(next)
-            }
-            return
-        }
+    /// Prerolled starts so far, the immediate ones included; and whether the last waiting one was
+    /// started by its timeout rather than by the gate. Diagnostics for tests: exactly one start per
+    /// preroll, and the one the handover triggered.
+    var prerollStartCount: Int {
         lock.lock()
         defer { lock.unlock() }
-        guard prerollGeneration == wait.gen, let rate = prerollRate else { return }
-        prerollRate = nil
-        EngineLog.emit("[AudioOutput] preroll \(ready ? "ready" : "timed out") after "
-                       + "\(String(format: "%.0f", waited * 1000)) ms; starting at t=\(String(format: "%.3f", wait.time.seconds)) rate=\(rate)",
-                       category: .swPlayback)
-        startAfterPreroll(rate: rate, time: wait.time)
-        let release: ClockHoldRelease = ready ? .ready(waitedSeconds: waited) : .timedOut(waitedSeconds: waited)
-        _onPrerollTransition?(PrerollTransition(generation: wait.gen, event: .released(release)))
+        return _prerollStartCount
+    }
+    private var _prerollStartCount = 0  // guarded by lock
+    var lastPrerollTimedOut: Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _lastPrerollTimedOut
+    }
+    private var _lastPrerollTimedOut: Bool?  // guarded by lock
+
+    /// The gate's inputs moved: the renderer handed a frame over (`SampleBufferRenderer.setPrerollAdvancedObserver`).
+    /// Callable from any thread and never blocks: it queues one evaluation on `prerollQueue` if a
+    /// preroll waits and none is queued yet. This replaced a poll every 2 ms, which kept the gate's
+    /// lock and this one busy about 300 times a second through every wait (measured on macOS) and
+    /// saw an opened gate a median 3.0 ms late (7.1 ms at worst, timer leeway); this sees it in 0.02 ms.
+    func videoPrerollAdvanced() {
+        let gen: Int? = prerollWake.withLock { wake in
+            guard let gen = wake.generation, !wake.queued else { return nil }
+            wake.queued = true
+            return gen
+        }
+        guard let gen else { return }
+        prerollQueue.async { [weak self] in self?.evaluatePreroll(gen: gen, timedOut: false) }
     }
 
-    /// Starts the clock `prerollStartLead` from now. Called with `lock` held.
-    private func startAfterPreroll(rate: Float, time: CMTime) {
+    /// Asks the gate for the preroll armed as `gen`, and starts the clock if it is open or the
+    /// timeout has come. On `prerollQueue` only, so a handover and the timeout are judged one at a
+    /// time; the generation, read again under `lock` after the gate answered, makes the first of them
+    /// the only start and lets a pause, seek or stop in the meantime win.
+    private func evaluatePreroll(gen: Int, timedOut: Bool) {
+        // A handover from here on queues another evaluation: this one may read the gate before it.
+        prerollWake.withLock { if $0.generation == gen { $0.queued = false } }
+        lock.lock()
+        let current = prerollGeneration == gen && prerollRate != nil
+        let time = prerollTime
+        let started = prerollStarted
+        lock.unlock()
+        guard current else { return }
+        let ready = videoPrerollSatisfied?(time.seconds) != false
+        guard ready || timedOut else { return }
+        // Read before `lock`, like the gate: the decoder's count, for a timeout its progress may extend.
+        let progress = ready ? nil : videoPrerollProgress?()
+        let now = CACurrentMediaTime()
+        let waited = now - started
+        let lead = Self.currentPrerollStartLead()
+        lock.lock()
+        defer { lock.unlock() }
+        guard prerollGeneration == gen, let rate = prerollRate else { return }
+        if !ready {
+            if let progress, progress != prerollProgress {
+                if prerollProgress != nil { prerollProgressAt = now }
+                prerollProgress = progress
+            }
+            if Self.prerollKeepsWaiting(waited: waited, sinceProgress: now - prerollProgressAt) {
+                // The next tick where it could time out: `prerollTimeout` after the last frame, or the cap.
+                let deadline = min(prerollProgressAt + (prerollTimeoutOverride ?? Self.prerollTimeout),
+                                   started + Self.prerollProgressCap)
+                armPrerollTimer(gen: gen, after: max(deadline - now, 0))
+                return
+            }
+        }
+        disarmPreroll(release: ready ? .ready(waitedSeconds: waited) : .timedOut(waitedSeconds: waited))
+        _lastPrerollTimedOut = !ready
+        EngineLog.emit("[AudioOutput] preroll \(ready ? "ready" : "timed out") after "
+                       + "\(String(format: "%.0f", waited * 1000)) ms; starting at t=\(String(format: "%.3f", time.seconds)) rate=\(rate)",
+                       category: .swPlayback)
+        startAfterPreroll(rate: rate, time: time, lead: lead)
+    }
+
+    /// The waiting preroll's timeout tick, `seconds` from now, in place of any earlier one. Called with
+    /// `lock` held.
+    private func armPrerollTimer(gen: Int, after seconds: Double) {
+        prerollTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: prerollQueue)
+        timer.schedule(deadline: .now() + seconds)
+        timer.setEventHandler { [weak self] in self?.evaluatePreroll(gen: gen, timedOut: true) }
+        prerollTimer = timer
+        timer.resume()
+    }
+
+    /// Starts the clock `lead` seconds from now (``currentPrerollStartLead()``, read by the caller before
+    /// it took `lock`). Called with `lock` held.
+    private func startAfterPreroll(rate: Float, time: CMTime, lead: Double) {
+        _lastPrerollStartLead = lead
+        _prerollStartCount += 1
+        EngineLog.emit("[AudioOutput] start lead \(String(format: "%.0f", lead * 1000)) ms", category: .swPlayback, level: .verbose)
         let hostNow = CMClockGetTime(CMClockGetHostTimeClock())
-        let host = CMTimeAdd(hostNow, CMTime(seconds: Self.prerollStartLead, preferredTimescale: 1_000_000_000))
+        let host = CMTimeAdd(hostNow, CMTime(seconds: lead, preferredTimescale: 1_000_000_000))
         synchronizer.setRate(rate, time: timeline.rendererTime(forSource: time), atHostTime: host)
     }
 
     private func cancelPreroll() {
         lock.lock()
-        endPreroll()
+        disarmPreroll()
         lock.unlock()
     }
 
-    /// Retires the current preroll chain, and reports a hold that was still waiting as cancelled.
-    /// Called with `lock` held.
-    private func endPreroll() {
+    /// Ends any waiting preroll: its generation moves on, so a handover or timeout already queued for
+    /// it finds nothing to start. A hold still waiting is reported released as `release`: cancelled,
+    /// unless the start itself ends it. Called with `lock` held.
+    private func disarmPreroll(release: ClockHoldRelease = .cancelled) {
         if prerollRate != nil {
-            _onPrerollTransition?(PrerollTransition(generation: prerollGeneration, event: .released(.cancelled)))
+            _onPrerollTransition?(PrerollTransition(generation: prerollGeneration, event: .released(release)))
         }
         prerollGeneration &+= 1
         prerollRate = nil
+        prerollTimer?.cancel()
+        prerollTimer = nil
+        prerollProgress = nil
+        prerollWake.withLock { $0 = PrerollWake() }
     }
 
     private func updatePrerollRate(_ rate: Float) -> Bool {

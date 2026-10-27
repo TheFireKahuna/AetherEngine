@@ -21,23 +21,17 @@ extension AetherEngine {
     /// (reload at position, audio-track switch, AirPlay LAN swap, background return), because it is
     /// stored in the options those rebuilds replay. Passing the value already in force does nothing.
     ///
-    /// **What it costs, per route.** The offset moves audio at the last place the engine still holds
-    /// its timestamps, and on both routes the media between there and the speaker is already
-    /// committed to the previous value: up to `AudioLookaheadPolicy.targetLeadSeconds` of decoded
-    /// audio on `.software`, and on `.loopback` the segments AVPlayer has already fetched, whose cut
-    /// audio cannot be re-timed in place (the seam would gain a gap or an overlap of exactly the
-    /// change, and a change that moves audio earlier is eaten by the muxer's strictly-increasing DTS
-    /// rule). So a change is brought to the playhead rather than left to arrive when that media
-    /// drains, and what that costs differs:
-    ///
-    /// - `.software`: a seek to the current position. Measured on a 30 fps H.264 fixture: set at
-    ///   t=4.90 s, landed at 4.90 s, the new offset delivered on the next buffer.
-    /// - `.loopback`: the session-preserving reload (#460). A seek is not enough and measuring it is
-    ///   what settled this: seeking to the position AVPlayer already holds is a buffer hit, so it
-    ///   plays its old-offset segments out regardless, and dropping those segments under it only
-    ///   turns the hand-over into a rebuffer (6 s measured). Replacing the item is the one thing that
-    ///   makes AVPlayer let go. Measured on the same fixture: about 0.3 s of held picture, position
-    ///   preserved to the sample (7.80 s to 7.80 s).
+    /// **What it costs.** The offset moves audio at the last place the engine still holds its
+    /// timestamps, and on `.loopback` the segments AVPlayer has already fetched are committed to the
+    /// previous value: their cut audio cannot be re-timed in place (the seam would gain a gap or an
+    /// overlap of exactly the change, and a change that moves audio earlier is eaten by the muxer's
+    /// strictly-increasing DTS rule). So a change is brought to the playhead through the
+    /// session-preserving reload (#460) rather than left to arrive when that media drains. A seek is
+    /// not enough and measuring it is what settled this: seeking to the position AVPlayer already
+    /// holds is a buffer hit, so it plays its old-offset segments out regardless, and dropping those
+    /// segments under it only turns the hand-over into a rebuffer (6 s measured). Replacing the item
+    /// is the one thing that makes AVPlayer let go. Measured on a 30 fps H.264 fixture: about 0.3 s of
+    /// held picture, position preserved to the sample (7.80 s to 7.80 s).
     ///
     /// This is why it is not free the way `setRate` is. A session that cannot re-anchor (live without
     /// a DVR window) keeps the value and lets it arrive at the next seam the session makes on its
@@ -84,17 +78,6 @@ extension AetherEngine {
                 + "this session's audio timestamps are not the engine's to move (route=\(route.rawValue))",
                 category: .engine
             )
-
-        case .sampleTimestamps:
-            // The renderer takes the new stamp on the next buffer. What is already decoded still
-            // carries the old one, so re-anchor to bring the change to the playhead: on this path
-            // that is a flush and a demuxer reposition, and it lands inside a seek.
-            softwareHost?.setAudioDelay(clamped)
-            EngineLog.emit(
-                "[AetherEngine] AE#464: audio delay = \(Self.ms(clamped)) on the software path",
-                category: .engine
-            )
-            reanchorForAudioDelay { position, _ in await self.seek(to: position, origin: .host) }
 
         case .segmentTimestamps:
             // A seek is NOT enough here, and measuring it is what settled the shape: seeking to the
