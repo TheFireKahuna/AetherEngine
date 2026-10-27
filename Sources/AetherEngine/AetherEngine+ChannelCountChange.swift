@@ -35,7 +35,7 @@ extension AetherEngine {
     /// Only a renderer path owns its channel preference; the native path leaves it to AVKit, and a host
     /// that took over activation (`rendererAudioSessionActivationEnabled = false`) owns it too.
     var ownsChannelPreference: Bool {
-        rendererAudioSessionActivationEnabled && (softwareHost != nil || audioHost != nil)
+        rendererAudioSessionActivationEnabled && audioHost != nil
     }
 
     #if os(iOS) || os(tvOS)

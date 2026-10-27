@@ -86,63 +86,6 @@ struct LiveEdgeCushionTests {
         #expect(cushionedJoin.last?.uri == "s29")
     }
 
-    // MARK: - Software path
-
-    @Test("an unset cushion leaves the software holdback as it was")
-    func softwareUnset() {
-        #expect(SoftwareLiveHoldback(deliveryUnitSeconds: nil, edgeCushionSeconds: nil) == .continuous)
-        let segmented = SoftwareLiveHoldback(deliveryUnitSeconds: 10, edgeCushionSeconds: 5)
-        #expect(segmented.joinLeadSeconds == 16)
-        #expect(segmented.resumeCushionSeconds == 12)
-        #expect(segmented.edgeHoldbackSeconds == 26)
-    }
-
-    @Test("a continuous source joins, lands, resumes and counts the edge at the cushion")
-    func softwareContinuous() {
-        let h = SoftwareLiveHoldback(deliveryUnitSeconds: nil, edgeCushionSeconds: 20)
-        #expect(h.joinLeadSeconds == 20)
-        #expect(h.landingHoldbackSeconds == 20)
-        #expect(h.resumeCushionSeconds == 20)
-        #expect(h.edgeHoldbackSeconds == 20)
-    }
-
-    @Test("a segmented source takes the deeper of its own lead and the cushion")
-    func softwareSegmented() {
-        let h = SoftwareLiveHoldback(deliveryUnitSeconds: 10, edgeCushionSeconds: 30)
-        #expect(h.joinLeadSeconds == 30)
-        #expect(h.resumeCushionSeconds == 30)
-        #expect(h.edgeHoldbackSeconds == 40)
-    }
-
-    @Test("a realtime join waits until the cushion stands behind the newest media")
-    func softwareJoinWaits() {
-        var policy = SoftwareLiveJoinPolicy()
-        var decision: SoftwareLiveJoinPolicy.Decision?
-        var now = 0.0
-        // An 8 s connect burst, then real time.
-        while decision == nil, now < 60 {
-            decision = policy.observe(firstPts: 0, newestPts: 8 + now, at: now,
-                                      leadSeconds: 20, minimumSpanSeconds: 20)
-            now += 0.05
-        }
-        #expect(decision == .fromStart)
-        #expect(now >= 11.9)
-    }
-
-    @Test("a join whose source never fills the cushion starts on what it holds")
-    func softwareJoinDeadline() {
-        var policy = SoftwareLiveJoinPolicy()
-        var decision: SoftwareLiveJoinPolicy.Decision?
-        var now = 0.0
-        while decision == nil, now < 60 {
-            decision = policy.observe(firstPts: 0, newestPts: 8, at: now,
-                                      leadSeconds: 20, minimumSpanSeconds: 20)
-            now += 0.05
-        }
-        #expect(decision == .fromStart)
-        #expect(now >= SoftwareLiveJoinPolicy.maximumSettleSeconds + 20)
-        #expect(now < SoftwareLiveJoinPolicy.maximumSettleSeconds + 21)
-    }
 }
 
 @Suite("A remote-HLS cushion never plays closer than the origin's own offset")

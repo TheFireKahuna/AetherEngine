@@ -13,19 +13,9 @@ import SwiftUI
 /// A single render surface owned by AetherEngine.
 ///
 /// The host embeds one instance (UIKit on iOS/tvOS, AppKit on macOS) and
-/// hands it to `engine.bind(view:)`. The engine then attaches whichever
-/// `CALayer` is active for the current source:
-///
-/// - `AVPlayerLayer` for the native AVPlayer path (HEVC, H.264, plus AV1
-///   on devices with hardware AV1 decode).
-/// - `AVSampleBufferDisplayLayer` for the software path driven by
-///   `SoftwarePlaybackHost` (AV1 without hardware decode, VP9, MPEG-4
-///   Part 2, MPEG-2, VC-1).
-///
-/// The view swaps the hosted layer internally on dispatch changes, so the
-/// host never needs to know which backend is rendering. The active layer
-/// can also change across sessions when consecutive sources dispatch to
-/// different paths.
+/// hands it to `engine.bind(view:)`. The engine then attaches the session's
+/// `AVPlayerLayer`. Software-decoded pictures (AV1 without hardware decode,
+/// VP9, MPEG-4 Part 2, MPEG-2, VC-1) are drawn by the overlay above it.
 @MainActor
 public final class AetherPlayerView: PlatformBaseView, HeldStillSurface {
 

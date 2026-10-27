@@ -5,7 +5,7 @@ import Foundation
 /// Live rules exist because of a device-verified stall (tvOS 26, Jellyfin live `stream.ts`, 2026-06): reloading a live session against the same URL caused Jellyfin to re-serve its transcode backlog (~60 s, segments 0..19) at I/O speed before AVPlayer's first playlist fetch. The pre-readiness seek-to-0 then pointed 60 s behind the live edge while AVPlayer targeted edge-minus-holdback; the item fetched init.mp4 + all segments but never reached `readyToPlay`, parking in `waitingToPlay` forever (frozen frame). Fix: treat any live reload as a fresh join -- no stale-clock resume, no explicit start seek.
 enum LiveReloadPolicy {
 
-    /// Start position handed to `loadNative` / `loadSoftware` / `load(url:)`.
+    /// Start position handed to `loadNative` / `load(url:)`.
     ///
     /// - VOD: pre-reload playhead; positions <= 1 s collapse to nil to skip the seek at head.
     /// - Live: always nil. The DVR window restarts at rejoin; a position would be stale and could wedge AVPlayer against the backlog.

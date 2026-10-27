@@ -30,7 +30,6 @@ extension AetherEngine {
         // its `AetherPlayerView`, if any, is not what is on screen.
         let surface: (any HeldStillSurface)? = boundStillView ?? boundView
         let nativeSource = nativeHost
-        let softwareSource = nativeSource == nil ? softwareHost : nil
         if let skip = surface == nil ? "no surface bound"
             : nativeSource == nil ? "no video host"
             : Self.heldPictureSkipReason(
@@ -153,7 +152,6 @@ extension AetherEngine {
         #endif
     }
 
-    /// Called where `loadSoftware` installs its host: a picture held over a software rebuild comes
     /// Dolby Vision whose base layer has no displayable colour of its own: Profile 5, and AV1
     /// Profile 10, whose compatibility id is not known here. Every other profile's base layer is HDR10,
     /// HLG or SDR and is held as the output vends it.

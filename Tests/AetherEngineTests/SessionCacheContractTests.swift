@@ -327,26 +327,6 @@ extension SessionCacheLifecycleContractTests {
     }
 }
 
-extension SessionCacheBudgetCompatibilityTests {
-    @Test(arguments: [Int64(0), 1024, 16 << 30], [false, true])
-    func softwareAutomaticIsUnchanged(available: Int64, relaxed: Bool) {
-        #expect(SoftwarePlaybackHost.packetCacheBudgetBytes(requestedBytes: nil,
-            availableBytes: available, capRelaxed: relaxed) ==
-            HLSVideoEngine.sessionRetentionBudgetBytes(volumeAvailableBytes: available, capRelaxed: relaxed))
-    }
-
-    @Test func softwareWindowOnlyStillRespectsVolumeSafety() {
-        #expect(SoftwarePlaybackHost.packetCacheBudgetBytes(requestedBytes: 0,
-            availableBytes: 16 << 30, capRelaxed: true) == 32 << 20)
-        #expect(SoftwarePlaybackHost.packetCacheBudgetBytes(requestedBytes: 0,
-            availableBytes: 1024, capRelaxed: true) == 256)
-        #expect(SoftwarePlaybackHost.packetCacheBudgetBytes(requestedBytes: 100,
-            availableBytes: 1024, capRelaxed: true) == 100)
-        #expect(SoftwarePlaybackHost.packetCacheBudgetBytes(requestedBytes: Int.max,
-            availableBytes: nil, capRelaxed: true) == 2 << 30)
-    }
-}
-
 extension SessionCachePublicContractTests {
     @Test func stopRetainsZeroArgumentCallbackCompatibility() {
         let session = HLSVideoEngine(url: URL(string: "https://example.invalid/unused")!)

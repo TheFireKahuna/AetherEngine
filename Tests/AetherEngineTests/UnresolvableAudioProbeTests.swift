@@ -41,15 +41,13 @@ struct UnresolvableAudioProbeTests {
                                            sampleRate: 48000, channels: 0))
     }
 
-    /// The guard that keeps `shouldRepairLiveAACCodecpar` alive: a live MPEG-TS AAC stream reaches
-    /// the probe with `sample_rate == 0` and is repaired downstream, so parking it would take the
-    /// audio off every live channel this engine plays. Having a decoder is what separates them.
+    /// A live MPEG-TS AAC stream reaches the probe with `sample_rate == 0` and is repaired
+    /// downstream, so parking it would take the audio off every live channel this engine plays.
+    /// Having a decoder is what separates them.
     @Test("a live AAC stream with no sample rate is left alone, because it has a decoder")
     func liveAACIsNotParked() {
         #expect(!Demuxer.audioCannotResolve(codecID: AV_CODEC_ID_AAC, codecType: AVMEDIA_TYPE_AUDIO,
                                             sampleRate: 0, channels: 0))
-        #expect(SoftwarePlaybackHost.shouldRepairLiveAACCodecpar(
-            isLive: true, codecID: AV_CODEC_ID_AAC, sampleRate: 0))
     }
 
     @Test("a codec the container already described is none of this decision's business")

@@ -889,7 +889,6 @@ extension AetherEngine {
     /// none, and this label used to name one for it.
     nonisolated static func softwareAudioDecoderLabel(
         audioTracks: [TrackInfo],
-        route: SoftwareAtmosRoute = .pcm
         activeIndex: Int32
     ) -> String? {
         guard activeIndex >= 0,

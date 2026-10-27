@@ -8,9 +8,9 @@ import Testing
 @MainActor
 struct InterruptionPlayGuardTests {
 
-    private func engine(withSoftwareHost: Bool = true) throws -> AetherEngine {
+    private func engine(withRendererHost: Bool = true) throws -> AetherEngine {
         let engine = try AetherEngine()
-        if withSoftwareHost { engine.softwareHost = SoftwarePlaybackHost(videoGravity: .resizeAspect) }
+        if withRendererHost { engine.audioHost = AudioPlaybackHost() }
         engine.state = .paused
         return engine
     }
@@ -76,7 +76,7 @@ struct InterruptionPlayGuardTests {
     func setRateHeld() throws {
         let engine = try engine()
         defer { engine.stop() }
-        let host = try #require(engine.softwareHost)
+        let host = try #require(engine.audioHost)
         engine.state = .playing
         let before = host.rate
         engine.noteAudioInterruptionBegan()
@@ -154,7 +154,7 @@ struct InterruptionPlayGuardTests {
 
     @Test("without a renderer path the engine does not hold play")
     func nativePathUntouched() throws {
-        let engine = try engine(withSoftwareHost: false)
+        let engine = try engine(withRendererHost: false)
         defer { engine.stop() }
         engine.noteAudioInterruptionBegan()
         #expect(!engine.deferPlayForInterruption())

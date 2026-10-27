@@ -76,7 +76,6 @@ final class DocumentedConstantsTests: XCTestCase {
         XCTAssertEqual(DoviFelComposer.outputPoolAllocationThreshold, 15)
         XCTAssertEqual(DoviFelComposer.outputPoolReserve, 3)
         XCTAssertEqual(DualLayerVideoDecoder.maxBorrowedParamsRun, 3)
-        XCTAssertEqual(SampleBufferRenderer.hardwareDecoderReorderDepth, 4)
         XCTAssertEqual(DualLayerVideoDecoder.settledKeyMemory, 64)
         XCTAssertEqual(DualLayerVideoDecoder.summaryIntervalSeconds, 1.0)
         // About 36 ms: ten attempts with a sleep between each pair.
@@ -95,7 +94,6 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("a reserve of 3 more", fel)
         assertDocumented("allocation threshold 15 + reserve 3", fel)
         assertDocumented("`maxBorrowedParamsRun` (3)", fel)
-        assertDocumented("the renderer's 4-frame reorder buffer", fel)
         assertDocumented("last 64\n  settled base-layer keys", fel)
         assertDocumented("for at most about 36 ms", fel)
         assertDocumented("Counters feed a 1 Hz summary", fel)
@@ -109,25 +107,6 @@ final class DocumentedConstantsTests: XCTestCase {
             throw XCTSkip("running outside a source checkout; no docs to check against")
         }
         return text
-    }
-
-    /// docs/formats.md quotes the lead a software-path live join keeps behind the newest media.
-    func testSoftwareLiveJoinLeadMatchesDocumentation() throws {
-        XCTAssertEqual(SoftwareLiveJoinPolicy.leadSeconds, 4)
-        XCTAssertEqual(SoftwareLiveJoinPolicy.minimumSettleSeconds, 0.3)
-        XCTAssertEqual(SoftwareLiveJoinPolicy.maximumSettleSeconds, 1.5)
-        XCTAssertEqual(SoftwareLiveJoinPolicy.calmWindowSeconds, 0.25)
-        assertDocumented("`SoftwareLiveJoinPolicy.leadSeconds` (4 s) behind the newest media", try documentation())
-    }
-
-    /// docs/formats.md quotes the segmented holdback of a live HLS ingest on the software path (AE#813).
-    func testSoftwareLiveHoldbackMatchesDocumentation() throws {
-        XCTAssertEqual(SoftwareLiveHoldback(deliveryUnitSeconds: 2).joinLeadSeconds, 4)
-        XCTAssertEqual(SoftwareLiveHoldback(deliveryUnitSeconds: 10).joinLeadSeconds, 16)
-        XCTAssertEqual(SoftwareLiveHoldback.maximumLeadSeconds, 45)
-        XCTAssertEqual(SoftwareLiveHoldback.resumeSlackSeconds, 2)
-        assertDocumented("`1.5 x segment + 1 s` behind the newest media (4 s on 2 s segments, 16 s on 10 s segments, at most 45 s)",
-                         try documentation())
     }
 
     // MARK: - Documentation corpus

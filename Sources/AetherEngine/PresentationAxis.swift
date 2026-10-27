@@ -30,25 +30,12 @@ enum PresentationAxis {
     ///
     /// - `.native`: the origin the native session latches for a VOD source, the container start
     ///   (`HLSVideoEngine.sourceStartSeconds`).
-    /// - `.software`: the session zero of the software clock. Once the host has anchored its clock that is
-    ///   the zero it reports (`softwareClockZero`), which is authoritative. Until then it is predicted the
-    ///   way the host derives it: `SWClockAnchorPolicy.resumeSessionZero` of the host's origin, the
-    ///   container start backed up by the video stream's own start (`sourceStartOrigin`), which is zero
-    ///   within the 2 s tolerance.
     /// - Anything else (`.none`, the audio-only backends) has no established origin here, so the
     ///   chapters stay on the raw container axis, as they were published before this rule.
     static func containerChapterOrigin(backend: PlaybackBackend, formatStartSeconds: Double,
-                                       sourceStartOrigin: Double, softwareClockZero: Double? = nil,
                                        isLive: Bool) -> Double {
-        if isLive, backend == .native || backend == .software { return 0 }
-        switch backend {
-        case .native:
-            return Swift.max(0, formatStartSeconds)
-        case .software:
-            return softwareClockZero ?? SWClockAnchorPolicy.resumeSessionZero(sourceOriginSeconds: sourceStartOrigin)
-        default:
-            return 0
-        }
+        guard backend == .native, !isLive else { return 0 }
+        return Swift.max(0, formatStartSeconds)
     }
 }
 

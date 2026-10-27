@@ -222,7 +222,6 @@ final class AudioOutput: @unchecked Sendable {
         )
     }
 
-    /// Retire the old session's layer without blocking the caller. SoftwarePlaybackHost creates a
     /// The output was configured for another format under the renderer (`…OutputConfigurationDidChange`): another
     /// client played something else (the Atmos activator's keep-alive player starting beside an APAC session), or
     /// the HDMI sink came back from an input switch or a power cycle in a different mode. The renderer keeps

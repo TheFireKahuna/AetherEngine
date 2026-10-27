@@ -227,6 +227,18 @@ the public-API contract.
   panel repeated a frame about every 42 s. A probe within 0.005 of 24.000 now snaps to 24; a Matroska track with
   DefaultDuration probes as an exact 24/1 or 24000/1001, so 23.976 sources and noisier probes keep 23.976.
 
+### Changed
+
+- **The retired software host is gone.** Software-decoded video (AV1 without hardware decode, VP9, VP8,
+  MPEG-2, VC-1, interlaced H.264, a Profile 7 FEL composition, `preferredDecodePath = .software`) has played as
+  the overlay over the loopback AVPlayer session since the host stopped being routed to, so `SoftwarePlaybackHost`,
+  its sample-buffer renderer, its packet spools and DVR ring, and the API only it fed are removed:
+  `isClockHeld` / `clockHoldEvents`, `ownsSoftwareNowPlaying` / `softwareNowPlayingActive` / `remoteSkipInterval`,
+  `setSoftwareVideoFrameTimeObserver` / `softwarePresentationTimebase` / `SoftwareVideoFrameTime`,
+  `softwareDisplaySize`, `setSoftwareSubtitleDelay` / `softwareSubtitleDelaySeconds`,
+  `setSoftwareLiveDVRLimits` / `softwareLiveDVRBytes`, `LoadOptions.softwareDVRRetention` and
+  `softwarePacketCacheStorage`, `softwareHostFramesEnqueued`, and the software cache fields of `LiveTelemetry`.
+  `PlaybackBackend.software` and `VideoRoute.software` stay as reserved cases and are never assigned.
 
 - **SDR scrub stills decode on one VideoToolbox session and touch no disk** (#682). Each still used to wrap its
   keyframe in an MP4 fragment written through a staging file, then open a demuxer, a decoder and a VideoToolbox

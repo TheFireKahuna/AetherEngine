@@ -27,7 +27,6 @@ extension AetherEngine {
         guard page != loadedOptions.teletextPage else { return }
         setLoadedTeletextPage(page)
         nativeVideoSession?.teletextPageForSubtitleTap = page
-        softwareHost?.teletextPageForSubtitleTap = page
         nativeVideoSession?.refreshSubtitleTapDecoders()
 
         let rebuilt = rebuildTeletextDrainDecoders()

@@ -7,9 +7,9 @@ import Testing
 @MainActor
 struct ChannelCountChangeTests {
 
-    private func engine(software: Bool = true) throws -> AetherEngine {
+    private func engine(rendererHost: Bool = true) throws -> AetherEngine {
         let engine = try AetherEngine()
-        if software { engine.softwareHost = SoftwarePlaybackHost(videoGravity: .resizeAspect) }
+        if rendererHost { engine.audioHost = AudioPlaybackHost() }
         return engine
     }
 

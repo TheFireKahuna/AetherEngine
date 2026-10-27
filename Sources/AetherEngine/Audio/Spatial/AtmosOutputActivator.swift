@@ -277,7 +277,6 @@ extension AetherEngine {
         if let player = currentAVPlayer {
             let activator = atmosOutputActivator ?? AtmosOutputActivator()
             atmosOutputActivator = activator
-        } else if let host = softwareHost, host.audioRouteCarriesDolbyAtmos {
             activator.attach(
                 to: player,
                 playsAPAC: { [weak self] _ in self?.nativeVideoSession?.audioIsAPAC == true },

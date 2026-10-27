@@ -3,19 +3,11 @@ import Foundation
 @testable import AetherEngine
 
 /// #660: the engine hands its stored volume to a host right after building it, before `load()`.
-/// The FFmpeg hosts forwarded that write to an `AudioOutput` that `load()` had not built yet, so it
-/// was dropped and every software session started at full volume. The host now keeps the volume
-/// itself and hands it to each output it builds.
-@Suite("Software hosts keep a volume set before their audio output exists (#660)")
-struct Issue660SoftwareVolumeTests {
-
-    @MainActor
-    @Test("a software host reports the volume it was given before load")
-    func softwareHostKeepsVolumeBeforeLoad() {
-        let host = SoftwarePlaybackHost()
-        host.volume = 0.25
-        #expect(host.volume == 0.25)
-    }
+/// The FFmpeg audio host forwarded that write to an `AudioOutput` that `load()` had not built yet, so it
+/// was dropped and every session started at full volume. The host now keeps the volume itself and
+/// hands it to each output it builds.
+@Suite("The audio host keeps a volume set before its audio output exists (#660)")
+struct AudioHostVolumeBeforeLoadTests {
 
     @MainActor
     @Test("an audio host reports the volume it was given before load")

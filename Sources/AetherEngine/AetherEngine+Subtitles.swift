@@ -348,7 +348,6 @@ extension AetherEngine {
         if let factory = subtitleDrainDecoderFactoryForTesting { return factory(streamIndex) }
         #endif
         return nativeVideoSession?.makeOverlayDecoder(streamIndex: streamIndex)
-            ?? softwareHost?.makeOverlayDecoder(streamIndex: streamIndex)
     }
 
     /// Start (or keep) the 500ms drain loop. Requests an immediate tick so a fresh selection

@@ -45,7 +45,6 @@ Native AVPlayer is the default route: the engine demuxes with FFmpeg and serves 
 local loopback server, so HEVC / H.264 / hardware AV1 keep Dolby Vision, HDR and Atmos signalling.
 AV1 without hardware decode, interlaced or MVC-carrying H.264, Dolby Vision Profile 7 FEL (when
 requested and built in) and every codec the native route does not carry (VP9, VP8, MPEG-2, VC-1, ...)
-go to the software host (dav1d / libavcodec into `AVSampleBufferDisplayLayer`).
 are decoded by the engine (dav1d / libavcodec, VideoToolbox for HEVC) and drawn as an overlay
 (`SoftwareOverlayRenderer`) over the AVPlayer session, which keeps transport, audio and signalling.
 Audio is stream-copied where Apple can play it and otherwise bridged (FLAC, or APAC for rendered

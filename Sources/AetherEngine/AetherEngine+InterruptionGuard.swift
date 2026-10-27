@@ -22,7 +22,7 @@ extension AetherEngine {
     /// because the user asked for it.
     func deferPlayForInterruption() -> Bool {
         guard Self.interruptionHoldsTransport(
-            interrupted: audioInterruptionActive, rendererPath: softwareHost != nil || audioHost != nil
+            interrupted: audioInterruptionActive, rendererPath: audioHost != nil
         ) else { return false }
         if playDeferredByInterruption {
             audioInterruptionActive = false

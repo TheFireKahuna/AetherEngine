@@ -142,7 +142,6 @@ public enum AudioDelivery: String, Sendable, Equatable, CaseIterable {
     static func derive(backend: PlaybackBackend,
                        nativeRemoteHLS: Bool,
                        loopbackSession: AudioDelivery?,
-                       softwareHost: AudioDelivery?,
                        audioOnlyHost: AudioDelivery?) -> AudioDelivery {
         switch backend {
         case .none, .aether, .software:

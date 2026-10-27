@@ -618,7 +618,6 @@ struct DualLayerEdgeCaseTests {
 
     @Test("the route gates take no display input and agree for a FEL P7 title, so a non-DV display does not change the route today")
     func routeGatesIgnoreTheDisplay() {
-        // `SoftwarePlaybackHost.shouldUseDualLayerDecoder` have no `DisplayCapabilities` parameter:
         // `DualLayerRouteDecision.decide` and `VideoRoutingPolicy.requiresSoftwarePath` have no
         // `DisplayCapabilities` parameter:
         // the load decides the route from the stream, the options and the decoder capability only.
@@ -627,8 +626,6 @@ struct DualLayerEdgeCaseTests {
             codecID: AV_CODEC_ID_HEVC, fieldOrder: AV_FIELD_PROGRESSIVE, av1Available: true,
             dvProfile: 7, dolbyVisionHandling: .automatic, preferDualLayerDolbyVision: true,
             canHardwareDecode: { true }, elType: "FEL")
-        let dual = SoftwarePlaybackHost.shouldUseDualLayerDecoder(
-            dvProfile: 7, elType: "FEL", preferDualLayerDolbyVision: true, dolbyVisionHandling: .automatic)
         #expect(decision.isTaken && software)
         // And they fall back together.
         let melDecision = DualLayerRouteDecision.decide(
@@ -641,8 +638,6 @@ struct DualLayerEdgeCaseTests {
             codecID: AV_CODEC_ID_HEVC, fieldOrder: AV_FIELD_PROGRESSIVE, av1Available: true,
             dvProfile: 7, dolbyVisionHandling: .automatic, preferDualLayerDolbyVision: true,
             canHardwareDecode: { true }, elType: "MEL"))
-        #expect(!SoftwarePlaybackHost.shouldUseDualLayerDecoder(
-            dvProfile: 7, elType: "MEL", preferDualLayerDolbyVision: true, dolbyVisionHandling: .automatic))
     }
 }
 #endif

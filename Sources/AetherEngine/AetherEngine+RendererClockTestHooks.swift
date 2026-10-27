@@ -12,7 +12,6 @@ extension AetherEngine {
     /// whose clock has not armed yet).
     @MainActor
     public func stallRendererClockForTesting() -> Bool {
-        if let softwareHost { return softwareHost.stallClockForTesting() }
         if let audioHost { return audioHost.stallClockForTesting() }
         return false
     }
@@ -20,7 +19,7 @@ extension AetherEngine {
     /// The renderer path's synchronizer rate, nil when the active backend has no synchronizer.
     @MainActor
     public var rendererClockRateForTesting: Float? {
-        softwareHost?.clockRateForTesting ?? audioHost?.clockRateForTesting
+        audioHost?.clockRateForTesting
     }
 }
 #endif

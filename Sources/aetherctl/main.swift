@@ -407,23 +407,6 @@ if first == "seektest" {
     exit(runSeekTest(url: parseSourceURL(urlArg), seeks: seeks, gapMs: gapMs, settleSeconds: settle))
 }
 
-// SW-path background-audio keepalive harness (iOS background audio on the software decode path).
-if first == "bgaudio" {
-    var rest = Array(args.dropFirst(2))
-    let fg = takeDoubleFlag("--fg", in: 0...maxRunSeconds, from: &rest) ?? 3.0
-    let bg = takeDoubleFlag("--bg", in: 0...maxRunSeconds, from: &rest) ?? 6.0
-    let loseSession = takeFlag("--lose-session", from: &rest)
-    guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
-        print("ERROR: bgaudio requires a <url> argument")
-        print("Usage: aetherctl bgaudio [--fg N] [--bg N] [--lose-session] <url>")
-        exit(64)
-    }
-    rest.removeAll { $0 == urlArg }
-    rejectStrayFlags(rest, subcommand: "bgaudio")
-    exit(runBackgroundAudio(url: parseSourceURL(urlArg), fgSeconds: fg, bgSeconds: bg,
-                            loseSession: loseSession))
-}
-
 if first == "smbtest" {
     var rest = Array(args.dropFirst(2))
     let reads = takeIntFlag("--reads", in: 0...1_000_000, from: &rest) ?? 64
@@ -616,13 +599,13 @@ if first == "audiotap" {
     rest.removeAll { $0 == "--remote" }
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: audiotap requires a <url> argument")
-        print("Usage: aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>")
+        print("Usage: aetherctl audiotap [--duration S] [--out PATH.wav] [--remote] <url>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "audiotap")
     exit(runAudioTap(url: parseSourceURL(urlArg), duration: duration, outPath: outPath,
-                 remote: remote, software: software))
+                 remote: remote))
 }
 
 if first == "hlsfixture" {

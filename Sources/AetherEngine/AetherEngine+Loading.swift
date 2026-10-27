@@ -164,27 +164,6 @@ extension AetherEngine {
         recordStartupCheckpoint(.presenting)   // #361
     }
 
-    /// #353: mirror a software host's settled picture size onto the public `softwareDisplaySize`.
-    ///
-    /// A mirror rather than the latch `hasFirstFrameReadyForDisplay` gets, because the two answer
-    /// different questions. A picture that exists cannot stop existing for the rest of the load, but
-    /// the size it presents at can change under it: a live source that switches resolution
-    /// mid-stream re-shapes the rectangle a host already laid out against, and a latched first value
-    /// would keep the overlay on the old one.
-    ///
-    /// No `dropFirst()` here either, and that is a property of this path rather than a style choice:
-    /// the software path builds a new host per load (one construction site, and `stopInternal` nils
-    /// it), so what a fresh mirror replays is that host's own nil and not the outgoing item's size.
-    /// The native hosts, which are the ones reused across a load, have no size to mirror.
-    func mirrorSoftwareDisplaySize(
-        from publisher: Published<CGSize?>.Publisher,
-        storeIn cancellables: inout Set<AnyCancellable>
-    ) {
-        publisher
-            .sink { [weak self] size in self?.softwareDisplaySize = size }
-            .store(in: &cancellables)
-    }
-
     /// `videoReadyForDisplay` is the host's raw layer level (#315); nil on the audio hosts, which
     /// have nothing to display. It is folded, never mirrored: the engine's published flag is latched
     /// for the load, so the seams that reuse a host and briefly lose the picture do not surface.

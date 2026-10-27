@@ -14,9 +14,9 @@ final class AudioTapReaderSelectionTests: XCTestCase {
         XCTAssertEqual(AudioTapReaderSelection.kind(backend: .native, hasLoopbackSession: false,
             nativeRemoteHLS: true, hasLoadedURL: false), .none)
     }
-    func testSoftwareBackend() {
+    func testNoneOnRetiredSoftwareBackend() {
         XCTAssertEqual(AudioTapReaderSelection.kind(backend: .software, hasLoopbackSession: false,
-            nativeRemoteHLS: false, hasLoadedURL: true), .software)
+            nativeRemoteHLS: false, hasLoadedURL: true), .none)
     }
     func testNoneWhenPlainNativeNoLoopback() {
         XCTAssertEqual(AudioTapReaderSelection.kind(backend: .native, hasLoopbackSession: false,

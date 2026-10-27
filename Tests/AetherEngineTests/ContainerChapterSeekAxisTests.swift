@@ -100,33 +100,6 @@ struct ContainerChapterSeekAxisTests {
         #expect(chapters[0].durationSeconds == 5)
     }
 
-    @Test("The software origin is the container start, with the software clock's 2 s tolerance")
-    func softwareOriginFollowsClockAnchor() {
-        #expect(PresentationAxis.containerChapterOrigin(
-            backend: .software, formatStartSeconds: 5, sourceStartOrigin: 5, isLive: false) == 5)
-        // A start inside the tolerance is anchored at zero by the software clock (SWClockAnchorPolicy).
-        #expect(PresentationAxis.containerChapterOrigin(
-            backend: .software, formatStartSeconds: 1.5, sourceStartOrigin: 1.5, isLive: false) == 0)
-    }
-
-    @Test("The software origin follows the host's origin (stream start fallback), not the format start")
-    func softwareOriginUsesHostOrigin() {
-        // The container states no start (format start reads as 0) but the video stream starts at 600 s.
-        #expect(PresentationAxis.containerChapterOrigin(
-            backend: .software, formatStartSeconds: 0, sourceStartOrigin: 600, isLive: false) == 600)
-    }
-
-    @Test("Once the clock has anchored, its own session zero is the origin")
-    func softwareOriginPrefersAnchoredZero() {
-        // A cold start anchors on the first sample, which can differ from the predicted origin.
-        #expect(PresentationAxis.containerChapterOrigin(
-            backend: .software, formatStartSeconds: 0, sourceStartOrigin: 0, softwareClockZero: 600.04,
-            isLive: false) == 600.04)
-        #expect(PresentationAxis.containerChapterOrigin(
-            backend: .software, formatStartSeconds: 5, sourceStartOrigin: 5, softwareClockZero: 0,
-            isLive: false) == 0)
-    }
-
     @Test("The native origin is the container start")
     func nativeOrigin() {
         #expect(PresentationAxis.containerChapterOrigin(
@@ -229,20 +202,6 @@ struct ContainerChapterSeekMediaTests {
         let ready = try await waitUntil(timeout: .seconds(20)) { engine.isSessionReady }
         #expect(ready, "software=\(software) session ready")
         return engine
-    }
-
-    /// Seeks to every chapter and reads `sourceTime` once, shortly after the seek returns. The window
-    /// is tight on purpose: a clock that runs forward would pass a wide one from an early landing, or
-    /// from a seek that did nothing.
-    private func checkLandings(_ engine: AetherEngine, _ chapters: [ChapterInfo], _ sourceTimes: [Double],
-                               phase: String) async throws {
-        for (chapter, source) in zip(chapters, sourceTimes) {
-            await engine.seek(to: chapter.startSeconds)
-            try await Task.sleep(for: .milliseconds(350))
-            let landed = engine.sourceTime
-            #expect(landed >= source - 0.1 && landed < source + 0.6,
-                    "\(phase): chapter \(chapter.id) @ \(chapter.startSeconds) sourceTime \(landed), want [\(source - 0.1), \(source + 0.6))")
-        }
     }
 
     private func checkEveryChapterLands(url: URL, software: Bool, expectedStarts: [Double],

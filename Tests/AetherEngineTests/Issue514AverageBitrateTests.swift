@@ -199,12 +199,10 @@ struct Issue514AverageBitrateTests {
     @Test("native folds AVPlayer's clock back with the producer's shift; routes without a pump read nil")
     func ledgerPlayheadPerBackend() {
         #expect(LiveTelemetrySampler.ledgerPlayhead(
-            backend: .native, nativeClock: 12, playlistShift: 3_600, softwareSourceClock: nil) == 3_612)
+            backend: .native, nativeClock: 12, playlistShift: 3_600) == 3_612)
         #expect(LiveTelemetrySampler.ledgerPlayhead(
-            backend: .native, nativeClock: nil, playlistShift: 3_600, softwareSourceClock: nil) == nil)
+            backend: .native, nativeClock: nil, playlistShift: 3_600) == nil)
         #expect(LiveTelemetrySampler.ledgerPlayhead(
-            backend: .software, nativeClock: 12, playlistShift: 3_600, softwareSourceClock: 90) == 90)
-        #expect(LiveTelemetrySampler.ledgerPlayhead(
-            backend: .audio, nativeClock: 12, playlistShift: 0, softwareSourceClock: 12) == nil)
+            backend: .audio, nativeClock: 12, playlistShift: 0) == nil)
     }
 }

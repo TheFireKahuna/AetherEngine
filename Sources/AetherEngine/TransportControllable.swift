@@ -13,7 +13,6 @@ protocol TransportControllable: AnyObject {
     var volume: Float { get set }
 }
 
-extension SoftwarePlaybackHost: TransportControllable {}
 extension AudioPlaybackHost: TransportControllable {}
 extension AudioAVPlayerHost: TransportControllable {}
 extension NativeAVPlayerHost: TransportControllable {}

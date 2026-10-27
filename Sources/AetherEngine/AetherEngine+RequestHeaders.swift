@@ -43,6 +43,7 @@ extension AetherEngine {
             return .noActiveSession
         }
         // Disc and DASH readers take their headers at open; the session's demuxer knows which it opened.
+        let sourceDemuxer = nativeVideoSession?.demuxer
         let readersFixedAtOpen = Demuxer.isDiscImageURL(url, headers: loadedOptions.httpHeaders)
             || sourceDemuxer?.isDiscSource == true || sourceDemuxer?.isDASHSource == true
         setLoadedHTTPHeaders(headers)

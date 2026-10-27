@@ -81,7 +81,6 @@ When a restart does run, it must reproduce segments on the SAME media timeline t
 
 The video track's output time base is normally the source's, which movenc scales up to at least 10000 (Matroska's 1/1000 becomes 1/16000). That keeps whatever quantization the container has, and on a constant-rate track it is not harmless: 23.976 fps on 1 ms ticks reaches AVPlayer as 41 and 42 ms steps, and at a 59.94 Hz output every second frame sits exactly on a refresh boundary, where half a millisecond of rounding decides which vsync shows it (AE#886). `CFRFrameGrid` therefore gives a VOD track whose source tick is 0.1 ms or coarser, and whose rate probes as exactly a standard rate that the tick cannot hold, a time base with one frame in whole ticks (1/24000 and 1001 ticks for 23.976, 1/24000 and 1000 for 24), anchored at the stream's start time. `HLSSegmentProducer` puts each packet whose source-axis PTS lies within one source tick of a slot onto that slot (DTS onto its own slot, never past the PTS), and rescales everything else as before. The grid is derived from stream fields only, never from observed packets, so every producer of a session writes the same `init.mp4` timescale and a restarted segment still matches its continuous twin.
 
-The software host attempts a hardware-only VideoToolbox session for VP9 profile 0 (8-bit 4:2:0)
 ### Software decode on the overlay (AV1 + VP9 + VP8 + legacy formats)
 
 Codecs AVPlayer's HLS-fMP4 pipeline does not accept are decoded by the engine and drawn as an overlay over
@@ -99,7 +98,6 @@ and `SoftwareOverlayRenderer` presents them on an `AVSampleBufferDisplayLayer` a
 timed against the AVPlayer item's clock.
 
 ```
-Source URL ──► Demuxer ──┬─► SoftwareVideoDecoder (dav1d) ──► SampleBufferRenderer
 Source URL ──► Demuxer ──► HLSSegmentProducer ──┬─► placeholder video + audio ──► AVPlayer
                                                  │                                   │ clock
                                                  └─► OverlayDecodeTap ──► SoftwareOverlayRenderer
@@ -107,8 +105,6 @@ Source URL ──► Demuxer ──► HLSSegmentProducer ──┬─► placeh
                                                                      AVSampleBufferDisplayLayer
 ```
 
-A seek holds the last frame on screen rather than blanking it. `SampleBufferRenderer.flush()` takes a `removingDisplayedImage` flag and hands it straight to `AVSampleBufferVideoRenderer.flush(removingDisplayedImage:)`: stop/teardown clears the visible frame (the default), but `SoftwarePlaybackHost.seek()` passes `false`, so the previous frame stays up until the post-seek keyframe decodes instead of flashing black on slow sources like MPEG-2. This matches the native/AVPlayer path, which holds the frame through a seek (#90).
-**Background audio (iOS).** When the app backgrounds while playing, the engine keeps audio going rather than tearing the pipeline down. The decision is a pure, unit-tested policy, `backgroundAction(isAudioBackend:hasSoftwareHost:softwareHostHasAudio:keepVideoAlive:pipActive:state:)`, driven from the `UIApplication` lifecycle observers; `keepVideoAlive` comes from `shouldKeepVideoAlive(enabled:pipActive:state:)` and is gated to iOS (tvOS always tears down, wedge-safe: a frozen decode session crossing a multi-hour suspension wedged `mediaserverd`). On the native path "keep audio alive" is just declining to tear down: `AVPlayer` under the `.playback` session keeps decoding. The software path has no `AVPlayer`, and its combined demux loop normally paces the whole loop (audio and video) on the video renderer's `isReadyForMoreMediaData`; once `AVSampleBufferDisplayLayer` stops draining in the background that gate never reopens and audio would starve. So the host enters `backgroundAudioOnly`: the loop drops video packets and paces on the audio renderer (`AudioOutput.isReadyForMoreMediaData`) instead, keeping `AVSampleBufferAudioRenderer` fed and the synchronizer advancing. On foreground return the flag clears, the video decoder and renderer flush, and video resyncs at the next keyframe with audio uninterrupted. A software host that renders no audio of its own never enters this mode (AE#739): the loop would have nothing to pace on and would drop the rest of the file within moments, parking the clock at end of media in the background, so such a session is released like a paused one and reloaded on return. The VideoToolbox session is rebuilt on every foreground return, because an iOS screen lock invalidates it and in audio-only mode nothing decodes video to notice. A loss observed while video is wanted (`kVTInvalidSessionErr` from a decode) is reported by `HardwareVideoDecoder.onSessionLost`; the host rebuilds the session and repositions to the playhead so the picture returns on the frame the audio is at, and owes the recovery to the next foreground return when it happens in the background or VT refuses the rebuild. Scope is the combined VOD loop (and live-without-DVR, which shares it); the DVR feeder loop is unchanged. Exercise it headless with `aetherctl bgaudio` (see [cli.md](cli.md)).
 ### Audio-only pipeline (music, podcasts, audiobooks)
 
 When the host sets `LoadOptions.audioOnly`, the engine skips the video machinery entirely: no HLS loopback server, no segment producer, no display layer. Decode is native-first. Codecs on the `avPlayerCanDecodeAudio` whitelist hand the source URL straight to a bare `AVPlayer` (`AudioAVPlayerHost`); everything else demuxes through libavformat and decodes through libavcodec into an `AVSampleBufferAudioRenderer` (`AudioPlaybackHost`). Transport (`play` / `pause` / `seek`) routes to the active host, and `stopInternal` tears it down for a clean handoff back to the video path on the next load.
@@ -233,7 +229,6 @@ DVR viewer to the live edge. In-place item replacement preserves the repair budg
 rearms after sustained healthy presentation. Encoded long-GOP H.264/AAC replay tests decode both
 admitted software packets and remuxed fragments and compare every picture with the original.
 
-(`SoftwarePacketMemoryFIFO`, bounds in `SoftwarePlaybackHost.memoryPacketStoreBudget`):
 ## SwiftUI `Menu` in custom player chrome
 
 On tvOS 26, the focused row of an open SwiftUI `Menu` blinks whenever any SwiftUI render transaction runs in the hosting tree, even one fully contained in an unrelated leaf view (a `TimelineView(.periodic)` wall clock, a playbar observing `engine.clock`, a subtitle overlay). Minimal repro: a `Menu` next to a `TimelineView(.periodic(from: .now, by: 1))`, open the menu, the focused item blinks once per second. This is a SwiftUI issue, not an engine one; reported to Apple by an AetherEngine adopter (see [AetherEngine#29](https://github.com/superuser404notfound/AetherEngine/issues/29)).
@@ -313,7 +308,6 @@ Sources/AetherEngine/
 ├── PresentationAxis.swift                   Display-axis fold for disc titles (source PTS <-> 0-based published axis, AE#105)
 ├── PresentationAxisMap.swift                Source axis <-> item axis (#260): the seam history of producer shifts as a piecewise-constant map, plus its off-main mirror. Written by the shift-changed / rebased handlers, read by the clock fold, the live thumbnail path and hosts
 ├── NativeVideoFrameTime.swift               Per-muxed-frame presentation times on both axes (#260): the value type + observer typealias; emitted from HLSSegmentProducer.finalizeAndWriteVideo
-├── SoftwareVideoFrameTime.swift             Per-enqueued-frame presentation time on the software path (#311): one axis (source == presentation there), plus a flush generation that a seek moves; emitted from SampleBufferRenderer.flushFrame
 ├── AetherEngine+FrameTimes.swift            Public installers for both per-frame time observers (native re-armed on each session, software on each host) plus `softwarePresentationTimebase`, the render synchronizer's clock
 ├── FrameTimeSequence.swift                  Process-wide monotonic allocator behind NativeVideoFrameTime.epoch and SoftwareVideoFrameTime.generation (#314), so the ordering rule holds across a load() and not only inside one session
 ├── PlayerState.swift                        PlaybackState, PlaybackPhase, VideoFormat, PlaybackBackend, LoadOptions, SourceProbe, TrackInfo, FontAttachment, MediaMetadata, SubtitleCue, SubtitleImage
@@ -325,7 +319,6 @@ Sources/AetherEngine/
 ├── AetherEngine+SubtitleOCR.swift           Arming, per-ordinal cursors and the MainActor tick of the bitmap-subtitle OCR worker that fills a text rendition for PiP / AirPlay / external display while a PGS / DVB / DVD track's rendition is selected natively (PiP / AirPlay / external display)
 ├── AetherEngine+TeletextPage.swift          The teletext caption page as a live setting: `setTeletextPage(_:)` rebuilds the drain decoder of every channel currently showing a teletext track and leaves the others alone, so a page libzvbi does not flag as a subtitle page is correctable without leaving the channel (#364)
 ├── AetherEngine+ScrubThumbnail.swift        Cache-backed scrub still for the active native session: decodes from already-produced SegmentCache bytes, so single-connection sources (debrid / torrent links) that refuse the FrameExtractor's second demuxer still get previews (#106)
-├── AetherEngine+SoftwareNowPlaying.swift    Builds the software host's Now-Playing publisher when the app set `ownsSoftwareNowPlaying` (primary role only) and publishes `softwareNowPlayingActive`
 ├── SeekEvent.swift                          One statement about a seek's lifecycle (outcome plus the target it belonged to): `isSeeking` / `seekTarget` are a level signal, and a level cannot say why it fell (#38 follow-up)
 ├── StartupProgress.swift                    The nine-checkpoint startup ladder behind `$startupProgress` (#361): each value is recorded by the code that finishes the work it names, never by a timer, so a determinate loading bar holds through a slow stretch and jumps through a skipped one. A path that skips work is credited by the checkpoint it does reach, which is why the ladder is one ordered axis rather than a per-path set
 ├── SubtitleSessionCarryover.swift           Subtitle session state carried across an engine-initiated `reloadAtCurrentPosition` (AirPlay LAN swap, background-return reopen), which otherwise rebuilds the session from `LoadOptions` alone (#170)
@@ -339,12 +332,7 @@ Sources/AetherEngine/
 │   ├── AudioOutput.swift                    SW path: AVSampleBufferAudioRenderer + Synchronizer (master clock)
 │   ├── AudioPlaybackHost.swift              Audio-only path: FFmpeg demux + decode into AVSampleBufferAudioRenderer for codecs off the whitelist
 │   ├── AudioTailPadding.swift               Native path: silence in the delivered codec from where a title's audio ends to where its video does, written into the final segment at end of file, because AVPlayer ends an item when its audio runs out (AE#847)
-│   ├── SoftwareAtmosRoute.swift             SW path: the pure choice of how a track's audio reaches the renderer (PCM decode, compressed E-AC-3 JOC, or TrueHD Atmos / DTS:X as APAC) from codec, stream shape, live and `objectAudioRendering`
-│   ├── SoftwareAudioProducing.swift         SW path: what the host asks of whatever turns an audio packet into renderer input; implemented by `AudioDecoder`, `SoftwareEAC3Passthrough` and `SoftwareAPACProducer`
-│   ├── SoftwareEAC3Passthrough.swift        SW path: E-AC-3 JOC packets enqueued compressed to the audio renderer, with the `dec3` format description built from the stream, so the system's Atmos decoder gets the objects
-│   ├── AtmosDecoderPrimer.swift             Registers the system's Atmos decoders in the process once (creates an AVPlayer), which the renderer needs before it decodes compressed E-AC-3 as Atmos
 │   ├── Spatial/
-│   │   └── SoftwareAPACProducer.swift       SW path: TrueHD Atmos / DTS:X rendered into a speaker bed through `SpatialAudioBridge` and encoded as APAC, the packets handed to the audio renderer as sample buffers
 │   └── Tap/
 │       ├── AudioTapController.swift         Lifecycle owner for one tap: owns the AsyncStream continuation + (native path) the LoopbackAudioReader; one per engine, re-install replaces it (#95)
 │       ├── AudioTapDecoder.swift            FFmpeg decode of tap packets into mono Float32 48 kHz AVAudioPCMBuffers (lazy resampler, own lock discipline)
@@ -361,7 +349,6 @@ Sources/AetherEngine/
 │   ├── A53SEIParser.swift                   A53/GA94 cc_data extraction from H.264/HEVC SEI NALs (#131)
 │   ├── DualLayerPictureAlignment.swift      SW FEL path (`DualLayerDolbyVision` trait): pairs each EL picture with the base picture of the same display slot (POC), falling back to access-unit pairing (#702)
 │   ├── FrameSideDataRing.swift              SW FEL path (`DualLayerDolbyVision` trait): fixed ring of per-frame RPU parameters and display metadata keyed by timestamp (#702)
-│   ├── OrderedDelivery.swift                SW FEL path (`DualLayerDolbyVision` trait): hands composed frames from the Metal completion queue to the renderer in decode order, with an epoch for seeks and a stall guard (#702)
 │   ├── OrderedDelivery.swift                Both SW decoders: hands frames from the GPU's completion queue to the host in decode order (by ticket), drops old epochs after a seek, skips a failed frame's ticket, with a stall guard (#702)
 │   ├── CCDataParser.swift                   Parses the bare cc_data triplet stream from a demuxable CEA-608 caption track (#77)
 │   ├── CEA608Decoder.swift                  In-house CEA-608 line-21 decoder (field-1 / CC1), validated against FFmpeg ccaption_dec.c (#77)
@@ -457,8 +444,6 @@ Sources/AetherEngine/
 │   ├── OverlaySubtitles.swift               The session's cues drawn into the overlay's pictures while Picture in Picture shows its layer: the cue set rasterised once and turned into the picture's coding on the GPU, each picture blended into a copy, handed back in order
 │   ├── SoftwarePathEscalation.swift         Native path: the last rung. A CoreMedia-domain failure (AVPlayer refusing the MEDIA, not the source) is offered to the engine's own decoder once per session instead of ending it, since every recovery above reloads the same bytes (AE#561)
 │   ├── RemoteHLSMediaSelection.swift        Remote-HLS bypass (#154): pure loopback→bypass reroute decision for non-live m3u8 sources (FFmpeg has no network) + legible AVMediaSelectionGroup → `subtitleTracks` mapping (synthetic ids from 200000)
-│   ├── SoftwarePlaybackHost.swift           SW path: demux loop + decoders + renderer + synchronizer orchestration
-│   ├── SoftwarePlaybackHost+AudioProducer.swift SW path: picks and builds the audio producer for the session's track, with every unavailable Atmos route landing on the PCM decode (logged)
 │   ├── AirPlayPlaylistDecision.swift        Pure decisions for the wireless-AirPlay loopback rewrite: which of master / media a receiver is handed, and whether a route change rebuilds the session or swaps its item (a sequential origin, a forward-only live source), kept separate and testable offline like `MasterFallbackDecision` (#86, #227, #526)
 │   ├── RemoteHLSFormatDetection.swift       Dynamic-range classification for the `nativeRemoteHLS` bypass, read back from AVPlayer's own track format instead of a second origin probe, which that path exists to avoid (#168)
 │   ├── RemoteHLSStreamDescription.swift     The rest of that read-back for stats panels: delivered dimensions, colour description and avcC/hvcC profile as a `VideoStreamFormat`, and the item's audio tracks as `TrackInfo` (codec, channels, rate, dec3 JOC)
@@ -470,13 +455,11 @@ Sources/AetherEngine/
 │   ├── RerouteVerdictMemory.swift           Bounded, expiring memory of master URLs whose carriage watchdog fired, so a retune after an ingest death relands on the working path instead of re-paying a full mount plus grace (#199)
 │   ├── SWClockAnchorPolicy.swift            Where the SW demux loop anchors the synchronizer clock on the first decoded sample: verbatim for files and resumes (intrinsic A/V lead-in survives), at the sample for a mid-stream-joined source (#107); a sample BEHIND the anchor is resume preroll and never moves it (AE#724)
 │   ├── SeekResumeIntent.swift               Whether a seek on a demuxer-driven host re-arms the clock at `lastRate` or parks it at 0, for the second seek issued inside the window its predecessor cleared (#292)
-│   ├── SoftwareNowPlaying.swift             Software-host Now-Playing: state-to-card mapping, remote-command routing and the publisher, behind small protocols for the two process-wide centers so tests run on fakes; undoes only its own changes at stop
 │   ├── SoftwarePiPSource.swift              What a host needs to build an `AVPictureInPictureController` around the software overlay: its layer, and the transport answers behind the sample-buffer delegate on the layer's timebase
 │   └── StartupReadinessGate.swift           Outcome of one startup-readiness attempt: the reloaded item reached a playable state, died, or ran out the settle window without doing either
 ├── Network/
 │   └── HLSLocalServer.swift                 Native path: local HTTP server (all interfaces for AirPlay, every path behind a per-session token, loopback URLs handed to the local player) serving playlist + segments. It writes the master, so the audio rendition's attributes are decided here: `EXT-X-MEDIA:TYPE=AUDIO` carries `LANGUAGE` (AE#458) and `CHANNELS`, the latter answered by the segment provider (`"16/JOC"` for a stream-copied E-AC-3 JOC track, the served bed count otherwise) and omitted entirely when the provider has no rendition to attribute. An untagged track has no rendition unless it is a stream-copied JOC one, which gets one without `LANGUAGE` for the sake of its `CHANNELS` (AE#726)
 ├── Renderer/
-│   ├── SampleBufferRenderer.swift           SW path: AVSampleBufferDisplayLayer + B-frame reorder, HDR10+ attachments; `flush(removingDisplayedImage:)` holds the last frame through a seek (#90); the decode thread reaches the layer only through its `sampleBufferRenderer`, taken once on the main actor (#351)
 │   └── SubtitleFrameCompositor.swift        Composites active cues into decoded software-path frames while PiP is active, since the system PiP window renders only the sample-buffer layer; playback wins, every failure path returns the original buffer untouched
 ├── Subtitles/
 │   ├── ASSScriptBuilder.swift               Reassembles raw ASS event cues + TrackInfo.assHeader into a complete script for whole-file renderers

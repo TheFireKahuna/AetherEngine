@@ -308,52 +308,6 @@ final class PresentedFrameProbe: @unchecked Sendable {
     }
 }
 
-/// #311: records the software path's per-frame reports, from the decode thread. Also checks the
-/// API's own claim while it is at it: these arrive past the reorder buffer, so `ooo` (a report whose
-/// presentation time precedes its predecessor within one generation) must stay 0 on real media.
-final class FrameTimeProbe: @unchecked Sendable {
-    private let lock = NSLock()
-    private var total = 0
-    private var sinceTick = 0
-    private var last: CMTime?
-    private var lastInGeneration: CMTime?
-    private var generation: UInt64 = 0
-    private var generations: Set<UInt64> = []
-    private var outOfOrder = 0
-
-    func record(_ frame: SoftwareVideoFrameTime) {
-        lock.lock()
-        defer { lock.unlock() }
-        total += 1
-        sinceTick += 1
-        generations.insert(frame.generation)
-        if frame.generation != generation {
-            generation = frame.generation
-            lastInGeneration = nil
-        }
-        if let previous = lastInGeneration, CMTimeCompare(frame.presentation, previous) < 0 {
-            outOfOrder += 1
-        }
-        lastInGeneration = frame.presentation
-        last = frame.presentation
-    }
-
-    /// Frames since the previous call, and the state at this instant.
-    func drainTick() -> (frames: Int, last: CMTime?, generation: UInt64, outOfOrder: Int) {
-        lock.lock()
-        defer { lock.unlock() }
-        let n = sinceTick
-        sinceTick = 0
-        return (n, last, generation, outOfOrder)
-    }
-
-    func summary() -> String {
-        lock.lock()
-        defer { lock.unlock() }
-        return "frames=\(total) outOfOrder=\(outOfOrder) generations=\(generations.sorted())"
-    }
-}
-
 /// Decoded-PCM continuity monitor fed by the engine audio tap (#95 infrastructure).
 /// Tracks per-buffer source-PTS abutment (gap = next.start - prev.end) and the running
 /// end-of-enqueued-audio position, so the telemetry loop can print the audio lead
@@ -1045,24 +999,6 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
                 line += " pic=none"
             }
         }
-        if let frameProbe {
-            let tick = frameProbe.drainTick()
-            line += " ft=\(tick.frames)"
-            if let last = tick.last { line += String(format: " ftLast=%.3fs", last.seconds) }
-            line += " ftGen=\(tick.generation) ooo=\(tick.outOfOrder)"
-            // The clock the frames are presented against, read through the public property. Its
-            // proximity to ftLast is the point: one axis, no conversion between them.
-            if let timebase = engine.softwarePresentationTimebase {
-                line += String(format: " tb=%.3fs", timebase.time.seconds)
-            }
-            // #353: the rectangle the frames land in. Read next to the coded dimensions on purpose:
-            // on anamorphic content the two differ, and that difference IS the defect being watched.
-            if let size = engine.softwareDisplaySize {
-                line += " disp=\(Int(size.width))x\(Int(size.height))"
-                observedDisplaySize = size
-                observedCodedSize = (engine.sourceVideoWidth, engine.sourceVideoHeight)
-            }
-        }
         print(line)
         // DVR-seek smoke: rewind 20 s mid-session, then live-edge return 15 s later, so the
         // telemetry shows whether the clock and the audio look-ahead recover from both.
@@ -1574,9 +1510,6 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
 }
 
 
-/// AVPlayer; the software paths run their own synchronizer, and its timebase is the only place their
-/// effective rate exists. Neither is a value the engine caches, which is what makes the drill's
-/// answer worth having.
 /// #436: reading the rate back off the transport: the AVPlayer serving the session. Not a value the
 /// engine caches, which is what makes the drill's answer worth having.
 enum Issue436RateHold {

@@ -37,7 +37,7 @@ public struct SoftwarePathEscalationEvent: Sendable, Equatable {
 /// item dies with `-19602`, the reload lands on the same segment, and the replacement item dies on
 /// it 62 ms later.
 ///
-/// `SoftwarePlaybackHost` decodes with libavcodec, which answers a sample Apple's parser rejects by
+/// The software overlay decodes with libavcodec, which answers a sample Apple's parser rejects by
 /// skipping one frame, and it reads the demuxer directly rather than the loopback HLS the native
 /// path is served over, so it also steps around a local-server wedge. One escalation per session,
 /// because a second one could only repeat the first.

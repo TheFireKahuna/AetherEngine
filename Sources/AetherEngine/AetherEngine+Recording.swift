@@ -38,7 +38,7 @@ public extension AetherEngine {
         guard isLive else { throw RecordingFailure.notLive }
 
         let route = videoRoute
-        guard route == .loopback || route == .software else {
+        guard route == .loopback else {
             throw RecordingFailure.unsupportedRoute(route)
         }
         guard let host = currentRecordingHost() else {
@@ -97,13 +97,7 @@ extension AetherEngine {
     /// `.remoteBypass` has neither, which is the whole reason `startRecording` refuses it: there is
     /// no engine-owned byte path to tap.
     func currentRecordingHost() -> LiveRecordingHost? {
-        if let producer = nativeVideoSession?.producer {
-            return producer
-        }
-        if let software = softwareHost {
-            return software
-        }
-        return nil
+        nativeVideoSession?.producer
     }
 
     /// Ends a running recording, if any, for a reason that is not a failure. Idempotent.

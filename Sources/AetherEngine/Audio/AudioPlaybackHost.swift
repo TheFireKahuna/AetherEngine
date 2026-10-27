@@ -43,7 +43,6 @@ final class AudioPlaybackHost {
     /// the pre-seek synchronizer position over the target this seek already committed to.
     private var seekInFlight = false
 
-    /// `SoftwarePlaybackHost.inFlightSeekResumeIntent`). A seek entering while another is suspended in
     /// Transport intent for the reposition currently in flight (#292). A seek entering while another is suspended in
     /// its off-main reposition (#254) must not read the `isPlaying` its predecessor cleared.
     private var inFlightSeekResumeIntent = false
@@ -110,7 +109,6 @@ final class AudioPlaybackHost {
     /// Audit DEC-102: the offset between the source's own timestamps and the published position, set once by
     /// the demux loop when it anchors the clock on a first sample that lies past the load anchor (an Ogg
     /// radio stream's granule position, an audio-only TS that joined mid-broadcast). 0 for a source that
-    /// starts where it was asked to. Same meaning and same policy as `SoftwarePlaybackHost.clockSessionZero`.
     /// starts where it was asked to.
     nonisolated(unsafe) private var _sessionZeroSeconds: Double = 0
     nonisolated private var sessionZeroSeconds: Double {
@@ -291,7 +289,6 @@ final class AudioPlaybackHost {
     }
 
     /// #254: the demuxer reposition is awaited off the main actor, for the reason
-    /// `SoftwarePlaybackHost.seek`, same shape, only without the video half.
     /// `Demuxer.seekBounded(to:anchorStreamIndex:timeout:on:isSuperseded:)` documents.
     @discardableResult
     func seek(to seconds: Double) async -> Demuxer.RepositionOutcome {
@@ -347,7 +344,6 @@ final class AudioPlaybackHost {
             isPlaying = true
         } else {
             // Paused seek: anchor at target rate 0 so play() resumes from the SEEK position not the stale
-            // pre-seek clock (mirrors SoftwarePlaybackHost's VOD path).
             // pre-seek clock.
             audioOutput?.seekClock(to: targetTime, rate: 0)
             pausedByHost = true

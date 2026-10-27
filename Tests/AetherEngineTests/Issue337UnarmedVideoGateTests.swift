@@ -54,21 +54,6 @@ struct Issue337UnarmedVideoGateTests {
             audioArmingStillPossible: true))
     }
 
-    @Test("a spent pre-arm budget makes the feeder's park terminal too")
-    func pumpBudgetSpent() {
-        let stillPossible = AudioLookaheadPolicy.decide(
-            clockArmed: false,
-            preArmPacketsFed: AudioLookaheadPolicy.preArmPacketBudget,
-            lastFedAudioPTS: .nan,
-            clockSeconds: 0) == .feed
-        #expect(!stillPossible)
-        #expect(SWClockAnchorPolicy.shouldArmFromParkedVideo(
-            clockArmed: false,
-            isPlaying: true,
-            rendererReadyForMoreData: false,
-            audioArmingStillPossible: stillPossible))
-    }
-
     @Test("the gate's video anchor keeps a zero-based load anchor, so the queued frames still present")
     func gateAnchorKeepsTheLoadAnchor() {
         // The packet held at the gate is the renderer queue's depth ahead of the frame on screen

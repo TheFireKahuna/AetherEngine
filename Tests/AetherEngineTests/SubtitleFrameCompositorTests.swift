@@ -29,21 +29,6 @@ struct SubtitleFrameCompositorTests {
         #expect(SubtitleFrameCompositor.activeCues(in: cues, at: 11, delaySeconds: .infinity).isEmpty)
     }
 
-    @MainActor
-    @Test("software subtitle preference survives PiP transitions and rejects invalid values")
-    func delayPreference() throws {
-        let engine = try AetherEngine()
-        engine.setSoftwareSubtitleDelay(1.5)
-        engine.pictureInPictureActive = true
-        engine.pictureInPictureActive = false
-        engine.setSoftwareSubtitleDelay(.nan)
-        #expect(engine.softwareSubtitleDelaySeconds == 1.5)
-        engine.setSoftwareSubtitleDelay(-0.5)
-        #expect(engine.softwareSubtitleDelaySeconds == -0.5)
-        engine.stop()
-        #expect(engine.softwareSubtitleDelaySeconds == -0.5)
-    }
-
     @Test("text layout scales with frame height and keeps a safe bottom margin")
     func textLayoutScales() {
         let layout = SubtitleFrameCompositor.textLayout(frameWidth: 1920, frameHeight: 1080)

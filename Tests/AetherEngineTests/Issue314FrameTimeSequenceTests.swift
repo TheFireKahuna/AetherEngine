@@ -31,23 +31,10 @@ private final class EpochCollector: @unchecked Sendable {
     }
 }
 
-private final class GenerationCollector: @unchecked Sendable {
-    private let lock = NSLock()
-    private var storage: [SoftwareVideoFrameTime] = []
-
-    var values: [SoftwareVideoFrameTime] {
-        lock.lock(); defer { lock.unlock() }; return storage
-    }
-
-    func append(_ value: SoftwareVideoFrameTime) {
-        lock.lock(); storage.append(value); lock.unlock()
-    }
-}
-
 /// AE#314: the frame-time discriminators are ordered process-wide, not per session.
 ///
 /// Both public frame-time types document the same rule: a higher value retires everything recorded
-/// under a lower one. A `load()` builds a new session and a new renderer, so per-instance counters made
+/// under a lower one. A `load()` builds a new session, so per-instance counters made
 /// that rule invert at exactly the seam it is needed at, and a host that ordered by it dropped the new
 /// item's frames for as long as the item played.
 ///
@@ -82,49 +69,6 @@ struct Issue314FrameTimeSequenceTests {
         let drawn = sink.values
         #expect(drawn.count == 4000)
         #expect(Set(drawn).count == 4000, "two callers were handed the same value")
-    }
-
-    // MARK: - Software path
-
-    /// The load seam, without media: a load builds a new `SampleBufferRenderer`, and the outgoing one
-    /// has usually flushed at least once (any seek during the previous item). A renderer counting from
-    /// zero therefore came up *below* the one it replaces, and a host applying the documented rule
-    /// discarded every frame of the new item.
-    @Test("a new renderer reports above the one it replaces")
-    @MainActor
-    func newRendererOutranksTheOutgoingOne() throws {
-        let outgoing = SampleBufferRenderer()
-        let outgoingFrames = GenerationCollector()
-        outgoing.setFrameEnqueuedObserver { outgoingFrames.append($0) }
-
-        outgoing.enqueue(pixelBuffer: Self.makePixelBuffer(),
-                         pts: CMTime(seconds: 5.0, preferredTimescale: 600))
-        outgoing.drainReorderBuffer()
-        outgoing.flush(removingDisplayedImage: false)   // a seek in the outgoing item
-        outgoing.enqueue(pixelBuffer: Self.makePixelBuffer(),
-                         pts: CMTime(seconds: 60.0, preferredTimescale: 600))
-        outgoing.drainReorderBuffer()
-        let outgoingGeneration = try #require(outgoingFrames.values.last?.generation)
-
-        let incoming = SampleBufferRenderer()           // the load
-        let incomingFrames = GenerationCollector()
-        incoming.setFrameEnqueuedObserver { incomingFrames.append($0) }
-        incoming.enqueue(pixelBuffer: Self.makePixelBuffer(),
-                         pts: CMTime(seconds: 0.0, preferredTimescale: 600))
-        incoming.drainReorderBuffer()
-        let incomingGeneration = try #require(incomingFrames.values.first?.generation)
-
-        #expect(incomingGeneration > outgoingGeneration,
-                "new item reported generation \(incomingGeneration), outgoing item was at \(outgoingGeneration)")
-
-        // And a frame the outgoing renderer still hands over ranks below the new item, so it is retired
-        // by the new item's first report rather than retiring it.
-        outgoing.enqueue(pixelBuffer: Self.makePixelBuffer(),
-                         pts: CMTime(seconds: 61.0, preferredTimescale: 600))
-        outgoing.drainReorderBuffer()
-        let straggler = try #require(outgoingFrames.values.last?.generation)
-        #expect(straggler < incomingGeneration,
-                "straggler reported \(straggler), which outranks the new item's \(incomingGeneration)")
     }
 
     // MARK: - Native path

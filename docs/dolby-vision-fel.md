@@ -334,10 +334,8 @@ the HDR10 base layer. A host that wants the base layer on a non-Dolby-Vision dis
 or sets it from what it knows of the display. This is the current
 behaviour, documented rather than designed; it is not changed here.
 
-The dual-layer route runs on the software host: there is no `AVPlayer` and no `AVPlayerItem`, and the
 ### 5.2.3 What the route keeps from the native route
 
-| Scrub thumbnails | With `serveIFramePlaylist`, an `EXT-X-I-FRAME-STREAM-INF` rendition next to the master, so a stock `AVPlayerViewController` draws its own thumbnails and scans on I-frames, plus `scrubThumbnail(atSeconds:)`. | No I-frame playlist, so a stock player shows no thumbnails of its own. `scrubThumbnail(atSeconds:)` answers from the software host's retained packet cache (`servesPacketCacheStills`) and only when that cache exists: a local file is read directly and has none, so there the call returns nil. The still is the base layer decoded by libavcodec, not the composed picture. |
 The composed overlay draws over a loopback `AVPlayer` session, so transport, Now Playing, audio, the
 item's media selection and the I-frame rendition stay the native route's. What differs is the picture:
 

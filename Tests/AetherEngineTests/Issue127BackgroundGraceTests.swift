@@ -55,10 +55,6 @@ struct Issue127BackgroundGraceTests {
             action: .doNothing, state: .paused,
             supportsGraceWindow: true, graceSeconds: 15
         ) == .perform(.doNothing))
-        #expect(AetherEngine.backgroundStep(
-            action: .enterSoftwareAudioOnly, state: .playing,
-            supportsGraceWindow: true, graceSeconds: 15
-        ) == .perform(.enterSoftwareAudioOnly))
     }
 
     // MARK: - shouldDeferHostSeek (pre-ready seek deferral)

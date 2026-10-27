@@ -16,7 +16,6 @@ struct AudioDeliveryDeriveTests {
             #expect(AudioDelivery.derive(backend: .none,
                                          nativeRemoteHLS: false,
                                          loopbackSession: stale,
-                                         softwareHost: stale,
                                          audioOnlyHost: stale) == AudioDelivery.none)
         }
     }
@@ -26,7 +25,6 @@ struct AudioDeliveryDeriveTests {
         #expect(AudioDelivery.derive(backend: .aether,
                                      nativeRemoteHLS: false,
                                      loopbackSession: .streamCopy,
-                                     softwareHost: nil,
                                      audioOnlyHost: nil) == AudioDelivery.none)
     }
 
@@ -36,7 +34,6 @@ struct AudioDeliveryDeriveTests {
             #expect(AudioDelivery.derive(backend: .native,
                                          nativeRemoteHLS: false,
                                          loopbackSession: outcome,
-                                         softwareHost: nil,
                                          audioOnlyHost: nil) == outcome)
         }
     }
@@ -49,7 +46,6 @@ struct AudioDeliveryDeriveTests {
         #expect(AudioDelivery.derive(backend: .native,
                                      nativeRemoteHLS: true,
                                      loopbackSession: nil,
-                                     softwareHost: nil,
                                      audioOnlyHost: nil) == .playerManaged)
     }
 
@@ -59,7 +55,6 @@ struct AudioDeliveryDeriveTests {
         #expect(AudioDelivery.derive(backend: .native,
                                      nativeRemoteHLS: true,
                                      loopbackSession: .droppedNoPipeline,
-                                     softwareHost: nil,
                                      audioOnlyHost: nil) == .playerManaged)
     }
 
@@ -68,28 +63,7 @@ struct AudioDeliveryDeriveTests {
         #expect(AudioDelivery.derive(backend: .native,
                                      nativeRemoteHLS: false,
                                      loopbackSession: nil,
-                                     softwareHost: nil,
                                      audioOnlyHost: nil) == AudioDelivery.none)
-    }
-
-    @Test("the software host's own outcome is what the host reads")
-    func softwarePassesItsOutcomeThrough() {
-        for outcome: AudioDelivery in [.decoded, .droppedNoPipeline, .noAudioInSource] {
-            #expect(AudioDelivery.derive(backend: .software,
-                                         nativeRemoteHLS: false,
-                                         loopbackSession: nil,
-                                         softwareHost: outcome,
-                                         audioOnlyHost: nil) == outcome)
-        }
-    }
-
-    @Test("the remote-HLS bit cannot reach the software path")
-    func softwareIgnoresTheRemoteBit() {
-        #expect(AudioDelivery.derive(backend: .software,
-                                     nativeRemoteHLS: true,
-                                     loopbackSession: nil,
-                                     softwareHost: .decoded,
-                                     audioOnlyHost: nil) == .decoded)
     }
 
     @Test("an audio-only session reports the host serving it")
@@ -97,12 +71,10 @@ struct AudioDeliveryDeriveTests {
         #expect(AudioDelivery.derive(backend: .audio,
                                      nativeRemoteHLS: false,
                                      loopbackSession: nil,
-                                     softwareHost: nil,
                                      audioOnlyHost: .playerManaged) == .playerManaged)
         #expect(AudioDelivery.derive(backend: .audio,
                                      nativeRemoteHLS: false,
                                      loopbackSession: nil,
-                                     softwareHost: nil,
                                      audioOnlyHost: .decoded) == .decoded)
     }
 
@@ -115,7 +87,6 @@ struct AudioDeliveryDeriveTests {
                 #expect(AudioDelivery.derive(backend: backend,
                                              nativeRemoteHLS: remote,
                                              loopbackSession: nil,
-                                             softwareHost: nil,
                                              audioOnlyHost: nil) != .droppedNoPipeline)
             }
         }
@@ -154,25 +125,10 @@ struct AudioDeliveryClassificationTests {
         #expect(HLSVideoEngine.videoOnlyAudioDelivery(hadSourceAudioStream: false) == .noAudioInSource)
     }
 
-    /// `AudioDecoder.open` failing leaves the software host at `audioStreamIndex = -1` and playing
-    /// video-only, exactly like the loopback tail and just as silently.
-    @Test("the software host separates an absent track from a decoder that would not open")
-    func softwareHostSeparatesAbsentFromDropped() {
-        #expect(SoftwarePlaybackHost.audioDelivery(resolvedAudioIndex: 1, decoderOpened: true,
-                                                   sourceCarriesAudio: true) == .decoded)
-        #expect(SoftwarePlaybackHost.audioDelivery(resolvedAudioIndex: 1, decoderOpened: false,
-                                                   sourceCarriesAudio: true) == .droppedNoPipeline)
-        #expect(SoftwarePlaybackHost.audioDelivery(resolvedAudioIndex: -1, decoderOpened: false,
-                                                   sourceCarriesAudio: false) == .noAudioInSource)
-        // AE#641: a stream the pick passed over (empty parameters) is still the source's audio.
-        #expect(SoftwarePlaybackHost.audioDelivery(resolvedAudioIndex: -1, decoderOpened: false,
-                                                   sourceCarriesAudio: true) == .droppedNoPipeline)
-    }
-
     /// The label is the second half of the same lie: it was built from the probe's track list, so a
-    /// software session that dropped its audio still published "libavcodec AC3 → CoreAudio". Asking
-    /// the host's own resolved index instead makes a dropped session say nothing, which is what a
-    /// host reading the pair `audioTracks` + `activeAudioDecoder` was told it could rely on.
+    /// session that dropped its audio still published "libavcodec AC3 → CoreAudio". Asking the host's
+    /// own resolved index instead makes a dropped session say nothing, which is what a host reading
+    /// the pair `audioTracks` + `activeAudioDecoder` was told it could rely on.
     @Test("the decoder label goes quiet when the host has no audio stream")
     func labelIsSilentWithoutAnOpenDecoder() {
         let tracks = [TrackInfo(id: 1, name: "English", codec: "ac3", language: "eng",
@@ -182,25 +138,6 @@ struct AudioDeliveryClassificationTests {
         #expect(AetherEngine.softwareAudioDecoderLabel(audioTracks: tracks, activeIndex: -1) == nil)
     }
 
-    /// On a device the Dolby Vision FEL route's details read "libavcodec TRUEHD → CoreAudio" and
-    /// "Decoded" while the log said the TrueHD Atmos track went to the renderer as APAC 7.1.4.
-    @Test("the software host's Atmos routes report what reaches the renderer")
-    func atmosRoutesReportTheirDelivery() {
-        #expect(SoftwarePlaybackHost.audioDelivery(resolvedAudioIndex: 1, decoderOpened: true,
-                                                   sourceCarriesAudio: true, route: .apac(.l714)) == .bridged)
-        #expect(SoftwarePlaybackHost.audioDelivery(resolvedAudioIndex: 1, decoderOpened: true,
-                                                   sourceCarriesAudio: true, route: .compressedEAC3JOC) == .streamCopy)
-        #expect(SoftwarePlaybackHost.audioDelivery(resolvedAudioIndex: 1, decoderOpened: false,
-                                                   sourceCarriesAudio: true, route: .apac(.l714)) == .droppedNoPipeline)
-        let trueHD = [TrackInfo(id: 1, name: "English", codec: "truehd", language: "eng", channels: 8, isDefault: true)]
-        let dts = [TrackInfo(id: 1, name: "English", codec: "dts", language: "eng", channels: 8, isDefault: true)]
-        #expect(AetherEngine.softwareAudioDecoderLabel(audioTracks: trueHD, activeIndex: 1, route: .apac(.l714))
-                == "TRUEHD Atmos → APAC 7.1.4")
-        #expect(AetherEngine.softwareAudioDecoderLabel(audioTracks: dts, activeIndex: 1, route: .apac(.l916))
-                == "DTS:X → APAC 9.1.6")
-        #expect(AetherEngine.softwareAudioDecoderLabel(audioTracks: trueHD, activeIndex: 1)
-                == "libavcodec TRUEHD → CoreAudio")
-    }
 }
 
 /// Engine-level wiring: the published fact is derived from `playbackBackend`, the session options and

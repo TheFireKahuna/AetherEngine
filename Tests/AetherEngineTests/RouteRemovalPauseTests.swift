@@ -10,9 +10,9 @@ import AVFoundation
 @MainActor
 struct RouteRemovalPauseTests {
 
-    private func engine(software: Bool = true, state: PlaybackState = .playing) throws -> AetherEngine {
+    private func engine(rendererHost: Bool = true, state: PlaybackState = .playing) throws -> AetherEngine {
         let engine = try AetherEngine()
-        if software { engine.softwareHost = SoftwarePlaybackHost(videoGravity: .resizeAspect) }
+        if rendererHost { engine.audioHost = AudioPlaybackHost() }
         engine.state = state
         return engine
     }
@@ -70,7 +70,7 @@ struct RouteRemovalPauseTests {
 
     @Test("the native path is left to AVPlayer")
     func nativeUntouched() throws {
-        let engine = try engine(software: false)
+        let engine = try engine(rendererHost: false)
         defer { engine.stop() }
         engine.noteOutputRouteRemoved()
         #expect(engine.state == .playing)

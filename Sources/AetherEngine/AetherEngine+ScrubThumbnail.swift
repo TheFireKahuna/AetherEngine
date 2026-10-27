@@ -157,8 +157,6 @@ extension AetherEngine {
     /// on a Dolby Vision Profile 5 / 10.0 session in a build without the `DualLayerDolbyVision`
     /// trait, where no frame can become a correct still; `scrubPreviewDrawsInView` covers that source.
     public var supportsCacheBackedStills: Bool {
-        guard let softwareHost else { return false }
-        return isLive || softwareHost.servesPacketCacheStills || softwareStillsFromLocalFile
         nativeVideoSession?.yieldsStills ?? false
     }
 }

@@ -47,6 +47,7 @@ final class APACEncodePipeline: @unchecked Sendable {
         /// plus k·1024, its priming packets included (the HLS route's convention, see `SpatialAudioBridge.wrap`).
         let pts: Int64
         /// k: where the packet sits in its encoder run. The first `leadingFrames` of a run's decoded audio are
+        /// the encoder's priming, so a consumer can state them (`SoftwareAPACProducer`).
         let indexInRun: Int64
     }
 

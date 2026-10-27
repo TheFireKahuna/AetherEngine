@@ -21,21 +21,9 @@ struct LiveRecordingTapTests {
             .appendingPathComponent("Sources/AetherEngine")
     }
 
-    @Test("both live routes conform to LiveRecordingHost")
-    func bothRoutesConform() {
+    @Test("the loopback producer conforms to LiveRecordingHost")
+    func producerConforms() {
         #expect((HLSSegmentProducer.self as Any) is LiveRecordingHost.Type)
-        #expect((SoftwarePlaybackHost.self as Any) is LiveRecordingHost.Type)
-    }
-
-    @Test("the software host taps at both of its packet read sites")
-    func softwareTapsBothReadSites() throws {
-        let path = Self.sourcesRoot.appendingPathComponent("Native/SoftwarePlaybackHost.swift")
-        let source = try String(contentsOf: path, encoding: .utf8)
-        // The two read loops are `nonisolated static` and reach the host through @Sendable
-        // closures, so the tap arrives as `recordingTap`, mirroring the existing subtitleTapSink.
-        let taps = source.components(separatedBy: "recordingTap(packet)").count - 1
-        #expect(taps == 2,
-                "expected the tap in both readerIteration and demuxIteration, found \(taps)")
     }
 
     @Test("the loopback tap sits on the merged read, not on the bare demuxer")

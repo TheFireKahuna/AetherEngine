@@ -6,21 +6,13 @@ extension AetherEngine {
     /// Frame from the live DVR window at `atSessionSeconds` (seekableLiveRange axis), decoded
     /// locally with no network.
     ///
-    /// Two sessions can answer, and both read a buffer the session already holds rather than opening
-    /// a second connection (a live source is forward-only, so a second demuxer could not seek it).
-    /// A native session decodes from its DVR segment cache after converting stable session time to
-    /// raw output. A software session has no such cache, so it decodes out of its own
-    /// packet ring (#544), which is the same buffer the scrubber seeks within. nil when neither is
-    /// live, when the time is outside the resident window, or when the decode fails.
+    /// Reads a buffer the session already holds rather than opening a second connection (a live source
+    /// is forward-only, so a second demuxer could not seek it): the native session's DVR segment cache,
+    /// after converting stable session time to raw output. nil when no native session is live, when
+    /// the time is outside the resident window, or when the decode fails.
     public func liveScrubThumbnail(atSessionSeconds seconds: Double, maxWidth: Int = 320) async -> CGImage? {
         guard isLive else { return nil }
-        guard let session = nativeVideoSession else {
-            guard let host = softwareHost else { return nil }
-            let gen = loadGeneration
-            let image = await host.liveScrubStill(atSessionSeconds: seconds, maxWidth: maxWidth)
-            // A zap between the request and the frame would hand the new channel the old one's picture.
-            return loadGeneration == gen ? image : nil
-        }
+        guard let session = nativeVideoSession else { return nil }
         guard session.yieldsStills else { return nil }
         // Segment table and tfdt use continuous output time, including across source PTS rebases.
         let outputSeconds = seconds - liveSessionShiftSeconds
@@ -541,16 +533,6 @@ extension AetherEngine {
         return true
     }
 
-    /// Bound the software packet spool without stopping its source, decoders or clock.
-    /// Requires LoadOptions.softwareDVRRetention. Expiry withdraws optional history
-    /// and falls back to the caller-selected playback cushion.
-    @discardableResult
-    public func setSoftwareLiveDVRLimits(_ limits: LiveDVRLimits, availableCapacityBytes: Int64?) -> Bool {
-        guard isLive, isSessionReady, videoRoute == .software, let host = softwareHost else { return false }
-        return host.setLiveDVRLimits(limits, availableBytes: availableCapacityBytes)
-    }
-    public var softwareLiveDVRBytes: Int64? { softwareHost?.liveDVRBytes.map(Int64.init) }
-
     /// Finite pinned playback payload that may exceed the optional retention allowance.
     /// Does not include muxer staging, init/subtitle data, AVPlayer buffers, or recording output.
     public var nativeLiveDVRMandatoryBytes: Int64? {
@@ -563,15 +545,9 @@ extension AetherEngine {
         guard var w = liveWindow else { return }
         if videoRoute == .loopback, let limits = nativeVideoSession?.nativeLiveDVRWindow {
             w.setWindowSeconds(limits.windowSeconds)
-        } else if videoRoute == .software {
-            // The software spool owns both actual retained history and capacity expiry.
-            // A route transition never transfers expanded native retention into it.
-            w.setWindowSeconds(softwareHost?.liveDVRWindowSeconds)
         }
-        // AE#813: only the software path holds back from a segmented frontier; a route change clears it.
-        w.noteEdgeHoldback(videoRoute == .software ? softwareHost?.liveHoldback.edgeHoldbackSeconds : nil)
-        // Resident media bounds the allowance on both playback routes.
-        var residentFloor = videoRoute == .software ? softwareHost?.liveDVRResidentFloor : residentLiveFloorSessionSeconds()
+        // Resident media bounds the allowance.
+        var residentFloor = residentLiveFloorSessionSeconds()
         // An empty/delayed AVPlayer seekableTimeRanges mirror yields only the item's zero
         // (plus its axis offset). It must not pin a ready native DVR window at that zero
         // while its real cache and played clock advance. Admit only already-played,
@@ -798,30 +774,6 @@ extension AetherEngine {
         let clockTarget = origin == .host && itemEnd > 0 && playedResidentEdge == nil
             ? Swift.min(mappedClockTarget, itemEnd) : mappedClockTarget
         return (sessionTarget, clockTarget)
-    }
-
-    /// Sodalite#104 round 3: where a software live seek lands, given where it was asked to land.
-    ///
-    /// The software path plays out of a ring the reader fills at the rate the source delivers, so a
-    /// landing AT the frontier has nothing ahead of it: the pump finds the ring dry, the clock parks,
-    /// and it resumes once `rebufferResumeLeadSeconds` of audio stands ahead of it. On a real-time
-    /// source that lead arrives exactly as slowly as it is deep, and the frontier moves on by the same
-    /// amount meanwhile, so the session resumes that far behind the frontier after a frozen picture
-    /// of the same length. Measured from a device on a tuner: `lead=0.13s` to `lead=2.05s` in 1.92 s
-    /// on every Return to Live, while a rewind into content the ring already held reached its first
-    /// frame in 223 to 258 ms.
-    ///
-    /// Landing the lead behind the frontier reaches the same place with the same cushion and spends
-    /// nothing on the way. A target the ring already holds that lead for is untouched.
-    ///
-    /// AE#813: a source that delivers whole segments needs more than that lead, because nothing
-    /// arrives until the next segment does, so it lands as far back as a join would place it
-    /// (`SoftwareLiveHoldback.landingHoldbackSeconds`).
-    nonisolated static func softwareLiveLanding(
-        requested: Double, window: LiveWindow,
-        holdbackSeconds: Double = AudioLookaheadPolicy.rebufferResumeLeadSeconds
-    ) -> Double {
-        window.clamp(Swift.min(requested, window.edgeTime - holdbackSeconds))
     }
 
     /// AE#454: how close the fresh item has to be to the place it was asked for before the correcting
