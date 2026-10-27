@@ -16,11 +16,14 @@ import CoreVideo
 /// `package` so the aetherctl probes read frames the same way without the helper becoming engine API.
 package enum ItemVideoOutput {
 
-    package enum Format: Equatable {
+    package enum Format: Sendable {
         /// IOSurface-backed, in whatever pixel format the decoder produces.
         case ioSurface
         /// One pixel format, converted to if the decoder produces another.
         case pixelFormat(OSType)
+        /// The attributes a consumer states itself (the software overlay's frame source: its pixel format, Metal and
+        /// IOSurface compatibility).
+        case attributes([String: any Sendable])
     }
 
     package static func make(_ format: Format) -> AVPlayerItemVideoOutput {
@@ -34,6 +37,8 @@ package enum ItemVideoOutput {
             ])
         case .pixelFormat(let type):
             return AVPlayerItemVideoOutput(pixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: type])
+        case .attributes(let attributes):
+            return AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
         }
     }
 
@@ -46,6 +51,8 @@ package enum ItemVideoOutput {
             return attributes
         case .pixelFormat(let type):
             return CVPixelBufferAttributes(pixelFormatTypes: [CVPixelFormatType(rawValue: type)])
+        case .attributes(let attributes):
+            return CVPixelBufferAttributes(rawAttributes: attributes)
         }
     }
 

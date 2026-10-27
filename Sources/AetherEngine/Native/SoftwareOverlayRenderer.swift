@@ -186,7 +186,7 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         self.source = source
         videoRenderer = layer.sampleBufferRenderer
         rendererIO = VideoRendererIO(renderer: videoRenderer)
-        output = AVPlayerItemVideoOutput(pixelBufferAttributes: source.outputAttributes)
+        output = ItemVideoOutput.make(.attributes(source.outputAttributes))
         // The overlay is the item's picture: AVPlayer keeps decoding into the output but stops rendering its
         // own, so one video pipeline presents.
         output.suppressesPlayerRendering = true
@@ -772,7 +772,7 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
     /// Logs, once, the format AVPlayer's decoder produces on its own (an output asking for nothing), beside the
     /// format the source asks for: when they differ, AVPlayer converts every frame to hand it over.
     private func logDecoderFormat(item: AVPlayerItem) {
-        let probe = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
+        let probe = ItemVideoOutput.make(.ioSurface)
         let requested = (source.outputAttributes[kCVPixelBufferPixelFormatTypeKey as String] as? OSType).map(Self.fourCC) ?? "any"
         item.add(probe)
         queue.asyncAfter(deadline: .now() + 2) { [weak item] in
