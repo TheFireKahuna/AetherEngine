@@ -1,4 +1,5 @@
 import AVFoundation
+import AetherEngine
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -60,9 +61,7 @@ final class PictureProbe: @unchecked Sendable {
     @MainActor
     func attachIfNeeded(_ item: AVPlayerItem?) {
         guard let item, item !== attachedItem else { return }
-        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-        ])
+        let output = ItemVideoOutput.make(.pixelFormat(kCVPixelFormatType_32BGRA))
         item.add(output)
         self.output = output
         self.attachedItem = item
@@ -76,8 +75,8 @@ final class PictureProbe: @unchecked Sendable {
         let hostTime = CACurrentMediaTime()
         let itemTime = output.itemTime(forHostTime: hostTime)
         guard itemTime.isNumeric else { return nil }
-        var display = CMTime.zero
-        guard let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &display),
+        let (image, display) = ItemVideoOutput.frame(of: output, at: itemTime)
+        guard let buffer = image,
               let frameIndex = Self.decodeFrameIndex(
                   from: buffer, blocks: blocks, pitch: blockPitch, center: blockCenter)
         else { return nil }

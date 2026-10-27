@@ -311,6 +311,9 @@ final class NativeAVPlayerHost {
     nonisolated(unsafe) private var loadStartTime = DispatchTime.now()
     private var notificationObservers: [NSObjectProtocol] = []
     private var itemDiagnostics: AVPlayerItemDiagnostics?
+    /// AVFoundation's own playback metrics for the current item (`AVPlayerItemMetricsLog`), typed `AnyObject`
+    /// because the type exists from tvOS 18.
+    private var itemMetrics: AnyObject?
     private var retiringDiagnostics: [ObjectIdentifier: AVPlayerItemDiagnostics] = [:]
     private var counterGeneration = 0
     private var reportedIncompleteRetirement = false
@@ -639,6 +642,7 @@ final class NativeAVPlayerHost {
         playerItem = item
         let diagnostics = AVPlayerItemDiagnostics(item: item, pool: diagnosticPool, read: diagnosticRead)
         itemDiagnostics = diagnostics
+        if #available(macOS 15, iOS 18, tvOS 18, *) { itemMetrics = AVPlayerItemMetricsLog(item: item, sid: sid) }
         diagnostics.onSnapshot = { [weak self, weak diagnostics] snapshot, request in
             guard let self, let diagnostics, self.sessionID == sid,
                   self.itemDiagnostics === diagnostics else { return }
@@ -1086,6 +1090,25 @@ final class NativeAVPlayerHost {
         return true
     }
 
+    /// #98: a master rejection is handed to the engine, which reloads the media playlist, instead of surfacing.
+    private func signalMasterRejection(_ error: NSError, desc: String, item: AVPlayerItem, withheld: Bool) {
+        let code = MasterFallbackDecision.rejectionCode(for: error, iFramePlaylistWithheld: withheld)
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sessionID) startup .failed is a master rejection "
+            + "(code=\(code)); signalling engine for media fallback instead of surfacing",
+            category: .engine)
+        pendingDisplayRejection = DisplayRejection(code: code, message: desc, domain: error.domain)
+    }
+
+    /// A startup failure that is not a master rejection.
+    private func failStartup(_ desc: String, item: AVPlayerItem) {
+        // AE#561: a startup failure on the media itself (a segment Apple's parser refuses) is
+        // not the end of the source, only of this consumer's opinion of it.
+        if offerToSoftwarePath(desc, item: item, position: renderedTime) { return }
+        failure = Self.itemFailureInfo(desc: desc, itemError: item.error,
+                                       relayRefusalCode: upstreamTrustRefusal?())
+    }
+
     private func handleItemFailed(_ desc: String, item: AVPlayerItem) {
         // Ignore a late `.failed` KVO from an item we have already replaced.
         guard playerItem === item else { return }
@@ -1124,25 +1147,35 @@ final class NativeAVPlayerHost {
                 remoteHLSOriginRefused = true
                 return
             }
-            if let error = item.error as NSError?, MasterFallbackDecision.isMasterRejection(error,
-                mediaErrorCodes: item.errorLog()?.events.map(\.errorStatusCode) ?? [],
-                iFramePlaylistWithheld: iFramePlaylistWithheld?() ?? false) {
-                let code = MasterFallbackDecision.rejectionCode(for: error,
-                    iFramePlaylistWithheld: iFramePlaylistWithheld?() ?? false)
-                EngineLog.emit(
-                    "[NativeAVPlayerHost] #\(sessionID) startup .failed is a master rejection "
-                    + "(code=\(code)); signalling engine for media fallback instead of surfacing",
-                    category: .engine)
-                pendingDisplayRejection = DisplayRejection(code: code,
-                                                           message: desc,
-                                                           domain: (item.error as NSError?)?.domain)
+            let withheld = iFramePlaylistWithheld?() ?? false
+            if let error = item.error as NSError?,
+               MasterFallbackDecision.isMasterRejection(error, iFramePlaylistWithheld: withheld) {
+                // The item's own error reads as a master rejection. The one thing that can still overrule
+                // it is a -12642 in the item's error log (a malformed media playlist wrapped in the same
+                // code). That log is read without blocking the main actor: tvOS 27's fetch, or the getter
+                // off it before 27 (the synchronous getter here was the main-actor stall item 9 names).
+                // A withheld I-frame playlist decides on the error alone and needs no log.
+                guard !(withheld && MasterFallbackDecision.isWithheldIFramePlaylistFailure(error)) else {
+                    signalMasterRejection(error, desc: desc, item: item, withheld: withheld)
+                    return
+                }
+                let sid = sessionID
+                Task { @MainActor [weak self] in
+                    let codes = await ItemLogs.errorStatusCodes(of: item)
+                    // Whatever happened while the log was read (a replaced item, a teardown, playback that
+                    // started after all) decides instead.
+                    guard let self, self.sessionID == sid, self.playerItem === item, !self.hasEverPlayed,
+                          self.failure == nil, self.pendingDisplayRejection == nil else { return }
+                    if MasterFallbackDecision.isMasterRejection(error, mediaErrorCodes: codes,
+                                                                iFramePlaylistWithheld: withheld) {
+                        self.signalMasterRejection(error, desc: desc, item: item, withheld: withheld)
+                    } else {
+                        self.failStartup(desc, item: item)
+                    }
+                }
                 return
             }
-            // AE#561: a startup failure on the media itself (a segment Apple's parser refuses) is
-            // not the end of the source, only of this consumer's opinion of it.
-            if offerToSoftwarePath(desc, item: item, position: renderedTime) { return }
-            failure = Self.itemFailureInfo(desc: desc, itemError: item.error,
-                                           relayRefusalCode: upstreamTrustRefusal?())
+            failStartup(desc, item: item)
             return
         }
 
@@ -1901,9 +1934,7 @@ final class NativeAVPlayerHost {
     /// nil when no frame arrives inside `timeout`, which the caller treats as "nothing to hold".
     func captureDisplayedFrame(timeout: Duration = .milliseconds(500)) async -> CVPixelBuffer? {
         guard let item = playerItem else { return nil }
-        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-            kCVPixelBufferIOSurfacePropertiesKey as String: [String: String]()
-        ])
+        let output = ItemVideoOutput.make(.ioSurface)
         item.add(output)
         defer { item.remove(output) }
         let clock = ContinuousClock()
@@ -1912,8 +1943,7 @@ final class NativeAVPlayerHost {
             // A playing item vends at the host clock, a paused one only at the time it holds.
             let itemTime = avPlayer.rate == 0 ? item.currentTime()
                 : output.itemTime(forHostTime: CACurrentMediaTime())
-            if itemTime.isNumeric,
-               let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) {
+            if itemTime.isNumeric, let buffer = ItemVideoOutput.frame(of: output, at: itemTime).pixelBuffer {
                 return buffer
             }
             try? await Task.sleep(for: .milliseconds(8))
@@ -2375,9 +2405,7 @@ final class NativeAVPlayerHost {
         }
         if diagnosticVideoOutput == nil {
             guard isVideoReadyForDisplay else { return true }
-            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-                kCVPixelBufferIOSurfacePropertiesKey as String: [String: String]()
-            ])
+            let output = ItemVideoOutput.make(.ioSurface)
             output.suppressesPlayerRendering = false
             item.add(output)
             diagnosticVideoOutput = output
@@ -2385,11 +2413,11 @@ final class NativeAVPlayerHost {
         }
         guard let output = diagnosticVideoOutput else { return true }
         let itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
-        var displayTime = CMTime.invalid
         var frame: Double?
-        if itemTime.isNumeric, output.hasNewPixelBuffer(forItemTime: itemTime),
-           output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &displayTime) != nil,
-           displayTime.isNumeric { frame = displayTime.seconds }
+        if itemTime.isNumeric, output.hasNewPixelBuffer(forItemTime: itemTime) {
+            let read = ItemVideoOutput.frame(of: output, at: itemTime)
+            if read.pixelBuffer != nil, read.displayTime.isNumeric { frame = read.displayTime.seconds }
+        }
         let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
         if let previous = videoFrameSampleAt, now - previous > 0.25 {
             EngineLog.emit("[NativeVideoFrames] event=observer_delay sid=\(session) age=\(String(format: "%.3f", now - previous)) kind=sampling_delay", category: .engine)
@@ -2460,6 +2488,7 @@ final class NativeAVPlayerHost {
             NotificationCenter.default.removeObserver(obs)
         }
         notificationObservers.removeAll()
+        itemMetrics = nil
         // Clear terminal flags: keepNativeHost reload reuses the host and @Published replays on subscribe; stale failure/didReachEnd corrupt the new session (issue #15).
         failure = nil
         // Audit Vcore-102: the same replay would hand the successor's sinks this item's refusal.

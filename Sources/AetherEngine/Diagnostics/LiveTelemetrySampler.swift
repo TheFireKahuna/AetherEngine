@@ -95,12 +95,10 @@ struct SoftwareReadings: Sendable {
 @MainActor
 final class LiveTelemetrySampler {
     typealias NativeRead = @Sendable (AVPlayer, AVPlayerItem) -> NativeAVFReadings
-    typealias SoftwareRead = @MainActor (AetherEngine) async -> SoftwareReadings
 
     private weak var engine: AetherEngine?
     private var task: Task<Void, Never>?
     private let nativeRead: NativeRead
-    private let softwareRead: SoftwareRead
 
     /// Dedicated + serial: the sync XPC reads may block for seconds, which must not tie up the
     /// shared cooperative pool, and serial means a stalled tick back-pressures the next one
@@ -110,12 +108,10 @@ final class LiveTelemetrySampler {
     private let readQueue = DispatchQueue(label: "engine.telemetry.avfread", qos: .utility)
 
     private var byteWindow = RollingWindow<Int64>(capacity: 10, zero: 0)   // 10-second rolling window
-    private var frameWindow = RollingWindow<Int>(capacity: 10, zero: 0)
     private var bridgeByteWindow = RollingWindow<Int64>(capacity: 10, zero: 0)
 
     private var lastDemuxerBytes: Int64 = 0
     private var lastBridgeBytes: Int64 = 0
-    private var lastFramesEnqueued: Int = 0
 
     /// AE#514: both bitrate fields, metered over what the playhead crossed. Readable so a test can pin
     /// that the tick feeds it, not only that the meter is right.
@@ -142,22 +138,18 @@ final class LiveTelemetrySampler {
     private static let eomParkFrozenEpsilonSeconds: Double = 0.05
 
     init(engine: AetherEngine,
-         nativeRead: @escaping NativeRead = LiveTelemetrySampler.batchReadNativeAVF,
          softwareRead: @escaping SoftwareRead = LiveTelemetrySampler.readSoftwareHost) {
         self.engine = engine
         self.nativeRead = nativeRead
-        self.softwareRead = softwareRead
     }
 
     func start() {
         stop()
         byteWindow.reset()
-        frameWindow.reset()
         bridgeByteWindow.reset()
         // Seed from CURRENT counters: a zero seed pushes all pre-start prefetch bytes into tick 1, inflating instant bitrate for ~10 s.
         lastDemuxerBytes = engine?.demuxerBytesFetched ?? 0
         lastBridgeBytes = engine?.audioBridgeOutputBytesLifetime ?? 0
-        lastFramesEnqueued = 0
         playedMeter = PlayedBitrateMeter()
         meterLedger = nil
         lastTickTime = nil
@@ -177,25 +169,6 @@ final class LiveTelemetrySampler {
     func stop() {
         task?.cancel()
         task = nil
-    }
-
-    /// #306 follow-up: the rate the link delivers at, measured over the seconds bytes actually arrived
-    /// in rather than over wall-clock seconds.
-    ///
-    /// The playback reader fetches a large range and then parks on backpressure until low water, so on
-    /// a fast link most ticks of a window carry nothing at all: measured over a local origin, a healthy
-    /// 2.8 Mbps VP9 session pulled 16.4 MB in one tick and then sat at exactly zero for the next 23,
-    /// while the reader's runway drained from 16.0 to 8.3 MB. A wall-clock mean reports 0.00 Mbps
-    /// through all of that, which is the false-with-confidence zero #306 was filed about, one field
-    /// over. Dividing by the active seconds instead reports the link, and under-reports it at worst,
-    /// since a burst that finishes inside a tick is still charged the whole second.
-    ///
-    /// nil when the window holds fewer than two samples (a single sample spans no time) or when nothing
-    /// arrived in it at all. That mirrors the native path, where `observedBitrate` is published only
-    /// when it is finite and positive: "not measurable right now" is a gap, never a zero.
-    static func observedTransferMbps(windowBytes: Int64, activeSeconds: Int, samples: Int) -> Double? {
-        guard samples >= 2, activeSeconds > 0, windowBytes > 0 else { return nil }
-        return Double(windowBytes) * 8.0 / Double(activeSeconds) / 1_000_000.0
     }
 
     /// Which cumulative counter the two bitrate fields are metered from.
@@ -239,8 +212,6 @@ final class LiveTelemetrySampler {
         case .native:
             guard let nativeClock, nativeClock.isFinite else { return nil }
             return nativeClock + playlistShift
-        case .software:
-            return softwareSourceClock
         case .aether, .none, .audio:
             return nil
         }
@@ -265,11 +236,6 @@ final class LiveTelemetrySampler {
         let transferMbps: Double? = byteWindow.count >= 2
             ? Double(byteWindow.sum) * 8.0 / Double(byteWindow.count) / 1_000_000.0
             : nil
-
-        let observedTransferMbps = Self.observedTransferMbps(
-            windowBytes: byteWindow.sum,
-            activeSeconds: byteWindow.activeCount,
-            samples: byteWindow.count)
 
         // Live audio-bridge output bitrate from the bridge's cumulative encoded-byte counter. 0 on the
         // stream-copy / AVPlayer-native / video-only paths (no bridge), which surfaces as nil.
@@ -428,7 +394,6 @@ final class LiveTelemetrySampler {
             }
         }
 
-        let softwareCache = engine.softwarePacketCacheSnapshot
         let snapshot = LiveTelemetry(
             instantBitrateMbps: instantBitrateMbps,
             averageBitrateMbps: averageBitrateMbps,
@@ -441,9 +406,6 @@ final class LiveTelemetrySampler {
             readerWindowAheadBytes: readerWindowAheadBytes,
             accumulatedFrameDelaySeconds: accumulatedFrameDelaySeconds,
             cachedBytes: engine.cachedBytes,
-            softwareCacheSeekHits: softwareCache?.cacheSeekHits,
-            softwareCacheSeekMisses: softwareCache?.cacheSeekMisses,
-            softwareCacheSourceEpoch: softwareCache?.sourceEpoch,
             networkThroughputMbps: networkThroughputMbps,
             networkTransferredBytes: networkTransferredBytes,
             avSyncGapMs: avSyncGapMs,
@@ -583,12 +545,13 @@ final class LiveTelemetrySampler {
         return current + retired
     }
 
-    /// The real batch, run on `readQueue`: one accessLog() shared by the snapshot fields and the
+    /// The real batch, run on `readQueue`: one access log shared by the snapshot fields and the
     /// LagDiag lifetime drop sum, one currentTime() shared by the forward-buffer math and the
     /// LagDiag clock (previously two of each per tick, all on the main actor).
     private nonisolated static func batchReadNativeAVF(player: AVPlayer, item: AVPlayerItem) -> NativeAVFReadings {
         var readings = NativeAVFReadings()
-        let events = item.accessLog()?.events
+        // The fetch on 27 (bounded, so a stranded media server costs this tick, not the queue), the getter before.
+        let events = ItemLogs.access(of: item)?.events
         // The rate is a `.last` read on purpose: it describes the link right now.
         if let event = events?.last {
             let observed = event.observedBitrate

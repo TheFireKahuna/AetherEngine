@@ -180,8 +180,7 @@ private func networkTelemetryFragment(_ telemetry: LiveTelemetry?) -> String {
 
 /// AE#510: what reached the screen on the NATIVE path, which had no frame observable at all.
 ///
-/// `--frame-times` reads the software renderer's own reports, so every judder report on the AVPlayer
-/// route could only be argued about from `AVPlayerItemTrack.currentVideoFrameRate`, an estimate that
+/// Every judder report on the AVPlayer route could only be argued about from `AVPlayerItemTrack.currentVideoFrameRate`, an estimate that
 /// is explicitly not a frame count. This attaches an `AVPlayerItemVideoOutput` to the engine's own
 /// item and counts DISTINCT presentation times, and it reports the largest gap between two of them,
 /// which is the observable that separates "the picture is late" from "only the random access points
@@ -212,9 +211,7 @@ final class PresentedFrameProbe: @unchecked Sendable {
         let already = attachedID == id
         lock.unlock()
         guard !already else { return }
-        let fresh = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        ])
+        let fresh = ItemVideoOutput.make(.pixelFormat(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange))
         if let output, let attachedItem { attachedItem.remove(output) }
         item.add(fresh)
         lock.lock()
@@ -245,9 +242,8 @@ final class PresentedFrameProbe: @unchecked Sendable {
         guard let current else { return }
         let itemTime = current.itemTime(forHostTime: CACurrentMediaTime())
         guard itemTime.isValid, current.hasNewPixelBuffer(forItemTime: itemTime) else { return }
-        var display = CMTime.zero
-        guard current.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &display) != nil,
-              display.isValid else { return }
+        let (image, display) = ItemVideoOutput.frame(of: current, at: itemTime)
+        guard image != nil, display.isValid else { return }
         let seconds = display.seconds
         lock.lock()
         defer { lock.unlock() }
@@ -465,7 +461,7 @@ private func seekIntentDrill(
 }
 
 @MainActor
-private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware: Bool = false, softwareEscalation: Bool = true, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, liveCushion: Double? = nil, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, servedURL: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0, nativeVideoFrameDiagnostics: Bool = false, nativeVideoFrameRecovery: Bool = false, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [], pausedMount: Bool = false, optionCorrection: LoadOptionCorrectionRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, progressiveSegments: Bool = false, objectAudioRendering: ObjectAudioRendering = .off, preferDualLayerDolbyVision: Bool = false, attachSurface: Bool = false, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:], deinterlaceFieldRate: DeinterlaceFieldRate = .field, assertDolbyVision: Bool = false, preserveASSMarkup: Bool = false, dolbyVisionHandling: DolbyVisionHandling = .automatic, record: URL? = nil) async -> Int32 {
+private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware: Bool = false, softwareEscalation: Bool = true, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, liveCushion: Double? = nil, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, presentTimes: Bool = false, servedURL: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0, nativeVideoFrameDiagnostics: Bool = false, nativeVideoFrameRecovery: Bool = false, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [], pausedMount: Bool = false, optionCorrection: LoadOptionCorrectionRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, objectAudioRendering: ObjectAudioRendering = .off, preferDualLayerDolbyVision: Bool = false, attachSurface: Bool = false, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:], deinterlaceFieldRate: DeinterlaceFieldRate = .field, assertDolbyVision: Bool = false, preserveASSMarkup: Bool = false, dolbyVisionHandling: DolbyVisionHandling = .automatic, record: URL? = nil) async -> Int32 {
     let engine: AetherEngine
     do {
         engine = try AetherEngine()
@@ -619,17 +615,9 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
                      Date().timeIntervalSince(stateTraceStart)))
     } : nil
     defer { stateTrace?.cancel() }
-    // #311: installed BEFORE the load on purpose. The engine holds it and arms the host it builds,
-    // which is the documented usage and the part a host would otherwise have to re-do per load.
-    let frameProbe = frameTimes ? FrameTimeProbe() : nil
     let presentProbe = presentTimes ? PresentedFrameProbe() : nil
     var servedURLItem: ObjectIdentifier?
     let picture = pictureProbe ? PictureProbe(sourceOrigin: pictureOrigin) : nil
-    if let frameProbe {
-        engine.setSoftwareVideoFrameTimeObserver { [weak frameProbe] frame in
-            frameProbe?.record(frame)
-        }
-    }
 
     #if canImport(AppKit)
     var surfaceWindow: NSWindow?
@@ -912,13 +900,6 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     // the label names the pipeline, the delivery says whether there is one at all.
     print("audio delivery=\(engine.audioDelivery.rawValue) "
           + "pipeline=\(engine.activeAudioDecoder ?? "none") tracks=\(engine.audioTracks.count)")
-    if frameTimes {
-        if let timebase = engine.softwarePresentationTimebase {
-            print(String(format: "  timebase: present, time=%.3fs rate=%.2f", timebase.time.seconds, timebase.rate))
-        } else {
-            print("  timebase: nil (not the software path)")
-        }
-    }
     for track in engine.audioTracks {
         print("  audio    id=\(track.id) codec=\(track.codec) lang=\(track.language ?? "?") ch=\(track.channels)\(track.isDefault ? " default" : "")")
     }
@@ -945,8 +926,6 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
 
     // #353: sampled during the session, because the engine clears the size with the session and the
     // summary below prints after teardown. Paired with the coded dimensions read at the same moment.
-    var observedDisplaySize: CGSize?
-    var observedCodedSize: (Int32, Int32) = (0, 0)
 
     // #433: `seekfar` (optionally `seekfar@N`) picks the second the far seek is issued in, so a run can
     // put the restart on top of a reader that is deep enough into its ladder to still be parked.
@@ -1438,17 +1417,6 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         print(String(format: "presented frames: total=%d perSecond min/median/max=%d/%d/%d largestGap=%.3fs at %.3fs",
                      p.total, p.min, p.median, p.max, p.largestGap, p.gapAt))
     }
-    if let frameProbe {
-        print("frame times: \(frameProbe.summary())")
-        // #353: coded next to settled. Equal on square-pixel sources, and on anamorphic content the
-        // gap is exactly what a host laying out against `sourceVideoWidth` would have got wrong.
-        if let size = observedDisplaySize {
-            print("display size: \(Int(size.width))x\(Int(size.height)) "
-                  + "(coded \(observedCodedSize.0)x\(observedCodedSize.1))")
-        } else {
-            print("display size: never published (not the software path, or no frame built)")
-        }
-    }
     if !finalSubtitleTracks.isEmpty {
         let listed = finalSubtitleTracks
             .map { "#\($0.id) \($0.name)(\($0.language ?? "?"))\($0.isExternal ? "*" : "")" }
@@ -1605,20 +1573,17 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
 }
 
 
-/// #436: reading the rate back off the transport, whichever one is serving. The native paths run an
 /// AVPlayer; the software paths run their own synchronizer, and its timebase is the only place their
 /// effective rate exists. Neither is a value the engine caches, which is what makes the drill's
 /// answer worth having.
+/// #436: reading the rate back off the transport: the AVPlayer serving the session. Not a value the
+/// engine caches, which is what makes the drill's answer worth having.
 enum Issue436RateHold {
     static let rate: Float = 1.5
 
     @MainActor
     static func observedRate(_ engine: AetherEngine) -> Float {
-        if let player = engine.currentAVPlayer { return player.rate }
-        if let timebase = engine.softwarePresentationTimebase {
-            return Float(CMTimebaseGetRate(timebase))
-        }
-        return -1
+        engine.currentAVPlayer?.rate ?? -1
     }
 }
 

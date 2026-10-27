@@ -28,7 +28,7 @@ struct LogRedactionTests {
 
     @Test("the generic credential parameter names are covered", arguments: [
         "api_key", "ApiKey", "access_token", "token", "password", "secret", "signature",
-        "X-Emby-Token", "X-MediaBrowser-Token",
+        "X-Emby-Token", "X-MediaBrowser-Token", "MediaBrowserToken", "pw",
     ])
     func genericKeyNames(key: String) {
         let line = LogRedaction.redact("[x] https://s/a?\(key)=\(token)&keep=1")
@@ -255,6 +255,29 @@ struct LogRedactionTests {
         #expect(LogRedaction.redact("[x] abc") == "[x] abc")
     }
 
+    /// Shapes a host's redactor already caught (Sodalite's audit DIAG-1/DIAG-3) and this one did not,
+    /// found by the host's parity check over engine lines.
+    @Test("a tab separates a header or query value like a space")
+    func tabSeparators() {
+        #expect(!LogRedaction.redact("X-Emby-Token:\t\(token)").contains(token))
+        #expect(!LogRedaction.redact("api_key\t=\(token)").contains(token))
+    }
+
+    @Test("a decoded session cookie inside a Cookie header goes whole")
+    func decodedCookieInHeader() {
+        let line = LogRedaction.redact("Cookie: connect.sid=s:\(token).sigpart; Path=/")
+        #expect(!line.contains(token))
+        #expect(!line.contains("sigpart"))
+        #expect(line.hasSuffix("; Path=/"))
+    }
+
+    @Test("a raw @ inside a password does not leave the rest of it readable")
+    func rawAtInsidePassword() {
+        let line = LogRedaction.redact("[x] url=http://bob:p@\(token)@host/x ok")
+        #expect(!line.contains(token))
+        #expect(line == "[x] url=http://bob:<redacted>@host/x ok")
+    }
+
     /// Audit SUB-109: `registerSecret` was a set, so the second owner of a value unregistering it
     /// (logout of one of two profiles sharing a password) unmasked it for the first.
     @Test("a secret registered twice stays redacted until both registrations are gone")
@@ -263,7 +286,7 @@ struct LogRedactionTests {
         #expect(EngineLog.registerSecret(secret))
         #expect(EngineLog.registerSecret(secret))
         EngineLog.unregisterSecret(secret)
-        #expect(LogRedaction.redact("[x] pw=\(secret)x") == "[x] pw=<redacted>x")
+        #expect(LogRedaction.redact("[x] v=\(secret)x") == "[x] v=<redacted>x")
         EngineLog.unregisterSecret(secret)
         #expect(LogRedaction.redact("[x] v=\(secret)x") == "[x] v=\(secret)x")
     }
