@@ -14,8 +14,9 @@ public enum EngineLog {
         case demux        // Demuxer/AVIOReader: source open, seek, packet reads
         case hlsServer = "hls.server"    // HLSLocalServer: incoming GETs, playlist, segment dispatch
         case audioBridge = "audio.bridge" // AudioBridge: decode->S16PCM->FLAC, PTS rebase, lifecycle
-        case swPlayback = "sw.playback"   // SoftwarePlaybackHost pipeline: SoftwareVideoDecoder, HardwareVideoDecoder, SampleBufferRenderer
+        case swPlayback = "sw.playback"   // software overlay pipeline: SoftwareVideoDecoder, HardwareVideoDecoder, SoftwareOverlayRenderer
         case scrub        // seek diagnostics: backward-seek detection, reset reasons, A/V watermarks
+        case displaySignals = "display.signals" // DisplaySignalProbe: public display readings beside the private reference (DEBUG builds)
     }
 
     /// Optional host handler for every diagnostic line (in-app overlay, aetherctl stdout).

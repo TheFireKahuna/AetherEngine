@@ -70,7 +70,9 @@ struct Issue535RefusalNeedsEligibilityTests {
             .appendingPathComponent("Sources/AetherEngine/AetherEngine.swift")
         let text = try #require(try? String(contentsOf: source, encoding: .utf8))
         let fn = try #require(text.range(of: "func fallBackToMediaPlaylist("))
-        let body = String(text[fn.lowerBound...].prefix(2500))
+        let rest = text[fn.upperBound...]
+        let end = rest.range(of: "\n    func ")?.lowerBound ?? rest.endIndex
+        let body = String(text[fn.lowerBound..<end])
         let gate = try #require(body.range(of: "shouldLatchPanelRefusal("))
         let set = try #require(body.range(of: "Self.panelRefusedHDRMaster = true"))
         #expect(gate.lowerBound < set.lowerBound)

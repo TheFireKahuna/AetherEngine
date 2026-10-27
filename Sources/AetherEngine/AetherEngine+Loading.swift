@@ -1087,6 +1087,9 @@ extension AetherEngine {
                 }
             }
         }
+        session.onLiveVideoColour = { [weak self] itemSeconds, colour in
+            self?.hop(for: generation) { [weak self] in self?.noteLiveVideoColour(itemSeconds: itemSeconds, colour: colour) }
+        }
         session.onPlaylistShiftRebased = { [weak self] seconds, seamOutputSeconds in
             self?.hop(for: generation) { [weak self] in
                 guard let self = self else { return }
@@ -1561,6 +1564,7 @@ extension AetherEngine {
                 self.checkPendingScrubLanding(rendered: value)
                 // #65: mirror AVPlayer's rendered (playlist-axis) position for off-main wedge re-anchoring.
                 self.renderedPositionMirror.set(value)
+                self.crossLiveDisplayRange(at: value)
                 // #368: on a sequential origin the "source PTS" of a rendered frame is whatever the
                 // current archive chunk and libavformat's wrap correction made of it, so publishing it
                 // would break both the documented `sourceTime == currentTime in steady play` relation

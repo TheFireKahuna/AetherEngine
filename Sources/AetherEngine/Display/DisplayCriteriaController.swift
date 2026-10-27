@@ -36,22 +36,12 @@ final class DisplayCriteriaController {
     /// HDR video is on the screen (see `panelPresentsHDR`), so its absence at exactly the moment a load asks
     /// proves nothing, and any invalidation rule built on it would re-arm the very false negative this
     /// exists to answer. Only an event that can mean a changed output configuration clears it: leaving for
-    /// the background or a refused HDR master (`forgetPanelProof`). A display change cannot strand it either:
     /// `effectiveVideoFormat` clamps to `displayCapabilities` before `apply()`, so an SDR route writes SDR
     /// criteria and never consults the proof.
     ///
     /// Process-wide, like the display it describes: a host that builds an engine per item gets a fresh
     /// controller for every load, and an instance flag lost the proof at every one, so an Apple TV whose
     /// headroom never moves read `provenHDR=no` on the next title moments after AVFoundation had
-    /// accepted an HDR master on it. Readable for the tests; set only through `notePanelEngagedHDR`,
-    /// a headroom reading, and cleared by `forgetPanelProof`.
-    private static var panelProvenToEngageHDRInProcess = false {
-        didSet { if panelProvenToEngageHDRInProcess { observeProofInvalidation() } }
-    }
-    private(set) var panelProvenToEngageHDR: Bool {
-        get { Self.panelProvenToEngageHDRInProcess }
-        set { Self.panelProvenToEngageHDRInProcess = newValue }
-    }
 
     #if os(iOS) || os(tvOS)
     /// Installed once, the first time the proof latches, and kept for the process: the proof outlives
@@ -63,12 +53,12 @@ final class DisplayCriteriaController {
         proofInvalidationObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
         ) { _ in
-            MainActor.assumeIsolated { forgetPanelProof("leaving for the background") }
         }
     }
     #else
     private static func observeProofInvalidation() {}
     #endif
+    private var panelProvenToEngageHDR: Bool = false
 
     #if os(tvOS)
     /// #339: armed at the criteria write, not when the play gate opens, so an engine-written switch is
@@ -554,6 +544,9 @@ final class DisplayCriteriaController {
     /// the #449 reporter's 50 Hz panel reads 50.002 Hz.
     nonisolated static let panelRateTolerance: Double = 0.0005
 
+    /// The refresh rate asked for when the source states none: the film rate FrameRateSnap uses.
+    nonisolated static let unknownFrameRateFallback: Double = 23.976
+
     nonisolated static func panelRateRelation(requestedRate: Float?, panelNominalRate: Double?) -> PanelRateRelation {
         guard let requested = requestedRate.map(Double.init), requested > 0, requested.isFinite,
               let panel = panelNominalRate, panel > 0, panel.isFinite else { return .unmeasured }
@@ -812,7 +805,9 @@ final class DisplayCriteriaController {
         // Codec FourCC drives the HDMI mode: 'hvc1' -> HDR10/HLG, 'dvh1' -> Dolby Vision. Using HEVC for a DV source kept DrHurt's Philips panel in HDR10 instead of DV (P8 MKV). ref: Jellyfin #16179, KSPlayer #633.
         let dvh1: FourCharCode = 0x64766831
         let codecType: CMVideoCodecType = codecTag ?? (format == .dolbyVision ? dvh1 : kCMVideoCodecType_HEVC)
-        let effectiveRate = Float(frameRate ?? 24.0)
+        // Unknown rate: film cadence, as FrameRateSnap sends for every probe in [23.5, 24.05] short of an exact 24.
+        // Nearly all such material is 23.976, and a panel that has 24 Hz also has 23.976, not always the reverse.
+        let effectiveRate = Float(frameRate ?? Self.unknownFrameRateFallback)
         let hasExtensions = isHDR && !omitColorExtensions
 
         // #133: skip the panel write when these criteria are already active. Re-writing identical criteria
@@ -852,7 +847,7 @@ final class DisplayCriteriaController {
             lastCriteriaWasHDR = isHDR
             EngineLog.emit(
                 "[DisplayCriteria] skipped SET reason=unchanged (format=\(format) codec=\(fourccString(codecType)) "
-                + "rate=\(frameRate.map { String(format: "%.3f", $0) } ?? "default(24)"))",
+                + "rate=\(frameRate.map { String(format: "%.3f", $0) } ?? "default(23.976)"))",
                 category: .engine
             )
             return .unchanged
@@ -891,7 +886,7 @@ final class DisplayCriteriaController {
 
         EngineLog.emit(
             "[DisplayCriteria] SET: format=\(format) codec=\(fourccString(codecType)) "
-            + "rate=\(frameRate.map { String(format: "%.3f", $0) } ?? "default(24)") "
+            + "rate=\(frameRate.map { String(format: "%.3f", $0) } ?? "default(23.976)") "
             + "extensions=\(extensions != nil ? "HDR" : "none")",
             category: .engine
         )
@@ -1312,6 +1307,11 @@ final class DisplayCriteriaController {
         guard screen.currentEDRHeadroom > 1.001 else { return false }
         if !panelProvenToEngageHDR {
             EngineLog.emit("[DisplayCriteria] panel proven to engage HDR (headroom \(String(format: "%.2f", screen.currentEDRHeadroom))); later sessions trust an accepted HDR write even after the headroom decays", category: .engine)
+        latchPanelProof("headroom \(String(format: "%.2f", screen.currentEDRHeadroom))")
+    private func latchPanelProof(_ evidence: String) {
+        guard !panelProvenToEngageHDR else { return }
+        panelProvenToEngageHDR = true
+    }
             panelProvenToEngageHDR = true
         }
         return true
@@ -1324,21 +1324,14 @@ final class DisplayCriteriaController {
     /// Dolby Vision playback) proves HDR only on the AVPlayer route, and every later session on a path with
     /// no master to accept (the software host, the Dolby Vision FEL route) kept its SDR label.
     func notePanelEngagedHDR(_ evidence: String) {
-        guard !panelProvenToEngageHDR else { return }
         EngineLog.emit("[DisplayCriteria] panel proven to engage HDR (\(evidence)); later sessions trust an accepted HDR write even without a headroom reading", category: .engine)
-        panelProvenToEngageHDR = true
+        latchPanelProof(evidence)
     }
 
     /// AE#588's rule applied to the proof: it describes an output configuration, which the user changes in
     /// Settings (only reachable by leaving the app) or by swapping the TV, so leaving for the background
     /// forgets it (observed process-wide, with or without an engine alive), and so does an HDR master the
     /// display refused. The next HDR session on the AVPlayer route proves it again.
-    static func forgetPanelProof(_ reason: String) {
-        guard panelProvenToEngageHDRInProcess else { return }
-        panelProvenToEngageHDRInProcess = false
-        EngineLog.emit("[DisplayCriteria] \(reason) clears the panel's HDR proof; the next session asks the display again",
-                       category: .engine)
-    }
     /// Nil-out preferredDisplayCriteria to return the panel to default. No-op when apply() was never called this session (suppressed host) to avoid racing AVKit's in-flight criteria management.
     func reset() {
         #if os(tvOS)
@@ -1376,6 +1369,7 @@ final class DisplayCriteriaController {
                 proven: panelProvenToEngageHDR,
                 headroomLimit: Self.headroomLimitLabel(window.traitCollection)),
             category: .engine)
+        DisplaySignalProbe.snapshot(trigger: "criteria:\(phase)")
     }
 
     /// The trait's own three states, spelled out rather than mapped to a Bool: "unspecified" is a real
