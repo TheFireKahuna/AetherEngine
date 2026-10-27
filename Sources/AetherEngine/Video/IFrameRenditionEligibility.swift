@@ -8,7 +8,7 @@ enum IFrameRenditionEligibility {
     enum AbsentReason: String, Equatable {
         case notRequested, live, planNotKeyframeAligned, sequentialOrigin, heldSourceConnection
         case serialOrigin, discSource, noSecondReader, mediaPlaylistRouting
-        /// A Dolby Vision Profile 5 / 10.0 source in a build without the `DolbyVisionStillReshaping`
+        /// A Dolby Vision Profile 5 / 10.0 source in a build without the `DualLayerDolbyVision`
         /// trait: no entry could be answered with a correct picture.
         case dolbyVisionStillsNotBuiltIn
     }

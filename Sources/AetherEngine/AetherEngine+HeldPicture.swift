@@ -8,15 +8,9 @@ extension AetherEngine {
     /// rebuild has its own failure paths; this only keeps a frozen frame from outliving them.
     static let heldPictureTimeoutSeconds: Double = 8
 
-    /// The longest an audio switch waits for a reshaped Dolby Vision still before it rebuilds without
+    /// The longest an audio switch waits for a Dolby Vision frame from the compositor before it rebuilds without
     /// one. The outgoing picture stays on screen, paused, for as long as the decode runs.
     static let heldPictureDolbyVisionBudgetSeconds: Double = 3
-
-    /// The reshaped still's size. The RPU reshaping runs per output pixel on the CPU and dominates the
-    /// cost (measured on an M1 Pro, Profile 5 UHD: 1.53 s at 1920 wide, 0.40 s at 960, 0.11 s at 480,
-    /// plus ~0.24 s of decode per second the frame sits into its segment). The still stands for a few
-    /// hundred milliseconds under the host's loading scrim, where 960 does not read as soft.
-    static let heldPictureReshapedSize = CGSize(width: 960, height: 540)
 
     /// AE#711 follow-up: hold the picture on screen across the rebuild of an audio switch.
     ///
@@ -25,14 +19,10 @@ extension AetherEngine {
     /// is read from the paused old item (about 20 ms paused; a playing one needs ~300 ms before a
     /// fresh output sees anything, which is why the caller pauses first). Dolby Vision without a
     /// displayable base layer (Profile 5, AV1 Profile 10) cannot be taken from that output, which
-    /// vends the base layer; it is decoded from the resident segment instead, frame-accurately and
-    /// through the same RPU reshaping the scrub stills use (`DolbyVisionStillConverter`), which only a
-    /// build with the `DolbyVisionStillReshaping` trait has; without it the hold is skipped.
+    /// vends the base layer; its frame is played out of the resident segment through the system
+    /// compositor instead, which colours it as it colours playback.
     ///
-    /// Software: the rebuild replaces host and layer, and the old host's `stop()` flushes its layer to
-    /// black for the whole startup of the new one. The frame is read back from the renderer.
-    ///
-    /// Either way the picture is laid over the video until the next host reports one. Call before
+    /// The picture is laid over the video until the next host reports one. Call before
     /// `stopInternal`.
     func holdPictureAcrossItemSwap() async {
         releaseHeldPicture(reason: nil)
@@ -42,7 +32,7 @@ extension AetherEngine {
         let nativeSource = nativeHost
         let softwareSource = nativeSource == nil ? softwareHost : nil
         if let skip = surface == nil ? "no surface bound"
-            : (nativeSource == nil && softwareSource == nil) ? "no video host"
+            : nativeSource == nil ? "no video host"
             : Self.heldPictureSkipReason(
                 pictureInPictureActive: pictureInPictureActive,
                 externalPlaybackActive: Self.externalPlaybackActive(nativeSource)) {
@@ -56,23 +46,15 @@ extension AetherEngine {
         let started = ContinuousClock.now
 
         if let host = nativeSource,
-           Self.heldPictureNeedsReshaping(videoFormat: videoFormat, dolbyVisionProfile: sourceDVProfile),
-           !OptionalComponent.dolbyVisionStillReshaping.isBuiltIn {
+           Self.heldPictureNeedsCompositor(videoFormat: videoFormat, dolbyVisionProfile: sourceDVProfile) {
             await holdThroughCompositor(host: host, view: view, generation: generation, started: started)
             return
         }
 
         let held: (frame: CVPixelBuffer, isHDR: Bool, route: String)?
         if let host = nativeSource {
-            if Self.heldPictureNeedsReshaping(videoFormat: videoFormat, dolbyVisionProfile: sourceDVProfile) {
-                held = await reshapedDolbyVisionStill(itemSeconds: host.avPlayer.currentTime().seconds)
-                    .map { ($0, false, "Dolby Vision reshaped") }
-            } else {
-                held = await host.captureDisplayedFrame()
-                    .map { ($0, Self.heldPictureIsHDR(videoFormat), "native output") }
-            }
-        } else if let host = softwareSource {
-            held = host.displayedFrame().map { ($0, Self.heldPictureIsHDR(videoFormat), "software renderer") }
+            held = await host.captureDisplayedFrame()
+                .map { ($0, Self.heldPictureIsHDR(videoFormat), "native output") }
         } else {
             held = nil
         }
@@ -81,7 +63,7 @@ extension AetherEngine {
             EngineLog.emit("[AetherEngine] held picture: no frame from the outgoing picture", category: .engine)
             return
         }
-        guard loadGeneration == generation, nativeHost === nativeSource, softwareHost === softwareSource,
+        guard loadGeneration == generation, nativeHost === nativeSource,
               (boundStillView ?? boundView) === view else {
             heldPictureLastSkip = "superseded while the frame was read"
             EngineLog.emit("[AetherEngine] held picture: superseded while the frame was read", category: .engine)
@@ -100,7 +82,7 @@ extension AetherEngine {
             category: .engine)
     }
 
-    /// Dolby Vision without a displayable base layer and without the still reshaping: the frame under
+    /// Dolby Vision without a displayable base layer: the frame under
     /// the playhead, played out of the resident segment by a player of the surface's own, so the
     /// system compositor colours it as it colours playback. Waits at most
     /// `heldPictureDolbyVisionBudgetSeconds`, the outgoing picture paused meanwhile.
@@ -139,8 +121,7 @@ extension AetherEngine {
             category: .engine)
     }
 
-    /// Records the hold and arms its release: the next item's first frame (native), the next host's
-    /// (software), or `heldPictureTimeoutSeconds`.
+    /// Records the hold and arms its release: the next item's first frame, or `heldPictureTimeoutSeconds`.
     private func armHeldPicture(on view: any HeldStillSurface, route: String, nativeSource: NativeAVPlayerHost?) {
         heldPictureView = view
         heldPictureLastRoute = route
@@ -155,8 +136,6 @@ extension AetherEngine {
                 .sink { [weak self] _ in
                     MainActor.assumeIsolated { self?.releaseHeldPicture(reason: "first frame of the next item") }
                 }
-        } else {
-            heldPictureAwaitsSoftwareHost = true
         }
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(Self.heldPictureTimeoutSeconds))
@@ -175,70 +154,10 @@ extension AetherEngine {
     }
 
     /// Called where `loadSoftware` installs its host: a picture held over a software rebuild comes
-    /// down at that host's first frame.
-    func armHeldPictureRelease(onSoftwareHost host: SoftwarePlaybackHost) {
-        guard heldPictureAwaitsSoftwareHost, heldPictureView != nil else { return }
-        heldPictureAwaitsSoftwareHost = false
-        heldPictureRelease = host.$isVideoReadyForDisplay
-            .first(where: { $0 })
-            .sink { [weak self] _ in
-                MainActor.assumeIsolated { self?.releaseHeldPicture(reason: "first frame of the next host") }
-            }
-    }
-
-    /// The current native frame decoded from the resident segment and reshaped through its RPU. nil
-    /// when the segment is not resident, the decode fails, or it outruns
-    /// `heldPictureDolbyVisionBudgetSeconds`.
-    private func reshapedDolbyVisionStill(itemSeconds: Double) async -> CVPixelBuffer? {
-        guard !isLive, itemSeconds.isFinite, let session = nativeVideoSession,
-              let source = session.scrubThumbnailSource(atSeconds: itemSeconds),
-              let reader = source.makeReader() else { return nil }
-        let extractor = FrameExtractor(reader: reader, formatHint: "mp4")
-        let offset = max(0, itemSeconds - source.startSeconds)
-        let image = await withTaskGroup(of: CGImage?.self) { group -> CGImage? in
-            group.addTask { await extractor.snapshot(afterFirstFrameBy: offset, maxSize: Self.heldPictureReshapedSize) }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(Self.heldPictureDolbyVisionBudgetSeconds))
-                return nil
-            }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first
-        }
-        Task { await extractor.shutdown() }
-        return image.flatMap(Self.pixelBuffer(from:))
-    }
-
-    /// An sRGB still as an IOSurface-backed BGRA buffer, the shape a sample-buffer layer displays.
-    nonisolated static func pixelBuffer(from image: CGImage) -> CVPixelBuffer? {
-        let attributes: [String: Any] = [
-            kCVPixelBufferIOSurfacePropertiesKey as String: [String: String](),
-            kCVPixelBufferCGImageCompatibilityKey as String: true,
-            kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
-        ]
-        var buffer: CVPixelBuffer?
-        guard CVPixelBufferCreate(kCFAllocatorDefault, image.width, image.height, kCVPixelFormatType_32BGRA,
-                                  attributes as CFDictionary, &buffer) == kCVReturnSuccess,
-              let buffer else { return nil }
-        CVPixelBufferLockBaseAddress(buffer, [])
-        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-        guard let context = CGContext(
-            data: CVPixelBufferGetBaseAddress(buffer), width: image.width, height: image.height,
-            bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
-            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-        ) else { return nil }
-        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
-        CVBufferSetAttachment(buffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
-        CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_sRGB, .shouldPropagate)
-        return buffer
-    }
-
     /// Dolby Vision whose base layer has no displayable colour of its own: Profile 5, and AV1
-    /// Profile 10, whose compatibility id is not known here (the reshaping path falls back to the
-    /// base layer itself when it finds no RPU). Every other profile's base layer is HDR10, HLG or
-    /// SDR and is held as the output vends it.
-    nonisolated static func heldPictureNeedsReshaping(videoFormat: VideoFormat, dolbyVisionProfile: Int?) -> Bool {
+    /// Profile 10, whose compatibility id is not known here. Every other profile's base layer is HDR10,
+    /// HLG or SDR and is held as the output vends it.
+    nonisolated static func heldPictureNeedsCompositor(videoFormat: VideoFormat, dolbyVisionProfile: Int?) -> Bool {
         videoFormat == .dolbyVision && (dolbyVisionProfile == 5 || dolbyVisionProfile == 10)
     }
 
@@ -251,7 +170,6 @@ extension AetherEngine {
     func releaseHeldPicture(reason: String?) {
         heldPictureRelease?.cancel()
         heldPictureRelease = nil
-        heldPictureAwaitsSoftwareHost = false
         guard let view = heldPictureView else { return }
         view.clearStill()
         heldPictureView = nil

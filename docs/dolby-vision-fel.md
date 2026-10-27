@@ -587,6 +587,36 @@ debugging, such as the pairing, queueing and bypass traces, uses `EngineLog` lev
 | I8 | No lock is held across a blocking wait or a host callback | `DualLayerVideoDecoderTests.slowOnFrameDoesNotBlockDecoderOperations` (a blocked `onFrame` never stalls concurrent decoder work); `DualLayerGpuSlotWaitTests` for the GPU slot wait |
 | I9 | Stream classification changes only at open, flush or close | `DualLayerStreamClassificationTests` |
 
+### 5.13 Stills without a base layer (profile 5, AV1 10.0)
+
+A profile 5 picture's planes are IPT-PQ-c2, not Y'CbCr: only its RPU makes them a picture. Playback leaves that to
+the system compositor; a still (scrub thumbnails, the I-frame tier, the extractor) is composed here, on the GPU, by the
+same composer (`DoviFelComposer.composeBaseLayerStill`), one batch per still, waited for, off the playback path. The
+specification is ETSI GS CCM 001 v1.1.1 (research/colour-range-dv/specs); each stage, and where it says nothing:
+
+| Stage | Follows | How |
+| --- | --- | --- |
+| Base-layer mapping | CCM 001 5.4.2 | The composer's fixed-point prediction, in pipelines specialised for the base layer alone (function constant 3: no enhancement-layer texture, NLQ table or their registers) |
+| Reconstruction | 5.4.3.3 | `disable_residual_flag` is 1, so h = v, rounded to `hdr_bit_depth` (12) bits and clipped. 5.5 is omitted: the base layer is PQ |
+| Chroma to every pixel | not specified | Dolby's reference filters the composer already has: `dovi_chroma_420_to_422` vertically, at the picture's own siting (`chroma_location`), then the 2:1 horizontal filter of the EL upsampling (`dovi_el_h`), whose columns are co-sited, as HEVC and AV1 Dolby Vision site chroma |
+| Opponent to trichromatic | 6.2.2 `YCCtoRGB_coef`, `YCCtoRGB_offset` | (I, Ct, Cp) / 4095 less the offsets, times the matrix: L'M'S'. The RPU carries the coefficients over 2^13 and the offsets over 2^28 (FFmpeg and libplacebo read them so, and an RPU's neutral chroma is 2^27); CCM 001's baseband defaults imply 2^30 for the offsets, a different carriage |
+| Linearisation | 6.2.2 `signal_eotf` (PQ) | The ST 2084 EOTF |
+| To LMS | 6.2.2 `RGBtoLMS_coef` | For IPT-PQ-c2, the inverse of its crosstalk (17081 / -349 over 2^14 on the titles seen) |
+| LMS to BT.2020 | not in the RPU; derived from IPT-PQ-c2's own definition | Dolby's IPT-PQ-c2 XYZ to LMS matrix (WO 2016/172091 A1, given to 15 digits) is the D65-normalised Hunt-Pointer-Estevez matrix with 2% crosstalk mixed in (C(0.02) x HPE reproduces it); the RPU's `rgb_to_lms` is C(0.02)'s inverse (1.04254 / -0.02130 against 0.98/0.94 and -0.02/0.94). So LMS to BT.2020 is XYZ to BT.2020 RGB (H.273's chromaticities, D65 at 0.3127, 0.3290) after that matrix inverted and the crosstalk mixed back, computed in double (`DoviIptConversion.lmsToBT2020`). Every row sums to 1: a neutral IPT signal is a neutral RGB. libplacebo's constant is the same derivation with its own D65 (0.31271, 0.32902) for the RGB side, which reproduces it to 2e-7 and leans neutrals blue by 1.5e-4 |
+| Encoding | BT.2100 | ST 2084 inverse EOTF, BT.2020 non-constant-luminance Y'CbCr, 16-bit video range 4:4:4, tagged BT.2020 / PQ |
+| Mastering display | 6.2.2 `source_min_PQ` / `source_max_PQ` | Primaries and white from level 9 (its index into the predefined set, or its chromaticities); luminance from level 6, else the source PQ range, which 6.2.2 ties to ST 2086's mastering luminance; light level from level 6 (`DolbyVisionMasteringDisplay`) |
+| Display mapping | CCM 001 leaves DM to the display | `StillRenderer` maps the BT.2020 PQ picture to SDR as it maps every HDR still (VideoToolbox, Apple's curve) |
+
+Precision. The ST 2084 curves are written so nothing cancels (p = 1 + d with d an exact e^x - 1, and the inverse's
+ratio as 1 + x through log(1 + x), Kahan's forms over precise `exp` and `log`): in single precision the direct forms
+are off by up to 11 in 65535 at 16-bit video range, these by 0.1 (measured over every 12-bit code,
+float against double). `DolbyVisionBaseLayerStillTests` holds the GPU still to a double-precision reference built
+from the stages above, within 1 in 65535 at every base-layer luma code, with the conversion of a real profile 5 RPU.
+The conversion kernel takes 22 registers on the A15, none spilled.
+
+Not handled: chroma sited between luma columns (`chroma_location` centre, top or bottom), which no HEVC or AV1 Dolby
+Vision stream seen uses, is filtered as co-sited.
+
 ---
 
 ## 6. Verification

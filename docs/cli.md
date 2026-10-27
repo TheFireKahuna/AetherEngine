@@ -1,6 +1,6 @@
 # aetherctl
 
-A standalone macOS CLI shipped alongside the library for repro work without going through TestFlight + Apple TV. It builds with the package's traits, so the optional components ([README › Optional components](../README.md#optional-components)) are in it only when it is built with them: `swift run --traits TrueHDObjectAudio,DTSXObjectAudio,DualLayerDolbyVision,DolbyVisionStillReshaping aetherctl …` for `--atmos-bed`, `play --fel`, `--cycle-el`, `--dv-pin` and `feltest`, and for Profile 5 / 10.0 stills in `extract` and `play --host-calls` (`DolbyVisionStillReshaping`; without it those stills print as nil). Most subcommands operate on a media source URL (`file://` or `http(s)://`); `live`, `dvr`, `hlsfixture`, and `hlslive` run against built-in synthetic fixtures.
+A standalone macOS CLI shipped alongside the library for repro work without going through TestFlight + Apple TV. It builds with the package's traits, so the optional components ([README › Optional components](../README.md#optional-components)) are in it only when it is built with them: `swift run --traits TrueHDObjectAudio,DTSXObjectAudio,DualLayerDolbyVision aetherctl …` for `--atmos-bed`, `play --fel`, `--cycle-el`, `--dv-pin` and `feltest`, and for Profile 5 / 10.0 stills in `extract` and `play --host-calls` (`DualLayerDolbyVision`; without it those stills print as nil). Most subcommands operate on a media source URL (`file://` or `http(s)://`); `live`, `dvr`, `hlsfixture`, and `hlslive` run against built-in synthetic fixtures.
 
 ```bash
 swift run aetherctl probe <url>          # dump container + streams + duration, exit
@@ -18,7 +18,6 @@ swift run aetherctl extract <url>        # FrameExtractor still-image extraction
 swift run aetherctl scrubpreview <url>   # Dolby Vision Profile 5 / 10.0 compositor scrub previews, resident and from the source
 swift run aetherctl audio [--seconds N] <url>   # audio-only pipeline smoke test (default 10 s)
 swift run aetherctl audiotap <url>       # decode the PCM audio tap headless, write mono 48 kHz WAV (#95)
-swift run aetherctl bgaudio <url>        # SW-path background-audio keepalive probe (iOS background behavior)
 swift run aetherctl customio <path>      # exercise the custom IOReader path end-to-end
 swift run aetherctl disc-inspect <path>  # walk a local DVD / Blu-ray ISO: titles, chapters, recognition stages
 swift run aetherctl live                 # live MPEG-TS session against the built-in fixture

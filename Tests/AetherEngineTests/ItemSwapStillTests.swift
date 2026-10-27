@@ -301,12 +301,12 @@ struct ItemSwapStillTests {
             pictureInPictureActive: false, externalPlaybackActive: true) != nil)
     }
 
-    @Test("only Dolby Vision without a displayable base layer is reshaped from the segment")
-    func reshapingRule() {
-        #expect(AetherEngine.heldPictureNeedsReshaping(videoFormat: .dolbyVision, dolbyVisionProfile: 5))
-        #expect(AetherEngine.heldPictureNeedsReshaping(videoFormat: .dolbyVision, dolbyVisionProfile: 10))
-        #expect(!AetherEngine.heldPictureNeedsReshaping(videoFormat: .dolbyVision, dolbyVisionProfile: 8))
-        #expect(!AetherEngine.heldPictureNeedsReshaping(videoFormat: .hdr10, dolbyVisionProfile: 5))
+    @Test("only Dolby Vision without a displayable base layer is held through the compositor")
+    func compositorRule() {
+        #expect(AetherEngine.heldPictureNeedsCompositor(videoFormat: .dolbyVision, dolbyVisionProfile: 5))
+        #expect(AetherEngine.heldPictureNeedsCompositor(videoFormat: .dolbyVision, dolbyVisionProfile: 10))
+        #expect(!AetherEngine.heldPictureNeedsCompositor(videoFormat: .dolbyVision, dolbyVisionProfile: 8))
+        #expect(!AetherEngine.heldPictureNeedsCompositor(videoFormat: .hdr10, dolbyVisionProfile: 5))
     }
 
     /// The fixture paints frame n at grey level 2n, so the frame a still came from can be read off it.
@@ -369,12 +369,14 @@ struct ItemSwapStillTests {
     nonisolated static let profile81URL = userFixtures
         .appendingPathComponent("Patterns_Of_Nature_HDR10-P8.1_UHD_24_H265-10Mbps_DD+JOC-768Kbps.mp4")
 
-    #if DolbyVisionStillReshaping
-    /// Dolby's own Profile 5 signal, which cannot be committed: the base layer is IPTPQc2 and only
-    /// the RPU makes it a picture, so the hold must come from the reshaping path.
-    @Test("a Profile 5 title holds a reshaped still",
+    /// Dolby's own Profile 5 signal, which cannot be committed: the base layer is IPTPQc2 and only its RPU makes it a
+    /// picture, so where the hold needs one (the output presents Dolby Vision) the engine plays the frame out of the
+    /// resident segment through a player of the surface's own, and the system compositor colours it. Where AVPlayer
+    /// presents the source as HDR10 (a Mac without a Dolby Vision display), the output's own picture is correct and is
+    /// held as before.
+    @Test("a Profile 5 title holds its frame through the compositor",
           .enabled(if: FileManager.default.fileExists(atPath: ItemSwapStillTests.profile5URL.path)))
-    func profile5HoldsAReshapedStill() async throws {
+    func profile5HoldsThroughCompositor() async throws {
         let engine = try AetherEngine()
         defer { engine.stop() }
         let view = AetherPlayerView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
@@ -384,47 +386,18 @@ struct ItemSwapStillTests {
         try await waitFor { host.isVideoReadyForDisplay }
         try await Task.sleep(for: .seconds(1))
         engine.pause()
-        let started = ContinuousClock.now
-        await engine.holdPictureAcrossItemSwap()
-        #expect(ContinuousClock.now - started < .seconds(AetherEngine.heldPictureDolbyVisionBudgetSeconds))
-        #expect(engine.videoFormat == .dolbyVision)
-        #expect(engine.heldPictureLastRoute == "Dolby Vision reshaped")
-        #expect(view.isHoldingStill)
-    }
-    #else
-    /// Without the reshaping a Profile 5 picture cannot be made into a still, so where the hold needs
-    /// one (the output presents Dolby Vision) the engine plays the frame out of the resident segment
-    /// through a player of the surface's own, and the system compositor colours it. Where AVPlayer
-    /// presents the source as HDR10 (a Mac without a Dolby Vision display), the output's own picture
-    /// is correct and is held as before.
-    @Test("without the reshaping trait a Profile 5 title holds its frame through the compositor",
-          .enabled(if: FileManager.default.fileExists(atPath: ItemSwapStillTests.profile5URL.path)))
-    func profile5WithoutReshapingHoldsThroughCompositor() async throws {
-        let engine = try AetherEngine()
-        defer { engine.stop() }
-        let view = AetherPlayerView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
-        engine.bind(view: view)
-        _ = try await engine.load(url: Self.profile5URL)
-        let host = try #require(engine.nativeHost)
-        try await waitFor { host.isVideoReadyForDisplay }
-        try await Task.sleep(for: .seconds(1))
-        engine.pause()
-        // No scrub still either; the compositor preview stands in, and the capabilities say so up front.
-        #expect(!engine.supportsCacheBackedStills)
+        #expect(engine.supportsCacheBackedStills == AetherEngine.OptionalComponent.dualLayerDolbyVision.isBuiltIn)
         #expect(engine.scrubPreviewDrawsInView)
-        #expect(await engine.scrubThumbnail(atSeconds: 0.5, maxWidth: 160) == nil)
         let started = ContinuousClock.now
         await engine.holdPictureAcrossItemSwap()
         #expect(ContinuousClock.now - started < .seconds(AetherEngine.heldPictureDolbyVisionBudgetSeconds + 0.5))
-        if AetherEngine.heldPictureNeedsReshaping(videoFormat: engine.videoFormat, dolbyVisionProfile: engine.sourceDVProfile) {
+        if AetherEngine.heldPictureNeedsCompositor(videoFormat: engine.videoFormat, dolbyVisionProfile: engine.sourceDVProfile) {
             #expect(engine.heldPictureLastRoute == "Dolby Vision compositor")
             #expect(view.isHoldingStill)
         } else {
             #expect(engine.heldPictureLastRoute == "native output")
         }
-        #expect(engine.heldPictureLastRoute != "Dolby Vision reshaped")
     }
-    #endif
 
     @Test("a Profile 8.1 title holds its HDR10 base layer from the output",
           .enabled(if: FileManager.default.fileExists(atPath: ItemSwapStillTests.profile81URL.path)))

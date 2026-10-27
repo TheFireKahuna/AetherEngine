@@ -175,6 +175,12 @@ constant bool dovi_fc_mmr_exact [[function_constant(1)]];
 // registers.
 constant bool dovi_fc_luma_mmr [[function_constant(2)]];
 
+// Function constant 3: the base layer alone, for a picture with no enhancement layer (Dolby Vision profile 5, AV1
+// profile 10.0). The reconstruction is the prediction (h = v, CCM 001 5.4.3.3 with no residual), so these pipelines
+// take neither the enhancement layer nor its inverse-NLQ table, and carry none of their reads or registers.
+constant bool dovi_fc_base_only [[function_constant(3)]];
+constant bool dovi_fc_with_el = !dovi_fc_base_only;
+
 // Blue-noise threshold in [0.5/4096, 4095.5/4096]: rank k of the 4096 cells maps to (k + 0.5) / 4096, so the
 // mean over the tile is exactly 0.5, the rounding bias of the undithered branch. A 10-bit code plus the
 // threshold needs 10 + 13 bits, inside float's 24, so floor(v + d) is exact. Each component reads the tile at
@@ -637,10 +643,23 @@ static inline bool dovi_residual_at(constant struct DoviMetalParams &params, uin
 // input, and reconstructing chroma to full resolution here would cost a separate
 // pass for a case that does not occur in practice.
 
+kernel void dovi_compose_luma(
+    texture2d<ushort, access::read>        bl_y_tex      [[texture(0)]],
+    texture2d<ushort, access::read>        bl_uv_tex     [[texture(1)]],
+    texture2d<ushort, access::sample>      el_y_tex      [[texture(2), function_constant(dovi_fc_with_el)]],
+    texture2d<ushort, access::write>       out_y_tex     [[texture(3)]],
+    constant struct DoviMetalParams&       params        [[buffer(0)]],
+    constant int*                          luma_lut      [[buffer(1)]],
+    device const int*                      nlq_lut       [[buffer(2), function_constant(dovi_fc_with_el)]],
+    device const int*                      mmr_table     [[buffer(3)]],
+    uint2                                  grid          [[thread_position_in_grid]],
+    uint                                   lane          [[thread_index_in_simdgroup]])
 {
     // This lane's pixel (`dovi_lane_column`); x0 is the first column of its SIMD-group's 32.
     uint x0 = grid.x - lane;
     uint2 gid = uint2(dovi_lane_column(x0, lane), grid.y);
+    bool residual = dovi_fc_with_el && (params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u &&
+                    params.nlq_y.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_y.nlq_scale != 0;
     // The EL's horizontal pass reads its neighbours' vertical results, so every lane runs it before any leaves.
     int el_code = 0;
     if (residual) {
@@ -697,6 +716,16 @@ static inline bool dovi_residual_at(constant struct DoviMetalParams &params, uin
 // Chroma: both chroma planes in one pass, since an MMR curve for Cb and for Cr
 // reads the same three base-layer components. Composed at the 4:2:0 sites, where the reconstruction is defined;
 // for sv22 (DOVI_FLAG_CHROMA_422) the result goes to the intermediate dovi_chroma_420_to_422 reads, not the output.
+kernel void dovi_compose_chroma(
+    texture2d<ushort, access::read>        bl_y_tex      [[texture(0)]],
+    texture2d<ushort, access::read>        bl_uv_tex     [[texture(1)]],
+    texture2d<ushort, access::read>        el_uv_tex     [[texture(2), function_constant(dovi_fc_with_el)]],
+    texture2d<ushort, access::write>       out_uv_tex    [[texture(3)]],
+    constant struct DoviMetalParams&       params        [[buffer(0)]],
+    device const int*                      nlq_lut       [[buffer(2), function_constant(dovi_fc_with_el)]],
+    device const int*                      mmr_table     [[buffer(3)]],
+    uint2                                  grid          [[thread_position_in_grid]],
+    uint                                   lane          [[thread_index_in_simdgroup]])
 {
     // This lane's chroma sample (`dovi_lane_column`); x0 is the first column of its SIMD-group's 32.
     uint x0 = grid.x - lane;
@@ -705,6 +734,7 @@ static inline bool dovi_residual_at(constant struct DoviMetalParams &params, uin
     uint uv_height = dovi_chroma_size(params.bl_height);
     bool cb_active = params.nlq_cb.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cb.nlq_scale != 0;
     bool cr_active = params.nlq_cr.nlq_method == DOVI_NLQ_METHOD_LINEAR && params.nlq_cr.nlq_scale != 0;
+    bool residual = dovi_fc_with_el && (params.flags & DOVI_FLAG_DISABLE_RESIDUAL) == 0u && (cb_active || cr_active);
     // As in the luma kernel: every lane runs the EL upsampling before any leaves.
     int2 el_code = int2(0);
     if (residual) {
@@ -855,6 +885,101 @@ kernel void dovi_chroma_420_to_422(
     int2 h = (sum + 64) >> 7;
     out_uv_tex.write(ushort4(ushort(dovi_full_precision(h.x, params.vdr_max)),
                              ushort(dovi_full_precision(h.y, params.vdr_max)), 0, 0), gid);
+}
+
+/* ============================================================================
+   IPT-PQ-c2 to BT.2020 Y'CbCr PQ (profile 5 and AV1 10.0 stills)
+   ========================================================================= */
+
+// The colour conversion a profile 5 picture carries in its RPU's display-management data (CCM 001 6.2.2), with the
+// last step the RPU leaves implied:
+// - ycc_to_lms: YCCtoRGB_coef, the opponent signal (here IPT, signal_color_space 2) to the non-linear trichromatic one,
+//   applied after subtracting ycc_offset (YCCtoRGB_offset);
+// - the ST 2084 EOTF on each component (signal_eotf: PQ);
+// - lms_to_rgb: RGBtoLMS_coef (for IPT-PQ-c2, the inverse of its crosstalk) followed by LMS to linear BT.2020 RGB,
+//   one matrix. Row major.
+struct DoviIptConversion {
+    float ycc_to_lms[9];
+    float ycc_offset[3];
+    float lms_to_rgb[9];
+};
+
+// e^x - 1 and log(1 + x), accurate for small x where the direct forms lose their digits to the subtraction (Kahan's
+// formulations over precise exp and log). Reassociation off: it would fold (1 + x) - 1 back to x.
+static inline float3 dovi_expm1(float3 x) {
+    #pragma clang fp reassociate(off)
+    float3 u = precise::exp(x);
+    float3 um1 = u - 1.0f;
+    float3 r = select(um1 * x / precise::log(u), x, u == 1.0f);
+    return select(r, float3(-1.0f), um1 == -1.0f);
+}
+
+static inline float3 dovi_log1p(float3 x) {
+    #pragma clang fp reassociate(off)
+    float3 u = 1.0f + x;
+    return select(precise::log(u) * x / (u - 1.0f), x, u == 1.0f);
+}
+
+// The ST 2084 curves, written so that nothing cancels: with p = 1 + d, p - c1 = (1 - c1) + d and c2 - c3 p =
+// (c2 - c3) - c3 d, and the inverse's ratio (c1 + c2 p) / (1 + c3 p) is 1 + (c2 - c3) d / (1 + c3 p); 1 - c1 and
+// c2 - c3 are both 0.1640625 exactly. In single precision the direct forms are off by up to 11 in 65535 at 16-bit
+// video range; these, by a tenth of one.
+static inline float3 dovi_pq_eotf(float3 e) {
+    float3 d = dovi_expm1(precise::log(max(e, 1e-30f)) * (1.0f / 78.84375f));
+    float3 ratio = max(0.1640625f + d, 0.0f) / (0.1640625f - 18.6875f * d);
+    return select(precise::exp(precise::log(ratio) * (1.0f / 0.1593017578125f)), float3(0.0f), e <= 0.0f);
+}
+
+static inline float3 dovi_pq_oetf(float3 l) {
+    float3 d = dovi_expm1(precise::log(max(l, 1e-30f)) * 0.1593017578125f);
+    float3 encoded = precise::exp(78.84375f * dovi_log1p(0.1640625f * d / (1.0f + 18.6875f * (1.0f + d))));
+    return select(encoded, float3(precise::pow(0.8359375f, 78.84375f)), l <= 0.0f);
+}
+
+static inline float3 dovi_mul3(constant float *m, float3 v) {
+    return float3(m[0] * v.x + m[1] * v.y + m[2] * v.z,
+                  m[3] * v.x + m[4] * v.y + m[5] * v.z,
+                  m[6] * v.x + m[7] * v.y + m[8] * v.z);
+}
+
+// One output pixel per lane (`dovi_lane_column`): the composed luma sum at the pixel, and the composed chroma, already
+// brought to every row by `dovi_chroma_420_to_422`, brought to the pixel's column by the reference horizontal 2:1
+// filter (`dovi_el_h`; chroma sits on the even luma columns). Each is reconstructed to hdr_bit_depth bits
+// (`dovi_reconstruct`, CCM 001 5.4.3.3), taken to the signal's [0, 1] range, converted, and written as BT.2020
+// non-constant-luminance Y'CbCr, PQ, 16-bit video range (luma 4096...60160), 4:4:4, so nothing is rounded between
+// the reconstruction and the still's own mapping. Whole threadgroups 32 wide, as the composition kernels.
+kernel void dovi_ipt_to_bt2020(
+    texture2d<ushort, access::read>        sum_y_tex     [[texture(0)]],
+    texture2d<ushort, access::read>        sum_uv_tex    [[texture(1)]],
+    texture2d<ushort, access::write>       out_y_tex     [[texture(2)]],
+    texture2d<ushort, access::write>       out_uv_tex    [[texture(3)]],
+    constant struct DoviMetalParams&       params        [[buffer(0)]],
+    constant struct DoviIptConversion&     conversion    [[buffer(4)]],
+    uint2                                  grid          [[thread_position_in_grid]],
+    uint                                   lane          [[thread_index_in_simdgroup]])
+{
+    uint x0 = grid.x - lane;
+    uint2 gid = uint2(dovi_lane_column(x0, lane), grid.y);
+    uint row = min(gid.y, params.bl_height - 1u);
+    int column = dovi_el_column(x0, lane, dovi_chroma_size(params.bl_width));
+    int2 chroma = dovi_el_h(int2(sum_uv_tex.read(uint2(uint(column), row)).rg), lane);
+    if (gid.x >= params.bl_width || gid.y >= params.bl_height) {
+        return;
+    }
+    float max_code = float(params.vdr_max);
+    float3 signal = float3(float(dovi_reconstruct(int(sum_y_tex.read(gid).r), params.vdr_max)),
+                           float(dovi_reconstruct(chroma.x, params.vdr_max)),
+                           float(dovi_reconstruct(chroma.y, params.vdr_max))) / max_code;
+    float3 offset = float3(conversion.ycc_offset[0], conversion.ycc_offset[1], conversion.ycc_offset[2]);
+    float3 lms = dovi_pq_eotf(dovi_mul3(conversion.ycc_to_lms, signal - offset));
+    float3 rgb = dovi_pq_oetf(max(dovi_mul3(conversion.lms_to_rgb, lms), 0.0f));
+    float y = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
+    float cb = (rgb.b - y) / 1.8814f;
+    float cr = (rgb.r - y) / 1.4746f;
+    uint3 codes = uint3(clamp(rint(float3(4096.0f + 56064.0f * y, 32768.0f + 57344.0f * cb, 32768.0f + 57344.0f * cr)),
+                              0.0f, 65535.0f));
+    out_y_tex.write(ushort4(ushort(codes.x), 0, 0, 0), gid);
+    out_uv_tex.write(ushort4(ushort(codes.y), ushort(codes.z), 0, 0), gid);
 }
 
 /* ============================================================================

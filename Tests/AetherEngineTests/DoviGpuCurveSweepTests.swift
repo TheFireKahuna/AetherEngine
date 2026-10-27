@@ -7,7 +7,7 @@ import Metal
 @testable import AetherEngine
 
 /// Runs the real composition kernels over every base-layer code and compares the
-/// result against ``DolbyVisionStillConverter/ReshapeCurve`` in Swift.
+/// result against ``ReferenceCurve``, a floating-point evaluation of the same curve in Swift.
 ///
 /// The rest of the suite re-implements the shader's arithmetic in Swift and tests
 /// the re-implementation, so it would pass unchanged if the Metal source diverged
@@ -120,8 +120,38 @@ struct DoviGpuCurveSweepTests {
 
     // MARK: - Luma: multi-piece polynomial
 
-    // The reference curve is the still converter's, compiled only with DolbyVisionStillReshaping.
-    #if DolbyVisionStillReshaping
+    /// One reshaping curve evaluated in doubles from its normalised pivots and coefficients: the piece the clamped value
+    /// falls in, then its polynomial, or its MMR sum over the encoded input vector `sig` (y, u, v).
+    struct ReferenceCurve {
+        let pivots: [Double]
+        let isMMR: [Bool]
+        let poly: [[Double]]
+        let mmrOrder: [Int]
+        let mmrConst: [Double]
+        let mmrCoef: [[[Double]]]
+
+        func map(_ x: Double, _ sig: (Double, Double, Double)) -> Double {
+            let n = pivots.count
+            if n < 2 { return x }
+            let clamped = min(max(x, pivots[0]), pivots[n - 1])
+            var seg = 0
+            while seg < n - 2 && clamped >= pivots[seg + 1] { seg += 1 }
+            if isMMR[seg] {
+                var s = mmrConst[seg]
+                let base = [sig.0, sig.1, sig.2, sig.0 * sig.1, sig.0 * sig.2, sig.1 * sig.2, sig.0 * sig.1 * sig.2]
+                var t = base
+                let order = max(1, mmrOrder[seg])
+                for o in 0..<min(order, 3) {
+                    for k in 0..<7 { s += mmrCoef[seg][o][k] * t[k] }
+                    if o + 1 < order { for k in 0..<7 { t[k] *= base[k] } }
+                }
+                return s
+            }
+            let c = poly[seg]
+            return c[0] + clamped * (c[1] + clamped * c[2])
+        }
+    }
+
     @Test("GPU luma sweep: a 3-piece polynomial with per-piece order and denominator matches the reference curve")
     func lumaMultiPiecePolynomialSweep() throws {
         guard let composer = DoviFelComposer.p010ForTesting() else {
@@ -188,7 +218,7 @@ struct DoviGpuCurveSweepTests {
             return
         }
 
-        let reference = DolbyVisionStillConverter.ReshapeCurve(
+        let reference = ReferenceCurve(
             pivots: pivotCodes.map { Double($0) / Double(blMax) },
             isMMR: [false, false, false],
             poly: exact,
@@ -309,7 +339,7 @@ struct DoviGpuCurveSweepTests {
             return
         }
 
-        let reference = DolbyVisionStillConverter.ReshapeCurve(
+        let reference = ReferenceCurve(
             pivots: pivotCodes.map { Double($0) / Double(blMax) },
             isMMR: [true, true],
             poly: [[0, 0, 0], [0, 0, 0]],
@@ -354,7 +384,6 @@ struct DoviGpuCurveSweepTests {
     }
 
     // MARK: - Identity is bit-exact
-    #endif
 
     @Test("GPU identity curve is bit-exact: every base-layer code survives the round trip")
     func identityCurveIsBitExact() throws {

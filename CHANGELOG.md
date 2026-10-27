@@ -66,6 +66,11 @@ the public-API contract.
   `reactivateAudioSession()` makes the session active again for a resume on the paths the engine owns it
   (software, audio-only) and leaves the native path to AVKit, for hosts that called `setActive` themselves.
 
+- **CM v4.0 RPUs with a level 253 block keep their Dolby Vision on the Profile 7 routes.** Disney+ v4.0
+  RPUs carry L253 (0x55 filler, up to 66 bytes), which `dolby_vision` 3.4.0 refused as an unknown level, so
+  every RPU of a hybrid built on such a donor was dropped and the title played as its base layer.
+  `DoviRpuGuard` now walks past L253, so a malformed block behind one is still refused before libdovi.
+
 - **An audio tap consumer that falls behind is told where it lost audio (AE#864, thanks @qoli).** The tap stream
   shed its oldest queued buffer when full, and the buffer received next was already queued, so it arrived without
   `discontinuity` and a host read contiguous PCM across a gap of seconds. The queue now keeps what it holds, drops
@@ -84,6 +89,11 @@ the public-API contract.
   panel repeated a frame about every 42 s. A probe within 0.005 of 24.000 now snaps to 24; a Matroska track with
   DefaultDuration probes as an exact 24/1 or 24000/1001, so 23.976 sources and noisier probes keep 23.976.
 
+
+- **LibDovi comes from this fork's TheFireKahuna/LibDovi 2.2.0-fire.1**, built from
+  TheFireKahuna/dovi_tool at 2.3.4. Same crate version, 3.4.0, plus the unreleased level 253 support;
+  the header change is additive (`DoviDmData.level253`, two constants). Every upstream slice ships;
+  upstream's pin is kept in a comment in `Package.swift`.
 ## [7.48.0] - 2026-10-26
 
 ### Added

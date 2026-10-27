@@ -69,6 +69,10 @@ struct DoviRpuGuardTests {
         var cmv29Count: UInt64 = 0
         var cmv29Block: (length: UInt64, level: UInt64)?
         var cmv40Block: (length: UInt64, level: UInt64)?
+        /// A block written ahead of `cmv40Block` in the CM v4.0 list (only with one). A level 253 lead carries
+        /// 0x55 filler bytes, as real ones do; any other level, zeros.
+        var cmv40Lead: (length: UInt64, level: UInt64)?
+        /// `ycc_to_rgb_offset[0...2]` of an uncompressed payload, over 2^28; video range by default.
         var yccToRgbOffsets: (UInt64, UInt64, UInt64) = (1 << 24, 1 << 27, 1 << 27)
     }
 
@@ -95,8 +99,12 @@ struct DoviRpuGuardTests {
             while w.bits.count % 8 != 0 { w.bits.append(false) }
         }
         if let block = dm.cmv40Block {
-            w.ue(2)
+            w.ue(dm.cmv40Lead == nil ? 2 : 3)
             while w.bits.count % 8 != 0 { w.bits.append(false) }
+            if let lead = dm.cmv40Lead {
+                w.ue(lead.length); w.put(lead.level, 8)
+                for _ in 0..<lead.length { w.put(lead.level == 253 ? 0x55 : 0, 8) }
+            }
             w.ue(block.length); w.put(block.level, 8)
             for _ in 0..<block.length { w.put(0, 8) }
             w.ue(2); w.put(254, 8)               // the required level 254 block
@@ -292,7 +300,8 @@ struct DoviRpuGuardTests {
     /// mandatory level 254 block, `cmv29Count` the declared CM v2.9 block count (no blocks follow it, so only 0 parses).
     /// `prevRpuId` replaces the `prev_vdr_rpu_id` encoding.
     static func craftUsePrev(cmv29Count: UInt64 = 0, cmv29Block: (length: UInt64, level: UInt64)? = nil,
-                             cmv40Block: (length: UInt64, level: UInt64)?, compressed: Bool = true,
+                             cmv40Block: (length: UInt64, level: UInt64)?,
+                             cmv40Lead: (length: UInt64, level: UInt64)? = nil, compressed: Bool = true,
                              currentDmMetadataId: ((inout BitWriter) -> Void)? = nil,
                              prevRpuId: ((inout BitWriter) -> Void)? = nil) -> [UInt8] {
         var w = BitWriter()
@@ -309,7 +318,8 @@ struct DoviRpuGuardTests {
         w.put(1, 1)                          // use_prev_vdr_rpu
         if let prevRpuId { prevRpuId(&w) } else { w.ue(0) }   // prev_vdr_rpu_id
         writeDM(&w, DMPayload(compressed: compressed, currentDmMetadataId: currentDmMetadataId,
-                              cmv29Count: cmv29Count, cmv29Block: cmv29Block, cmv40Block: cmv40Block))
+                              cmv29Count: cmv29Count, cmv29Block: cmv29Block, cmv40Block: cmv40Block,
+                              cmv40Lead: cmv40Lead))
         return seal(w.bytes)
     }
 
@@ -419,12 +429,84 @@ struct DoviRpuGuardTests {
         Self.expectRejected(Self.craftUsePrev(cmv40Block: (11, 8), compressed: false), "level 8 length 11, uncompressed")
     }
 
+    @Test("a level 253 block parses, and the walk continues past it to the blocks behind")
+    func level253() {
+        // L253 (filler, as Disney+ CM v4.0 RPUs carry it): libdovi 3.4.0 rejected the level, the vendored build
+        // parses up to 66 bytes. The guard walks past it, so a bad block behind one is still caught.
+        Self.expectAccepted(Self.craftUsePrev(cmv40Block: (66, 253)), "level 253, 66 bytes")
+        Self.expectAccepted(Self.craftUsePrev(cmv40Block: (10, 8), cmv40Lead: (12, 253)), "level 8 behind level 253")
+        Self.expectRejected(Self.craftUsePrev(cmv40Block: (11, 8), cmv40Lead: (12, 253)),
+                            "level 8 length 11 behind level 253")
+        Self.expectRejected(Self.craftUsePrev(cmv40Block: (11, 8), cmv40Lead: (12, 253), compressed: false),
+                            "same, uncompressed")
+        // Past libdovi's 66-byte cap it is a parse error, not an abort: not flagged, and libdovi refuses it.
+        let long = Self.craftUsePrev(cmv40Block: (67, 253))
+        #expect(Self.verdict(long) == (true, false))
+        let rpu = long.withUnsafeBufferPointer { DoviRpuGuard.parse($0.baseAddress!, $0.count) }
+        #expect(rpu == nil || dovi_rpu_get_error(rpu) != nil)
+        if let rpu { dovi_rpu_free(rpu) }
+    }
+
+    @Test("a level 253 block survives the Profile 8.1 rewrite")
+    func level253SurvivesConversion() throws {
+        let nal = Self.craftUsePrev(cmv40Block: (10, 8), cmv40Lead: (12, 253))
+        let rpu = try #require(nal.withUnsafeBufferPointer { DoviRpuGuard.parse($0.baseAddress!, $0.count) })
+        defer { dovi_rpu_free(rpu) }
+        let out = try #require(DoviRpuConverter.convertedUnspec62(rpu))
+        defer { dovi_data_free(out) }
+        let bytes = [UInt8](UnsafeBufferPointer(start: out.pointee.data, count: out.pointee.len))
+        let again = try #require(bytes.withUnsafeBufferPointer { DoviRpuGuard.parse($0.baseAddress!, $0.count) })
+        defer { dovi_rpu_free(again) }
+        let dm = try #require(dovi_rpu_get_vdr_dm_data(again))
+        defer { dovi_rpu_free_vdr_dm_data(dm) }
+        let l253 = try #require(dm.pointee.dm_data.level253)
+        #expect(l253.pointee.len == 12)
+        #expect(UnsafeBufferPointer(start: l253.pointee.data, count: l253.pointee.len).allSatisfy { $0 == 0x55 })
+        #expect(dm.pointee.dm_data.level8.len == 1)
+    }
+
     @Test("a non-empty CM v2.9 block list is walked to the CM v4.0 list behind it")
     func cmv29BlockWalk() {
         // Level 1 is a 5-byte CM v2.9 block.
         Self.expectAccepted(Self.craftUsePrev(cmv29Block: (5, 1), cmv40Block: (10, 8)), "valid")
         Self.expectRejected(Self.craftUsePrev(cmv29Block: (5, 1), cmv40Block: (11, 8)), "level 8 length 11 behind a level 1 block")
         Self.expectRejected(Self.craftUsePrev(cmv29Block: (5, 1), cmv40Block: (11, 8), compressed: false), "same, uncompressed")
+    }
+
+    @Test("a block libdovi carries without interpreting is walked past, and a bad block behind it is still caught",
+          arguments: [(3, 7), (5, 3), (1, 8)])
+    func carriedCmv29BlockWalk(length: Int, level: Int) {
+        // In the CM v2.9 list: a reserved level, the broadcast L3 (libdovi files L3 under CM v4.0) and a CM v4.0
+        // level. The vendored libdovi keeps each as its bytes instead of failing the RPU.
+        let block = (UInt64(length), UInt64(level))
+        Self.expectAccepted(Self.craftUsePrev(cmv29Block: block, cmv40Block: (10, 8)), "level \(level) in the v2.9 list")
+        Self.expectRejected(Self.craftUsePrev(cmv29Block: block, cmv40Block: (11, 8)),
+                            "level 8 length 11 behind a carried level \(level)")
+    }
+
+    @Test("a block outside the CM v4.0 set is carried there too, and the walk continues past it")
+    func carriedCmv40BlockWalk() {
+        Self.expectAccepted(Self.craftUsePrev(cmv40Block: (10, 8), cmv40Lead: (2, 200)), "reserved level 200")
+        Self.expectAccepted(Self.craftUsePrev(cmv40Block: (10, 8), cmv40Lead: (5, 1)), "a CM v2.9 level")
+        Self.expectRejected(Self.craftUsePrev(cmv40Block: (11, 8), cmv40Lead: (2, 200)),
+                            "level 8 length 11 behind a carried level 200")
+    }
+
+    @Test("a carried block survives the Profile 8.1 rewrite: the block count is unchanged")
+    func carriedBlockSurvivesConversion() throws {
+        let nal = Self.craftUsePrev(cmv29Block: (3, 7), cmv40Block: (10, 8), cmv40Lead: (2, 200))
+        let rpu = try #require(nal.withUnsafeBufferPointer { DoviRpuGuard.parse($0.baseAddress!, $0.count) })
+        defer { dovi_rpu_free(rpu) }
+        let out = try #require(DoviRpuConverter.convertedUnspec62(rpu))
+        defer { dovi_data_free(out) }
+        let bytes = [UInt8](UnsafeBufferPointer(start: out.pointee.data, count: out.pointee.len))
+        let again = try #require(bytes.withUnsafeBufferPointer { DoviRpuGuard.parse($0.baseAddress!, $0.count) })
+        defer { dovi_rpu_free(again) }
+        let dm = try #require(dovi_rpu_get_vdr_dm_data(again))
+        defer { dovi_rpu_free_vdr_dm_data(dm) }
+        // One CM v2.9 block (level 7), three CM v4.0 blocks (level 200, level 8, the required level 254).
+        #expect(dm.pointee.dm_data.num_ext_blocks == 4)
+        #expect(dm.pointee.dm_data.level8.len == 1)
     }
 
     @Test("level 9 and level 10 blocks of an undefined length are rejected, the defined ones are not",

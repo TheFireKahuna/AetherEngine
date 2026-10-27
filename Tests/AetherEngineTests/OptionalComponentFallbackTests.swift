@@ -5,10 +5,9 @@ import AetherLibavcodec
 import AetherLibavutil
 @testable import AetherEngine
 
-/// The object renderer, the dual-layer composer and the Dolby Vision still reshaping are compiled only
-/// with their package traits, all off by default. A build without one still accepts the option that asks
-/// for it, and the option changes nothing: object audio keeps the channel bridge, a Profile 7 source keeps
-/// the native route, a Profile 5 source yields no still. The track pick is pinned the same way in
+/// The object renderer and the Dolby Vision composer are compiled only with their package traits, all off by
+/// default. A build without one still accepts the option that asks for it, and the option changes nothing: object
+/// audio keeps the channel bridge, a Profile 7 source keeps the native route, a Profile 5 source yields no still. The track pick is pinned the same way in
 /// `AudioLanguageSelectionTests.withoutTraitNothingIsPreferred`.
 @Suite("Optional components fall back when their trait is off")
 struct OptionalComponentFallbackTests {
@@ -16,7 +15,7 @@ struct OptionalComponentFallbackTests {
     @Test("the runtime query reports each component as this build was compiled")
     func runtimeQueryMatchesTheBuild() {
         #expect(AetherEngine.OptionalComponent.allCases.map(\.traitName)
-                == ["TrueHDObjectAudio", "DTSXObjectAudio", "DualLayerDolbyVision", "DolbyVisionStillReshaping"])
+                == ["TrueHDObjectAudio", "DTSXObjectAudio", "DualLayerDolbyVision", "MLSubtitleUpscale"])
         #if TrueHDObjectAudio
         #expect(AetherEngine.OptionalComponent.trueHDObjectAudio.isBuiltIn)
         #else
@@ -31,11 +30,6 @@ struct OptionalComponentFallbackTests {
         #expect(AetherEngine.OptionalComponent.dualLayerDolbyVision.isBuiltIn)
         #else
         #expect(!AetherEngine.OptionalComponent.dualLayerDolbyVision.isBuiltIn)
-        #endif
-        #if DolbyVisionStillReshaping
-        #expect(AetherEngine.OptionalComponent.dolbyVisionStillReshaping.isBuiltIn)
-        #else
-        #expect(!AetherEngine.OptionalComponent.dolbyVisionStillReshaping.isBuiltIn)
         #endif
         #expect(AetherEngine.linksTrueHDObjectDecoder == AetherEngine.OptionalComponent.trueHDObjectAudio.isBuiltIn)
         #expect(DualLayerRouteDecision.isBuiltIn == AetherEngine.OptionalComponent.dualLayerDolbyVision.isBuiltIn)
@@ -85,10 +79,10 @@ struct OptionalComponentFallbackTests {
     }
     #endif
 
-    #if !DolbyVisionStillReshaping
+    #if !DualLayerDolbyVision
     /// The 64x64 HDR10 fixture with a Profile 5 record: its frames are what a Profile 5 decode hands
     /// the still path. Read as YCbCr, real Profile 5 planes are the green / magenta still of #103, so
-    /// without the reshaping the answer is no still at all, while the same frames without the record
+    /// without the composer the answer is no still at all, while the same frames without the record
     /// still make one.
     @MainActor
     @Test("a Dolby Vision Profile 5 frame yields no still; the same frames without the record do")

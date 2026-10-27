@@ -534,12 +534,10 @@ Sources/AetherEngine/
 │   └── FrameRateSnap.swift                  Snap to standard rates (23.976, 24, 25, 29.97, 30, 50, 59.94, 60)
 ├── FrameExtractor/
 │   ├── AetherEngine+FrameExtractor.swift    makeFrameExtractor() convenience for the currently loaded URL
-│   ├── DolbyVisionStillConverter.swift      `DolbyVisionStillReshaping` trait. Applies the RPU-carried DV colour transform to a DV P5 / P10.0 base-layer frame (IPT-PQ-C2, not YCbCr) so scrub stills lose the green + magenta cast (#103)
 │   ├── FrameExtractor.swift                 Off-playback still extraction actor: serial decode queue, cancel-supersede, idle-close
 │   ├── FrameDecodeContext.swift             Isolated FFmpeg demux + decode + sws_scale → CGImage (thumbnail / preview / snapshot)
 │   ├── FrameCache.swift                     Bounded LRU: mode-isolated stores, second-bucketed thumbnails
 │   ├── FrameTypes.swift                     FrameMode (.thumbnail / .preview / .snapshot)
-│   └── HDRToneMapper.swift                  zscale + tonemap libavfilter graph: HDR (PQ / HLG, BT.2020) stills → SDR BT.709
 ├── IO/
 │   ├── IOReader.swift                       Public custom byte-source protocol + MediaSource (load(source:) input)
 │   ├── DataIOReader.swift                   Ready-made in-memory IOReader over an immutable Data buffer
@@ -558,7 +556,6 @@ Sources/AetherEngine/
 │       ├── HLSCarriageProbe.swift           Reads a live source's video carriage from its playlist and the first segment's PMT, so the #168 verdict is available while the native mount is still inside its watchdog grace instead of seconds after it (#293, #296)
 │       └── LiveArrivalCadenceMeter.swift    Measures the observed segment-arrival cadence of a live upstream (interval between batches of new segments plus the currently open gap), the signal LL-HLS shaping trusts instead of a self-reported TARGETDURATION. The closed intervals are reported separately, because the seal may not be taken from a gap the first-serve gate is itself holding open (AE#447)
 ├── Native/
-│   ├── AudioLookahead.swift                 SW live feeder audio look-ahead pump policy + cursor state: audio lead decoupled from video decode pace, live-edge underrun rebuffer (#107)
 │   ├── Issue93ItemDeathRevive.swift         Bounded revive budget (`ItemDeathReviveGate`) for items killed by accumulated -12889 media timeouts (`failedToPlayToEndTime`, #93 round 3)
 │   ├── MasterFallbackDecision.swift         Pure master → media playlist fallback decision (#98, #130): maps a master-rejection item failure (-11868 external-SDR, -11848 HDR-on-SDR, -1002 all variants filtered at parse) to a reactive re-serve
 │   ├── NativeAVPlayerHost.swift             Native path: AVPlayer host bound to the loopback HLS-fMP4 URL; awaits real seek landing (deadline-bounded, first resume wins, #129), suppresses stale clock during in-flight seek
@@ -615,6 +612,7 @@ Sources/AetherEngine/
 │   ├── DoviRpuConverter.swift               libdovi RPU surgery for both routes. Native path: per-packet Profile 7 → 8.1 rewrite (convert type-62 RPU, drop type-63 EL). SW FEL path: `separateDualLayers` also lifts the EL into its own packet and returns the composer's reshaping parameters plus the 8.1 RPU attached as display metadata
 │   ├── DoviRpuConverter+Probe.swift         Diagnostic DV-conversion probe (`doviConvertProbe` / `DoviConvertProbeResult`), backs `aetherctl dovitest`
 │   ├── HEVCPictureOrderCount.swift          H.265 picture order count (8.3.1) of one layer from parameter sets and first slice headers, no decoding; nil for anything it cannot follow (#702)
+│   ├── DolbyVisionMasteringDisplay.swift    The HDR10 static metadata of the master an RPU reconstructs: level 9's primaries, level 6's or the source PQ range's luminance, level 6's light level
 │   ├── DoviDisplayMetadata.swift            SW FEL path (`DualLayerDolbyVision` trait): sets `DolbyVisionRPUData` (the Profile 8.1 RPU minus its NAL header) and `DolbyCompatibilityID` (the CFString "1", never a number) on every emitted buffer, or clears both; tvOS consumes them in backboardd
 │   ├── DoviDisplayMetadataDebug.swift       DEBUG-only pin test (`DualLayerDolbyVision` trait): substitutes a captured RPU on a duty cycle, the on-device consumption test
 │   ├── DoviRpuSurvey.swift                  L1 / L2 display-metadata survey over a title's RPUs (no decode, no GPU); backs `aetherctl dvsurvey`
@@ -623,6 +621,7 @@ Sources/AetherEngine/
 │   ├── Metal/                               `DualLayerDolbyVision` trait only
 │   │   ├── DoviFelComposer.swift            BL + EL + RPU composition: runtime-compiled pipelines, pooled P010 output, `composeAsync` bounded at `maxFramesInFlight` with completions on its own serial queue; RPU → `DoviMetalParams` parsing
 │   │   ├── DoviShaderSource.swift           Luma / chroma compose kernels (reshaping, inverse NLQ, bilinear EL upsampling, ordered dither) and the ABI layout probe, compiled at runtime
+│   │   ├── DoviIptConversion.swift          A profile 5 / AV1 10.0 RPU's display-management colour conversion (ycc_to_rgb with its offsets, rgb_to_lms, LMS to BT.2020) as `dovi_ipt_to_bt2020` takes it
 │   │   └── DoviMetalParams.swift            Swift mirror of the kernel parameter structs and their byte-exact serializer
 │   ├── Issue65LivelockBreakers.swift        Pure backpressure-wedge detection (`BackpressureWedgeDetector`) breaking the VOD HLS scrub-burst livelock (#65); `seekIsWedged` starvation check + `SeekResumeGuard` single-resume latch for the deadline-bounded seek
 │   ├── Issue99MuxerFailureRevive.swift      Bounded revive for a VOD pump that died with `muxerFailed` (#99): the first cut firing before any bridged audio reached the muxer (dec3 box) no longer ends the session

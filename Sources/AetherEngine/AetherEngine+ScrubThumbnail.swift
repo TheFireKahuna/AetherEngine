@@ -204,11 +204,11 @@ extension AetherEngine {
     /// the preview rather than show blank frames from a refused second-connection
     /// FrameExtractor (#106). It reports capability, not per-frame availability: transient
     /// nils from `scrubThumbnail` while a segment is still being produced are expected. False as well
-    /// on a Dolby Vision Profile 5 / 10.0 session in a build without the `DolbyVisionStillReshaping`
+    /// on a Dolby Vision Profile 5 / 10.0 session in a build without the `DualLayerDolbyVision`
     /// trait, where no frame can become a correct still; `scrubPreviewDrawsInView` covers that source.
     public var supportsCacheBackedStills: Bool {
-        if let session = nativeVideoSession { return session.yieldsStills }
         guard let softwareHost else { return false }
         return isLive || softwareHost.servesPacketCacheStills || softwareStillsFromLocalFile
+        nativeVideoSession?.yieldsStills ?? false
     }
 }

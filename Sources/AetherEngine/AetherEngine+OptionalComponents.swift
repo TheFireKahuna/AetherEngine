@@ -11,12 +11,10 @@ extension AetherEngine {
         case trueHDObjectAudio = "TrueHDObjectAudio"
         /// DTS:X height and object rendering for `LoadOptions.objectAudioRendering` (trait `DTSXObjectAudio`).
         case dtsxObjectAudio = "DTSXObjectAudio"
-        /// Profile 7 FEL dual-layer composition for `LoadOptions.preferDualLayerDolbyVision`
-        /// (trait `DualLayerDolbyVision`).
+        /// The Dolby Vision composer (trait `DualLayerDolbyVision`): Profile 7 FEL dual-layer composition for
+        /// `LoadOptions.preferDualLayerDolbyVision`, and the stills (scrub thumbnails, I-frame stills) of Profile 5 /
+        /// 10.0 sources, which have no base layer to show.
         case dualLayerDolbyVision = "DualLayerDolbyVision"
-        /// Stills (scrub thumbnails, I-frame stills, held pictures) of Dolby Vision Profile 5 / 10.0
-        /// sources, which have no base layer to show (trait `DolbyVisionStillReshaping`).
-        case dolbyVisionStillReshaping = "DolbyVisionStillReshaping"
 
         /// The package trait that compiles the component.
         public var traitName: String { rawValue }
@@ -42,8 +40,6 @@ extension AetherEngine {
                 #else
                 return false
                 #endif
-            case .dolbyVisionStillReshaping:
-                #if DolbyVisionStillReshaping
                 return true
                 #else
                 return false
