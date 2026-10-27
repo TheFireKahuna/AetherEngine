@@ -495,6 +495,7 @@ Sources/AetherEngine/
 │   ├── SubtitleOCRPendingState.swift        Pending-composition end resolution for the OCR worker, mirroring the sidecar semantics: a composition still open at the next composition or clear event ends at that event's PTS
 │   ├── WebVTTCueSettings.swift              WebVTT cue settings (`line`, `position`, `align`) mapped onto `SubtitleTextPlacement`: libavcodec's decoder drops them from the ASS line it synthesises, the demuxer keeps them as packet side data (#233)
 │   └── WebVTTSegmentParser.swift            One parsed WebVTT segment of a live SUBTITLES rendition: cue times are in the segment's own local clock (a counter providers run for days), and placement comes from the playlist geometry rather than the `X-TIMESTAMP-MAP` the spec offers (#359)
+│   ├── FilmGrain.h                          AV1 film grain: the synthesis kernels by role (templates, scaling tables, block offsets) and the per-sample grain the finisher reads through
 ├── Video/
 │   ├── HLSVideoEngine.swift                 Native path: session orchestrator (start/stop, producer construction + restart, shift handling)
 │   ├── HLSVideoEngine+AudioRoute.swift      Native path: stream-copy -> bridge -> video-only audio cascade

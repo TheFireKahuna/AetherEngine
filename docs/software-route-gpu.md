@@ -243,6 +243,98 @@ during the diagnosis was not committed.
 wrong-field-order control all play as the legend says; 50 / 25 pictures a second shown, none dropped. **Open:** timings
 per frame on the M4 and the A15.
 
+## Part 5. AV1 film grain on the GPU (built)
+
+The last CPU pass over a software-decoded picture: dav1d applies grain by default, writing a second, grained copy
+of every picture. The target is the specification's Option 1, bit for bit.
+
+### 5.1 What the specification requires
+
+- **Normative status** (AV1 7.2): with `film_grain_params_present`, "a decoder shall implement a film grain synthesis
+  process"; a conformant decoder either produces output "identical in all respects ... including applying the exact
+  film grain synthesis process as specified in section 7.18.3" (Option 1), or keeps the pre-grain picture identical
+  and adds grain with no "perceptually significant differences" (Option 2, defined by whoever accredits). Skipping it
+  is not conformant. We take Option 1.
+- **Output only** (7.18, 7.20): references store the pre-grain picture; grain is applied to `OutY/U/V` alone.
+- **Parameters per shown frame** (5.9.30, 6.8.20): `update_grain = 0` loads a reference's set except `grain_seed`;
+  `show_existing_frame` loads the shown frame's set with its seed (the same pattern repeats). dav1d resolves all of it;
+  FFmpeg's `AV_FRAME_DATA_FILM_GRAIN_PARAMS` (`AVFilmGrainAOMParams`) carries the final set with the offsets already
+  removed (`ar_coeffs`, `uv_mult`, `uv_mult_luma` less 128, `uv_offset` less 256, `scaling_shift` and
+  `ar_coeff_shift` with their 8 and 6 added), `limit_output_range` = `clip_to_restricted_range`. `MC_IDENTITY` has no
+  field: it is the frame's own matrix (`AVCOL_SPC_RGB`).
+- **The process** (7.18.3, unchanged since 2018; no normative errata):
+  1. A 16-bit LFSR (`get_random_number`) seeded with `grain_seed` draws from `Gaussian_Sequence` (2048 entries) into
+     an 82 x 73 luma template, shifted by `12 - BitDepth + grain_scale_shift` with `Round2`; Cb and Cr from seeds
+     `grain_seed ^ 0xb524` / `^ 0x49d8`, 44 x 38 (4:2:0), 44 x 73 (4:2:2) or 82 x 73. A plane with no points draws
+     nothing.
+  2. A causal auto-regressive filter of lag 0..3 (24 luma, 25 chroma coefficients, the last the luma correlation),
+     in place, raster order, from (3, 3) to (w - 3, h), `Round2(sum, ar_coeff_shift)`, clipped to
+     `GrainMin..GrainMax` (`-128..127` scaled by `BitDepth - 8`). Chroma reads the filtered luma template, averaged over
+     its subsampling with `Round2`.
+  3. Scaling: a 256-entry piecewise-linear LUT per plane (`delta = deltaY * ((65536 + (deltaX >> 1)) / deltaX)`,
+     divide first), read at higher depths by `scale_lut`, which interpolates between entries with `Round2`.
+  4. Per 32 x 32 luma block, one 8-bit draw from a stripe LFSR re-seeded every 32 rows from `grain_seed` and the
+     stripe number gives `offsetX = rand >> 4`, `offsetY = rand & 15`, shared by all planes (template origin
+     `9 + 2 * offset`, or `6 + offset` on a subsampled axis). With `overlap_flag`, two columns (one subsampled) blend
+     with the left block at 27 / 17 and 17 / 27 (23 / 22 subsampled), `Round2(, 5)` and clip; then two rows with the
+     block above, the same way. Horizontal first, then vertical, each rounded and clipped.
+  5. Chroma before luma, from the un-noised luma: `averageLuma` is the top luma row of the pair, averaged
+     horizontally (`lumaNextX = Min(lumaX + 1, w - 1)` at an odd right edge); with `chroma_scaling_from_luma` it indexes
+     the LUT directly, otherwise `Clip1(((averageLuma * cb_luma_mult + orig * cb_mult) >> 6) + (cb_offset << (BitDepth - 8)))`.
+     `noise = Round2(scale_lut(v) * grain, ScalingShift)`, the sample clipped to `0..2^BitDepth - 1`, or with
+     `clip_to_restricted_range` to `16..235` (`240` chroma, `235` under `MC_IDENTITY`) scaled to the depth.
+  6. Edge cases the spec defines: partial blocks at the right and bottom, odd sizes, monochrome (luma only),
+     `num_y_points = 0` (luma untouched, not even clipped), chroma clipped whenever `chroma_scaling_from_luma` is set,
+     even with zero noise.
+
+### 5.2 Sources and licences
+
+- **The specification is the normative reference** (7.18.3 and its `Gaussian_Sequence` table); **dav1d's C
+  (`src/filmgrain_tmpl.c`, `src/fg_apply_tmpl.c`, BSD-2-Clause) is the implementation reference**, derived from where it
+  is the clearer statement. Its layout is already the GPU's (templates once per frame, the LUTs expanded to every code
+  value, application per sample), and its fix history is the list of traps: divide before multiply in the LUT,
+  chroma from un-noised luma, the high-depth LUT index, odd edges, the clip-only case. BSD-2 sits inside the engine:
+  it permits App Store distribution already, so the exception is not needed for it. The derived files carry dav1d's
+  notice (© 2018 Niklas Haas, © 2018 VideoLAN and dav1d authors, © 2018 Two Orioles, LLC; both clauses and the
+  disclaimer) beside the engine's header, and the app's acknowledgements carry it too.
+- **Not derived from FFmpeg's applier** (`libavcodec/aom_film_grain*.c`, LGPL-2.1+, itself a port of dav1d's C):
+  outside what the exception can cover, and dav1d's original says the same under BSD-2. Reading `AVFilmGrainParams`
+  through FFmpegBuild's headers is use of its API, as everywhere.
+- **dav1d and libaom are also the oracles**: dav1d applies grain itself and is verified bit exact on the Argon
+  streams (`md5_ref`).
+- **Patents**: the same position as decoding AV1 at all (the engine ships dav1d already). The AOM Patent License 1.0
+  covers AOM licensors and asks for its text in source and binary notices, which neither FFmpegBuild (`LICENSES/` has
+  dav1d's BSD-2 only) nor the engine ships today: add it. Sisvel's AV1 pool claims essential patents; the one
+  film-grain patent found (Dolby, EP 3678097) was revoked by the EPO in 2022. Not legal advice.
+
+### 5.3 Design
+
+- **Decoder**: `AV_CODEC_EXPORT_DATA_FILM_GRAIN` on libdav1d (the wrapper then turns `apply_grain` off,
+  `libdav1d.c:280`); each frame's `AV_FRAME_DATA_FILM_GRAIN_PARAMS` travels with it to the finisher.
+- Integer arithmetic in `int32` throughout (AR sums reach about 6.3 million, the 12-bit chroma combination about
+  1 million). `Round2` and `>> 6` of a negative value need floor semantics: tested explicitly, not assumed of MSL.
+
+### 5.4 Conformance
+
+1. **Argon streams** (streams.videolan.org/argon): every profile, depth, subsampling, monochrome, odd size and clip
+   case, with `md5_ref` (grain applied) per stream. dav1d with grain off, our grained planes, the same md5.
+2. **libaom's vectors** `av1-1-b8-23-film_grain-50.ivf` and `av1-1-b10-23-film_grain-50.ivf`.
+3. **Targeted streams** from SVT-AV1 4.2.0's `--fgs-table` (every lag, overlap on and off, chroma from luma, the
+   restricted range, odd sizes, 8 and 10 bit), against Homebrew dav1d 1.5.4 with `--filmgrain 1` (the version
+   FFmpegBuild ships).
+4. **The fused path**: the finisher fed an ungrained picture and its parameters equals the finisher fed the oracle's
+   grained picture, output code for output code.
+
+### 5.5 Built and measured
+
+- A15 (offline counts, `research/a15-registers`): the synthesis kernels 8 to 24 registers; the grained finish 16 to 18 at 8, 10
+- The four others are not grain: FFmpeg's `libdav1d_init_params` (upstream master too) updates the colourspace only
+  when a sequence header carries a colour description, so a later header without one keeps the earlier matrix
+  instead of AV1's `MC_UNSPECIFIED`. Frames after such a switch arrive labelled RGB (and as `gbrp` at 4:4:4), so
+  `MC_IDENTITY`'s 235 chroma limit is taken where dav1d takes 240. Decoded with each frame's true matrix, every frame
+  of the four matches (the mismatching frames under "identity" and under "not identity" never overlap). The same stale
+  label misreads such frames for display. The fix is in FFmpegBuild: assign the sequence's values unconditionally
+  (dav1d already writes UNKNOWN when the description is absent), and `DAV1D_CHR_UNKNOWN` to `AVCHROMA_LOC_UNSPECIFIED`.
 
 ## Part 6. Film in interlaced carriage: soft telecine, field matching, decimation (built, verified on device)
 
@@ -428,6 +520,10 @@ joins whose container already carries the first part's colour for every player, 
 CODECS stay as the master declared them at load.
 
 LibDeinterlace 2.0.1 and LibMLSubUpscaler 2.0.0 ship as committed XCFrameworks (tvOS, iOS, macOS, visionOS, devices
+<archive>`), on Metal 3 the device. Functions that read no function constant (the grain synthesis kernels, `pf_cl_prepare`,
+telecine's variants of the 8-bit planar ones; with grain's synthesis and decimate's gate, 80 pipelines, and the FEL
+Release, records those 92 with a Metal 4 compiler (`ShaderHarvest`) and translates them for the A15 on tvOS 27.0 into
+new tvOS release. On the Mac, the same chain translated for its own GPU served every pipeline of the set (88 then) from the archive.
 ## Banked
 
 - **Zero-copy rawvideo** by allocating its packets in slabs. Worth it only if a local or loopback producer ever feeds
@@ -445,3 +541,5 @@ LibDeinterlace 2.0.1 and LibMLSubUpscaler 2.0.0 ship as committed XCFrameworks (
   across it). The live ones need a probe sequence that serves a growing MPEG-TS.
 - **ICtCp tagging** relies on CoreVideo's own `ITU_R_2100_ICtCp` tag (code point 14, absent from the public headers);
   whether tvOS's display layer decodes it correctly is untested.
+5. Done (5.3): grain synthesis split by role, in a pass of its own beside the field bwdif; 29% less GPU time for a
+   lag-3 4:2:0 set on the M4 Pro.

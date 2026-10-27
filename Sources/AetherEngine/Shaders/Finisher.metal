@@ -40,6 +40,7 @@ constant uint FC_MATRIX        [[function_constant(28)]];
 constant uint FC_BITDEPTH_RGB  [[function_constant(29)]];
 // Constant luminance: the stream's TransferCharacteristics (1, 4, 5, 6, 7, 8, 13, 14, 15, 16 or 18).
 constant uint FC_TRANSFER      [[function_constant(30)]];
+constant bool FC_GRAIN         [[function_constant(31)]];
 // The source is one of two pictures of one layout, chosen on the GPU (inverse telecine's window passes its weave
 // through): `alt` when the word at `chosen` is nonzero.
 constant bool FC_CHOSEN_SOURCE [[function_constant(32)]];
@@ -262,9 +263,58 @@ static inline uint pf_read(device const uchar* src, constant PFFrame& f,
     return pf_read_row(src + f.plane_offset[plane] + y * f.linesize[plane], step, offset, shift, depth, x);
 }
 
+// Components 0...2 as decoded.
+static inline uint pf_r0(device const uchar* s, constant PFFrame& f, uint x, uint y) {
+    return pf_read(s, f, FC_C0_PLANE, FC_C0_STEP, FC_C0_OFFSET, FC_C0_SHIFT, FC_C0_DEPTH, x, y);
+}
+static inline uint pf_r1(device const uchar* s, constant PFFrame& f, uint x, uint y) {
+    return pf_read(s, f, FC_C1_PLANE, FC_C1_STEP, FC_C1_OFFSET, FC_C1_SHIFT, FC_C1_DEPTH, x, y);
+}
+static inline uint pf_r2(device const uchar* s, constant PFFrame& f, uint x, uint y) {
+    return pf_read(s, f, FC_C2_PLANE, FC_C2_STEP, FC_C2_OFFSET, FC_C2_SHIFT, FC_C2_DEPTH, x, y);
+}
 
+// The picture and the film grain tables (bound to a placeholder when FC_GRAIN is off).
 static inline device const uchar* pf_source(device const uchar* src, device const uchar* alt, device const uint* chosen) {
     return FC_CHOSEN_SOURCE && chosen[0] != 0u ? alt : src;
+}
+
+struct pf_src {
+    device const uchar* p;
+    device const uchar* g;
+};
+
+// The sample of plane `plane` at (x, y), as decoded: the component that lives there (for GBR, plane 0 is G).
+static inline uint pf_plane_sample(pf_src s, constant PFFrame& f, uint plane, uint x, uint y) {
+    if (FC_C0_PLANE == plane) { return pf_r0(s.p, f, x, y); }
+    if (FC_C1_PLANE == plane) { return pf_r1(s.p, f, x, y); }
+    return pf_r2(s.p, f, x, y);
+}
+
+
+// A sample of plane `plane` with its film grain. Grain is a property of the plane (AV1's planes 0, 1, 2), not of the
+// component the finisher reads it as. Chroma takes the un-noised luma at its site. Kept inline: outlined, it is a call
+// with a stack frame from every sample read.
+static inline __attribute__((always_inline)) uint pf_grained(pf_src s, constant PFFrame& f, uint plane, uint v, uint x, uint y) {
+    if (plane == 0u) { return fg_luma(s.g, v, x, y); }
+    uint lx = x << FC_SRC_LOG2_W, ly = y << FC_SRC_LOG2_H;
+    uint average = pf_plane_sample(s, f, 0u, lx, ly);
+    if (FC_SRC_LOG2_W != 0u) { average = (average + pf_plane_sample(s, f, 0u, min(lx + 1u, f.width - 1u), ly) + 1u) >> 1; }
+    return fg_chroma(s.g, plane - 1u, v, average, FC_SRC_LOG2_W, FC_SRC_LOG2_H, x, y);
+}
+
+// Components 0...2 as shown: with their grain under FC_GRAIN.
+static inline uint pf_c0(pf_src s, constant PFFrame& f, uint x, uint y) {
+    uint v = pf_r0(s.p, f, x, y);
+    return FC_GRAIN ? pf_grained(s, f, FC_C0_PLANE, v, x, y) : v;
+}
+static inline uint pf_c1(pf_src s, constant PFFrame& f, uint x, uint y) {
+    uint v = pf_r1(s.p, f, x, y);
+    return FC_GRAIN ? pf_grained(s, f, FC_C1_PLANE, v, x, y) : v;
+}
+static inline uint pf_c2(pf_src s, constant PFFrame& f, uint x, uint y) {
+    uint v = pf_r2(s.p, f, x, y);
+    return FC_GRAIN ? pf_grained(s, f, FC_C2_PLANE, v, x, y) : v;
 }
 
 // MARK: - Codes at the output depth
@@ -331,6 +381,35 @@ static inline int4 pf_cubic8(int k) {
 }
 
 // Source chroma (components 1, 2) at output chroma sample `o`, as exact numerators over 2^20 (2^10 per axis).
+static inline long2 pf_resample(pf_src s, constant PFFrame& f, uint2 o) {
+    if (FC_SRC_LOG2_W == FC_OUT_LOG2_W && FC_SRC_LOG2_H == FC_OUT_LOG2_H) {
+        return long2(long(pf_c1(s, f, o.x, o.y)), long(pf_c2(s, f, o.x, o.y))) << 20;
+    }
+    int src_w = int((f.width + (1u << FC_SRC_LOG2_W) - 1u) >> FC_SRC_LOG2_W);
+    int src_h = int((f.height + (1u << FC_SRC_LOG2_H) - 1u) >> FC_SRC_LOG2_H);
+    // Source coordinate in eighths: 8 * ( site_out - site_src(0) ) / 2^src_log2, sites in half samples.
+    // Both divisions are exact (4 / 2^src_log2 is whole); the floor of a negative coordinate is taken by removing
+    // its phase first, so nothing depends on how a signed shift rounds.
+    int ux8 = 4 * (pf_site2(int(o.x), FC_OUT_LOG2_W, false) - pf_site2(0, FC_SRC_LOG2_W, false)) / (1 << FC_SRC_LOG2_W);
+    int uy8 = 4 * (pf_site2(int(o.y), FC_OUT_LOG2_H, true) - pf_site2(0, FC_SRC_LOG2_H, true)) / (1 << FC_SRC_LOG2_H);
+    int x0 = (ux8 - (ux8 & 7)) / 8, y0 = (uy8 - (uy8 & 7)) / 8;
+    int4 wx = FC_SRC_LOG2_W == FC_OUT_LOG2_W ? int4(0, 1024, 0, 0) : pf_cubic8(ux8 & 7);
+    int4 wy = FC_SRC_LOG2_H == FC_OUT_LOG2_H ? int4(0, 1024, 0, 0) : pf_cubic8(uy8 & 7);
+    long2 sum = 0;
+    for (int j = 0; j < 4; ++j) {
+        if (wy[j] == 0) { continue; }
+        uint sy = uint(clamp(y0 - 1 + j, 0, src_h - 1));
+        // Four taps of at most 1024 times a 16-bit code stay inside 32 bits.
+        int2 row = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (wx[i] == 0) { continue; }
+            uint sx = uint(clamp(x0 - 1 + i, 0, src_w - 1));
+            row += wx[i] * int2(int(pf_c1(s, f, sx, sy)), int(pf_c2(s, f, sx, sy)));
+        }
+        sum += long(wy[j]) * long2(row);
+    }
+    return sum;
+}
 
 // A resampled chroma value (numerator over 2^20, clamped to the source's codes) as an output word, exactly:
 // video range Round( c * 2^(T - d) ) with the fraction bits, full range (37) with the real value.
@@ -347,6 +426,14 @@ static inline uint pf_resampled_word(long c, uint d) {
 
 // MARK: - RGB
 
+static inline int3 pf_rgb_codes(pf_src s, constant PFFrame& f, uint x, uint y) {
+    if (FC_PALETTE) {
+        // AV_PIX_FMT_PAL8: an index into 256 native-endian ARGB words in plane 1.
+        uint e = *(device const uint*)(s.p + f.plane_offset[1] + pf_r0(s.p, f, x, y) * 4u);
+        return int3(int((e >> 16) & 0xFFu), int((e >> 8) & 0xFFu), int(e & 0xFFu));
+    }
+    return int3(int(pf_c0(s, f, x, y)), int(pf_c1(s, f, x, y)), int(pf_c2(s, f, x, y)));
+}
 
 // MARK: - Transfer characteristics (H.273 Table 3), for constant luminance
 
@@ -588,6 +675,19 @@ static inline uint3 pf_round_codes_df(thread pf_df* words) {
 constant uint PF_SRC_BW = 1u << FC_SRC_LOG2_W;
 constant uint PF_SRC_BH = 1u << FC_SRC_LOG2_H;
 
+static inline void pf_load_window(pf_src s, constant PFFrame& f, uint2 g, thread int2 (&w)[5][5]) {
+    int src_w = int((f.width + PF_SRC_BW - 1u) >> FC_SRC_LOG2_W);
+    int src_h = int((f.height + PF_SRC_BH - 1u) >> FC_SRC_LOG2_H);
+    for (int j = 0; j < 5; ++j) {
+        if (PF_SRC_BH == 1u && j != 2) { continue; }
+        uint sy = uint(clamp(int(g.y) - 2 + j, 0, src_h - 1));
+        for (int i = 0; i < 5; ++i) {
+            if (PF_SRC_BW == 1u && i != 2) { continue; }
+            uint sx = uint(clamp(int(g.x) - 2 + i, 0, src_w - 1));
+            w[j][i] = int2(int(pf_c1(s, f, sx, sy)), int(pf_c2(s, f, sx, sy)));
+        }
+    }
+}
 
 // Chroma at pixel p from the window around source sample g: pf_resample's exact numerators over 2^20.
 static inline long2 pf_window_sample(thread int2 (&w)[5][5], uint2 g, uint2 p) {
@@ -646,6 +746,101 @@ static inline uint3 pf_convert_codes(constant PFFrame& f, long y, long2 c) {
 
 // MARK: - Kernel
 
+kernel void pf_finish(device const uchar*            src     [[buffer(0)]],
+                      constant PFFrame&               f       [[buffer(1)]],
+                      device atomic_uint*             list    [[buffer(2)]],
+                      device const pf_luma_entry*     lut     [[buffer(4)]],
+                      device const uchar*             grain   [[buffer(5)]],
+                      device const uchar*             alt     [[buffer(6)]],
+                      device const uint*              chosen  [[buffer(7)]],
+                      texture2d<uint, access::write>  out_y   [[texture(0)]],
+                      texture2d<uint, access::write>  out_c   [[texture(1)]],
+                      uint2                           gid     [[thread_position_in_grid]]) {
+    pf_src s = pf_src{pf_source(src, alt, chosen), grain};
+    if (FC_MODE == 4u || FC_MODE == 5u) {
+        // gid is a source chroma sample; its block of pixels.
+        uint2 base = gid * uint2(PF_SRC_BW, PF_SRC_BH);
+        if (base.x >= f.width || base.y >= f.height) { return; }
+        int2 window[5][5];
+        pf_load_window(s, f, gid, window);
+        uint flagged = 0u;  // bit k: the block's pixel k needs the exact recompute
+        for (uint j = 0u; j < PF_SRC_BH; ++j) {
+            for (uint i = 0u; i < PF_SRC_BW; ++i) {
+                uint2 p = base + uint2(i, j);
+                if (p.x >= f.width || p.y >= f.height) { continue; }
+                uint y = pf_c0(s, f, p.x, p.y);
+                long2 c = pf_window_sample(window, gid, p);
+                if (FC_MODE == 4u) {
+                    pf_write_codes(out_y, out_c, p, pf_convert_codes(f, long(y), c));
+                } else if (PF_EXACT_ONLY) {
+                    pf_luma_entry e = lut[y];
+                    pf_df ey, epb, epr, words[3];
+                    pf_cl_signals(f, e, c, ey, epb, epr);
+                    pf_cl_exact(ey, epb, epr, pf_df{e.ly.x, e.ly.y}, f, words);
+                    pf_write_codes(out_y, out_c, p, pf_round_codes_df(words));
+                } else {
+                    float fast[3], errors[3];
+                    pf_cl_fast(f, lut[y], c, fast, errors);
+                    pf_write_codes(out_y, out_c, p, uint3(pf_round_f(fast[0], PF_Y_MAX), pf_round_f(fast[1], PF_C_MAX),
+                                                          pf_round_f(fast[2], PF_C_MAX)));
+                    // A word within twice its error bound of a rounding tie is recomputed exactly.
+                    bool flag = false;
+                    for (uint k = 0u; k < 3u; ++k) { flag = flag || pf_near_tie_f(fast[k], 2.0f * errors[k]); }
+                    if (flag && f.tie_bound > 0.0f) { flagged |= 1u << (j * PF_SRC_BW + i); }
+                }
+            }
+        }
+        if (FC_MODE == 5u && !PF_EXACT_ONLY) {
+            // One atomic per SIMD group: the flagged pixels take consecutive slots from the group's single add.
+            uint mine = popcount(flagged);
+            uint before = simd_prefix_exclusive_sum(mine);
+            uint total = simd_sum(mine);
+            uint slot = 0u;
+            if (simd_is_first() && total > 0u) { slot = atomic_fetch_add_explicit(&list[0], total, memory_order_relaxed); }
+            slot = simd_broadcast_first(slot) + before;
+            for (uint k = 0u; k < PF_SRC_BW * PF_SRC_BH; ++k) {
+                if ((flagged & (1u << k)) == 0u) { continue; }
+                if (slot < f.list_capacity) {
+                    uint2 p = base + uint2(k % PF_SRC_BW, k / PF_SRC_BW);
+                    atomic_store_explicit(&list[1u + slot], p.x | (p.y << 16), memory_order_relaxed);
+                }
+                ++slot;
+            }
+        }
+        return;
+    }
+    if (gid.x >= f.chroma_width || gid.y >= f.chroma_height) { return; }
+    uint cb, cr;
+    if (FC_MODE == 3u) {
+        // RGB goes out 4:4:4: one pixel, all three outputs from one read.
+        int3 c = pf_rgb_codes(s, f, gid.x, gid.y);
+        pf_df r = pf_df{float(c.x), 0.0f}, g = pf_df{float(c.y), 0.0f}, b = pf_df{float(c.z), 0.0f};
+        out_y.write(uint4(pf_container(pf_affine_word(f, 0u, r, g, b, PF_WORD_MAX), gid.x, gid.y)), gid);
+        cb = pf_affine_word(f, 1u, r, g, b, PF_WORD_MAX);
+        cr = pf_affine_word(f, 2u, r, g, b, PF_WORD_MAX);
+    } else {
+        uint2 base = gid * uint2(PF_BLOCK_W, PF_BLOCK_H);
+        for (uint j = 0u; j < PF_BLOCK_H; ++j) {
+            for (uint i = 0u; i < PF_BLOCK_W; ++i) {
+                uint2 p = base + uint2(i, j);
+                if (p.x < f.width && p.y < f.height) {
+                    out_y.write(uint4(pf_container(pf_luma_word(pf_c0(s, f, p.x, p.y), FC_C0_DEPTH), p.x, p.y)), p);
+                }
+            }
+        }
+        if (FC_MODE == 2u) {
+            cb = cr = 1u << (FC_TARGET_BITS - 1u + FC_FRACTION_BITS);
+        } else if (FC_MODE == 1u) {
+            long2 c = pf_resample(s, f, gid);
+            cb = pf_resampled_word(c.x, FC_C1_DEPTH);
+            cr = pf_resampled_word(c.y, FC_C2_DEPTH);
+        } else {
+            cb = pf_chroma_word(pf_c1(s, f, gid.x, gid.y), FC_C1_DEPTH);
+            cr = pf_chroma_word(pf_c2(s, f, gid.x, gid.y), FC_C2_DEPTH);
+        }
+    }
+    out_c.write(uint4(pf_container(cb, 2u * gid.x, gid.y), pf_container(cr, 2u * gid.x + 1u, gid.y), 0u, 0u), gid);
+}
 
 // The pixels the fast path flagged, as indirect dispatch arguments for pf_cl_correct (64 threads a group).
 kernel void pf_cl_prepare(device atomic_uint* list [[buffer(2)]], device uint* arguments [[buffer(3)]],
@@ -657,3 +852,24 @@ kernel void pf_cl_prepare(device atomic_uint* list [[buffer(2)]], device uint* a
 }
 
 // Each flagged pixel recomputed in double-float, overwriting the fast path's words.
+kernel void pf_cl_correct(device const uchar*            src     [[buffer(0)]],
+                          constant PFFrame&               f       [[buffer(1)]],
+                          device atomic_uint*             list    [[buffer(2)]],
+                          device const pf_luma_entry*     lut     [[buffer(4)]],
+                          device const uchar*             grain   [[buffer(5)]],
+                          device const uchar*             alt     [[buffer(6)]],
+                          device const uint*              chosen  [[buffer(7)]],
+                          texture2d<uint, access::write>  out_y   [[texture(0)]],
+                          texture2d<uint, access::write>  out_c   [[texture(1)]],
+                          uint                            gid     [[thread_position_in_grid]]) {
+    pf_src s = pf_src{pf_source(src, alt, chosen), grain};
+    uint count = min(atomic_load_explicit(&list[0], memory_order_relaxed), f.list_capacity);
+    if (gid >= count) { return; }
+    uint packed = atomic_load_explicit(&list[1u + gid], memory_order_relaxed);
+    uint2 p = uint2(packed & 0xFFFFu, packed >> 16);
+    pf_luma_entry e = lut[pf_c0(s, f, p.x, p.y)];
+    pf_df ey, epb, epr, words[3];
+    pf_cl_signals(f, e, pf_resample(s, f, p), ey, epb, epr);
+    pf_cl_exact(ey, epb, epr, pf_df{e.ly.x, e.ly.y}, f, words);
+    pf_write_codes(out_y, out_c, p, pf_round_codes_df(words));
+}
