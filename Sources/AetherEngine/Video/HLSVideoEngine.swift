@@ -2116,6 +2116,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 )
             } else {
                 initialProducerBaseIndex = segmentIndexForPlaylistTime(startSeconds)
+                // The overlay's first run starts where AVPlayer will, before AVPlayer has a clock to say so.
+                overlayDecodeTap?.noteStart(at: startSeconds)
+                #if DualLayerDolbyVision
+                felTap?.noteStart(at: startSeconds)
+                #endif
                 EngineLog.emit(
                     "[HLSVideoEngine] initial producer anchored at idx=\(initialProducerBaseIndex) "
                     + "(startPosition=\(String(format: "%.2f", startSeconds))s)",

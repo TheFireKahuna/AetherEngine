@@ -1,3 +1,4 @@
+import AVFoundation
 import Combine
 import Foundation
 
@@ -11,8 +12,10 @@ extension AetherEngine {
         softwareOverlay = nil
         softwarePiPSource = nil
         overlaySubtitleCues = nil
+        followReportedTime(of: nil)
         defer { followOverlayWithExternalPlayback() }
         guard let item = currentAVPlayerItem, let source = makeOverlaySource() else { return }
+        followReportedTime(of: item)
         let renderer = SoftwareOverlayRenderer(item: item, source: source)
         renderer.start()
         softwareOverlay = renderer
@@ -21,6 +24,19 @@ extension AetherEngine {
         overlaySubtitleCues = Publishers.CombineLatest($subtitleCues, $secondarySubtitleCues)
             .sink { [weak self] primary, secondary in self?.syncOverlaySubtitles(cues: primary + secondary) }
         EngineLog.emit("[AetherEngine] software overlay attached to the native item", category: .engine)
+    }
+
+    /// The overlay's decode follows where AVPlayer reports it is, a seek's target included before the seek's segment
+    /// arrives, to know the picture a run starts on (`OverlayRunStart`).
+    private func followReportedTime(of item: AVPlayerItem?) {
+        let read: (@Sendable () -> Double?)? = item.map { item in
+            let reported = ReportedItemTime(item)
+            return { reported.seconds() }
+        }
+        nativeVideoSession?.overlayDecodeTap?.follow(reportedTime: read)
+        #if DualLayerDolbyVision
+        nativeVideoSession?.felTap?.follow(reportedTime: read)
+        #endif
     }
 
     /// A placeholder stream must never reach an AirPlay receiver: AVPlayer's external playback stays off while the
@@ -56,4 +72,11 @@ extension AetherEngine {
         #endif
         return nil
     }
+}
+
+/// An item's `currentTime()` for a thread other than the main actor (#134: a synchronous call into the media server).
+private final class ReportedItemTime: @unchecked Sendable {
+    private weak var item: AVPlayerItem?
+    init(_ item: AVPlayerItem) { self.item = item }
+    func seconds() -> Double? { item?.currentTime().seconds }
 }

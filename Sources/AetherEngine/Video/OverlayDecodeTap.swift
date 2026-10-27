@@ -57,28 +57,39 @@ final class OverlayDecodeTap: @unchecked Sendable {
     func close() { units.close() }
 
     /// Keeps a copy of the source video packet `packet` (output timestamps, decode order) before the placeholder
-    /// replaces it. `shiftSeconds` is the producer run's offset from the item axis to the source axis.
+    /// replaces it; `opensRun` for a producer's first. `shiftSeconds` is the producer run's offset from the item axis
+    /// to the source axis.
     ///
-    /// A run's first unit is where AVPlayer's clock is about to be (a load, a resume, a seek), so before the player
-    /// moves the clock itself the decode works toward it.
-    func keep(_ packet: UnsafePointer<AVPacket>, timeBase: AVRational, shiftSeconds: Double) {
+    /// A run opens where AVPlayer is about to start (a load, a resume, a seek), so the decode works toward the picture
+    /// it starts on (`OverlayRunStart`).
+    func keep(_ packet: UnsafePointer<AVPacket>, opensRun: Bool, timeBase: AVRational, shiftSeconds: Double) {
         guard packet.pointee.pts != Int64.min, let copy = av_packet_clone(packet) else { return }
         let seconds = Double(packet.pointee.pts) * av_q2d(timeBase)
-        let playerIdle = runStart.noteUnit(at: seconds, opensRun: units.beginsRun(dts: packet.pointee.dts))
+        if opensRun { units.beginRun() }
+        let decodeTo = runStart.noteUnit(at: seconds, opensRun: opensRun)
         units.insert(pts: packet.pointee.pts, timeBase: timeBase, isKey: packet.pointee.flags & AV_PKT_FLAG_KEY != 0,
                      info: shiftSeconds, packet: copy)
-        if playerIdle { units.advance(to: seconds) }
+        if let decodeTo { units.advance(to: decodeTo) }
     }
 
-    /// Blocks until the current run's first picture is decoded, when the clock is at or heading for the run's start:
-    /// the segment holding it is what AVPlayer prerolls the placeholder on and then starts its clock. True when the
-    /// picture is there or nothing needs to wait; false after `timeout`, once the decoder has stalled
+    /// Where AVPlayer will start, before the player has a clock (a resume's start position, item time).
+    func noteStart(at seconds: Double) {
+        runStart.noteStart(at: seconds)
+    }
+
+    /// Reads where AVPlayer reports it is (item time, a pending seek's target included); nil once its item is gone.
+    func follow(reportedTime read: (@Sendable () -> Double?)?) {
+        runStart.follow(reportedTime: read)
+    }
+
+    /// Blocks until the picture AVPlayer starts the current run on is decoded (`OverlayRunStart`): the segment holding
+    /// it is what AVPlayer prerolls the placeholder on and then starts its clock. True when the picture is there or
+    /// nothing needs to wait; false after `timeout`, once the decoder has stalled
     /// (`OverlayRunStart.stalledDecodeSeconds`), or once `shouldStop` says so.
     func awaitRunStart(timeout: TimeInterval, shouldStop: () -> Bool) -> Bool {
-        runStart.awaitPicture(clockSeconds: units.clockSeconds, timeout: timeout,
-                              progress: { units.unitsDecoded }, hasPicture: {
-            units.hasPicture(near: $0, toleranceSeconds: PictureTapDecoder.shownBeforeClockSeconds)
-        }, shouldStop: shouldStop)
+        runStart.awaitPicture(decodeClock: { units.clockSeconds }, decodeTo: { units.advance(to: $0) },
+                              timeout: timeout, progress: { units.unitsDecoded },
+                              hasPicture: { units.hasPictureShown(at: $0) }, shouldStop: shouldStop)
     }
 
     /// The picture on screen at `seconds` (item time) and its own time, nil before the decoder reaches it.
@@ -92,9 +103,9 @@ final class OverlayDecodeTap: @unchecked Sendable {
         units.pictures(after: last, atOrBefore: seconds)
     }
 
-    /// Where AVPlayer's clock is (item time).
+    /// Where AVPlayer's clock is (item time). Its staging while an item gets ready is not followed.
     func advance(to seconds: Double) {
-        runStart.notePlayerMoved()
+        guard runStart.notePlayerMoved(to: seconds) else { return }
         units.advance(to: seconds)
     }
 

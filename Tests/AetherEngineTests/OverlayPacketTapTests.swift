@@ -50,6 +50,7 @@ struct OverlayPacketTapTests {
             decoder = d
             return d
         }
+        tap.beginRun()
         for i in 0..<(seconds * 25) {
             let pts = Int64(i * 40)
             let packet = av_packet_alloc()!
@@ -57,7 +58,6 @@ struct OverlayPacketTapTests {
             packet.pointee.pts = pts
             packet.pointee.dts = pts
             let isKey = i % (gop * 25) == 0
-            _ = tap.beginsRun(dts: pts)
             tap.insert(pts: pts, timeBase: tb, isKey: isKey, info: Double(i), packet: packet)
         }
         return (tap, { decoder })
@@ -98,6 +98,48 @@ struct OverlayPacketTapTests {
         tap.advance(to: 9)
         #expect(Self.waitUntil(5) { tap.unit(at: 9)?.picture != nil })
         #expect(try #require(decoder()).fed.filter(\.restart).map(\.pts) == [0, 8000])
+    }
+
+    @Test("the picture on screen at a time counts as decoded once a picture at or after that time is, not before")
+    func pictureShownAtATime() throws {
+        let (tap, decoder) = Self.makeTap(seconds: 4, gop: 2)
+        defer { tap.close() }
+        // Pictures every 40 ms: the one on screen at 2.43 s is 2.40 s, final once 2.44 s is decoded.
+        tap.advance(to: 2.43)
+        #expect(Self.waitUntil(5) { tap.hasPictureShown(at: 2.43) })
+        #expect(tap.unit(at: 2.40)?.picture != nil && tap.unit(at: 2.44)?.picture != nil)
+        // Nothing past the decode window has been decoded, so a later time is not answered for.
+        #expect(!tap.hasPictureShown(at: 3.5))
+        #expect(try #require(decoder()).fed.filter(\.restart).last?.pts == 2000)
+    }
+
+    @Test("a backward seek's run is kept while the clock still reads where the seek left from, and decoded to")
+    func backwardRunSurvivesAStaleClock() throws {
+        var decoder: EchoDecoder?
+        let tap = OverlayPacketTap<Double>(decodeAheadSeconds: 0.75) { deliver in
+            let d = EchoDecoder(deliver: deliver)
+            decoder = d
+            return d
+        }
+        defer { tap.close() }
+        func feed(_ pts: Int64, key: Bool) {
+            let packet = av_packet_alloc()!
+            _ = av_new_packet(packet, 4)
+            packet.pointee.pts = pts
+            packet.pointee.dts = pts
+            tap.insert(pts: pts, timeBase: Self.tb, isKey: key, info: 0, packet: packet)
+        }
+        tap.beginRun()
+        for i in 0..<500 { feed(2_400_000 + Int64(i * 40), key: i % 25 == 0) }
+        tap.advance(to: 2410)
+        #expect(Self.waitUntil(5) { tap.hasPictureShown(at: 2410) })
+        // The seek's run is cut far behind the clock, which reads the old position until the seek completes.
+        tap.beginRun()
+        for i in 0..<60 { feed(900_000 + Int64(i * 40), key: i % 25 == 0) }
+        tap.advance(to: 2410.5)
+        tap.advance(to: 900.45)
+        #expect(Self.waitUntil(5) { tap.hasPictureShown(at: 900.45) })
+        #expect(try #require(decoder).fed.filter(\.restart).last?.pts == 900_000)
     }
 
     @Test("a jump back inside the run, behind its decode, restarts at the keyframe before the clock")
@@ -231,7 +273,7 @@ struct OverlayPacketTapStorageTests {
         packet.pointee.flags = AV_PKT_FLAG_KEY
         let target = av_packet_new_side_data(packet, AV_PKT_DATA_DOVI_CONF, side.count)!
         side.withUnsafeBufferPointer { target.update(from: $0.baseAddress!, count: $0.count) }
-        _ = tap.beginsRun(dts: -40)
+        tap.beginRun()
         tap.insert(pts: 0, timeBase: OverlayPacketTapTests.tb, isKey: true, info: 0, packet: packet)
         tap.advance(to: 0)
 
@@ -262,7 +304,6 @@ struct OverlayPacketTapStorageTests {
             _ = av_new_packet(packet, 4)
             packet.pointee.pts = pts
             packet.pointee.dts = pts
-            _ = tap.beginsRun(dts: pts)
             tap.insert(pts: pts, timeBase: OverlayPacketTapTests.tb, isKey: i % 50 == 0, info: Double(i), packet: packet)
         }
         // Past its ceiling the producer is owed no more room, but nothing it already cut ahead is dropped.

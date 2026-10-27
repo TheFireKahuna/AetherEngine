@@ -684,6 +684,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     var overlayDecodeTap: OverlayDecodeTap?
     /// Whether this run's first segment has been released to AVPlayer (`releaseOverlayRunStart`). Pump thread only.
     private var overlayRunStartReleased = false
+    /// Whether this producer has handed an overlay its first video unit, the one that opens its run. Pump thread only.
+    private var overlayRunOpened = false
     /// Whether this producer feeds an overlay whose decode AVPlayer's start waits for: the software overlay's, or the
     /// FEL overlay's enhancement layer.
     private var holdsOverlayRunStart: Bool {
@@ -5014,8 +5016,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             category: .session
                         )
                     }
+                    let opensOverlayRun = !overlayRunOpened
+                    overlayRunOpened = true
                     if let overlayDecodeTap {
-                        overlayDecodeTap.keep(packet, timeBase: videoConfig.timeBase,
+                        overlayDecodeTap.keep(packet, opensRun: opensOverlayRun, timeBase: videoConfig.timeBase,
                                               shiftSeconds: Double(videoShiftPts == Int64.min ? 0 : videoShiftPts) * sourceVideoTbSeconds)
                         observeOverlaySourceCaptions(packet)
                     }
@@ -5042,7 +5046,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         let converted: Bool
                         #if DualLayerDolbyVision
                         if let felTap {
-                            converted = felTap.rewrite(packet, framing: a53NALFraming, timeBase: videoConfig.timeBase,
+                            converted = felTap.rewrite(packet, opensRun: opensOverlayRun, framing: a53NALFraming,
+                                                       timeBase: videoConfig.timeBase,
                                                        chromaLocation: UInt32(max(0, videoConfig.codecpar.pointee.chroma_location.rawValue)))
                         } else {
                             converted = DoviRpuConverter.convertPacketToProfile81(packet, framing: a53NALFraming)

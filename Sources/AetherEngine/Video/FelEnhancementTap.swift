@@ -13,7 +13,7 @@ import AetherLibavutil
 /// (`separateDualLayers`); with a tap it keeps the rest instead of dropping it: the compressed enhancement
 /// layer and the composer parameters, in an ``OverlayPacketTap`` keyed by the packet's output presentation
 /// time, which is AVPlayer's item time. The enhancement layer is decoded near the clock on VideoToolbox. A run's
-/// first segment is held until the enhancement picture at the run's start is decoded (`awaitRunStart`), so a start
+/// first segment is held until the enhancement picture AVPlayer starts on is decoded (`awaitRunStart`), so a start
 /// or a seek opens on the full picture; after it, a frame whose enhancement picture is not decoded in time is
 /// composed with the residual off.
 final class FelEnhancementTap: @unchecked Sendable {
@@ -30,9 +30,6 @@ final class FelEnhancementTap: @unchecked Sendable {
     }
     /// Where the current run starts and whether the player has moved the clock since (`OverlayRunStart`).
     private let runStart = OverlayRunStart()
-    /// How far from a run's start the enhancement picture that opens it may be: the frame on screen at the start is
-    /// the one at or before it.
-    static let runStartToleranceSeconds = 0.1
 
     // Producer side, only touched from `rewrite` (one producer feeds at a time).
     private var alignment = DualLayerVideoDecoder.makeAlignment()
@@ -43,26 +40,28 @@ final class FelEnhancementTap: @unchecked Sendable {
     func close() { units.close() }
 
     /// Rewrites `packet` to its Profile 8.1 base layer and keeps the enhancement layer and parameters. `packet`
-    /// carries output (item-axis) timestamps, in decode order.
+    /// carries output (item-axis) timestamps, in decode order; `opensRun` for a producer's first.
     ///
     /// The TV applies the RPU in AVPlayer's stream to the overlay's picture, which is composed, so the packet's
     /// RPU is the composed form for every `el_type` (a residual-off or MEL-like RPU in mode 2 form would keep
     /// its curves and reshape the composed picture again). A packet whose own RPU is missing or failed to
     /// convert carries the last composed one, the RPU of the parameters it borrows. With
     /// `AetherEngine.felComposedRpuOverride` set, every packet cut from then on carries the override instead.
-    func rewrite(_ packet: UnsafeMutablePointer<AVPacket>, framing: VideoNALFraming, timeBase: AVRational,
-                 chromaLocation: UInt32) -> Bool {
+    func rewrite(_ packet: UnsafeMutablePointer<AVPacket>, opensRun: Bool, framing: VideoNALFraming,
+                 timeBase: AVRational, chromaLocation: UInt32) -> Bool {
         let pts = packet.pointee.pts
         let dts = packet.pointee.dts == Int64.min ? pts : packet.pointee.dts
         let isKey = packet.pointee.flags & AV_PKT_FLAG_KEY != 0
-        let opensRun = units.beginsRun(dts: packet.pointee.dts)
         // A new run is read for picture order afresh.
-        if opensRun { alignment = DualLayerVideoDecoder.makeAlignment() }
-        // A run's first unit is where AVPlayer's clock is about to be (a load, a resume, a seek), so before the player
-        // moves the clock itself the decode works toward it, once the unit is kept.
+        if opensRun {
+            units.beginRun()
+            alignment = DualLayerVideoDecoder.makeAlignment()
+        }
+        // A run opens where AVPlayer is about to start (a load, a resume, a seek), so the decode works toward the
+        // picture it starts on (`OverlayRunStart`), once the unit is kept.
         let seconds = Double(pts) * av_q2d(timeBase)
-        let decodesTowardRun = pts != Int64.min && runStart.noteUnit(at: seconds, opensRun: opensRun)
-        defer { if decodesTowardRun { units.advance(to: seconds) } }
+        let decodeTo = pts != Int64.min ? runStart.noteUnit(at: seconds, opensRun: opensRun) : nil
+        defer { if let decodeTo { units.advance(to: decodeTo) } }
         var elPTS = pts
         if let data = packet.pointee.data, pts != Int64.min {
             elPTS = alignment.enhancementPTS(data, Int(packet.pointee.size), framing: framing, pts: pts)
@@ -105,21 +104,31 @@ final class FelEnhancementTap: @unchecked Sendable {
     /// producer has not cut it.
     func frameTime(after seconds: Double) -> Double? { units.unitTime(after: seconds) }
 
-    /// Where AVPlayer's clock is (item time): what the decoder works toward and what is kept around it.
+    /// Where AVPlayer's clock is (item time): what the decoder works toward and what is kept around it. Its staging
+    /// while an item gets ready is not followed.
     func advance(to seconds: Double) {
-        runStart.notePlayerMoved()
+        guard runStart.notePlayerMoved(to: seconds) else { return }
         units.advance(to: seconds)
     }
 
-    /// Blocks until the enhancement picture at the current run's start is decoded, when the clock is at or heading
-    /// for the run's start: the segment holding it is what AVPlayer prerolls and starts its clock on. True when the
-    /// picture is there or nothing needs to wait; false after `timeout`, once the decoder has stalled
-    /// (`OverlayRunStart.stalledDecodeSeconds`), or once `shouldStop` says so.
+    /// Where AVPlayer will start, before the player has a clock (a resume's start position, item time).
+    func noteStart(at seconds: Double) {
+        runStart.noteStart(at: seconds)
+    }
+
+    /// Reads where AVPlayer reports it is (item time, a pending seek's target included); nil once its item is gone.
+    func follow(reportedTime read: (@Sendable () -> Double?)?) {
+        runStart.follow(reportedTime: read)
+    }
+
+    /// Blocks until the enhancement picture AVPlayer starts the current run on is decoded (`OverlayRunStart`): the
+    /// segment holding it is what AVPlayer prerolls and starts its clock on. True when the picture is there or nothing
+    /// needs to wait; false after `timeout`, once the decoder has stalled (`OverlayRunStart.stalledDecodeSeconds`), or
+    /// once `shouldStop` says so.
     func awaitRunStart(timeout: TimeInterval, shouldStop: () -> Bool) -> Bool {
-        runStart.awaitPicture(clockSeconds: units.clockSeconds, timeout: timeout,
-                              progress: { units.unitsDecoded }, hasPicture: {
-            units.hasPicture(near: $0, toleranceSeconds: Self.runStartToleranceSeconds)
-        }, shouldStop: shouldStop)
+        runStart.awaitPicture(decodeClock: { units.clockSeconds }, decodeTo: { units.advance(to: $0) },
+                              timeout: timeout, progress: { units.unitsDecoded },
+                              hasPicture: { units.hasPictureShown(at: $0) }, shouldStop: shouldStop)
     }
 
     /// Where the decode works toward, in item seconds.

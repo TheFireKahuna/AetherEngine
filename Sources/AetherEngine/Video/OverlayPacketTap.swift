@@ -20,8 +20,8 @@ protocol OverlayTapDecoder: AnyObject {
 /// The video packets the segment producer cuts for AVPlayer, kept for an overlay's own decoder
 /// (``SoftwareOverlayRenderer``) and decoded near AVPlayer's clock.
 ///
-/// The producer hands access units over in decode order with output (item-axis) timestamps, one run at a time:
-/// decode time going backwards is a restart or a seek, a new run. Each unit keeps the packet to decode and what the
+/// The producer hands access units over in decode order with output (item-axis) timestamps, one run at a time: each
+/// producer (a load, a seek's restart, either direction) opens a new run with its first unit. Each unit keeps the packet to decode and what the
 /// overlay needs beside it (`Info`), keyed by its presentation time, which is AVPlayer's item time. The producer cuts
 /// ahead of AVPlayer, so a unit exists before AVPlayer can show it, and a seek restarts the producer at the target,
 /// so the tap follows seeks with no logic of its own.
@@ -92,9 +92,10 @@ final class OverlayPacketTap<Info: OverlayUnitInfo>: @unchecked Sendable {
     /// The bytes the kept units hold on disk.
     private var storedBytes = 0
 
-    // Producer side, only touched by the one producer feeding at a time.
-    private var lastRecordedDts: Int64?
+    /// The run the producer is cutting: counted by the one producer feeding at a time, read under `state`.
     private var run = 0
+    /// The newest unit of that run, ms. Guarded by `state`.
+    private var runNewestPtsMs = Int64.min
 
     // Decoder side, only touched from the decode loop (under `state` where it reads entries).
     private var decoder: OverlayTapDecoder?
@@ -130,14 +131,12 @@ final class OverlayPacketTap<Info: OverlayUnitInfo>: @unchecked Sendable {
 
     // MARK: - Producer
 
-    /// Whether the unit with decode time `dts` starts a new run (decode time going backwards). Only a stated decode
-    /// time counts; without one, arrival order is all there is. Call before ``insert``.
-    func beginsRun(dts: Int64) -> Bool {
-        guard dts != Int64.min else { return false }
-        defer { lastRecordedDts = dts }
-        guard let last = lastRecordedDts, dts <= last else { return false }
+    /// The next unit opens a new run: a producer's first. Call before its ``insert``.
+    func beginRun() {
+        state.lock()
         run += 1
-        return true
+        runNewestPtsMs = .min
+        state.unlock()
     }
 
     /// Keeps one access unit: its presentation time in `timeBase`, and `packet`, which the tap takes ownership of
@@ -158,6 +157,7 @@ final class OverlayPacketTap<Info: OverlayUnitInfo>: @unchecked Sendable {
         nextSeq += 1
         if let stale = seqByPts[ptsMs], let old = entries.removeValue(forKey: stale) { storedBytes -= old.stored.length }
         entries[seq] = Entry(seq: seq, run: run, ptsMs: ptsMs, isKey: isKey, hasPacket: hasPacket, stored: stored)
+        runNewestPtsMs = max(runNewestPtsMs, ptsMs)
         fedInfo.removeValue(forKey: ptsMs)
         storedBytes += stored.length
         seqByPts[ptsMs] = seq
@@ -275,12 +275,14 @@ final class OverlayPacketTap<Info: OverlayUnitInfo>: @unchecked Sendable {
     /// Guarded by `state`.
     private var catchUp = CatchUp()
 
-    /// Whether a picture within `toleranceSeconds` of `seconds` (item time) has been decoded.
-    func hasPicture(near seconds: Double, toleranceSeconds: Double) -> Bool {
-        let ms = Int64((seconds * 1000).rounded()), tolerance = Int64((toleranceSeconds * 1000).rounded())
+    /// Whether the picture on screen at `seconds` (item time) has been decoded: the newest at or before it, final once
+    /// a picture at or after it has been decoded too, since pictures arrive in presentation order.
+    func hasPictureShown(at seconds: Double) -> Bool {
+        let ms = Int64((seconds * 1000).rounded())
         state.lock()
         defer { state.unlock() }
-        return decoded.keys.contains { abs($0 - ms) <= tolerance }
+        guard let newest = decoded.keys.max(), newest >= ms else { return false }
+        return decoded.keys.contains { $0 <= ms }
     }
 
     /// Where the decode works toward, in item seconds.
@@ -416,16 +418,24 @@ final class OverlayPacketTap<Info: OverlayUnitInfo>: @unchecked Sendable {
     static var fedInfoBehindMs: Int64 { 2000 }
 
     /// Drops decoded pictures the clock has passed, units further behind than `keepBehindSeconds`, and past
-    /// ``hardMaxEntries`` those furthest from the clock. Caller holds `state`.
+    /// ``hardMaxEntries`` those furthest from the clock. The run being cut is kept while the clock is further past
+    /// its newest unit than that: a backward seek's run is cut while the clock still reads where the seek left from,
+    /// and it is what AVPlayer plays next. Caller holds `state`.
     private func trimLocked() {
         trimDecodedLocked()
-        let floor = clockMs - Int64(Self.keepBehindSeconds * 1000)
-        var drop = entries.values.filter { $0.ptsMs < floor }.map(\.seq)
+        let keepBehindMs = Int64(Self.keepBehindSeconds * 1000)
+        let floor = clockMs - keepBehindMs
+        let clockLeftRun = runNewestPtsMs != .min && clockMs > runNewestPtsMs + keepBehindMs
+        var drop = entries.values.filter { $0.ptsMs < floor && !(clockLeftRun && $0.run == run) }.map(\.seq)
         let excess = entries.count - drop.count - Self.hardMaxEntries
         if excess > 0 {
             let dropped = Set(drop)
             drop += entries.values.filter { !dropped.contains($0.seq) }
-                .sorted { abs($0.ptsMs - clockMs) > abs($1.ptsMs - clockMs) }
+                .sorted { a, b in
+                    // Other runs first, then the furthest from the clock.
+                    if (a.run == run) != (b.run == run) { return a.run != run }
+                    return abs(a.ptsMs - clockMs) > abs(b.ptsMs - clockMs)
+                }
                 .prefix(excess).map(\.seq)
         }
         for seq in drop {

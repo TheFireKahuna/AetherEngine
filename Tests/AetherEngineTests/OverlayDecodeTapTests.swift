@@ -70,11 +70,13 @@ struct OverlayDecodeTapTests {
                                    containerSAR: stream.pointee.sample_aspect_ratio, deinterlace: DeinterlaceConfig()) { _, _ in }
         defer { tap.close() }
         #expect(tap.decodesInHardware == hardware)
+        var opensRun = true
         while let packet = try demuxer.readPacket() {
             var owned: UnsafeMutablePointer<AVPacket>? = packet
             defer { trackedPacketFree(&owned) }
             guard packet.pointee.stream_index == index else { continue }
-            tap.keep(packet, timeBase: tb, shiftSeconds: 0)
+            tap.keep(packet, opensRun: opensRun, timeBase: tb, shiftSeconds: 0)
+            opensRun = false
             reference.decode(packet: packet, epoch: nil)
         }
         reference.drainForEndOfStream()

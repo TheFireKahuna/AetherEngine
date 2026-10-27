@@ -81,3 +81,52 @@ for byte, and each one ends with a lip-sync check on the TV.
    group of pictures; survey the library first.
 
 Not done: a pre-roll shorter than the encoder's memory. That changes the audio at the seek point.
+
+## Overlay sessions: the picture a seek starts on
+
+On an overlay session (a Profile 7 FEL composed over its base layer, or a codec the engine decodes itself) the
+producer holds a run's first segment from AVPlayer until the overlay has decoded the picture AVPlayer starts on
+(`OverlayRunStart`), so the first frame shown is the full picture. Before this work the hold waited for the wrong
+picture:
+
+- It waited for a picture within 0.1 s of the run's first keyframe, while the decoder worked toward AVPlayer's clock.
+  A resume or seek partway into a group of pictures waited out the 5 s bound (a TRON resume on an iPhone:
+  `no picture yet, released after 5005 ms`).
+- A run was detected by decode time going backwards, so a forward seek opened no run and was held for nothing.
+- On a seek during playback the overlay learned the target only when AVPlayer's clock moved, which happens when the
+  seek completes, after the held segment is released. Measured on a Mac with Civil War from Jellyfin: the hold
+  passed at once, and the seek to 900.45 s showed 67 frames not ready and 19 composed with the residual off.
+
+### What AVPlayer does, measured
+
+- A zero-tolerance seek moves the clock only once the target segment is complete. Serving the segment up to and
+  including the fragment holding the target is not enough: AVPlayer neither moves its clock nor decodes a frame, and
+  after about 3.5 s asks for the rest with a Range request. The hold stays a whole-segment hold.
+- `currentTime()` reports a pending seek's target 50 to 57 ms after the seek, before any of its data arrives, while
+  the item's timebase (which the overlay follows) stays where it was. This holds for every seek: the engine's own,
+  AVKit's transport bar, a resume.
+- AVPlayer asks for the segment about 2 ms after the seek, before `currentTime()` reports the target (the same race
+  #207 notes), so the target is read when the hold decides, not when the run opens.
+- When it starts playing, AVPlayer's timebase runs from 50 to 185 ms before the target so as to reach it at the host
+  time it starts on, while the item sits at the target (`setRate(_:time:atHostTime:)`, documented). Nothing before
+  the target is shown, so the overlay holding the target's picture through that lead is correct.
+- While a freshly loaded item gets ready, its clock stages at the first picture of the segment it asked for, then
+  returns to the target. That staging is not a target.
+
+### The fix
+
+- The producer marks every run: its first video unit opens one, whichever way the seek went.
+- The picture AVPlayer starts on is the one on screen at its reported time (`currentTime()`), read off the main
+  actor as #134 does. Until AVPlayer exists (a load whose first run is cut before the item is made) the session's
+  start position stands in, which is what AVPlayer then reports.
+- If the reported time is not yet inside the run, the hold waits a short bound for it (the report lands within
+  60 ms of a seek) before treating the run as cut ahead of a playing clock, which holds nothing.
+- The decode works toward that picture as soon as it is known, and AVPlayer's staging does not move it.
+- The hold passes exactly when the picture on screen at the target is decoded: the newest at or before it, once a
+  picture at or after it exists. No tolerance window.
+- The 5 s bound stays, as a failure bound only.
+
+Proof: unit tests of the hold and the tap; the overlay A/V sync test resumed partway into a group of pictures
+(nothing before the resume point presented, started within 3 s, the click on the white picture); the Civil War FEL
+run from Jellyfin with a resume and mid-group seeks, every seek held for its own picture with no frame not ready or
+composed without its residual. On the TV: a FEL resume and transport-bar scrubs, with the same counters.

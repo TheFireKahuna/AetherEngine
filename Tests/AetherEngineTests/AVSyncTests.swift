@@ -66,31 +66,46 @@ struct AVSyncTests {
     /// its item time on a layer that follows AVPlayer's clock, while the sound goes to AVPlayer in the segments the
     /// session serves. The white picture's item time, as the overlay hands it to its layer, and the click's, in the
     /// segment AVPlayer is served in the same session, are the same to the sample.
-    @Test("through the software overlay the click and the white picture share their item time", .timeLimit(.minutes(2)))
+    ///
+    /// Resumed partway into a group of pictures (keyframes at 0 and 1 s, 24 fps), the overlay starts on the picture on
+    /// screen at the resume point, 0.583 s for 0.6 s, as AVPlayer does: nothing before it is presented, and the start
+    /// is not held to the run-start bound waiting for the group's first picture.
+    @Test("through the software overlay the click and the white picture share their item time", .timeLimit(.minutes(2)),
+          arguments: [nil, 0.6])
     @MainActor
-    func overlayClickOnPicture() async throws {
+    func overlayClickOnPicture(startPosition: Double?) async throws {
         let url = avsyncFixture("mpeg2-overlay.mkv")
         try #require(FileManager.default.fileExists(atPath: url.path),
                      "run Scripts/fetch-fixtures.sh to generate Fixtures/avsync/")
         let engine = try AetherEngine()
         defer { engine.stop() }
-        _ = try await engine.load(url: url, options: LoadOptions())
+        _ = try await engine.load(url: url, startPosition: startPosition, options: LoadOptions())
         let player = try #require(engine.currentAVPlayer)
         #expect(engine.nativeVideoSession?.overlayDecodeTap != nil, "MPEG-2 plays through the overlay")
         player.isMuted = true
+        let played = ContinuousClock.now
         engine.play()
         let deadline = Date().addingTimeInterval(15)
         while engine.softwareOverlay == nil, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
         let renderer = try #require(engine.softwareOverlay)
-        let presented = OSAllocatedUnfairLock(initialState: (white: [Double](), latest: 0.0))
+        let presented = OSAllocatedUnfairLock(initialState: (white: [Double](), earliest: Double.infinity, latest: 0.0,
+                                                             firstAt: ContinuousClock.Instant?.none))
         renderer.onPresented = { time, picture in
             let white = Self.isWhite(picture)
             presented.withLock { state in
                 if white { state.white.append(time.seconds) }
+                state.earliest = min(state.earliest, time.seconds)
                 state.latest = max(state.latest, time.seconds)
+                if state.firstAt == nil { state.firstAt = .now }
             }
         }
         while presented.withLock({ $0.latest }) < 1.5, Date() < deadline { try await Task.sleep(for: .milliseconds(50)) }
+        if startPosition != nil {
+            let (earliest, firstAt) = presented.withLock { ($0.earliest, $0.firstAt) }
+            #expect(earliest >= 0.583, "a picture from before the resume point was presented: \(earliest) s")
+            let started = try #require(firstAt, "nothing was presented")
+            #expect(started - played < .seconds(3), "the first picture took \(started - played) after play()")
+        }
         let white = presented.withLock { $0.white }
         #expect(white.count == 1, "one white picture, presented once: \(white)")
         let picture = try #require(white.first, "the white picture reached the layer")
