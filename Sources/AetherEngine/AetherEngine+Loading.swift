@@ -941,6 +941,10 @@ extension AetherEngine {
         // #240: the pump claims the source link through this gate while it is fetching, so the
         // subtitle side readers can stay out of its way. Set before start().
         session.sideReaderLinkGate = sideReaderLinkGate
+        #if DualLayerDolbyVision
+        // LoadOptions.felOverlay: the session's own read of the source feeds the overlay's enhancement layer.
+        session.felTap = felOverlayWanted ? FelEnhancementTap() : nil
+        #endif
         session.overlayDeinterlace = DeinterlaceConfig(fieldRate: loadedOptions.deinterlaceFieldRate, film: loadFilmCarriage,
                                                        softTelecine: loadSoftTelecine)
         // AE#682: set before start(), where the session decides whether it can serve the rendition.

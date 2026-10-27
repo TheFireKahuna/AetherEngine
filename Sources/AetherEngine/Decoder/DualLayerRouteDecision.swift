@@ -1,6 +1,6 @@
 import AetherLibavcodec
 
-/// Whether a Profile 7 load takes the dual-layer route (`SoftwarePlaybackHost` + `DualLayerVideoDecoder`)
+/// Whether a Profile 7 load takes the dual-layer route (the composed overlay, `DualLayerVideoDecoder`)
 /// or keeps the native route (single-layer 8.1 where the display takes Dolby Vision), and if not, why. Pure so every exit is unit-testable; the load asks it
 /// once per P7 source and logs `logLine`, so the diagnostic and the routing cannot disagree.
 ///

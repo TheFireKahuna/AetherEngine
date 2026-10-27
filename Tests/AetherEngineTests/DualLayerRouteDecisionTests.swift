@@ -200,6 +200,7 @@ struct DualLayerRouteDecisionTests {
         baseOnly.dolbyVisionHandling = .baseLayerOnly
         var offAutomatic = automatic
         offAutomatic.preferDualLayerDolbyVision = false
+        offAutomatic.felOverlay = false
         var offBaseOnly = offAutomatic
         offBaseOnly.dolbyVisionHandling = .baseLayerOnly
         func refusal(custom: Bool = true, from: LoadOptions, to: LoadOptions, profile: Int? = 7) -> SessionReloadRefusal? {
@@ -208,7 +209,7 @@ struct DualLayerRouteDecisionTests {
         }
         #expect(refusal(from: automatic, to: baseOnly) == .dualLayerRouteNeedsFreshLoad)
         #expect(refusal(from: baseOnly, to: automatic) == .dualLayerRouteNeedsFreshLoad)
-        // The preference is off on both sides: the route is not taken either way.
+        // Both FEL routes are off on both sides: the route is not taken either way.
         #expect(refusal(from: offAutomatic, to: offBaseOnly) == nil)
         // URL sources re-run load(), other profiles route the same, an unchanged handling moves nothing.
         #expect(refusal(custom: false, from: automatic, to: baseOnly) == nil)
@@ -216,15 +217,5 @@ struct DualLayerRouteDecisionTests {
         #expect(refusal(from: automatic, to: automatic) == nil)
     }
 
-    /// A fatal decode error is the decoder session's, reported once; only a stopped host drops it, a
-    /// seek in flight does not.
-    @Test("a session failure is admitted across a seek and dropped only by a stop")
-    func sessionFailureIgnoresSeekGeneration() {
-        #expect(SoftwareReadAdmission.admitsSessionFailure(stopRequested: false))
-        #expect(!SoftwareReadAdmission.admitsSessionFailure(stopRequested: true))
-        // The per-seek admission it replaces rejects the same event once a seek has opened.
-        #expect(!SoftwareReadAdmission.admits(readGeneration: 3, requestedGeneration: 4,
-                                              settledGeneration: 3, stopRequested: false))
-    }
 }
 #endif

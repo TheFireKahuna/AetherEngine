@@ -167,11 +167,36 @@ public enum DoviRpuConverter {
     /// mode number), so for a FEL RPU `baseLayer` goes through mode 1 first: the NLQ becomes MEL's, the
     /// recomputed `el_type` is MEL, and mode 2 then leaves the mapping alone. That is the same RPU as
     /// dovi_tool's mode 5. Other RPUs keep their mapping through mode 2 as they are.
+    static func dualLayerUnspec62(_ rpu: OpaquePointer, isFEL: Bool)
+        -> (composed: UnsafePointer<DoviData>, baseLayer: UnsafePointer<DoviData>)? {
+        if isFEL {
+            guard dovi_convert_rpu_with_mode(rpu, 1) == 0 else { return nil }
+        }
+        guard dovi_convert_rpu_with_mode(rpu, 2) == 0, let baseLayer = dovi_write_unspec62_nalu(rpu) else { return nil }
+        guard dovi_rpu_remove_mapping(rpu) == 0, let composed = dovi_write_unspec62_nalu(rpu) else {
+            dovi_data_free(baseLayer)
+            return nil
+        }
+        return (composed, baseLayer)
+    }
+
+    /// Which Profile 8.1 RPU a rebuilt base-layer packet carries.
+    enum PacketRpu {
+        /// The mode 2 form: the remux route's, whose frames are the base layer as the TV reconstructs it.
+        case mode2
+        /// The composed form (no mapping) whatever the RPU's `el_type`, for a packet whose picture is replaced
+        /// by a composed one before it is shown (the FEL overlay: the TV applies the RPU in AVPlayer's stream
+        /// to the overlay's picture). A packet whose own RPU is missing or failed to convert carries
+        /// `fallback`, so every access unit still has the RPU for the picture shown over it. `override`, when
+        /// set, is the RPU every packet carries in place of its own (`DoviComposedRpuOverride`); the results
+        /// still describe the packet's own.
+        case composed(fallback: [UInt8]?, override: [UInt8]? = nil)
+    }
 
     /// Splits a Profile 7 packet into its layers in one walk.
     ///
-    /// The base-layer packet is rewritten in place to hold the base layer and the Profile 8.1 RPU (mode 2),
-    /// unless `useCustomBlockSource` leaves it untouched for a decoder that skips the unspec NALs itself.
+    /// The base-layer packet is rewritten in place to hold the base layer and the Profile 8.1 RPU `packetRpu`
+    /// says, unless `useCustomBlockSource` leaves it untouched for a decoder that skips the unspec NALs itself.
     /// With `extractEL` the enhancement layer comes back as a separate packet of its own (the 2-byte
     /// unspec63 header stripped), stamped like the source; with `extractParams` the RPU is also parsed into
     /// the composition parameters. This is the walk `convertPacketToProfile81` runs with both off.
@@ -184,7 +209,8 @@ public enum DoviRpuConverter {
         framing: VideoNALFraming = .lengthPrefixed(size: 4),
         extractEL: Bool = true,
         useCustomBlockSource: Bool = false,
-        extractParams: Bool = true
+        extractParams: Bool = true,
+        packetRpu: PacketRpu = .mode2
     ) -> DualLayerPacketResult {
         let untouched = DualLayerPacketResult(elPacket: nil, rpuData: nil, isFEL: false, success: true)
         guard let data = packet.pointee.data, packet.pointee.size > 4 else { return untouched }
@@ -253,13 +279,29 @@ public enum DoviRpuConverter {
                     // not flip the stream classification.
                     dovi_rpu_free_header(hdr)
                 }
-                guard let out = Self.convertedUnspec62(rpu) else {
                 // The dual-layer outputs need the composed form (no mapping), which mode 2 alone does not
+                // give for every RPU (`dualLayerUnspec62`). With `.mode2` the packet keeps the mode 2 form:
+                // for a FEL RPU that is the composed one, for any other the one that kept its mapping.
                 let out: UnsafePointer<DoviData>
+                var composedOut: UnsafePointer<DoviData>?
+                var baseLayerOut: UnsafePointer<DoviData>?
+                if keepRpuBytes || composesPacket {
+                    guard let forms = Self.dualLayerUnspec62(rpu, isFEL: thisFEL) else {
+                        degraded = true
+                        return
+                    }
                     rewritten.append(forms.composed)
                     rewritten.append(forms.baseLayer)
+                    out = composesPacket || thisFEL ? forms.composed : forms.baseLayer
                     composedOut = forms.composed
                     baseLayerOut = forms.baseLayer
+                } else {
+                    guard let mode2 = Self.convertedUnspec62(rpu) else {
+                        degraded = true
+                        return
+                    }
+                    rewritten.append(mode2)
+                    out = mode2
                 }
                 guard let outData = out.pointee.data, out.pointee.len > 0 else {
                     degraded = true
@@ -326,14 +368,16 @@ public enum DoviRpuConverter {
 
         // Rebuild the base layer (not with a custom block source: the FEL decoder needs the original
         // packet untouched so VT can skip unspec62/63 NALs via the base-layer format description).
-        if (converted || hadEL || degraded), !useCustomBlockSource {
-            let total = framedSize(pieces)
-            // Degenerate: all NALs were RPU/EL. Leave the packet untouched rather than emit a zero-length video packet.
-            if total > 0 {
-                if let newRef = buildPacketBuffer(pieces, total: total, emitsStartCodes: framing == .annexB) {
         // A composed packet carries the override, or without an RPU of its own the fallback, last, where an access
         // unit's RPU goes.
         let carried = composesPacket && !useCustomBlockSource ? composedOverride ?? (converted ? nil : composedFallback) : nil
+        // Degenerate: all NALs were RPU/EL. Leave the packet untouched rather than emit a video packet with no picture.
+        if (converted || hadEL || degraded || carried != nil), !useCustomBlockSource, !pieces.isEmpty {
+            (carried ?? []).withUnsafeBufferPointer { extra in
+                var all = pieces
+                if let base = extra.baseAddress, extra.count > 0 { all.append(Piece(base: base, count: extra.count)) }
+                let total = framedSize(all)
+                if let newRef = buildPacketBuffer(all, total: total, emitsStartCodes: framing == .annexB) {
                     av_buffer_unref(&packet.pointee.buf)
                     packet.pointee.buf = newRef
                     packet.pointee.data = newRef.pointee.data

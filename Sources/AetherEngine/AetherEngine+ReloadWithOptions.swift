@@ -412,8 +412,9 @@ enum SessionOptionCorrection {
     ) -> SessionReloadRefusal? {
         guard DualLayerRouteDecision.isBuiltIn, isCustomSource, dvProfile == 7 else { return nil }
         let preferenceChanged = proposed.preferDualLayerDolbyVision != current.preferDualLayerDolbyVision
+            || proposed.felOverlay != current.felOverlay
         let handlingMovesRoute = proposed.dolbyVisionHandling != current.dolbyVisionHandling
-            && proposed.preferDualLayerDolbyVision
+            && (proposed.preferDualLayerDolbyVision || proposed.felOverlay)
         guard preferenceChanged || handlingMovesRoute else { return nil }
         return .dualLayerRouteNeedsFreshLoad
     }
@@ -453,7 +454,6 @@ enum SessionOptionCorrection {
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
         "audioBridgeMode", "objectAudioRendering", "stereoPresentation", "isLive", "audioOnly",
         "dvrWindowSeconds",
-        "softwareDVRRetention",
         "liveBlockingReload", "liveJoinProfile", "sourceOpenPolicy", "liveStartupGraceSeconds", "liveStartupSingleSegmentMinimumSeconds", "liveEdgeCushionSeconds", "liveJoinStartsImmediately",
         "clampsLiveResumeToWindow", "nativeRemoteHLS", "nativeRemoteHLSIngestFallback",
         "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "confirmAtmos",

@@ -478,8 +478,9 @@ public struct LoadOptions: Sendable, Equatable {
     /// the native route (the single-layer Profile 8.1 conversion, or the HDR10 base layer). When true, `dolbyVisionHandling` is `.automatic`, the stream's
     /// enhancement layer is FEL, VideoToolbox decodes HEVC in hardware and the stream fits the real-time
     /// budget (`DualLayerRouteDecision.maximumPixelsPerSecond`: UHD at 30 fps plus a 1080p enhancement
-    /// layer), the stream routes through the dual-layer pipeline (SoftwarePlaybackHost +
-    /// DualLayerVideoDecoder). A Profile 7 MEL stream, and anything the device cannot decode twice in real
+    /// layer), the stream routes through the dual-layer pipeline
+    /// (DualLayerVideoDecoder); `felOverlay`, on by default, takes precedence and composes it over AVPlayer
+    /// on the native route instead. A Profile 7 MEL stream, and anything the device cannot decode twice in real
     /// time, keeps the native route either way (8.1 where the display takes Dolby Vision, the HDR10 base
     /// layer where it does not); the load logs one line saying which route it took and why. The source
     /// must be a seekable VOD: live and non-seekable sources keep the native route. Default false.
@@ -497,12 +498,21 @@ public struct LoadOptions: Sendable, Equatable {
     /// `SessionReloadRefusal.dualLayerRouteNeedsFreshLoad`, because the in-place rebuild keeps the route
     /// the session was loaded with; call `load()` again instead.
     ///
-    /// Known trade-off, audio: the route runs on the software host, whose audio is decoded by FFmpeg and
+    /// Known trade-off, audio, with `felOverlay` off: the route runs on the software host, whose audio is decoded by FFmpeg and
     /// played through the sample-buffer audio renderer, and on tvOS only AVPlayer emits Dolby Atmos objects.
     /// An E-AC-3 (JOC) track therefore plays as its channel-bed core (5.1 or 7.1), without the Atmos objects,
     /// where the native route would hand it to AVPlayer unchanged. TrueHD behaves as on the native route,
     /// which also decodes it and loses the objects. Not engineered around.
     public var preferDualLayerDolbyVision: Bool = false
+
+    /// A Profile 7 FEL stays on the native route, and its enhancement layer is composed over AVPlayer's
+    /// source's enhancement layer, composes it on the dual-layer composer and presents it in a layer the
+    /// transport, AVKit's controls and menus, native subtitles and the audio (Dolby Atmos included).
+    /// Same capability gate as `preferDualLayerDolbyVision`, which it takes precedence over. Needs the
+    /// `DualLayerDolbyVision` trait; without it the option does nothing. Default on, so a build with the trait
+    /// composes every eligible FEL this way. Off, a FEL keeps the 8.1 conversion, unless
+    /// `preferDualLayerDolbyVision` sends it to the software host.
+    public var felOverlay: Bool = true
 
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
@@ -1066,6 +1076,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
         self.dolbyVisionHandling = dolbyVisionHandling
         self.preferDualLayerDolbyVision = preferDualLayerDolbyVision
+        self.felOverlay = felOverlay
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel

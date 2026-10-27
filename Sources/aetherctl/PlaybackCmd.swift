@@ -558,6 +558,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         // harness for a record the bitstream contradicts.
         dolbyVisionHandling: dolbyVisionHandling,
         preferDualLayerDolbyVision: preferDualLayerDolbyVision,
+        // No AVKit layer here to host the overlay, so `--fel` means the software host's composition.
+        felOverlay: false,
         panelPresentsDolbyVision: assertDolbyVision,
         objectAudioRendering: objectAudioRendering,
         isLive: live,
