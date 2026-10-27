@@ -1,11 +1,14 @@
 // Only with the TrueHDObjectAudio trait (off by default), which links LibTrueHD.
 #if TrueHDObjectAudio
+import Accelerate
 import Foundation
 import TrueHD
 
 /// TrueHD object-presentation decoder over the LibTrueHD library (the Rust `truehd` crate behind
 /// a C API): lossless decode of presentation 3, which for an Atmos stream is the bed plus up to 15
-/// dynamic objects, together with the object audio metadata (OAMD) that positions them.
+/// dynamic objects, together with the object audio metadata (OAMD) that positions them. The decode
+/// is exact (LibTrueHD's interpolating decode), and every element is prepared for the
+/// renderer by `state(for:stream:)`.
 ///
 /// The library's coordinates are OAMD room coordinates (ETSI TS 103 420 4.2.1): x left→right and
 /// y front→back on 0...1, z −1 floor, 0 ear level, +1 ceiling. That is the renderer's own room
@@ -23,25 +26,87 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     private var roles: [ObjectAudioRole] = []
     private var rolesSerial: UInt32?
     private var planes: [UnsafePointer<Float>] = []
+    /// Object output (`APACObjectOutput`): the elements and their full metadata, ramps included, go
+    /// out as APAC objects.
+    let objectOutput: Bool
+    /// The TrueHD decoder's (`AudioStageSpan.trueHDDecoderMemory`, `TrueHDMajorSync`) at the rendering
+    /// rate; a 96 or 192 kHz stream adds the decimator's filter.
+    let span = AudioStageSpan(
+        latency: 0,
+        memory: AudioStageSpan.trueHDDecoderMemory(outputRate: Int32(ObjectAudioRendering.sampleRate))
+            + ObjectAudioDecimator.span.memory)
     private(set) var selfResetCount = 0
+    private var warpLogged = false
     /// Blocks between a reset and the first metadata, so objects play from the first frame (see
     /// `ObjectMetadataHold`), and the released block last handed out, whose planes it owns.
     private let hold = ObjectMetadataHold()
     private var lent: ObjectMetadataHold.Copy?
+    /// A 96 or 192 kHz stream's elements, brought to 48 kHz (`ObjectAudioDecimator`), and a
+    /// discontinuity the decimator has not yet produced a block to carry.
+    private var decimator: ObjectAudioDecimator?
+    private var discontinuityPending = false
+    /// The last block's clock and its output_timing (`clock(_:)`). Kept across a reset: the clock is
+    /// the stream's, so a resync continues on it.
+    private var lastClock: (Int64, UInt16)?
 
-    init() throws {
+    /// The listener's dialogue gain in dB (`LoadOptions.objectDialogueGain`), applied as
+    /// `dialogueEnhancement(gain:maximum:)` has it.
+    let dialogueGain: Float
+
+    /// Dialogue normalisation, which a TrueHD decoder applies: the presentation's stated dialogue
+    /// level is brought to -31 LKFS. On the decoded planes, so both paths after the decoder play it
+    /// (the render, object output). The gain, and the planes the elements are scaled into when it is
+    /// not 1.
+    private var normalisation: Float = 1
+    private let normalisedPlanes = NormalisedPlanes()
+
+    init(objectOutput: Bool = false, dialogueGain: Float = 0) throws {
+        #if !APACObjectOutput
+        precondition(!objectOutput, "object output is only built with the APACObjectOutput trait")
+        #endif
         guard let handle = truehd_atmos_decoder_create(TRUEHD_ATMOS_PRESENTATION_HIGHEST) else {
             throw DecoderError(status: TRUEHD_ATMOS_ERR_INVALID_ARGUMENT, message: "create failed")
         }
         self.handle = handle
+        self.dialogueGain = dialogueGain
+        self.objectOutput = objectOutput
     }
 
     deinit { truehd_atmos_decoder_destroy(handle) }
 
-    func push(_ bytes: UnsafeRawBufferPointer) throws {
+    /// -(dialogue_level + 31) dB as a gain: the stated level brought to -31 LKFS. 1 for a
+    /// presentation that states none (dialogue_level 0).
+    static func normalisationGain(dialogueLevel: Int32) -> Float {
+        dialogueLevel == 0 ? 1 : powf(10, -Float(dialogueLevel + 31) / 20)
+    }
+
+    /// The gain dialogue normalisation gives `presentation`, from the stream's latest major sync.
+    private func normalisationGain(presentation: Int) -> Float {
+        var info = TrueHDAtmosStreamInfo()
+        guard truehd_atmos_decoder_get_stream_info(handle, &info) == TRUEHD_ATMOS_OK else { return 1 }
+        return withUnsafeBytes(of: &info.presentations) { raw in
+            let presentations = raw.bindMemory(to: TrueHDAtmosPresentationInfo.self)
+            guard presentations.indices.contains(presentation) else { return 1 }
+            return Self.normalisationGain(dialogueLevel: presentations[presentation].dialogue_level)
+        }
+    }
+
+    /// Note a change of the normalisation gain, logged once each.
+    private func noteNormalisation(_ gain: Float, presentation: Int) {
+        guard gain != normalisation else { return }
+        normalisation = gain
+        EngineLog.emit(
+            String(format: "[TrueHDObjectAudioDecoder] dialogue normalisation: presentation %d at %+.1f dB "
+                   + "(the stream's dialogue_norm brought to -31 LKFS)", presentation, 20 * log10(gain)),
+            category: .session)
+    }
+
+    /// The library reports `pts` back on the blocks whose access units start in these bytes, with
+    /// how many access units of the same push came before (`TrueHDAtmosBlock.pts_au_index`).
+    func push(_ bytes: UnsafeRawBufferPointer, pts: Int64) throws {
         guard let base = bytes.baseAddress, bytes.count > 0 else { return }
         let status = truehd_atmos_decoder_push(
-            handle, base.assumingMemoryBound(to: UInt8.self), bytes.count, Int64.min)
+            handle, base.assumingMemoryBound(to: UInt8.self), bytes.count, pts)
         // BUFFER_FULL (8 MiB waiting) cannot happen behind the bridge, which drains every block after
         // each push; a panic resets for the same reason as in `nextBlock`.
         if status == TRUEHD_ATMOS_ERR_PANIC {
@@ -65,8 +130,48 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         }
     }
 
-    /// The library's next block, with every element's state as of its first metadata update.
+    /// The next block at 48 kHz, with every element's state as of its first metadata update.
     private func pull() throws -> (ObjectAudioDecodedBlock, [ObjectAudioElementState?]?)? {
+        while let (block, firstStates) = try pullLibrary() {
+            guard let factor = ObjectAudioDecimator.factor(from: block.sampleRate) else { return (block, firstStates) }
+            if let decimated = decimate(block, factor: factor) { return (decimated, decimated.updates.first?.states) }
+        }
+        return nil
+    }
+
+    /// `block` at 48 kHz, nil while the decimator's look-ahead has taken all of it (a stream's first
+    /// frames, a short final access unit).
+    private func decimate(_ block: ObjectAudioDecodedBlock, factor: Int) -> ObjectAudioDecodedBlock? {
+        if decimator?.factor != factor {
+            decimator = ObjectAudioDecimator(factor: factor)
+        }
+        guard let decimator else { return nil }
+        if block.isDiscontinuity {
+            decimator.reset()
+            discontinuityPending = true
+        }
+        let main = decimator.process(planes: block.planes, frames: block.frameCount,
+                                     inputStart: block.inputFrameOffset, updates: block.updates)
+        var out = block
+        guard main.frames > 0 else { return nil }
+        out.sampleRate = ObjectAudioRendering.sampleRate
+        out.frameCount = main.frames
+        out.inputFrameOffset = main.start
+        // The timestamp keeps marking the same input frame, now counted at 48 kHz: access units are
+        // 80 or 160 frames at 96 or 192 kHz, so the division is exact.
+        out.sourcePtsInputFrame = block.sourcePtsInputFrame / Int64(factor)
+        out.clockFrame = block.clockFrame.map { $0 / Int64(factor) }
+        out.clockModulus = block.clockModulus.map { $0 / Int64(factor) }
+        out.gridFrames = block.gridFrames / factor
+        out.planes = main.planes
+        out.updates = main.updates
+        out.isDiscontinuity = discontinuityPending
+        discontinuityPending = false
+        return out
+    }
+
+    /// The library's next block, at the stream's rate.
+    private func pullLibrary() throws -> (ObjectAudioDecodedBlock, [ObjectAudioElementState?]?)? {
         var block = TrueHDAtmosBlock()
         let status = truehd_atmos_decoder_pull(handle, &block)
         if status == TRUEHD_ATMOS_NEED_MORE_DATA { return nil }
@@ -87,6 +192,9 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         }
         planes.removeAll(keepingCapacity: true)
         for c in 0..<channels { planes.append(UnsafePointer(block.channels[c]!)) }
+        let gain = normalisationGain(presentation: Int(block.presentation))
+        noteNormalisation(gain, presentation: Int(block.presentation))
+        if gain != 1 { normalisedPlanes.scale(&planes, frames: Int(block.frame_count), gain: gain) }
 
         var updates: [ObjectAudioMetadataUpdate] = []
         var firstStates: [ObjectAudioElementState?]?
@@ -95,16 +203,15 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             let count = min(Int(md.element_count), channels)
             for u in 0..<Int(md.update_count) {
                 let update = md.updates[u]
-                if u == 0 { firstStates = (0..<count).map { Self.state(for: update.elements[$0]) } }
-                var states: [ObjectAudioElementState?] = []
-                states.reserveCapacity(count)
-                for e in 0..<count {
-                    let element = update.elements[e]
-                    states.append(element.flags & TRUEHD_ATMOS_ELEMENT_CHANGED != 0
-                                  ? Self.state(for: element) : nil)
-                }
+                // Trims and warp as of this update, which another update in the block may change.
+                let stream = streamMetadata(warpMode: update.warp_mode, trims: update.trims)
+                if u == 0 { firstStates = (0..<count).map { state(for: update.elements[$0], stream) } }
+                // Every element, unchanged ones included: an update restarts every ramp (TS 103 448
+                // pseudocode 19).
+                let states: [ObjectAudioElementState?] = (0..<count).map { state(for: update.elements[$0], stream) }
                 updates.append(ObjectAudioMetadataUpdate(
-                    frameOffset: Int(update.frame_offset), rampFrames: Int(update.ramp_frames), states: states))
+                    frameOffset: Int(update.frame_offset),
+                    rampFrames: Int(update.ramp_frames), states: states))
             }
         }
 
@@ -116,13 +223,34 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             isDiscontinuity: block.flags & TRUEHD_ATMOS_BLOCK_DISCONTINUITY != 0,
             roles: roles,
             planes: planes,
-            updates: updates), firstStates)
+            updates: updates,
+            sourcePts: block.pts == Int64.min ? nil : block.pts,
+            sourcePtsInputFrame: Int64(block.input_frame_offset)
+                - Int64(block.pts_au_index) * Int64(block.access_unit_frames),
+            clockFrame: clock(block.output_timing),
+            gridFrames: Int(block.access_unit_frames),
+            clockModulus: 1 << 16), firstStates)
+    }
+
+    /// output_timing (the frame this block plays at, modulo 2^16) counted on from the last block's,
+    /// so the clock keeps growing across its wraps.
+    private func clock(_ outputTiming: UInt32) -> Int64 {
+        let timing = UInt16(truncatingIfNeeded: outputTiming)
+        if let (last, lastTiming) = lastClock {
+            let next = last + Int64(timing &- lastTiming)
+            lastClock = (next, timing)
+            return next
+        }
+        lastClock = (Int64(timing), timing)
+        return Int64(timing)
     }
 
     func reset() {
         _ = truehd_atmos_decoder_reset(handle)
         hold.arm()
         lent = nil
+        decimator?.reset()
+        discontinuityPending = false
     }
 
     func releaseHeldBlocks() {
@@ -169,33 +297,186 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         }
     }
 
-    static func state(for element: TrueHDAtmosElement) -> ObjectAudioElementState {
+    private func state(for element: TrueHDAtmosElement, _ stream: StreamMetadata) -> ObjectAudioElementState {
+        Self.state(for: element, stream: stream)
+    }
+
+    /// What the stream signals for every element at once, as of a block's updates.
+    struct StreamMetadata: Equatable {
+        /// warp_mode 1 (TS 103 420 table 32).
+        var warp = false
+        var trim = ObjectAudioTrim.defaults
+        /// The linear gain for elements the stream marks as dialogue (`dialogueEnhancement`).
+        var dialogue: Float = 1
+    }
+
+    /// Dialogue enhancement as AC-4 specifies it for object audio (TS 103 190-2 V1.3.1 5.8.2.5): the
+    /// objects marked as dialogue take 10^(G/20), G the listener's gain in dB, at most `maximum`, the
+    /// most the stream allows. A stream that states no maximum allows none (G_max = 0 dB), so it can
+    /// be turned down but not up. TrueHD carries the marks in OAMD element 4 (dialog 1) and no maximum
+    /// anyone has decoded, and no film surveyed carries the element at all.
+    static func dialogueEnhancement(gain: Float, maximum: Float = 0) -> Float {
+        powf(10, min(gain, maximum) / 20)
+    }
+
+    private func streamMetadata(warpMode: Int32, trims updateTrims: UnsafePointer<TrueHDAtmosTrim>?) -> StreamMetadata {
+        var stream = StreamMetadata(warp: warpMode == TRUEHD_ATMOS_WARP_WARPING,
+                                    dialogue: Self.dialogueEnhancement(gain: dialogueGain))
+        if stream.warp, !warpLogged {
+            warpLogged = true
+            EngineLog.emit("[TrueHDObjectAudioDecoder] the stream signals warp_mode 1: object depth is doubled "
+                           + "(TS 103 420 table 32)", category: .session)
+        }
+        if let updateTrims {
+            let trims = UnsafeBufferPointer(start: updateTrims, count: Int(TRUEHD_ATMOS_TRIM_CONFIGS))
+            stream.trim = ObjectAudioTrim(configs: trims.map { t in
+                switch t.mode {
+                case TRUEHD_ATMOS_TRIM_DISABLED: .disabled
+                case TRUEHD_ATMOS_TRIM_CUSTOM: .custom(centre: t.centre_db, surround: t.surround_db, height: t.height_db,
+                                                       balanceTop: t.balance_top, balanceListener: t.balance_listener)
+                default: .default
+                }
+            })
+        }
+        return stream
+    }
+
+    /// An element as its metadata decodes and is prepared for panning, which both paths
+    /// share, the render and object output. In order: the room position (distance, screen
+    /// anchoring), warp, the elevation switch, snap; zones, trims and the elevation switch's ear-level
+    /// position, which depends on the layout, travel on to the panner.
+    static func state(for element: TrueHDAtmosElement, stream: StreamMetadata = .init()) -> ObjectAudioElementState {
         let active = element.flags & TRUEHD_ATMOS_ELEMENT_ACTIVE != 0
-        var p = element.position
-        var size = max(element.size.0, element.size.1, element.size.2)
+        var p = SIMD3(element.position.0, element.position.1, element.position.2)
+        // OAMD width, depth, height: TS 103 448's object_width_X, _Y, _Z.
+        var size = SIMD3(element.size.0, element.size.1, element.size.2)
+        var divergence = element.flags & TRUEHD_ATMOS_ELEMENT_DIVERGENCE != 0 ? element.divergence : 0
+        var excluded = excludedSpeakers(zone: element.zone)
+        let isObject = element.kind == TRUEHD_ATMOS_ELEMENT_OBJECT
         if element.kind == TRUEHD_ATMOS_ELEMENT_ISF {
             // The library does not decode ISF (intermediate spatial format) positions, and no home
             // content carrying them was found. Spread it over the room rather than pin it to
             // whatever position value is left in the struct.
-            p = (0.5, 0.5, 0.5)
-            size = 1
+            p = SIMD3(0.5, 0.5, 0.5)
+            size = SIMD3(repeating: 1)
         } else if element.flags & TRUEHD_ATMOS_ELEMENT_SCREEN_REF != 0 {
-            // Screen-anchored: x across the screen and z −1…1 over its height, while y stays room
-            // depth (header, COORDINATES). A home room has no screen geometry to map that onto
-            // exactly, so the screen spans the front wall's width and its top sits halfway up the
-            // room rather than at the ceiling.
-            p = (p.0, p.1, max(0, p.2) * 0.5)
+            p = roomPosition(screenAnchored: p, screenFactor: element.screen_factor,
+                             depthFactor: element.depth_factor, screen: .frontWall)
+        } else if element.flags & TRUEHD_ATMOS_ELEMENT_DISTANCE != 0 {
+            p = beyondTheRoom(p)
         }
-        var excluded = excludedSpeakers(zone: element.zone)
-        if element.kind == TRUEHD_ATMOS_ELEMENT_OBJECT, element.flags & TRUEHD_ATMOS_ELEMENT_ELEVATION == 0 {
-            excluded.formUnion(heights)
+        if isObject, stream.warp { p.y = min(1, 2 * p.y) }
+        let elevation = !isObject || element.flags & TRUEHD_ATMOS_ELEMENT_ELEVATION != 0
+        // TS 103 448 5.1.3.2: no height speakers (`ObjectAudioRenderer.renderPosition` puts it at ear
+        // level where there are some to keep off).
+        if !elevation { excluded.formUnion(heights) }
+        // TS 103 448 5.1.2.2: a screen-anchored object does not snap.
+        let screenAnchored = element.flags & TRUEHD_ATMOS_ELEMENT_SCREEN_REF != 0
+        if isObject, element.flags & TRUEHD_ATMOS_ELEMENT_SNAP != 0, !screenAnchored {
+            p = snapped(p, zone: element.zone, elevation: element.flags & TRUEHD_ATMOS_ELEMENT_ELEVATION != 0)
+            size = .zero
+            divergence = 0
         }
+        let bypassTrim = !isObject || element.flags & TRUEHD_ATMOS_ELEMENT_TRIM_BYPASS != 0
+        let dialogue = element.dialog == TRUEHD_ATMOS_DIALOG_DIALOGUE ? stream.dialogue : 1
         return ObjectAudioElementState(
-            position: SIMD3(p.0, p.1, max(0, p.2)),
-            gain: active ? element.gain : 0,
+            position: SIMD3(p.x, p.y, max(0, p.z)),
+            gain: active ? element.gain * dialogue : 0,
             size: size,
-            snap: element.flags & TRUEHD_ATMOS_ELEMENT_SNAP != 0,
-            excluded: excluded)
+            divergence: divergence,
+            excluded: excluded,
+            elevation: elevation,
+            trim: bypassTrim ? nil : stream.trim)
+    }
+
+    /// TS 103 420 5.2.1.2: an object with a distance lies outside the room, distance_factor times
+    /// as far from the room's centre O = (0.5, 0.5, 0) as the boundary point I on the ray from O
+    /// through its position. Every factor is above 1 (table 15) and a speaker layout ends at the
+    /// boundary, so it renders at I, in the direction it was placed.
+    static func beyondTheRoom(_ c: SIMD3<Float>) -> SIMD3<Float> {
+        let o = SIMD3<Float>(0.5, 0.5, 0)
+        let d = c - o
+        // The room is x, y in 0...1 and z in -1...1: half-extents 0.5, 0.5, 1 about O.
+        let half = SIMD3<Float>(0.5, 0.5, 1)
+        var t = Float.infinity
+        for axis in 0..<3 where d[axis] != 0 { t = min(t, half[axis] / abs(d[axis])) }
+        return t.isFinite ? o + t * d : c
+    }
+
+    /// TS 103 448 5.1.4: the panner target of the 22.2 layout nearest the position by the
+    /// weighted distance of pseudocode 2, among those the zone mask and the elevation switch
+    /// leave (5.1.3 applied to 22.2), the ties going as the clause orders the list.
+    static func snapped(_ p: SIMD3<Float>, zone: UInt8, elevation: Bool) -> SIMD3<Float> {
+        let weights = SIMD3<Float>(1.0 / 16, 4, 32)
+        var best = p, bestDistance = Float.infinity
+        for target in snapTargets where elevation || target.position.z == 0 {
+            if target.excludedBy.contains(zone) { continue }
+            let d = target.position - p
+            let distance = (weights * d * d).sum()
+            if distance < bestDistance {
+                bestDistance = distance
+                best = target.position
+            }
+        }
+        return best
+    }
+
+    /// TS 103 448 table A.9 (22.2) with the zone masks of table 4 that remove each target, ordered
+    /// as 5.1.4.2 orders the snap list: the three centre-line targets first, then by z and y
+    /// descending and x ascending. LFEs are no targets.
+    private static let snapTargets: [(position: SIMD3<Float>, excludedBy: Set<UInt8>)] = {
+        let (noBack, noSides, centreBack, screen, surround) = (TRUEHD_ATMOS_ZONE_NO_BACK, TRUEHD_ATMOS_ZONE_NO_SIDES,
+            TRUEHD_ATMOS_ZONE_CENTER_BACK, TRUEHD_ATMOS_ZONE_SCREEN_ONLY, TRUEHD_ATMOS_ZONE_SURROUND_ONLY)
+        let table: [(SIMD3<Float>, Set<UInt8>)] = [
+            (SIMD3(0, 0, 0), [centreBack, surround]),                  // L
+            (SIMD3(1, 0, 0), [centreBack, surround]),                  // R
+            (SIMD3(0.5, 0, 0), [surround]),                            // C
+            (SIMD3(0, 0.5, 0), [noSides, centreBack, screen]),         // Lss
+            (SIMD3(1, 0.5, 0), [noSides, centreBack, screen]),         // Rss
+            (SIMD3(0, 1, 0), [noBack, screen]),                        // Lb
+            (SIMD3(1, 1, 0), [noBack, screen]),                        // Rb
+            (SIMD3(0.25, 0.25, 1), []), (SIMD3(0.75, 0.25, 1), []),    // Tfl, Tfr
+            (SIMD3(0.25, 0.75, 1), []), (SIMD3(0.75, 0.75, 1), []),    // Tbl, Tbr
+            (SIMD3(0.25, 0.5, 1), []), (SIMD3(0.75, 0.5, 1), []),      // Tsl, Tsr
+            (SIMD3(0.5, 0.25, 1), []), (SIMD3(0.5, 0.75, 1), []),      // Tfc, Tbc
+            (SIMD3(0.5, 0.5, 1), []),                                  // Tc
+            (SIMD3(0, 0, -1), []), (SIMD3(1, 0, -1), []),              // Bfl, Bfr
+            (SIMD3(0.5, 0, -1), []),                                   // Bfc
+            (SIMD3(0.5, 1, 0), [noBack, screen]),                      // Cb
+            (SIMD3(0, 0.2929, 0), [noSides, centreBack, screen, surround]),  // Lw
+            (SIMD3(1, 0.2929, 0), [noSides, centreBack, screen, surround]),  // Rw
+        ]
+        let first: [SIMD3<Float>] = [SIMD3(0.5, 0, 0), SIMD3(0.5, 0, 1), SIMD3(0.5, 0, -1)]
+        return table.sorted { a, b in
+            let (ia, ib) = (first.firstIndex(of: a.0) ?? 3, first.firstIndex(of: b.0) ?? 3)
+            if ia != ib { return ia < ib }
+            if a.0.z != b.0.z { return a.0.z > b.0.z }
+            if a.0.y != b.0.y { return a.0.y > b.0.y }
+            return a.0.x < b.0.x
+        }.map { (position: $0.0, excludedBy: $0.1) }
+    }()
+
+    /// The playback screen in room coordinates (TS 103 420 4.2.1: x 0…1 left to right, z −1…1 floor to
+    /// ceiling): its bottom-left corner and its size. The stream does not carry it. Without one the
+    /// screen fills the front wall, which makes the screen-anchored mapping the identity.
+    struct PlaybackScreen: Equatable {
+        var origin: SIMD3<Float>
+        var width: Float
+        var height: Float
+        static let frontWall = PlaybackScreen(origin: SIMD3(0, 0, -1), width: 1, height: 2)
+    }
+
+    /// TS 103 420 5.2.1.3: a screen-anchored position (x across the screen, z −1…1 over its height,
+    /// y room depth) as a room position. At the front wall it sits on the screen; deeper in the room it
+    /// moves toward the raw coordinates by `screenFactor`, weighted by depth to the power `depthFactor`.
+    static func roomPosition(screenAnchored p: SIMD3<Float>, screenFactor: Float, depthFactor: Float,
+                             screen: PlaybackScreen) -> SIMD3<Float> {
+        let onScreen = SIMD3(screen.origin.x + screen.width * p.x, p.y,
+                             screen.origin.z + screen.height / 2 * (p.z + 1))          // C_R
+        let blend = screenFactor * p + (1 - screenFactor) * onScreen                    // M1 C_S + (I - M1) C_R
+        let weight = pow(max(p.y, 0), depthFactor)                                      // y^depth_factor
+        let mixed = weight * blend + (1 - weight) * onScreen                            // M2 (…) + (I - M2) C_R
+        return SIMD3(mixed.x, p.y, mixed.z)
     }
 
     /// Built once: they run per changed element on every metadata update.
@@ -218,6 +499,25 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         case TRUEHD_ATMOS_ZONE_SCREEN_ONLY: return screenOnly
         case TRUEHD_ATMOS_ZONE_SURROUND_ONLY: return surroundOnly
         default: return []
+        }
+    }
+}
+/// A block's planes with a gain applied, in planes of its own: the library's are read-only and
+/// valid until the next pull, and these are reused the same way.
+private final class NormalisedPlanes {
+    private var storage: [UnsafeMutablePointer<Float>] = []
+
+    deinit { storage.forEach { $0.deallocate() } }
+
+    /// `planes` (each `frames` long) times `gain`, the pointers replaced with this object's.
+    func scale(_ planes: inout [UnsafePointer<Float>], frames: Int, gain: Float) {
+        while storage.count < planes.count {
+            storage.append(.allocate(capacity: Int(TRUEHD_ATMOS_MAX_BLOCK_FRAMES)))
+        }
+        var g = gain
+        for c in planes.indices {
+            vDSP_vsmul(planes[c], 1, &g, storage[c], 1, vDSP_Length(frames))
+            planes[c] = UnsafePointer(storage[c])
         }
     }
 }

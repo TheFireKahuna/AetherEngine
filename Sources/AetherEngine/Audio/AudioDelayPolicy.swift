@@ -10,10 +10,10 @@ import Foundation
 /// engine still holds the timestamps. That is a different place on each route, and on both of them
 /// it is the LAST place rather than the obvious one:
 ///
-/// - `.software`: the decoded sample's stamped PTS, downstream of `AudioClockAnchor`. Applying it to
-///   the container PTS upstream instead would feed the gapless predictor an offset it treats as
-///   ordinary rounding jitter, so any nudge below its 100 ms discontinuity threshold would vanish
-///   without a trace, and the clock-arming decision (`SWClockAnchorPolicy`) would move with it.
+/// - `.software`: the decoded sample's stamped PTS, downstream of where the decoder places it on the
+///   stream's grid (`SourceGrid`). Applied to the container PTS upstream instead, an offset would
+///   move every timestamp off the grid the stream's start lays, and the clock-arming decision
+///   (`SWClockAnchorPolicy`) would move with it.
 /// - `.loopback`: the audio timestamps written into the fMP4 segments. Segments already cut carry
 ///   the old offset, and the two are not splicable: at the seam the audio track gains a gap or an
 ///   overlap of exactly the change, and a change that moves audio EARLIER walks into
@@ -48,9 +48,6 @@ enum AudioDelayPolicy {
 
     /// Where the offset is applied on a given route.
     enum Application: Equatable {
-        /// Stamped onto decoded audio samples as they are handed to the renderer. Takes effect as
-        /// soon as the renderer's queue is flushed, with no re-cut and no rebuild.
-        case sampleTimestamps
         /// Written into the fMP4 segments the local server feeds AVPlayer. A change is only clean
         /// across a re-cut at the playhead, so applying one costs a producer restart.
         case segmentTimestamps
@@ -60,11 +57,11 @@ enum AudioDelayPolicy {
 
     static func application(for route: VideoRoute) -> Application {
         switch route {
-        case .software: return .sampleTimestamps
         case .loopback: return .segmentTimestamps
         // AVPlayer owns the whole media selection; the engine never sees the timestamps (`.remoteBypass`),
-        // or there is no video for audio to be early or late against (`.audio`, `.none`).
-        case .remoteBypass, .audio, .none: return .unavailable
+        // or there is no video for audio to be early or late against (`.audio`, `.none`, and the retired
+        // `.software`).
+        case .remoteBypass, .audio, .none, .software: return .unavailable
         }
     }
 

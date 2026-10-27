@@ -71,6 +71,7 @@ struct Issue641LiveUndecodableAudioTests {
             avcodec_parameters_free(&p)
         }
         let bridge = try AudioBridge(srcCodecpar: codecpar, srcTimeBase: timeBase, mode: .surroundCompat)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         let calls = Calls()
         bridge.onDecoderProducedNothing = { calls.append($0) }

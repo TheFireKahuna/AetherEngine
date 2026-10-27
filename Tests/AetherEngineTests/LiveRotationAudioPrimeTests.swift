@@ -92,6 +92,7 @@ struct LiveRotationAudioPrimeTests {
                 srcTimeBase: stream.pointee.time_base,
                 mode: .surroundCompat
             )
+            bridge.setSourceStart(0)
             self.bridge = bridge
             while let packet = try audioDemuxer.readPacket() {
                 var p: UnsafeMutablePointer<AVPacket>? = packet

@@ -17,11 +17,21 @@ struct ProducerDeterminismTests {
         var mode: AudioBridgeMode = .surroundCompat
         var delay: Double = 0
         var testDescription: String {
+            clip + (["opus.mkv", "dts.mkv", "dts-drift.mkv", "truehd.mkv", "truehd-jitter.mkv"].contains(clip) ? " \(mode)" : "")
+                + (delay == 0 ? "" : " delay \(delay)")
         }
     }
 
     /// Copied from Matroska (Cues), MPEG-TS (the uniform grid) and MP4; bridged from Opus, DTS and TrueHD
     /// in both bridge modes; an audio delay either way.
+    static let routes: [Route] = [
+        .init(clip: "aac.mkv"), .init(clip: "ac3.ts"), .init(clip: "eac3.mp4"), .init(clip: "flac.mkv"),
+        .init(clip: "opus.mkv"), .init(clip: "dts.mkv"), .init(clip: "dts.mkv", mode: .lossless),
+        .init(clip: "truehd.mkv"), .init(clip: "truehd.mkv", mode: .lossless),
+        .init(clip: "truehd.mkv", delay: 0.15), .init(clip: "aac.mkv", delay: -0.15),
+        // Timestamps up to 112 frames off their frames, drifting and snapping back (fetch-fixtures.sh).
+        .init(clip: "dts-drift.mkv"), .init(clip: "truehd-jitter.mkv"),
+    ]
 
     private static func fixture(_ name: String) -> URL {
         URL(fileURLWithPath: #filePath)

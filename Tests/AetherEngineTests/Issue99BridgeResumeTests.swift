@@ -84,6 +84,7 @@ final class Issue99BridgeResumeTests: XCTestCase {
         }
 
         let bridge = try AudioBridge(srcCodecpar: codecpar, srcTimeBase: tb, mode: .surroundCompat)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
 
         var outputs: [UnsafeMutablePointer<AVPacket>] = []
@@ -115,6 +116,7 @@ final class Issue99BridgeResumeTests: XCTestCase {
         XCTAssertGreaterThan(packets.count, 3)
 
         let bridge = try AudioBridge(srcCodecpar: codecpar, srcTimeBase: tb, mode: .surroundCompat)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
 
         let half = packets.count / 2
@@ -152,6 +154,7 @@ final class Issue99BridgeResumeTests: XCTestCase {
         XCTAssertGreaterThan(packets.count, 1)
 
         let bridge = try AudioBridge(srcCodecpar: codecpar, srcTimeBase: tb, mode: .surroundCompat)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
 
         _ = try bridge.feed(packet: packets[0])

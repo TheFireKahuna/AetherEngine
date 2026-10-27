@@ -21,6 +21,8 @@
 #   cue-axis-bframes.mkv/.mp4     - one HEVC B-pyramid stream in both containers (AE#561)
 #   long-first-gop-{aac,pcm}.mkv  - 11 s first GOP, then 2 s GOPs; passthrough and bridged audio
 #   bridge-eac3-51.mkv            - 5.1 PCM in MKV, drives the EAC3 audio bridge (AE#561 follow-up)
+#   avsync/*                      - a white frame and a click at exactly 1 s, per audio codec and
+#                                   container, for AVSyncTests (audio against video, to the sample)
 #   decmem/*                      - 12 s of music-like audio in every codec the audio bridge decodes,
 #                                   for AudioDecoderMemoryTests (a decode started anywhere matches a
 #                                   continuous one past the decoder's declared memory)
@@ -36,7 +38,8 @@
 #   ./Scripts/fetch-fixtures.sh
 #
 # Requires:
-#   - ffmpeg with libx264, libx265, libaom-av1, libvpx-vp9 enabled.
+#   - ffmpeg with libx264, libx265, libaom-av1, libvpx-vp9 enabled (and libopus, libmp3lame for
+#     the avsync clips).
 #     macOS: `brew install ffmpeg` covers all four codecs.
 
 set -euo pipefail
@@ -392,6 +395,39 @@ for AUDIO in aac pcm; do
         -c:a "$CODEC" -ac 2 -f matroska "$FIXTURES_DIR/long-first-gop-$AUDIO.mkv"
 done
 
+# AVSyncTests: one white frame and one click at exactly the same instant (frame 24 at 24 fps, sample
+# 48000 at 48 kHz), in every audio codec the HLS route copies or bridges and in each container that
+# carries it. H.264 with B-frames, so the video side has a composition offset to keep straight. FFmpeg's
+# own decode puts the click on the frame in every clip (checked with -copyts); DTS is left out because
+# FFmpeg's experimental encoder adds 512 samples of delay it does not declare, so the clip itself is off.
+echo "→ avsync/* (frame and click at 1.000 s, per audio codec and container)"
+mkdir -p "$FIXTURES_DIR/avsync"
+AVSYNC_V="color=black:s=320x240:r=24:d=4,drawbox=x=0:y=0:w=320:h=240:color=white:t=fill:enable='eq(n,24)'"
+AVSYNC_CLICK="if(between(n,48000,48143),0.8*sin(2*PI*1000*(n-48000)/48000),0)"
+AVSYNC_STEREO="aevalsrc='$AVSYNC_CLICK|$AVSYNC_CLICK':s=48000:d=4"
+AVSYNC_51="aevalsrc='$AVSYNC_CLICK|0|0|0|0|0':s=48000:d=4:c=5.1"
+avsync_clip() {  # <name> <audio source> <audio args...>
+    local name="$1" source="$2"; shift 2
+    ffmpeg -hide_banner -loglevel error -y -f lavfi -i "$AVSYNC_V" -f lavfi -i "$source" "$@" \
+        -c:v libx264 -bf 3 -g 48 -pix_fmt yuv420p "$FIXTURES_DIR/avsync/$name"
+}
+avsync_clip aac.mkv "$AVSYNC_STEREO" -c:a aac -b:a 192k
+avsync_clip aac.mp4 "$AVSYNC_STEREO" -c:a aac -b:a 192k
+avsync_clip aac.ts "$AVSYNC_STEREO" -c:a aac -b:a 192k
+avsync_clip ac3.mkv "$AVSYNC_51" -c:a ac3
+avsync_clip ac3.ts "$AVSYNC_51" -c:a ac3
+avsync_clip eac3.mkv "$AVSYNC_51" -c:a eac3
+avsync_clip eac3.mp4 "$AVSYNC_51" -c:a eac3
+avsync_clip flac.mkv "$AVSYNC_STEREO" -c:a flac
+avsync_clip pcm.mkv "$AVSYNC_STEREO" -c:a pcm_s24le
+avsync_clip truehd.mkv "$AVSYNC_51" -c:a truehd -strict -2
+avsync_clip opus.mkv "$AVSYNC_STEREO" -c:a libopus
+avsync_clip mp3.mkv "$AVSYNC_STEREO" -c:a libmp3lame
+# FFmpeg's DTS encoder delays its output by one frame (512 samples) and declares no padding, so FFmpeg's
+# own decode puts a click at 48 000 one frame late: the DTS clip's click goes in a frame early.
+AVSYNC_DTS_CLICK="if(between(n,47488,47631),0.8*sin(2*PI*1000*(n-47488)/48000),0)"
+avsync_clip dts.mkv "aevalsrc='$AVSYNC_DTS_CLICK|0|0|0|0|0':s=48000:d=4:c=5.1" -c:a dca -strict -2
+
 # AudioDecoderMemoryTests: per channel, a tone with vibrato and a slow swell, a gated harmonic, a
 # repeating chirp, gated noise bursts and a noise floor, so every band carries something that changes.
 # Pure steady tones are avoided: Opus can settle into alternating between two rounded values on one.
@@ -436,6 +472,30 @@ determinism_clip flac.mkv "$DET_ST" -c:a flac
 determinism_clip opus.mkv "$DET_ST" -c:a libopus -b:a 128k
 determinism_clip dts.mkv "$DET_51" -c:a dca -strict -2
 determinism_clip truehd.mkv "$DET_51" -c:a truehd -strict -2
+# Audio that stops at 9 s under 24 s of picture (AE#847): the last segment is padded with silence.
+
+# Audio whose timestamps are off their frames the ways the library's remuxes carry them, the audio itself continuous.
+# Remuxed from the clips above, so the bitstream is the same and only the timestamps differ.
+# - DTS (research/dts-timing): timestamps falling behind their frames and snapping back, about 2 ms off at worst.
+# - TrueHD (a survey of seven titles): stamps a millisecond off either way on scattered packets, and on one title
+#   the first packet stamped 5 ms ahead of the rest.
+echo "→ avsync/{dts-drift,truehd-jitter,truehd-firststamp}.mkv, determinism/{dts-drift,truehd-jitter}.mkv"
+audio_drift() {  # <from> <to> <packets per snap> <samples behind at the snap>
+    local expr="round(mod(N\\,$3)*$4/$3/48000/TB)"
+    ffmpeg -hide_banner -loglevel error -y -i "$1" -map 0 -c copy -bsf:a "setts=pts=PTS-$expr:dts=DTS-$expr" "$2"
+}
+TRUEHD_JITTER="if(eq(mod(N\\,7)\\,3)\\,1\\,if(eq(mod(N\\,11)\\,5)\\,-1\\,0))*0.001/TB"
+for d in avsync determinism; do
+    # DTS: a 512-sample frame a packet, 32 samples behind per 25 of them (as measured), back every 60.
+    audio_drift "$FIXTURES_DIR/$d/dts.mkv" "$FIXTURES_DIR/$d/dts-drift.mkv" 60 77
+    # TrueHD: a 40-sample access unit a packet; one packet in seven a millisecond late, one in eleven early.
+    ffmpeg -hide_banner -loglevel error -y -i "$FIXTURES_DIR/$d/truehd.mkv" -map 0 -c copy \
+        -bsf:a "setts=pts=PTS+$TRUEHD_JITTER:dts=DTS+$TRUEHD_JITTER" "$FIXTURES_DIR/$d/truehd-jitter.mkv"
+done
+# TrueHD whose first packet is stamped apart from the rest: every packet but the first 5 ms later.
+ffmpeg -hide_banner -loglevel error -y -i "$FIXTURES_DIR/avsync/truehd.mkv" -map 0 -c copy \
+    -bsf:a "setts=pts=if(eq(N\\,0)\\,PTS\\,PTS+0.005/TB):dts=if(eq(N\\,0)\\,DTS\\,DTS+0.005/TB)" \
+    "$FIXTURES_DIR/avsync/truehd-firststamp.mkv"
 
 echo ""
 echo "Done. Try:"

@@ -30,13 +30,26 @@ final class AudioDecoder: @unchecked Sendable {
     private static let minSamplesPerBuffer = 1024
 
     private var pendingBytes = Data()
-    private var pendingStartPTS: CMTime = .invalid
     private var pendingSampleCount: Int = 0
+    /// Where the pending buffer's first sample plays, and where the sample after the last one taken
+    /// goes, in source frames at `sampleRate`: positions on the stream's grid, so consecutive buffers
+    /// abut to the sample (#89: a buffer stamped with its container-rounded time left a gap or overlap
+    /// at every frame of a non-integer-millisecond length, 1536-sample AC-3 at 44.1 kHz).
+    private var pendingStart: Int64?
+    private var nextPosition: Int64?
 
-    /// Gapless presentation clock (issue #89): stamps each buffer from a running sample count so
-    /// consecutive buffers abut to the sample, instead of from each buffer's container-quantized PTS
-    /// (which clicks at every frame for non-integer-ms frame durations like 1536-sample AC-3 @ 44.1 kHz).
-    private var clock = AudioClockAnchor()
+    /// The stream's frames on its lattice from its first coded frame (`SourceGrid`), built at the first
+    /// frame from the stream's start and codec; `runFrames` counts what the decoder produced in the
+    /// current run, the frame being placed included.
+    private var grid: SourceGrid?
+    private var sourceStart: Int64?
+    private var sourceParameters: UnsafeMutablePointer<AVCodecParameters>?
+    private var runFrames: Int64 = 0
+    /// The decoder's count broke (a packet it refused, a flush): the next frame starts a new run.
+    private var runBreakPending = false
+    /// Decoded frames dropped because nothing yet said where they play.
+    private(set) var framesDroppedUnplaced = 0
+    private var reportedNoSourceStart = false
 
     #if DEBUG
     private var _loggedZeroConvert = false
@@ -52,6 +65,11 @@ final class AudioDecoder: @unchecked Sendable {
     private(set) var channels: Int32 = 0
     /// The order the resampler writes and the tag stamped on it (see `ResamplerOutput`).
     private var output = ResamplerOutput(channels: 2)
+    /// Samples still to drop from the start of the next converted frames (an overlap).
+    private var pendingTrimSamples = 0
+    /// Frames placed away from where the count said, for tests and diagnostics.
+    private(set) var continuityGaps = 0
+    private(set) var continuityOverlaps = 0
 
     func open(stream: UnsafeMutablePointer<AVStream>) throws {
         guard let codecpar = stream.pointee.codecpar else {
@@ -59,6 +77,10 @@ final class AudioDecoder: @unchecked Sendable {
         }
 
         timeBase = stream.pointee.time_base
+        sourceStart = stream.pointee.start_time == Int64.min ? nil : stream.pointee.start_time
+        if sourceParameters != nil { avcodec_parameters_free(&sourceParameters) }
+        sourceParameters = avcodec_parameters_alloc()
+        if let sourceParameters { _ = avcodec_parameters_copy(sourceParameters, codecpar) }
         sampleRate = codecpar.pointee.sample_rate
         channels = codecpar.pointee.ch_layout.nb_channels
         if channels <= 0 || channels > 8 { channels = 2 }
@@ -76,6 +98,10 @@ final class AudioDecoder: @unchecked Sendable {
             throw AudioDecoderError.parameterCopyFailed
         }
 
+        // The packets' time base, so a decoder that trims priming (Opus pre-skip, a LAME header, an MP4
+        // edit list's AAC delay) moves the frame's pts past what it trimmed; without it the pts stays the
+        // packet's and the first audio played that much early.
+        ctx.pointee.pkt_timebase = stream.pointee.time_base
         guard openAudioDecoder(ctx, codec) >= 0 else {
             throw AudioDecoderError.openFailed
         }
@@ -96,7 +122,10 @@ final class AudioDecoder: @unchecked Sendable {
         var results: [CMSampleBuffer] = []
 
         let sendRet = avcodec_send_packet(ctx, packet)
-        guard sendRet >= 0 else { return [] }
+        guard sendRet >= 0 else {
+            runBreakPending = true
+            return []
+        }
 
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
         defer { av_frame_free(&frame) }
@@ -111,12 +140,7 @@ final class AudioDecoder: @unchecked Sendable {
                 if let sampleBuffer = rebuildResampler(for: f) { results.append(sampleBuffer) }
                 if swrContext == nil { continue }
             }
-            appendFrameToPending(f)
-            if pendingSampleCount >= Self.minSamplesPerBuffer {
-                if let sampleBuffer = emitPending() {
-                    results.append(sampleBuffer)
-                }
-            }
+            take(f, into: &results)
         }
 
         return results
@@ -124,9 +148,8 @@ final class AudioDecoder: @unchecked Sendable {
 
     /// Tear down and rebuild the resampler for a frame whose input parameters changed mid-stream
     /// (#452). Emits the accumulator first (its bytes are in the OLD output format and must be
-    /// neither dropped nor mixed with the new format's) and returns that buffer, if any. The gapless
-    /// clock's sample count is denominated in the old rate, so it resets and the next buffer
-    /// re-anchors from its own container PTS. On a failed rebuild `swrContext` stays nil and the
+    /// neither dropped nor mixed with the new format's) and returns that buffer, if any. The grid is
+    /// laid at the decoded rate, so it is laid again at the next frame's. On a failed rebuild `swrContext` stays nil and the
     /// caller skips the frame; the next frame retries, mirroring the lazy-init failure mode.
     private func rebuildResampler(for frame: UnsafeMutablePointer<AVFrame>) -> CMSampleBuffer? {
         let flushed = emitPending()
@@ -137,7 +160,10 @@ final class AudioDecoder: @unchecked Sendable {
             + "); rebuilding resampler",
             category: .swPlayback)
         swr_free(&swrContext)
-        clock.reset()
+        // The grid is laid at the decoded rate, which may have changed.
+        grid = nil
+        nextPosition = nil
+        pendingTrimSamples = 0
         _ = initResamplerFromFrame(frame)
         return flushed
     }
@@ -217,8 +243,9 @@ final class AudioDecoder: @unchecked Sendable {
         avcodec_flush_buffers(ctx)
         // Drop the coalesced samples; after a seek they'd be at the wrong PTS anyway.
         resetPending()
-        // Re-anchor the gapless clock to the post-seek PTS on the next emitted buffer.
-        clock.reset()
+        nextPosition = nil
+        runBreakPending = true
+        pendingTrimSamples = 0
         #if DEBUG
         _loggedZeroConvert = false
         #endif
@@ -245,10 +272,7 @@ final class AudioDecoder: @unchecked Sendable {
                     if let sampleBuffer = rebuildResampler(for: f) { results.append(sampleBuffer) }
                     if swrContext == nil { continue }
                 }
-                appendFrameToPending(f)
-                if pendingSampleCount >= Self.minSamplesPerBuffer {
-                    if let sampleBuffer = emitPending() { results.append(sampleBuffer) }
-                }
+                take(f, into: &results)
             }
         }
         // Force-emit whatever is left below the coalescing threshold (emitPending only needs > 0 samples).
@@ -264,6 +288,9 @@ final class AudioDecoder: @unchecked Sendable {
         }
         if swrContext != nil {
             swr_free(&swrContext)
+        }
+        if sourceParameters != nil {
+            avcodec_parameters_free(&sourceParameters)
         }
         // The stored copy may hold an allocated channel map for custom-order layouts (#452).
         configuredInput.release()
@@ -319,9 +346,70 @@ final class AudioDecoder: @unchecked Sendable {
 
     // MARK: - Frame → pending buffer → CMSampleBuffer
 
-    /// Resample one frame and append float-interleaved bytes to the pending accumulator. Captures the frame's PTS
-    /// on the first append so emitPending() stamps the coalesced buffer correctly.
-    private func appendFrameToPending(_ frame: UnsafeMutablePointer<AVFrame>) {
+    /// One decoded frame: placed on the grid, against where the count says it goes, then appended.
+    private func take(_ frame: UnsafeMutablePointer<AVFrame>, into results: inout [CMSampleBuffer]) {
+        guard let start = position(of: frame) else {
+            framesDroppedUnplaced += 1
+            return
+        }
+        if let next = nextPosition, start != next {
+            switch AudioContinuity.decide(expected: next, actual: start, tolerance: 0, sampleRate: sampleRate) {
+            case .continue:
+                break
+            case .gap, .jump:
+                // The renderer leaves exactly the gap: this frame starts the next buffer at its own place.
+                if let buffer = emitPending() { results.append(buffer) }
+                continuityGaps += 1
+            case .overlap(let samples):
+                pendingTrimSamples += Int(samples)
+                continuityOverlaps += 1
+            }
+        }
+        appendFrameToPending(frame, at: start)
+        if pendingSampleCount >= Self.minSamplesPerBuffer, let buffer = emitPending() {
+            results.append(buffer)
+        }
+    }
+
+    /// Where `frame` starts, in source frames at its rate: on the stream's grid, placed by its timestamp
+    /// and every other one of its run (`SourceGrid`); nil while nothing can say. The frame's end is
+    /// what is placed: a decoder that trims a codec's delay off the front of the stream's first frame
+    /// leaves that frame's start off the lattice, never its end.
+    private func position(of frame: UnsafeMutablePointer<AVFrame>) -> Int64? {
+        let rate = frame.pointee.sample_rate
+        guard rate > 0, let parameters = sourceParameters else { return nil }
+        if grid == nil {
+            guard let sourceStart else {
+                if !reportedNoSourceStart {
+                    reportedNoSourceStart = true
+                    EngineLog.emit("[AudioDecoder] ERROR: no stream start, so no frame can be placed", category: .swPlayback)
+                }
+                return nil
+            }
+            grid = SourceGrid(
+                origin: SourceGrid.origin(start: sourceStart, timeBase: timeBase, sampleRate: rate,
+                                          initialPadding: parameters.pointee.initial_padding),
+                step: SourceGrid.lattice(codecpar: parameters, sampleRate: rate,
+                                         decodedFrameSamples: Int64(frame.pointee.nb_samples)),
+                tolerance: AudioContinuity.tolerance(sourceTimeBase: timeBase, sampleRate: rate))
+            runFrames = 0
+        }
+        if runBreakPending {
+            runBreakPending = false
+            grid?.restart()
+            runFrames = 0
+        }
+        let frames = Int64(frame.pointee.nb_samples)
+        runFrames += frames
+        let end = frame.pointee.pts == Int64.min
+            ? nil : av_rescale_q(frame.pointee.pts, timeBase, AVRational(num: 1, den: rate)) + frames
+        guard case .position(let at) = grid!.place(relative: runFrames, estimate: end).0 else { return nil }
+        return at - frames
+    }
+
+    /// Resample one frame and append float-interleaved bytes to the pending accumulator; the first append
+    /// gives the buffer its start (`start`, past any overlap trimmed off).
+    private func appendFrameToPending(_ frame: UnsafeMutablePointer<AVFrame>, at start: Int64) {
         guard let swr = swrContext else { return }
 
         let numSamples = Int(frame.pointee.nb_samples)
@@ -360,14 +448,17 @@ final class AudioDecoder: @unchecked Sendable {
         }
         #endif
         guard convertedSamples > 0 else { return }
+        // An overlap `take` found comes off the start of what this frame converted to.
+        let skip = min(pendingTrimSamples, Int(convertedSamples))
+        pendingTrimSamples -= skip
+        let kept = Int(convertedSamples) - skip
+        guard kept > 0 else { return }
 
-        // First frame in a new accumulator captures the PTS; subsequent frames only extend the buffer.
-        if pendingSampleCount == 0 {
-            pendingStartPTS = SourceTimestampBounds.cmTime(ticks: frame.pointee.pts, timeBase: timeBase)
-        }
+        nextPosition = start + Int64(convertedSamples)
+        if pendingSampleCount == 0 { pendingStart = start + Int64(skip) }
 
-        pendingBytes.append(tempBuffer, count: Int(convertedSamples) * bytesPerSample)
-        pendingSampleCount += Int(convertedSamples)
+        pendingBytes.append(tempBuffer + skip * bytesPerSample, count: kept * bytesPerSample)
+        pendingSampleCount += kept
     }
 
     /// Build a CMSampleBuffer from the pending accumulator and reset it. Nil if nothing pending.
@@ -377,9 +468,12 @@ final class AudioDecoder: @unchecked Sendable {
               !pendingBytes.isEmpty
         else { return nil }
 
+        guard let start = pendingStart else {
+            resetPending()
+            return nil
+        }
         let totalBytes = pendingBytes.count
         let totalSamples = pendingSampleCount
-        let startPTS = pendingStartPTS
 
         var blockBuffer: CMBlockBuffer?
         var status = CMBlockBufferCreateWithMemoryBlock(
@@ -412,11 +506,7 @@ final class AudioDecoder: @unchecked Sendable {
             return nil
         }
 
-        // Gapless PTS (issue #89): derive this buffer's start from the running sample count so
-        // consecutive buffers abut exactly, instead of from the container-quantized PTS (which leaves
-        // +/-0.5 ms gaps and per-frame clicks for non-integer-ms frame durations). Committed only on
-        // success below, so a dropped buffer never advances the clock.
-        let (outPTS, reanchor) = clock.resolve(startPTS: startPTS, sampleRate: sampleRate)
+        let outPTS = CMTime(value: start, timescale: sampleRate)
 
         // Single timing entry: CoreMedia treats `duration` as per-SAMPLE, so LPCM must be 1/sampleRate. Stamping
         // the buffer total made GetDuration report totalSamples^2/sampleRate (~22s for 1024 samples), wedging
@@ -444,14 +534,13 @@ final class AudioDecoder: @unchecked Sendable {
         )
         resetPending()
         guard status == noErr, let sample = sampleBuffer else { return nil }
-        clock.commit(pts: outPTS, reanchor: reanchor, sampleCount: totalSamples)
         return sample
     }
 
     private func resetPending() {
         pendingBytes.removeAll(keepingCapacity: true)
         pendingSampleCount = 0
-        pendingStartPTS = .invalid
+        pendingStart = nil
     }
 }
 
@@ -479,9 +568,18 @@ enum AudioDecoderError: Error, CustomStringConvertible, LocalizedError {
 
 /// Opens an audio decoder at the programme's reference dynamics. FFmpeg's AC-3 and E-AC-3 decoders
 /// apply the stream's dynamic range compression in full by default (`drc_scale` 1); a receiver
+/// decoding the same bitstream plays it uncompressed unless asked, so the engine does too.
+///
+/// They also fill the coefficients the encoder gave no bits with noise (A/52's dither), from a
+/// generator that by default runs on from the decoder's open, so a frame decodes differently with
+/// every frame before it and a decode started anywhere never meets a continuous one (measured over 60
+/// starts in four files: never once). `cons_noisegen` seeds it from each frame's own bytes: the same
+/// noise level and spectrum, A/52 leaves the generator to the decoder, and a frame decodes the same
+/// every time. Decoders without these options ignore them.
 func openAudioDecoder(_ ctx: UnsafeMutablePointer<AVCodecContext>, _ codec: UnsafePointer<AVCodec>) -> Int32 {
     var options: OpaquePointer?
     av_dict_set(&options, "drc_scale", "0", 0)
+    av_dict_set(&options, "cons_noisegen", "1", 0)
     defer { av_dict_free(&options) }
     return avcodec_open2(ctx, codec, &options)
 }

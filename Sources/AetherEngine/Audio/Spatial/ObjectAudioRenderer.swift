@@ -111,6 +111,21 @@ struct ObjectAudioMetadataUpdate: Sendable {
     /// alone, ramp included. Atmos restarts every element's ramp at every update, restated values
     /// included (TS 103 448 pseudocode 19), so its decoder sends every element.
     var states: [ObjectAudioElementState?]
+
+    /// The same update for a block whose first `frames` frames are cut off: one that starts inside the
+    /// cut starts on the first frame kept with only what is left of its ramp, so every element still
+    /// arrives where it is going on the frame it was due there.
+    func droppingFirst(_ frames: Int) -> ObjectAudioMetadataUpdate {
+        var update = self
+        let elapsed = frames - frameOffset
+        if elapsed > 0 {
+            update.rampFrames = max(rampFrames - elapsed, 0)
+            update.frameOffset = 0
+        } else {
+            update.frameOffset -= frames
+        }
+        return update
+    }
 }
 
 /// Renders object audio (beds + dynamic objects + metadata) into a `SpatialSpeakerLayout` bed.

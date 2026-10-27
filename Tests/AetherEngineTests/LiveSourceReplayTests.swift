@@ -84,12 +84,8 @@ struct LiveSourceReplayTests {
         let stream = try #require(demuxer.stream(at: index))
         var audio: HLSSegmentProducer.AudioConfig?
         if let stream = demuxer.stream(at: demuxer.audioStreamIndex) {
-            audio = .init(codecpar: UnsafePointer(stream.pointee.codecpar),
-                          timeBase: stream.pointee.time_base,
-                          sourceStreamIndex: demuxer.audioStreamIndex,
-                          inputTimeBase: stream.pointee.time_base,
-                          sourceTimeBase: stream.pointee.time_base,
-                          bridge: nil, stripAacAdts: true)
+            audio = .init(copying: stream, codecpar: UnsafePointer(stream.pointee.codecpar),
+                          sourceStreamIndex: demuxer.audioStreamIndex, framing: .adts)
         }
         let cache = retainedCache ?? SegmentCache(forwardWindow: 32, backwardWindow: 32)
         let baseIndex = predecessor == nil ? 0 : cache.count
@@ -120,88 +116,6 @@ struct LiveSourceReplayTests {
             #expect(reader.consumedBytes < bytes.count, "the packet bound fires before source EOF")
         }
         return producer
-    }
-
-    private final class AdmissionGate: @unchecked Sendable {
-        private let lock = NSLock()
-        private var held = false
-        private var sawHold = false
-        private var reads = 0
-        private var ended = false
-        private var stopped = false
-        func noteRead() { lock.withLock { reads += 1; if reads == 1 { held = true } } }
-        func mayRead() -> Bool { lock.withLock { if held { sawHold = true }; return !held } }
-        func release() { lock.withLock { held = false } }
-        func stop() { lock.withLock { stopped = true; held = false } }
-        func finish() { lock.withLock { ended = true } }
-        var blocked: Bool { lock.withLock { sawHold } }
-        var done: Bool { lock.withLock { ended } }
-        var shouldStop: Bool { lock.withLock { stopped } }
-    }
-
-    @Test("software acquisition cannot evict a cursor while its recovery transition is held")
-    func readerHonoursDVRRecoveryHold() async throws {
-        let demuxer = Demuxer()
-        try demuxer.open(reader: Reader(TinyTransportStreamFixture.data), formatHint: "mpegts")
-        let video = demuxer.videoStreamIndex
-        let tb = try #require(demuxer.stream(at: video)).pointee.time_base
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let ring = try PacketRingBuffer(windowSeconds: 2, scratch: directory)
-        let condition = NSCondition()
-        let gate = AdmissionGate()
-        defer { gate.stop(); condition.withLock { condition.broadcast() } }
-        Thread.detachNewThread {
-            defer { demuxer.close(); gate.finish() }
-            SoftwarePlaybackHost.runLiveReaderLoop(demuxer: demuxer,
-                videoStreamIndex: video, audioStreamIndex: -1, condition: condition, ring: ring,
-                videoTimeBaseSeconds: Double(tb.num) / Double(tb.den), audioTimeBaseSeconds: 0,
-                noteEdge: { _ in gate.noteRead() }, readerMayAdvance: { gate.mayRead() },
-                stopRequested: { gate.shouldStop }, onError: { _ in gate.stop() },
-                onSourceEnded: {})
-        }
-        try await waitFor { gate.blocked || gate.done }
-        #expect(gate.blocked)
-        #expect(ring.seqBounds.first == 0)
-        #expect(ring.seqBounds.end == 1)
-        gate.release(); condition.withLock { condition.broadcast() }
-        try await waitFor { gate.done }
-        #expect(ring.seqBounds.end > 1)
-        ring.close()
-        try? FileManager.default.removeItem(at: directory)
-    }
-
-    @Test("software admission removes real H264/AAC replay before the DVR timeline")
-    func softwarePacketAdmission() throws {
-        let clip = try fixture(data: Self.audioVideoFixture(), headFrames: 12, replayStartFrame: 2)
-        func signatures(_ bytes: Data) throws -> [LivePacketReplayGuard.Signature] {
-            let demuxer = Demuxer()
-            try demuxer.open(reader: Reader(bytes), formatHint: "mpegts", isLive: true)
-            defer { demuxer.close() }
-            let video = demuxer.videoStreamIndex
-            let audio = demuxer.audioStreamIndex
-            let vt = try #require(demuxer.stream(at: video)).pointee.time_base
-            let at = try #require(demuxer.stream(at: audio)).pointee.time_base
-            let filter = LiveReplayPacketReader(videoIndex: video, audioIndex: audio,
-                videoTimeBase: Double(vt.num) / Double(vt.den), audioTimeBase: Double(at.num) / Double(at.den))
-            var result: [LivePacketReplayGuard.Signature] = []
-            while let packet = try filter.read(from: { try demuxer.readPacket() }) {
-                defer { var owned: UnsafeMutablePointer<AVPacket>? = packet; av_packet_free(&owned) }
-                guard packet.pointee.stream_index == video || packet.pointee.stream_index == audio,
-                      let data = packet.pointee.data, packet.pointee.size > 0 else { continue }
-                result.append(.init(stream: packet.pointee.stream_index == video ? .video : .audio,
-                    dts: packet.pointee.dts, pts: packet.pointee.pts,
-                    payload: UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size))))
-            }
-            return result
-        }
-        let baseline = try signatures(clip.head + clip.tail)
-        let recovered = try signatures(clip.head + clip.replay + clip.tail)
-        // TS/PES interleaving can change at the seam; each decoder must still receive
-        // exactly its original compressed packets, in original per-track order.
-        for track in [LivePacketReplayGuard.Stream.video, .audio] {
-            #expect(recovered.filter { $0.stream == track } == baseline.filter { $0.stream == track })
-        }
     }
 
     @Test("fresh producers keep cached replay history through repeated source recoveries")
@@ -384,7 +298,7 @@ struct LiveSourceReplayTests {
 
     /// Decode the actual admitted/remuxed media, including delayed B-frames. Packet counts
     /// alone cannot detect a lost reference picture or a broken fMP4 sample description.
-    private func decodedPictures(_ bytes: Data, format: String, filterReplay: Bool) throws -> [SHA256.Digest] {
+    private func decodedPictures(_ bytes: Data, format: String) throws -> [SHA256.Digest] {
         let demuxer = Demuxer()
         try demuxer.open(reader: Reader(bytes), formatHint: format)
         defer { demuxer.close() }
@@ -399,11 +313,6 @@ struct LiveSourceReplayTests {
         }
         #expect(avcodec_parameters_to_context(context, stream.pointee.codecpar) >= 0)
         #expect(avcodec_open2(context, codec, nil) >= 0)
-        let tb = stream.pointee.time_base
-        let audio = demuxer.audioStreamIndex
-        let at = try #require(demuxer.stream(at: audio)).pointee.time_base
-        let admission = LiveReplayPacketReader(videoIndex: video, audioIndex: audio,
-            videoTimeBase: Double(tb.num) / Double(tb.den), audioTimeBase: Double(at.num) / Double(at.den))
         var hashes: [SHA256.Digest] = []
         func drain() {
             while avcodec_receive_frame(context, frame) >= 0 {
@@ -422,7 +331,7 @@ struct LiveSourceReplayTests {
                 av_frame_unref(frame)
             }
         }
-        while let packet = try (filterReplay ? admission.read(from: { try demuxer.readPacket() }) : demuxer.readPacket()) {
+        while let packet = try demuxer.readPacket() {
             defer { var p: UnsafeMutablePointer<AVPacket>? = packet; av_packet_free(&p) }
             if packet.pointee.stream_index == video {
                 #expect(avcodec_send_packet(context, packet) >= 0)
@@ -434,7 +343,7 @@ struct LiveSourceReplayTests {
         return hashes
     }
 
-    @Test("long GOP replay preserves every decoded picture on software and remux paths", arguments: [false, true])
+    @Test("long GOP replay preserves every decoded picture on the remux path", arguments: [false, true])
     func longGOPDecodedContinuity(damaged: Bool) async throws {
         let bytes = try LongGOPTransportStreamFixture.data()
         let clip = try fixture(data: bytes, headFrames: 620, replayStartFrame: 120)
@@ -445,10 +354,9 @@ struct LiveSourceReplayTests {
             let previous = try #require(head.range(of: aud, options: .backwards, in: 0..<last.lowerBound))
             head[previous.lowerBound / 188 * 188 + 1] |= 0x80
         }
-        let expected = try decodedPictures(bytes, format: "mpegts", filterReplay: false)
+        let expected = try decodedPictures(bytes, format: "mpegts")
         #expect(expected.count == 800)
         let replay = head + clip.replay + clip.tail
-        #expect(try decodedPictures(replay, format: "mpegts", filterReplay: true) == expected)
         let cache = SegmentCache(forwardWindow: 32, backwardWindow: 32)
         defer { cache.close() }
         _ = try await run(replay, expected: "eof", expectedRebases: 0, retainedCache: cache)
@@ -456,7 +364,7 @@ struct LiveSourceReplayTests {
         for index in 0..<cache.count {
             remuxed.append(try #require(cache.fetch(index: index, timeout: 0)))
         }
-        #expect(try decodedPictures(remuxed, format: "mov", filterReplay: false) == expected)
+        #expect(try decodedPictures(remuxed, format: "mov") == expected)
     }
 
     /// Exercise Apple's decoder as well as FFmpeg: the native consumer can reject a
@@ -475,9 +383,8 @@ struct LiveSourceReplayTests {
             // Real transport loss inside the outgoing access unit, not just a flag on intact bytes.
             head = Data(head.prefix(last.lowerBound + (seam >= 3 ? 80 : 10)))
         }
-        let expected = try decodedPictures(bytes, format: "mpegts", filterReplay: false)
+        let expected = try decodedPictures(bytes, format: "mpegts")
         #expect(expected.count == 800)
-        #expect(try decodedPictures(head + clip.replay + clip.tail, format: "mpegts", filterReplay: true) == expected)
         var decoded: [[NativePicture]] = []
         for input in [bytes, head + clip.replay + clip.tail] {
             let cache = SegmentCache(forwardWindow: 32, backwardWindow: 32)

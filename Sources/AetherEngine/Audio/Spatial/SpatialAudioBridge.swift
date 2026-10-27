@@ -1,7 +1,6 @@
 // Only with the TrueHDObjectAudio or DTSXObjectAudio trait (both off by default).
 #if TrueHDObjectAudio || DTSXObjectAudio
 import Foundation
-import CoreMedia
 import AetherLibavcodec
 import AetherLibavutil
 
@@ -9,7 +8,7 @@ import AetherLibavutil
 /// into a `SpatialSpeakerLayout` bed and encodes that as Apple Positional Audio, which tvOS delivers
 /// to an Atmos receiver as Dolby MAT with the heights intact.
 ///
-/// The FLAC bridge keeps TrueHD and DTS-HD lossless but can only carry the 7.1 presentation, so every
+/// The PCM bridge keeps TrueHD and DTS-HD lossless but can only carry the 7.1 presentation, so every
 /// height and every object position is gone before the audio leaves the engine. This bridge trades the
 /// lossless bed for the Atmos mix: APAC is lossy, at a few Mbit/s, several times the rate streaming
 /// services deliver Atmos at.
@@ -43,20 +42,57 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     let soundSampleEntryOverride: Data?
     /// HLS `CODECS` value for the track.
     let hlsCodecs: String
-    var servedChannelCount: Int? { layout.channelCount }
+    var servedChannelCount: Int? {
+#if APACObjectOutput
+        // CHANNELS agrees with CODECS: both name the tier the object stream is announced as.
+        if objectOutput { return Self.objectAnnouncedLayout.channelCount }
+#endif
+        return layout.channelCount
+    }
     let peakOutputBitRate: Int64
-    /// The encoder's packets as a sample-buffer format description, and the frames the encoder
-    /// primes with, for a host that feeds an audio renderer instead of a muxer (see `wrap`).
-    let packetFormatDescription: CMAudioFormatDescription
-    let encoderLeadingFrames: Int
+    /// The encoder's priming: the first frames of every encoder run's decoded audio, before its content.
+    var leadingFrames: Int { pipeline.leadingFrames }
+
+    /// What the bed handed to the encoder at a position takes input from, decoder to limiter
+    /// (`AudioStageSpan`). Two stages are not in it. The renderer's memory is the metadata's, and it
+    /// says itself when it has settled (`ObjectAudioRenderer.isSettled`). The encoder's never ends,
+    /// so a segment that must not depend on its run gets a run of its own
+    /// (`APACEncoder.segmentRunLeadFrames`).
+    var span: AudioStageSpan {
+        var stages = [decoder.span]
+#if APACObjectOutput
+        if objectOutput { return .series(stages) }
+#endif
+        stages.append(PeakLimiter.span(sampleRate: Self.sampleRate))
+        return .series(stages)
+    }
+
+    /// A segment's run (`AudioSegmentRuns`): `span`, then the encoder, whose rate control never
+    /// forgets where a run began, so a run leaves it `APACEncoder.segmentRunLeadFrames` before the
+    /// segment.
+    var runSpan: AudioStageSpan? { span.then(AudioStageSpan(latency: 0, memory: APACEncoder.segmentRunLeadFrames)) }
+    var runEncoderMemory: Int { APACEncoder.segmentRunLeadFrames }
+    var runPacketFrames: Int { APACEncoder.framesPerPacket }
 
     private let srcTimeBase: AVRational
     private let decoder: ObjectAudioDecoding
     private let pipeline: APACEncodePipeline
     private var renderer: ObjectAudioRenderer?
     private var rendererGeneration = -1
-    /// What the encoder is fed, per bed channel, for the session log (see `BedLevelMeter`).
-    private var levelMeter: BedLevelMeter
+    /// The renderer started over (built, or reset by a restart) and its next block marks where.
+    private var rendererRunPending = true
+    /// Where the renderer's run began, until it settles (`ObjectAudioRenderer.isSettled`): how long
+    /// that takes on real programmes is what a restart's pre-roll has to cover, so it is logged.
+    private var rendererSettlingFrom: Int64?
+    /// What the encoder is fed, per bed channel, for the session log (see `BedLevelMeter`): this
+    /// bridge's, or the session's when it makes one segment (`measuring`).
+    let levels: SessionLevelMeter
+    /// A segment's run measures into the session's meter, and only its own segment: frames on the
+    /// output timeline (`startRun`). Nil: everything this bridge makes is its own to measure.
+    private var measuring: Range<Int64>?
+    private let ownsLevels: Bool
+    /// Set-up lines go to the log once a session: a segment's run is made as the session's own was.
+    private let announces: Bool
     /// Keeps the bed under full scale, since the encoder carries anything over it on (see `PeakLimiter`).
     private var limiter: PeakLimiter
 
@@ -66,22 +102,54 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// `encodeChunkFrames` at a time (see `APACEncodePipeline`).
     private var output: APACEncodePipeline.PlaneBuffer
     private var pendingFrames = 0
+    /// Frames taken from the decoder that have not reached the encoder yet, outside `output`: the
+    /// limiter's look-ahead.
+    private var heldBack: Int { limiter.backlog }
     private static let encodeChunkFrames = 2048
+#if APACObjectOutput
+    /// Elements go out as APAC objects (`APACObjectEncoder`): no renderer mix, no split, no limiter
+    /// (the system renderer mixes after the encode). The presentation the chunk being filled holds.
+    private let objectOutput: Bool
+    private var objectRoles: [ObjectAudioRole] = []
+    /// The channel bed an object stream is announced as in the playlist (see `init`): the one tvOS
+    /// renders it to for an HDMI Atmos route.
+    static let objectAnnouncedLayout = SpatialSpeakerLayout.l714
+#endif
 
-    /// Timeline, in 48 kHz frames on the output time base.
-    /// `originFrame`: the source PTS of the first packet pushed since the last reset.
+    /// Timeline, in 48 kHz frames on the output time base. Where a block plays comes from `grid`
+    /// (`SourceGrid`): the stream's frames from its start, on the decoder's own clock where the
+    /// bitstream has one (TrueHD), else its count of what it was given since its reset, placed by
+    /// every source timestamp the decoder attributes to the run's blocks (`sourcePts`).
     /// `encoderStartFrame`: where the first frame handed to the encoder since the reset sits.
     /// `encoderFramesIn`: frames handed to the encoder since the reset, so the next chunk sits at
     /// `encoderStartFrame + encoderFramesIn`. The pipeline stamps the packets; see `wrap`.
-    private var originFrame: Int64?
+    private var grid: SourceGrid?
+    /// The stream's first timestamp (source time base, the producer's axis), where continuous
+    /// playback puts its first frame: the grid's origin (`setSourceStart`).
+    private var sourceStart: Int64?
+    /// The decoder started over after a failure. One with a clock is still on it; one that counts its
+    /// input counts from zero again, so its run starts over and the next timestamp places it.
+    private var runBreakPending = false
+    /// No stream start was given, so nothing can be placed; logged once.
+    private var reportedNoSourceStart = false
+    /// The stream's own clock (TrueHD's output_timing) against its start (`setStreamClock`); nil where the
+    /// stream has no clock or its head could not be read. With it, a block that carries the clock is placed by
+    /// the clock, and timestamps only choose its window.
+    private var streamClock: StreamClockPlacement?
     private var encoderStartFrame: Int64?
     private var encoderFramesIn: Int64 = 0
-    private var nextExpectedInputOffset: Int64?
+    /// Where a VOD segment's run puts the encoder's first frame (`startRun(atFrame:segment:)`), until the
+    /// run's first placed block anchors it.
+    private var runStartFrame: Int64?
+    /// Rendered frames still to drop before the encoder: audio an output offset puts before the
+    /// timeline's start, cut at the exact frame (`encodePending`).
+    private var pendingTrimFrames: Int64 = 0
+    /// `setOutputOffset`, in seconds, and in frames once a reset's first push has taken it.
+    private var outputOffsetSeconds: Double = 0
+    private var outputOffsetFrames: Int64 = 0
     private var drainedAtEOF = false
-    /// The decoder reset itself after an internal failure: its offsets count from zero again, so the
-    /// next block re-anchors on the next packet's timestamp instead of being appended to the encoder.
+    /// The decoder reset itself after an internal failure: its offsets count from zero again.
     private var decoderSelfResetsSeen = 0
-    private var reanchorPending = false
     /// Feeds in a row that threw, for a rate-limited log and the AE#641 report of a bridge that
     /// keeps failing (a decoder that panics on every unit, a rate the renderer refuses).
     private var consecutiveFeedFailures = 0
@@ -118,34 +186,74 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// third packet after every reset.
     static let silentFeedPacketThreshold = AudioBridge.trueHDSilentFeedPacketThreshold
 
+    /// `objectOutput` (personal builds with `APACObjectOutput`): send the decoder's elements as APAC
+    /// objects instead of rendering them into `layout`.
     init(
         srcTimeBase: AVRational,
         layout: SpatialSpeakerLayout,
         decoder: ObjectAudioDecoding,
-        bitRate: Int? = nil
+        bitRate: Int? = nil,
+        objectOutput: Bool = false,
+        sessionLevels: SessionLevelMeter? = nil
     ) throws {
         self.srcTimeBase = srcTimeBase
         self.layout = layout
         self.decoder = decoder
-        levelMeter = BedLevelMeter(layout: layout, sampleRate: Self.sampleRate)
-        limiter = PeakLimiter(sampleRate: Self.sampleRate)
-        let rate = bitRate ?? layout.channelCount * Self.bitRatePerChannel
-        peakOutputBitRate = Int64(rate)
-        let encoder = try APACEncoder(layout: layout, sampleRate: Double(Self.sampleRate), bitRate: rate)
+        levels = sessionLevels ?? SessionLevelMeter(layout: layout, sampleRate: Self.sampleRate)
+        ownsLevels = sessionLevels == nil
+        announces = sessionLevels == nil
+        limiter = PeakLimiter(sampleRate: Self.sampleRate, channels: layout.channelCount)
+        let encoder: any APACChunkEncoding
+        let channels: Int
+        let rate: Int
+#if APACObjectOutput
+        self.objectOutput = objectOutput
+        if objectOutput {
+            // Coded to quality per object (`APACObjectEncoder.objectBitRate`), the stream's rate follows
+            // the content; this is what the playlist declares as its peak (Unfold peaks at 10.3 Mbit/s).
+            rate = bitRate ?? (APACObjectEncoder.objectSlots + 1) * APACObjectEncoder.objectBitRate
+            let objects = try APACObjectEncoder(bitRate: rate, sampleRate: Double(Self.sampleRate))
+            objects.followRoute()
+            if sessionLevels == nil {
+                EngineLog.emit("[SpatialAudioBridge] objects rendered for a \(objects.output.rawValue) output", category: .session)
+            }
+            encoder = objects
+            channels = APACObjectEncoder.elementCapacity
+            // Advertised as the 7.1.4 channel tier the HDMI route renders it to, not the stream's own
+            // profile and level (`objects.hlsCodecs`, apac.05.00). On a tvOS 27.2 Apple TV the object
+            // stream announced as apac.05.00 reached the receiver as multichannel PCM, where the 7.1.4
+            // bed (apac.31.03) and the same objects played from a file (no playlist) reached it as Dolby
+            // MAT: APAC levels are channel-count tiers, level 0 the stereo one, and the player decides on
+            // MAT for HLS from the playlist (MediaToolbox's HLS Atmos selection, HasAtmosAlternates /
+            // AtmosIsSupported) before it reads the stream. The decoder takes the scene from the dapa box.
+            hlsCodecs = APACSampleEntry.codecsString(channelCount: Self.objectAnnouncedLayout.channelCount)
+        } else {
+            rate = bitRate ?? layout.channelCount * Self.bitRatePerChannel
+            encoder = try APACEncoder(layout: layout, sampleRate: Double(Self.sampleRate), bitRate: rate)
+            channels = layout.channelCount
+            hlsCodecs = APACSampleEntry.codecsString(channelCount: layout.channelCount)
+        }
+#else
+        precondition(!objectOutput, "object output is only built with the APACObjectOutput trait")
+        rate = bitRate ?? layout.channelCount * Self.bitRatePerChannel
+        encoder = try APACEncoder(layout: layout, sampleRate: Double(Self.sampleRate), bitRate: rate)
+        channels = layout.channelCount
+        hlsCodecs = APACSampleEntry.codecsString(channelCount: layout.channelCount)
+#endif
+        // Constant mode holds the target; the sync packets each add about a packet (`APACEncoder.peakBitRate`).
+        peakOutputBitRate = Int64(APACEncoder.peakBitRate(target: rate))
         let pipeline = APACEncodePipeline(
-            encoder: encoder, channels: layout.channelCount, bufferFrames: Self.encodeChunkFrames * 4)
+            encoder: encoder, channels: channels, bufferFrames: Self.encodeChunkFrames * 4)
         self.pipeline = pipeline
-        packetFormatDescription = encoder.formatDescription
-        encoderLeadingFrames = encoder.leadingFrames
         output = pipeline.takeInitialBuffer()
         soundSampleEntryOverride = APACSampleEntry.sampleEntry(
             magicCookie: encoder.magicCookie, sampleRate: Self.sampleRate)
-        hlsCodecs = APACSampleEntry.codecsString(channelCount: layout.channelCount)
         guard let cp = Self.makeStandInCodecpar() else { throw BridgeError.codecparAllocFailed }
         encoderCodecpar = cp
+        guard announces else { return }
         EngineLog.emit(
-            "[SpatialAudioBridge] init: layout=\(layout.rawValue) bitRate=\(rate / 1000) kbps "
-            + "codecs=\(hlsCodecs) priming=\(encoder.leadingFrames) frames",
+            "[SpatialAudioBridge] init: \(objectOutput ? "objects (\(channels - 1) slots + LFE, stream \(APACSampleEntry.codecsString(magicCookie: encoder.magicCookie) ?? "?"))" : "layout=\(layout.rawValue)") "
+            + "bitRate=\(rate / 1000) kbps codecs=\(hlsCodecs) priming=\(encoder.leadingFrames) frames",
             category: .session
         )
     }
@@ -191,33 +299,44 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     func feed(packet: UnsafePointer<AVPacket>) throws -> [UnsafeMutablePointer<AVPacket>] {
         opLock.lock()
         defer { opLock.unlock() }
+        var results: [UnsafeMutablePointer<AVPacket>] = []
+        wrap(feedLocked(packet: packet), into: &results)
+        return results
+    }
+
+    /// `feed` without the muxer's packets: the encoder's own, each with its place in its encoder run, for a
+    /// consumer that states the priming itself .
+    func feedStamped(packet: UnsafePointer<AVPacket>) -> [APACEncodePipeline.StampedPacket] {
+        opLock.lock()
+        defer { opLock.unlock() }
+        let stamped = feedLocked(packet: packet)
+        noteEmitted(stamped)
+        return stamped
+    }
+
+    /// Caller holds `opLock`.
+    private func feedLocked(packet: UnsafePointer<AVPacket>) -> [APACEncodePipeline.StampedPacket] {
         stats.packetsFed += 1
         stats.packetsFedSinceLastEnqueue += 1
         // Every exit: a decoder that rejects each packet has decoded nothing too.
         defer { noteDecodedNothingIfNeeded() }
 
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return [] }
+        let ts = packet.pointee.pts != Self.avNoPTS ? packet.pointee.pts : packet.pointee.dts
         do {
-            try decoder.push(UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)))
+            try decoder.push(UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)), pts: ts)
         } catch {
             stats.packetsRejected += 1
             noteDecoderSelfReset()
             noteFeedFailure(error)
-            var results: [UnsafeMutablePointer<AVPacket>] = []
+            var results: [APACEncodePipeline.StampedPacket] = []
             // This feed has already counted as failed.
             collectEncoded(into: &results, noteFailure: false)
             return results
         }
-        // The anchor is the first packet the decoder actually took, so its input offsets count from
-        // this packet. dts covers a packet whose pts the demuxer left unset.
-        if originFrame == nil {
-            let ts = packet.pointee.pts != Self.avNoPTS ? packet.pointee.pts : packet.pointee.dts
-            if ts != Self.avNoPTS { originFrame = av_rescale_q(ts, srcTimeBase, encoderTimeBase) }
-        }
-
         // Packets already stamped stay in the result when a later block of the same packet fails:
         // their timestamps are right, and dropping them would leave a hole the source never had.
-        var results: [UnsafeMutablePointer<AVPacket>] = []
+        var results: [APACEncodePipeline.StampedPacket] = []
         do {
             while let block = try decoder.nextBlock() {
                 stats.framesDecoded += 1
@@ -238,9 +357,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     private func noteDecoderSelfReset() {
         guard decoder.selfResetCount != decoderSelfResetsSeen else { return }
         decoderSelfResetsSeen = decoder.selfResetCount
-        originFrame = nil
-        nextExpectedInputOffset = nil
-        reanchorPending = encoderStartFrame != nil
+        runBreakPending = true
     }
 
     /// Caller holds `opLock`. The first failure and every `silentFeedPacketThreshold`th after it are
@@ -276,13 +393,15 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     func settle() -> [UnsafeMutablePointer<AVPacket>] {
         opLock.lock()
         defer { opLock.unlock() }
-        var results: [UnsafeMutablePointer<AVPacket>] = []
+        var stamped: [APACEncodePipeline.StampedPacket] = []
         // Audio the decoder holds for metadata sits before the cut; released here, the cut sees what
         // it saw before the hold existed, rather than up to 100 ms of it landing in the next segment.
-        renderHeldBlocks(into: &results)
+        renderHeldBlocks(into: &stamped)
         let settled = pipeline.settle()
-        wrap(settled.packets, into: &results)
+        stamped += settled.packets
         noteEncodeErrors(settled.errors)
+        var results: [UnsafeMutablePointer<AVPacket>] = []
+        wrap(stamped, into: &results)
         return results
     }
 
@@ -291,14 +410,17 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         defer { opLock.unlock() }
         guard !drainedAtEOF else { return [] }
         drainedAtEOF = true
-        var results: [UnsafeMutablePointer<AVPacket>] = []
+        var stamped: [APACEncodePipeline.StampedPacket] = []
         // Audio the decoder held back for metadata that never came plays as it is.
-        renderHeldBlocks(into: &results)
+        renderHeldBlocks(into: &stamped)
         encodePending()
-        logLevels(levelMeter.restart())
+        drainLimiter()
+        restartLevels()
         let finished = pipeline.finish()
-        wrap(finished.packets, into: &results)
+        stamped += finished.packets
         noteEncodeErrors(finished.errors)
+        var results: [UnsafeMutablePointer<AVPacket>] = []
+        wrap(stamped, into: &results)
         if !results.isEmpty {
             EngineLog.emit("[SpatialAudioBridge] EOF flush emitted \(results.count) tail packet(s)", category: .session)
         }
@@ -310,34 +432,69 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         defer { opLock.unlock() }
         decoder.reset()
         renderer?.reset()
+        rendererRunPending = true
         pipeline.reset()
         limiter.reset()
-        logLevels(levelMeter.restart())
+        restartLevels()
         pendingFrames = 0
-        originFrame = nil
+#if APACObjectOutput
+        output.objectUpdates.removeAll(keepingCapacity: true)
+        output.objectDiscontinuities.removeAll(keepingCapacity: true)
+#endif
+        grid?.restart()
+        runBreakPending = false
+        streamClock?.restart()
         encoderStartFrame = nil
         encoderFramesIn = 0
-        nextExpectedInputOffset = nil
+        pendingTrimFrames = 0
         drainedAtEOF = false
         decoderSelfResetsSeen = decoder.selfResetCount
-        reanchorPending = false
         consecutiveFeedFailures = 0
     }
 
+    func startRun(atFrame frame: Int64, segment: Range<Int64>) {
+        opLock.lock()
+        defer { opLock.unlock() }
+        runStartFrame = frame
+        measuring = segment
+    }
+
+    func setOutputOffset(seconds: Double) {
+        opLock.lock()
+        defer { opLock.unlock() }
+        outputOffsetSeconds = seconds
+    }
+
+    /// Where the stream's clock reads zero, counted from its start, in frames at the stream's own rate
+    /// (`StreamClockAnchors`), shared by the session's runs; nil for none.
+    func setStreamClock(anchors: StreamClockAnchors?) {
+        opLock.lock()
+        defer { opLock.unlock() }
+        streamClock = anchors.map(StreamClockPlacement.init(anchors:))
+    }
+
+    func setSourceStart(_ pts: Int64?) {
+        opLock.lock()
+        defer { opLock.unlock() }
+        guard pts != sourceStart else { return }
+        sourceStart = pts
+        grid = nil
+    }
+
+    /// A live splice the producer re-timed: everything placed from here on plays `deltaSeconds` later
+    /// (or earlier), through the same placement as any other block (`place(at:)`).
     func noteTimelineJump(deltaSeconds: Double) {
         opLock.lock()
         defer { opLock.unlock() }
-        guard deltaSeconds > 0, let start = encoderStartFrame else { return }
-        let frames = Int64((deltaSeconds * Double(Self.sampleRate)).rounded())
-        encoderStartFrame = start + frames
-        pipeline.shift(by: frames)
+        guard deltaSeconds != 0, deltaSeconds.isFinite, encoderStartFrame != nil else { return }
+        outputOffsetFrames += Int64((deltaSeconds * Double(Self.sampleRate)).rounded())
     }
 
     func close() {
         opLock.lock()
         defer { opLock.unlock() }
         // A viewer who hears no heights stops playback: the window they stopped in is the one to log.
-        logLevels(levelMeter.restart())
+        restartLevels()
         pipeline.close()
         cleanup()
     }
@@ -349,7 +506,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     // MARK: - Pipeline
 
     /// Caller holds `opLock`.
-    private func renderHeldBlocks(into results: inout [UnsafeMutablePointer<AVPacket>]) {
+    private func renderHeldBlocks(into results: inout [APACEncodePipeline.StampedPacket]) {
         decoder.releaseHeldBlocks()
         do {
             while let block = try decoder.nextBlock() {
@@ -361,12 +518,12 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         }
     }
 
-    private func renderAndEncode(_ block: ObjectAudioDecodedBlock, into results: inout [UnsafeMutablePointer<AVPacket>]) throws {
+    private func renderAndEncode(_ block: ObjectAudioDecodedBlock, into results: inout [APACEncodePipeline.StampedPacket]) throws {
         guard block.sampleRate == Self.sampleRate else { throw BridgeError.unsupportedSampleRate(block.sampleRate) }
         guard block.frameCount > 0 else { return }
 
         let rebuilt = renderer == nil || block.configurationGeneration != rendererGeneration
-        if rebuilt {
+        if rebuilt, announces || renderer != nil {
             // Whether the presentation has an LFE element at all is the first question a missing-LFE
             // report asks.
             EngineLog.emit(
@@ -374,40 +531,194 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
                     + BedLevelMeter.configurationSummary(block.roles),
                 category: .session
             )
+        }
+        if rebuilt {
             renderer = ObjectAudioRenderer(layout: layout, roles: block.roles)
             rendererGeneration = block.configurationGeneration
+            rendererRunPending = true
         } else if block.isDiscontinuity {
             renderer?.markDiscontinuity()
         }
-        levelMeter.observe(roles: block.roles, updates: block.updates, configurationChanged: rebuilt)
-        levelMeter.measureInput(roles: block.roles, planes: block.planes, frameCount: block.frameCount)
-        let activity = levelMeter.activity
-        activityLock.withLock { latestActivity = activity }
-        // Anchor the encoder on the first block after a reset, and keep the encoder's input
-        // contiguous with the source afterwards: a gap the decoder skipped (corrupt access units) is
-        // filled with silence so everything after it stays on its timestamp.
-        if encoderStartFrame == nil {
-            encoderStartFrame = (originFrame ?? 0) + block.inputFrameOffset
-        } else if reanchorPending, let start = encoderStartFrame {
-            // After the decoder's own reset: put this block where the source says it plays.
-            reanchorPending = false
-            let target = (originFrame ?? start + encoderFramesIn + Int64(pendingFrames)) + block.inputFrameOffset
-            place(at: target)
-        } else if let expected = nextExpectedInputOffset, block.inputFrameOffset > expected,
-                  let start = encoderStartFrame {
-            let end = start + encoderFramesIn + Int64(pendingFrames)
-            place(at: end + (block.inputFrameOffset - expected))
+        // Every block plays where the grid puts it: the encoder is anchored on the first, and a gap
+        // the decoder skipped (corrupt access units) is filled with silence so everything after it
+        // stays on its frame. Nothing says where a block plays before the run's first timestamp, so
+        // until then it is dropped rather than placed at a guess.
+        let placed = position(of: block)
+        let offset = Int64((outputOffsetSeconds * Double(Self.sampleRate)).rounded())
+        if measuring.map({ range in placed.map { range.contains($0 + offset) } ?? false }) ?? true {
+            let activity = levels.with { meter in
+                meter.observe(roles: block.roles, updates: block.updates, configurationChanged: rebuilt)
+                meter.measureInput(roles: block.roles, planes: block.planes, frameCount: block.frameCount)
+                return meter.activity
+            }
+            activityLock.withLock { latestActivity = activity }
         }
-        nextExpectedInputOffset = block.inputFrameOffset + Int64(block.frameCount)
+        guard let position = placed else {
+            stats.blocksDroppedUnplaced += 1
+            return
+        }
+        if encoderStartFrame == nil {
+            outputOffsetFrames = Int64((outputOffsetSeconds * Double(Self.sampleRate)).rounded())
+            if let runStart = runStartFrame {
+                runStartFrame = nil
+                anchorRun(at: runStart, firstBlockAt: position + outputOffsetFrames)
+            } else {
+                anchor(at: position + outputOffsetFrames)
+            }
+        } else {
+            place(at: position + outputOffsetFrames)
+        }
 
+#if APACObjectOutput
+        if objectOutput {
+            stageObjects(block, discontinuity: block.isDiscontinuity && !rebuilt)
+            stats.samplesEnqueued += Int64(block.frameCount)
+            stats.packetsFedSinceLastEnqueue = 0
+            if pendingFrames >= Self.encodeChunkFrames { encodePending() }
+            return
+        }
+#endif
         output.ensureCapacity(pendingFrames + block.frameCount, keeping: pendingFrames)
         renderer!.render(
             inputs: block.planes, frameCount: block.frameCount, updates: block.updates,
             outputs: output.planes.map { $0 + pendingFrames })
         pendingFrames += block.frameCount
+        noteRendererSettling(blockAt: position, frames: block.frameCount)
         stats.samplesEnqueued += Int64(block.frameCount)
         stats.packetsFedSinceLastEnqueue = 0
         if pendingFrames >= Self.encodeChunkFrames { encodePending() }
+    }
+
+    /// Log where the renderer settles, once per run.
+    private func noteRendererSettling(blockAt position: Int64, frames: Int) {
+        if rendererRunPending {
+            rendererRunPending = false
+            rendererSettlingFrom = position
+        }
+        guard let from = rendererSettlingFrom, renderer?.isSettled == true else { return }
+        rendererSettlingFrom = nil
+        let end = position + Int64(frames)
+        EngineLog.emit(
+            String(format: "[SpatialAudioBridge] render settled by %.3f s, %.3f s after its run began",
+                   Double(end) / Double(Self.sampleRate), Double(end - from) / Double(Self.sampleRate)),
+            category: .session)
+    }
+
+#if APACObjectOutput
+    /// The block's elements into `output` as they are, and its metadata beside them for the encoder.
+    /// A chunk holds one presentation, so a new one starts a new chunk.
+    private func stageObjects(_ block: ObjectAudioDecodedBlock, discontinuity: Bool) {
+        if block.roles != objectRoles {
+            if pendingFrames > 0 { encodePending() }
+            objectRoles = block.roles
+            output.objectRoles = block.roles
+        }
+        let n = block.frameCount
+        output.ensureCapacity(pendingFrames + n, keeping: pendingFrames)
+        for (i, plane) in output.planes.enumerated() {
+            if i < block.planes.count {
+                (plane + pendingFrames).update(from: block.planes[i], count: n)
+            } else {
+                (plane + pendingFrames).update(repeating: 0, count: n)
+            }
+        }
+        if discontinuity { output.objectDiscontinuities.append(pendingFrames) }
+        for update in block.updates {
+            var shifted = update
+            shifted.frameOffset += pendingFrames
+            output.objectUpdates.append(shifted)
+        }
+        pendingFrames += n
+    }
+#endif
+
+    /// Caller holds `opLock`. Where `block` plays on the source timeline (48 kHz frames), or nil
+    /// while its run has had no timestamp: by the stream's clock where it has one, else on the grid.
+    private func position(of block: ObjectAudioDecodedBlock) -> Int64? {
+        switch clockPlacement(of: block) {
+        case .placed(let position): return position
+        case .unplaced: return nil
+        case .notByClock: break
+        }
+        if grid == nil {
+            guard let sourceStart else {
+                if !reportedNoSourceStart {
+                    reportedNoSourceStart = true
+                    EngineLog.emit("[SpatialAudioBridge] ERROR: no stream start, so no block can be placed",
+                                   category: .session)
+                }
+                return nil
+            }
+            grid = SourceGrid(origin: av_rescale_q(sourceStart, srcTimeBase, encoderTimeBase),
+                              step: Int64(block.gridFrames),
+                              tolerance: AudioContinuity.tolerance(sourceTimeBase: srcTimeBase, sampleRate: Int32(Self.sampleRate)))
+        }
+        if runBreakPending {
+            runBreakPending = false
+            if block.clockFrame == nil { grid?.restart() }
+        }
+        let estimate = estimatedPosition(of: block)
+        let (placement, restarted) = grid!.place(relative: block.clockFrame ?? block.inputFrameOffset, estimate: estimate)
+        if restarted {
+            // A timestamp no grid point of the run allows: the stream was cut here.
+            stats.timestampMismatches += 1
+            if stats.timestampMismatches == 1 || stats.timestampMismatches % 1000 == 0 {
+                EngineLog.emit(
+                    "[SpatialAudioBridge] a source timestamp left the run's grid (a splice); placed anew "
+                    + "(\(stats.timestampMismatches) so far)", category: .session)
+            }
+        }
+        guard case .position(let at) = placement else { return nil }
+        return at
+    }
+
+    /// Where `block` plays by the last container timestamp at or before it (48 kHz frames), nil before any.
+    private func estimatedPosition(of block: ObjectAudioDecodedBlock) -> Int64? {
+        block.sourcePts.map {
+            av_rescale_q($0, srcTimeBase, encoderTimeBase) + block.inputFrameOffset - block.sourcePtsInputFrame
+        }
+    }
+
+    private enum ClockPlacement {
+        case placed(Int64)
+        case unplaced
+        /// No clock to place by (none in the stream, not measured, or parted from the timestamps).
+        case notByClock
+    }
+
+    /// Caller holds `opLock`. Where the stream's clock puts `block` (`StreamClockPlacement`), the stream's
+    /// start and the block's timestamp counted in 48 kHz frames and the clock as the decoder states it (divided
+    /// down for a 96 or 192 kHz stream). A splice parts the clock: the grid places the rest of the run.
+    private func clockPlacement(of block: ObjectAudioDecodedBlock) -> ClockPlacement {
+        guard var clock = streamClock, let frame = block.clockFrame,
+              let modulus = block.clockModulus, modulus > 0, let sourceStart else { return .notByClock }
+        defer { streamClock = clock }
+        if runBreakPending {
+            // The decoder started over: its clock is the stream's again from its next major sync.
+            runBreakPending = false
+            clock.breakRun()
+        }
+        let noise = SourceGrid.noise(tolerance: AudioContinuity.tolerance(sourceTimeBase: srcTimeBase,
+                                                                           sampleRate: Int32(Self.sampleRate)))
+        switch clock.place(clock: frame, modulus: modulus, scale: (1 << 16) / modulus,
+                           origin: av_rescale_q(sourceStart, srcTimeBase, encoderTimeBase),
+                           estimate: estimatedPosition(of: block), noise: noise,
+                           tick: av_rescale_q(1, srcTimeBase, encoderTimeBase)) {
+        case .position(let position):
+            return .placed(position)
+        case .unplaced:
+            return .unplaced
+        case .byTimestamps:
+            return .notByClock
+        case .parted(let frames):
+            grid?.restart()
+            EngineLog.emit(
+                "[SpatialAudioBridge] the stream's clock and its timestamps parted by "
+                + "\(String(format: "%+.3f", Double(frames) / Double(Self.sampleRate))) s "
+                + "(a splice to a stretch no anchor fits); the rest of the run is placed on the grid, and the stretch's "
+                + "anchor read from it", category: .session)
+            return .notByClock
+        }
     }
 
     /// Continue the encoder's input at `target` (a source position in 48 kHz frames): a short gap
@@ -415,7 +726,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// later packet keeps its source position.
     private func place(at target: Int64) {
         guard let start = encoderStartFrame else { return }
-        let end = start + encoderFramesIn + Int64(pendingFrames)
+        let end = runningEnd(from: start)
         let gap = target - end
         if gap == 0 { return }
         if gap > 0, gap <= Int64(Self.maxSilenceFillFrames) {
@@ -423,13 +734,37 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             return
         }
         encodePending()
+        drainLimiter()
         pipeline.restart()
         limiter.reset()
-        encoderStartFrame = target
-        encoderFramesIn = 0
+        anchor(at: target)
         EngineLog.emit(
             "[SpatialAudioBridge] encoder re-anchored \(String(format: "%+.3f", Double(gap) / Double(Self.sampleRate))) s "
             + "off its running position", category: .session)
+    }
+
+    /// Where the next frame taken from the decoder plays.
+    private func runningEnd(from start: Int64) -> Int64 {
+        start + encoderFramesIn + Int64(pendingFrames + heldBack) - pendingTrimFrames
+    }
+
+    /// Start an encoder run at `position`. Never below zero: `baseMediaDecodeTime` is unsigned
+    /// (AE#561), and an APAC packet cut from the front would take its priming with it, so audio
+    /// before the timeline's start comes off the rendered frames instead.
+    private func anchor(at position: Int64) {
+        encoderStartFrame = max(position, 0)
+        encoderFramesIn = 0
+        pendingTrimFrames = max(-position, 0)
+    }
+
+    /// Start a segment's run with the encoder at `start` whatever the first block is: audio rendered
+    /// before it only settles the renderer and limiter and comes off; a stream that begins
+    /// after it is preceded by silence.
+    private func anchorRun(at start: Int64, firstBlockAt position: Int64) {
+        encoderStartFrame = start
+        encoderFramesIn = 0
+        pendingTrimFrames = max(start - position, 0)
+        if position > start { encodeSilence(frames: Int(position - start)) }
     }
 
     /// The longest gap filled with silence rather than by restarting the encoder.
@@ -454,22 +789,68 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// `collectEncoded` on a later call.
     private func encodePending() {
         guard pendingFrames > 0 else { return }
-        let frames = pendingFrames
+        var frames = pendingFrames
         pendingFrames = 0
-        guard let start = encoderStartFrame else { return }
-        limiter.process(output.planes, frameCount: frames)
+        guard encoderStartFrame != nil else { return }
+        if pendingTrimFrames > 0 {
+            let cut = Int(min(pendingTrimFrames, Int64(frames)))
+            pendingTrimFrames -= Int64(cut)
+            frames -= cut
+            for plane in output.planes where frames > 0 {
+                memmove(plane, plane + cut, frames * MemoryLayout<Float>.stride)
+            }
+#if APACObjectOutput
+            output.objectUpdates = output.objectUpdates.map { $0.droppingFirst(cut) }
+            output.objectDiscontinuities = output.objectDiscontinuities.map { max($0 - cut, 0) }
+#endif
+            if frames == 0 { return }
+        }
+#if APACObjectOutput
+        if objectOutput, let start = encoderStartFrame {
+            let position = start + encoderFramesIn
+            // No bed to measure, but the objects and the LFE input still get their line.
+            if let measured = measured(position: position, frames: frames) {
+                logLevels(levels.with { $0.addUnmeasured(frameCount: measured.count,
+                                                         startSeconds: Double(measured.lowerBound) / Double(Self.sampleRate)) })
+            }
+            output = pipeline.submit(output, frames: frames, position: position)
+            // The free buffer handed back still holds the chunk it last carried.
+            output.objectRoles = objectRoles
+            output.objectUpdates.removeAll(keepingCapacity: true)
+            output.objectDiscontinuities.removeAll(keepingCapacity: true)
+            encoderFramesIn += Int64(frames)
+            return
+        }
+#endif
+        submitLimited(limiter.process(output.planes, frameCount: frames, lfe: layout.lfeIndex))
+    }
+
+    /// The frames the limiter still holds, to the encoder: before it restarts somewhere else or the
+    /// input ends, so the audio up to there plays in full. `output` is empty here.
+    private func drainLimiter() {
+        guard limiter.backlog > 0, encoderStartFrame != nil else { return }
+        output.ensureCapacity(limiter.backlog, keeping: 0)
+        submitLimited(limiter.drain(into: output.planes, lfe: layout.lfeIndex))
+    }
+
+    /// The first `frames` of `output`, which the limiter has handed on, to the encoder's queue.
+    private func submitLimited(_ frames: Int) {
+        guard frames > 0, let start = encoderStartFrame else { return }
         let position = start + encoderFramesIn
         // Where this chunk plays, for the level line: the anchor is a source PTS in 48 kHz frames.
-        logLevels(levelMeter.add(output.planes.map { UnsafePointer($0) }, frameCount: frames,
-                                 startSeconds: Double(position) / Double(Self.sampleRate)))
+        if let measured = measured(position: position, frames: frames) {
+            let skip = Int(measured.lowerBound - position)
+            logLevels(levels.with { $0.add(output.planes.map { UnsafePointer($0 + skip) }, frameCount: measured.count,
+                                           startSeconds: Double(measured.lowerBound) / Double(Self.sampleRate)) })
+        }
         output = pipeline.submit(output, frames: frames, position: position)
         encoderFramesIn += Int64(frames)
     }
 
     /// Caller holds `opLock`. Everything the encoder has finished since the last call.
-    private func collectEncoded(into results: inout [UnsafeMutablePointer<AVPacket>], noteFailure: Bool = true) {
+    private func collectEncoded(into results: inout [APACEncodePipeline.StampedPacket], noteFailure: Bool = true) {
         let encoded = pipeline.collect()
-        wrap(encoded.packets, into: &results)
+        results += encoded.packets
         noteEncodeErrors(encoded.errors, noteFailure: noteFailure)
     }
 
@@ -479,6 +860,21 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         guard let first = errors.first else { return }
         stats.encodeErrors += errors.count
         if noteFailure { noteFeedFailure(first) }
+    }
+
+    /// The frames of a chunk at `position` this bridge measures: all of them, or those of its segment.
+    private func measured(position: Int64, frames: Int) -> Range<Int64>? {
+        let chunk = position..<(position + Int64(frames))
+        guard let measuring else { return chunk }
+        let kept = chunk.clamped(to: measuring)
+        return kept.isEmpty ? nil : kept
+    }
+
+    /// The session meter's open window, if this bridge owns it: on a seek, the end of input or
+    /// teardown. A segment's run leaves the session's to the session.
+    private func restartLevels() {
+        guard ownsLevels else { return }
+        logLevels(levels.with { $0.restart() })
     }
 
     /// The level line, with the limiter's work over the same window when it had any.
@@ -516,10 +912,14 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
             avpkt.pointee.dts = packet.pts
             avpkt.pointee.duration = frames
             if packet.isSync { avpkt.pointee.flags |= AV_PKT_FLAG_KEY }
-            outputBytesLifetime += Int64(packet.data.count)
-            stats.packetsEmitted += 1
             results.append(avpkt)
         }
+        noteEmitted(packets)
+    }
+
+    private func noteEmitted(_ packets: [APACEncodePipeline.StampedPacket]) {
+        for packet in packets { outputBytesLifetime += Int64(packet.data.count) }
+        stats.packetsEmitted += packets.count
     }
 }
 #endif

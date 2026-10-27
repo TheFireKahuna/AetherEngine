@@ -19,6 +19,7 @@ struct BridgeLosslessBitDepthTests {
         var par: UnsafeMutablePointer<AVCodecParameters>? = codecpar
         defer { avcodec_parameters_free(&par) }
         let bridge = try AudioBridge(srcCodecpar: codecpar, srcTimeBase: AVRational(num: 1, den: 48_000), mode: .lossless)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
 
         var out: [UInt8] = []

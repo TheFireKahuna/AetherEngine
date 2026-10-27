@@ -79,6 +79,55 @@ final class OutputTimestampSanitizerTests: XCTestCase {
         XCTAssertEqual(v.dts, 100, "video stream is independent of audio's high-water mark")
     }
 
+    // MARK: - Sound never holds more than its timeline
+
+    func testSoundPacketInsideTheSoundWrittenIsDropped() throws {
+        var s = OutputTimestampSanitizer(maxSoundOverlapTicks: 480_000)
+        for i in 0..<10 {
+            let t = Int64(i * 1024)
+            XCTAssertNotNil(s.sanitize(streamIndex: 1, pts: t, dts: t, soundDuration: 1024))
+        }
+        // The source steps back 4 packets: those repeat sound already written and must not be squashed in.
+        var kept: [Int64] = []
+        for i in 6..<14 {
+            let t = Int64(i * 1024)
+            if let out = s.sanitize(streamIndex: 1, pts: t, dts: t, soundDuration: 1024) { kept.append(out.pts) }
+        }
+        XCTAssertEqual(kept, [10, 11, 12, 13].map { Int64($0 * 1024) }, "the timeline carries on where the sound ends")
+        XCTAssertEqual(s.droppedSoundRepeats, 4)
+    }
+
+    func testSoundOverlapUnderHalfAPacketIsKeptAtItsOwnTime() throws {
+        var s = OutputTimestampSanitizer(maxSoundOverlapTicks: 480_000)
+        _ = s.sanitize(streamIndex: 1, pts: 0, dts: 0, soundDuration: 1024)
+        let out = try XCTUnwrap(s.sanitize(streamIndex: 1, pts: 1000, dts: 1000, soundDuration: 1024))
+        XCTAssertEqual(out.pts, 1000, "rounding in the source's timestamps is not a repeat")
+        XCTAssertEqual(s.droppedSoundRepeats, 0)
+    }
+
+    func testRestartedSourceClockCarriesOnAsBefore() throws {
+        var s = OutputTimestampSanitizer(maxSoundOverlapTicks: 480_000)
+        _ = s.sanitize(streamIndex: 1, pts: 10_000_000, dts: 10_000_000, soundDuration: 1024)
+        let out = try XCTUnwrap(s.sanitize(streamIndex: 1, pts: 2_000, dts: 2_000, soundDuration: 1024))
+        XCTAssertEqual(out.dts, 10_000_001, "further back than any repeat is a clock restart, kept monotonic")
+    }
+
+    func testSoundLengthIsNeverReadLongerThanThePacketOrTheCodecFrame() {
+        XCTAssertEqual(MP4SegmentMuxer.soundDuration(stated: 1056, frameTicks: 1024), 1024, "a rounded-up duration")
+        XCTAssertEqual(MP4SegmentMuxer.soundDuration(stated: 4096, frameTicks: 1024), 1024, "a wrong one")
+        XCTAssertEqual(MP4SegmentMuxer.soundDuration(stated: 512, frameTicks: 1024), 512, "a short last packet")
+        XCTAssertEqual(MP4SegmentMuxer.soundDuration(stated: 0, frameTicks: 1024), 1024)
+        XCTAssertEqual(MP4SegmentMuxer.soundDuration(stated: 960, frameTicks: 0), 960)
+        XCTAssertEqual(MP4SegmentMuxer.soundDuration(stated: 0, frameTicks: 0), 0, "nothing known: the repeat rule stays off")
+    }
+
+    func testVideoIsNeverDroppedForOverlap() throws {
+        var s = OutputTimestampSanitizer(maxSoundOverlapTicks: 480_000)
+        _ = s.sanitize(streamIndex: 0, pts: 10_000, dts: 10_000)
+        let out = try XCTUnwrap(s.sanitize(streamIndex: 0, pts: 5_000, dts: 5_000))
+        XCTAssertEqual(out.dts, 10_001)
+    }
+
     // MARK: - Hostile input (audit SEG-101)
 
     func testDtsAtInt64MaxCannotBeBumpedAndIsDropped() {

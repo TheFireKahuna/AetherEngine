@@ -119,6 +119,7 @@ struct Issue395StereoBridgeEncoderTests {
         let bridge = try AudioBridge(srcCodecpar: stream.pointee.codecpar,
                                      srcTimeBase: stream.pointee.time_base,
                                      mode: mode)
+        bridge.setSourceStart(0)
         defer { bridge.close() }
         try body(bridge, packets)
     }

@@ -34,6 +34,10 @@
       "state" : {
       }
     },
+    {
+      "identity" : "libtruehd",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/TheFireKahuna/LibTrueHD",
       "state" : {
         "revision" : "c946b596944f03036c8caed2b7cb7726a47f32fc",
         "version" : "4.0.0-fire.1"

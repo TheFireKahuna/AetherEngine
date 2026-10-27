@@ -6,6 +6,7 @@ import Testing
 @testable import AetherEngine
 
 /// The bridge's stages against what they declare (`AudioStageSpan`): a run started anywhere puts out
+/// what a continuous run does, byte for byte, from `memory` after its start, on every `DecmemClip`.
 @Suite("A run started anywhere matches continuous playback past its declared memory")
 struct AudioDecoderMemoryTests {
 
@@ -14,6 +15,13 @@ struct AudioDecoderMemoryTests {
     private final class Decoder {
         let ctx: UnsafeMutablePointer<AVCodecContext>
         let frame = av_frame_alloc()!
+        init(_ clip: DecmemClip) throws {
+            let codec = try #require(avcodec_find_decoder(clip.codecpar.pointee.codec_id))
+            ctx = avcodec_alloc_context3(codec)!
+            avcodec_parameters_to_context(ctx, clip.codecpar)
+            ctx.pointee.pkt_timebase = clip.timeBase
+            try #require(openAudioDecoder(ctx, codec) >= 0)
+        }
         deinit {
             var c: UnsafeMutablePointer<AVCodecContext>? = ctx
             avcodec_free_context(&c)
@@ -43,6 +51,7 @@ struct AudioDecoderMemoryTests {
           arguments: ["mp2.mkv", "mp3-64k.mp3", "mp3-vbr.mkv", "mp3-lsf.mp3", "vorbis.ogg", "opus.mkv",
                       "dts-51.mkv", "truehd-51.mkv", "truehd-96k.mkv", "flac.mkv"])
     func decoderSettles(_ name: String) throws {
+        let clip = try DecmemClip.read(name)
         defer { clip.free() }
         let rate = clip.codecpar.pointee.sample_rate
         let memory = try #require(AudioStageSpan.decoder(clip.codecpar, outputRate: rate)).memory
@@ -71,9 +80,32 @@ struct AudioDecoderMemoryTests {
     }
 
     /// The whole clip decoded, plane by plane, as S32P or FLTP (a packed decode is split into planes).
+    private func decodeAll(_ clip: DecmemClip) throws -> (format: AVSampleFormat, planes: [[UInt32]]) {
+        let dec = try Decoder(clip)
+        let channels = Int(clip.codecpar.pointee.ch_layout.nb_channels)
+        var planes = [[UInt32]](repeating: [], count: channels)
+        var format = AV_SAMPLE_FMT_NONE
+        for p in clip.packets {
+            let out = dec.decode(p)
+            guard out.frames > 0 else { continue }
+            format = dec.ctx.pointee.sample_fmt
+            let planar = av_sample_fmt_is_planar(format) != 0
+            out.bytes.withUnsafeBytes { raw in
+                let s = raw.bindMemory(to: UInt32.self)
+                for c in 0..<channels {
+                    planes[c] += planar ? Array(s[(c * out.frames)..<((c + 1) * out.frames)])
+                        : (0..<out.frames).map { s[$0 * channels + c] }
+                }
+            }
+        }
+        format = av_get_planar_sample_fmt(format)
+        try #require(format == AV_SAMPLE_FMT_S32P || format == AV_SAMPLE_FMT_FLTP)
+        return (format, planes)
+    }
 
     @Test("the resampler settles within its declared span, 96 kHz into 48")
     func resamplerSettles() throws {
+        let clip = try DecmemClip.read("truehd-96k.mkv")
         defer { clip.free() }
         let (format, planes) = try decodeAll(clip)
         try #require(format == AV_SAMPLE_FMT_S32P)
@@ -124,6 +156,7 @@ struct AudioDecoderMemoryTests {
 
     @Test("the E-AC-3 encoder settles within its declared span")
     func eac3EncoderSettles() throws {
+        let clip = try DecmemClip.read("dts-51.mkv")
         defer { clip.free() }
         let (format, planes) = try decodeAll(clip)
         let codec = try #require(avcodec_find_encoder(AV_CODEC_ID_EAC3))
@@ -184,6 +217,7 @@ struct AudioDecoderMemoryTests {
 
     @Test("the bridge declares its decoder, resampler and encoder in series; nil for a decoder not known")
     func bridgeComposes() throws {
+        let clip = try DecmemClip.read("dts-51.mkv")
         defer { clip.free() }
         let bridge = try AudioBridge(srcCodecpar: clip.codecpar, srcTimeBase: clip.timeBase, mode: .surroundCompat)
         #expect(bridge.output == .eac3)

@@ -268,6 +268,14 @@ final class MP4SegmentMuxer {
     /// The same offset in the muxer's OUTPUT audio time base, latched once the header has rewritten
     /// it. Packets reach `writePacket` already rescaled, so this is the base the shift must be in.
     private var audioDelayTicks: Int64 = 0
+    /// Audio packets not written because they fell before zero (see `writePacket`).
+    private(set) var audioPacketsBeforeZero = 0
+    /// One codec frame of the audio track in `muxerAudioTimeBase` ticks, the exact length of a packet
+    /// (`soundDuration`); 0 when the codec's frame size is not fixed.
+    private var audioFrameTicks: Int64 = 0
+    /// The furthest back an audio packet may start inside the sound already written and still be a
+    /// repeat of it rather than a source clock that restarted (`OutputTimestampSanitizer`).
+    static let maxAudioRepeatSeconds: Int64 = 10
 
     /// Mid-segment fragment-flush bound (#64). With movflags +frag_custom a moof+mdat is emitted only at
     /// an explicit segment cut; a degenerate plan (sparse-keyframe TS index) or any very long segment
@@ -475,6 +483,17 @@ final class MP4SegmentMuxer {
             // time_base, because that is the base the packets arrive in.
             audioDelayTicks = Self.audioDelayTicks(seconds: audioDelaySeconds,
                                                    audioTimeBase: muxerAudioTimeBase)
+            if let audio, muxerAudioTimeBase.num > 0, muxerAudioTimeBase.den > 0 {
+                let frameSize = audio.codecpar.pointee.frame_size
+                let sampleRate = audio.codecpar.pointee.sample_rate
+                if frameSize > 0, sampleRate > 0 {
+                    audioFrameTicks = av_rescale_q(Int64(frameSize), AVRational(num: 1, den: sampleRate),
+                                                   muxerAudioTimeBase)
+                }
+                timestampSanitizer = OutputTimestampSanitizer(
+                    maxSoundOverlapTicks: Self.maxAudioRepeatSeconds * Int64(muxerAudioTimeBase.den)
+                        / Int64(muxerAudioTimeBase.num))
+            }
             if audioDelayTicks != 0 {
                 // Release-visible: which muxer carries which offset is the only way to tell "the host
                 // set it" from "the segments being served were cut with it", and a restart is what
@@ -505,6 +524,19 @@ final class MP4SegmentMuxer {
     }
 
     private let byteCounter: ByteCounter
+
+    /// What an audio packet holds, in output ticks, for `OutputTimestampSanitizer`'s repeat rule: the
+    /// codec's fixed frame where it has one, which is exact, and never more than the packet states. A
+    /// container's duration can be rounded up or simply wrong, and a length read too long would take a
+    /// packet that only follows on for a repeat; read short, the rule only grows more lenient.
+    static func soundDuration(stated: Int64, frameTicks: Int64) -> Int64 {
+        switch (stated > 0, frameTicks > 0) {
+        case (true, true): return min(stated, frameTicks)
+        case (true, false): return stated
+        case (false, true): return frameTicks
+        case (false, false): return 0
+        }
+    }
 
     // MARK: - Audio delay conversion (pure, AE#464)
 
@@ -727,12 +759,37 @@ final class MP4SegmentMuxer {
             if packet.pointee.pts != Int64.min { packet.pointee.pts &+= audioDelayTicks }
             if packet.pointee.dts != Int64.min { packet.pointee.dts &+= audioDelayTicks }
         }
+        // `baseMediaDecodeTime` is unsigned: an audio timestamp below zero, whatever put it there (a
+        // negative delay above, a source that starts early), goes out as 2^64 minus it, and AVPlayer
+        // places that fragment 584 thousand years out (AE#561). Audio before the timeline's start has
+        // nowhere to play, so it is not written.
+        if packet.pointee.stream_index == audioOutputStreamIndex,
+           (packet.pointee.dts != Int64.min && packet.pointee.dts < 0)
+            || (packet.pointee.pts != Int64.min && packet.pointee.pts < 0) {
+            audioPacketsBeforeZero += 1
+            if audioPacketsBeforeZero == 1 {
+                EngineLog.emit("[MP4SegmentMuxer] audio before the timeline's start (dts \(packet.pointee.dts), "
+                               + "audio delay \(audioDelaySeconds) s) is not written", category: .session)
+            }
+            av_packet_unref(packet)
+            return (0, .none)
+        }
 
+        let isAudio = packet.pointee.stream_index == audioOutputStreamIndex
+        let repeatsBefore = timestampSanitizer.droppedSoundRepeats
         guard let clean = timestampSanitizer.sanitize(
             streamIndex: packet.pointee.stream_index,
             pts: packet.pointee.pts,
-            dts: packet.pointee.dts
+            dts: packet.pointee.dts,
+            soundDuration: isAudio ? Self.soundDuration(stated: packet.pointee.duration, frameTicks: audioFrameTicks) : nil
         ) else {
+            let repeats = timestampSanitizer.droppedSoundRepeats
+            if repeats > repeatsBefore, repeats <= 5 || repeats % 100 == 0 {
+                EngineLog.emit(
+                    "[MP4SegmentMuxer] audio packet at pts \(packet.pointee.pts) starts inside the sound already "
+                    + "written; dropped so the track's sound keeps its timeline (#\(repeats) this muxer)",
+                    category: .session)
+            }
             av_packet_unref(packet)
             return (0, .none)
         }

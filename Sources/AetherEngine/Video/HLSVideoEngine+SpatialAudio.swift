@@ -226,6 +226,7 @@ extension HLSVideoEngine {
         }
     }
 
+
     /// Build the producer on a `SpatialAudioBridge` when the host asked for object rendering and the
     /// source qualifies. Nil means "not this route": ineligible, unsupported OS, not DTS:X, or a
     /// bridge/header failure, each logged, and the caller carries on with the ordinary bridge
@@ -325,12 +326,25 @@ extension HLSVideoEngine {
         source: ObjectAudioSource
     ) -> HLSSegmentProducer? {
         let bridge: SpatialAudioBridge
+        /// A decoder for each segment's run, made as the session's own.
+        let makeDecoder: () throws -> ObjectAudioDecoding
+        /// The stream's clock against its start, for a source whose bitstream carries one (TrueHD): one store of
+        /// anchors for the session's bridge and every run.
+        var clockAnchors: StreamClockAnchors?
         do {
             let decoder: ObjectAudioDecoding
             switch source {
             case .trueHDAtmos:
                 #if TrueHDObjectAudio
-                decoder = try TrueHDObjectAudioDecoder()
+                let dialogueGain = objectDialogueGain
+                makeDecoder = {
+                    APACObjectOutputSwitch.isOn
+                        ? try TrueHDObjectAudioDecoder(objectOutput: true, dialogueGain: dialogueGain)
+                        : try TrueHDObjectAudioDecoder(dialogueGain: dialogueGain)
+                }
+                decoder = try makeDecoder()
+                clockAnchors = trueHDClockHeadOffset(audioStream: audioStream, audioDemuxer: audioDemuxer,
+                                                     streamIndex: sourceAudioStreamIndex).map(StreamClockAnchors.init(headOffset:))
                 #else
                 return nil
                 #endif
@@ -356,6 +370,7 @@ extension HLSVideoEngine {
                     // The verdict decoded the first packets; the bridge starts from the same ones again.
                     dtsx.reset()
                     decoder = dtsx
+                    makeDecoder = { try DTSXObjectAudioDecoder() }
                     audioIsConfirmedDTSX = true
                 case .refused(let reason):
                     EngineLog.emit(
@@ -379,6 +394,7 @@ extension HLSVideoEngine {
             bridge = try SpatialAudioBridge(
                 srcTimeBase: audioStream.pointee.time_base, layout: layout, decoder: decoder,
                 objectOutput: source == .trueHDAtmos && APACObjectOutputSwitch.isOn)
+            bridge.setStreamClock(anchors: clockAnchors)
         } catch {
             EngineLog.emit(
                 "[HLSVideoEngine] ERROR: \(source.name) rendering unavailable (\(error)); keeping the channel bridge",
@@ -390,20 +406,33 @@ extension HLSVideoEngine {
             bridge.close()
             return nil
         }
+        // Same surfacing as the channel bridge: a decoder that never answers is a failure, not silence.
+        let watchesDecoder = sideAudioDemuxer == nil
+        let streamIndex = sourceAudioStreamIndex
+        let objectOutput = source == .trueHDAtmos && APACObjectOutputSwitch.isOn
+        let levels = bridge.levels
+        let delivered = segmentRuns(template: bridge, sourceStream: audioStream) { [weak self] in
+            let run = try SpatialAudioBridge(srcTimeBase: audioStream.pointee.time_base, layout: layout,
+                                             decoder: try makeDecoder(), objectOutput: objectOutput,
+                                             sessionLevels: levels)
+            run.setStreamClock(anchors: clockAnchors)
+            if watchesDecoder {
+                run.onDecoderProducedNothing = { [weak self] stats in
+                    self?.handleBridgeDecodedNothing(streamIndex: streamIndex, summary: stats.summary)
+                }
+            }
+            return run
+        } ?? bridge
         let cfg = HLSSegmentProducer.AudioConfig(
+            bridging: audioStream,
             codecpar: cp,
-            timeBase: bridge.encoderTimeBase,
             sourceStreamIndex: sourceAudioStreamIndex,
-            inputTimeBase: bridge.encoderTimeBase,
-            sourceTimeBase: audioStream.pointee.time_base,
-            bridge: bridge,
+            bridge: delivered,
             language: audioLanguage
         )
         savedAudioConfig = cfg
-        audioBridge = bridge
-        // Same surfacing as the channel bridge: a decoder that never answers is a failure, not silence.
-        if sideAudioDemuxer == nil {
-            let streamIndex = sourceAudioStreamIndex
+        audioBridge = delivered
+        if watchesDecoder {
             bridge.onDecoderProducedNothing = { [weak self] stats in
                 self?.handleBridgeDecodedNothing(streamIndex: streamIndex, summary: stats.summary)
             }
@@ -438,7 +467,7 @@ extension HLSVideoEngine {
             )
             savedAudioConfig = nil
             audioBridge = nil
-            bridge.close()
+            delivered.close()
             return nil
         }
     }

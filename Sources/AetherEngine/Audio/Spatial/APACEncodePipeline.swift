@@ -138,13 +138,6 @@ final class APACEncodePipeline: @unchecked Sendable {
         }
     }
 
-    /// Move every packet stamped from now on by `frames`.
-    func shift(by frames: Int64) {
-        enqueue { [self] in
-            runStart = runStart.map { $0 + frames }
-        }
-    }
-
     /// Drain the encoder at end of stream and wait for it. Returns everything not yet collected.
     func finish() -> (packets: [StampedPacket], errors: [Error]) {
         enqueue { [self] in
