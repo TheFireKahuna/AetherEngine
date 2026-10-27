@@ -119,7 +119,9 @@ enum AirPlayPlaylistDecision {
     /// (the receiver cannot reach 127.0.0.1), and the path of the chosen playlist. `.master` keeps whatever
     /// the session resolved. The playlists' `EXT-X-MEDIA` and segment URIs are relative, so everything
     /// resolves against the LAN base with no further work.
-    static func receiverURL(base: URL, lanIP: String, playlist: ReceiverPlaylist) -> URL? {
+    /// `mediaPlaylistName`: the session's playlist that plays without a master (`HLSLocalServer.standaloneMediaPlaylistName`).
+    static func receiverURL(base: URL, lanIP: String, playlist: ReceiverPlaylist,
+                            mediaPlaylistName: String = "media.m3u8") -> URL? {
         var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
         components?.host = lanIP
         if playlist == .media {
@@ -128,7 +130,7 @@ enum AirPlayPlaylistDecision {
             // would send the receiver to an address the server refuses.
             var parts = (components?.path ?? "").split(separator: "/", omittingEmptySubsequences: true)
             if !parts.isEmpty { parts.removeLast() }
-            components?.path = "/" + (parts + ["media.m3u8"]).joined(separator: "/")
+            components?.path = "/" + (parts + [Substring(mediaPlaylistName)]).joined(separator: "/")
         }
         return components?.url
     }

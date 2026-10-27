@@ -128,6 +128,11 @@ the public-API contract.
   libavcodec cannot decode, so the tap's stream stayed empty for the whole session. The tap now decodes APAC
   with AudioToolbox, from the cookie the init segment carries, and downmixes the bed to its mono 48 kHz format
   on the same clock as every other codec.
+- **The silence that pads an early-ending audio track lands in the final audio segment when the audio is a
+  rendition of its own (AE#847).** The fill was written into the audio segment where the source's audio ran
+  out, so that segment ran past its playlist duration and the final one was served empty, and the item still
+  ended at the end of the audio. The audio rendition now moves on to the video's last segment first, the
+  segments in between are served without samples, and the silence fills the final one.
 - **A software or FEL overlay whose decoder stalls no longer holds a start for the full five seconds.** The
   hold on a run's first segment now lets go two seconds after the decoder last made progress, as well as at
   its five-second bound. A decoder that has not decoded its first unit yet (a session opening) still gets

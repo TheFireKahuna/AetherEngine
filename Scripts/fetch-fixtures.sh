@@ -531,6 +531,7 @@ determinism_clip opus.mkv "$DET_ST" -c:a libopus -b:a 128k
 determinism_clip dts.mkv "$DET_51" -c:a dca -strict -2
 determinism_clip truehd.mkv "$DET_51" -c:a truehd -strict -2
 # Audio that stops at 9 s under 24 s of picture (AE#847): the last segment is padded with silence.
+determinism_clip ac3-short.mkv "${DECMEM_51/d=12/d=9}:s=48000" -c:a ac3
 
 # Audio whose timestamps are off their frames the ways the library's remuxes carry them, the audio itself continuous.
 # Remuxed from the clips above, so the bitstream is the same and only the timestamps differ.

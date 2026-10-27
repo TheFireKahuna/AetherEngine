@@ -50,7 +50,8 @@ final class SegmentCache: @unchecked Sendable {
     /// content is a cache hit and never fires the producer restart that wedges slow sources (#93)
     /// and detaches AVKit's PiP legible renderer (Sodalite#32). 0 = window-only legacy pruning
     /// (live sessions, where the sliding playlist already dropped everything behind the window).
-    private let retentionBudgetBytes: Int
+    /// A demuxed session's two caches share its budget (`setRetentionBudget`). Guarded by `condition`.
+    private var retentionBudgetBytes: Int
     private let nativeLiveDVRPolicy: LiveDVRRetentionPolicy?
     private var nativeLiveRetentionFloor = 0
     private lazy var nativeLiveExpiryQueue = DispatchQueue(label: "com.aetherengine.live-expiry", qos: .utility)
@@ -539,6 +540,17 @@ final class SegmentCache: @unchecked Sendable {
         condition.unlock()
         if hadEntries { onResidentSetChanged?() }
         return result
+    }
+
+    /// The share of the session's retention budget this cache keeps: a demuxed session splits it between its
+    /// video and audio renditions (docs/demuxed-audio.md). Applied at once.
+    func setRetentionBudget(_ bytes: Int) {
+        condition.lock()
+        retentionBudgetBytes = bytes
+        let doomed = pruneOutsideWindow()
+        condition.unlock()
+        for url in doomed { try? FileManager.default.removeItem(at: url) }
+        if !doomed.isEmpty { onResidentSetChanged?() }
     }
 
     // MARK: - Reader side

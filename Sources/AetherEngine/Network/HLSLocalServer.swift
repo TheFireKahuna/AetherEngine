@@ -18,24 +18,31 @@ protocol HLSSegmentProvider: AnyObject {
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data?
 
     /// As above, but a VOD segment that is still being written may come back as a reader over it,
-    /// which the server sends chunk by chunk (`LoadOptions.progressiveSegmentDelivery`). Default
+    /// which the server sends chunk by chunk. Default
     /// wraps `mediaSegment(at:onSlow:)`.
     func mediaSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource?
 
-    /// Optional file URL for disk-backed segments (cache adopt path). Server streams file -> socket bypassing Foundation Data; sendfile(2) was tried but SIGSYS'd on tvOS sandbox.
+    /// Optional file URL for disk-backed segments (cache adopt path). The server maps the file and sends from the mapping (`streamFileToSocket`).
     /// Must name a file that exists: the server stats and opens it afterwards, and a URL whose file
     /// has gone is answered with an error response rather than the bytes the bookkeeping promised.
     func mediaSegmentURL(at index: Int) -> URL?
 
-    /// AE#418 round 7: what became of a media-segment request. `delivered` is true once the whole
-    /// response went out; false when it was refused or the write failed on a client that hung up.
-    /// The axis is a statement about bytes in AVPlayer's timeline, so a placement composed from a
-    /// request needs to know whether that request was answered. Default ignores it.
-    func didServeMediaSegment(index: Int, delivered: Bool)
-
     /// One more chunk of a progressively delivered segment left the server: the request-counting
     /// wedge watchdog's evidence that AVPlayer is still reading. Default ignores it.
     func didDeliverProgressiveChunk(index: Int)
+
+    /// Whether the session serves its audio as a rendition of its own (`HLSOutputShape.demuxed`): the master
+    /// names `audio.m3u8`, whose init and segments come from the two calls below. Default false.
+    var servesAudioRendition: Bool { get }
+    /// The audio rendition's init segment. Default nil.
+    func audioInitSegment() -> Data?
+    /// The audio rendition's segment `index`, as `mediaSegmentSource(at:onSlow:)` serves the video's. Default nil.
+    func audioSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource?
+    /// The joined view's init for a video init version (`FMP4Join`): the playlist a demuxed session plays from
+    /// without a master. Default nil.
+    func muxedInitSegment(versionID: Int) -> Data?
+    /// The joined view's segment `index`. Default nil.
+    func muxedSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource?
 
     var segmentCount: Int { get }
     func segmentDuration(at index: Int) -> Double
@@ -107,7 +114,8 @@ protocol HLSSegmentProvider: AnyObject {
     /// Native subtitle renditions (#15): one per text track, for the master EXT-X-MEDIA:TYPE=SUBTITLES tags
     /// and the /subs_{N} endpoints. Empty unless prepareNativeSubtitles is on and the cue stores are threaded.
     /// NAMEs must be unique within the group (duplicates collapse AVFoundation's legible options).
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { get }
+    /// The SUBTITLES renditions, each at its ordinal (its index), served as `subs_<ordinal>.m3u8`.
+    var nativeSubtitleRenditions: [NativeSubtitleRenditionInfo] { get }
     /// Ordinal advertised as DEFAULT=YES in the master SUBTITLES group (Sodalite#32).
     var nativeSubtitleDefaultOrdinal: Int { get }
     /// Serve the SUBTITLES rendition as one whole-program .vtt (single VOD segment) instead of per-video-segment (Sodalite#32).
@@ -117,14 +125,22 @@ protocol HLSSegmentProvider: AnyObject {
     /// playlist one segment per video segment, so the embedded reader (parked ~90s ahead of the playhead)
     /// has the cues for a segment in the store by the time AVPlayer fetches it.
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String?
+    /// The player fetched rendition `ordinal`'s media playlist: it has selected that rendition.
+    func nativeSubtitleRenditionRequested(ordinal: Int)
 
     /// AE#682: true when this session lists an I-frame rendition in its master. The two calls below
     /// answer `iframe_init.mp4` and `iframe{N}.mp4`; both may block on a source read.
     var iFrameRenditionServed: Bool { get }
     /// What the rendition carries; nil reads as `.keyframes`.
     var iFrameRenditionFormat: IFrameRenditionFormat? { get }
+    /// The I-frame playlists' entries, denser than the media segments; nil lists one per segment.
+    var iFrameTimeline: [IFrameRendition.Entry]? { get }
     func iFrameInitSegment() -> Data?
     func iFrameSegment(at index: Int) -> Data?
+    /// The SDR companion an HDR session lists beside its keyframes (`iframe_sdr.m3u8`), nil when none.
+    var iFrameCompanionFormat: IFrameRenditionFormat? { get }
+    func iFrameCompanionInitSegment() -> Data?
+    func iFrameCompanionSegment(at index: Int) -> Data?
 
     /// Atomic snapshot at the top of each playlist build. discontinuitySequence = EXT-X-DISCONTINUITY-tagged segments that slid out of the window (RFC 8216 §6.2.2 requires incrementing it; omission slips AVPlayer's discontinuity tracking one window per boundary). firstVisible in the same snapshot: a separate lock acquisition let a concurrent slide produce MEDIA-SEQUENCE newer than the count.
     func notePlaylistBuild() -> (visibleCount: Int, firstVisible: Int, refreshCounter: Int, endlistAdded: Bool, discontinuitySequence: Int)
@@ -183,8 +199,12 @@ extension HLSSegmentProvider {
         mediaSegment(at: index, onSlow: onSlow).map { .data($0) }
     }
     func mediaSegmentURL(at index: Int) -> URL? { nil }
-    func didServeMediaSegment(index: Int, delivered: Bool) {}
     func didDeliverProgressiveChunk(index: Int) {}
+    var servesAudioRendition: Bool { false }
+    func audioInitSegment() -> Data? { nil }
+    func audioSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource? { nil }
+    func muxedInitSegment(versionID: Int) -> Data? { nil }
+    func muxedSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource? { nil }
     var staticMasterPlaylistBody: String? { nil }
     var firstVisibleSegmentIndex: Int { 0 }
     func segmentIsDiscontinuous(at index: Int) -> Bool { false }
@@ -202,14 +222,19 @@ extension HLSSegmentProvider {
     var masterClosedCaptions: String? { nil }
     var masterAudioRendition: (language: String?, name: String)? { nil }
     var masterAudioChannels: String? { nil }
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { [] }
+    var nativeSubtitleRenditions: [NativeSubtitleRenditionInfo] { [] }
     var nativeSubtitleDefaultOrdinal: Int { 0 }
     var nativeSubtitleWholeProgram: Bool { false }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? { nil }
+    func nativeSubtitleRenditionRequested(ordinal: Int) {}
     var iFrameRenditionServed: Bool { false }
     var iFrameRenditionFormat: IFrameRenditionFormat? { nil }
+    var iFrameTimeline: [IFrameRendition.Entry]? { nil }
     func iFrameInitSegment() -> Data? { nil }
     func iFrameSegment(at index: Int) -> Data? { nil }
+    var iFrameCompanionFormat: IFrameRenditionFormat? { nil }
+    func iFrameCompanionInitSegment() -> Data? { nil }
+    func iFrameCompanionSegment(at index: Int) -> Data? { nil }
     var liveTargetSegmentDuration: Double? { nil }
     var liveRejoinStart: (segmentIndex: Int, secondsIntoSegment: Double)? { nil }
     func noteServedLiveRejoinPlacement(timeOffset: Double, firstVisible: Int) {}
@@ -388,7 +413,13 @@ final class HLSLocalServer: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard port > 0 else { return nil }
-        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/\(livePlaylistPrefix)media.m3u8")
+        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/\(livePlaylistPrefix)\(standaloneMediaPlaylistName)")
+    }
+
+    /// The media playlist that plays without a master: the variant's own, or a demuxed session's joined view, whose
+    /// variant playlist is its video alone (docs/demuxed-audio.md).
+    var standaloneMediaPlaylistName: String {
+        provider?.servesAudioRendition == true ? "muxed.m3u8" : "media.m3u8"
     }
 
     /// HDR-preserving reduced master (#98): source VIDEO-RANGE kept, no SUPPLEMENTAL-CODECS
@@ -520,8 +551,8 @@ final class HLSLocalServer: @unchecked Sendable {
         return servedMediaBytes
     }
 
-    /// AE#682: how long `iframe.m3u8` waits for the first media segment request when the rendition is
-    /// SDR JPEG next to an HDR variant. AVPlayer asks for the main variant's segments before the I-frame
+    /// AE#682: how long `iframe_sdr.m3u8`, the SDR stills tier listed next to an HDR variant, waits for the
+    /// first media segment request. AVPlayer asks for the main variant's segments before the I-frame
     /// playlist; one that refused the HDR variant never asks for a segment, and would otherwise play the
     /// stills as the video instead of failing into the media-playlist fallback.
     static let iFrameMainVariantWaitSeconds: TimeInterval = 3
@@ -552,6 +583,7 @@ final class HLSLocalServer: @unchecked Sendable {
 
     private var loggedReducedMasterPlaylist = false
     private var loggedMediaPlaylist = false
+    private var loggedAudioPlaylist = false
     private var loggedRequestHeaders = false
     /// #227 diag: every distinct client address seen this session, logged once each. AirPlay is supposed to
     /// hand the playlist URL to the receiver, so a receiver address must show up here while AirPlaying; only
@@ -738,6 +770,7 @@ final class HLSLocalServer: @unchecked Sendable {
         loggedMasterPlaylist = false
         loggedReducedMasterPlaylist = false
         loggedMediaPlaylist = false
+        loggedAudioPlaylist = false
         mediaPlaylistBuildCount = 0
         // Under the lock: a handler removes its fd here before it closes it, so a number still in the
         // set is still that handler's. Shut down outside the lock, the handler could close in between
@@ -820,6 +853,11 @@ final class HLSLocalServer: @unchecked Sendable {
             // closed-peer send still raises SIGPIPE on iOS.
             var on: Int32 = 1
             _ = setsockopt(clientFd, SOL_SOCKET, SO_NOSIGPIPE, &on,
+                           socklen_t(MemoryLayout<Int32>.size))
+            // Every response goes out as whole vectored writes, so Nagle has nothing to coalesce,
+            // and on a LAN peer (an AirPlay receiver) it would hold a response's last partial
+            // segment for the receiver's delayed ACK.
+            _ = setsockopt(clientFd, IPPROTO_TCP, TCP_NODELAY, &on,
                            socklen_t(MemoryLayout<Int32>.size))
             let acceptedAt = Self.uptimeSeconds()
 
@@ -1049,7 +1087,7 @@ final class HLSLocalServer: @unchecked Sendable {
         guard route.generation <= (provider?.livePlaylistGeneration ?? 0) else {
             return send404(fd: fd, path: routePath, reason: "unknown playlist generation")
         }
-        let normalizedPath = (route.path == "/audio.m3u8") ? "/media.m3u8" : route.path
+        let normalizedPath = route.path
         let loggedRequest = Self.requestLineForLog(
             method: parts[0], routePath: routePath, query: query,
             version: parts.count > 2 ? parts[2] : nil)
@@ -1104,12 +1142,12 @@ final class HLSLocalServer: @unchecked Sendable {
                     EngineLog.emit(
                         "[HLSLocalServer] -> \(status) relay stream bytes=\(contentLength) "
                             + "type=\(contentType)", category: .hlsServer, level: .verbose)
-                    return self.writeAll(fd: fd, data: Data(header.utf8),
+                    return self.writeAll(fd: fd, parts: [Data(header.utf8)],
                                          path: "\(normalizedPath) [header]")
                 },
                 body: { [weak self] chunk in
                     guard let self else { return false }
-                    return self.writeAll(fd: fd, data: chunk, path: normalizedPath)
+                    return self.writeAll(fd: fd, parts: [chunk], path: normalizedPath)
                 })
             switch relay.respond(
                 query: query,
@@ -1163,7 +1201,12 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             return send404(fd: fd, path: normalizedPath, reason: "no masterCodecs")
 
-        case "/media.m3u8":
+        case "/media.m3u8", "/audio.m3u8", "/muxed.m3u8":
+            let rendition: MediaRendition = normalizedPath == "/audio.m3u8" ? .audio
+                : normalizedPath == "/muxed.m3u8" ? .muxed : .video
+            if rendition != .video, provider?.servesAudioRendition != true {
+                return send404(fd: fd, path: normalizedPath, reason: "no audio rendition (muxed audio)")
+            }
             // For live: hold until at least one segment exists (-12888 fires immediately on empty live playlist; AVPlayer never re-polls).
             if let p = provider, p.playlistType == .live {
                 if let msn = Self.parseHLSMsn(query) {
@@ -1189,11 +1232,16 @@ final class HLSLocalServer: @unchecked Sendable {
                 // surfaces the failure instead of hanging).
                 _ = p.waitForSequentialStartupSegments(timeout: 30.0)
             }
-            let body = buildMediaPlaylist(generation: route.generation)
+            let body = buildMediaPlaylist(generation: route.generation, rendition: rendition)
             stateLock.lock()
-            let firstTime = !loggedMediaPlaylist
-            if firstTime { loggedMediaPlaylist = true }
-            mediaPlaylistBuildCount += 1
+            // The counters are the video playlist's: what reads them watches AVPlayer's reloads of the variant.
+            let firstTime = rendition == .video ? !loggedMediaPlaylist : !loggedAudioPlaylist
+            if rendition == .video {
+                if firstTime { loggedMediaPlaylist = true }
+                mediaPlaylistBuildCount += 1
+            } else if firstTime {
+                loggedAudioPlaylist = true
+            }
             let isLivePlaylist = (provider?.playlistType == .live)
             let periodic = isLivePlaylist && (mediaPlaylistBuildCount % 10 == 0)
             stateLock.unlock()
@@ -1201,9 +1249,9 @@ final class HLSLocalServer: @unchecked Sendable {
                 let lines = body.split(separator: "\n", omittingEmptySubsequences: false)
                 let head = lines.prefix(8).joined(separator: "\n")
                 let tail = lines.suffix(6).joined(separator: "\n")
-                EngineLog.emit("[HLSLocalServer] media.m3u8 head:\n\(head)",
+                EngineLog.emit("[HLSLocalServer] \(normalizedPath.dropFirst()) head:\n\(head)",
                                category: .hlsServer, level: .verbose)
-                EngineLog.emit("[HLSLocalServer] media.m3u8 tail:\n\(tail)",
+                EngineLog.emit("[HLSLocalServer] \(normalizedPath.dropFirst()) tail:\n\(tail)",
                                category: .hlsServer, level: .verbose)
             }
             return send200(fd: fd, path: normalizedPath,
@@ -1216,6 +1264,7 @@ final class HLSLocalServer: @unchecked Sendable {
                 return send404(fd: fd, path: normalizedPath, reason: "unparseable subtitle playlist path")
             }
             EngineLog.emit("[HLSLocalServer] subtitle rendition selected: subs_\(parsed.ordinal).m3u8 fetched", category: .hlsServer)
+            prov.nativeSubtitleRenditionRequested(ordinal: parsed.ordinal)
             let subBody = Self.buildSubtitleMediaPlaylistText(ordinal: parsed.ordinal, provider: prov, generation: route.generation)
             return send200(fd: fd, path: normalizedPath,
                            data: Data(subBody.utf8),
@@ -1249,13 +1298,22 @@ final class HLSLocalServer: @unchecked Sendable {
             guard let prov = provider, prov.iFrameRenditionServed else {
                 return send404(fd: fd, path: normalizedPath, reason: "no I-frame rendition")
             }
-            if case .jpeg = prov.iFrameRenditionFormat, !waitForMainVariant() {
+            let body = Self.buildIFramePlaylistText(provider: prov, subResourceBaseURL: subResourceBaseURL)
+            return send200(fd: fd, path: normalizedPath, data: Data(body.utf8),
+                           contentType: "application/vnd.apple.mpegurl")
+
+        case "/iframe_sdr.m3u8":
+            guard let prov = provider, prov.iFrameRenditionServed, prov.iFrameCompanionFormat != nil else {
+                return send404(fd: fd, path: normalizedPath, reason: "no SDR I-frame companion")
+            }
+            if !waitForMainVariant() {
                 EngineLog.emit("[HLSLocalServer] i-frame rendition withheld: no media segment requested within "
                                + "\(Self.iFrameMainVariantWaitSeconds)s, so the HDR variant was refused",
                                category: .hlsServer)
                 return send404(fd: fd, path: normalizedPath, reason: "main variant not playing")
             }
-            let body = Self.buildIFramePlaylistText(provider: prov, subResourceBaseURL: subResourceBaseURL)
+            let body = Self.buildIFramePlaylistText(provider: prov, subResourceBaseURL: subResourceBaseURL,
+                                                    resourceName: "iframe_sdr")
             return send200(fd: fd, path: normalizedPath, data: Data(body.utf8),
                            contentType: "application/vnd.apple.mpegurl")
 
@@ -1265,12 +1323,39 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             return send200(fd: fd, path: normalizedPath, data: data, contentType: "video/mp4")
 
+        case "/iframe_sdr_init.mp4":
+            guard let data = provider?.iFrameCompanionInitSegment(), !data.isEmpty else {
+                return send404(fd: fd, path: normalizedPath, reason: "SDR I-frame init unavailable")
+            }
+            return send200(fd: fd, path: normalizedPath, data: data, contentType: "video/mp4")
+
+        case let p where p.hasPrefix("/iframe_sdr") && p.hasSuffix(".mp4"):
+            guard let index = Self.parseIFramePath(p, resourceName: "iframe_sdr"),
+                  let data = provider?.iFrameCompanionSegment(at: index), !data.isEmpty else {
+                return send404(fd: fd, path: normalizedPath, reason: "no SDR I-frame for \(normalizedPath)")
+            }
+            return send200(fd: fd, path: normalizedPath, data: data, contentType: "video/mp4")
+
         case let p where p.hasPrefix("/iframe") && p.hasSuffix(".mp4"):
             guard let index = Self.parseIFramePath(p),
                   let data = provider?.iFrameSegment(at: index), !data.isEmpty else {
                 return send404(fd: fd, path: normalizedPath, reason: "no I-frame for \(normalizedPath)")
             }
             return send200(fd: fd, path: normalizedPath, data: data, contentType: "video/mp4")
+
+        case "/muxed-init.mp4":
+            stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
+            guard let data = provider?.muxedInitSegment(versionID: 0), !data.isEmpty else {
+                return send404(fd: fd, path: normalizedPath, reason: "muxed-init.mp4 not available")
+            }
+            return send200(fd: fd, path: normalizedPath, data: data, contentType: "video/mp4")
+
+        case "/audio-init.mp4":
+            stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
+            guard let data = provider?.audioInitSegment(), !data.isEmpty else {
+                return send404(fd: fd, path: normalizedPath, reason: "audio-init.mp4 not available")
+            }
+            return send200(fd: fd, path: normalizedPath, data: data, contentType: "audio/mp4")
 
         case "/init.mp4":
             stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
@@ -1283,6 +1368,14 @@ final class HLSLocalServer: @unchecked Sendable {
                            contentType: "video/mp4")
 
         default:
+            // The joined view's versioned init, the video's version N joined with the audio's init.
+            if normalizedPath.hasPrefix("/muxed-init"), normalizedPath.hasSuffix(".mp4"),
+               let v = Int(normalizedPath.dropFirst("/muxed-init".count).dropLast(".mp4".count)), v > 0 {
+                guard let data = provider?.muxedInitSegment(versionID: v), !data.isEmpty else {
+                    return send404(fd: fd, path: normalizedPath, reason: "muxed-init\(v).mp4 not available")
+                }
+                return send200(fd: fd, path: normalizedPath, data: data, contentType: "video/mp4")
+            }
             // Versioned init for SSAI program switches: /init<N>.mp4 (N>0).
             if normalizedPath.hasPrefix("/init"),
                normalizedPath.hasSuffix(".mp4") {
@@ -1297,102 +1390,126 @@ final class HLSLocalServer: @unchecked Sendable {
                                    contentType: "video/mp4")
                 }
             }
-            if normalizedPath.hasPrefix("/seg"),
-               normalizedPath.hasSuffix(".mp4") {
+            if let route = Self.segmentRoute(normalizedPath) {
                 stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
-                let indexStr = normalizedPath.dropFirst(4).dropLast(4)
-                if let index = Int(indexStr), index >= 0 {
-                    // AE#418 round 7: every exit from this branch says what became of the request, so
-                    // a placement composed from it can tell "not delivered yet" from "never arriving".
-                    func delivered(_ ok: Bool) -> Bool {
-                        provider?.didServeMediaSegment(index: index, delivered: ok)
-                        return ok
-                    }
-                    func refused(_ responseWritten: Bool) -> Bool {
-                        provider?.didServeMediaSegment(index: index, delivered: false)
-                        return responseWritten
-                    }
-                    // File-backed fast path: stream page cache -> socket without Data materialization.
-                    if let url = provider?.mediaSegmentURL(at: index) {
-                        let outcome = send200File(fd: fd, path: normalizedPath,
-                                                  fileURL: url,
-                                                  contentType: "video/mp4",
-                                                  segmentIndex: index)
-                        // A cache entry can outlive its file, and that answer is a retriable 503: the
-                        // request is not answered yet, so it says nothing about the placement.
-                        switch outcome.body {
-                        case .segment: return delivered(outcome.writeSucceeded)
-                        case .refusal: return refused(outcome.writeSucceeded)
-                        case .retry: return outcome.writeSucceeded
-                        }
-                    }
-                    // #93 round 3: a serve outliving the provider's slow threshold (wedge-window
-                    // restart, 25-50 s worst case) emits response headers NOW as a chunked
-                    // transfer; the body follows when the segment lands. Without this, AVPlayer's
-                    // ~3.5 s time-to-first-byte watchdog logs -12889 per silent request and three
-                    // strikes fail the item (failedToPlayToEndTime, terminal from the couch).
-                    let early = EarlyHeaderState()
-                    let source = provider?.mediaSegmentSource(at: index, onSlow: { [weak self] in
-                        guard let self, early.markSentOnce() else { return }
-                        EngineLog.emit(
-                            "[HLSLocalServer] seg\(index): slow serve, sending early chunked header",
-                            category: .hlsServer)
-                        _ = self.writeAll(fd: fd,
-                                          data: Self.chunkedResponseHeader(contentType: "video/mp4"),
-                                          path: "\(normalizedPath) [early header]")
-                    })
-                    // A segment being written: commit the chunked header (unless the slow-serve
-                    // signal already did) and send each fragment as it lands. An abandoned segment
-                    // ends the connection without the final chunk, so AVPlayer retries it rather
-                    // than taking the partial bytes for a whole segment.
-                    if case .progressive(let reader) = source {
-                        if early.markSentOnce() {
-                            guard writeAll(fd: fd, data: Self.chunkedResponseHeader(contentType: "video/mp4"),
-                                           path: "\(normalizedPath) [progressive header]") else {
-                                return refused(false)
-                            }
-                        }
-                        return delivered(sendProgressiveBody(fd: fd, path: normalizedPath, reader: reader))
-                    }
-                    let data: Data? = {
-                        if case .data(let d) = source { return d }
-                        return nil
-                    }()
-                    if early.wasSent {
-                        guard let data, !data.isEmpty else {
-                            // Headers are committed; abort so AVPlayer sees a truncated transfer
-                            // and retries, instead of a cacheable empty 200.
-                            EngineLog.emit(
-                                "[HLSLocalServer] seg\(index): early-header serve missed; "
-                                + "closing connection for AVPlayer retry",
-                                category: .hlsServer)
-                            return refused(false)
-                        }
-                        return delivered(sendChunkedBody(fd: fd, path: normalizedPath, data: data))
-                    }
-                    if let data, !data.isEmpty {
-                        return delivered(send200(fd: fd, path: normalizedPath, data: data,
-                                                 contentType: "video/mp4"))
-                    }
-                    let providerCount = provider?.segmentCount ?? -1
-                    let reason = "segment[\(index)] empty (segmentCount=\(providerCount))"
-                    switch Self.classifySegmentResponse(
-                        index: index, segmentCount: providerCount, hasData: false) {
-                    case .serve:
-                        // Unreachable: hasData is false here.
-                        return refused(send404(fd: fd, path: normalizedPath, reason: reason))
-                    case .retryLater:
-                        // A 503 is retriable, so the request is not answered yet; the placement waits
-                        // for the retry rather than concluding from it.
-                        return send503(fd: fd, path: normalizedPath, reason: reason)
-                    case .notFound:
-                        return refused(send404(fd: fd, path: normalizedPath, reason: reason))
-                    }
+                guard let index = Int(route.index), index >= 0 else {
+                    return send404(fd: fd, path: normalizedPath,
+                                   reason: "unparseable \(route.rendition.name) index '\(route.index)'")
                 }
-                return send404(fd: fd, path: normalizedPath,
-                               reason: "unparseable seg index '\(indexStr)'")
+                return serveSegment(fd: fd, path: normalizedPath, index: index, rendition: route.rendition)
             }
             return send404(fd: fd, path: normalizedPath, reason: "unknown path")
+        }
+    }
+
+    /// The media playlists the server serves (docs/demuxed-audio.md): the variant's video (or, muxed, video and
+    /// audio) as `seg<N>.mp4`; the demuxed shape's audio as `audio<N>.mp4`; and its joined view, the two in one file
+    /// per segment (`FMP4Join`), as `muxed<N>.mp4`, for playing without a master.
+    enum MediaRendition: Sendable {
+        case video, audio, muxed
+        var name: String {
+            switch self {
+            case .video: return "seg"
+            case .audio: return "audio"
+            case .muxed: return "muxed"
+            }
+        }
+        var playlistPath: String { self == .video ? "/media.m3u8" : "/\(name).m3u8" }
+    }
+
+    /// A segment path's rendition and index text: `/seg<N>.mp4`, `/audio<N>.mp4` or `/muxed<N>.mp4`.
+    static func segmentRoute(_ path: String) -> (rendition: MediaRendition, index: Substring)? {
+        guard path.hasSuffix(".mp4") else { return nil }
+        for rendition in [MediaRendition.video, .audio, .muxed] where path.hasPrefix("/\(rendition.name)") {
+            return (rendition, path.dropFirst(rendition.name.count + 1).dropLast(".mp4".count))
+        }
+        return nil
+    }
+
+    /// One media segment, of either rendition, as the video's always was: a resident file straight from the
+    /// page cache (video), a reader over one still being written, an early chunked header for a slow serve.
+    private func serveSegment(fd: Int32, path normalizedPath: String, index: Int,
+                              rendition: MediaRendition) -> Bool {
+        // File-backed fast path: stream page cache -> socket without Data materialization.
+        if rendition == .video, let url = provider?.mediaSegmentURL(at: index) {
+            let outcome = send200File(fd: fd, path: normalizedPath,
+                                      fileURL: url,
+                                      contentType: "video/mp4",
+                                      segmentIndex: index)
+            // A cache entry can outlive its file, and that answer is a retriable 503: the
+            // request is not answered yet, so it says nothing about the placement.
+            switch outcome.body {
+            case .segment: return (outcome.writeSucceeded)
+            case .refusal: return (outcome.writeSucceeded)
+            case .retry: return outcome.writeSucceeded
+            }
+        }
+        // #93 round 3: a serve outliving the provider's slow threshold (wedge-window
+        // restart, 25-50 s worst case) emits response headers NOW as a chunked
+        // transfer; the body follows when the segment lands. Without this, AVPlayer's
+        // ~3.5 s time-to-first-byte watchdog logs -12889 per silent request and three
+        // strikes fail the item (failedToPlayToEndTime, terminal from the couch).
+        let early = EarlyHeaderState()
+        let onSlow: @Sendable () -> Void = { [weak self] in
+            guard let self, early.markSentOnce() else { return }
+            EngineLog.emit(
+                "[HLSLocalServer] \(rendition.name)\(index): slow serve, sending early chunked header",
+                category: .hlsServer)
+            _ = self.writeAll(fd: fd, parts: [Self.chunkedResponseHeader(contentType: "video/mp4")],
+                              path: "\(normalizedPath) [early header]")
+        }
+        let source: SegmentSource?
+        switch rendition {
+        case .video: source = provider?.mediaSegmentSource(at: index, onSlow: onSlow)
+        case .audio: source = provider?.audioSegmentSource(at: index, onSlow: onSlow)
+        case .muxed: source = provider?.muxedSegmentSource(at: index, onSlow: onSlow)
+        }
+        // A segment being written: commit the chunked header (unless the slow-serve
+        // signal already did) and send each fragment as it lands. An abandoned segment
+        // ends the connection without the final chunk, so AVPlayer retries it rather
+        // than taking the partial bytes for a whole segment.
+        if case .progressive(let reader) = source {
+            if early.markSentOnce() {
+                guard writeAll(fd: fd, parts: [Self.chunkedResponseHeader(contentType: "video/mp4")],
+                               path: "\(normalizedPath) [progressive header]") else {
+                    return (false)
+                }
+            }
+            return (sendProgressiveBody(fd: fd, path: normalizedPath, reader: reader))
+        }
+        let data: Data? = {
+            if case .data(let d) = source { return d }
+            return nil
+        }()
+        if early.wasSent {
+            guard let data, !data.isEmpty else {
+                // Headers are committed; abort so AVPlayer sees a truncated transfer
+                // and retries, instead of a cacheable empty 200.
+                EngineLog.emit(
+                    "[HLSLocalServer] \(rendition.name)\(index): early-header serve missed; "
+                    + "closing connection for AVPlayer retry",
+                    category: .hlsServer)
+                return (false)
+            }
+            return (sendChunkedBody(fd: fd, path: normalizedPath, data: data))
+        }
+        if let data, !data.isEmpty {
+            return (send200(fd: fd, path: normalizedPath, data: data,
+                                     contentType: "video/mp4"))
+        }
+        let providerCount = provider?.segmentCount ?? -1
+        let reason = "segment[\(index)] empty (segmentCount=\(providerCount))"
+        switch Self.classifySegmentResponse(
+            index: index, segmentCount: providerCount, hasData: false) {
+        case .serve:
+            // Unreachable: hasData is false here.
+            return (send404(fd: fd, path: normalizedPath, reason: reason))
+        case .retryLater:
+            // A 503 is retriable, so the request is not answered yet; the placement waits
+            // for the retry rather than concluding from it.
+            return send503(fd: fd, path: normalizedPath, reason: reason)
+        case .notFound:
+            return (send404(fd: fd, path: normalizedPath, reason: reason))
         }
     }
 
@@ -1443,9 +1560,8 @@ final class HLSLocalServer: @unchecked Sendable {
         while true {
             switch reader.next() {
             case .bytes(let data):
-                guard writeAll(fd: fd, data: Self.chunkFrameHeader(size: data.count), path: "\(path) [chunk size]"),
-                      writeAll(fd: fd, data: data, path: path),
-                      writeAll(fd: fd, data: Self.chunkFrameTrailer, path: "\(path) [chunk trailer]") else {
+                guard writeAll(fd: fd, parts: [Self.chunkFrameHeader(size: data.count), data, Self.chunkFrameTrailer],
+                               path: path) else {
                     return false
                 }
                 sent += data.count
@@ -1454,7 +1570,7 @@ final class HLSLocalServer: @unchecked Sendable {
                 EngineLog.emit(
                     "[HLSLocalServer] -> 200 \(path) bytes=\(sent) type=video/mp4 [progressive]",
                     category: .hlsServer, level: .verbose)
-                return writeAll(fd: fd, data: Self.chunkedFinal, path: "\(path) [chunk final]")
+                return writeAll(fd: fd, parts: [Self.chunkedFinal], path: "\(path) [chunk final]")
             case .abandoned:
                 EngineLog.emit(
                     "[HLSLocalServer] \(path): the producer abandoned this segment after \(sent) B sent; "
@@ -1465,22 +1581,20 @@ final class HLSLocalServer: @unchecked Sendable {
         }
     }
 
-    /// Body for an early-header serve: the whole segment as one chunk. Four separate send()
-    /// calls so mmap-backed segment Data is never copied into a Swift heap buffer.
+    /// Body for an early-header serve: the whole segment as one chunk, framing and all in one
+    /// vectored write, so mmap-backed segment Data is never copied into a Swift heap buffer.
     private func sendChunkedBody(fd: Int32, path: String, data: Data) -> Bool {
         EngineLog.emit(
             "[HLSLocalServer] -> 200 \(path) bytes=\(data.count) type=video/mp4 [chunked, early header]",
             category: .hlsServer, level: .verbose)
-        guard writeAll(fd: fd, data: Self.chunkFrameHeader(size: data.count), path: "\(path) [chunk size]"),
-              writeAll(fd: fd, data: data, path: path),
-              writeAll(fd: fd, data: Self.chunkFrameTrailer, path: "\(path) [chunk trailer]"),
-              writeAll(fd: fd, data: Self.chunkedFinal, path: "\(path) [chunk final]") else {
+        guard writeAll(fd: fd, parts: [Self.chunkFrameHeader(size: data.count), data, Self.chunkFrameTrailer,
+                                       Self.chunkedFinal], path: path) else {
             return false
         }
         return true
     }
 
-    /// Shared response-header builder. Header and body are sent in two separate send() calls: data may be mmap-backed and must NOT be copied via Data.append (would materialize segment into Swift heap, defeating the BSD-socket rewrite).
+    /// Shared response-header builder. Header and body go out as two vectors of one `writev`: data may be mmap-backed and must NOT be copied via Data.append (would materialize segment into Swift heap, defeating the BSD-socket rewrite).
     private static func responseHeader(
         status: String, contentLength: Int, contentType: String?
     ) -> Data {
@@ -1503,10 +1617,7 @@ final class HLSLocalServer: @unchecked Sendable {
         EngineLog.emit("[HLSLocalServer] -> 200 \(path) bytes=\(data.count) type=\(contentType)",
                        category: .hlsServer, level: .verbose)
 
-        guard writeAll(fd: fd, data: headerData, path: "\(path) [header]") else {
-            return false
-        }
-        return writeAll(fd: fd, data: data, path: path)
+        return writeAll(fd: fd, parts: [headerData, data], path: path)
     }
 
     /// What a file-backed serve answered with, alongside whether the write went through. AE#418
@@ -1538,10 +1649,7 @@ final class HLSLocalServer: @unchecked Sendable {
         EngineLog.emit("[HLSLocalServer] -> 200 \(path) bytes=\(fileSize) type=\(contentType) [filestream]",
                        category: .hlsServer, level: .verbose)
 
-        guard writeAll(fd: fd, data: headerData, path: "\(path) [header]") else {
-            return (.segment, false)
-        }
-        return (.segment, streamFileToSocket(fileURL: fileURL, socketFd: fd, path: path,
+        return (.segment, streamFileToSocket(fileURL: fileURL, socketFd: fd, head: headerData, path: path,
                                              expectedLength: fileSize))
     }
 
@@ -1564,10 +1672,7 @@ final class HLSLocalServer: @unchecked Sendable {
         EngineLog.emit(
             "[HLSLocalServer] -> \(answer.status) relay bytes=\(answer.body.count) "
                 + "type=\(answer.contentType)", category: .hlsServer, level: .verbose)
-        guard writeAll(fd: fd, data: Data(header.utf8), path: "\(path) [header]") else {
-            return false
-        }
-        return answer.body.isEmpty ? true : writeAll(fd: fd, data: answer.body, path: path)
+        return writeAll(fd: fd, parts: [Data(header.utf8), answer.body], path: path)
     }
 
     /// The response head for a relayed answer, whether it is written whole or streamed. One writer,
@@ -1617,7 +1722,7 @@ final class HLSLocalServer: @unchecked Sendable {
             EngineLog.emit("[HLSLocalServer] -> 404 \(path) reason=\(reason)",
                            category: .hlsServer)
         }
-        return writeAll(fd: fd, data: response, path: path)
+        return writeAll(fd: fd, parts: [response], path: path)
     }
 
     /// 503 for an in-range segment not yet produced (#50). AVPlayer treats a 404 on a VOD segment as terminal loadFailed; 503+Retry-After keeps it recoverable so VideoSegmentProvider.serveSegment can nudge the producer back.
@@ -1629,7 +1734,7 @@ final class HLSLocalServer: @unchecked Sendable {
         header += "Connection: keep-alive\r\n\r\n"
         EngineLog.emit("[HLSLocalServer] -> 503 \(path) reason=\(reason)",
                        category: .hlsServer)
-        return writeAll(fd: fd, data: Data(header.utf8), path: path)
+        return writeAll(fd: fd, parts: [Data(header.utf8)], path: path)
     }
 
     /// How to answer a `/seg{N}.mp4` request, given whether the provider
@@ -1652,97 +1757,100 @@ final class HLSLocalServer: @unchecked Sendable {
         return .notFound
     }
 
-    /// Blocking send loop. Uses withUnsafeBytes so mmap-backed Data stays mmap-backed (kernel page-faults in only the bytes copied to the socket send buffer, no heap accumulation).
-    private func writeAll(fd: Int32, data: Data, path: String) -> Bool {
-        var written = 0
-        let total = data.count
-        if total == 0 { return true }
-        while written < total {
-            let result = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int in
-                guard let base = raw.baseAddress else { return -1 }
-                let remaining = total - written
-                return send(fd, base.advanced(by: written), remaining, 0)
+    /// Blocking send of `parts` back to back, as one `writev` per kernel turn rather than one `send`
+    /// each, so a response head never leaves as a packet of its own ahead of its body. The bytes are
+    /// read where they are (mmap-backed segment Data stays mmap-backed, nothing is joined into a
+    /// heap buffer first).
+    private func writeAll(fd: Int32, parts: [Data], path: String) -> Bool {
+        func pin(_ index: Int, _ buffers: inout [UnsafeRawBufferPointer]) -> Bool {
+            guard index < parts.count else { return sendVectors(fd: fd, buffers, path: path) }
+            return parts[index].withUnsafeBytes { raw -> Bool in
+                if raw.count > 0 { buffers.append(raw) }
+                return pin(index + 1, &buffers)
             }
-            if result < 0 {
+        }
+        var buffers: [UnsafeRawBufferPointer] = []
+        buffers.reserveCapacity(parts.count)
+        return pin(0, &buffers)
+    }
+
+    /// The vectored send loop under `writeAll` and the file path: resumes a partial write where the
+    /// kernel stopped, retries EINTR, and counts what went out.
+    private func sendVectors(fd: Int32, _ buffers: [UnsafeRawBufferPointer], path: String) -> Bool {
+        var vectors = buffers.map { iovec(iov_base: UnsafeMutableRawPointer(mutating: $0.baseAddress), iov_len: $0.count) }
+        let total = buffers.reduce(0) { $0 + $1.count }
+        if total == 0 { return true }
+        var first = 0
+        while first < vectors.count {
+            let count = Int32(min(vectors.count - first, Int(IOV_MAX)))
+            let n = vectors[first...].withUnsafeBufferPointer { writev(fd, $0.baseAddress, count) }
+            if n < 0 {
                 let err = errno
                 if err == EINTR { continue }
                 EngineLog.emit("[HLSLocalServer] send failed for \(path): errno=\(err)",
                                category: .hlsServer)
                 return false
             }
-            if result == 0 {
+            if n == 0 {
                 EngineLog.emit("[HLSLocalServer] send returned 0 for \(path)",
                                category: .hlsServer)
                 return false
             }
-            written += result
+            var left = n
+            while first < vectors.count, left >= vectors[first].iov_len {
+                left -= vectors[first].iov_len
+                first += 1
+            }
+            if left > 0 {
+                vectors[first].iov_base = vectors[first].iov_base?.advanced(by: left)
+                vectors[first].iov_len -= left
+            }
         }
         bumpBytesSent(total)
         return true
     }
 
-    /// Chunked file -> socket stream (256 KB buffer). sendfile(2) tried first but is SIGSYS'd by tvOS sandbox; reverted to read+send. expectedLength must match Content-Length exactly: a file that grew or shrank between stat and read would shift HTTP framing on the keep-alive connection. Short file fails the response (closes connection) rather than leaving the client waiting.
-    private func streamFileToSocket(fileURL: URL, socketFd: Int32, path: String,
-                             expectedLength: Int) -> Bool {
-        let handle: FileHandle
-        do {
-            handle = try FileHandle(forReadingFrom: fileURL)
-        } catch {
-            EngineLog.emit("[HLSLocalServer] file open failed \(path): \(error)",
+    /// File -> socket straight out of the page cache: the file is mapped and `writev` copies from the
+    /// mapping, `head` (the response head) riding in front of it in the same call, so the bytes are
+    /// copied into the socket once and never through a user buffer
+    /// (sendfile(2) would skip even that copy, but the tvOS sandbox SIGSYS's it). expectedLength must
+    /// match Content-Length exactly: a file that changed size between stat and open would shift HTTP
+    /// framing on the keep-alive connection, so a shorter file fails the response (closes the
+    /// connection) and a longer one sends only expectedLength. Mapping is safe against the cache's own
+    /// lifecycle: a served segment is adopted whole and only ever unlinked, never truncated, and a
+    /// mapping outlives the unlink.
+    private func streamFileToSocket(fileURL: URL, socketFd: Int32, head: Data, path: String,
+                                    expectedLength: Int) -> Bool {
+        let fileFd = Darwin.open(fileURL.path, O_RDONLY | O_CLOEXEC)
+        guard fileFd >= 0 else {
+            EngineLog.emit("[HLSLocalServer] file open failed \(path): errno=\(errno)",
                            category: .hlsServer)
             return false
         }
-        let fileFd = handle.fileDescriptor
-        defer { try? handle.close() }
-
-        let chunkSize = 256 * 1024
-        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
-        defer { buffer.deallocate() }
-
-        var totalSent: Int = 0
-        while true {
-            if totalSent >= expectedLength {
-                // File grew after stat; do not send excess bytes.
-                bumpBytesSent(totalSent)
-                bumpSendfileBytes(totalSent)
-                return true
-            }
-            let want = min(chunkSize, expectedLength - totalSent)
-            let nRead = read(fileFd, buffer, want)
-            if nRead == 0 {
-                // File shrank after stat; fail to avoid framing desync.
-                EngineLog.emit(
-                    "[HLSLocalServer] short file \(path): sent=\(totalSent) expected=\(expectedLength)",
-                    category: .hlsServer
-                )
-                return false
-            }
-            if nRead < 0 {
-                let err = errno
-                if err == EINTR { continue }
-                EngineLog.emit("[HLSLocalServer] file read failed \(path): errno=\(err) sent=\(totalSent)",
-                               category: .hlsServer)
-                return false
-            }
-            var written = 0
-            while written < nRead {
-                let n = send(socketFd, buffer.advanced(by: written), nRead - written, 0)
-                if n < 0 {
-                    let err = errno
-                    if err == EINTR { continue }
-                    EngineLog.emit("[HLSLocalServer] send failed \(path): errno=\(err) sent=\(totalSent + written)",
-                                   category: .hlsServer)
-                    return false
-                }
-                if n == 0 {
-                    EngineLog.emit("[HLSLocalServer] send returned 0 \(path) sent=\(totalSent + written)",
-                                   category: .hlsServer)
-                    return false
-                }
-                written += n
-            }
-            totalSent += nRead
+        defer { Darwin.close(fileFd) }
+        var st = stat()
+        guard fstat(fileFd, &st) == 0, st.st_size >= expectedLength, expectedLength > 0 else {
+            EngineLog.emit(
+                "[HLSLocalServer] short file \(path): size=\(st.st_size) expected=\(expectedLength)",
+                category: .hlsServer
+            )
+            return false
         }
+        guard let mapping = mmap(nil, expectedLength, PROT_READ, MAP_PRIVATE, fileFd, 0),
+              mapping != MAP_FAILED else {
+            EngineLog.emit("[HLSLocalServer] file map failed \(path): errno=\(errno)",
+                           category: .hlsServer)
+            return false
+        }
+        defer { munmap(mapping, expectedLength) }
+
+        let sent = head.withUnsafeBytes { headBytes in
+            sendVectors(fd: socketFd,
+                        [headBytes, UnsafeRawBufferPointer(start: mapping, count: expectedLength)],
+                        path: path)
+        }
+        if sent { bumpSendfileBytes(expectedLength) }
+        return sent
     }
 
     // MARK: - Playlist construction
@@ -1762,11 +1870,11 @@ final class HLSLocalServer: @unchecked Sendable {
                                              variant: variant)
     }
 
-    private func buildMediaPlaylist(generation: Int) -> String {
+    private func buildMediaPlaylist(generation: Int, rendition: MediaRendition) -> String {
         guard let provider = provider else { return "#EXTM3U\n" }
         return Self.buildMediaPlaylistText(provider: provider,
                                             subResourceBaseURL: subResourceBaseURL,
-                                            generation: generation)
+                                            generation: generation, rendition: rendition)
     }
 
     /// Parse ?_HLS_msn=N from the request query. _HLS_part ignored (segment-level blocking only, no partial segments). Returns nil for absent or unparseable (treated as plain reload).
@@ -1823,8 +1931,8 @@ final class HLSLocalServer: @unchecked Sendable {
         if let layout = provider.masterVideoLayout {
             streamInfAttrs.append("REQ-VIDEO-LAYOUT=\"\(layout)\"")
         }
-        // AE#458: the audio is muxed into the variant, so its rendition carries no URI (RFC 8216 4.3.4.2.1).
-        // That tag is the ONLY place AVFoundation reads an audio language from on an HLS asset: measured on
+        // AE#458: the audio rendition tag is the ONLY place AVFoundation reads an audio language from on an HLS
+        // asset, muxed audio's tag included, which names no URI: measured on
         // macOS 26, an fMP4 whose mdhd reads "deu" still reports languageCode=nil and builds no audible
         // selection group at all, so every UI over that group (AVKit's audio menu) shows "Not Specified".
         // MP4SegmentMuxer writes the mdhd too, but that is not what fixes the label.
@@ -1837,7 +1945,11 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         if let audio = audioRendition {
             var audioAttrs = ["TYPE=AUDIO", "GROUP-ID=\"aud\"", "NAME=\"\(audio.name)\""]
-            if let language = audio.language { audioAttrs.append("LANGUAGE=\"\(language)\"") }
+            // A rendition of its own states its language whatever it is; muxed audio's tag is there only for the
+            // language and channels it can state.
+            if let language = audio.language ?? (provider.servesAudioRendition ? "und" : nil) {
+                audioAttrs.append("LANGUAGE=\"\(language)\"")
+            }
             audioAttrs.append(contentsOf: ["DEFAULT=YES", "AUTOSELECT=YES"])
             // CHANNELS is where object audio is declared to AVFoundation. The CODECS string stays
             // `ec-3` (#34: never `ec+3`), and the per-segment `dec3` box is below the playlist layer,
@@ -1847,27 +1959,34 @@ final class HLSLocalServer: @unchecked Sendable {
             if let channels = provider.masterAudioChannels {
                 audioAttrs.append("CHANNELS=\"\(channels)\"")
             }
+            // Demuxed, the audio is a rendition of its own; muxed, it is in the variant's segments and the tag
+            // names no URI.
+            if provider.servesAudioRendition { audioAttrs.append("URI=\"audio.m3u8\"") }
             lines.append("#EXT-X-MEDIA:\(audioAttrs.joined(separator: ","))")
         }
 
         // #15: native WebVTT subtitle renditions (separate from the A/V variant; in-band timed text is
         // non-conformant for HLS). Orthogonal to the video VIDEO-RANGE/CODECS attributes.
-        // Sodalite#32: DEFAULT=NO,AUTOSELECT=NO so AVKit never auto-selects a subtitle rendition in fullscreen
-        // (the on-frame overlay owns fullscreen subtitles). The host explicitly selects the matching rendition
-        // only on PiP entry and deselects it on PiP exit, so the two never double up.
         let subRenditions = provider.nativeSubtitleRenditions
-        for r in subRenditions {
+        for (ordinal, r) in subRenditions.enumerated() {
             var mediaAttrs = ["TYPE=SUBTITLES", "GROUP-ID=\"subs\"", "NAME=\"\(r.name)\""]
             if let lang = r.language { mediaAttrs.append("LANGUAGE=\"\(lang)\"") }
-            mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=NO"])
-            // Deliberately NO FORCED=YES, even for a source-forced track: AVKit force-displays a FORCED
-            // rendition whose language matches the selected audio regardless of DEFAULT/AUTOSELECT and the
-            // user's CC-off preference, which self-engages a rendition and contradicts the invariant above
-            // (the on-frame overlay owns fullscreen subtitles; the host selects a rendition only on PiP).
-            // A source-forced German track on German audio then rendered with subtitles off (Sodalite#38
-            // follow-on, DV-master path). Same-language forced/full pairs are disambiguated by NAME, not
-            // FORCED. `r.isForced` still rides the published track list so the host can label/pick it.
-            mediaAttrs.append("URI=\"subs_\(r.ordinal).m3u8\"")
+            // Declared as the HLS Authoring Specification asks, so AVFoundation's own selection works from
+            // the viewer's settings: a forced rendition FORCED=YES with AUTOSELECT=YES (5.11), which tvOS
+            // shows by itself when the viewer has no subtitles on and the audio's language matches; SDH with
+            // the accessibility characteristics and AUTOSELECT=YES (4.5, 4.6), which "Closed Captions + SDH"
+            // selects. DEFAULT stays NO: the engine follows the selection AVFoundation makes, and a track
+            // the overlay draws is kept from AVKit by suppressing its rendering, not by withholding it.
+            if r.isForced {
+                mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=YES", "FORCED=YES"])
+            } else if r.isSDH {
+                mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=YES",
+                    "CHARACTERISTICS=\"public.accessibility.transcribes-spoken-dialog,"
+                    + "public.accessibility.describes-music-and-sound\""])
+            } else {
+                mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=NO"])
+            }
+            mediaAttrs.append("URI=\"subs_\(ordinal).m3u8\"")
             lines.append("#EXT-X-MEDIA:\(mediaAttrs.joined(separator: ","))")
         }
         if !subRenditions.isEmpty {
@@ -1875,17 +1994,32 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         lines.append("#EXT-X-STREAM-INF:\(streamInfAttrs.joined(separator: ","))")
         lines.append("media.m3u8")
-        if provider.iFrameRenditionServed,
-           case .jpeg(let width, let height, let jpegBandwidth) = provider.iFrameRenditionFormat {
-            // AE#682: AVKit shows no scrub thumbnail from a PQ or Dolby Vision keyframe, so an HDR
-            // session lists SDR stills, the shape of Apple's own motion JPEG trick-play tier.
-            let iFrameAttrs = ["BANDWIDTH=\(jpegBandwidth)", "CODECS=\"mjpg\"", "RESOLUTION=\(width)x\(height)",
-                               "VIDEO-RANGE=SDR", "URI=\"iframe.m3u8\""]
-            lines.append("#EXT-X-I-FRAME-STREAM-INF:\(iFrameAttrs.joined(separator: ","))")
+        // A stills tier declares its own codec, size and range: its pictures are not the variant's. One that is not
+        // SDR is an overlay session's scan tier, which stands where the variant's keyframes would and declares what
+        // they would beside that: the variant's Dolby Vision brand and protection level.
+        func stillsLine(_ format: IFrameRenditionFormat?, uri: String, hdcp: String?) -> String? {
+            guard case .stills(let width, let height, let stillCodecs, let peak, let average, let range)? = format else { return nil }
+            var attrs = ["AVERAGE-BANDWIDTH=\(average)", "BANDWIDTH=\(peak)", "VIDEO-RANGE=\(range.rawValue)",
+                         "CODECS=\"\(stillCodecs)\"", "RESOLUTION=\(width)x\(height)"]
+            if range != .sdr, variant == .primary, let supplemental = provider.masterSupplementalCodecs {
+                attrs.append("SUPPLEMENTAL-CODECS=\"\(supplemental)\"")
+            }
+            // An SDR still needs no protection level; stated only when the variant states one.
+            if let hdcp { attrs.append("HDCP-LEVEL=\(range == .sdr ? "NONE" : hdcp)") }
+            attrs.append("URI=\"\(uri)\"")
+            return "#EXT-X-I-FRAME-STREAM-INF:\(attrs.joined(separator: ","))"
+        }
+        let hdcp = provider.masterHDCPLevel
+        if let line = stillsLine(provider.iFrameRenditionFormat, uri: "iframe.m3u8", hdcp: hdcp) {
+            lines.append(line)
         } else if provider.iFrameRenditionServed {
             // AE#682: BANDWIDTH is the variant's, an honest ceiling (one keyframe cannot outweigh the
             // segment it opens). A value below the real peak logs -12318 on every fetch.
-            var iFrameAttrs = ["BANDWIDTH=\(bandwidth)", "CODECS=\"\(videoCodecs(of: codecs))\""]
+            var iFrameAttrs: [String] = []
+            if let average = keyframeAverageBandwidth(provider: provider, ceiling: bandwidth) {
+                iFrameAttrs.append("AVERAGE-BANDWIDTH=\(average)")
+            }
+            iFrameAttrs.append(contentsOf: ["BANDWIDTH=\(bandwidth)", "CODECS=\"\(videoCodecs(of: codecs))\""])
             if variant == .primary, let supplemental = provider.masterSupplementalCodecs {
                 iFrameAttrs.append("SUPPLEMENTAL-CODECS=\"\(supplemental)\"")
             }
@@ -1895,10 +2029,43 @@ final class HLSLocalServer: @unchecked Sendable {
             if let range = provider.masterVideoRange {
                 iFrameAttrs.append("VIDEO-RANGE=\(range.rawValue)")
             }
+            // Same HDCP-LEVEL as the variant whose keyframes these are.
+            if let hdcp { iFrameAttrs.append("HDCP-LEVEL=\(hdcp)") }
             iFrameAttrs.append("URI=\"iframe.m3u8\"")
             lines.append("#EXT-X-I-FRAME-STREAM-INF:\(iFrameAttrs.joined(separator: ","))")
         }
+        // An HDR session's SDR trick-play tier, Apple's own layout and a tvOS MUST of the HLS Authoring
+        // Specification (6.16): AVKit's scrub thumbnail player is capped at SDR and takes the lowest range
+        // on offer, while the main player scans on the tier above. Attribute order as the specification's
+        // examples give it.
+        if provider.iFrameRenditionServed,
+           let line = stillsLine(provider.iFrameCompanionFormat, uri: "iframe_sdr.m3u8", hdcp: hdcp) {
+            lines.append(line)
+        }
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// How much heavier a keyframe is than the variant's average frame. Measured on a 71 Mbit/s Dolby
+    /// Vision Profile 7 remux (850 KB keyframes against 370 KB frames, 2.3) and the HDR10 fixture (2.5).
+    static let keyframeToAverageFrameRatio = 2.5
+
+    /// AVERAGE-BANDWIDTH of the keyframe tier: one keyframe, estimated from the variant's average frame,
+    /// over the mean I-frame entry. The index holds no keyframe sizes and the master is read once, before the
+    /// first keyframe is, so this is an estimate; nil when the variant states no average or frame rate.
+    static func keyframeAverageBandwidth(provider: HLSSegmentProvider, ceiling: Int) -> Int? {
+        let durations = iFrameDurations(provider: provider)
+        guard let variantAverage = provider.masterAverageBandwidth, variantAverage > 0,
+              let frameRate = provider.masterFrameRate, frameRate > 0, !durations.isEmpty
+        else { return nil }
+        let meanSegment = max(durations.reduce(0, +) / Double(durations.count), 0.1)
+        let keyframeBits = Double(variantAverage) / frameRate * keyframeToAverageFrameRatio
+        return min(ceiling, Int((keyframeBits / meanSegment).rounded(.up)))
+    }
+
+    /// Each I-frame entry's duration: the rendition's own timeline, or one per media segment.
+    static func iFrameDurations(provider: HLSSegmentProvider) -> [Double] {
+        provider.iFrameTimeline?.map(\.durationSeconds)
+            ?? (0..<provider.segmentCount).map { provider.segmentDuration(at: $0) }
     }
 
     /// The video entry of a master CODECS list. An I-frame variant carries no audio, and a CODECS
@@ -1913,9 +2080,9 @@ final class HLSLocalServer: @unchecked Sendable {
 
     /// "/iframe{N}.mp4" -> N. nil for the init, for a negative or non-numeric index, and for any
     /// other path.
-    static func parseIFramePath(_ path: String) -> Int? {
-        guard path.hasPrefix("/iframe"), path.hasSuffix(".mp4") else { return nil }
-        let digits = path.dropFirst("/iframe".count).dropLast(".mp4".count)
+    static func parseIFramePath(_ path: String, resourceName: String = "iframe") -> Int? {
+        guard path.hasPrefix("/\(resourceName)"), path.hasSuffix(".mp4") else { return nil }
+        let digits = path.dropFirst(resourceName.count + 1).dropLast(".mp4".count)
         guard !digits.isEmpty, digits.allSatisfy(\.isNumber) else { return nil }
         return Int(digits)
     }
@@ -1924,10 +2091,10 @@ final class HLSLocalServer: @unchecked Sendable {
     /// EXTINF and TARGETDURATION as the VOD media playlist, so both renditions describe one timeline.
     /// VOD only; the caller never lists this rendition for a live or event session.
     static func buildIFramePlaylistText(provider: HLSSegmentProvider,
-                                        subResourceBaseURL: URL? = nil) -> String {
-        let count = provider.segmentCount
-        var maxDuration: Double = 0
-        for i in 0..<count { maxDuration = max(maxDuration, provider.segmentDuration(at: i)) }
+                                        subResourceBaseURL: URL? = nil,
+                                        resourceName: String = "iframe") -> String {
+        let durations = iFrameDurations(provider: provider)
+        let maxDuration = durations.max() ?? 0
         let targetDuration = LiveEdgePolicy.targetDurationSeconds(
             maxSegmentDuration: maxDuration, cutTargetSeconds: nil, cadenceFloorSeconds: nil)
         let prefix: String
@@ -1939,10 +2106,10 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         var lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-I-FRAMES-ONLY",
                      "#EXT-X-TARGETDURATION:\(targetDuration)", "#EXT-X-MEDIA-SEQUENCE:0",
-                     "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-MAP:URI=\"\(prefix)iframe_init.mp4\""]
-        for i in 0..<count {
-            lines.append("#EXTINF:\(String(format: "%.3f", provider.segmentDuration(at: i))),")
-            lines.append("\(prefix)iframe\(i).mp4")
+                     "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-MAP:URI=\"\(prefix)\(resourceName)_init.mp4\""]
+        for (i, duration) in durations.enumerated() {
+            lines.append("#EXTINF:\(String(format: "%.3f", duration)),")
+            lines.append("\(prefix)\(resourceName)\(i).mp4")
         }
         lines.append("#EXT-X-ENDLIST")
         return lines.joined(separator: "\n") + "\n"
@@ -2057,8 +2224,11 @@ final class HLSLocalServer: @unchecked Sendable {
         return (ord, nil)
     }
 
+    /// A rendition's media playlist. The audio rendition's lists the video's indices, durations and
+    /// discontinuities from the same snapshot, so the two play as one timeline, with its own init.
     static func buildMediaPlaylistText(provider: HLSSegmentProvider,
-                                        subResourceBaseURL: URL? = nil, generation: Int? = nil) -> String {
+                                        subResourceBaseURL: URL? = nil, generation: Int? = nil,
+                                        rendition: MediaRendition = .video) -> String {
         // Atomic snapshot from notePlaylistBuild(); a separate lock acquisition for visibleCount vs firstVisible let a concurrent window slide produce a trapping range.
         let snapshot = provider.notePlaylistBuild()
         let requestedGeneration = generation ?? provider.livePlaylistGeneration
@@ -2102,6 +2272,10 @@ final class HLSLocalServer: @unchecked Sendable {
         var lines: [String] = []
         lines.append("#EXTM3U")
         lines.append("#EXT-X-VERSION:7")
+        // Every segment this server cuts opens on an IDR (authoring 7.4), and an item can load this
+        // playlist without the master that already says so, so it says so too (authoring 9.12): a seek
+        // then knows its target's own segment is enough, rather than fetching the one before it.
+        lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
         if typeIsLive {
             var serverControl: [String] = []
             // CAN-BLOCK-RELOAD: AVPlayer sends ?_HLS_msn=N and the server holds the response until that segment is cut (see waitForLiveSegment), so AVPlayer gets each segment the instant it exists instead of a poll-interval late. Segment-level only (no EXT-X-PART). Gated on liveBlockingReloadEnabled: bursty sources can't honor the contract (-15410 and periodic stalls on device repro 2026-06-11); they fall back to plain reloads with a raised TARGETDURATION.
@@ -2176,26 +2350,30 @@ final class HLSLocalServer: @unchecked Sendable {
             lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
         }
         // Absolute custom-scheme URIs route sub-resources through AVAssetResourceLoader; relative URIs go through CFNetwork (aetherctl workflow).
-        let initURI: (Int) -> String
-        let segURI: (Int) -> String
+        let prefix: String
         if let base = subResourceBaseURL {
             let baseStr = base.absoluteString
-            let baseWithSlash = baseStr.hasSuffix("/") ? baseStr : baseStr + "/"
-            initURI = { v in v == 0 ? "\(baseWithSlash)init.mp4" : "\(baseWithSlash)init\(v).mp4" }
-            segURI = { idx in "\(baseWithSlash)seg\(idx).mp4" }
+            prefix = baseStr.hasSuffix("/") ? baseStr : baseStr + "/"
         } else {
-            initURI = { v in v == 0 ? "init.mp4" : "init\(v).mp4" }
-            segURI = { idx in "seg\(idx).mp4" }
+            prefix = ""
         }
+        // The audio rendition keeps one init across a program switch: only the video's is versioned, and the joined
+        // view's follows it.
+        let initName = rendition == .muxed ? "muxed-init" : "init"
+        let initURI: (Int) -> String = rendition == .audio
+            ? { _ in "\(prefix)audio-init.mp4" }
+            : { v in v == 0 ? "\(prefix)\(initName).mp4" : "\(prefix)\(initName)\(v).mp4" }
+        let segURI: (Int) -> String = { idx in "\(prefix)\(rendition.name)\(idx).mp4" }
+        let initVersion: (Int) -> Int = { rendition == .audio ? 0 : provider.initVersionID(forSegment: $0) }
         // Initial EXT-X-MAP emitted before the loop so a discontinuity on seg0 is still directly before its #EXTINF (RFC/Apple: session map precedes first segment's tags).
-        var lastInitVersion = provider.initVersionID(forSegment: firstVisible)
+        var lastInitVersion = initVersion(firstVisible)
         lines.append("#EXT-X-MAP:URI=\"\(initURI(lastInitVersion))\"")
         for i in firstVisible..<count {
             if provider.segmentIsDiscontinuous(at: i) {
                 lines.append("#EXT-X-DISCONTINUITY")
             }
             // SSAI mid-stream init change: emit new EXT-X-MAP after discontinuity, before #EXTINF (verified order AVPlayer accepts for mid-stream init + resolution change).
-            let v = provider.initVersionID(forSegment: i)
+            let v = initVersion(i)
             if v != lastInitVersion {
                 lines.append("#EXT-X-MAP:URI=\"\(initURI(v))\"")
                 lastInitVersion = v

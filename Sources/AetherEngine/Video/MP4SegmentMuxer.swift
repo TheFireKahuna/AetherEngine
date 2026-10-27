@@ -26,10 +26,19 @@ import AetherLibavutil
 /// moof+mdat across calls; subsequent cuts are single-call. FragmentSplitter routes ftyp+moov
 /// to onInitCaptured (init.mp4) and moof+mdat bytes to the staging POSIX file.
 /// The APAC track the splitter adds the pre-roll group to, set from the init (splitter-thread only).
+final class PreRollTrack: @unchecked Sendable {
+    var trackID: UInt32?
+}
 
 /// What the splitter stamps a segment's first `moof` with (`InBandClock`): which segment the muxer is
 /// writing, the earliest picture written to it so far, on the muxer's video time base. Written by the
 /// muxer as packets go in, read by the splitter as the fragment goes out, both on the pump thread.
+final class SegmentClockState: @unchecked Sendable {
+    var segmentIndex: Int
+    var pictureFirstPts: Int64 = Int64.min
+    var timeBase = AVRational(num: 0, den: 1)
+    init(segmentIndex: Int) { self.segmentIndex = segmentIndex }
+}
 
 final class MP4SegmentMuxer {
 
@@ -150,6 +159,9 @@ final class MP4SegmentMuxer {
     /// once an audio packet has been muxed. Collapsing it into nil (= failure) is what wedged AE#222.
     enum CutOutcome: Equatable {
         case completed(path: URL, bytesWritten: Int)
+        /// The segment held no sample: an audio rendition's index with no audio in it. The next segment's
+        /// file is open, as after a completed cut.
+        case empty
         case deferredAwaitingAudioSampleEntry
         case failed
     }
@@ -289,19 +301,28 @@ final class MP4SegmentMuxer {
     /// would otherwise buffer the whole span in libavformat's interleaver until the cut, growing RAM
     /// without bound (a 110 min Blu-ray reached ~13 GB and swapped the device disk full). Track the video
     /// output DTS window since the last flush and force an interim flush (the same drain pair as the cut,
-    /// minus the fd rotation) once it spans more than `maxBufferedFragmentTicks`. Output-TB ticks (the
-    /// muxer rewrites its own video time_base at write_header), 0 = bound disabled. Computed from the
-    /// latched `muxerVideoTimeBase` after write_header; defaults to 0 so cleanup() on an init error path
-    /// (which runs before the latch) sees a fully-initialized stored property.
+    /// minus the fd rotation) once it spans more than `maxBufferedFragmentTicks`. The window is kept on
+    /// the track that leads the file (`windowStreamIndex`: video, or audio in an audio rendition's
+    /// muxer). Output-TB ticks (the muxer rewrites its own time_base at write_header), 0 = bound
+    /// disabled. Computed after write_header; defaults to 0 so cleanup() on an init error path (which
+    /// runs before the latch) sees a fully-initialized stored property.
     private var maxBufferedFragmentTicks: Int64 = 0
-    /// Output-TB DTS of the first video packet since the last flush; Int64.min = no window open yet.
-    private var fragmentWindowFirstVideoDts: Int64 = Int64.min
+    /// Output-TB DTS of the window track's first packet since the last flush; Int64.min = none open.
+    private var fragmentWindowFirstDts: Int64 = Int64.min
 
     /// AE#684: the sound handed to the segment being cut, first and last packet, in
     /// `muxerAudioTimeBase`, and the earliest picture, in `muxerVideoTimeBase`, as written. A segment
     /// opens on a video keyframe and carries whatever audio the source interleaved up to there, so
     /// where its sound begins against its picture is a property of the source's mux, and it is what
     /// an item placed in that segment starts its audio from.
+    struct SegmentOpening {
+        let pictureFirstPts: Int64?
+        let sound: (first: Int64, last: Int64)?
+    }
+    private var segmentPictureFirstPts: Int64 {
+        get { clockState.pictureFirstPts }
+        set { clockState.pictureFirstPts = newValue }
+    }
     private var segmentSoundFirstPts: Int64 = Int64.min
     private var segmentSoundLastPts: Int64 = Int64.min
 
@@ -323,43 +344,55 @@ final class MP4SegmentMuxer {
     private(set) var writtenVideoEndPts: Int64 = Int64.min
     private(set) var writtenAudioEndPts: Int64 = Int64.min
     /// AE#847: the earliest video pts of the segment being written, Int64.min before its first.
-    private(set) var segmentVideoStartPts: Int64 = Int64.min
+    var segmentVideoStartPts: Int64 { segmentPictureFirstPts }
 
-    let videoOutputStreamIndex: Int32 = 0
-    let audioOutputStreamIndex: Int32 = 1
+    /// The file's streams: video first when there is one. An audio rendition's muxer has its audio at
+    /// 0 and no video (-1); a video rendition's has no audio (-1).
+    let videoOutputStreamIndex: Int32
+    let audioOutputStreamIndex: Int32
+    /// The stream the #64 interim-flush window is kept on.
+    private var windowStreamIndex: Int32 { videoOutputStreamIndex >= 0 ? videoOutputStreamIndex : audioOutputStreamIndex }
 
     private let splitter: FragmentSplitter
 
     // MARK: - Init
 
-    /// Build the session-long muxer, opening its first segment file.
+    /// Build the session-long muxer, opening its first segment file. `video` and `audio` are the tracks
+    /// the file carries: both muxed, or one of them for a rendition of its own (`HLSOutputShape`).
     /// `onInitCaptured` fires once when ftyp+moov bytes finish streaming (= init.mp4 content).
     /// Throws on any libavformat init failure or staging-file open failure.
     init(
         initialSegmentIndex: Int,
         sessionDir: URL,
-        video: VideoConfig,
+        video: VideoConfig?,
         audio: AudioConfig?,
         maxBufferedFragmentSeconds: Double = 8.0,
         audioMoovPrimeFrame: [UInt8]? = nil,
         audioDelaySeconds: Double = 0,
         onStorageExhausted: (@Sendable () -> Void)? = nil,
+        onBytesStaged: (@Sendable () -> Void)? = nil,
+        inMemory: Bool = false,
+        segmentClock: ((_ segmentIndex: Int, _ pictureFirstPts: Int64, _ timeBase: AVRational) -> InBandClock.Stamp?)? = nil,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         let clockState = SegmentClockState(segmentIndex: initialSegmentIndex)
         self.clockState = clockState
         self.currentSegmentIndex = initialSegmentIndex
         self.sessionDir = sessionDir
+        precondition(video != nil || audio != nil, "a muxer carries at least one track")
         self.haveAudio = audio != nil
+        self.videoOutputStreamIndex = video != nil ? 0 : -1
+        self.audioOutputStreamIndex = audio == nil ? -1 : (video != nil ? 1 : 0)
+        self.renditionTag = video == nil ? "audio" : "seg"
         self.audioDelaySeconds = audioDelaySeconds
         self.audioNeedsParsedPacketForMoov =
             audio.map { Self.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
-        self.videoNALFraming = video.nalFramingLatch ?? NALFramingLatch()
-        self.convertsAnnexBVideoSamples = video.convertsAnnexBSamples
+        self.videoNALFraming = video?.nalFramingLatch ?? NALFramingLatch()
+        self.convertsAnnexBVideoSamples = video?.convertsAnnexBSamples ?? false
         // AE#561: the override, when there is one, is the record that reaches the sample entry. Both
         // carry the same width (the #19 rebuild keeps the source header's first 22 bytes), so this
         // only matters for a source whose own extradata is missing or Annex B.
-        if let override = video.extradataOverride {
+        if let video, let override = video.extradataOverride {
             self.videoNALLengthPrefixSize = override.withUnsafeBufferPointer {
                 NALUnitChain.lengthPrefixSize(
                     codecID: video.codecpar.pointee.codec_id,
@@ -367,15 +400,17 @@ final class MP4SegmentMuxer {
                     extradataSize: $0.count
                 )
             }
-        } else {
+        } else if let video {
             self.videoNALLengthPrefixSize = NALUnitChain.lengthPrefixSize(
                 codecID: video.codecpar.pointee.codec_id,
                 extradata: UnsafePointer(video.codecpar.pointee.extradata),
                 extradataSize: Int(video.codecpar.pointee.extradata_size)
             )
+        } else {
+            self.videoNALLengthPrefixSize = nil
         }
 
-        let firstPath = Self.stagingPath(forSegmentIndex: initialSegmentIndex,
+        let firstPath = Self.stagingPath(forSegmentIndex: initialSegmentIndex, tag: renditionTag,
                                          in: sessionDir)
         self.currentStagingPath = firstPath
         let firstFd: Int32
@@ -511,9 +546,12 @@ final class MP4SegmentMuxer {
         }
         self.headerWritten = true
 
-        muxerVideoTimeBase = ctx.pointee.streams.advanced(by: 0).pointee!.pointee.time_base
+        if videoOutputStreamIndex >= 0 {
+            muxerVideoTimeBase = ctx.pointee.streams.advanced(by: Int(videoOutputStreamIndex)).pointee!.pointee.time_base
+            clockState.timeBase = muxerVideoTimeBase
+        }
         if haveAudio {
-            muxerAudioTimeBase = ctx.pointee.streams.advanced(by: 1).pointee!.pointee.time_base
+            muxerAudioTimeBase = ctx.pointee.streams.advanced(by: Int(audioOutputStreamIndex)).pointee!.pointee.time_base
             // AE#464: same reason as the bound below. Latched after write_header rewrote the stream
             // time_base, because that is the base the packets arrive in.
             audioDelayTicks = Self.audioDelayTicks(seconds: audioDelaySeconds,
@@ -541,12 +579,12 @@ final class MP4SegmentMuxer {
                 )
             }
         }
-        // Bound is in the muxer's rewritten output video TB: packets reach writePacket already rescaled
-        // to muxerVideoTimeBase, so the window math must use it (not the source TB). Latched here, after
-        // write_header has rewritten the stream time_base (#64).
+        // Bound is in the window track's rewritten output TB: packets reach writePacket already rescaled
+        // to it, so the window math must use it (not the source TB). Latched here, after write_header has
+        // rewritten the stream time_base (#64).
         maxBufferedFragmentTicks = Self.bufferedFragmentTicks(
             seconds: maxBufferedFragmentSeconds,
-            timeBase: muxerVideoTimeBase
+            timeBase: videoOutputStreamIndex >= 0 ? muxerVideoTimeBase : muxerAudioTimeBase
         )
 
         // AE#222: prime moov from one real audio frame when the audio sample entry is packet-derived. Without
@@ -661,7 +699,7 @@ final class MP4SegmentMuxer {
     /// Single source of truth: drift between the two would let the probe pass while the real muxer fails.
     private static func configureStreamsAndWriteHeader(
         ctx: UnsafeMutablePointer<AVFormatContext>,
-        video: VideoConfig,
+        video: VideoConfig?,
         audio: AudioConfig?
     ) throws {
         // strict=-2 lets the mp4 muxer write Dolby Vision atoms (dvcC,
@@ -670,55 +708,57 @@ final class MP4SegmentMuxer {
         // setting; mp4 muxer respects the same compliance level.
         ctx.pointee.strict_std_compliance = -2
 
-        // Video stream.
-        guard let videoStream = avformat_new_stream(ctx, nil) else {
-            throw MuxerError.streamCreationFailed
-        }
-        let vCopy = avcodec_parameters_copy(videoStream.pointee.codecpar, video.codecpar)
-        guard vCopy >= 0 else {
-            throw MuxerError.copyParametersFailed(code: vCopy)
-        }
-        videoStream.pointee.time_base = video.timeBase
-        if let override = video.codecTagOverride,
-           let tag = Self.mkTag(fromFourCC: override) {
-            videoStream.pointee.codecpar.pointee.codec_tag = tag
-        }
-        switch video.doviConfig {
-        case .keep:
-            break
-        case .strip:
-            Self.stripDolbyVisionSideData(videoStream.pointee.codecpar)
-        case .rewriteToProfile81:
-            Self.rewriteDoviConfig(videoStream.pointee.codecpar, profile: 8, blCompatibilityID: 1)
-        case .rewriteToProfile5:
-            Self.rewriteDoviConfig(videoStream.pointee.codecpar, profile: 5, blCompatibilityID: 0)
-        }
-        if let co = video.colorOverride {
-            videoStream.pointee.codecpar.pointee.color_primaries = co.primaries
-            videoStream.pointee.codecpar.pointee.color_trc = co.trc
-            videoStream.pointee.codecpar.pointee.color_space = co.space
-            videoStream.pointee.codecpar.pointee.color_range = co.range
-        }
-        if let extradata = video.extradataOverride {
-            Self.replaceExtradata(videoStream.pointee.codecpar, with: extradata)
-        }
-        if video.stereo == .multiview {
-            // movenc writes `lhvC` (the second layer's parameter sets, which the extradata carries after
-            // the base layer's) only for a stream with this disposition, and a new stream has none. The
-            // source's stereo side data stays: from an MP4 it is the `vexu` the film came with.
-            videoStream.pointee.disposition |= AV_DISPOSITION_MULTILAYER
-        } else if videoStream.pointee.codecpar.pointee.nb_coded_side_data > 0,
-                  videoStream.pointee.codecpar.pointee.coded_side_data != nil {
-            // Anything else leaves the source's stereo claim out. movenc turns a Matroska StereoMode into
-            // `st3d` plus a `vexu` with both eye views and no packing, which AVFoundation reads as a
-            // stereo track it cannot split (measured: HasLeft/RightStereoEyeView, no ViewPackingKind);
-            // a packed frame gets Apple's full vexu after write_header instead (`installingViewPacking`),
-            // and a 2D session is plainly 2D.
-            av_packet_side_data_remove(
-                videoStream.pointee.codecpar.pointee.coded_side_data,
-                &videoStream.pointee.codecpar.pointee.nb_coded_side_data,
-                AV_PKT_DATA_STEREO3D
-            )
+        // Video stream, first when there is one.
+        if let video {
+            guard let videoStream = avformat_new_stream(ctx, nil) else {
+                throw MuxerError.streamCreationFailed
+            }
+            let vCopy = avcodec_parameters_copy(videoStream.pointee.codecpar, video.codecpar)
+            guard vCopy >= 0 else {
+                throw MuxerError.copyParametersFailed(code: vCopy)
+            }
+            videoStream.pointee.time_base = video.timeBase
+            if let override = video.codecTagOverride,
+               let tag = Self.mkTag(fromFourCC: override) {
+                videoStream.pointee.codecpar.pointee.codec_tag = tag
+            }
+            switch video.doviConfig {
+            case .keep:
+                break
+            case .strip:
+                Self.stripDolbyVisionSideData(videoStream.pointee.codecpar)
+            case .rewriteToProfile81:
+                Self.rewriteDoviConfig(videoStream.pointee.codecpar, profile: 8, blCompatibilityID: 1)
+            case .rewriteToProfile5:
+                Self.rewriteDoviConfig(videoStream.pointee.codecpar, profile: 5, blCompatibilityID: 0)
+            }
+            if let co = video.colorOverride {
+                videoStream.pointee.codecpar.pointee.color_primaries = co.primaries
+                videoStream.pointee.codecpar.pointee.color_trc = co.trc
+                videoStream.pointee.codecpar.pointee.color_space = co.space
+                videoStream.pointee.codecpar.pointee.color_range = co.range
+            }
+            if let extradata = video.extradataOverride {
+                Self.replaceExtradata(videoStream.pointee.codecpar, with: extradata)
+            }
+            if video.stereo == .multiview {
+                // movenc writes `lhvC` (the second layer's parameter sets, which the extradata carries after
+                // the base layer's) only for a stream with this disposition, and a new stream has none. The
+                // source's stereo side data stays: from an MP4 it is the `vexu` the film came with.
+                videoStream.pointee.disposition |= AV_DISPOSITION_MULTILAYER
+            } else if videoStream.pointee.codecpar.pointee.nb_coded_side_data > 0,
+                      videoStream.pointee.codecpar.pointee.coded_side_data != nil {
+                // Anything else leaves the source's stereo claim out. movenc turns a Matroska StereoMode into
+                // `st3d` plus a `vexu` with both eye views and no packing, which AVFoundation reads as a
+                // stereo track it cannot split (measured: HasLeft/RightStereoEyeView, no ViewPackingKind);
+                // a packed frame gets Apple's full vexu after write_header instead (`installingViewPacking`),
+                // and a 2D session is plainly 2D.
+                av_packet_side_data_remove(
+                    videoStream.pointee.codecpar.pointee.coded_side_data,
+                    &videoStream.pointee.codecpar.pointee.nb_coded_side_data,
+                    AV_PKT_DATA_STEREO3D
+                )
+            }
         }
         if let audio = audio {
             guard let audioStream = avformat_new_stream(ctx, nil) else {
@@ -729,9 +769,9 @@ final class MP4SegmentMuxer {
                 throw MuxerError.copyParametersFailed(code: aCopy)
             }
             audioStream.pointee.time_base = audio.timeBase
-            // AE#458: movenc reads this in mov_init, so it has to be set before write_header. With one
-            // muxed audio track and no EXT-X-MEDIA rendition, mdhd is the only place AVFoundation can
-            // read a track language from.
+            // AE#458: movenc reads this in mov_init, so it has to be set before write_header. The master's
+            // EXT-X-MEDIA tag is where AVFoundation reads the language; mdhd states it in the file too,
+            // which is all a media-direct (muxed) session has.
             if let language = audio.language {
                 av_dict_set(&audioStream.pointee.metadata, "language", language, 0)
             }
@@ -842,19 +882,19 @@ final class MP4SegmentMuxer {
         // #64 mid-segment flush bound: cap libavformat's interleaver RAM on a very long segment
         // (degenerate sparse-keyframe plan, or an audio stream that decodes to nothing) by emitting a
         // moof+mdat into the current staging file before the buffered span grows without bound. Tracked
-        // on the video output stream only; audio/subtitle packets ride along and are force-drained by the
-        // flush. Flush BEFORE writing the triggering packet so it opens a fresh window.
-        if streamIndex == videoOutputStreamIndex, packet.pointee.dts != Int64.min {
+        // on the window track only (video, or audio in an audio rendition's muxer); the other packets ride
+        // along and are force-drained by the flush. Flush BEFORE writing the triggering packet so it opens a fresh window.
+        if streamIndex == windowStreamIndex, packet.pointee.dts != Int64.min {
             let dts = packet.pointee.dts
-            if fragmentWindowFirstVideoDts == Int64.min {
-                fragmentWindowFirstVideoDts = dts
+            if fragmentWindowFirstDts == Int64.min {
+                fragmentWindowFirstDts = dts
             } else if Self.bufferedTicksExceedsBound(
-                firstDts: fragmentWindowFirstVideoDts,
+                firstDts: fragmentWindowFirstDts,
                 currentDts: dts,
                 boundTicks: maxBufferedFragmentTicks
             ) {
                 flushPendingFragment()
-                fragmentWindowFirstVideoDts = dts
+                fragmentWindowFirstDts = dts
             }
         }
 
@@ -945,6 +985,17 @@ final class MP4SegmentMuxer {
     /// Bytes staged for the segment currently being written. Zero right after a moov prime, whose fragment
     /// bytes are deliberately discarded.
     var stagedSegmentByteCount: Int { byteCounter.bytesWrittenCurrentSegment }
+
+    /// Places each track's next fragment at its first packet's own timestamp rather than where that track's
+    /// written samples end (`+frag_discont`, consumed by the next packet written). Without it a track that
+    /// resumes after a gap has its fragment's tfdt stitched onto its last sample, and the player sounds the
+    /// resumed samples where the gap began (AE#847). The output carries absolute dts, so a track without a gap
+    /// gets the tfdt it would have had anyway.
+    @discardableResult
+    func placeNextFragmentAtItsTimestamp() -> Bool {
+        guard let priv = formatContext?.pointee.priv_data else { return false }
+        return av_opt_set(priv, "movflags", "+frag_discont", 0) >= 0
+    }
 
     /// AE#222: mux one real audio frame and flush, so ftyp+moov (with a packet-derived dec3/dac3/dmlp)
     /// is emitted here rather than at the first cut, then drop the primed fragment's bytes from the staging
@@ -1063,8 +1114,7 @@ final class MP4SegmentMuxer {
             _ = av_write_frame(ctx, nil)
         }
         // New segment starts a fresh buffered-fragment window (#64).
-        fragmentWindowFirstVideoDts = Int64.min
-        segmentVideoStartPts = Int64.min
+        fragmentWindowFirstDts = Int64.min
 
         // 2. Snapshot the completed segment + reset counters.
         let completedPath = currentStagingPath
@@ -1075,14 +1125,16 @@ final class MP4SegmentMuxer {
         byteCounter.fd = -1
         byteCounter.bytesWrittenCurrentSegment = 0
 
-        if completedFailed || completedBytes == 0 {
+        if completedFailed {
             try? FileManager.default.removeItem(at: completedPath)
             return .failed
         }
+        let empty = completedBytes == 0
+        if empty { try? FileManager.default.removeItem(at: completedPath) }
 
         byteCounter.fragmentCuts += 1
 
-        let nextPath = Self.stagingPath(forSegmentIndex: nextIdx, in: sessionDir)
+        let nextPath = Self.stagingPath(forSegmentIndex: nextIdx, tag: renditionTag, in: sessionDir)
         do {
             let nextFd = try Self.openPosix(path: nextPath)
             self.fd = nextFd
@@ -1097,12 +1149,49 @@ final class MP4SegmentMuxer {
                 category: .session
             )
             isWedged = true
-            return .completed(path: completedPath, bytesWritten: completedBytes)
+            return empty ? .empty : .completed(path: completedPath, bytesWritten: completedBytes)
         }
 
-        return .completed(path: completedPath, bytesWritten: completedBytes)
+        return empty ? .empty : .completed(path: completedPath, bytesWritten: completedBytes)
+    }
+
+    /// A fragment of `trackID` with no sample, its decode time `baseMediaDecodeTime`: what an audio
+    /// rendition serves for an index whose time holds no audio (`HLSOutputShape.demuxed`), so its playlist
+    /// still covers every index, as the video's does, and the next segment's decode time follows on. A
+    /// track fragment may carry no run.
+    static func emptyFragment(trackID: UInt32, sequence: UInt32, baseMediaDecodeTime: UInt64) -> Data {
+        func box(_ type: String, _ body: [UInt8]) -> [UInt8] {
+            let size = UInt32(8 + body.count)
+            return withUnsafeBytes(of: size.bigEndian, Array.init) + Array(type.utf8) + body
+        }
+        func be32(_ v: UInt32) -> [UInt8] { withUnsafeBytes(of: v.bigEndian, Array.init) }
+        func be64(_ v: UInt64) -> [UInt8] { withUnsafeBytes(of: v.bigEndian, Array.init) }
+        let mfhd = box("mfhd", be32(0) + be32(sequence))
+        // default-base-is-moof, as every fragment movenc writes here.
+        let tfhd = box("tfhd", be32(0x02_0000) + be32(trackID))
+        let tfdt = box("tfdt", be32(0x0100_0000) + be64(baseMediaDecodeTime))
+        let moof = box("moof", mfhd + box("traf", tfhd + tfdt))
+        return Data(moof + box("mdat", []))
+    }
+
     /// In-memory muxers only: flushes the fragment written since the last call, the same flush as
     /// `cutFragmentForNextSegment`, and hands its bytes over. nil when nothing was written.
+    func takeFragmentInMemory() -> Data? {
+        guard let ctx = formatContext, headerWritten, let memory = byteCounter.memory else { return nil }
+        if audioNeedsParsedPacketForMoov, !audioPacketWritten, !moovFlushed { return nil }
+        _ = av_interleaved_write_frame(ctx, nil)
+        _ = av_write_frame(ctx, nil)
+        if !moovFlushed {
+            moovFlushed = true
+            _ = av_write_frame(ctx, nil)
+        }
+        fragmentWindowFirstDts = Int64.min
+        let bytes = Data(referencing: memory)
+        byteCounter.memory = NSMutableData()
+        byteCounter.bytesWrittenCurrentSegment = 0
+        guard !bytes.isEmpty else { return nil }
+        byteCounter.fragmentCuts += 1
+        return bytes
     }
 
     /// Final teardown: flush remaining packets, write trailer (mfra discarded by splitter), close fd.
@@ -1146,11 +1235,15 @@ final class MP4SegmentMuxer {
 
     // MARK: - Path helpers
 
-    private static func stagingPath(forSegmentIndex idx: Int, in sessionDir: URL) -> URL {
+    private static func stagingPath(forSegmentIndex idx: Int, tag: String, in sessionDir: URL) -> URL {
         sessionDir.appendingPathComponent(
-            "staging-seg-\(idx)-\(UUID().uuidString.prefix(8)).tmp"
+            "staging-\(tag)-\(idx)-\(UUID().uuidString.prefix(8)).tmp"
         )
     }
+
+    /// Names this muxer's staging files: `seg` for the video (or muxed) file, `audio` for an audio
+    /// rendition's.
+    private let renditionTag: String
 
     private static func openPosix(path: URL) throws -> Int32 {
         let cPath = path.withUnsafeFileSystemRepresentation { ptr -> [CChar] in
