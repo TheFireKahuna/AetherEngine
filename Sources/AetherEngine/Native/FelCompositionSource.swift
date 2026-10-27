@@ -58,7 +58,7 @@ final class FelCompositionSource: OverlayFrameSource, @unchecked Sendable {
     /// The base layer is half the picture, whatever the rate.
     func pacing(atRate rate: Double) -> OverlayPacing { .outputFrames }
 
-    func frameTime(after itemSeconds: Double) -> Double? { tap.frameTime(after: itemSeconds) }
+    func frameInterval(after itemSeconds: Double) -> CMTimeRange? { tap.frameInterval(after: itemSeconds) }
 
     func pictures(after last: CMTime?, at itemSeconds: Double) -> [(picture: CVPixelBuffer, time: CMTime)] { [] }
 

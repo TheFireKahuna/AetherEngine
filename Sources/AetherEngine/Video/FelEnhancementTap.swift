@@ -39,18 +39,20 @@ final class FelEnhancementTap: @unchecked Sendable {
 
     func close() { units.close() }
 
-    /// Rewrites `packet` to its Profile 8.1 base layer and keeps the enhancement layer and parameters. `packet`
-    /// carries output (item-axis) timestamps, in decode order; `opensRun` for a producer's first.
+    /// Rewrites `packet` to its Profile 8.1 base layer and keeps the enhancement layer and parameters, named by
+    /// `served`, the time AVPlayer is served the packet at (nil for one with no presentation time, which is rewritten
+    /// and not kept). Packets come in decode order; `opensRun` for a producer's first.
     ///
     /// The TV applies the RPU in AVPlayer's stream to the overlay's picture, which is composed, so the packet's
     /// RPU is the composed form for every `el_type` (a residual-off or MEL-like RPU in mode 2 form would keep
     /// its curves and reshape the composed picture again). A packet whose own RPU is missing or failed to
     /// convert carries the last composed one, the RPU of the parameters it borrows. With
     /// `AetherEngine.felComposedRpuOverride` set, every packet cut from then on carries the override instead.
-    func rewrite(_ packet: UnsafeMutablePointer<AVPacket>, opensRun: Bool, framing: VideoNALFraming,
-                 timeBase: AVRational, chromaLocation: UInt32) -> Bool {
-        let pts = packet.pointee.pts
-        let dts = packet.pointee.dts == Int64.min ? pts : packet.pointee.dts
+    func rewrite(_ packet: UnsafeMutablePointer<AVPacket>, opensRun: Bool, served: ServedVideoTime?,
+                 framing: VideoNALFraming, chromaLocation: UInt32) -> Bool {
+        let pts = served?.pts ?? Int64.min
+        let dts = served.map { $0.dts == Int64.min ? $0.pts : $0.dts } ?? Int64.min
+        let timeBase = served?.timeBase ?? AVRational(num: 1, den: 1)
         let isKey = packet.pointee.flags & AV_PKT_FLAG_KEY != 0
         // A new run is read for picture order afresh.
         if opensRun {
@@ -100,9 +102,9 @@ final class FelEnhancementTap: @unchecked Sendable {
         units.unit(at: seconds).map { Frame(enhancement: $0.picture, params: $0.info) }
     }
 
-    /// The time of the frame AVPlayer is served after `seconds` (item time), in whole milliseconds; nil while the
-    /// producer has not cut it.
-    func frameTime(after seconds: Double) -> Double? { units.unitTime(after: seconds) }
+    /// The served interval of the frame after the one AVPlayer shows at `seconds` (item time), exact; nil while the
+    /// producer has not cut it (``OverlayPacketTap/frameInterval(after:)``).
+    func frameInterval(after seconds: Double) -> CMTimeRange? { units.frameInterval(after: seconds) }
 
     /// Where AVPlayer's clock is (item time): what the decoder works toward and what is kept around it. Its staging
     /// while an item gets ready is not followed.

@@ -130,3 +130,23 @@ Proof: unit tests of the hold and the tap; the overlay A/V sync test resumed par
 (nothing before the resume point presented, started within 3 s, the click on the white picture); the Civil War FEL
 run from Jellyfin with a resume and mid-group seeks, every seek held for its own picture with no frame not ready or
 composed without its residual. On the TV: a FEL resume and transport-bar scrubs, with the same counters.
+
+## Overlay sessions: one time for a frame
+
+The overlay names every frame by the time AVPlayer is served it at, exactly: the producer computes it once
+(`HLSSegmentProducer.servedVideoTime`, the frame grid's slot where AE#886 puts video on one, the frame's own time
+otherwise, in the session's one served time base) and hands it to the taps. The unit, the decoder's picture of it
+(the decoders run in that time base) and AVPlayer's frame share it. Before, the taps named frames by the source's
+whole milliseconds and the renderer asked for each at that time plus 0.5 ms, which held only while video was served
+at those milliseconds; on the frame grid the request landed before the frame, the pull stopped at AVPlayer's output
+edge, the look-ahead fell from about 370 ms to the clock, and FEL frames were composed with the residual off.
+
+- AVPlayer's item time for a frame is its served time plus the run's axis, which an honest plan keeps within
+  EXTINF's rounding of zero.
+- The renderer asks the output for a frame at the middle of the interval it is served for
+  (`OverlayFrameSource.frameInterval(after:)`): `pixelBufferAndDisplayTime(forItemTime:)` hands over the frame on
+  display at that time, which is that frame for any axis under half a frame.
+- AVPlayer's frame is paired with the unit nearest the time AVPlayer reports for it, which is its own while the axis
+  is under half a frame (`OverlayPacketTap.unit(at:)`).
+- Not covered: a run whose axis is half a frame or more (a Matroska cue naming an ordinary frame, AE#408). The
+  in-band clock measures it; the overlay does not apply it yet.

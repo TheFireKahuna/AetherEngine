@@ -113,6 +113,42 @@ struct OverlayPacketTapTests {
         #expect(try #require(decoder()).fed.filter(\.restart).last?.pts == 2000)
     }
 
+    @Test("a frame on the frame grid is named by its served time: AVPlayer's time for it finds it within half a frame, and the next frame's interval is exact, its middle inside it")
+    func gridFramesNamedExactly() throws {
+        let grid = AVRational(num: 1, den: 24000)
+        let tap = OverlayPacketTap<Double>(decodeAheadSeconds: 0.2) { EchoDecoder(deliver: $0) }
+        defer { tap.close() }
+        tap.beginRun()
+        for i in 0..<96 {
+            let pts = Int64(i * 1001)
+            let packet = av_packet_alloc()!
+            _ = av_new_packet(packet, 4)
+            packet.pointee.pts = pts
+            packet.pointee.dts = pts
+            tap.insert(pts: pts, timeBase: grid, isKey: i % 48 == 0, info: Double(i), packet: packet)
+        }
+        let frame = 1001.0 / 24000
+        for i in 1..<95 {
+            // AVPlayer's time for frame i: its served time, on an item axis that EXTINF's rounding can move by up to a
+            // millisecond either way.
+            for offset in [-0.0009, 0, 0.0009] {
+                let itemTime = Double(i) * frame + offset
+                #expect(tap.unit(at: itemTime)?.info == Double(i), "frame \(i), axis \(offset)")
+                let next = try #require(tap.frameInterval(after: itemTime))
+                #expect(next.start == CMTime(value: Int64((i + 1) * 1001), timescale: 24000), "frame \(i)")
+                #expect(next.duration == CMTime(value: 1001, timescale: 24000), "frame \(i)")
+                let middle = SoftwareOverlayRenderer.middle(of: next)
+                #expect(CMTimeCompare(middle, next.start) > 0 && CMTimeCompare(middle, next.end) < 0, "frame \(i)")
+            }
+        }
+        // Past every frame cut, no frame is named.
+        #expect(tap.unit(at: 200) == nil)
+        // The decoder's pictures carry the served times: the picture on screen at a frame's time is that frame's.
+        tap.advance(to: 1.0)
+        #expect(Self.waitUntil(5) { tap.hasPictureShown(at: 24 * frame) })
+        #expect(tap.picture(atOrBefore: 24 * frame)?.time == CMTime(value: 24 * 1001, timescale: 24000))
+    }
+
     @Test("a backward seek's run is kept while the clock still reads where the seek left from, and decoded to")
     func backwardRunSurvivesAStaleClock() throws {
         var decoder: EchoDecoder?

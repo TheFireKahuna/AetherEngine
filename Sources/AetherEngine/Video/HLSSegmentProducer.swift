@@ -258,6 +258,25 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private let frameGrid: CFRFrameGrid?
     private var griddedVideoPackets = 0
     private var offGridVideoPackets = 0
+
+    /// The time base AVPlayer is served this session's video in: the frame grid's where the session has one, the
+    /// source's otherwise, the same for every producer of the session.
+    private var servedVideoTimeBase: AVRational { frameGrid?.outputTimeBase ?? sourceVideoTimeBase }
+
+    /// The time AVPlayer is served the video packet `packet` (item axis, source time base) at, as the write serves it:
+    /// its slot on the frame grid where it lies on one, its own time in ``servedVideoTimeBase`` otherwise. The overlay's
+    /// taps name its unit by it. Nil for a packet with no presentation time.
+    private func servedVideoTime(_ packet: UnsafePointer<AVPacket>) -> ServedVideoTime? {
+        let pts = packet.pointee.pts, dts = packet.pointee.dts
+        guard pts != Int64.min else { return nil }
+        let timeBase = servedVideoTimeBase
+        if let gridded = frameGrid?.place(pts: pts, dts: dts, duration: packet.pointee.duration, shift: videoShiftPts) {
+            return ServedVideoTime(pts: gridded.pts, dts: gridded.dts, timeBase: timeBase)
+        }
+        return ServedVideoTime(pts: av_rescale_q(pts, sourceVideoTimeBase, timeBase),
+                               dts: dts == Int64.min ? Int64.min : av_rescale_q(dts, sourceVideoTimeBase, timeBase),
+                               timeBase: timeBase)
+    }
     private let videoConfig: StreamConfig
     private let audioConfig: AudioConfig?
 
@@ -5018,9 +5037,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     }
                     let opensOverlayRun = !overlayRunOpened
                     overlayRunOpened = true
+                    let served = servedVideoTime(packet)
                     if let overlayDecodeTap {
-                        overlayDecodeTap.keep(packet, opensRun: opensOverlayRun, timeBase: videoConfig.timeBase,
-                                              shiftSeconds: Double(videoShiftPts == Int64.min ? 0 : videoShiftPts) * sourceVideoTbSeconds)
+                        if let served {
+                            overlayDecodeTap.keep(packet, opensRun: opensOverlayRun, served: served,
+                                                  shiftSeconds: Double(videoShiftPts == Int64.min ? 0 : videoShiftPts) * sourceVideoTbSeconds)
+                        }
                         observeOverlaySourceCaptions(packet)
                     }
                     if let overlayPlaceholder, !overlayPlaceholder.substitute(packet) {
@@ -5046,8 +5068,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         let converted: Bool
                         #if DualLayerDolbyVision
                         if let felTap {
-                            converted = felTap.rewrite(packet, opensRun: opensOverlayRun, framing: a53NALFraming,
-                                                       timeBase: videoConfig.timeBase,
+                            converted = felTap.rewrite(packet, opensRun: opensOverlayRun, served: served,
+                                                       framing: a53NALFraming,
                                                        chromaLocation: UInt32(max(0, videoConfig.codecpar.pointee.chroma_location.rawValue)))
                         } else {
                             converted = DoviRpuConverter.convertPacketToProfile81(packet, framing: a53NALFraming)

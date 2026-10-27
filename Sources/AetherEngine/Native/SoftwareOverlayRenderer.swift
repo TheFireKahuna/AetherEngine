@@ -25,9 +25,9 @@ protocol OverlayFrameSource: AnyObject, Sendable {
     func advance(to itemSeconds: Double)
     /// How the pictures follow AVPlayer while the item plays at `rate`.
     func pacing(atRate rate: Double) -> OverlayPacing
-    /// `.outputFrames`: the item time of the frame after `itemSeconds` as AVPlayer is served them, in whole
-    /// milliseconds; nil while it is not known.
-    func frameTime(after itemSeconds: Double) -> Double?
+    /// `.outputFrames`: the frame after the one AVPlayer shows at `itemSeconds`, as the interval it is served for, from
+    /// its served time to the next frame's, exact; nil while it is not known.
+    func frameInterval(after itemSeconds: Double) -> CMTimeRange?
     /// `.outputFrames`: the picture for AVPlayer's frame `output` at `frameTime`, handed to `done` on any thread (nil
     /// when it could not be made). False, with `done` never called, when the source has nothing for that time yet:
     /// the renderer offers the same frame again at the next refresh. `output` is valid until `done` runs.
@@ -148,6 +148,7 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
     private var followsHost = false
     /// The last frame taken off the output (or shown, paced by the clock).
     private var lastPulled = CMTime.invalid
+    private var diagCount = 0
     /// The newest picture enqueued, on the layer's timeline.
     private var lastQueued = CMTime.invalid
     /// Item times of the pictures enqueued and not yet passed by the clock, oldest first.
@@ -384,15 +385,16 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         if making > 0 { makeQueue.async { self.makeTaken() } }
         var took = false
         while making + blending + queued.count < Self.lookaheadFrames {
-            // A frame AVPlayer is served is asked for half a millisecond past its whole-millisecond time: at or
-            // past its own time, short of the next frame's. One the clock has passed is behind the picture
-            // on screen, and the frame at the clock is taken instead. With none taken since a restart, the first is
-            // the first AVPlayer has from the clock on: after a seek AVPlayer starts its clock short of the target,
-            // and the frames before the target are never put out.
+            // The output hands over the frame on display at the time it is asked for, so a frame is asked for at the
+            // middle of the interval it is served for: inside its own interval wherever AVPlayer's item axis sits
+            // against the served times, by less than half a frame. One the clock has passed is behind the picture on
+            // screen, and the frame at the clock is taken instead. With none taken since a restart, the first is the
+            // first AVPlayer has from the clock on: after a seek AVPlayer starts its clock short of the target, and
+            // the frames before the target are never put out.
             let itemTime: CMTime
             if lastPulled.isValid {
-                guard let next = source.frameTime(after: lastPulled.seconds) else { break }
-                itemTime = CMTimeMaximum(CMTime(seconds: next + 0.0005, preferredTimescale: 1_000_000_000), clock)
+                guard let next = source.frameInterval(after: lastPulled.seconds) else { break }
+                itemTime = CMTimeMaximum(Self.middle(of: next), clock)
             } else if let first = firstOutputTime(from: clock) {
                 itemTime = first
             } else {
@@ -401,10 +403,12 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
             }
             guard output.hasNewPixelBuffer(forItemTime: itemTime) else {
                 countersLock.withLock { _counters.atOutputEdge += 1 }
+                if diagCount < 40 { diagCount += 1; EngineLog.emit("[AXISDIAG] edge: asked \(itemTime.value)/\(itemTime.timescale) (\(String(format: "%.6f", itemTime.seconds))) last \(String(format: "%.6f", lastPulled.seconds)) clock \(String(format: "%.6f", clock.seconds))", category: .swPlayback) }
                 break
             }
             let pullStart = CACurrentMediaTime()
             guard let (frame, frameTime) = outputFrame(forItemTime: itemTime), frameTime.isValid else { break }
+            if diagCount < 40 { diagCount += 1; EngineLog.emit("[AXISDIAG] pulled \(frameTime.value)/\(frameTime.timescale) (\(String(format: "%.6f", frameTime.seconds))) asked \(String(format: "%.6f", itemTime.seconds))", category: .swPlayback) }
             stages.record("pull", ms: (CACurrentMediaTime() - pullStart) * 1000)
             stages.record("pulled ahead of the clock", ms: (frameTime - clock).seconds * 1000)
             countersLock.withLock { _counters.pulled += 1 }
@@ -427,12 +431,17 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         if output.hasNewPixelBuffer(forItemTime: clock) { return clock }
         var cursor = clock.seconds
         for _ in 0..<Self.lookaheadFrames {
-            guard let next = source.frameTime(after: cursor) else { return nil }
-            let time = CMTime(seconds: next + 0.0005, preferredTimescale: 1_000_000_000)
+            guard let next = source.frameInterval(after: cursor) else { return nil }
+            let time = Self.middle(of: next)
             if output.hasNewPixelBuffer(forItemTime: time) { return time }
-            cursor = next
+            cursor = next.start.seconds
         }
         return nil
+    }
+
+    /// The middle of a frame's interval, exactly.
+    static func middle(of interval: CMTimeRange) -> CMTime {
+        CMTimeAdd(interval.start, CMTimeMultiplyByRatio(interval.duration, multiplier: 1, divisor: 2))
     }
 
     /// Render queue: hands AVPlayer's frame at `frameTime` to the make queue.
@@ -521,9 +530,8 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
             if rate == 0 { quiesceIfIdle(refresh) }
             return
         }
-        var frameTime = CMTime.invalid
-        guard let picture = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &frameTime),
-              frameTime.isValid else { return }
+        let (image, frameTime) = ItemVideoOutput.frame(of: output, at: itemTime)
+        guard let picture = image, frameTime.isValid else { return }
         lastNewFrame = CACurrentMediaTime()
         countersLock.withLock { _counters.pulled += 1 }
         source.advance(to: frameTime.seconds)
@@ -657,6 +665,7 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
     /// Render queue: what the layer holds belongs to a position or a sequence the clock just left. The picture
     /// on screen stays until the next one replaces it.
     private func restartPresentation(because reason: String) {
+        diagCount = 0
         EngineLog.emit("[SoftwareOverlay] restart: \(reason); \(queued.count) queued, \(making) being made, last taken "
                        + (lastPulled.isValid ? String(format: "%.3f s", lastPulled.seconds) : "none"), category: .swPlayback)
         rendererIO.flush(removingDisplayedImage: false)
@@ -753,8 +762,8 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
             guard let readOnly else { return nil }
             return (.readOnly(readOnly), frameTime)
         }
-        var frameTime = CMTime.invalid
-        guard let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &frameTime) else { return nil }
+        let (buffer, frameTime) = ItemVideoOutput.frame(of: output, at: itemTime)
+        guard let buffer else { return nil }
         return (.copied(buffer), frameTime)
     }
 
@@ -778,7 +787,7 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         queue.asyncAfter(deadline: .now() + 2) { [weak item] in
             defer { item?.remove(probe) }
             let now = probe.itemTime(forHostTime: CACurrentMediaTime())
-            guard let buffer = probe.copyPixelBuffer(forItemTime: now, itemTimeForDisplay: nil) else {
+            guard let buffer = ItemVideoOutput.frame(of: probe, at: now).pixelBuffer else {
                 EngineLog.emit("[SoftwareOverlay] decoder format: no frame to read", category: .swPlayback)
                 return
             }

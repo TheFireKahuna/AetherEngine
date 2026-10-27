@@ -85,7 +85,7 @@ struct SoftwareOverlayEngineTests {
             let first = try #require(run.first, "a picture near \(target) after the seek")
             let overdueMs = (first.clock - (first.time + clip.interval)) * 1000
             #expect(first.time <= target + clip.interval + 0.002
-                        && overdueMs <= Double(OverlayPacketTap<Double>.heldPastMs) + 2,
+                        && overdueMs <= OverlayPacketTap<Double>.heldPastSeconds * 1000 + 2,
                     "the first picture after the seek to \(target) is at \(first.time), clock \(first.clock)")
             let faults = OverlayPresentations.faults(in: run, interval: clip.interval, steadyFrom: target + 0.5)
             #expect(faults.isEmpty, "after the seek to \(target), \(faults.count) faults: \(faults.prefix(8))")

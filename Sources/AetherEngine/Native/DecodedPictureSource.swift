@@ -24,7 +24,7 @@ final class DecodedPictureSource: OverlayFrameSource, @unchecked Sendable {
 
     func pacing(atRate rate: Double) -> OverlayPacing { rate < 0 || rate > 2 ? .showOutput : .clock }
 
-    func frameTime(after itemSeconds: Double) -> Double? { nil }
+    func frameInterval(after itemSeconds: Double) -> CMTimeRange? { nil }
 
     func makePicture(from output: CVPixelBuffer, at frameTime: CMTime,
                      done: @escaping @Sendable (CVPixelBuffer?) -> Void) -> Bool { false }

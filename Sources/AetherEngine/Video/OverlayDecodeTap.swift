@@ -32,7 +32,8 @@ final class OverlayDecodeTap: @unchecked Sendable {
     /// Where the current run starts and whether the player has moved the clock since (`OverlayRunStart`).
     private let runStart = OverlayRunStart()
 
-    /// `parameters` and `timeBase` are the source stream's, `containerSAR` its container's sample aspect;
+    /// `parameters` are the source stream's and `timeBase` the one the session serves video in, which the decoder runs
+    /// in so its pictures carry the times their units are served at; `containerSAR` is the container's sample aspect,
     /// `deinterlace` what the load decided for interlaced carriage. `onCaptions` takes the decoder's A53 captions
     /// in presentation order, timed on the source axis.
     init(parameters: UnsafePointer<AVCodecParameters>, timeBase: AVRational, containerSAR: AVRational,
@@ -56,18 +57,20 @@ final class OverlayDecodeTap: @unchecked Sendable {
 
     func close() { units.close() }
 
-    /// Keeps a copy of the source video packet `packet` (output timestamps, decode order) before the placeholder
-    /// replaces it; `opensRun` for a producer's first. `shiftSeconds` is the producer run's offset from the item axis
-    /// to the source axis.
+    /// Keeps a copy of the source video packet `packet` (decode order) before the placeholder replaces it, named and
+    /// stamped with `served`, the time AVPlayer is served it at; `opensRun` for a producer's first. `shiftSeconds` is
+    /// the producer run's offset from the item axis to the source axis.
     ///
     /// A run opens where AVPlayer is about to start (a load, a resume, a seek), so the decode works toward the picture
     /// it starts on (`OverlayRunStart`).
-    func keep(_ packet: UnsafePointer<AVPacket>, opensRun: Bool, timeBase: AVRational, shiftSeconds: Double) {
-        guard packet.pointee.pts != Int64.min, let copy = av_packet_clone(packet) else { return }
-        let seconds = Double(packet.pointee.pts) * av_q2d(timeBase)
+    func keep(_ packet: UnsafePointer<AVPacket>, opensRun: Bool, served: ServedVideoTime, shiftSeconds: Double) {
+        guard served.pts != Int64.min, let copy = av_packet_clone(packet) else { return }
+        copy.pointee.pts = served.pts
+        copy.pointee.dts = served.dts
+        let seconds = Double(served.pts) * av_q2d(served.timeBase)
         if opensRun { units.beginRun() }
         let decodeTo = runStart.noteUnit(at: seconds, opensRun: opensRun)
-        units.insert(pts: packet.pointee.pts, timeBase: timeBase, isKey: packet.pointee.flags & AV_PKT_FLAG_KEY != 0,
+        units.insert(pts: served.pts, timeBase: served.timeBase, isKey: packet.pointee.flags & AV_PKT_FLAG_KEY != 0,
                      info: shiftSeconds, packet: copy)
         if let decodeTo { units.advance(to: decodeTo) }
     }

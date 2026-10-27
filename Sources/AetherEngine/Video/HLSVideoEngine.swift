@@ -2074,8 +2074,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             self.sourceVideoConfig = HLSSegmentProducer.StreamConfig(
                 codecpar: UnsafePointer(ownedSourceParams.ptr), timeBase: videoTimeBase, codecTagOverride: nil,
                 nalFramingOverride: sourceFraming.measuredFraming)
+            // The decode runs in the time base AVPlayer is served video in, so its pictures carry served times.
             overlayDecodeTap = OverlayDecodeTap(
-                parameters: ownedSourceParams.ptr, timeBase: videoTimeBase,
+                parameters: ownedSourceParams.ptr, timeBase: frameGrid?.outputTimeBase ?? videoTimeBase,
                 containerSAR: videoStream.pointee.sample_aspect_ratio, deinterlace: overlayDeinterlace
             ) { [weak self] triplets, sourceSeconds in self?.overlayCaptionObserverForSession?(triplets, sourceSeconds) }
         } else {

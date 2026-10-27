@@ -75,7 +75,8 @@ struct OverlayDecodeTapTests {
             var owned: UnsafeMutablePointer<AVPacket>? = packet
             defer { trackedPacketFree(&owned) }
             guard packet.pointee.stream_index == index else { continue }
-            tap.keep(packet, opensRun: opensRun, timeBase: tb, shiftSeconds: 0)
+            tap.keep(packet, opensRun: opensRun,
+                     served: ServedVideoTime(pts: packet.pointee.pts, dts: packet.pointee.dts, timeBase: tb), shiftSeconds: 0)
             opensRun = false
             reference.decode(packet: packet, epoch: nil)
         }

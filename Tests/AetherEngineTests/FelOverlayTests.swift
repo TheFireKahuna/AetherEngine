@@ -97,7 +97,9 @@ struct FelOverlayRealFileTests {
             var referenceOwned: UnsafeMutablePointer<AVPacket>? = reference
             defer { trackedPacketFree(&referenceOwned) }
             _ = DoviRpuConverter.convertPacketToProfile81(reference)
-            _ = tap.rewrite(packet, opensRun: fed.isEmpty, framing: .lengthPrefixed(size: 4), timeBase: tb, chromaLocation: 0)
+            _ = tap.rewrite(packet, opensRun: fed.isEmpty,
+                            served: ServedVideoTime(pts: packet.pointee.pts, dts: packet.pointee.dts, timeBase: tb),
+                            framing: .lengthPrefixed(size: 4), chromaLocation: 0)
             if packet.pointee.size != reference.pointee.size
                 || memcmp(packet.pointee.data, reference.pointee.data, Int(packet.pointee.size)) != 0 { match = false }
             fed.append(t)
@@ -234,8 +236,10 @@ extension FelOverlayTests {
             pkt.pointee.pts = Int64(i * 40)
             pkt.pointee.dts = Int64(i * 40)
             if i == 0 { pkt.pointee.flags |= AV_PKT_FLAG_KEY }
-            _ = tap.rewrite(pkt, opensRun: i == 0, framing: .lengthPrefixed(size: 4), timeBase: AVRational(num: 1, den: 1000),
-                            chromaLocation: 0)
+            _ = tap.rewrite(pkt, opensRun: i == 0,
+                            served: ServedVideoTime(pts: pkt.pointee.pts, dts: pkt.pointee.dts,
+                                                    timeBase: AVRational(num: 1, den: 1000)),
+                            framing: .lengthPrefixed(size: 4), chromaLocation: 0)
             #expect(tap.frame(at: Double(i) * 0.04) != nil, "unit \(i)")
             let served = R.nals(of: pkt)
             #expect(served.count == 2 && served.first == R.slice, "unit \(i)")
