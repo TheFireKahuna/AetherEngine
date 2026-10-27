@@ -4,36 +4,48 @@ import Foundation
 /// What the segment provider needs from an I-frame rendition (AE#682).
 protocol IFrameSegmentSource: AnyObject, Sendable {
     var format: IFrameRenditionFormat { get }
+    /// One entry per `iframe{N}.mp4`, the timeline both tiers' playlists list.
+    var entries: [IFrameRendition.Entry] { get }
     func initSegment() -> Data?
     func fragment(at index: Int) -> Data?
+    /// The SDR companion listed beside an HDR session's keyframes (`iframe_sdr.m3u8`), nil when none.
+    var companionFormat: IFrameRenditionFormat? { get }
+    func companionInitSegment() -> Data?
+    func companionFragment(at index: Int) -> Data?
+}
+
+extension IFrameSegmentSource {
+    var companionFormat: IFrameRenditionFormat? { nil }
+    func companionInitSegment() -> Data? { nil }
+    func companionFragment(at index: Int) -> Data? { nil }
 }
 
 /// What the I-frame rendition carries, and so what the master declares for it.
 enum IFrameRenditionFormat: Equatable, Sendable {
     /// The source's own keyframes; the master repeats the variant's codec, range and size.
     case keyframes
-    /// One SDR Motion JPEG still per keyframe (`IFrameJPEGBuilder`), for HDR and Dolby Vision sources.
-    case jpeg(width: Int, height: Int, bandwidth: Int)
 
     var logName: String {
         switch self {
         case .keyframes: return "keyframes"
-        case .jpeg: return "jpeg"
         }
     }
+
 }
 
-/// AE#682: answers `iframe_init.mp4` and `iframe{N}.mp4`. One request at a time: there is one side
-/// demuxer, and AVKit asks for up to five keyframes at once.
+/// AE#682: answers `iframe_init.mp4` and `iframe{N}.mp4`. One request at a time: there is one keyframe
+/// reader (`IFrameKeyframeReader`), and AVKit asks for up to five keyframes at once.
 final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
-    struct Entry {
+    struct Entry: Equatable, Sendable {
         let startPts: Int64
         let startSeconds: Double
         let durationSeconds: Double
     }
 
     let format: IFrameRenditionFormat
-    private let entries: [Entry]
+    let companionFormat: IFrameRenditionFormat?
+    private let buildCompanion: ((Data, Int, Entry) -> IFrameFragmentBuilder.Output?)?
+    let entries: [Entry]
     private let cache: IFramePayloadCache
     private let readPayload: (Entry) -> Data?
     private let buildFragment: (Data, Int, Entry) -> IFrameFragmentBuilder.Output?
@@ -46,18 +58,24 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
     private let stateLock = NSLock()
     private var isShutDown = false
     private var capturedInit: Data?
+    private var capturedCompanionInit: Data?
     private var failureLog = IFrameLogThrottle()
+    private var timing = IFrameBuildTiming()
 
     init(entries: [Entry],
          cache: IFramePayloadCache,
          format: IFrameRenditionFormat = .keyframes,
          readPayload: @escaping (Entry) -> Data?,
          buildFragment: @escaping (Data, Int, Entry) -> IFrameFragmentBuilder.Output?,
+         companion: (format: IFrameRenditionFormat,
+                     build: (Data, Int, Entry) -> IFrameFragmentBuilder.Output?)? = nil,
          waitForLink: @escaping (_ shouldStop: () -> Bool) -> Void = { _ in },
          sourceReadsAllowed: @escaping () -> Bool = { true },
          interruptReads: @escaping () -> Void = {},
          closeReader: @escaping () -> Void = {}) {
         self.format = format
+        self.companionFormat = companion?.format
+        self.buildCompanion = companion?.build
         self.entries = entries
         self.cache = cache
         self.readPayload = readPayload
@@ -88,7 +106,23 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
         }
     }
 
-    /// The keyframe that opens segment `index`, from the cache or the side reader, and never a
+    func companionInitSegment() -> Data? {
+        queue.sync {
+            guard !shutDown, buildCompanion != nil else { return nil }
+            if capturedCompanionInit == nil { _ = buildCompanionLocked(at: 0) }
+            return capturedCompanionInit
+        }
+    }
+
+    /// The companion is built from the same keyframe reads, so it costs no second reader on the source.
+    func companionFragment(at index: Int) -> Data? {
+        queue.sync {
+            guard !shutDown, buildCompanion != nil else { return nil }
+            return buildCompanionLocked(at: index)
+        }
+    }
+
+    /// The keyframe that opens segment `index`, from the cache or the keyframe reader, and never a
     /// neighbour's in its place: a scrub preview names the span it shows, so a stand-in would put
     /// the wrong picture over the right time. `isStale` is asked before the source is touched, so a
     /// queue of superseded requests costs no reads.
@@ -116,11 +150,36 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
         let ms = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
         EngineLog.emit("[IFrameRendition] read idx=\(index) bytes=\(read.count) "
                        + "ms=\(String(format: "%.0f", ms))", category: .session, level: .verbose)
+        timing.noteRead(ms: ms, bytes: read.count)
         cache.store(read, for: index)
         return read
     }
 
     private func buildLocked(at index: Int) -> Data? {
+        guard let (payload, entry) = payloadLocked(at: index),
+              let output = buildFragment(payload, index, entry) else { return nil }
+        if capturedInit == nil { capturedInit = output.initSegment }
+        return output.fragment
+    }
+
+    private func buildCompanionLocked(at index: Int) -> Data? {
+        let started = DispatchTime.now()
+        guard let buildCompanion, let (payload, entry) = payloadLocked(at: index) else { return nil }
+        let built = DispatchTime.now()
+        guard let output = buildCompanion(payload, index, entry) else { return nil }
+        if capturedCompanionInit == nil { capturedCompanionInit = output.initSegment }
+        if let line = timing.noteStill(totalMs: Self.ms(since: started), buildMs: Self.ms(since: built)) {
+            EngineLog.emit("[IFrameRendition] sdr stills: \(line)", category: .session)
+        }
+        return output.fragment
+    }
+
+    private static func ms(since start: DispatchTime) -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
+    }
+
+    /// The keyframe for segment `index`, or a cached neighbour's when it cannot be read.
+    private func payloadLocked(at index: Int) -> (Data, Entry)? {
         guard entries.indices.contains(index) else { return nil }
         let entry = entries[index]
         var payload = cache.payload(for: index)
@@ -146,9 +205,8 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
                 return nil
             }
         }
-        guard let payload, let output = buildFragment(payload, index, entry) else { return nil }
-        if capturedInit == nil { capturedInit = output.initSegment }
-        return output.fragment
+        guard let payload else { return nil }
+        return (payload, entry)
     }
 
     /// Idempotent, and every call drains: the session frees the codec parameters the builder reads
@@ -165,6 +223,41 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
             closeReader()
             cache.removeAll()
         }
+    }
+}
+
+/// Where an SDR still's time goes, summed over a window of stills: one line per `window` requests, so a
+/// scrub says whether the source read or the decode and encode set its pace.
+struct IFrameBuildTiming {
+    var window = 20
+    private var stills = 0
+    private var totalMs = 0.0
+    private var maxTotalMs = 0.0
+    private var buildMs = 0.0
+    private var reads = 0
+    private var readMs = 0.0
+    private var readBytes = 0
+
+    mutating func noteRead(ms: Double, bytes: Int) {
+        reads += 1
+        readMs += ms
+        readBytes += bytes
+    }
+
+    /// The summary line once `window` stills have been answered, nil before.
+    mutating func noteStill(totalMs still: Double, buildMs stillBuild: Double) -> String? {
+        stills += 1
+        totalMs += still
+        maxTotalMs = max(maxTotalMs, still)
+        buildMs += stillBuild
+        guard stills >= window else { return nil }
+        let n = Double(stills)
+        let line = String(format: "%d answered, avg %.0f ms (max %.0f): build %.0f ms; %d source reads avg %.0f ms, %.0f KB",
+                          stills, totalMs / n, maxTotalMs, buildMs / n, reads,
+                          reads > 0 ? readMs / Double(reads) : 0,
+                          reads > 0 ? Double(readBytes) / Double(reads) / 1024 : 0)
+        self = IFrameBuildTiming(window: window)
+        return line
     }
 }
 

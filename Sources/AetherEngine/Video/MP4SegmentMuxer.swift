@@ -362,17 +362,23 @@ final class MP4SegmentMuxer {
                                          in: sessionDir)
         self.currentStagingPath = firstPath
         let firstFd: Int32
-        do {
-            firstFd = try Self.openPosix(path: firstPath)
-        } catch {
-            if Self.isOutOfSpace(error) { onStorageExhausted?() }
-            throw error
+        if inMemory {
+            // No staging file: fragments collect in memory and leave through `takeFragmentInMemory()`.
+            firstFd = -1
+        } else {
+            do {
+                firstFd = try Self.openPosix(path: firstPath)
+            } catch {
+                if Self.isOutOfSpace(error) { onStorageExhausted?() }
+                throw error
+            }
         }
         self.fd = firstFd
 
         // Ref-typed counter shared with the splitter closure (closure can't capture self during init).
         let counter = ByteCounter()
         counter.fd = firstFd
+        counter.memory = inMemory ? NSMutableData() : nil
         counter.onStorageExhausted = onStorageExhausted
         self.byteCounter = counter
 
@@ -1003,6 +1009,8 @@ final class MP4SegmentMuxer {
         }
 
         return .completed(path: completedPath, bytesWritten: completedBytes)
+    /// In-memory muxers only: flushes the fragment written since the last call, the same flush as
+    /// `cutFragmentForNextSegment`, and hands its bytes over. nil when nothing was written.
     }
 
     /// Final teardown: flush remaining packets, write trailer (mfra discarded by splitter), close fd.
@@ -1316,6 +1324,8 @@ final class MP4SegmentMuxer {
 /// (closures can't capture self during init).
 private final class ByteCounter {
     var fd: Int32 = -1
+    /// In-memory muxers: where fragment bytes go instead of `fd`.
+    var memory: NSMutableData?
     var bytesWrittenCurrentSegment: Int = 0
     var writeFailed: Bool = false
     /// Reports a staging write that hit a full volume to the session's cache.

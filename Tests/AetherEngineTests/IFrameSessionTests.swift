@@ -62,66 +62,69 @@ struct IFrameSessionTests {
         let playbackURL = try engine.start()
         defer { engine.stop() }
         try #require(engine.planBoundariesClaimRandomAccess, "fixture must plan on its keyframe index")
-        #expect(engine.iFrameRenditionVerdict == .served)
+        #expect(engine.iFrameRenditionVerdict == .served(.keyframes))
         #expect(playbackURL.lastPathComponent == "master.m3u8")
         let prov = try #require(engine.provider)
         #expect(prov.iFrameRenditionServed)
         #expect(prov.iFrameRenditionFormat == .keyframes)
         try #require(prov.segmentCount >= 2)
+        let timeline = try #require(prov.iFrameTimeline)
+        #expect(timeline.count >= prov.segmentCount)
 
         let initSegment = try #require(prov.iFrameInitSegment())
         let timescale = Double(try #require(IFrameTestBoxes.timescale(initSegment: initSegment)))
         // Deliberately out of order: the last entry first.
-        for index in [prov.segmentCount - 1, 0, 1] {
+        for index in [timeline.count - 1, 0, 1] {
             let fragment = try #require(prov.iFrameSegment(at: index))
             #expect(IFrameTestBoxes.sampleCount(fragment: fragment) == 1)
             let tfdt = Double(try #require(IFrameTestBoxes.baseDecodeTime(fragment: fragment)))
-            #expect(abs(tfdt / timescale - engine.segmentPlan[index].startSeconds) < 0.002,
-                    "iframe\(index) sits at \(tfdt / timescale), plan says \(engine.segmentPlan[index].startSeconds)")
+            #expect(abs(tfdt / timescale - timeline[index].startSeconds) < 0.002,
+                    "iframe\(index) sits at \(tfdt / timescale), timeline says \(timeline[index].startSeconds)")
         }
-        #expect(prov.iFrameSegment(at: prov.segmentCount) == nil)
+        #expect(prov.iFrameSegment(at: timeline.count) == nil)
     }
 
     private static let dolbyVisionFixture = "user/Patterns_Of_Nature_DoVi_24_P5_UHD_HEVC-10mbps_DD+JOC-768kbps_iOS.mp4"
 
-    // Profile 5 stills need the DolbyVisionStillReshaping trait (README, "Optional components").
-    #if DolbyVisionStillReshaping
-    @Test("a Dolby Vision session serves SDR JPEG stills on the plan's timeline",
+    // Profile 5 stills need the Dolby Vision composer, trait DualLayerDolbyVision (README, "Optional components").
+    #if DualLayerDolbyVision
+    @Test("a Dolby Vision session serves SDR HEVC stills on the plan's timeline beside its keyframe tier",
           .enabled(if: fixtureExists(dolbyVisionFixture)), .timeLimit(.minutes(2)))
-    func dolbyVisionServesJPEG() throws {
+    func dolbyVisionServesSDRStills() throws {
         let engine = HLSVideoEngine(url: fixtureURL(Self.dolbyVisionFixture), dvModeAvailable: true)
         engine.requestIFramePlaylist()
         _ = try engine.start()
         defer { engine.stop() }
-        try #require(engine.iFrameRenditionVerdict == .served)
+        try #require(engine.iFrameRenditionVerdict == .served(.keyframes))
         let prov = try #require(engine.provider)
-        guard case .jpeg(let width, let height, _) = prov.iFrameRenditionFormat else {
-            Issue.record("expected a JPEG rendition, got \(String(describing: prov.iFrameRenditionFormat))")
+        guard case .stills(let width, let height, let codecs, _, _, .sdr) = prov.iFrameCompanionFormat else {
+            Issue.record("expected an SDR stills tier, got \(String(describing: prov.iFrameCompanionFormat))")
             return
         }
-        #expect(width == 640 && height == 360)
+        #expect(width == 800 && height == 450)
+        #expect(codecs.hasPrefix("hvc1.2."))
         let master = HLSLocalServer.buildMasterPlaylistText(provider: prov)
-        #expect(master.contains("CODECS=\"mjpg\",RESOLUTION=640x360,VIDEO-RANGE=SDR"))
-        let initSegment = try #require(prov.iFrameInitSegment())
+        #expect(master.contains("VIDEO-RANGE=SDR,CODECS=\"\(codecs)\",RESOLUTION=800x450"))
+        let initSegment = try #require(prov.iFrameCompanionInitSegment())
         let timescale = Double(try #require(IFrameTestBoxes.timescale(initSegment: initSegment)))
-        for index in [prov.segmentCount - 1, 2] {
-            let fragment = try #require(prov.iFrameSegment(at: index))
+        let timeline = try #require(prov.iFrameTimeline)
+        for index in [timeline.count - 1, 2] {
+            let fragment = try #require(prov.iFrameCompanionSegment(at: index))
             let tfdt = Double(try #require(IFrameTestBoxes.baseDecodeTime(fragment: fragment)))
-            #expect(abs(tfdt / timescale - engine.segmentPlan[index].startSeconds) < 0.002)
-            let mdat = try #require(IFrameTestBoxes.find(["mdat"], in: fragment))
-            #expect(fragment.subdata(in: mdat).prefix(2) == Data([0xFF, 0xD8]))
+            #expect(abs(tfdt / timescale - timeline[index].startSeconds) < 0.002)
+            #expect(IFrameTestBoxes.sampleCount(fragment: fragment) == 1)
         }
     }
 
-    @Test("a JPEG I-frame playlist waits for the main variant and is withheld from a player that refused it",
+    @Test("the SDR stills playlist waits for the main variant and is withheld from a player that refused it",
           .enabled(if: fixtureExists(dolbyVisionFixture)), .timeLimit(.minutes(2)))
-    func jpegPlaylistFollowsMainVariant() throws {
+    func sdrStillsPlaylistFollowsMainVariant() throws {
         let engine = HLSVideoEngine(url: fixtureURL(Self.dolbyVisionFixture), dvModeAvailable: true)
         engine.requestIFramePlaylist()
         let playbackURL = try engine.start()
         defer { engine.stop() }
         let base = playbackURL.deletingLastPathComponent()
-        let playlistURL = base.appendingPathComponent("iframe.m3u8")
+        let playlistURL = base.appendingPathComponent("iframe_sdr.m3u8")
 
         let started = Date()
         #expect(!engine.iFrameRenditionWithheld)
@@ -131,10 +134,10 @@ struct IFrameSessionTests {
 
         _ = try Data(contentsOf: base.appendingPathComponent("init.mp4"))
         let playlist = try String(contentsOf: playlistURL, encoding: .utf8)
-        #expect(playlist.contains("iframe1.mp4"))
+        #expect(playlist.contains("iframe_sdr1.mp4"))
     }
     #else
-    @Test("without the reshaping trait a Profile 5 session lists no I-frame rendition",
+    @Test("without the Dolby Vision composer a Profile 5 session lists no I-frame rendition",
           .enabled(if: fixtureExists(dolbyVisionFixture)), .timeLimit(.minutes(2)))
     func dolbyVisionWithoutReshapingHasNoRendition() throws {
         let engine = HLSVideoEngine(url: fixtureURL(Self.dolbyVisionFixture), dvModeAvailable: true)
@@ -197,8 +200,10 @@ struct IFrameSessionTests {
         #expect(prov.iFrameSegment(at: 0) == nil)
     }
 
+    // The requests block their threads on the rendition's queue, so they run off the cooperative pool: on it,
+    // twenty of them hold every pool thread, and the stop and the index resolution they wait for never run.
     @Test("stopping while a keyframe request is in flight neither crashes nor hangs",
-          .enabled(if: fixtureExists(fixture)), .timeLimit(.minutes(2)))
+          .enabled(if: fixtureExists(fixture)), .timeLimit(.minutes(2)), .offCooperativePool)
     func stopWithRenditionInFlightDoesNotCrash() async throws {
         let engine = HLSVideoEngine(url: fixtureURL(Self.fixture), dvModeAvailable: false)
         engine.requestIFramePlaylist()
@@ -218,8 +223,8 @@ struct IFrameSessionTests {
     func liveSessionServesNoRendition() {
         let verdict = IFrameRenditionEligibility.candidate(.init(
             requested: true, isLive: true, planBoundariesClaimRandomAccess: true,
-            sequentialOrigin: false, heldSourceConnection: false, originIsSerial: false,
-            isDiscSource: false, secondReaderAvailable: true))
+            seeksToTimeWithoutIndex: true, sequentialOrigin: false, heldSourceConnection: false,
+            originIsSerial: false, secondReaderAvailable: true))
         #expect(verdict == .absent(.live))
     }
 
@@ -239,7 +244,7 @@ struct IFrameSessionTests {
         let clone = try CountingFileReader(url: fixtureURL(Self.fixture))
         let engine = HLSVideoEngine(url: fixtureURL(Self.fixture), dvModeAvailable: false)
         engine.requestIFramePlaylist()
-        engine.customIFrameReader = (reader: clone, formatHint: "mp4")
+        engine.customKeyframeReader = (reader: clone, formatHint: "mp4")
         _ = try engine.start()
         let prov = try #require(engine.provider)
         let fragment = try #require(prov.iFrameSegment(at: 1))
@@ -257,23 +262,24 @@ struct IFrameSessionTests {
         let clone = try CountingFileReader(url: fixtureURL(Self.fixture))
         let engine = HLSVideoEngine(url: fixtureURL(Self.fixture), dvModeAvailable: false)
         engine.requestIFramePlaylist()
-        engine.customIFrameReader = (reader: clone, formatHint: "mp4")
+        engine.customKeyframeReader = (reader: clone, formatHint: "mp4")
         _ = try engine.start()
         engine.stop()
         try await waitFor { clone.closes == 1 }
     }
 
-    @Test("a clone handed to a session that cannot serve the rendition is closed at once",
+    @Test("a clone handed to a session that can read no picture off the source is closed at once",
           .enabled(if: fixtureExists("sdr-h264.mp4")), .timeLimit(.minutes(2)))
     func cloneOfAnAbsentRenditionIsClosed() throws {
         // One IRAP in the whole file: no keyframe-aligned plan, so the rendition stays absent.
         let clone = try CountingFileReader(url: fixtureURL("sdr-h264.mp4"))
         let engine = HLSVideoEngine(url: fixtureURL("sdr-h264.mp4"), dvModeAvailable: false)
         engine.requestIFramePlaylist()
-        engine.customIFrameReader = (reader: clone, formatHint: "mp4")
+        engine.customKeyframeReader = (reader: clone, formatHint: "mp4")
         _ = try engine.start()
         defer { engine.stop() }
         #expect(engine.iFrameRenditionVerdict == .absent(.planNotKeyframeAligned))
+        #expect(engine.sourceStillTimeline == nil)
         #expect(clone.closes == 1)
     }
 }

@@ -7,7 +7,7 @@ struct IFramePayloadCacheTests {
     private func makeCache(limit: Int) throws -> (IFramePayloadCache, URL) {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("iframe-cache-\(UUID().uuidString)", isDirectory: true)
-        return (IFramePayloadCache(directory: dir, byteLimit: limit), dir)
+        return (IFramePayloadCache(byteLimit: limit), dir)
     }
 
     @Test("a stored payload comes back byte for byte")
@@ -54,22 +54,13 @@ struct IFramePayloadCacheTests {
         #expect(cache.nearestIndex(to: 12) == 4)
     }
 
-    @Test("removeAll forgets everything and deletes the directory")
+    @Test("removeAll forgets everything and writes nothing to disk")
     func removeAll() throws {
         let (cache, dir) = try makeCache(limit: 1000)
         cache.store(Data([1]), for: 0)
+        #expect(!FileManager.default.fileExists(atPath: dir.path))
         cache.removeAll()
         #expect(cache.payload(for: 0) == nil)
-        #expect(!FileManager.default.fileExists(atPath: dir.path))
-    }
-
-    @Test("a payload whose file vanished is a miss, not a crash")
-    func missingFileIsAMiss() throws {
-        let (cache, dir) = try makeCache(limit: 1000)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        cache.store(Data([1]), for: 3)
-        try FileManager.default.removeItem(at: dir)
-        #expect(cache.payload(for: 3) == nil)
-        #expect(cache.nearestIndex(to: 3) == nil)
+        #expect(cache.nearestIndex(to: 0) == nil)
     }
 }

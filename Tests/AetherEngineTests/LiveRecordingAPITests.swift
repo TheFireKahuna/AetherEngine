@@ -3,7 +3,7 @@ import Foundation
 @testable import AetherEngine
 
 /// The guards and the lifecycle of the public recording API (AE#560).
-@Suite("Live recording API", .serialized)
+@Suite("Live recording API", .serialized, .timeLimit(.minutes(1)))
 @MainActor
 struct LiveRecordingAPITests {
 

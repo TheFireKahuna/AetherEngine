@@ -407,6 +407,68 @@ extension HLSVideoEngine {
         return peak > 0 && peak < Double(Int64.max) ? Int64(peak) : nil
     }
 
+    /// The closest two I-frame entries sit: about one a second, the dense trick-play tier the HLS Authoring
+    /// Specification suggests (6.2), from the source's own keyframes (6.3).
+    static let iFrameMinSpacingSeconds = 0.75
+
+    /// A dense still's spacing: one a second, the rate the HLS Authoring Specification's dense I-frame
+    /// renditions are built at (6.2), and its bitrate tables assume (6.7).
+    static let denseStillSpacingSeconds = 1.0
+
+    /// The stills timeline of a source with no keyframe list (`IFrameRenditionEligibility.Timeline.stills`):
+    /// an entry every `spacing` seconds from the plan's start to its end, each at its own time on the plan's
+    /// axis, the last one running to the end of the program.
+    static func denseStillEntries(plan: [Segment], timeBaseSeconds: Double,
+                                  spacing: Double = denseStillSpacingSeconds) -> [IFrameRendition.Entry] {
+        guard let first = plan.first, let last = plan.last, timeBaseSeconds > 0, spacing > 0 else { return [] }
+        let end = last.startSeconds + max(last.durationSeconds, 0)
+        let count = Int(((end - first.startSeconds) / spacing).rounded(.up))
+        return (0..<max(0, count)).map { k in
+            let seconds = first.startSeconds + Double(k) * spacing
+            return IFrameRendition.Entry(
+                startPts: first.startPts + Int64((Double(k) * spacing / timeBaseSeconds).rounded()),
+                startSeconds: seconds, durationSeconds: min(spacing, end - seconds))
+        }
+    }
+
+    /// AE#682: the I-frame playlists' timeline, finer than the media segments so fast-forward and rewind step
+    /// through the title in about one-second strides rather than one per segment. Every segment's opening
+    /// keyframe stays an entry; between two of them, an indexed keyframe is added when it sits at least
+    /// `minSpacingSeconds` from the entry before it and from the next segment. Positions are measured from
+    /// the segment they fall in, so they share the plan's axis. Without keyframes, one entry per segment.
+    static func iFrameEntries(plan: [Segment], keyframes: [Int64], timeBaseSeconds: Double,
+                              minSpacingSeconds: Double = iFrameMinSpacingSeconds) -> [IFrameRendition.Entry] {
+        var starts: [(pts: Int64, seconds: Double)] = []
+        let sorted = keyframes.sorted()
+        for (i, segment) in plan.enumerated() {
+            starts.append((segment.startPts, segment.startSeconds))
+            guard timeBaseSeconds > 0, !sorted.isEmpty else { continue }
+            let next = i + 1 < plan.count ? plan[i + 1] : nil
+            let endSeconds = next?.startSeconds ?? segment.startSeconds + max(segment.durationSeconds, 0)
+            var low = 0, high = sorted.count
+            while low < high {
+                let mid = (low + high) / 2
+                if sorted[mid] <= segment.startPts { low = mid + 1 } else { high = mid }
+            }
+            var last = segment.startSeconds
+            for pts in sorted[low...] {
+                if let next, pts >= next.startPts { break }
+                let seconds = segment.startSeconds + Double(pts - segment.startPts) * timeBaseSeconds
+                guard seconds < endSeconds else { break }
+                if seconds - last >= minSpacingSeconds, endSeconds - seconds >= minSpacingSeconds {
+                    starts.append((pts, seconds))
+                    last = seconds
+                }
+            }
+        }
+        let programEnd = plan.last.map { $0.startSeconds + max($0.durationSeconds, 0) } ?? 0
+        return starts.enumerated().map { j, start in
+            let end = j + 1 < starts.count ? starts[j + 1].seconds : programEnd
+            return IFrameRendition.Entry(startPts: start.pts, startSeconds: start.seconds,
+                                         durationSeconds: max(end - start.seconds, 0))
+        }
+    }
+
     /// Segments shorter than this are folded into a neighbour by `collapseShortSegments`. A keyframe
     /// cluster (several IRAPs within a few frames) otherwise makes `buildKeyframeSegmentPlan` emit
     /// sub-frame segments whose narrow [start,end) window can miss every demuxed keyframe, so the producer

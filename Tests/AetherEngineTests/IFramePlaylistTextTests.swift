@@ -7,11 +7,12 @@ private final class IFrameMockProvider: HLSSegmentProvider, @unchecked Sendable 
     let served: Bool
     let durations: [Double]
     let supplemental: String?
-    let format: IFrameRenditionFormat?
+    let companion: IFrameRenditionFormat?
+    let averageBandwidth: Int?
     init(served: Bool, durations: [Double] = [4.0, 4.0, 2.5], supplemental: String? = nil,
-         format: IFrameRenditionFormat? = nil) {
+         companion: IFrameRenditionFormat? = nil, averageBandwidth: Int? = nil) {
         self.served = served; self.durations = durations; self.supplemental = supplemental
-        self.format = format
+        self.companion = companion; self.averageBandwidth = averageBandwidth
     }
     func initSegment() -> Data? { Data([0x00]) }
     func mediaSegment(at index: Int) -> Data? { Data([0x00]) }
@@ -24,8 +25,10 @@ private final class IFrameMockProvider: HLSSegmentProvider, @unchecked Sendable 
     var masterVideoRange: HLSVideoRange? { .pq }
     var masterBandwidth: Int? { 12_000_000 }
     var masterFrameRate: Double? { 23.976 }
+    var masterAverageBandwidth: Int? { averageBandwidth }
     var iFrameRenditionServed: Bool { served }
-    var iFrameRenditionFormat: IFrameRenditionFormat? { format }
+    var iFrameRenditionFormat: IFrameRenditionFormat? { .keyframes }
+    var iFrameCompanionFormat: IFrameRenditionFormat? { companion }
 }
 
 struct IFramePlaylistTextTests {
@@ -41,15 +44,37 @@ struct IFramePlaylistTextTests {
         #expect(lines.firstIndex(of: tag[0])! > variantURI)
     }
 
-    @Test("a JPEG rendition is declared as SDR motion JPEG, whatever the variant carries")
-    func masterLineForJPEG() {
+    @Test("the keyframe tier's AVERAGE-BANDWIDTH is one estimated keyframe over the mean segment, under BANDWIDTH")
+    func keyframeAverageBandwidth() {
+        // 2.5 frames of 6 Mbit/s at 23.976 over a 3.5 s mean segment.
+        let p = IFrameMockProvider(served: true, averageBandwidth: 6_000_000)
+        let tag = HLSLocalServer.buildMasterPlaylistText(provider: p)
+            .split(separator: "\n").map(String.init)
+            .first { $0.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:") }
+        #expect(tag == "#EXT-X-I-FRAME-STREAM-INF:AVERAGE-BANDWIDTH=178751,BANDWIDTH=12000000,"
+                + "CODECS=\"hvc1.2.4.L150.B0\",RESOLUTION=3840x2160,VIDEO-RANGE=PQ,URI=\"iframe.m3u8\"")
+        let heavy = IFrameMockProvider(served: true, durations: [0.05], averageBandwidth: 900_000_000)
+        #expect(HLSLocalServer.keyframeAverageBandwidth(provider: heavy, ceiling: 12_000_000) == 12_000_000)
+    }
+
+    @Test("an HDR session keeps its Dolby Vision keyframe tier and adds the 10-bit SDR HEVC tier")
+    func masterLineForSDRStills() {
         let p = IFrameMockProvider(served: true, supplemental: "dvh1.08.06/db1p",
                                    format: .jpeg(width: 640, height: 360, bandwidth: 790_000))
         let tag = HLSLocalServer.buildMasterPlaylistText(provider: p)
             .split(separator: "\n").map(String.init)
             .filter { $0.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:") }
-        #expect(tag == ["#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=790000,CODECS=\"mjpg\","
-                        + "RESOLUTION=640x360,VIDEO-RANGE=SDR,URI=\"iframe.m3u8\""])
+        #expect(tag == ["#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=12000000,CODECS=\"hvc1.2.4.L150.B0\","
+                        + "SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\",RESOLUTION=3840x2160,VIDEO-RANGE=PQ,URI=\"iframe.m3u8\"",
+                        "#EXT-X-I-FRAME-STREAM-INF:AVERAGE-BANDWIDTH=50000,BANDWIDTH=1050000,VIDEO-RANGE=SDR,"
+                        + "CODECS=\"hvc1.2.4.L90.B0\",RESOLUTION=800x450,URI=\"iframe_sdr.m3u8\""])
+    }
+
+    @Test("SDR companion paths parse apart from the keyframe tier's")
+    func companionPaths() {
+        #expect(HLSLocalServer.parseIFramePath("/iframe_sdr12.mp4", resourceName: "iframe_sdr") == 12)
+        #expect(HLSLocalServer.parseIFramePath("/iframe_sdr12.mp4") == nil)
+        #expect(HLSLocalServer.parseIFramePath("/iframe_sdr_init.mp4", resourceName: "iframe_sdr") == nil)
     }
 
     @Test("master is untouched when the rendition is not served")
