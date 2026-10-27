@@ -1,4 +1,6 @@
 // The FEL overlay route: AVPlayer plays a Profile 7 FEL's base layer on the native route, and
+// SoftwareOverlayRenderer shows FelCompositionSource's composition (the enhancement layer read by
+// FelEnhancementTap) over its picture.
 import AVFoundation
 import Foundation
 import Testing
@@ -19,6 +21,11 @@ struct FelOverlayTests {
 extension FelOverlayTests {
 
     /// A renderer over an idle tap, both closed by the caller.
+    private func makeRenderer() throws -> (SoftwareOverlayRenderer, FelEnhancementTap) {
+        let tap = FelEnhancementTap()
+        let source = try #require(FelCompositionSource(tap: tap, baseLayerFullRange: false))
+        return (SoftwareOverlayRenderer(item: AVPlayerItem(url: URL(fileURLWithPath: "/dev/null")), source: source), tap)
+    }
 
     /// AVPlayerLayer builds its private sublayers at init: an intermediate layer holding the video
     /// container and `FigSubtitleCALayer`. This pins that shape, which `install(in:)` depends on.
@@ -131,7 +138,84 @@ struct FelOverlayRealFileTests {
         #expect(fed.allSatisfy { tap.frame(at: $0) != nil })
     }
 
+    /// Loads the clip with the overlay, plays it muted and attaches to the overlay once the engine has it.
     @MainActor
+    private func play(_ clip: String) async throws -> (AetherEngine, SoftwareOverlayRenderer, OverlayPresentations) {
+        let engine = try AetherEngine()
+        var options = LoadOptions()
+        options.felOverlay = true
+        _ = try await engine.load(url: DoviFelRealFileTests.url(clip), options: options)
+        let player = try #require(engine.currentAVPlayer, "a FEL with felOverlay plays on the native route")
+        player.isMuted = true
+        engine.play()
+        // The overlay comes with the item, which the engine learns of on the main actor after the player has it.
+        let deadline = Date().addingTimeInterval(15)
+        while engine.softwareOverlay == nil, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let renderer = try #require(engine.softwareOverlay)
+        let timebase = try #require(player.currentItem?.timebase)
+        return (engine, renderer, OverlayPresentations(renderer, timebase: timebase))
+    }
+
+    /// The clip's frame interval, from its container.
+    private static func frameInterval(_ clip: String) throws -> Double {
+        let demuxer = Demuxer()
+        try demuxer.open(url: DoviFelRealFileTests.url(clip))
+        defer { demuxer.close() }
+        let stream = try #require(demuxer.stream(at: demuxer.videoStreamIndex))
+        let rate = stream.pointee.avg_frame_rate
+        return Double(rate.den) / Double(rate.num)
+    }
+
+    @Test("a FEL loaded with felOverlay stays native and composes every frame once, in order, ahead of its time",
+          .enabled(if: DoviFelRealFileTests.available("fel-clip-a.mkv"), DoviFelRealFileTests.needsClips))
+    @MainActor
+    func engineComposesOverAVPlayer() async throws {
+        let interval = try Self.frameInterval("fel-clip-a.mkv")
+        let (engine, renderer, presented) = try await play("fel-clip-a.mkv")
+        defer { engine.stop() }
+        let source = try #require(renderer.source as? FelCompositionSource)
+        #expect(try await presented.wait(forPictureAt: 0))
+        let first = try #require(presented.all.first?.time)
+        #expect(try await presented.wait(forPictureAt: first + 3))
+        let faults = OverlayPresentations.faults(in: presented.all[...], interval: interval, steadyFrom: first + 1)
+        #expect(faults.isEmpty, "\(faults.count) faults: \(faults.prefix(8))")
+        let counters = renderer.counters
+        #expect(counters.failed == 0)
+        // Past the first second the enhancement layer is decoded in time: the residual is on.
+        #expect(source.residualOff < counters.presented / 4)
+    }
+
+    @Test("a FEL seek forward, back, and while paused presents its target and composes on from it",
+          .enabled(if: DoviFelRealFileTests.available("fel-clip-a.mkv"), DoviFelRealFileTests.needsClips))
+    @MainActor
+    func seeks() async throws {
+        let interval = try Self.frameInterval("fel-clip-a.mkv")
+        let (engine, _, presented) = try await play("fel-clip-a.mkv")
+        defer { engine.stop() }
+        #expect(try await presented.wait(forPictureAt: 2))
+        for target in [20.0, 5.0] {
+            let before = presented.count
+            await engine.seek(to: target)
+            #expect(try await presented.wait(forPictureAt: target + 1.5, before: target + 3, after: before), "seek to \(target)")
+            let run = presented.run(afterSeekTo: target, after: before, interval: interval)
+            let start = try #require(run.first?.time, "a picture near \(target) after the seek")
+            #expect(start >= target - interval - 0.002 && start <= target + interval + 0.002,
+                    "the first picture after the seek to \(target) is at \(start)")
+            let faults = OverlayPresentations.faults(in: run, interval: interval, steadyFrom: target + 1)
+            #expect(faults.isEmpty, "after the seek to \(target), \(faults.count) faults: \(faults.prefix(8))")
+        }
+        engine.pause()
+        try await Task.sleep(for: .milliseconds(300))
+        let before = presented.count
+        let target = 10.0
+        await engine.seek(to: target)
+        try await Task.sleep(for: .seconds(2))
+        let shown = presented.all.dropFirst(before)
+        #expect(shown.contains { $0.time >= target - interval - 0.002 && $0.time <= target + 0.002 },
+                "paused, the seek to \(target) presents the frame there; presented \(shown.map(\.time).prefix(12))")
+    }
 }
 extension FelOverlayTests {
 

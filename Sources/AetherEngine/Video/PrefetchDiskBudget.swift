@@ -12,6 +12,11 @@ import Foundation
 /// So the producer parks once the window's own bytes reach the budget. Eviction of the extras behind
 /// the playhead frees room as playback advances, which releases the park, so the prefetch tracks the
 /// budget instead of the source length. Sessions that never opt in never reach the condition.
+///
+/// An overlay session's tap keeps what the segments leave out (a Dolby Vision enhancement layer, a software-decoded
+/// stream's video) for every unit cut, until the clock passes it. Its bytes count against the same budget, and a
+/// full tap parks the producer too, so whatever has the producer read ahead (a subtitle consumer's lead) costs a
+/// bounded amount.
 enum PrefetchDiskBudget {
 
     /// Segments the producer may always run ahead of the consumer, budget or not. Bounding disk closer
@@ -23,15 +28,20 @@ enum PrefetchDiskBudget {
     ///   - forwardBytes: on-disk bytes at or above the consumer's target (`SegmentCache.forwardBytes`),
     ///     i.e. what the producer's race-ahead owns. History behind the playhead is excluded: the
     ///     extras eviction already bounds it, and counting it would throttle a standard session.
-    ///   - budgetBytes: the session retention budget; 0 (live) never parks.
+    ///   - overlayBytes: what an overlay tap keeps on disk for the units cut.
+    ///   - overlayFull: the tap holds as many units as it keeps (`OverlayPacketTap.hasRoomAhead`).
+    ///   - budgetBytes: the session retention budget; 0 (live) never parks for bytes.
     ///   - head: segment index the producer is about to write.
     ///   - consumerTarget: the consumer's last declared fetch index (`SegmentCache.targetIndex`).
     static func shouldPark(forwardBytes: Int,
+                           overlayBytes: Int = 0,
+                           overlayFull: Bool = false,
                            budgetBytes: Int,
                            head: Int,
                            consumerTarget: Int,
                            minAheadSegments: Int = minAheadSegments) -> Bool {
-        guard budgetBytes > 0, forwardBytes >= budgetBytes else { return false }
+        let overBudget = budgetBytes > 0 && forwardBytes + overlayBytes >= budgetBytes
+        guard overBudget || overlayFull else { return false }
         return head - consumerTarget >= minAheadSegments
     }
 }

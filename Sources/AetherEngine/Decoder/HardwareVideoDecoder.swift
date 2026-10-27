@@ -286,13 +286,22 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     // MARK: - Lifecycle
 
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
-        self.onFrame = onFrame
-
         guard let codecpar = stream.pointee.codecpar else {
             throw VideoDecoderError.noCodecParameters
         }
+        try open(parameters: codecpar, timeBase: stream.pointee.time_base,
+                 containerSAR: stream.pointee.sample_aspect_ratio, frameRate: stream.pointee.avg_frame_rate,
+                 onFrame: onFrame)
+    }
 
-        timeBase = stream.pointee.time_base
+    /// `open(stream:)` from the stream's parts, for a caller that keeps them past the demuxer's life: the codec
+    /// parameters, the time base packets are stamped in, the container's sample aspect ratio, and the average frame
+    /// rate (VP9's level; zero when unknown).
+    func open(parameters codecpar: UnsafePointer<AVCodecParameters>, timeBase: AVRational, containerSAR: AVRational,
+              frameRate: AVRational = AVRational(num: 0, den: 1),
+              onFrame: @escaping DecodedFrameHandler) throws {
+        self.onFrame = onFrame
+        self.timeBase = timeBase
         width = codecpar.pointee.width
         height = codecpar.pointee.height
 
@@ -301,7 +310,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // DisplayWidth quotient, MP4's `pasp`), which is where every DVD remuxed to MKV carries it.
         pixelAspectRatio = Self.resolvePixelAspectRatio(
             bitstream: codecpar.pointee.sample_aspect_ratio,
-            container: stream.pointee.sample_aspect_ratio,
+            container: containerSAR,
             width: width,
             height: height
         )
@@ -310,8 +319,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 "[HWDecoder] SAR \(sar.num):\(sar.den) on \(width)x\(height) "
                 + "(bitstream=\(codecpar.pointee.sample_aspect_ratio.num):"
                 + "\(codecpar.pointee.sample_aspect_ratio.den) "
-                + "container=\(stream.pointee.sample_aspect_ratio.num):"
-                + "\(stream.pointee.sample_aspect_ratio.den))",
+                + "container=\(containerSAR.num):\(containerSAR.den))",
                 category: .swPlayback
             )
         }
@@ -319,7 +327,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         if codecpar.pointee.codec_id == AV_CODEC_ID_AV1, !Self.canDecodeAV1InHardware {
             throw VideoDecoderError.unsupportedCodec(id: codecpar.pointee.codec_id.rawValue)
         }
-        let configuration = try VideoToolboxVideoFormat.make(stream: stream)
+        let configuration = try VideoToolboxVideoFormat.make(parameters: codecpar, containerSAR: containerSAR,
+                                                             frameRate: frameRate)
         codecName = configuration.codecName
         formatCodecType = configuration.codecType
         formatExtensions = configuration.extensions
@@ -358,16 +367,37 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let use10Bit = configuration.bitDepth > 8
 
         streamColor = ColorDescription(codecpar: codecpar)
+        containerHDRStatic = HDRStaticMetadata(codecpar: codecpar)
         streamCodecID = codecpar.pointee.codec_id
         streamProfile = codecpar.pointee.profile
         scansHDR10Plus = codecpar.pointee.color_trc == AVCOL_TRC_SMPTE2084
         hdr10PlusFraming = .lengthPrefixed(size: NALUnitChain.lengthPrefixSize(
             codecID: streamCodecID, extradata: codecpar.pointee.extradata,
             extradataSize: Int(codecpar.pointee.extradata_size)) ?? 4)
-        self.colorPrimaries = ColorAttachments.primaries(codecpar.pointee.color_primaries)
-        self.colorTransfer = ColorAttachments.transfer(codecpar.pointee.color_trc)
-        self.colorMatrix = ColorAttachments.matrix(codecpar.pointee.color_space)
-        let pixelFormat: OSType = use10Bit
+        let declared = HEVCInBandColour.Tags(primaries: ColorAttachments.primaries(codecpar.pointee.color_primaries),
+                                             transfer: ColorAttachments.transfer(codecpar.pointee.color_trc),
+                                             matrix: ColorAttachments.matrix(codecpar.pointee.color_space))
+        let record = codecpar.pointee.extradata.map {
+            [UInt8](UnsafeBufferPointer(start: $0, count: Int(codecpar.pointee.extradata_size)))
+        } ?? []
+        // HEVC states its colour per coded video sequence and its range in the SPS; AV1 and VP9 carry
+        // theirs in the format description built from the stream's parameters.
+        let fullRange: Bool
+        if streamCodecID == AV_CODEC_ID_HEVC {
+            inBandColour = HEVCInBandColour(
+                framing: A53SEIParser.nalFraming(codec: .hevc, extradata: codecpar.pointee.extradata,
+                                                 size: Int(codecpar.pointee.extradata_size)),
+                container: declared)
+            fullRange = BitstreamVideoRange.range(codecID: AV_CODEC_ID_HEVC, record: record) == AVCOL_RANGE_JPEG
+        } else {
+            inBandColour = nil
+            fullRange = codecpar.pointee.color_range == AVCOL_RANGE_JPEG
+        }
+        let presented = Self.guessingSD(declared, width: codecpar.pointee.width, height: codecpar.pointee.height)
+        self.colorPrimaries = presented.primaries
+        self.colorTransfer = presented.transfer
+        self.colorMatrix = presented.matrix
+        let pixelFormat = Self.pixelFormat(tenBit: use10Bit, fullRange: fullRange)
 
         let pixelBufferAttrs: NSDictionary = [
             kCVPixelBufferPixelFormatTypeKey: pixelFormat,
@@ -391,7 +421,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         session = createdSession
 
-        attachesAV1DolbyVisionRPU = Self.decodesAV1DolbyVision(stream: stream)
+        attachesAV1DolbyVisionRPU = Self.decodesAV1DolbyVision(parameters: codecpar)
         EngineLog.emit(
             "[HardwareVideoDecoder] opened \(codecName) \(width)x\(height) "
             + (attachesAV1DolbyVisionRPU ? "Dolby Vision 10.1 (RPU attached per frame) " : "")

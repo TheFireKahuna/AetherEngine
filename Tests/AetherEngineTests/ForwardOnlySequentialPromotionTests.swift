@@ -1,7 +1,7 @@
 // A URL source that turned out forward-only used to be forced onto the software host, which cannot
 // seek on it either and whose picture never reaches an AirPlay receiver (only its audio follows the
 // route). When the container states a duration, the engine now serves it as the sequential origin it
-// is. The software host itself still cannot hand a receiver its picture, and `airPlayPictureStaysLocal`
+// is. A picture the engine decodes itself still cannot reach a receiver, and `airPlayPictureStaysLocal`
 // says so instead of letting the TV play sound only in silence.
 import Testing
 @testable import AetherEngine
@@ -40,13 +40,10 @@ struct ForwardOnlySequentialPromotionTests {
         }
     }
 
-    @Test("only the software host leaves the picture behind on a wireless receiver")
+    @Test("only a picture drawn locally is left behind on a wireless receiver")
     func pictureStaysLocal() {
-        #expect(AetherEngine.airPlayPictureStaysLocal(backend: .software, wirelessAirPlayRoute: true))
-        for backend in [PlaybackBackend.native, .audio, .none] {
-            #expect(!AetherEngine.airPlayPictureStaysLocal(backend: backend, wirelessAirPlayRoute: true),
-                    "\(backend) reported a local picture")
-        }
-        #expect(!AetherEngine.airPlayPictureStaysLocal(backend: .software, wirelessAirPlayRoute: false))
+        #expect(AetherEngine.airPlayPictureStaysLocal(pictureDrawnLocally: true, wirelessAirPlayRoute: true))
+        #expect(!AetherEngine.airPlayPictureStaysLocal(pictureDrawnLocally: false, wirelessAirPlayRoute: true))
+        #expect(!AetherEngine.airPlayPictureStaysLocal(pictureDrawnLocally: true, wirelessAirPlayRoute: false))
     }
 }

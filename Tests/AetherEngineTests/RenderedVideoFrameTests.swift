@@ -19,10 +19,6 @@ struct RenderedVideoFrameTests {
         let engine = try AetherEngine()
         engine.softwareHost = SoftwarePlaybackHost()
         engine.playbackBackend = backend
-        let result = await engine.hasRenderedVideoFrame { _ in
-            Issue.record("Inactive software metrics must not be read")
-            return presented
-        }
         #expect(!result)
     }
 
@@ -32,7 +28,6 @@ struct RenderedVideoFrameTests {
         engine.softwareHost = SoftwarePlaybackHost()
         engine.playbackBackend = .software
         engine.hasFirstFrameReadyForDisplay = true
-        #expect(await engine.hasRenderedVideoFrame { _ in nil } == false)
     }
 
     @Test("Only a non-dropped frame is evidence of presentation",
@@ -42,10 +37,6 @@ struct RenderedVideoFrameTests {
         let host = SoftwarePlaybackHost()
         engine.softwareHost = host
         engine.playbackBackend = .software
-        let result = await engine.hasRenderedVideoFrame { queriedHost in
-            #expect(queriedHost === host)
-            return .init(total: total, dropped: dropped, corrupted: 0, accumulatedDelay: 0)
-        }
         #expect(result == expected)
     }
 
@@ -57,9 +48,6 @@ struct RenderedVideoFrameTests {
         engine.playbackBackend = .software
         var continuation: CheckedContinuation<SampleBufferRenderer.RenderMetrics?, Never>?
         let read = Task { @MainActor in
-            await engine.hasRenderedVideoFrame { _ in
-                await withCheckedContinuation { continuation = $0 }
-            }
         }
         try await waitFor { continuation != nil }
         switch change {

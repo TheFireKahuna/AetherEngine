@@ -130,30 +130,27 @@ struct ContainerChapterSeekAxisTests {
     @Test("The native origin is the container start")
     func nativeOrigin() {
         #expect(PresentationAxis.containerChapterOrigin(
-            backend: .native, formatStartSeconds: 5, sourceStartOrigin: 5, isLive: false) == 5)
+            backend: .native, formatStartSeconds: 5, isLive: false) == 5)
         #expect(PresentationAxis.containerChapterOrigin(
-            backend: .native, formatStartSeconds: 1.5, sourceStartOrigin: 1.5, isLive: false) == 1.5)
+            backend: .native, formatStartSeconds: 1.5, isLive: false) == 1.5)
     }
 
-    @Test("Live keeps origin zero on both video routes")
+    @Test("Live keeps origin zero")
     func liveOriginIsZero() {
         #expect(PresentationAxis.containerChapterOrigin(
-            backend: .native, formatStartSeconds: 5, sourceStartOrigin: 5, isLive: true) == 0)
-        #expect(PresentationAxis.containerChapterOrigin(
-            backend: .software, formatStartSeconds: 5, sourceStartOrigin: 5, softwareClockZero: 5,
-            isLive: true) == 0)
+            backend: .native, formatStartSeconds: 5, isLive: true) == 0)
     }
 
     @Test("Backends whose origin is not established publish the raw container times")
     func unestablishedOriginIsRaw() {
         #expect(PresentationAxis.containerChapterOrigin(
-            backend: .none, formatStartSeconds: 5, sourceStartOrigin: 5, isLive: false) == 0)
+            backend: .none, formatStartSeconds: 5, isLive: false) == 0)
         #expect(PresentationAxis.containerChapterOrigin(
-            backend: .audio, formatStartSeconds: 5, sourceStartOrigin: 5, isLive: false) == 0)
+            backend: .audio, formatStartSeconds: 5, isLive: false) == 0)
     }
 }
 
-/// The engine republishes `mediaChapters` when the backend settles and when the software clock anchors.
+/// The engine republishes `mediaChapters` when the backend settles.
 @Suite("Container chapters engine wiring")
 @MainActor
 struct ContainerChapterEngineWiringTests {
@@ -179,18 +176,6 @@ struct ContainerChapterEngineWiringTests {
         #expect(engine.mediaChapters.map(\.startSeconds) == [5, 9])
     }
 
-    @Test("The software list moves to the clock's real zero when the clock anchors")
-    func republishesWhenSoftwareClockAnchors() throws {
-        let engine = try AetherEngine()
-        engine.containerChapterSource = makeSource()
-        engine.playbackBackend = .software
-        #expect(engine.mediaChapters.map(\.startSeconds) == [0, 4])
-
-        engine.softwareClockSessionZero = 5.5
-        engine.republishMediaChapters()
-        #expect(engine.mediaChapters.map(\.startSeconds) == [0, 3.5])
-    }
-
     @Test("A source with no chapters publishes none")
     func noSourcePublishesNone() throws {
         let engine = try AetherEngine()
@@ -204,12 +189,8 @@ struct ContainerChapterEngineWiringTests {
 ///   AE_CHAPTER_CLIP_OFFSET  a Matroska file whose first cluster starts at 5 s, chapters at 5/9/13/17 s
 ///   AE_CHAPTER_CLIP_ZERO    a Matroska file that starts at 0, chapters at 0/4/8/12 s
 ///
-/// The software half asserts `sourceTime`, the raw container time the clock really reached. On the
-/// software host a seek publishes its own target as `currentTime`, so that value alone passes even when
-/// the content landed early. It runs two passes on separate loads: seek before the first play(), where
-/// the host predicts the session zero at load, and play first, where the demux loop resolves it. After
-/// each seek `sourceTime` is read once, about 0.35 s later, inside a tight window. The native half checks
-/// `sourceTime` as well as `currentTime`.
+/// Both halves check `sourceTime` as well as `currentTime`: the software-decoded half plays on the
+/// overlay over the same native session, with `preferredDecodePath = .software`.
 @Suite("Container chapter seek lands on the chapter (media)", .serialized, .timeLimit(.minutes(3)))
 @MainActor
 struct ContainerChapterSeekMediaTests {
@@ -266,61 +247,21 @@ struct ContainerChapterSeekMediaTests {
 
     private func checkEveryChapterLands(url: URL, software: Bool, expectedStarts: [Double],
                                         expectedSourceTimes: [Double]) async throws {
-        if software {
-            // Pass 1: seek before the first play(). The clock is not armed yet, so the seek has to
-            // convert on the zero the host predicted at load, and the demux loop never resolves its own.
-            let engine = try await loadReady(url, software: true)
-            defer { engine.stop() }
-            let chapters = engine.mediaChapters
-            #expect(chapters.map(\.startSeconds) == expectedStarts, "published chapter starts")
-
-            // The session zero exists from load on, for every consumer that converts before the first
-            // play: the subtitle-harvest anchor, the scrub stills, the resident ranges.
-            let originShift = expectedSourceTimes[0] - expectedStarts[0]
-            #expect((engine.softwareClockSessionZero ?? 0) == (originShift > 2 ? originShift : 0),
-                    "session zero reported at load")
-            let converted = try #require(engine.softwareHost).sourceSeconds(forSession: 4)
-            #expect(abs(converted - (4 + originShift)) < 0.001,
-                    "session 4 s converts to \(converted) s before play, want \(4 + originShift)")
-
-            for (chapter, source) in zip(chapters, expectedSourceTimes) {
-                let landed = try await seekAndSettle(engine, to: chapter.startSeconds, expecting: source) {
-                    $0.sourceTime
-                }
-                #expect(abs(landed - source) < 0.1,
-                        "before play: chapter \(chapter.id) @ \(chapter.startSeconds) sourceTime \(landed), want \(source)")
-            }
-            // Then play() on the armed clock and seek again.
-            engine.play()
-            let playing = try await waitUntil(timeout: .seconds(10)) { engine.state == .playing }
-            #expect(playing, "software play() reached .playing")
-            try await checkLandings(engine, chapters, expectedSourceTimes, phase: "after pre-play seeks and play")
-
-            // Pass 2: play first on a fresh load, so the demux loop resolves the zero when it arms
-            // the clock, then seek. This is the path where the loop, not the host, sets the zero.
-            let playFirst = try await loadReady(url, software: true)
-            defer { playFirst.stop() }
-            playFirst.play()
-            let started = try await waitUntil(timeout: .seconds(10)) {
-                playFirst.state == .playing && playFirst.sourceTime > expectedSourceTimes[0] + 0.1
-            }
-            #expect(started, "play-first: reached .playing past the origin, sourceTime \(playFirst.sourceTime)")
-            try await checkLandings(playFirst, playFirst.mediaChapters, expectedSourceTimes, phase: "play first")
-        } else {
-            let engine = try await loadReady(url, software: false)
-            defer { engine.stop() }
-            for (chapter, source) in zip(engine.mediaChapters, expectedSourceTimes) {
-                let landed = try await seekAndSettle(engine, to: chapter.startSeconds,
-                                                     expecting: chapter.startSeconds) { $0.currentTime }
-                #expect(abs(landed - chapter.startSeconds) < 0.1,
-                        "native chapter \(chapter.id) @ \(chapter.startSeconds) landed at \(landed)")
-                let reached = try await waitUntil(timeout: .seconds(4)) { abs(engine.sourceTime - source) <= 0.1 }
-                #expect(reached, "native chapter \(chapter.id) sourceTime \(engine.sourceTime), want \(source)")
-            }
+        let engine = try await loadReady(url, software: software)
+        defer { engine.stop() }
+        let route = software ? "overlay" : "native"
+        #expect(engine.mediaChapters.map(\.startSeconds) == expectedStarts, "\(route): published chapter starts")
+        for (chapter, source) in zip(engine.mediaChapters, expectedSourceTimes) {
+            let landed = try await seekAndSettle(engine, to: chapter.startSeconds,
+                                                 expecting: chapter.startSeconds) { $0.currentTime }
+            #expect(abs(landed - chapter.startSeconds) < 0.1,
+                    "\(route) chapter \(chapter.id) @ \(chapter.startSeconds) landed at \(landed)")
+            let reached = try await waitUntil(timeout: .seconds(4)) { abs(engine.sourceTime - source) <= 0.1 }
+            #expect(reached, "\(route) chapter \(chapter.id) sourceTime \(engine.sourceTime), want \(source)")
         }
     }
 
-    @Test("Chapter starts on a 5 s container start land on the chapter, software and native",
+    @Test("Chapter starts on a 5 s container start land on the chapter, software-decoded and native",
           .enabled(if: ContainerChapterSeekMediaTests.clip("AE_CHAPTER_CLIP_OFFSET") != nil))
     func offsetContainerChaptersLand() async throws {
         let url = try #require(Self.clip("AE_CHAPTER_CLIP_OFFSET"))
@@ -330,7 +271,7 @@ struct ContainerChapterSeekMediaTests {
                                          expectedSourceTimes: [5, 9, 13, 17])
     }
 
-    @Test("Chapter starts on a zero-start container land on the chapter, software and native",
+    @Test("Chapter starts on a zero-start container land on the chapter, software-decoded and native",
           .enabled(if: ContainerChapterSeekMediaTests.clip("AE_CHAPTER_CLIP_ZERO") != nil))
     func zeroContainerChaptersLand() async throws {
         let url = try #require(Self.clip("AE_CHAPTER_CLIP_ZERO"))

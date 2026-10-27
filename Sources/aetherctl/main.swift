@@ -647,7 +647,7 @@ if first == "live" {
     let rewindTest = takeFlag("--rewind-test", from: &rest)
     // --reload-test: macOS repro for tvOS live-reload frozen-frame stall; see liveReloadTest in LiveCmd.
     let reloadTest = takeFlag("--reload-test", from: &rest)
-    // --sw: TEST-ONLY force-SoftwarePlaybackHost routing for the H.264 fixture.
+    // --sw: TEST-ONLY force software-decode (overlay) routing for the H.264 fixture.
     let forceSW = takeFlag("--sw", from: &rest)
     // --drop-after N: close the first connection after N seconds (recoverable drop); AVIOReader reconnects.
     let dropAfter = takeDoubleFlag("--drop-after", from: &rest)

@@ -62,6 +62,7 @@ struct SoftwareChromaLocationTests {
             var p: UnsafeMutablePointer<AVPacket>? = pkt
             trackedPacketFree(&p)
         }
+        decoder.awaitDelivered()
         let buffer = try #require(box.first)
         for key in [kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferChromaLocationBottomFieldKey] {
             #expect(CVBufferCopyAttachment(buffer, key, nil) as? String == kCVImageBufferChromaLocation_Left as String)

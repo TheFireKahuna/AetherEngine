@@ -36,7 +36,7 @@ and the reporter one round trip, not to solve the issue.
 Exactly one kind: `bug`, `enhancement` or `question`. Then any number of areas that clearly apply:
 
 - `area: audio` (codecs, bridge, Atmos / DTS:X, channel layouts, AirPlay audio, lip-sync)
-- `area: video` (decode routes, frame pacing, AV1 / VP9 / interlaced, software host)
+- `area: video` (decode routes, frame pacing, AV1 / VP9 / interlaced, software overlay)
 - `area: hdr-dv` (Dolby Vision, HDR10 / HDR10+ / HLG, display criteria, panel mode switch)
 - `area: subtitles` (text, PGS / bitmap, forced, sidecars, closed captions)
 - `area: live` (live TV, HLS / TS live, DVR, timeshift, zapping)

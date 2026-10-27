@@ -851,6 +851,15 @@ extension AetherEngine {
 
     // MARK: - Decoder identity helpers
 
+    /// The video decoder of the native route's session: AVPlayer's own, or on an overlay session (a stream
+    /// AVPlayer is served a placeholder of) the overlay's decoder, which is VideoToolbox where it opened a
+    /// hardware session and libavcodec / dav1d otherwise. Read off the running session, never the route asked
+    /// for, so a load and a reload of the same stream name the same decoder.
+    func nativeVideoDecoderLabel(codecID: AVCodecID) -> String? {
+        let tap = nativeVideoSession?.overlayDecodeTap
+        return Self.videoDecoderLabel(codecID: codecID, isSoftware: tap.map { !$0.decodesInHardware } ?? false)
+    }
+
     /// User-facing label for the active video decoder. nil when no video track (AV_CODEC_ID_NONE).
     /// isSoftware describes the decoder, not the playback path: the software host can use VideoToolbox.
     static func videoDecoderLabel(codecID: AVCodecID, isSoftware: Bool) -> String? {
@@ -868,8 +877,6 @@ extension AetherEngine {
         return "VideoToolbox \(name) (HW)"
     }
 
-    /// for it. `route` is the host's `audioRoute`: the PCM decode is libavcodec into CoreAudio, the Atmos
-    /// routes are named the way the loopback route names its own APAC ("TRUEHD Atmos → APAC 7.1.4").
     /// User-facing label for the active audio pipeline of the audio-only host: libavcodec into CoreAudio.
     /// nil when no audio track. AE#462: `activeIndex` is the HOST's resolved index, never the engine's
     /// pick. The pick says which track was asked for; a session whose decoder refused to open serves

@@ -112,19 +112,17 @@ struct Issue260FrameTimeAxisTests {
     }
 
     /// A restart re-muxes segments from its start index forward under a fresh shift. The epoch is how a
-    /// consumer tells the rewritten frames from the ones it recorded before.
-    @Test("A restart opens a new epoch and reports the seam it starts at",
+    /// consumer tells the rewritten frames from the ones it recorded before. On VOD the axis itself is
+    /// what AVPlayer reports in band (`noteInBandClock`, `InBandClockTests`), so a restart publishes
+    /// no seam of its own; its frames land on its segment's own stretch of the item axis.
+    @Test("A restart opens a new epoch whose frames start at its own segment",
           .enabled(if: fixtureExists("restart-witness-av.mp4"),
                    "run Scripts/fetch-fixtures.sh to generate the witness clip"),
           .timeLimit(.minutes(2)))
     func restartOpensNewEpoch() async throws {
         let collector = FrameTimeCollector()
-        let seams = SeamCollector()
         let engine = HLSVideoEngine(url: fixtureURL("restart-witness-av.mp4"), dvModeAvailable: false)
         engine.setNativeVideoFrameTimeObserver { collector.record($0) }
-        engine.onPlaylistShiftChanged = { shift, seamItemSeconds in
-            seams.record(shift: shift, at: seamItemSeconds)
-        }
         _ = try engine.start()
         defer { engine.stop() }
         let prov = try #require(engine.provider)
@@ -132,38 +130,21 @@ struct Issue260FrameTimeAxisTests {
         #expect(prov.mediaSegment(at: 0) != nil)
         #expect(prov.mediaSegment(at: 1) != nil)
         let firstEpoch = try #require(collector.snapshot().last?.epoch)
+        let segmentStart = engine.restartLock.withLock {
+            engine.segmentPlan.count > 1 ? engine.segmentPlan[1].startSeconds : nil
+        }
+        let seamAt = try #require(segmentStart)
+        #expect(seamAt > 1.0, "segment 1 starts at \(seamAt)s on the item axis")
 
         engine.requestRestart(at: 1)
 
         try await waitFor { collector.snapshot().contains { $0.epoch > firstEpoch } }
         let restarted = collector.snapshot().filter { $0.epoch > firstEpoch }
-
-        // The restart producer starts at segment 1, so its seam sits at that segment's item-axis start,
-        // not at 0: a seam of 0 would collapse the history exactly like the pre-#260 behaviour.
-        let recorded = seams.snapshot()
-        try #require(recorded.count >= 2, "expected an initial shift plus a restart shift, got \(recorded)")
-        #expect(abs(recorded[0].at) < 0.001, "the first producer anchors at item 0, got \(recorded[0].at)s")
-        #expect(recorded[1].at > 1.0,
-                "restart at segment 1 must report its own item-axis start, got \(recorded[1].at)s")
-
-        // And the restarted frames land at or after that seam on the item axis.
-        let seamAt = recorded[1].at
+        // A restart that started its frames at 0 would collapse the history exactly like the pre-#260 behaviour.
         for frame in restarted {
             #expect(CMTimeGetSeconds(frame.item) >= seamAt - 0.001,
-                    "restarted frame at item \(CMTimeGetSeconds(frame.item))s precedes its seam \(seamAt)s")
+                    "restarted frame at item \(CMTimeGetSeconds(frame.item))s precedes its segment's start \(seamAt)s")
         }
     }
 }
 
-private final class SeamCollector: @unchecked Sendable {
-    private let lock = NSLock()
-    private var entries: [(shift: Double, at: Double)] = []
-
-    func record(shift: Double, at: Double) {
-        lock.lock(); entries.append((shift, at)); lock.unlock()
-    }
-
-    func snapshot() -> [(shift: Double, at: Double)] {
-        lock.lock(); defer { lock.unlock() }; return entries
-    }
-}

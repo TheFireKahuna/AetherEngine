@@ -506,7 +506,9 @@ public struct LoadOptions: Sendable, Equatable {
     public var preferDualLayerDolbyVision: Bool = false
 
     /// A Profile 7 FEL stays on the native route, and its enhancement layer is composed over AVPlayer's
+    /// picture instead: `AetherEngine.softwareOverlay` pairs each base-layer frame AVPlayer decodes with the
     /// source's enhancement layer, composes it on the dual-layer composer and presents it in a layer the
+    /// host puts inside its `AVPlayerLayer` (`SoftwareOverlayRenderer.install(in:)`). AVPlayer keeps the
     /// transport, AVKit's controls and menus, native subtitles and the audio (Dolby Atmos included).
     /// Same capability gate as `preferDualLayerDolbyVision`, which it takes precedence over. Needs the
     /// `DualLayerDolbyVision` trait; without it the option does nothing. Default on, so a build with the trait

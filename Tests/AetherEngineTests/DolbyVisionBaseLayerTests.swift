@@ -268,12 +268,11 @@ struct DolbyVisionBaseLayerTests {
             codecID: AV_CODEC_ID_HEVC, dvProfile: 5, dvBlCompatID: 0, presentsDolbyVisionBaseLayer: true))
         #expect(SessionOptionCorrection.decodePathRefusal(
             routedSoftware: false, preferred: .software, codecID: AV_CODEC_ID_HEVC,
-            dvProfile: 5, dvBLCompatID: 0, isLive: false, hasCompanionAudioReader: false)
+            dvProfile: 5, dvBLCompatID: 0)
             == .softwarePathCannotRepresentSource)
         #expect(SessionOptionCorrection.decodePathRefusal(
             routedSoftware: false, preferred: .software, codecID: AV_CODEC_ID_HEVC,
-            dvProfile: 5, dvBLCompatID: 0, presentsDolbyVisionBaseLayer: true,
-            isLive: false, hasCompanionAudioReader: false) == nil)
+            dvProfile: 5, dvBLCompatID: 0, presentsDolbyVisionBaseLayer: true) == nil)
     }
 
     // MARK: - The format clamp and the criteria it feeds

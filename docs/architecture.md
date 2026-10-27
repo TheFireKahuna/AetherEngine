@@ -82,12 +82,29 @@ When a restart does run, it must reproduce segments on the SAME media timeline t
 The video track's output time base is normally the source's, which movenc scales up to at least 10000 (Matroska's 1/1000 becomes 1/16000). That keeps whatever quantization the container has, and on a constant-rate track it is not harmless: 23.976 fps on 1 ms ticks reaches AVPlayer as 41 and 42 ms steps, and at a 59.94 Hz output every second frame sits exactly on a refresh boundary, where half a millisecond of rounding decides which vsync shows it (AE#886). `CFRFrameGrid` therefore gives a VOD track whose source tick is 0.1 ms or coarser, and whose rate probes as exactly a standard rate that the tick cannot hold, a time base with one frame in whole ticks (1/24000 and 1001 ticks for 23.976, 1/24000 and 1000 for 24), anchored at the stream's start time. `HLSSegmentProducer` puts each packet whose source-axis PTS lies within one source tick of a slot onto that slot (DTS onto its own slot, never past the PTS), and rescales everything else as before. The grid is derived from stream fields only, never from observed packets, so every producer of a session writes the same `init.mp4` timescale and a restarted segment still matches its continuous twin.
 
 The software host attempts a hardware-only VideoToolbox session for VP9 profile 0 (8-bit 4:2:0)
-using the [VP codec configuration box](https://www.webmproject.org/vp9/mp4/#vp-codec-configuration-box)
 ### Software decode on the overlay (AV1 + VP9 + VP8 + legacy formats)
 
+Codecs AVPlayer's HLS-fMP4 pipeline does not accept are decoded by the engine and drawn as an overlay over
+the native session: AV1 without a hardware decoder (no Apple TV ships one, and Apple bundles dav1d only on
+iOS / macOS), VP9 / VP8 (AVPlayer parses the HLS manifest, sees `vp09` / `vp08` in the CODECS attribute,
+then silently stops fetching), legacy MPEG-4 Part 2, MPEG-2 video and VC-1 (none of `mp4v.20.X` / `mp2v` /
+`vc-1` are in Apple's HLS Authoring Spec CODECS list), interlaced H.264 (`VideoRoutingPolicy`, keyed on the
+declared field order, verified against decoded frames by `InterlaceProbe` on seekable VOD, #232), and a
+Profile 7 FEL title composed from both layers. The session is still a loopback AVPlayer session: AVPlayer
+plays a placeholder video stream carrying the source's Dolby Vision / HDR signalling and the session's
+audio (stream copy, or the APAC spatial bridge for object audio), so transport, Now Playing, the audio
+route, interruptions and the panel's mode all stay AVPlayer's. `OverlayDecodeTap` decodes the source's
+pictures (`SoftwareVideoDecoder` for libavcodec / dav1d, `HardwareVideoDecoder` for HEVC) into GPU slabs,
+and `SoftwareOverlayRenderer` presents them on an `AVSampleBufferDisplayLayer` above the player layer,
+timed against the AVPlayer item's clock.
 
 ```
 Source URL ──► Demuxer ──┬─► SoftwareVideoDecoder (dav1d) ──► SampleBufferRenderer
+Source URL ──► Demuxer ──► HLSSegmentProducer ──┬─► placeholder video + audio ──► AVPlayer
+                                                 │                                   │ clock
+                                                 └─► OverlayDecodeTap ──► SoftwareOverlayRenderer
+                                                                                      │
+                                                                     AVSampleBufferDisplayLayer
 ```
 
 A seek holds the last frame on screen rather than blanking it. `SampleBufferRenderer.flush()` takes a `removingDisplayedImage` flag and hands it straight to `AVSampleBufferVideoRenderer.flush(removingDisplayedImage:)`: stop/teardown clears the visible frame (the default), but `SoftwarePlaybackHost.seek()` passes `false`, so the previous frame stays up until the post-seek keyframe decodes instead of flashing black on slow sources like MPEG-2. This matches the native/AVPlayer path, which holds the frame through a seek (#90).
@@ -522,7 +539,8 @@ Sources/AetherEngine/
 │   ├── SegmentCache.swift                   Native path: producer/consumer segment store with backpressure, scrub-aware eviction + byte-budgeted VOD backward retention (restart-free back-seeks)
 │   ├── VTCapabilityProbe.swift              AV1 system-decode probe + per-format `canHardwareDecode` HW-decodability check for H.264 / HEVC profiles (Intel Macs, older chips, #2); gates codec routing (VP9 / VP8 / MPEG-4 Part 2 / MPEG-2 / VC-1 and interlaced H.264 always route SW, see VideoRoutingPolicy)
 │   ├── LiveCadencePolicy.swift              Turns the observed arrival cadence into the two LL-HLS decisions (served TARGETDURATION, blocking-reload eligibility), re-evaluated on every manifest render, instead of trusting a bursty origin's own number
-│   ├── PrefetchDiskBudget.swift             Disk bound for an opt-in whole-source prefetch: the hard window is never evicted, so the budget bounds only what lives outside it (#207)
+│   ├── PrefetchDiskBudget.swift             Disk bound for what the producer keeps ahead: the segments past the consumer's target and an overlay tap's units count against the session budget, and a full tap parks it too, never inside the ten segments AVPlayer is owed (#207)
+│   ├── SpilledUnits.swift                   The overlay taps' access units on disk until the clock reaches them, packet and composer parameters: written once when cut, read back on the decode thread, in unlinked chunk files
 │   └── RetentionClaims.swift                Process-wide ledger of the running sessions' disk allowances: a new session is sized from the free space minus what the others may still write, so concurrent engines cannot each claim a quarter of the same space (#687)
 └── View/
     └── AetherPlayerView.swift               Polymorphic surface: hosts either AVPlayerLayer (native) or AVSampleBufferDisplayLayer (SW)

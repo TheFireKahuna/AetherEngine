@@ -327,7 +327,7 @@ stays but every frame goes out as its base layer.
 
 The route decision does not look at the display. With `preferDualLayerDolbyVision` on and a display
 that does not take Dolby Vision (an SDR or HDR10-only panel or mode), the route is still taken when
-the gate above passes: the software host composes the full FEL picture and presents it with the
+the gate above passes: the overlay composes the full FEL picture and the placeholder AVPlayer plays
 carries its Profile 8.1 metadata (§2), and how tvOS presents that on such a display is up to the platform.
 The native route, by contrast, strips the Dolby Vision for such a display (`CodecRoutePolicy`) and plays
 the HDR10 base layer. A host that wants the base layer on a non-Dolby-Vision display leaves the flag off,
@@ -339,13 +339,13 @@ The dual-layer route runs on the software host: there is no `AVPlayer` and no `A
 
 | Scrub thumbnails | With `serveIFramePlaylist`, an `EXT-X-I-FRAME-STREAM-INF` rendition next to the master, so a stock `AVPlayerViewController` draws its own thumbnails and scans on I-frames, plus `scrubThumbnail(atSeconds:)`. | No I-frame playlist, so a stock player shows no thumbnails of its own. `scrubThumbnail(atSeconds:)` answers from the software host's retained packet cache (`servesPacketCacheStills`) and only when that cache exists: a local file is read directly and has none, so there the call returns nil. The still is the base layer decoded by libavcodec, not the composed picture. |
 | Subtitles | Text tracks can be declared in the init segment and served as WebVTT renditions (`prepareNativeSubtitles`), so `AVMediaSelection`, PiP and external screens render them. | No renditions and no `AVMediaSelection`. The engine decodes the cues and publishes them; the host draws its own overlay in the app. They appear in a PiP window only through the frame compositor above, and the system caption styling does not apply. |
-| AirPlay | `AVPlayer` hands the receiver the stream (the engine serves the loopback over the LAN address for it). | The layer draws on the device and only the audio renderer follows the route, so a wireless receiver plays sound only. The engine publishes `airPlayPictureStaysLocal` (iOS) so a host can say so. When the host reports that the receiver shows video (`setAirPlayReceiverShowsVideo(_:)`), a FEL source takes the native route instead (8.1 where the display takes Dolby Vision, no enhancement layer) so the receiver gets a picture; an audio-only output such as a HomePod keeps the dual-layer route. This is decided at each load: on a URL source `reloadAtCurrentPosition()` decides again, a custom source keeps its route until the next `load()`. Not applicable where the device is itself the receiver. |
 The composed overlay draws over a loopback `AVPlayer` session, so transport, Now Playing, audio, the
 item's media selection and the I-frame rendition stay the native route's. What differs is the picture:
 
 | Feature | Dual-layer route |
 |---|---|
 | Picture in Picture | The engine publishes `SoftwarePiPSource` (the overlay's layer plus the transport answers for a sample-buffer PiP content source) and the host builds the `AVPictureInPictureController` around it; while PiP is active, subtitle cues are drawn into the overlay's pictures. |
+| AirPlay | The overlay draws on the device, so a wireless receiver gets the placeholder stream's sound only. The engine publishes `airPlayPictureStaysLocal` (iOS) so a host can say so. When the host reports that the receiver shows video (`setAirPlayReceiverShowsVideo(_:)`), a FEL source takes the native route instead (8.1 where the display takes Dolby Vision, no enhancement layer) so the receiver gets a picture. Decided at each load. |
 
 ### 5.3 Packet split
 

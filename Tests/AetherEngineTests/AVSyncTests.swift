@@ -7,6 +7,7 @@
 import AVFoundation
 import CoreVideo
 import Foundation
+import os
 import Testing
 @testable import AetherEngine
 
@@ -59,6 +60,87 @@ struct AVSyncTests {
         let video = flash + (origins.video ?? 0), audio = click + (origins.audio ?? 0)
         let offset = (audio - video) * 48_000
         #expect(abs(offset) <= clip.toleranceSamples, "audio is \(offset) samples off the picture")
+    }
+
+    /// Through the software overlay: the session decodes the MPEG-2 picture and the overlay stamps each picture with
+    /// its item time on a layer that follows AVPlayer's clock, while the sound goes to AVPlayer in the segments the
+    /// session serves. The white picture's item time, as the overlay hands it to its layer, and the click's, in the
+    /// segment AVPlayer is served in the same session, are the same to the sample.
+    @Test("through the software overlay the click and the white picture share their item time", .timeLimit(.minutes(2)))
+    @MainActor
+    func overlayClickOnPicture() async throws {
+        let url = avsyncFixture("mpeg2-overlay.mkv")
+        try #require(FileManager.default.fileExists(atPath: url.path),
+                     "run Scripts/fetch-fixtures.sh to generate Fixtures/avsync/")
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        _ = try await engine.load(url: url, options: LoadOptions())
+        let player = try #require(engine.currentAVPlayer)
+        #expect(engine.nativeVideoSession?.overlayDecodeTap != nil, "MPEG-2 plays through the overlay")
+        player.isMuted = true
+        engine.play()
+        let deadline = Date().addingTimeInterval(15)
+        while engine.softwareOverlay == nil, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        let renderer = try #require(engine.softwareOverlay)
+        let presented = OSAllocatedUnfairLock(initialState: (white: [Double](), latest: 0.0))
+        renderer.onPresented = { time, picture in
+            let white = Self.isWhite(picture)
+            presented.withLock { state in
+                if white { state.white.append(time.seconds) }
+                state.latest = max(state.latest, time.seconds)
+            }
+        }
+        while presented.withLock({ $0.latest }) < 1.5, Date() < deadline { try await Task.sleep(for: .milliseconds(50)) }
+        let white = presented.withLock { $0.white }
+        #expect(white.count == 1, "one white picture, presented once: \(white)")
+        let picture = try #require(white.first, "the white picture reached the layer")
+
+        // The sound AVPlayer is served in this session, placed at its fragment's tfdt as HLS places it.
+        let asset = try #require(player.currentItem?.asset as? AVURLAsset)
+        let (initBytes, segment) = try Self.firstSegment(of: asset.url)
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("avsync-overlay-\(UUID().uuidString).mp4")
+        try (initBytes + segment).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let measured = await withCheckedContinuation { (continuation: CheckedContinuation<(Double?, Double?), Never>) in
+            Thread.detachNewThread { continuation.resume(returning: Self.measure(file)) }
+        }
+        let click = try #require(measured.1, "no click decoded")
+        let audio = click + (Self.firstTfdtSeconds(initBytes + segment).audio ?? 0)
+        let offset = (audio - picture) * 48_000
+        #expect(abs(offset) <= 1, "the click is \(offset) samples off the white picture (picture \(picture) s, click \(audio) s)")
+    }
+
+    /// Whether a decoded picture's centre is white: its luma sample past half scale, 8- or 16-bit.
+    nonisolated static func isWhite(_ picture: CVPixelBuffer) -> Bool {
+        CVPixelBufferLockBaseAddress(picture, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(picture, .readOnly) }
+        let width = CVPixelBufferGetWidthOfPlane(picture, 0), height = CVPixelBufferGetHeightOfPlane(picture, 0)
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(picture, 0)
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(picture, 0) else { return false }
+        let row = base + stride * (height / 2)
+        if stride >= 2 * width {
+            return row.assumingMemoryBound(to: UInt16.self)[width / 2] > 0x8000
+        }
+        return row.assumingMemoryBound(to: UInt8.self)[width / 2] > 128
+    }
+
+    /// The init segment and the first media segment carrying the sound, of the media playlist at `url`, or of a
+    /// multivariant playlist's audio rendition where it names one (docs/demuxed-audio.md), else its first variant.
+    static func firstSegment(of url: URL) throws -> (Data, Data) {
+        let text = try String(contentsOf: url, encoding: .utf8)
+        let lines = text.split(whereSeparator: \.isNewline).map(String.init)
+        if let rendition = lines.first(where: { $0.hasPrefix("#EXT-X-MEDIA:TYPE=AUDIO") && $0.contains("URI=\"") }),
+           let uri = rendition.components(separatedBy: "URI=\"").last?.split(separator: "\"").first {
+            return try firstSegment(of: try #require(URL(string: String(uri), relativeTo: url)))
+        }
+        if let variant = lines.firstIndex(where: { $0.hasPrefix("#EXT-X-STREAM-INF") }), variant + 1 < lines.count {
+            return try firstSegment(of: try #require(URL(string: lines[variant + 1], relativeTo: url)))
+        }
+        let map = try #require(lines.first { $0.hasPrefix("#EXT-X-MAP:") }, "no init segment in \(url)")
+        let mapURI = try #require(map.split(separator: "\"").dropFirst().first.map(String.init))
+        let segmentURI = try #require(lines.first { !$0.hasPrefix("#") && !$0.isEmpty })
+        return (try Data(contentsOf: try #require(URL(string: mapURI, relativeTo: url))),
+                try Data(contentsOf: try #require(URL(string: segmentURI, relativeTo: url))))
     }
 
     /// AE#464's audio delay moves the sound against the picture by exactly what was asked, and a

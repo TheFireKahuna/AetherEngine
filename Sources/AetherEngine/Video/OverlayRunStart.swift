@@ -41,4 +41,22 @@ final class OverlayRunStart: @unchecked Sendable {
     /// run's start. True when the picture is there or nothing needs to wait; false after `timeout`, after
     /// ``stalledDecodeSeconds`` in which `progress` (the decoder's units so far) stood still once it had moved, or
     /// once `shouldStop` says so.
+    func awaitPicture(clockSeconds: Double, timeout: TimeInterval, progress: () -> Int,
+                      hasPicture: (Double) -> Bool, shouldStop: () -> Bool) -> Bool {
+        guard let start = clock.withLock({ $0.runStart }),
+              abs(clockSeconds - start) < Self.runStartNearClockSeconds else { return true }
+        let began = CACurrentMediaTime()
+        var last = progress()
+        var movedAt: CFTimeInterval?
+        while !hasPicture(start) {
+            if shouldStop() { return false }
+            let now = CACurrentMediaTime()
+            let count = progress()
+            if count != last { last = count; movedAt = now }
+            if now - began > timeout { return false }
+            if let movedAt, now - movedAt > Self.stalledDecodeSeconds { return false }
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        return true
+    }
 }

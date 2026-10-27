@@ -1070,26 +1070,31 @@ final class SegmentCache: @unchecked Sendable {
         return currentForwardBytes()
     }
 
-    /// #207 producer park step: true once the producer may write `head`. Withheld while its race-ahead
-    /// has reached `budgetBytes` and the consumer still has a safe lead behind it; the extras eviction
-    /// that follows the advancing playhead is what frees the room again.
-    func awaitPrefetchDiskHeadroom(head: Int, budgetBytes: Int, timeout: TimeInterval = 1.0) -> Bool {
+    /// #207 producer park step: true once the producer may write `head`. Withheld while its race-ahead,
+    /// with what an overlay tap keeps for it (`overlay`: the tap's bytes, and whether it is full), has
+    /// reached `budgetBytes` and the consumer still has a safe lead behind it; the extras eviction and the
+    /// tap's trimming that follow the advancing playhead are what free the room again.
+    func awaitPrefetchDiskHeadroom(head: Int, budgetBytes: Int,
+                                   overlay: () -> (bytes: Int, full: Bool) = { (0, false) },
+                                   timeout: TimeInterval = 1.0) -> Bool {
         condition.lock()
         defer { condition.unlock() }
-        if !shouldParkLocked(head: head, budgetBytes: budgetBytes) {
+        if !shouldParkLocked(head: head, budgetBytes: budgetBytes, overlay: overlay()) {
             _producerParked = false
             return true
         }
         _producerParked = true
         _ = condition.wait(until: Date().addingTimeInterval(timeout))
-        let released = !shouldParkLocked(head: head, budgetBytes: budgetBytes)
+        let released = !shouldParkLocked(head: head, budgetBytes: budgetBytes, overlay: overlay())
         _producerParked = !released
         return released
     }
 
     /// Must be called with condition held.
-    private func shouldParkLocked(head: Int, budgetBytes: Int) -> Bool {
+    private func shouldParkLocked(head: Int, budgetBytes: Int, overlay: (bytes: Int, full: Bool)) -> Bool {
         PrefetchDiskBudget.shouldPark(forwardBytes: currentForwardBytes(),
+                                      overlayBytes: overlay.bytes,
+                                      overlayFull: overlay.full,
                                       budgetBytes: budgetBytes,
                                       head: head,
                                       consumerTarget: currentTargetIndex)

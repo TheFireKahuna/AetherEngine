@@ -137,7 +137,7 @@ func runLive(
     let logEpoch = Date()
     EngineLog.handler = { print(String(format: "[+%6.2fs] ", Date().timeIntervalSince(logEpoch)) + $0) }
 
-    // TEST-ONLY: force SoftwarePlaybackHost routing; cleared on exit to avoid in-process bleed.
+    // TEST-ONLY: force the software-decode (overlay) route; cleared on exit to avoid in-process bleed.
     AetherEngine.setForceSoftwarePathForTesting(forceSoftware)
     // AE#454: the device's own manifest route, which no live leg had ever taken.
     AetherEngine.setForceMasterPlaylistForTesting(forceMaster)
@@ -145,7 +145,7 @@ func runLive(
         print("aetherctl live: --force-master set, routing behind the master playlist")
     }
     if forceSoftware {
-        print("aetherctl live: --sw set, forcing SoftwarePlaybackHost routing")
+        print("aetherctl live: --sw set, forcing the software-decode (overlay) route")
     }
     defer { AetherEngine.setForceSoftwarePathForTesting(false) }
     defer { AetherEngine.setForceMasterPlaylistForTesting(false) }

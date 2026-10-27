@@ -86,12 +86,12 @@ extension AetherEngine {
             throw AetherEngineError.sessionNotReloadable(refusal)
         }
 
-        // AE#461: the decode-path escape is the one correction that can move the session to a host
-        // that cannot serve this source. `load` catches both such sources, but only after the
-        // routing decision, which on a correction is after the teardown; decide it here instead so
-        // a refused correction still costs nothing (rule 2 above).
+        // AE#461: the decode-path escape is the one correction that can move the session's video somewhere
+        // that cannot show this source. `load` catches it, but only after the routing decision, which on a
+        // correction is after the teardown; decide it here instead so a refused correction still costs
+        // nothing (rule 2 above).
         if let refusal = SessionOptionCorrection.decodePathRefusal(
-            routedSoftware: playbackBackend == .software,
+            routedSoftware: overlayDecodesVideoWanted,
             preferred: proposed.preferredDecodePath,
             codecID: lastDetectedVideoCodec,
             // AE#532: what the source is, not what its record claimed. A Profile 5 record the RPU
@@ -103,12 +103,10 @@ extension AetherEngine {
             // the base layer on and moves to software in one step is honoured, one that keeps the
             // Dolby Vision on a Profile 5 record is refused as before.
             presentsDolbyVisionBaseLayer: proposed.dolbyVisionHandling == .baseLayerOnly
-                && sourceDolbyVisionBaseLayerPresentable,
-            isLive: loadedOptions.isLive,
-            hasCompanionAudioReader: (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil
+                && sourceDolbyVisionBaseLayerPresentable
         ) {
             EngineLog.emit(
-                "[AetherEngine] #461: decode-path correction refused, the software path cannot serve "
+                "[AetherEngine] #461: decode-path correction refused, the software overlay cannot show "
                 + "this session: \(refusal.rawValue)",
                 category: .engine
             )
@@ -256,16 +254,13 @@ public enum SessionReloadRefusal: String, Sendable, Equatable, CustomStringConve
     /// A custom `IOReader` source that reported itself non-seekable. The rebuild reopens the
     /// retained reader at the current position, which a forward-only origin cannot serve.
     case customSourceNotSeekable
-    /// AE#461: the correction would move the session onto the software path, and this source's only
-    /// signal is IPT-PQ-c2 (HEVC Profile 5, AV1 Profile 10.0), which has no compatible base layer.
-    /// The software decoders hand that signal on as YCbCr, so the picture would render green/purple.
-    /// Reached only from `reloadAtCurrentPosition(applying:)`, and only when the proposal moves a
-    /// native session across; a session already on the software path is not moved by it.
+    /// AE#461: the correction would move the session's video into the software overlay, and this source's
+    /// only signal is IPT-PQ-c2 (HEVC Profile 5, AV1 Profile 10.0), which has no compatible base layer. The
+    /// software decoders hand that signal on as YCbCr, and the overlay's pixels never reach the system
+    /// compositor that reshapes it, so the picture would render green/purple. Reached only from
+    /// `reloadAtCurrentPosition(applying:)`, and only when the proposal moves a session AVPlayer decodes; a
+    /// session already in the overlay is not moved by it.
     case softwarePathCannotRepresentSource
-    /// AE#461: the correction would move a demuxed-audio live session onto the software path. The
-    /// side-audio merge lives in the native path's segment producer, so the session would play
-    /// silent. Same reachability as `softwarePathCannotRepresentSource`.
-    case demuxedAudioLiveIsNativeOnly
     /// A correction of `preferDualLayerDolbyVision`, or of `dolbyVisionHandling` while the preference is on, on a Profile 7 session that plays from a custom
     /// `IOReader` source. The route is decided by `load()`'s probe, which a custom source's in-place
     /// rebuild does not re-run, so the change could not take effect. Call `load()` again with the
@@ -277,9 +272,7 @@ public enum SessionReloadRefusal: String, Sendable, Equatable, CustomStringConve
         case .noActiveSession: return "no active session"
         case .customSourceNotSeekable: return "the custom source is not seekable"
         case .softwarePathCannotRepresentSource:
-            return "the software path cannot represent this source's Dolby Vision signal"
-        case .demuxedAudioLiveIsNativeOnly:
-            return "this live source's audio is delivered separately and merged on the native path only"
+            return "the software overlay cannot represent this source's Dolby Vision signal"
         case .dualLayerRouteNeedsFreshLoad:
             return "the dual-layer Dolby Vision route of a custom source is decided by load(), not by a rebuild"
         }
@@ -351,26 +344,23 @@ enum SessionOptionCorrection {
 
     /// AE#461: why a decode-path correction cannot be honoured for this session, or nil when it can.
     ///
-    /// The escape moves a session onto `SoftwarePlaybackHost`, and two sources cannot be served
-    /// there. `load` fails both of them, but it fails them AFTER the routing decision, which on a
-    /// correction means after `stopInternal` has already taken the session down. #460's second rule
-    /// is that a refusal costs nothing, so the same two facts are decided here, before any teardown,
-    /// off state the session already carries (its codec and Dolby Vision configuration from the
-    /// load-time probe, its live flag, its reader's companion audio reader).
+    /// The escape moves a session's video into the software overlay, and an IPT-only Dolby Vision source
+    /// cannot be shown there. `load` fails it, but AFTER the routing decision, which on a correction means
+    /// after `stopInternal` has already taken the session down. #460's second rule is that a refusal costs
+    /// nothing, so the same fact is decided here, before any teardown, off the codec and Dolby Vision
+    /// configuration the load-time probe left on the session.
     ///
-    /// Only a FLIP is refusable. A session already on the software path is not moved by a software
-    /// preference, so it is not asked to represent anything new, and an `.automatic` preference
-    /// moves nothing at all: refusing on the source facts alone would start throwing on every
-    /// ordinary audio-track switch of a Dolby Vision source.
+    /// Only a FLIP is refusable. A session already in the overlay is not moved by a software preference,
+    /// so it is not asked to represent anything new, and an `.automatic` preference moves nothing at all:
+    /// refusing on the source facts alone would start throwing on every ordinary audio-track switch of a
+    /// Dolby Vision source.
     static func decodePathRefusal(
         routedSoftware: Bool,
         preferred: DecodePath,
         codecID: AVCodecID,
         dvProfile: Int?,
         dvBLCompatID: Int?,
-        presentsDolbyVisionBaseLayer: Bool = false,
-        isLive: Bool,
-        hasCompanionAudioReader: Bool
+        presentsDolbyVisionBaseLayer: Bool = false
     ) -> SessionReloadRefusal? {
         let flipsToSoftware = !routedSoftware
             && VideoRoutingPolicy.usesSoftwarePath(routedSoftware: routedSoftware, preferred: preferred)
@@ -380,13 +370,6 @@ enum SessionOptionCorrection {
             codecID: codecID, dvProfile: dvProfile, dvBlCompatID: dvBLCompatID,
             presentsDolbyVisionBaseLayer: presentsDolbyVisionBaseLayer) {
             return .softwarePathCannotRepresentSource
-        }
-        // The companion reader exists only for a video-only live variant (the resolver spins one up
-        // for exactly that shape), so this is the demuxed-audio population rather than a superset of
-        // it. `load`'s own guard re-checks that the main container carries no audio; erring towards
-        // the refusal here is the safe direction, because the session it leaves alone is playing.
-        if isLive, hasCompanionAudioReader {
-            return .demuxedAudioLiveIsNativeOnly
         }
         return nil
     }

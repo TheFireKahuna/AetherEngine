@@ -11,6 +11,7 @@ import AetherLibavutil
 ///
 /// The segment producer already splits every video packet into its layers to serve the base layer
 /// (`separateDualLayers`); with a tap it keeps the rest instead of dropping it: the compressed enhancement
+/// layer and the composer parameters, in an ``OverlayPacketTap`` keyed by the packet's output presentation
 /// time, which is AVPlayer's item time. The enhancement layer is decoded near the clock on VideoToolbox. A run's
 /// first segment is held until the enhancement picture at the run's start is decoded (`awaitRunStart`), so a start
 /// or a seek opens on the full picture; after it, a frame whose enhancement picture is not decoded in time is
@@ -24,6 +25,9 @@ final class FelEnhancementTap: @unchecked Sendable {
 
     static let decodeAheadSeconds = 0.75
 
+    private let units = OverlayPacketTap<DoviMetalParams>(decodeAheadSeconds: FelEnhancementTap.decodeAheadSeconds) {
+        EnhancementLayerDecoder(deliver: $0)
+    }
     /// Where the current run starts and whether the player has moved the clock since (`OverlayRunStart`).
     private let runStart = OverlayRunStart()
     /// How far from a run's start the enhancement picture that opens it may be: the frame on screen at the start is
@@ -36,6 +40,7 @@ final class FelEnhancementTap: @unchecked Sendable {
     private var lastRpu: [UInt8]?
     private var borrowedRun = 0
 
+    func close() { units.close() }
 
     /// Rewrites `packet` to its Profile 8.1 base layer and keeps the enhancement layer and parameters. `packet`
     /// carries output (item-axis) timestamps, in decode order.
@@ -51,6 +56,7 @@ final class FelEnhancementTap: @unchecked Sendable {
         let dts = packet.pointee.dts == Int64.min ? pts : packet.pointee.dts
         let isKey = packet.pointee.flags & AV_PKT_FLAG_KEY != 0
         let opensRun = units.beginsRun(dts: packet.pointee.dts)
+        // A new run is read for picture order afresh.
         if opensRun { alignment = DualLayerVideoDecoder.makeAlignment() }
         // A run's first unit is where AVPlayer's clock is about to be (a load, a resume, a seek), so before the player
         // moves the clock itself the decode works toward it, once the unit is kept.
@@ -86,12 +92,18 @@ final class FelEnhancementTap: @unchecked Sendable {
             el.pointee.dts = dts
             if isKey { el.pointee.flags |= AV_PKT_FLAG_KEY }
         }
+        units.insert(pts: pts, timeBase: timeBase, isKey: isKey, info: params, packet: layers.elPacket)
         return layers.success
     }
 
     /// The frame AVPlayer shows at `seconds` (item time), nil when the producer has not cut it.
     func frame(at seconds: Double) -> Frame? {
+        units.unit(at: seconds).map { Frame(enhancement: $0.picture, params: $0.info) }
     }
+
+    /// The time of the frame AVPlayer is served after `seconds` (item time), in whole milliseconds; nil while the
+    /// producer has not cut it.
+    func frameTime(after seconds: Double) -> Double? { units.unitTime(after: seconds) }
 
     /// Where AVPlayer's clock is (item time): what the decoder works toward and what is kept around it.
     func advance(to seconds: Double) {
@@ -102,9 +114,68 @@ final class FelEnhancementTap: @unchecked Sendable {
     /// Blocks until the enhancement picture at the current run's start is decoded, when the clock is at or heading
     /// for the run's start: the segment holding it is what AVPlayer prerolls and starts its clock on. True when the
     /// picture is there or nothing needs to wait; false after `timeout`, once the decoder has stalled
+    /// (`OverlayRunStart.stalledDecodeSeconds`), or once `shouldStop` says so.
     func awaitRunStart(timeout: TimeInterval, shouldStop: () -> Bool) -> Bool {
+        runStart.awaitPicture(clockSeconds: units.clockSeconds, timeout: timeout,
+                              progress: { units.unitsDecoded }, hasPicture: {
+            units.hasPicture(near: $0, toleranceSeconds: Self.runStartToleranceSeconds)
+        }, shouldStop: shouldStop)
     }
 
+    /// Where the decode works toward, in item seconds.
+    var clockSeconds: Double { units.clockSeconds }
+
+    var held: (accessUnits: Int, decoded: Int, bytes: Int) {
+        let held = units.held
+        return (held.units, held.decoded, held.bytes)
+    }
+
+    /// Whether the producer may cut another unit (``OverlayPacketTap/hasRoomAhead``).
+    var hasRoomAhead: Bool { units.hasRoomAhead }
 }
 
+/// A FEL unit's composer parameters, kept on disk with its enhancement-layer packet.
+extension DoviMetalParams: OverlayUnitInfo {
+    func unitRecord() -> Data { record() }
+    init?(unitRecord: Data) { self.init(record: unitRecord) }
+}
+
+/// The enhancement layer's VideoToolbox decoder, opened from the parameter sets of the first unit it is given.
+private final class EnhancementLayerDecoder: OverlayTapDecoder {
+    private let deliver: @Sendable (CVPixelBuffer, CMTime) -> Void
+    private var decoder: HardwareVideoDecoder?
+
+    init(deliver: @escaping @Sendable (CVPixelBuffer, CMTime) -> Void) { self.deliver = deliver }
+
+    func decode(_ packet: UnsafeMutablePointer<AVPacket>, restarting: Bool, clock: Double, timeBase: AVRational) {
+        if restarting { decoder?.flush() }
+        if decoder == nil { open(from: packet, timeBase: timeBase) }
+        decoder?.decode(packet: packet)
+    }
+
+    func close() { decoder?.close() }
+
+    private func open(from packet: UnsafeMutablePointer<AVPacket>, timeBase: AVRational) {
+        guard let data = packet.pointee.data else { return }
+        var vps: [UInt8]?, sps: [UInt8]?, pps: [UInt8]?
+        A53SEIParser.forEachNAL(data, Int(packet.pointee.size), .lengthPrefixed(size: 4)) { nal, len in
+            let bytes = [UInt8](UnsafeBufferPointer(start: nal, count: len))
+            switch (nal[0] >> 1) & 0x3F {
+            case 32: vps = bytes
+            case 33: sps = bytes
+            case 34: pps = bytes
+            default: break
+            }
+        }
+        guard let vps, let sps, let pps else { return }
+        let d = HardwareVideoDecoder()
+        let deliver = deliver
+        do {
+            try d.open(parameterSets: [vps, sps, pps], timeBase: timeBase) { buffer, pts, _ in deliver(buffer, pts) }
+            decoder = d
+        } catch {
+            EngineLog.emit("[FelEnhancementTap] enhancement decoder failed to open: \(error)", category: .swPlayback)
+        }
+    }
+}
 #endif

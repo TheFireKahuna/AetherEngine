@@ -75,7 +75,7 @@ func runSWDecode(url: URL, maxPackets: Int) -> Int32 {
     print("VERDICT: SW decode end-to-end healthy. \(result.framesDecoded) frames")
     print("         produced into \(result.firstFramePixelFormat ?? "?") pixel buffers.")
     print("         If real playback still hangs, the failure is downstream")
-    print("         (SoftwarePlaybackHost frame-enqueue, AVSampleBufferDisplayLayer")
+    print("         (overlay frame-enqueue, AVSampleBufferDisplayLayer")
     print("         attach, audio-clock sync).")
     return 0
 }

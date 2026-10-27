@@ -25,6 +25,9 @@ import CoreVideo
 /// picture is IPT, which only `DolbyVisionStillConverter` reads, so it takes that converter and then the same
 /// encoder. The CODECS the master declares come from a warm-up encode,
 /// so they match the `hvcC` in every init.
+///
+/// A software overlay session's scan tier is the same builder in the source's own colour (`destination`): its
+/// served pictures are placeholders, so its keyframes are stills as well.
 final class IFrameStillBuilder: @unchecked Sendable {
     static let defaultWidth = 800
     /// A still above this is not expected at this size; it bounds the declared BANDWIDTH.
@@ -36,6 +39,7 @@ final class IFrameStillBuilder: @unchecked Sendable {
     /// scrub back over ground already covered should cost nothing.
     static let cachedFragments = 1536
     private static let timescale: UInt32 = 90_000
+    static var sdr: ColorAttachments.Tags { StillRenderer.sdr }
 
     struct Output {
         let initSegment: Data
@@ -49,12 +53,38 @@ final class IFrameStillBuilder: @unchecked Sendable {
     let initSegment: Data
 
     private let decoder: FrameDecodeContext
+    private let encoder: HEVCIntraEncoder
+    private let destination: ColorAttachments.Tags
     private let lock = NSLock()
     private var built: [Int: Data] = [:]
     private var builtOrder: [Int] = []
     private var loggedFailure = false
 
     /// nil when no HEVC Main10 encoder can be made or the warm-up encode yields no configuration record.
+    /// `destination` is the stills' colour: BT.709 SDR for the thumbnail tier, or a source's own for a scan tier.
+    init?(decoder: FrameDecodeContext, width: Int, height: Int, destination: ColorAttachments.Tags = sdr) {
+        self.decoder = decoder
+        self.width = width
+        self.height = height
+        self.destination = destination
+        guard let encoder = HEVCIntraEncoder(width: width, height: height, colour: destination, quality: 0.7),
+              let codecs = HLSVideoEngine.hevcCodecsString(fromConfigRecord: [UInt8](encoder.hvcC)) else {
+            EngineLog.emit("[IFrameStill] no HEVC Main10 encoder, or its warm-up encode gave no hvcC", category: .session)
+            return nil
+        }
+        self.encoder = encoder
+        self.codecs = codecs
+        let codes = ColorAttachments.description(primaries: destination.primaries, transfer: destination.transfer,
+                                                 matrix: destination.matrix, fullRange: false)
+        let colr = Self.box("colr", Self.cat([Data("nclx".utf8), Self.be16(UInt16(codes.primaries.rawValue)),
+                                              Self.be16(UInt16(codes.transfer.rawValue)),
+                                              Self.be16(UInt16(codes.matrix.rawValue)), Data([0x00])]))
+        let entry = Self.visualSampleEntry("hvc1", width: width, height: height,
+                                           children: [Self.box("hvcC", encoder.hvcC), colr])
+        initSegment = Self.makeInit(width: width, height: height, sampleEntry: entry)
+        EngineLog.emit("[IFrameStill] \(width)x\(height) \(codecs) hardware=\(encoder.isHardware)",
+                       category: .session)
+    }
 
     /// Output size for a source of `codedWidth` x `codedHeight` with sample aspect `sar`, even on both axes.
     static func size(codedWidth: Int, codedHeight: Int, sarNum: Int32, sarDen: Int32,
@@ -116,6 +146,7 @@ final class IFrameStillBuilder: @unchecked Sendable {
 
     private func encode(at what: String, picture: () -> CVPixelBuffer?) -> Data? {
         do { try decoder.ensureOpen() } catch { return nil }
+        return encoded
     }
 
     // MARK: - ISO BMFF

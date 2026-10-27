@@ -128,6 +128,10 @@ the public-API contract.
   libavcodec cannot decode, so the tap's stream stayed empty for the whole session. The tap now decodes APAC
   with AudioToolbox, from the cookie the init segment carries, and downmixes the bed to its mono 48 kHz format
   on the same clock as every other codec.
+- **A software or FEL overlay whose decoder stalls no longer holds a start for the full five seconds.** The
+  hold on a run's first segment now lets go two seconds after the decoder last made progress, as well as at
+  its five-second bound. A decoder that has not decoded its first unit yet (a session opening) still gets
+  the whole bound, and one still working its way to the picture is still waited for.
 - **The Atmos output activator's pause grace checks the host again when it ends (AE#848).** It paused the
   silent stream outright, so a host that started playing without a refresh in between lost Dolby Atmos on
   the receiver sixty seconds into playback.
@@ -138,8 +142,11 @@ the public-API contract.
   AirPlay, an external display), and stays off while a Picture in Picture window shows the software overlay,
   whose pictures carry the cues.
 - **A placeholder stream never reaches an AirPlay receiver.** AVPlayer handed a receiver the stream of a
+  session the software overlay draws, which there is only the black placeholder. External playback is off
   for those sessions, the picture stays on the device and the audio follows the route, and
+  `airPlayPictureStaysLocal` says so.
 - **A retained paused session recovers a failed overlay layer on its return** (AE#870). With
+  `retainsVideoPipelineWhenBackgrounded`, an overlay layer whose queue failed while the process was
   suspended stayed black until a picture was refused; it is flushed on the return to the foreground.
 - **A cancelled subtitle recognition no longer waits for Vision.** A recognition holds the OCR slot until
   Vision returns, which under load took longer than a test's whole time limit; its caller now stops waiting

@@ -1,3 +1,4 @@
+import AVFoundation
 import Testing
 import AetherLibavcodec
 @testable import AetherEngine
@@ -15,14 +16,30 @@ struct AirPlayParityTests {
         #expect(!AetherEngine.airPlayVideoReceiverHoldsRoute(wirelessAirPlayRoute: false, receiverShowsVideo: true))
     }
 
-    @Test("a mirrored screen carries the software picture to the receiver")
+    @Test("a mirrored screen carries the locally drawn picture to the receiver")
     func mirroringIsNotLocalOnly() {
         #expect(AetherEngine.airPlayPictureStaysLocal(
-            backend: .software, wirelessAirPlayRoute: true, screenMirrored: false))
+            pictureDrawnLocally: true, wirelessAirPlayRoute: true, screenMirrored: false))
         #expect(!AetherEngine.airPlayPictureStaysLocal(
-            backend: .software, wirelessAirPlayRoute: true, screenMirrored: true))
+            pictureDrawnLocally: true, wirelessAirPlayRoute: true, screenMirrored: true))
         #expect(!AetherEngine.airPlayPictureStaysLocal(
-            backend: .software, wirelessAirPlayRoute: false, screenMirrored: true))
+            pictureDrawnLocally: true, wirelessAirPlayRoute: false, screenMirrored: true))
+    }
+
+    @Test("an overlay over a placeholder keeps AVPlayer's external playback off; none restores it")
+    @MainActor func placeholderNeverReachesReceiver() throws {
+        let engine = try AetherEngine()
+        let player = AVPlayer()
+        engine.currentAVPlayer = player
+        let overlay = try OverlayRendererFixture()
+        defer { overlay.close() }
+        engine.softwareOverlay = overlay.renderer
+        engine.followOverlayWithExternalPlayback()
+        #expect(engine.pictureDrawnLocally)
+        #expect(!player.allowsExternalPlayback)
+        engine.softwareOverlay = nil
+        engine.followOverlayWithExternalPlayback()
+        #expect(player.allowsExternalPlayback)
     }
 
     @Test("the host-reported flags default off and the setters store them")

@@ -4,24 +4,22 @@ import AetherLibavcodec
 @testable import AetherEngine
 
 /// AE#461 follow-up: a mid-play decode-path correction has to reach the rebuild that keeps the
-/// retained reader, and be refused before teardown when the software path cannot serve the source.
+/// retained reader, and be refused before teardown when the software overlay cannot show the source.
 ///
-/// `preferredDecodePath` was read only inside `load`, while the custom-source rebuild picks its host
-/// from the backend the session was already on. A correction on that shape was therefore accepted,
-/// logged as applied and then ignored, which is the one outcome #460's own rules forbid: a
-/// correction either lands or is refused by name, never three quarters of the way.
+/// `preferredDecodePath` was read only inside `load`, while the custom-source rebuild kept the route the
+/// session was already on. A correction on that shape was therefore accepted, logged as applied and then
+/// ignored, which is the one outcome #460's own rules forbid: a correction either lands or is refused by
+/// name, never three quarters of the way.
 ///
-/// The direction is what makes the rebuild safe to re-route at all. `DecodePath` has no `.native`,
-/// so the only flip reachable here is native -> software, and the software path is the general one.
-/// The reverse (`loadNative` on a software-routed AV1 source, `unsupportedCodec`) stays unreachable
-/// by construction rather than by a comment asking the next reader not to write it.
+/// The direction is what makes the rebuild safe to re-route at all. `DecodePath` has no `.native`, so the
+/// only move reachable here is AVPlayer's decode -> the software overlay, which serves every codec.
 struct Issue461CustomSourceDecodePathTests {
 
     // MARK: the rebuild's route
 
-    /// The rebuild must ask the same pure policy `load` asks, seeded with the backend it is on.
-    /// A rebuild that reads `wasOnSoftwarePath` alone cannot honour a correction, which is the bug.
-    @Test("a native session with a software preference rebuilds on software")
+    /// The rebuild must ask the same pure policy `load` asks, seeded with the route it is on.
+    /// A rebuild that keeps the route it was on cannot honour a correction, which is the bug.
+    @Test("a native session with a software preference rebuilds in the overlay")
     func nativeSessionFlipsWhenCorrected() {
         #expect(VideoRoutingPolicy.usesSoftwarePath(routedSoftware: false, preferred: .software))
     }
@@ -43,9 +41,7 @@ struct Issue461CustomSourceDecodePathTests {
             preferred: .software,
             codecID: AV_CODEC_ID_H264,
             dvProfile: nil,
-            dvBLCompatID: nil,
-            isLive: false,
-            hasCompanionAudioReader: false) == nil)
+            dvBLCompatID: nil) == nil)
     }
 
     /// #176's colour guard runs after the routing decision inside `load`, so on the custom rebuild it
@@ -58,18 +54,14 @@ struct Issue461CustomSourceDecodePathTests {
             preferred: .software,
             codecID: AV_CODEC_ID_HEVC,
             dvProfile: 5,
-            dvBLCompatID: 0,
-            isLive: false,
-            hasCompanionAudioReader: false) == .softwarePathCannotRepresentSource)
+            dvBLCompatID: 0) == .softwarePathCannotRepresentSource)
 
         #expect(SessionOptionCorrection.decodePathRefusal(
             routedSoftware: false,
             preferred: .software,
             codecID: AV_CODEC_ID_AV1,
             dvProfile: 10,
-            dvBLCompatID: 0,
-            isLive: false,
-            hasCompanionAudioReader: false) == .softwarePathCannotRepresentSource)
+            dvBLCompatID: 0) == .softwarePathCannotRepresentSource)
     }
 
     /// P8.1 and P10.1 carry a decodable base layer, so they are software-eligible and the correction
@@ -82,48 +74,14 @@ struct Issue461CustomSourceDecodePathTests {
             preferred: .software,
             codecID: AV_CODEC_ID_HEVC,
             dvProfile: 8,
-            dvBLCompatID: 1,
-            isLive: false,
-            hasCompanionAudioReader: false) == nil)
+            dvBLCompatID: 1) == nil)
 
         #expect(SessionOptionCorrection.decodePathRefusal(
             routedSoftware: false,
             preferred: .software,
             codecID: AV_CODEC_ID_AV1,
             dvProfile: 10,
-            dvBLCompatID: 1,
-            isLive: false,
-            hasCompanionAudioReader: false) == nil)
-    }
-
-    /// The side-audio merge lives in `HLSSegmentProducer`, on the native path. A demuxed-audio live
-    /// source moved onto the software path plays silent, and `load` fails it for that reason; the
-    /// correction is refused for the same reason, one teardown earlier.
-    @Test("a demuxed-audio live source is refused rather than played silent")
-    func demuxedAudioLiveIsRefused() {
-        #expect(SessionOptionCorrection.decodePathRefusal(
-            routedSoftware: false,
-            preferred: .software,
-            codecID: AV_CODEC_ID_H264,
-            dvProfile: nil,
-            dvBLCompatID: nil,
-            isLive: true,
-            hasCompanionAudioReader: true) == .demuxedAudioLiveIsNativeOnly)
-    }
-
-    /// A companion reader on a VOD session is not the demuxed-audio live shape, and live on its own
-    /// is the rung the escape exists for. Neither may borrow the other's refusal.
-    @Test("live alone and a companion reader alone are both accepted")
-    func neitherHalfOfTheLiveGuardRefusesAlone() {
-        #expect(SessionOptionCorrection.decodePathRefusal(
-            routedSoftware: false, preferred: .software, codecID: AV_CODEC_ID_H264,
-            dvProfile: nil, dvBLCompatID: nil,
-            isLive: true, hasCompanionAudioReader: false) == nil)
-
-        #expect(SessionOptionCorrection.decodePathRefusal(
-            routedSoftware: false, preferred: .software, codecID: AV_CODEC_ID_H264,
-            dvProfile: nil, dvBLCompatID: nil,
-            isLive: false, hasCompanionAudioReader: true) == nil)
+            dvBLCompatID: 1) == nil)
     }
 
     /// A refusal is about the flip, not about the field. A session already on the software path is
@@ -131,12 +89,9 @@ struct Issue461CustomSourceDecodePathTests {
     /// would break the plain reload of every source that legitimately routes software.
     @Test("a session already on the software path is never refused")
     func alreadySoftwareIsNeverRefused() {
-        for isLive in [false, true] {
-            #expect(SessionOptionCorrection.decodePathRefusal(
-                routedSoftware: true, preferred: .software, codecID: AV_CODEC_ID_HEVC,
-                dvProfile: 5, dvBLCompatID: 0,
-                isLive: isLive, hasCompanionAudioReader: true) == nil)
-        }
+        #expect(SessionOptionCorrection.decodePathRefusal(
+            routedSoftware: true, preferred: .software, codecID: AV_CODEC_ID_HEVC,
+            dvProfile: 5, dvBLCompatID: 0) == nil)
     }
 
     /// An uncorrected reload of a native session must not be refused by the source facts either, or
@@ -145,21 +100,14 @@ struct Issue461CustomSourceDecodePathTests {
     func automaticIsNeverRefused() {
         #expect(SessionOptionCorrection.decodePathRefusal(
             routedSoftware: false, preferred: .automatic, codecID: AV_CODEC_ID_HEVC,
-            dvProfile: 5, dvBLCompatID: 0,
-            isLive: true, hasCompanionAudioReader: true) == nil)
+            dvProfile: 5, dvBLCompatID: 0) == nil)
     }
 
-    /// The refusals say which one they are, in the thrown error and in the log, because a host that
-    /// has to choose between falling back to its own player and leaving the session alone needs the
-    /// difference.
-    @Test("the two refusals are distinguishable and described")
-    func refusalsAreDistinct() {
-        #expect(SessionReloadRefusal.softwarePathCannotRepresentSource
-                != SessionReloadRefusal.demuxedAudioLiveIsNativeOnly)
-        for refusal in [SessionReloadRefusal.softwarePathCannotRepresentSource,
-                        .demuxedAudioLiveIsNativeOnly] {
-            #expect(!refusal.rawValue.isEmpty)
-            #expect(!refusal.description.isEmpty)
-        }
+    /// The refusal says what it is, in the thrown error and in the log, because a host that has to choose
+    /// between falling back to its own player and leaving the session alone needs to know.
+    @Test("the refusal is named and described")
+    func refusalIsDescribed() {
+        #expect(!SessionReloadRefusal.softwarePathCannotRepresentSource.rawValue.isEmpty)
+        #expect(!SessionReloadRefusal.softwarePathCannotRepresentSource.description.isEmpty)
     }
 }

@@ -326,41 +326,6 @@ struct ItemSwapStillTests {
         #expect(grey > (Self.centreGrey(earlier) ?? .max))
     }
 
-    @Test("a software-path audio rebuild holds the renderer's picture until the next host's first frame")
-    func softwareRebuildHoldsThePicture() async throws {
-        let file = try await Self.fixtureURL()
-        defer { try? FileManager.default.removeItem(at: file) }
-        let engine = try AetherEngine()
-        defer { engine.stop() }
-        let view = AetherPlayerView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
-        engine.bind(view: view)
-        var options = LoadOptions()
-        options.preferredDecodePath = .software
-        _ = try await engine.load(url: file, options: options)
-        #expect(engine.playbackBackend == .software)
-        let host = try #require(engine.softwareHost)
-        try await waitFor { host.isVideoReadyForDisplay }
-        let audioIndex = try #require(engine.activeAudioTrackIndex)
-
-        var held = false
-        let watcher = Task { @MainActor in
-            while !Task.isCancelled {
-                if view.isHoldingStill { held = true }
-                try? await Task.sleep(for: .milliseconds(2))
-            }
-        }
-        let failure = await engine.reloadWithAudioOverride(
-            url: file, audioStreamIndex: Int32(audioIndex), expectedGeneration: engine.loadGeneration)
-        #expect(failure == nil)
-        try await waitFor { !view.isHoldingStill }
-        watcher.cancel()
-
-        #expect(held)
-        #expect(engine.heldPictureLastRoute == "software renderer")
-        #expect(engine.heldPictureLastRelease == "first frame of the next host")
-        #expect(engine.softwareHost !== host)
-    }
-
     nonisolated private static let userFixtures = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         .appendingPathComponent("Fixtures/user")

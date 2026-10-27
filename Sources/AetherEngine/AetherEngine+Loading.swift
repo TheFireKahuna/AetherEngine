@@ -946,6 +946,9 @@ extension AetherEngine {
         // LoadOptions.felOverlay: the session's own read of the source feeds the overlay's enhancement layer.
         session.felTap = felOverlayWanted ? FelEnhancementTap() : nil
         #endif
+        // A stream AVPlayer cannot decode: the session decodes it for the software overlay, which shows it over a
+        // placeholder, deinterlaced or film-matched as the load decided.
+        session.overlayDecodesVideo = overlayDecodesVideoWanted
         session.overlayDeinterlace = DeinterlaceConfig(fieldRate: loadedOptions.deinterlaceFieldRate, film: loadFilmCarriage,
                                                        softTelecine: loadSoftTelecine)
         // #240: a scrub thumbnail waits out a seek in flight. Set before start().
@@ -2367,32 +2370,23 @@ extension AetherEngine {
         // (that is the mount flag there), so the rebuild used to end in an unconditional `play()`.
         let resumesPlaying = resumePlaying ?? sessionRebuildResumesPlaying
         state = .loading
-        // AE#464 round 2: this branch reaches `loadSoftware` / `loadNative` rather than `load`, so it
+        // AE#464 round 2: this branch reaches `loadNative` rather than `load`, so it
         // parks its own rebuild position for anything that stacks behind it. Round 3 parks the
         // transport beside it.
         positionUnderReconstruction = resumeAt
         transportIntentUnderReconstruction = resumesPlaying
         let previousAudioIndex = activeAudioTrackIndex
-        // Snapshot before stopInternal wipes state. Must reload on the same backend: loadNative on a SW-routed AV1 source throws unsupportedCodec (HLSVideoEngine only accepts HEVC / H.264 / VP9 / probed-AV1).
-        let wasOnSoftwarePath = (playbackBackend == .software)
-        // AE#461 follow-up: which host this rebuild hands the source to. This used to be
-        // `wasOnSoftwarePath` alone, which made a `preferredDecodePath` correction on a custom source
-        // accepted, logged as applied and then silently ignored: the option is read only inside
-        // `load`, and a custom source never reaches it. The same pure policy `load` asks decides it
-        // here, seeded with the backend the session is currently on.
-        //
-        // The one-way type is what makes re-routing safe on this path. `DecodePath` has no `.native`,
-        // so the only flip reachable is native -> software, and the software path is the general one;
-        // the reverse (the `unsupportedCodec` case the line above warns about) stays unreachable by
-        // construction. What the software path cannot REPRESENT is refused before any teardown, in
-        // `reloadAtCurrentPosition(applying:)`, because the guards that catch it in `load` run after
-        // the routing decision and would fail a session this rebuild had already stopped.
-        let targetSoftwarePath = VideoRoutingPolicy.usesSoftwarePath(
-            routedSoftware: wasOnSoftwarePath, preferred: loadedOptions.preferredDecodePath)
-        if targetSoftwarePath != wasOnSoftwarePath {
+        // AE#461 / AE#561: a session whose video AVPlayer decodes moves into the software overlay when the host's
+        // preference asks for the software decode or the engine escalates to it, as `load` routes such a session:
+        // AVPlayer is handed the placeholder, not the video it refused, and the engine's own decoder draws it. A
+        // session already in the overlay is rebuilt there; its flag outlives the teardown below. `DecodePath` has no
+        // `.native`, so the overlay is never left by a rebuild.
+        let movesToOverlay = !overlayDecodesVideoWanted
+            && VideoRoutingPolicy.usesSoftwarePath(routedSoftware: false, preferred: loadedOptions.preferredDecodePath)
+        if movesToOverlay {
             EngineLog.emit(
-                "[AetherEngine] #461: reload re-routing this session native -> software on the host's "
-                + "preference (custom source: \(isCustomSource))",
+                "[AetherEngine] #461: reload moves this session's video into the software overlay "
+                + "(custom source: \(isCustomSource))",
                 category: .engine
             )
         }
@@ -2401,23 +2395,17 @@ extension AetherEngine {
         let reloadStart = DispatchTime.now()
         EngineLog.emit("[AetherEngine] reload: stopInternal start", category: .engine)
         // resetDisplayCriteria: false: video format is unchanged; resetting triggers a full waitForSwitch Stage 2 timeout (5 s at the 2026-05-26 device test, ~2 s cap since #117; Bose SLIII A2DP + 4K HDR10 PQ: each switch added ~12 s black-screen). On the same route a panel SDR drop during the reset window failed the PQ variant with AVFoundationErrorDomain -11868 / CoreMediaErrorDomain -17223.
-        // keepNativeHost: !targetSoftwarePath preserves the AVPlayer across the switch (issue #15).
-        // It follows the TARGET route, not the previous one: a rebuild that flips to software renders
-        // into its own layer, and a preserved host would leave AVKit bound to a stale player with
-        // audio still flowing into the next load (the release `load()` does by hand on that branch).
+        // keepNativeHost preserves the AVPlayer across the switch (issue #15); the overlay plays over it too.
         // Audit LIF-104: the AE#597 reset outranks the #15 reuse here exactly as it does in `load`,
         // or the first rebuild after a reset mounts its item on the invalidated AVPlayer.
         let mediaServicesWereReset = consumeMediaServicesReset()
         claimSoftwarePathTakeover()   // AE#629
         // Keep the current native item through an ordinary audio switch, but never reuse a host
-        // invalidated by a media-services reset (audit LIF-104).
+        // invalidated by a media-services reset (audit LIF-104), nor an item whose video moves into the overlay.
         let keepAudioSwitchItem = audioStreamIndex != nil && discTitleIDOverride == nil
-            && !targetSoftwarePath && !mediaServicesWereReset && nativeHost?.avPlayer.currentItem != nil
-        // The software path rebuilds its host and layer, and `stop()` flushes the old one to black.
-        let holdsSoftwarePicture = audioStreamIndex != nil && discTitleIDOverride == nil
-            && targetSoftwarePath && softwareHost != nil
-        if keepAudioSwitchItem || holdsSoftwarePicture {
-            if keepAudioSwitchItem { nativeHost?.pause() }
+            && !movesToOverlay && !mediaServicesWereReset && nativeHost?.avPlayer.currentItem != nil
+        if keepAudioSwitchItem {
+            nativeHost?.pause()
             let heldGeneration = loadGeneration
             await holdPictureAcrossItemSwap()
             // A stop() or load() that landed while the frame was read owns the engine now.
@@ -2432,8 +2420,9 @@ extension AetherEngine {
                 outgoingServingMaster: nativeVideoSession?.servingMasterPlaylist ?? true,
                 outgoingMasterRefusedByDisplay: masterRefusedByDisplay)
         stopInternal(resetDisplayCriteria: false,
-                     keepNativeHost: !targetSoftwarePath && !mediaServicesWereReset,
+                     keepNativeHost: !mediaServicesWereReset,
                      keepCustomReader: true, keepCurrentItem: keepAudioSwitchItem)
+        if movesToOverlay { overlayDecodesVideoWanted = true }
         sessionCacheStatusToken &+= 1
         diagnostics.sessionCacheStatus = .inactive
         pendingInPlaceItemHandover = keepAudioSwitchItem
@@ -2527,16 +2516,12 @@ extension AetherEngine {
         var reopenedDiscTitles: [TitleInfo] = []
         var reopenedDiscChapters: [ChapterInfo] = []
         var reopenedSelectedTitleID: Int? = nil
-        var reopenedAudioTracks: [TrackInfo] = []
-        var reopenedSubtitleTracks: [TrackInfo] = []
         var reopenedStartSeconds: Double = 0
         if let pre = customPreopened {
             reopenedDiscTitles = pre.discTitleInfos()
             if !reopenedDiscTitles.isEmpty {
                 reopenedDiscChapters = pre.discChapterInfos()
                 reopenedSelectedTitleID = pre.selectedDiscTitleID
-                reopenedAudioTracks = pre.audioTrackInfos()
-                reopenedSubtitleTracks = pre.subtitleTrackInfos()
                 // stopInternal zeroed sourceStartSeconds; recapture the software-path chapter-seek base from
                 // the reopened demuxer so a DVD chapter seek after an audio switch / custom reload still lands
                 // (the native base self-heals via onPlaylistShiftChanged, this one does not). (#67)
@@ -2547,33 +2532,7 @@ extension AetherEngine {
 
         do {
             let loadStart = DispatchTime.now()
-            if targetSoftwarePath {
-                EngineLog.emit("[AetherEngine] reload: loadSoftware enter audio=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s", category: .engine)
-                try await loadSoftware(
-                    url: url,
-                    sourceHTTPHeaders: loadedOptions.httpHeaders,
-                    startPosition: LiveReloadPolicy.resumePosition(
-                        isLive: loadedOptions.isLive, currentTime: resumeAt),
-                    audioSourceStreamIndex: audioStreamIndex,
-                    isLive: loadedOptions.isLive,
-                    dvrWindowSeconds: loadedOptions.dvrWindowSeconds,
-                    preopenedDemuxer: customPreopened,
-                    generation: gen,
-                    elType: sourceElType
-                )
-                EngineLog.emit("[AetherEngine] reload: loadSoftware done (\(elapsedMs(since: loadStart))ms)", category: .engine)
-                playbackBackend = .software
-                activeAudioTrackIndex = audioStreamIndex.map { Int($0) }
-                activeVideoDecoder = Self.videoDecoderLabel(
-                    codecID: preservedVideoCodec,
-                    isSoftware: !(softwareHost?.usesHardwareVideoDecoder ?? false)
-                )
-                // AE#462: the rebuilt host's own resolved index (see the load site).
-                presentCurrentLayer()
-                // Keep the latest transport intent if play/pause changed while the rebuild awaited I/O.
-                if transportIntentUnderReconstruction ?? resumesPlaying { softwareHost?.play() }
-                else { softwareHost?.pause() }
-            } else {
+            do {
                 EngineLog.emit("[AetherEngine] reload: loadNative enter audio=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s", category: .engine)
                 // #339: the only write this reload can still produce is a sole-writer host's re-write on the
                 // swapped item, which happens inside loadNative. Arm before it, or the gate below is again
@@ -2642,9 +2601,7 @@ extension AetherEngine {
                 playbackBackend = .native
                 // Publish the session's actual pick (invalid override falls back to auto; demuxed-audio resolves in side-demuxer numbering).
                 syncPublishedAudioStateFromNativeSession()
-                activeVideoDecoder = Self.videoDecoderLabel(
-                    codecID: preservedVideoCodec, isSoftware: false
-                )
+                activeVideoDecoder = nativeVideoDecoderLabel(codecID: preservedVideoCodec)
                 activeAudioDecoder = nativeVideoSession?.audioPipelineDescription
                 presentCurrentLayer()
                 // Wait for pending AVKit display-criteria handshake before resuming (first frame must not hit a mid-transition panel).
@@ -2675,7 +2632,7 @@ extension AetherEngine {
             // fail the reload like a load error instead of leaving the user
             // on an indefinitely frozen frame. Scoped to live reloads on the
             // native path; initial joins and VOD reloads never arm it.
-            if loadedOptions.isLive, !targetSoftwarePath {
+            if loadedOptions.isLive {
                 armLiveReloadWatchdog(generation: gen)
             }
             EngineLog.emit("[AetherEngine] reload: state=\(state == .playing ? ".playing" : ".paused") total=\(elapsedMs(since: reloadStart))ms", category: .engine)
@@ -2703,14 +2660,8 @@ extension AetherEngine {
             discChapters = reopenedDiscChapters
             selectedDiscTitle = reopenedSelectedTitleID.flatMap { id in reopenedDiscTitles.first { $0.id == id } }
             sourceStartSeconds = reopenedStartSeconds
-            // A title switch changes the title's stream set. The native path already republished the session's
-            // real list via syncPublishedAudioStateFromNativeSession above; only the software path, which does
-            // not reconcile tracks post-load, needs the probe-derived lists re-applied here.
-            if targetSoftwarePath {
-                audioTracks = reopenedAudioTracks
-                applyConfirmedTrackFlags()   // #214 follow-up: a title switch re-applies probe lists
-                subtitleTracks = reopenedSubtitleTracks
-            }
+            // A title switch changes the title's stream set; the session republished its real list via
+            // syncPublishedAudioStateFromNativeSession above.
         } else {
             activeDiscTitleID = nil
         }

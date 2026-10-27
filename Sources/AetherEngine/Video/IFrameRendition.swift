@@ -24,10 +24,15 @@ extension IFrameSegmentSource {
 enum IFrameRenditionFormat: Equatable, Sendable {
     /// The source's own keyframes; the master repeats the variant's codec, range and size.
     case keyframes
+    /// One 10-bit HEVC still per entry (`IFrameStillBuilder`), declaring its own codec, size and range: SDR, the
+    /// trick-play tier an HDR session lists beside its scan tier for AVKit's scrub thumbnails; or the source's own
+    /// range, the scan tier of a software overlay session, whose served pictures are placeholders.
+    case stills(width: Int, height: Int, codecs: String, bandwidth: Int, averageBandwidth: Int, videoRange: HLSVideoRange)
 
     var logName: String {
         switch self {
         case .keyframes: return "keyframes"
+        case .stills(_, _, _, _, _, let range): return "\(range.rawValue.lowercased())-hevc-stills"
         }
     }
 
