@@ -7,6 +7,10 @@ struct MPLSPlaylist: Equatable {
     /// frames begin at this STC value, so it is the origin used to fold each clip onto the title's
     /// contiguous presentation timeline (AE#105 multi-clip position drift).
     var inTimes: [UInt64] = []
+    /// Per-PlayItem out_time on the clip's STC, 45 kHz ticks, parallel to `clipIDs`: where the title stops
+    /// using the clip. A clip's own file can run past it, so anything stated on the clip's clock (an EP map
+    /// entry) belongs to the title only inside `inTimes[k]..<outTimes[k]`.
+    var outTimes: [UInt64] = []
     /// Presentation offset of each PlayItem's start, 45 kHz ticks relative to the title's start (sum of the
     /// durations of all earlier PlayItems), parallel to `clipIDs`.
     var cumulativeBefore: [UInt64] = []
@@ -36,6 +40,7 @@ enum MPLSParser {
         // Per-PlayItem state for chapter resolution: a mark's timestamp is on its clip's STC (which begins at
         // the PlayItem's in_time), so the title-relative chapter start needs in_time and the running offset.
         var inTimes: [UInt64] = []
+        var outTimes: [UInt64] = []
         var cumulativeBefore: [UInt64] = []
         var languages: [Int: String] = [:]
         for _ in 0..<count {
@@ -48,6 +53,7 @@ enum MPLSParser {
             let outT = UInt64(be32(data, body + 16))
             clips.append(clip)
             inTimes.append(inT)
+            outTimes.append(outT)
             cumulativeBefore.append(ticks)
             if outT >= inT { ticks += (outT - inT) }
             parseSTNLanguages(data, body: body, itemLen: itemLen, into: &languages)
@@ -56,7 +62,7 @@ enum MPLSParser {
         guard !clips.isEmpty else { return nil }
         let chapters = parseChapterStarts(data, inTimes: inTimes, cumulativeBefore: cumulativeBefore)
         return MPLSPlaylist(clipIDs: clips, durationTicks: ticks,
-                            inTimes: inTimes, cumulativeBefore: cumulativeBefore,
+                            inTimes: inTimes, outTimes: outTimes, cumulativeBefore: cumulativeBefore,
                             chapterStartTicks: chapters, streamLanguages: languages)
     }
 

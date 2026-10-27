@@ -59,9 +59,94 @@ struct DiscRecognitionBoundsTests {
         }
         func scan(_ list: [UDFEntry]) -> [MPLSPlaylist] {
             DiscReader.scanPlaylists(list,
-                                     extents: { _ in self.extentCalls += 1; return [(offset: 0, length: self.declaredLength)] },
+                                     extents: { entries in
+                                         self.extentCalls += entries.count
+                                         return entries.map { _ in [(offset: Int64(0), length: self.declaredLength)] }
+                                     },
                                      read: { _ in self.readCalls += 1; return self.bytes })
         }
+    }
+
+    // MARK: - Small file reads
+
+    /// An image read the way `HTTPDiscIOReader` reads one: a read outside its one window fetches a new
+    /// window from there.
+    private final class WindowedImage: IOReader, @unchecked Sendable {
+        let base: DataIOReader
+        let window: Int64
+        private var position: Int64 = 0
+        private var windowStart: Int64 = -1
+        private(set) var fetches = 0
+        init(_ data: Data, window: Int64 = 256 * 1024) { base = DataIOReader(data: data); self.window = window }
+        func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
+            if windowStart < 0 || position < windowStart || position >= windowStart + window {
+                fetches += 1
+                windowStart = position
+            }
+            let n = min(Int64(size), windowStart + window - position)
+            _ = base.seek(offset: position, whence: SEEK_SET)
+            let got = base.read(buffer, size: Int32(n))
+            if got > 0 { position += Int64(got) }
+            return got
+        }
+        func seek(offset: Int64, whence: Int32) -> Int64 {
+            guard whence == SEEK_SET else { return base.seek(offset: offset, whence: whence) }
+            position = offset
+            return offset
+        }
+        func close() {}
+    }
+
+    @Test("an image's small files are read in the order they sit on it, a few windows for hundreds of files")
+    func imageFilesReadInDiscOrder() {
+        // 400 files of 2 KB laid end to end, asked for in a scrambled order (a title's clips rarely sit in
+        // play order).
+        let count = 400, size = 2048
+        let data = Data((0..<count * size).map { UInt8(truncatingIfNeeded: $0 / size) })
+        var rng = SystemRandomNumberGenerator()
+        let asked = (0..<count).shuffled(using: &rng)
+        let extents: [Extents] = asked.map { [(offset: Int64($0 * size), length: Int64(size))] }
+        let image = WindowedImage(data)
+        let files = DiscReader.readImageFiles(declared: extents.map { $0[0].length },
+                                              offsets: extents.map { $0[0].offset }, scope: DiscRecognitionScope(),
+                                              read: { DiscReader.readAll(image, extents[$0]) })
+        #expect(files.map { $0.first.map(Int.init) } == asked.map { Optional($0 % 256) })
+        #expect(image.fetches <= (count * size) / (256 * 1024) + 1)
+
+        // The same reads in the order asked cost a window nearly every file.
+        let unordered = WindowedImage(data)
+        for e in extents { _ = DiscReader.readAll(unordered, e) }
+        #expect(unordered.fetches > count / 2)
+    }
+
+    @Test("a run of short reads from an image ends the reading")
+    func imageShortRunStops() {
+        var reads = 0
+        let files = DiscReader.readImageFiles(declared: Array(repeating: 100, count: 1000),
+                                              offsets: (0..<1000).map(Int64.init), scope: DiscRecognitionScope(),
+                                              read: { _ in reads += 1; return [] })
+        #expect(files.count == 1000)
+        #expect(reads == DiscReader.maxConsecutiveShortReads)
+    }
+
+    @Test("a folder's small files are read in lanes, results in the order asked")
+    func folderFilesReadInLanes() {
+        final class Gauge: @unchecked Sendable {
+            let lock = NSLock()
+            var inFlight = 0, peak = 0
+            func enter() { lock.lock(); inFlight += 1; peak = max(peak, inFlight); lock.unlock() }
+            func leave() { lock.lock(); inFlight -= 1; lock.unlock() }
+        }
+        let gauge = Gauge()
+        let files = DiscReader.readFolderFiles(count: 200, scope: DiscRecognitionScope()) { i in
+            gauge.enter()
+            defer { gauge.leave() }
+            Thread.sleep(forTimeInterval: 0.002)
+            return [UInt8(truncatingIfNeeded: i)]
+        }
+        #expect(files.map { $0.first } == (0..<200).map { Optional(UInt8(truncatingIfNeeded: $0)) })
+        #expect(gauge.peak > 1)
+        #expect(gauge.peak <= BlockingWork.readLanes)
     }
 
     // MARK: - MPLSParser
@@ -107,11 +192,9 @@ struct DiscRecognitionBoundsTests {
 
     @Test("an oversized playlist extent is skipped without being read or charged")
     func oversizedPlaylistIsNotRead() {
-        var reads = 0
-        let huge: Extents = [(offset: 0, length: 64 * 1024 * 1024)]
-        let parsed = DiscReader.scanPlaylists(entries(10), extents: { _ in huge }, read: { _ in reads += 1; return [] })
-        #expect(parsed.isEmpty)
-        #expect(reads == 0)
+        let source = PlaylistSource(bytes: [], declaredLength: 64 * 1024 * 1024)
+        #expect(source.scan(entries(10)).isEmpty)
+        #expect(source.readCalls == 0)
     }
 
     @Test("parsed PlayItems are kept up to a total budget")

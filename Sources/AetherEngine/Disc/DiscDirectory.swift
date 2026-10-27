@@ -14,7 +14,8 @@ public protocol DiscDirectoryReader: IOReader {
     var discFiles: [(path: String, size: Int64)] { get }
 
     /// A new, independent reader over one file of `discFiles` (matched case-insensitively), or nil when
-    /// it cannot be opened. The caller closes it.
+    /// it cannot be opened. The caller closes it. Called from several threads at once: recognition reads
+    /// a folder's playlists and clip information files in parallel (`DiscReader.readFolderFiles`).
     func openDiscFile(_ path: String) -> IOReader?
 
     /// The `.mpls` file name of the title to play (`00800.mpls`), when the host already knows it. The
@@ -42,12 +43,16 @@ public final class HTTPDiscDirectoryReader: DiscDirectoryReader {
     }
 
     private let files: [File]
+    /// `files` by upper-cased path: recognition opens every playlist and clip file by name, a few thousand
+    /// on an anti-rip disc, so each open is a lookup rather than a scan of the listing.
+    private let filesByPath: [String: File]
     private let httpHeaders: [String: String]
     public let preferredPlaylist: String?
 
     /// `httpHeaders` ride on every range request to every file.
     public init(files: [File], preferredPlaylist: String? = nil, httpHeaders: [String: String] = [:]) {
         self.files = files
+        self.filesByPath = Dictionary(files.map { ($0.path.uppercased(), $0) }, uniquingKeysWith: { first, _ in first })
         self.preferredPlaylist = preferredPlaylist
         self.httpHeaders = httpHeaders
     }
@@ -55,7 +60,7 @@ public final class HTTPDiscDirectoryReader: DiscDirectoryReader {
     public var discFiles: [(path: String, size: Int64)] { files.map { ($0.path, $0.size) } }
 
     public func openDiscFile(_ path: String) -> IOReader? {
-        guard let file = files.first(where: { $0.path.caseInsensitiveCompare(path) == .orderedSame }) else { return nil }
+        guard let file = filesByPath[path.uppercased()] else { return nil }
         // A small file (a playlist) is read whole, so whether its origin honours ranges does not matter and
         // the listed size can stand in for the range probe: a folder holds a few hundred playlists, and the
         // probe doubled the requests recognition made. A clip keeps the probe, which is what refuses an
@@ -278,7 +283,8 @@ extension DiscReader {
     /// A Blu-ray folder: the image path (`wrapBluRay`) with files in place of UDF extents. The playlist scan
     /// and the clip assembly are the same bounded code, so a folder cannot make recognition do more than
     /// an image can (audit NET-103).
-    static func wrapBluRayFolder(_ folder: DiscDirectoryReader, selectTitleID: Int?) -> DiscInfo? {
+    static func wrapBluRayFolder(_ folder: DiscDirectoryReader, selectTitleID: Int?,
+                                 scope: DiscRecognitionScope = DiscRecognitionScope()) -> DiscInfo? {
         let files = folder.discFiles
         let byPath = Dictionary(files.map { ($0.path.uppercased(), $0) }, uniquingKeysWith: { first, _ in first })
         func file(_ path: String) -> (path: String, size: Int64)? { byPath[path.uppercased()] }
@@ -293,11 +299,13 @@ extension DiscReader {
         }
         let parsed = scanPlaylists(playlists,
                                    name: { $0.path.lowercased() },
-                                   extents: { [(offset: 0, length: $0.size)] },
+                                   extents: { (entries: [(path: String, size: Int64)]) -> [[(offset: Int64, length: Int64)]?] in
+                                       entries.map { [(offset: Int64(0), length: $0.size)] }
+                                   },
+                                   readsInPlace: false,
+                                   scope: scope,
                                    read: { entry, extents in
-                                       guard let reader = folder.openDiscFile(entry.path) else { return [] }
-                                       defer { reader.close() }
-                                       return readAll(reader, extents)
+                                       scope.withFile({ folder.openDiscFile(entry.path) }) { readAll($0, extents) } ?? []
                                    })
         let titles = BDTitleSelector.enumerateTitles(parsed)
         guard !titles.isEmpty else {
@@ -327,11 +335,16 @@ extension DiscReader {
         }
         let totalBytes = segments.reduce(Int64(0)) { $0 + $1.size }
         EngineLog.emit("[disc] Blu-ray folder recognized: \(titles.count) title(s), selected \(selectedIndex) clips=\(selected.bdClipIDs ?? []) files=\(segments.count) bytes=\(totalBytes) clipSpans=\(clipTimeline.count) preferred=\(folder.preferredPlaylist ?? "-")", category: .demux)
-        let seekTable = buildSeekTable(title: selected, resolved: assembled.resolved) { clip in
-            guard let info = file("BDMV/CLIPINF/\(clip).clpi"), info.size > 0,
-                  let reader = folder.openDiscFile(info.path) else { return nil }
-            defer { reader.close() }
-            return readAll(reader, [(offset: 0, length: info.size)])
+        let seekTable = buildSeekTable(title: selected, resolved: assembled.resolved) { clips in
+            let infos = clips.map { file("BDMV/CLIPINF/\($0).clpi") }
+            let declared = infos.map { $0?.size ?? 0 }
+            guard clipInfoFitsBudget(declared) else { return nil }
+            return readFolderFiles(count: infos.count, scope: scope) { i in
+                guard let info = infos[i], info.size > 0 else { return [] }
+                return scope.withFile({ folder.openDiscFile(info.path) }) {
+                    readAll($0, [(offset: 0, length: info.size)])
+                } ?? []
+            }
         }
         return DiscInfo(reader: MultiFileConcatIOReader(segments: segments, opener: { folder.openDiscFile($0) }),
                         formatHint: "mpegts", titles: titles, selectedTitleIndex: selectedIndex,

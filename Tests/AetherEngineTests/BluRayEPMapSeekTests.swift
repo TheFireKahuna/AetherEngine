@@ -112,41 +112,52 @@ struct BluRayEPMapSeekTests {
         #expect(CLPIParser.entryPoints(Self.clpi([])).isEmpty)
     }
 
+    // MARK: - MPLS
+
+    @Test("each play item's in_time and out_time reach the title")
+    func playItemSpans() throws {
+        let playlist = try #require(MPLSParser.parse(Self.mpls([(id: "00001", inT: 63_000, outT: 423_000),
+                                                                (id: "00002", inT: 90_000, outT: 180_000)])))
+        #expect(playlist.inTimes == [63_000, 90_000])
+        #expect(playlist.outTimes == [423_000, 180_000])
+        let title = try #require(BDTitleSelector.enumerateTitles([playlist]).first)
+        #expect(title.bdClipInTimes == [63_000, 90_000])
+        #expect(title.bdClipOutTimes == [423_000, 180_000])
+    }
+
     // MARK: - The table
 
     /// Two clips that both run their clock from 11.6 s, 6149.6 s and 388 s long: the shape of a real
     /// two-clip UHD title a timestamp seek could not land in.
     static let overlappingClips = DiscSeekTable(clips: [
-        .init(concatByteStart: 0, cumulativeBeforeSec: 0, inTimeSec: 11.6,
+        .init(concatByteStart: 0, cumulativeBeforeSec: 0, inTimeSec: 11.6, outTimeSec: 11.6 + 6149.6,
               entries: (0..<6150).map { CLPIEntryPoint(pts45k: UInt64((11.6 + Double($0)) * 45000), spn: UInt32($0 * 1000)) }),
-        .init(concatByteStart: 50_000_000_000, cumulativeBeforeSec: 6149.6, inTimeSec: 11.6,
+        .init(concatByteStart: 50_000_000_000, cumulativeBeforeSec: 6149.6, inTimeSec: 11.6, outTimeSec: 11.6 + 388,
               entries: (0..<388).map { CLPIEntryPoint(pts45k: UInt64((11.6 + Double($0)) * 45000), spn: UInt32($0 * 1000)) }),
     ])
 
     @Test("folded title time picks the clip, and the clip's own clock picks the keyframe")
     func keyframeLookupAcrossOverlappingClips() throws {
         let table = Self.overlappingClips
-        let inFirst = try #require(table.keyframe(forSourceSeconds: 11.6 + 3000.5, base0Sec: 11.6))
+        let inFirst = try #require(table.keyframe(forSourceSeconds: 11.6 + 3000.5, titleOriginSec: 11.6))
         #expect(inFirst.clip == 0)
         #expect(abs(inFirst.keyframeSec - (11.6 + 3000)) < 0.001)
         #expect(inFirst.offset == 3000 * 1000 * 192)
 
-        let inSecond = try #require(table.keyframe(forSourceSeconds: 11.6 + 6149.6 + 100.2, base0Sec: 11.6))
+        let inSecond = try #require(table.keyframe(forSourceSeconds: 11.6 + 6149.6 + 100.2, titleOriginSec: 11.6))
         #expect(inSecond.clip == 1)
         #expect(abs(inSecond.keyframeSec - (11.6 + 100)) < 0.001)
         #expect(inSecond.offset == 50_000_000_000 + 100 * 1000 * 192)
     }
 
-    @Test("before clip 0's base is read, its in_time stands in for it")
-    func inTimeStandsInForAnUnreadBase() throws {
-        let hit = try #require(Self.overlappingClips.keyframe(forSourceSeconds: 11.6 + 42.5, base0Sec: .nan))
-        #expect(hit.clip == 0)
-        #expect(abs(hit.keyframeSec - (11.6 + 42)) < 0.001)
+    @Test("without the title's origin there is nothing to count title time from")
+    func noOriginNoLookup() {
+        #expect(Self.overlappingClips.keyframe(forSourceSeconds: 11.6 + 42.5, titleOriginSec: .nan) == nil)
     }
 
     @Test("a target before the first keyframe lands on the first one")
     func targetBeforeFirstKeyframe() throws {
-        let hit = try #require(Self.overlappingClips.keyframe(forSourceSeconds: 0, base0Sec: 11.6))
+        let hit = try #require(Self.overlappingClips.keyframe(forSourceSeconds: 0, titleOriginSec: 11.6))
         #expect(hit.clip == 0)
         #expect(hit.offset == 0)
     }
@@ -155,22 +166,130 @@ struct BluRayEPMapSeekTests {
     func buildingTheTable() {
         let title = DiscTitle(id: 0, durationTicks: 2 * 360_000, bdClipIDs: ["00001", "00002", "00001"],
                               bdClipCumulativeBeforeTicks: [0, 360_000, 720_000],
-                              bdClipInTimes: [63_000, 63_000, 63_000])
+                              bdClipInTimes: [63_000, 63_000, 63_000],
+                              bdClipOutTimes: [423_000, 423_000, 423_000])
         let resolved: [(item: Int, clip: String, byteStart: Int64)] = [(0, "00001", 0), (1, "00002", 6912), (2, "00001", 13824)]
         let map = Self.clpi([(pid: 0x1011, entries: Self.tinyEntries)])
-        var reads: [String] = []
-        let table = DiscReader.buildSeekTable(title: title, resolved: resolved) { clip in
-            reads.append(clip)
-            return map
+        var asked: [[String]] = []
+        let table = DiscReader.buildSeekTable(title: title, resolved: resolved) { clips in
+            asked.append(clips)
+            return clips.map { _ in map }
         }
         #expect(table?.clips.map(\.concatByteStart) == [0, 6912, 13824])
         #expect(table?.clips.map(\.cumulativeBeforeSec) == [0, 8, 16])
-        #expect(reads == ["00001", "00002"])
+        #expect(table?.clips.map(\.outTimeSec) == [9.4, 9.4, 9.4])
+        #expect(asked == [["00001", "00002"]])
 
-        let partial = DiscReader.buildSeekTable(title: title, resolved: resolved) { $0 == "00002" ? nil : map }
+        let partial = DiscReader.buildSeekTable(title: title, resolved: resolved) { clips in
+            clips.map { $0 == "00002" ? [] : map }
+        }
         #expect(partial == nil)
+        #expect(DiscReader.buildSeekTable(title: title, resolved: resolved) { _ in nil } == nil)
         let noInTimes = DiscTitle(id: 0, durationTicks: 1, bdClipIDs: ["00001"])
-        #expect(DiscReader.buildSeekTable(title: noInTimes, resolved: [(0, "00001", 0)]) { _ in map } == nil)
+        #expect(DiscReader.buildSeekTable(title: noInTimes, resolved: [(0, "00001", 0)]) { $0.map { _ in map } } == nil)
+    }
+
+    @Test("a title cut into hundreds of clips gets its table, its CLPI asked for at once")
+    func manyClipTitle() {
+        let count = 400
+        let ids = (0..<count).map { String(format: "%05d", $0) }
+        let title = DiscTitle(id: 0, durationTicks: UInt64(count) * 360_000, bdClipIDs: ids,
+                              bdClipCumulativeBeforeTicks: (0..<count).map { UInt64($0) * 360_000 },
+                              bdClipInTimes: Array(repeating: 63_000, count: count),
+                              bdClipOutTimes: Array(repeating: 423_000, count: count))
+        let resolved: [(item: Int, clip: String, byteStart: Int64)] = ids.enumerated().map { ($0, $1, Int64($0) * 6912) }
+        let map = Self.clpi([(pid: 0x1011, entries: Self.tinyEntries)])
+        var calls = 0
+        let table = DiscReader.buildSeekTable(title: title, resolved: resolved) { clips in
+            calls += 1
+            return clips.map { _ in map }
+        }
+        #expect(table?.clips.count == count)
+        #expect(calls == 1)
+    }
+
+    @Test("CLPI files are held to a byte budget on their declared sizes, before any is read")
+    func clipInfoBudget() {
+        let perFile = DiscReader.maxSmallFileBytes
+        let fitting = Int(DiscReader.maxSeekTableBytes / perFile)
+        #expect(DiscReader.clipInfoFitsBudget(Array(repeating: perFile, count: fitting)))
+        #expect(!DiscReader.clipInfoFitsBudget(Array(repeating: perFile, count: fitting + 1)))
+        // A real title: 900 clips of a few KB each.
+        #expect(DiscReader.clipInfoFitsBudget(Array(repeating: 6_000, count: 900)))
+    }
+
+    // MARK: - The plan's keyframes
+
+    /// Two play items over clips whose clocks overlap: item 0 plays clip A from 10 s to 20 s, item 1
+    /// plays clip B from 5 s to 12 s. Each clip's map has a keyframe every second from 4 s to 22 s, at the
+    /// map's precision, so the one on each `in_time` reads below it.
+    static let twoItems: DiscSeekTable = {
+        func entries(_ clipByte: Int) -> [CLPIEntryPoint] {
+            (4...22).map { CLPIEntryPoint(pts45k: UInt64($0 * 45000) / 256 * 256, spn: UInt32(clipByte + $0 * 10)) }
+        }
+        return DiscSeekTable(clips: [
+            .init(concatByteStart: 0, cumulativeBeforeSec: 0, inTimeSec: 10, outTimeSec: 20, entries: entries(0)),
+            .init(concatByteStart: 1_000_000, cumulativeBeforeSec: 10, inTimeSec: 5, outTimeSec: 12, entries: entries(0)),
+        ])
+    }()
+
+    @Test("the title's keyframes are each clip's entries inside its play item, on the source axis")
+    func titleKeyframesKeepThePlayedSpan() {
+        let keyframes = Self.twoItems.titleKeyframes(titleOriginSec: 10, timeBase: AVRational(num: 1, den: 90000))
+        // Item 0: 10 s ..< 20 s of clip A, the 20 s keyframe being item 1's start. Item 1: 5 s ..< 12 s of
+        // clip B, at title time 10 s on.
+        let seconds = keyframes.map { (Double($0.pts) / 90000).rounded() }
+        #expect(seconds == (10...19).map(Double.init) + (20...26).map(Double.init))
+        for (keyframe, expected) in zip(keyframes, (10...19).map { $0 * 45000 / 256 * 256 }) {
+            #expect(keyframe.pts == Int64(10 * 90000 + 2 * (expected - 10 * 45000)))
+        }
+        #expect(keyframes.first?.pos == Int64(10 * 10 * 192))
+        #expect(keyframes[10].pos == Int64(1_000_000 + 5 * 10 * 192))
+    }
+
+    @Test("every planned keyframe seeks back to its own entry")
+    func titleKeyframesRoundTrip() throws {
+        for origin in [10.0, 10.0 + ClipFold.wrapSeconds] {
+            let table = Self.twoItems
+            for keyframe in table.titleKeyframes(titleOriginSec: origin, timeBase: AVRational(num: 1, den: 90000)) {
+                let hit = try #require(table.keyframe(forSourceSeconds: Double(keyframe.pts) / 90000, titleOriginSec: origin))
+                #expect(hit.offset == keyframe.pos)
+            }
+        }
+    }
+
+    @Test("a clip whose clock wraps inside it keeps its keyframes in order, and each seeks back to its entry")
+    func clipClockWrapsInsideIt() throws {
+        // The 32-bit 45 kHz clock wraps at 2^32 ticks (95443.7 s). This clip's item starts 3 s before the
+        // wrap and runs 8 s, so its later entries and its out_time read near zero.
+        let wrap: UInt64 = 1 << 32
+        let in45k = wrap - 3 * 45000
+        let entries: [CLPIEntryPoint] = (-1...8).map { (second: Int) -> CLPIEntryPoint in
+            let raw: Int64 = (Int64(in45k) + Int64(second) * 45000) & Int64(wrap - 1)
+            let spn: UInt32 = UInt32(100 + second * 10)
+            return CLPIEntryPoint(pts45k: UInt64(raw) / 256 * 256, spn: spn)
+        }
+        let table = DiscSeekTable(clips: [
+            .init(concatByteStart: 0, cumulativeBeforeSec: 0, inTimeSec: Double(in45k) / 45000,
+                  outTimeSec: Double((in45k + 8 * 45000) & (wrap - 1)) / 45000, entries: entries),
+        ])
+        let origin = 4_000.0
+        let keyframes = table.titleKeyframes(titleOriginSec: origin, timeBase: AVRational(num: 1, den: 90000))
+        // The keyframe on in_time through the one before out_time, a second apart across the wrap.
+        let seconds: [Double] = keyframes.map { (Double($0.pts) / 90000 - origin).rounded() }
+        let expectedSeconds: [Double] = (0...7).map(Double.init)
+        #expect(seconds == expectedSeconds)
+        let positions: [Int64] = keyframes.map(\.pos)
+        let expectedPositions: [Int64] = (0...7).map { (second: Int) -> Int64 in Int64(100 + second * 10) * 192 }
+        #expect(positions == expectedPositions)
+        for keyframe in keyframes {
+            let hit = try #require(table.keyframe(forSourceSeconds: Double(keyframe.pts) / 90000, titleOriginSec: origin))
+            #expect(hit.offset == keyframe.pos)
+        }
+        // A target between keyframes past the wrap lands on the one before it.
+        let mid = try #require(table.keyframe(forSourceSeconds: origin + 5.5, titleOriginSec: origin))
+        let fifth: Int64 = (100 + 5 * 10) * 192
+        #expect(mid.offset == fifth)
     }
 
     // MARK: - Through the demuxer
@@ -188,6 +307,7 @@ struct BluRayEPMapSeekTests {
         #expect(table.clips.count == 1)
         #expect(table.clips[0].entries == Self.tinyEntries)
         #expect(table.clips[0].inTimeSec == 1.4)
+        #expect(table.clips[0].outTimeSec == 9.4)
     }
 
     @Test("an image without CLIPINF has no table, and seeks as before")
@@ -236,5 +356,84 @@ struct BluRayEPMapSeekTests {
         let landed = try #require(first)
         #expect(abs(landed - keyframe) < 0.01)
         #expect(!capture.matching(String(format: "EP map seek: source=%.3fs", target)).isEmpty)
+    }
+
+    // MARK: - Two clips
+
+    /// The tiny stream twice: item 0 plays clip 00001 from its first keyframe (1.4 s) to its end (9.4 s),
+    /// item 1 plays clip 00002, the same bytes, from its second keyframe (2.4 s). Item 1's first packets
+    /// sit a GOP before its `in_time`, a lead item 0 does not have, so a fold anchored on whichever packet
+    /// is read first places item 1 a second later than its play item says.
+    static func twoClipFolder() -> BluRayFolderTests.MemoryFolder {
+        BluRayFolderTests.MemoryFolder([
+            ("BDMV/index.bdmv", Data([0x49, 0x4E, 0x44, 0x58])),
+            ("BDMV/PLAYLIST/00800.mpls", Data(mpls([(id: "00001", inT: 63_000, outT: 423_000),
+                                                     (id: "00002", inT: 108_000, outT: 423_000)]))),
+            ("BDMV/STREAM/00001.m2ts", Data(tinyM2TS)),
+            ("BDMV/STREAM/00002.m2ts", Data(tinyM2TS)),
+            ("BDMV/CLIPINF/00001.clpi", Data(clpi([(pid: 0x1011, entries: tinyEntries)]))),
+            ("BDMV/CLIPINF/00002.clpi", Data(clpi([(pid: 0x1011, entries: tinyEntries)]))),
+        ])
+    }
+
+    /// Item 1's keyframes on the title: its 2.4 s keyframe at the item's start (title origin 1.4 s plus
+    /// item 0's 8 s), then one a second.
+    static let secondItemKeyframes: [Double] = [9.4, 10.4, 11.4, 12.4, 13.4, 14.4, 15.4]
+
+    /// The video keyframes `demuxer` reads from where it stands to the end, in seconds.
+    static func keyframeSeconds(_ demuxer: Demuxer) throws -> [Double] {
+        var out: [Double] = []
+        while let packet = try demuxer.readPacket() {
+            var owned: UnsafeMutablePointer<AVPacket>? = packet
+            defer { trackedPacketFree(&owned) }
+            guard packet.pointee.stream_index == demuxer.videoStreamIndex, packet.pointee.flags & AV_PKT_FLAG_KEY != 0,
+                  packet.pointee.pts != Int64.min else { continue }
+            out.append(Double(packet.pointee.pts) / 90000)
+        }
+        return out
+    }
+
+    @Test("a later clip's frames land where its play item says, played into or sought into")
+    func laterClipFoldsByItsPlayItem() throws {
+        let played = Demuxer()
+        try played.open(reader: Self.twoClipFolder())
+        defer { played.close() }
+        let throughout = try Self.keyframeSeconds(played)
+        for expected in Self.secondItemKeyframes {
+            #expect(throughout.contains { abs($0 - expected) < 0.001 }, "played into: \(expected)")
+        }
+
+        let sought = Demuxer()
+        try sought.open(reader: Self.twoClipFolder())
+        defer { sought.close() }
+        #expect(sought.seekBounded(to: 12.4, timeout: 5))
+        let after = try Self.keyframeSeconds(sought)
+        #expect(abs((after.first ?? 0) - 12.4) < 0.001)
+        #expect(Array(after.prefix(4)).enumerated().allSatisfy { abs($1 - (12.4 + Double($0))) < 0.001 })
+    }
+
+    @Test("the plan's keyframes are the EP maps', on the presentation axis, each one a seek lands on")
+    func planKeyframesComeFromTheMaps() throws {
+        let demuxer = Demuxer()
+        try demuxer.open(reader: Self.twoClipFolder())
+        defer { demuxer.close() }
+        #expect(demuxer.keyframeIndexAxis == .presentation)
+        let entries = demuxer.indexedKeyframeEntries(streamIndex: demuxer.videoStreamIndex)
+        let expected = Self.keyframes.map(\.seconds) + Self.secondItemKeyframes
+        #expect(entries.count == expected.count)
+        for (entry, seconds) in zip(entries, expected) {
+            // At the map's precision: never later than the picture, never more than 5.7 ms earlier.
+            let gap = seconds * 90000 - Double(entry.pts)
+            #expect(gap >= 0 && gap < 512, "entry \(entry.pts) for \(seconds)s")
+        }
+        // The producer's re-aim seeks on the stream's own ticks; on a disc that goes by the maps too.
+        let capture = EngineLogCapture()
+        defer { capture.end() }
+        for (entry, seconds) in zip(entries, expected) where seconds > 9 {
+            #expect(demuxer.seek(to: entry.pts, streamIndex: demuxer.videoStreamIndex))
+            let first = try Self.keyframeSeconds(demuxer).first ?? 0
+            #expect(abs(first - seconds) < 0.001, "seek to \(entry.pts) read \(first)")
+        }
+        #expect(!capture.matching("EP map seek").isEmpty)
     }
 }

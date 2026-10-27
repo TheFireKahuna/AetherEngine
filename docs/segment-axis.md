@@ -1,5 +1,8 @@
 # Honest segment boundaries and the in-band clock
 
+Status: the in-band clock is built and is the VOD axis (2026-10-25, `b85e7ed0`). Blu-ray titles plan on
+their EP maps (`19f8f4bf`). DVD titles, a loose `.m2ts` and plain TS stay on the uniform grid, which the
+clock measures; see "Discs" below. The probes it rests on are described under "Measured", including a
 load-time Cues check that was built and withdrawn on its cost.
 
 ## Why
@@ -64,6 +67,9 @@ Mac only.
 |---|---|---|
 | MP4/MOV | `stss` | `stss`, through libavformat's index |
 | Matroska | Cues. RFC 9559 22.1: "each keyframe SHOULD be referenced by a CuePoint", "RECOMMENDED to not reference non-keyframes". 10.4: a RAP MUST set the keyframe flag, or its BlockGroup MUST NOT hold a `ReferenceBlock`. `CueClusterPosition` mandatory; `CueRelativePosition` (DocTypeVersion 4) and `CueBlockNumber` optional. 25.1: clusters RECOMMENDED at most 5 s or 5 MB. | libavformat's index, which enters every cue as a keyframe (AE#408) |
+| Blu-ray disc (image or folder) | EP_map in each clip's `.clpi` | the EP maps (`DiscSeekTable.titleKeyframes`) |
+| DVD disc | VOBU time map (VTS_TMAPT): a byte every few seconds of title time, not each VOBU's time | uniform grid |
+| `.m2ts` alone, its BDMV folder beside it | the sibling `CLIPINF/<n>.clpi` | uniform grid (the engine only reads a `.clpi` as part of a disc) |
 | loose `.m2ts`, plain TS | nothing in the container. In-band only (`random_access_indicator`, NAL types); Blu-ray caps the spacing at about 1 s | uniform grid |
 | HLS sources | their own segment starts | used (AE#268) |
 
@@ -102,6 +108,11 @@ playlist says and the offset is zero by construction.
   is a sync sample, at no cost. A file that follows the spec (every one measured) opens every segment on
   its boundary. One whose Cues name ordinary frames (AE#408) is caught at that read: the AE#408 re-aim
   opens on the covering sync sample, and part 2 measures the offset.
+- **Blu-ray discs:** the EP maps; see "Discs".
+- **DVD discs:** the uniform grid. Each VOBU's time is in its navigation pack, one read per VOBU, the
+  cost the Cues check was withdrawn on; DVD GOPs are short (about 0.6 s at most), so the offset the clock
+  measures is small.
+- **`.m2ts` in a BDMV layout, opened alone:** its clip's EP_map, not built (no source in the library).
 - **Loose `.m2ts` and TS:** the uniform grid stays. The offset is bounded, known exactly to the producer
   at its gate, and measured by part 2.
 
@@ -127,6 +138,27 @@ corrected by the landing segment's own report, which arrives at the landing.
 - AE#412 recuts, re-evaluated: they exist for segments that carry no random-access point at all, which an
   honest plan cannot produce and Blu-ray's GOP cap rules out on a loose `.m2ts`.
 
+## Discs
+
+A Blu-ray title's EP maps are `indexedKeyframeEntries` for its video stream, so the keyframe-aligned plan
+takes them as it takes Matroska Cues, on the presentation axis (`Demuxer.keyframeIndexAxis`). Each entry
+is placed on the source axis as title origin plus its play item's start plus its distance from `in_time`,
+and kept when its picture presents inside the item's `in_time..<out_time`.
+
+- **Precision.** An entry drops the low 9 bits of the 90 kHz PTS: it reads up to 5.7 ms below its picture
+  and never above. That is less than any frame, so the gate opens on the entry's own picture, a clip's
+  first keyframe (presenting at `in_time`) is kept although its entry reads earlier, and the keyframe
+  presenting at `out_time` is left to the next item. A segment's stated start is at most 5.7 ms early,
+  constant across a run, which the clock reads. Exact times would cost a read per boundary.
+- **One fold.** A later clip's timestamps are moved by what its play item states,
+  `inTime[k] - inTime[0] - cumulativeBefore[k]`, with the 33-bit wrap the 32-bit `in_time` cannot express
+  read off any of its packets (`ClipFold.playlistOffsetSeconds`). Title time counts from play item 0's
+  `in_time` in clip 0's clock span, known when the probe sets `start_time`. Before this, a clip reached by
+  playing through was anchored on its first packet and one reached by a seek on the prediction, which
+  differ by how far each clip's first packet leads its `in_time`, so the plan could not match both.
+- **Seeks.** EP map seeks count from the same origin and look up by rounded ticks, so every boundary seeks
+  back to its own entry; `seek(to:streamIndex:)` (the AE#408 re-aim) takes the maps too.
+
 ## A/V sync
 
 None of this moves audio against video. Honest boundaries change which timestamps start segments, not any
@@ -144,6 +176,8 @@ output, HDMI, the receiver).
 
 ## Order of work
 
+1. **Blu-ray discs on their EP maps.** Done (`19f8f4bf`). DVD stays on the grid; a lone BDMV `.m2ts` is not
+   built.
 2. **The in-band clock, as one cutover** that writes the `emsg`, attaches the output, maps position from
    it, and deletes the model. Done (`b85e7ed0`).
 3. **Acceptance:** the picture-probe arms (late open, early, appended run, seek burst, drought, uniform-grid

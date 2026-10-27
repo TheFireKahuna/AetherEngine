@@ -1,10 +1,15 @@
 import Foundation
+import AetherLibavutil
 
 /// One entry point of a Blu-ray clip's EP map: a video keyframe's presentation time on the clip's own
 /// clock (45 kHz) and the source packet it starts at (192 bytes each in an `.m2ts`).
 struct CLPIEntryPoint: Sendable, Equatable {
     let pts45k: UInt64
     let spn: UInt32
+
+    /// The map's time precision, 45 kHz ticks: the fine field drops the low 9 bits of the 90 kHz PTS,
+    /// so an entry's picture presents in `pts45k..<pts45k + precision45k`.
+    static let precision45k: UInt64 = 256
 }
 
 /// Reads the EP map out of a clip information file (`BDMV/CLIPINF/NNNNN.clpi`).
@@ -98,29 +103,62 @@ struct DiscSeekTable: Sendable {
         let cumulativeBeforeSec: Double
         /// The play item's `in_time`: where on the clip's own clock the title starts using it.
         let inTimeSec: Double
+        /// The play item's `out_time`: where on the clip's own clock the title stops using it.
+        let outTimeSec: Double
+        /// The clip's entry points in order of `offset45k`, which is their order on the clip's clock even
+        /// where that clock wraps inside the clip.
         let entries: [CLPIEntryPoint]
+
+        init(concatByteStart: Int64, cumulativeBeforeSec: Double, inTimeSec: Double, outTimeSec: Double,
+             entries: [CLPIEntryPoint]) {
+            self.concatByteStart = concatByteStart
+            self.cumulativeBeforeSec = cumulativeBeforeSec
+            self.inTimeSec = inTimeSec
+            self.outTimeSec = outTimeSec
+            let in45k = Self.ticks45k(inTimeSec)
+            self.entries = entries.sorted { Self.offset45k($0.pts45k, from: in45k) < Self.offset45k($1.pts45k, from: in45k) }
+        }
+
+        /// How far `pts45k` is past this play item's `in_time`, negative before it.
+        func offset45k(_ pts45k: UInt64) -> Int64 { Self.offset45k(pts45k, from: Self.ticks45k(inTimeSec)) }
+
+        /// The play item's length on the clip's clock, 45 kHz ticks.
+        var duration45k: Int64 { Self.offset45k(Self.ticks45k(outTimeSec), from: Self.ticks45k(inTimeSec)) }
+
+        /// The distance on the clip's 32-bit 45 kHz clock, which wraps every 26.5 hours: a clip's times
+        /// may cross the wrap inside it (its `in_time` near the top, its later entries and `out_time`
+        /// past zero), and a clip is far shorter than half a wrap, so the signed 32-bit difference is
+        /// the distance.
+        private static func offset45k(_ pts45k: UInt64, from in45k: UInt64) -> Int64 {
+            Int64(Int32(truncatingIfNeeded: UInt32(truncatingIfNeeded: pts45k) &- UInt32(truncatingIfNeeded: in45k)))
+        }
+
+        private static func ticks45k(_ seconds: Double) -> UInt64 { UInt64((seconds * discTickRate).rounded()) }
     }
 
     let clips: [Clip]
 
-    /// The byte of the last keyframe at or before `seconds` on the demuxer's source axis (clip 0's
-    /// observed timestamp base plus the folded title time, AE#105), with the clip it is in and its time on
-    /// that clip's clock. `base0Sec` is NaN until the first clip's base has been read; the play item's
-    /// `in_time` stands in for it then.
-    func keyframe(forSourceSeconds seconds: Double, base0Sec: Double) -> (offset: Int64, clip: Int, keyframeSec: Double)? {
-        guard let first = clips.first else { return nil }
-        let base = base0Sec.isFinite ? base0Sec : first.inTimeSec
-        let titleTime = max(0, seconds - base)
-        guard let k = clips.lastIndex(where: { $0.cumulativeBeforeSec <= titleTime + 0.001 }) else { return nil }
+    /// The byte of the last keyframe at or before `seconds` on the demuxer's source axis (the title's
+    /// origin plus title time, `ClipFold.titleOriginSeconds`), with the clip it is in and its time on
+    /// that clip's clock.
+    func keyframe(forSourceSeconds seconds: Double, titleOriginSec: Double) -> (offset: Int64, clip: Int, keyframeSec: Double)? {
+        guard titleOriginSec.isFinite else { return nil }
+        let titleTime = max(0, seconds - titleOriginSec)
+        // Within the map's precision of a clip's start is that clip: its first keyframe usually presents at
+        // the play item's `in_time`, and its entry may read up to that much earlier (`titleKeyframes`).
+        let tolerance = Double(CLPIEntryPoint.precision45k) / discTickRate
+        guard let k = clips.lastIndex(where: { $0.cumulativeBeforeSec <= titleTime + tolerance }) else { return nil }
         let clip = clips[k]
         guard !clip.entries.isEmpty else { return nil }
-        let raw45k = UInt64(max(0, (clip.inTimeSec + (titleTime - clip.cumulativeBeforeSec)) * discTickRate))
+        // Rounded, not truncated: a plan boundary is an entry's own time (`titleKeyframes`), and the trip
+        // through seconds must come back to that entry rather than one tick below it.
+        let target45k = Int64(((titleTime - clip.cumulativeBeforeSec) * discTickRate).rounded())
         var lo = 0
         var hi = clip.entries.count - 1
         var best = 0
         while lo <= hi {
             let mid = (lo + hi) / 2
-            if clip.entries[mid].pts45k <= raw45k {
+            if clip.offset45k(clip.entries[mid].pts45k) <= target45k {
                 best = mid
                 lo = mid + 1
             } else {
@@ -130,30 +168,79 @@ struct DiscSeekTable: Sendable {
         let entry = clip.entries[best]
         return (clip.concatByteStart + Int64(entry.spn) * 192, k, Double(entry.pts45k) / discTickRate)
     }
+
+    /// Every keyframe the title plays, in title order: each clip's entries whose picture presents inside
+    /// its play item's `in_time..<out_time`, placed on the demuxer's source axis in `timeBase` ticks (the
+    /// inverse of `keyframe(forSourceSeconds:titleOriginSec:)`), with the byte it starts at.
+    ///
+    /// An entry's time is its picture's presentation time to the map's precision (5.7 ms) and never later,
+    /// which is below any frame interval: the first sync sample at or after it is that picture, and no
+    /// other picture presents within that precision of a play item's `in_time` or `out_time`. So a clip's
+    /// first keyframe, which usually presents at `in_time` itself, is kept although its entry may read
+    /// earlier, and the keyframe that presents at `out_time`, the next item's business, is not.
+    func titleKeyframes(titleOriginSec: Double, timeBase: AVRational) -> [(pts: Int64, pos: Int64)] {
+        guard titleOriginSec.isFinite, timeBase.num > 0, timeBase.den > 0 else { return [] }
+        let ticksPerSecond = Double(timeBase.den) / Double(timeBase.num)
+        var out: [(pts: Int64, pos: Int64)] = []
+        out.reserveCapacity(clips.reduce(0) { $0 + $1.entries.count })
+        let precision = Int64(CLPIEntryPoint.precision45k)
+        for clip in clips {
+            let duration = clip.duration45k
+            for entry in clip.entries {
+                let offset = clip.offset45k(entry.pts45k)
+                guard offset + precision > 0, offset + precision <= duration else { continue }
+                let titleSec = clip.cumulativeBeforeSec + Double(offset) / discTickRate
+                out.append((pts: Int64(((titleOriginSec + titleSec) * ticksPerSecond).rounded()),
+                            pos: clip.concatByteStart + Int64(entry.spn) * 192))
+            }
+        }
+        return out
+    }
 }
 
 extension DiscReader {
-    /// Distinct clips whose CLPI a seek table reads at most.
-    static let maxSeekTableClips = 256
+    /// Bytes of CLPI read for one seek table, the bound the PLAYLIST scan keeps (`maxPlaylistBytes`). A
+    /// title's distinct clips are already bounded by its 999 play items; a clip's CLPI is KB-scale (a
+    /// three-hour clip's EP map is about 100 KB), so this is orders above any disc and only stops a
+    /// crafted image whose CLPI files each run to `readAll`'s ceiling.
+    static let maxSeekTableBytes: Int64 = maxPlaylistBytes
+
+    /// Whether a title's CLPI files, `declared` bytes each, fit `maxSeekTableBytes` together. Checked on
+    /// the sizes the image or folder states, before anything is read.
+    static func clipInfoFitsBudget(_ declared: [Int64]) -> Bool {
+        let total = declared.reduce(Int64(0)) { $0 + max(0, $1) }
+        guard total <= maxSeekTableBytes else {
+            EngineLog.emit("[disc] seek table: \(declared.count) CLPI files declare \(total) bytes, past "
+                           + "\(maxSeekTableBytes); seeking by timestamp", category: .demux)
+            return false
+        }
+        return true
+    }
 
     /// The selected title's seek table, from the CLPI of each clip the title resolved. `resolved` lists
-    /// those clips with their play item index and their first byte in the concatenated stream. nil when
-    /// the playlist carries no `in_time`s or any clip has no readable EP map, so a title is either sought
-    /// by its maps throughout or by timestamp throughout.
+    /// those clips with their play item index and their first byte in the concatenated stream.
+    /// `readCLPIs` reads the CLPI of each distinct clip named, in that order, the way its source reads
+    /// best (`readImageFiles`, `readFolderFiles`), empty for a clip without one; nil when they do not fit
+    /// `clipInfoFitsBudget`. nil when the playlist carries no `in_time`s or `out_time`s or any clip has no
+    /// readable EP map, so a title is either sought by its maps throughout or by timestamp throughout.
+    ///
+    /// Every distinct clip is read, whatever their number: a title cut into hundreds of clips is the one a
+    /// timestamp search cannot seek (each clip runs its own clock), and the plan is built from these maps.
     static func buildSeekTable(title: DiscTitle,
                                resolved: [(item: Int, clip: String, byteStart: Int64)],
-                               readCLPI: (String) -> [UInt8]?) -> DiscSeekTable? {
-        guard let inTimes = title.bdClipInTimes, !resolved.isEmpty else { return nil }
-        // One small file per distinct clip. A real title has a handful; a title past this is not worth a
-        // request per clip before the first frame, and keeps seeking by timestamp.
-        guard Set(resolved.map(\.clip)).count <= maxSeekTableClips else { return nil }
+                               readCLPIs: ([String]) -> [[UInt8]]?) -> DiscSeekTable? {
+        guard let inTimes = title.bdClipInTimes, let outTimes = title.bdClipOutTimes,
+              inTimes.count == outTimes.count, !resolved.isEmpty else { return nil }
+        var distinct: [String] = []
+        var seen: Set<String> = []
+        for item in resolved where seen.insert(item.clip).inserted { distinct.append(item.clip) }
+        guard let files = readCLPIs(distinct), files.count == distinct.count else { return nil }
+        let maps = Dictionary(zip(distinct, files.map(CLPIParser.entryPoints)), uniquingKeysWith: { first, _ in first })
         let cumulativeBefore = title.bdClipCumulativeBeforeTicks ?? []
-        var maps: [String: [CLPIEntryPoint]] = [:]
         var clips: [DiscSeekTable.Clip] = []
         for item in resolved {
             guard item.item < inTimes.count else { return nil }
-            let entries = maps[item.clip] ?? (readCLPI(item.clip).map(CLPIParser.entryPoints) ?? [])
-            maps[item.clip] = entries
+            let entries = maps[item.clip] ?? []
             guard !entries.isEmpty else {
                 EngineLog.emit("[disc] seek table: clip \(item.clip) has no readable EP map; seeking by timestamp", category: .demux)
                 return nil
@@ -162,9 +249,11 @@ extension DiscReader {
                                cumulativeBeforeSec: item.item < cumulativeBefore.count
                                    ? Double(cumulativeBefore[item.item]) / discTickRate : 0,
                                inTimeSec: Double(inTimes[item.item]) / discTickRate,
+                               outTimeSec: Double(outTimes[item.item]) / discTickRate,
                                entries: entries))
         }
-        EngineLog.emit("[disc] seek table: \(clips.count) clip(s), entries=\(clips.map(\.entries.count))", category: .demux)
+        EngineLog.emit("[disc] seek table: \(clips.count) clip(s) of \(distinct.count) CLPI, "
+                       + "\(clips.reduce(0) { $0 + $1.entries.count }) entries", category: .demux)
         return DiscSeekTable(clips: clips)
     }
 }

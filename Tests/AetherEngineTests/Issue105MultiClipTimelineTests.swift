@@ -4,7 +4,7 @@ import XCTest
 /// AE#105: a multi-clip Blu-ray title concatenates m2ts clips that each carry their own STC, so the raw
 /// source PTS leaps at every clip boundary. The demuxer folds each clip onto one contiguous presentation
 /// timeline by subtracting a per-clip offset, attributing packets to clips by byte position. These cover
-/// the pure pieces of that transform (the end-to-end packet rewrite is device-verified on the real disc).
+/// the pure pieces of that transform; `BluRayEPMapSeekTests` reads packets through it.
 final class Issue105MultiClipTimelineTests: XCTestCase {
 
     // MARK: - Byte-position -> clip attribution (ClipSpan.index)
@@ -34,44 +34,47 @@ final class Issue105MultiClipTimelineTests: XCTestCase {
         XCTAssertEqual(ClipSpan.index(forPos: 500, in: [], fallback: 3), 3)
     }
 
-    // MARK: - Observed fold offset
+    // MARK: - Playlist fold offset
 
-    /// The demuxer resolves each later clip's fold offset from its OBSERVED raw base (as unwrapped by
-    /// FFmpeg), clip 0's observed base, and the small MPLS presentation duration. Replicates that and asserts
-    /// clip 1 is pulled back to continue right where clip 0 ended instead of leaping to ~96043s.
-    func test_observedFoldYieldsContiguousTimeline() {
-        // Real disc geometry from the #105 log: clip 0 raw base 4199.9s, clip 1 raw base 96043s (already
-        // >2^33 ticks, i.e. FFmpeg-unwrapped past the 33-bit PTS wrap), clip 0 presentation duration ~40s.
-        let base0 = 4_199.917, clip1ObservedBase = 96_043.0, clip0DurationSec = 40.083
-        let shift = ClipFold.offsetSeconds(observedBaseSec: clip1ObservedBase, base0Sec: base0,
-                                           cumulativeBeforeSec: clip0DurationSec)
+    /// Real disc geometry from the #105 log: clip 0 raw base 4199.917 s, clip 1 raw base 96043 s (already
+    /// past 2^33 ticks, i.e. FFmpeg-unwrapped past the 33-bit PTS wrap), clip 0 presentation 40.083 s.
+    private let base0 = 4_199.917, clip1RawBase = 96_043.0, clip0DurationSec = 40.083
 
-        // Folded clip 1 base = raw base - shift, must equal base0 + clip0 duration (contiguous), not 96043s.
-        let clip1FoldedBase = clip1ObservedBase - shift
-        XCTAssertEqual(clip1FoldedBase, base0 + clip0DurationSec, accuracy: 0.01)
-        XCTAssertEqual(shift, 91_803.0, accuracy: 0.1)
+    /// The MPLS `in_time` is a 32-bit 45 kHz field: clip 1's (96043 s) is past 2^32 ticks and reads wrapped,
+    /// so the playlist's own offset, `inTime[1] - inTime[0] - cumulativeBefore[1]`, is a whole wrap short.
+    private var predictedSec: Double {
+        let discTick = 45_000.0
+        let inTime0 = UInt64(base0 * discTick)
+        let inTime1Wrapped = UInt64((clip1RawBase * discTick).truncatingRemainder(dividingBy: 4_294_967_296))
+        return (Double(inTime1Wrapped) - Double(inTime0) - (clip0DurationSec * discTick).rounded()) / discTick
     }
 
-    /// Root cause: the old fold predicted the offset from the MPLS `inTime` field, a 32-bit 45 kHz value that
-    /// wraps at ~95443s. When clip 1's STC base (96043s) crosses that wrap, `inTime` reads ~599s, so the
-    /// predicted offset is wildly wrong (negative) while the observed offset stays correct. This is why the
-    /// prediction-based fold (b025ee8) did not fix the reporter's disc and the observed fold does.
-    func test_observedFoldSurvivesInTimeWrapWherePredictionFails() {
-        let discTick = 45_000.0
-        let base0 = 4_199.917, clip1ObservedBase = 96_043.0, clip0DurationSec = 40.083
+    /// Clip 1 is pulled back to continue right where clip 0 ended, the wrap the playlist cannot state read
+    /// off the clip's own packets, instead of leaping to ~96043 s or being pushed further out.
+    func test_playlistFoldYieldsContiguousTimelineAcrossTheWrap() {
+        XCTAssertLessThan(predictedSec, 0)  // the bare prediction: wrong sign, a wrap short
+        let origin = ClipFold.titleOriginSeconds(inTime0Sec: base0, nearRawSec: base0)
+        let shift = ClipFold.playlistOffsetSeconds(predictedSec: predictedSec, rawSec: clip1RawBase,
+                                                   titleOriginSec: origin, cumulativeBeforeSec: clip0DurationSec)
+        XCTAssertEqual(shift, 91_803.0, accuracy: 0.1)
+        XCTAssertEqual(clip1RawBase - shift, base0 + clip0DurationSec, accuracy: 0.01)
+    }
 
-        // MPLS inTime is a 32-bit field: clip 1's true STC (96043s) exceeds 2^32 ticks and wraps.
-        let inTime0 = UInt64(base0 * discTick)                                   // < 2^32, no wrap
-        let inTime1Wrapped = UInt64((clip1ObservedBase * discTick).truncatingRemainder(dividingBy: 4_294_967_296))
-        let cumBeforeTicks = UInt64(clip0DurationSec * discTick)
-        let predictedSec = (Double(inTime1Wrapped) - Double(inTime0) - Double(cumBeforeTicks)) / discTick
+    /// Any packet of the clip resolves it to the same offset: the first one read on a crossing, one a seek
+    /// lands on mid-clip, or a lead audio packet a little before the play item's `in_time`.
+    func test_playlistFoldDoesNotDependOnWhichPacketIsRead() {
+        let origin = ClipFold.titleOriginSeconds(inTime0Sec: base0, nearRawSec: base0)
+        let offsets = [clip1RawBase - 0.7, clip1RawBase, clip1RawBase + 1_800].map {
+            ClipFold.playlistOffsetSeconds(predictedSec: predictedSec, rawSec: $0, titleOriginSec: origin,
+                                           cumulativeBeforeSec: clip0DurationSec)
+        }
+        XCTAssertEqual(Set(offsets).count, 1)
+    }
 
-        let observedSec = ClipFold.offsetSeconds(observedBaseSec: clip1ObservedBase, base0Sec: base0,
-                                                 cumulativeBeforeSec: clip0DurationSec)
-
-        // Prediction is off by a wrap (thousands of seconds, wrong sign); observed lands on the true jump.
-        XCTAssertLessThan(predictedSec, 0)                       // wrong sign, would push clip 1 further out
-        XCTAssertEqual(observedSec, 91_803.0, accuracy: 0.1)
-        XCTAssertGreaterThan(abs(observedSec - predictedSec), 90_000.0)
+    /// The title's origin is play item 0's `in_time` in the clock span clip 0 is read in.
+    func test_titleOriginFollowsClipZerosClockSpan() {
+        XCTAssertEqual(ClipFold.titleOriginSeconds(inTime0Sec: 11.6, nearRawSec: 11.5), 11.6, accuracy: 1e-9)
+        XCTAssertEqual(ClipFold.titleOriginSeconds(inTime0Sec: 11.6, nearRawSec: 11.5 + ClipFold.wrapSeconds),
+                       11.6 + ClipFold.wrapSeconds, accuracy: 1e-6)
     }
 }
