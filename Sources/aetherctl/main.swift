@@ -70,7 +70,7 @@ func printUsage() {
       aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] [--stereo auto|mono|sbs|ou] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
-      aetherctl play [--fel] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
+      aetherctl play [--fel] [--surface | --window] [--cycle-el SECONDS] [--fel-output MODE] [--fel-rpu-override FILE] [--legacy-renderer-attach] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
                  [--assert-dv] [--dv-base-layer]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
@@ -111,11 +111,12 @@ func printUsage() {
                           (#92: SW-decode each segment in isolation; framesDecoded==0 => not independent)
       aetherctl disc-inspect <disc.iso>
       aetherctl dovitest [--out PATH.hevc] <file>
-      aetherctl feltest [--frames N] <file>   (DualLayerDolbyVision trait)
+      aetherctl feltest [--frames N] [--fel-output MODE] [--fel-rpu-override FILE] <file>   (DualLayerDolbyVision trait)
       aetherctl dvsurvey [--frames N] [--list K] <file>
       aetherctl extract [--at <sec>] [--preview|--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
-      aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>
+      aetherctl audiotap [--duration S] [--out PATH.wav] [--remote] <url>
+                         (#95: decode the loopback audio track to mono 48k WAV, print continuity stats)
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] [--audio-index N] [--reload-decode-path automatic|software] <file>
       aetherctl customio --live [--rate-kbps N] [--seconds N] [--dvr-window N] [--report-size] [--no-wrap] [--malloc-census] [--foundation-reader] [--host-carry none|removeFirst|subdata] [--reload-at S] [--cancel-latches] [--reload-decode-path automatic|software] [--reader-axis absolute|join|mismatched] [--join-offset-mb N] <file.ts>
                          (AE#445: a host-owned live spool behind MediaSource.custom, paced at the mux rate,
@@ -552,6 +553,44 @@ if first == "dvsurvey" {
     exit(runDvSurvey(url: parseSourceURL(urlArg), maxFrames: frames, listFrames: list))
 }
 
+#if DualLayerDolbyVision
+// One FEL frame composed with and without its residual, as raw planes: elframe --at SECONDS --out DIR <url>.
+if first == "elframe" {
+    var rest = Array(args.dropFirst(2))
+    let at = takeDoubleFlag("--at", from: &rest) ?? 0
+    guard let outIdx = rest.firstIndex(of: "--out"), outIdx + 1 < rest.count else {
+        print("Usage: aetherctl elframe --at SECONDS --out DIR <url>")
+        exit(64)
+    }
+    let out = URL(fileURLWithPath: rest[outIdx + 1])
+    rest.removeSubrange(outIdx...(outIdx + 1))
+    guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
+        print("Usage: aetherctl elframe --at SECONDS --out DIR <url>")
+        exit(64)
+    }
+    rest.removeAll { $0 == urlArg }
+    rejectStrayFlags(rest, subcommand: "elframe")
+    exit(runElFrame(url: parseSourceURL(urlArg), seconds: at, outDir: out))
+}
+
+// What each title's enhancement layer does to its picture, measured at sampled keyframes: `label<TAB>url` lines on stdin.
+if first == "elsurvey" {
+    var rest = Array(args.dropFirst(2))
+    let parallel = takeIntFlag("--parallel", from: &rest) ?? 8
+    let points = takeIntFlag("--points", from: &rest) ?? 48
+    rejectStrayFlags(rest, subcommand: "elsurvey")
+    exit(runElSurvey(parallel: parallel, points: points))
+}
+#endif
+
+// FEL / MEL for many sources at once: `label<TAB>url` lines on stdin.
+if first == "eltype" {
+    var rest = Array(args.dropFirst(2))
+    let parallel = takeIntFlag("--parallel", from: &rest) ?? 8
+    rejectStrayFlags(rest, subcommand: "eltype")
+    exit(runElType(parallel: parallel))
+}
+
 // #93 post-recovery judder: raw video packet timing per demuxer open profile.
 if first == "pktdump" {
     var rest = Array(args.dropFirst(2))
@@ -575,8 +614,6 @@ if first == "audiotap" {
     let outPath = takeStringFlag("--out", from: &rest) ?? debugOutputPath("audiotap.wav")
     let remote = rest.contains("--remote")
     rest.removeAll { $0 == "--remote" }
-    let software = rest.contains("--software")
-    rest.removeAll { $0 == "--software" }
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: audiotap requires a <url> argument")
         print("Usage: aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>")
@@ -1073,7 +1110,7 @@ if first == "play" {
         done.wait()
     }
     exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, liveCushion: liveCushion, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW, softwareEscalation: playSoftwareEscalation,
-                 censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, nativeVideoFrameDiagnostics: nativeVideoFrameDiagnostics, nativeVideoFrameRecovery: nativeVideoFrameRecovery, sidecars: sidecars,
+                 censusThresholdMB: censusThresholdMB, censusHz: censusHz, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, nativeVideoFrameDiagnostics: nativeVideoFrameDiagnostics, nativeVideoFrameRecovery: nativeVideoFrameRecovery, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
                  audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches,
