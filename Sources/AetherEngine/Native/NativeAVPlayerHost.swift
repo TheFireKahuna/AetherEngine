@@ -826,7 +826,7 @@ final class NativeAVPlayerHost {
                         try? await Task.sleep(nanoseconds: 2_500_000_000)
                         guard let self = self, let item = self.playerItem else { return }
                         Self.dumpAudioRoute(sid: sid, phase: "settled")
-                        await Self.warnIfFLACSurroundExceedsRoute(item, sid: sid)
+                        await Self.warnIfLPCMSurroundExceedsRoute(item, sid: sid)
                         await Self.warnIfEAC3SurroundOnStereoRoute(
                             item, sid: sid, isAtmosStreamCopy: contract.audioIsAtmosStreamCopy)
                         // #168: the video track can be absent from item.tracks at readyToPlay for HLS;
@@ -2954,25 +2954,25 @@ final class NativeAVPlayerHost {
         return parts.joined(separator: " ")
     }
 
-    /// Warn when the FLAC bridge produced N-channel LPCM but the route carries fewer channels. FLAC bridge decodes to LPCM (unlike stream-copy EAC3/AC3 which tunnels encoded). Not a bridge bug, a route capability mismatch. Silent with tvOS's Continuous Audio Connection on: every HDMI route then reports 32 channels whatever the sink takes (AE#794), so the route cannot show a mismatch.
-    private static func warnIfFLACSurroundExceedsRoute(_ item: AVPlayerItem, sid: Int) async {
+    /// Warn when an audio track tvOS outputs as LPCM (PCM, which the bridge hands on and linear PCM copies as, FLAC, ALAC) has N channels but the route carries fewer (unlike EAC3/AC3, which tunnel encoded). Not a bridge bug, a route capability mismatch. Silent with tvOS's Continuous Audio Connection on: every HDMI route then reports 32 channels whatever the sink takes (AE#794), so the route cannot show a mismatch.
+    private static func warnIfLPCMSurroundExceedsRoute(_ item: AVPlayerItem, sid: Int) async {
         #if os(iOS) || os(tvOS)
         var trackChannels: Int = 0
-        var isFLAC = false
+        var lpcmCodec: String?
         for itemTrack in item.tracks {
             guard let assetTrack = itemTrack.assetTrack else { continue }
             guard assetTrack.mediaType == .audio else { continue }
             guard let cm = await Self.formatDescriptions(of: assetTrack).first else { continue }
             let codec = fourccString(CMFormatDescriptionGetMediaSubType(cm))
-            if codec.lowercased() == "flac" {
-                isFLAC = true
+            if ["lpcm", "flac", "alac"].contains(codec.lowercased()) {
+                lpcmCodec = codec
                 if let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(cm) {
                     trackChannels = Int(asbdPtr.pointee.mChannelsPerFrame)
                 }
                 break
             }
         }
-        guard isFLAC, trackChannels > 2 else { return }
+        guard let lpcmCodec, trackChannels > 2 else { return }
         let session = AVAudioSession.sharedInstance()
         let routeChannels = max(
             session.currentRoute.outputs.first?.channels?.count ?? 0,
@@ -2980,7 +2980,7 @@ final class NativeAVPlayerHost {
         )
         guard routeChannels > 0, routeChannels < trackChannels else { return }
         EngineLog.emit(
-            "[NativeAVPlayerHost] #\(sid) WARNING: FLAC bridge produced \(trackChannels)-channel "
+            "[NativeAVPlayerHost] #\(sid) WARNING: the \(lpcmCodec) audio track is \(trackChannels)-channel "
             + "LPCM but active audio route carries only \(routeChannels) LPCM channels, tvOS "
             + "will downmix. A 6-channel route is a 5.1 sink (an eARC soundbar such as a Sonos "
             + "Arc takes 6-channel LPCM), which still gets lossless 5.1; a 2-channel route is a "

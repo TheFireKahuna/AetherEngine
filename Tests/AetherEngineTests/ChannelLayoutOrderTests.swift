@@ -32,32 +32,31 @@ final class ChannelLayoutOrderTests: XCTestCase {
         }
     }
 
-    /// CoreAudio's own expansion of a layout, so the comparison is against Apple's data rather
-    /// than against a second table of ours.
-    private func coreAudioOrder(_ labels: [AudioChannelLabel]) -> [String] {
-        labels.map { Self.name(for: $0) }
-    }
-
-    private static func name(for label: AudioChannelLabel) -> String {
-        switch label {
-        case kAudioChannelLabel_Left: return "FL"
-        case kAudioChannelLabel_Right: return "FR"
-        case kAudioChannelLabel_Center: return "FC"
-        case kAudioChannelLabel_LFEScreen: return "LFE"
-        case kAudioChannelLabel_LeftSurround: return "BL"
-        case kAudioChannelLabel_RightSurround: return "BR"
-        case kAudioChannelLabel_LeftCenter: return "FLC"
-        case kAudioChannelLabel_RightCenter: return "FRC"
-        case kAudioChannelLabel_CenterSurround: return "BC"
-        // CoreAudio names the extra 7.1 surround pair "rear" where FFmpeg names it "side".
-        // Measured through a real downmix: both place identically, so the pair is compared by
-        // position rather than by which of the two names each library prefers.
-        case kAudioChannelLabel_LeftSurroundDirect, kAudioChannelLabel_RearSurroundLeft:
-            return "SL"
-        case kAudioChannelLabel_RightSurroundDirect, kAudioChannelLabel_RearSurroundRight:
-            return "SR"
-        case kAudioChannelLabel_Mono: return "MONO"
-        default: return "label\(label)"
+    /// The CoreAudio label each channel the resampler writes has to carry, by meaning rather than
+    /// by name. CoreAudio's 7.1 is L R C LFE Ls Rs Rls Rrs with Ls/Rs the SIDE pair and Rls/Rrs
+    /// the REAR pair (its own WAVE_7_1, FFmpeg's order, expands to L R C LFE Rls Rrs Ls Rs, and
+    /// an AVAudioConverter from MPEG_7_1_C to WAVE_7_1 moves channels 5-6 to 7-8). So FFmpeg's
+    /// back pair is Rls/Rrs whenever a side pair sits beside it, and Ls/Rs when it is the only
+    /// surround pair, as in 5.0/5.1/6.1(back). The old test folded Rls and Lsd into one "SL" and
+    /// compared through a stereo downmix, which is blind to a front/back swap: it passed 7.1 with
+    /// the back pair labelled as sides and the sides as rears.
+    private func expectedLabels(_ count: Int32) -> [AudioChannelLabel] {
+        if count == 1 { return [kAudioChannelLabel_Mono] }
+        let names = resamplerOrder(count)
+        let hasSides = names.contains("SL")
+        return names.map { name in
+            switch name {
+            case "FL": return kAudioChannelLabel_Left
+            case "FR": return kAudioChannelLabel_Right
+            case "FC": return kAudioChannelLabel_Center
+            case "LFE": return kAudioChannelLabel_LFEScreen
+            case "BC": return kAudioChannelLabel_CenterSurround
+            case "SL": return kAudioChannelLabel_LeftSurround
+            case "SR": return kAudioChannelLabel_RightSurround
+            case "BL": return hasSides ? kAudioChannelLabel_RearSurroundLeft : kAudioChannelLabel_LeftSurround
+            case "BR": return hasSides ? kAudioChannelLabel_RearSurroundRight : kAudioChannelLabel_RightSurround
+            default: return kAudioChannelLabel_Unknown
+            }
         }
     }
 
@@ -133,11 +132,10 @@ final class ChannelLayoutOrderTests: XCTestCase {
 
     func testStampedLayoutDescribesTheChannelsTheResamplerActuallyWrote() {
         for count in Int32(1)...8 {
-            let stamped = coreAudioOrder(stampedChannelLabels(count))
             // A mono track is a mono track, not a centre channel: it keeps the Mono tag, whose
             // up-mix to stereo is full gain where a Centre description would cost 3 dB.
-            let expected = count == 1 ? ["MONO"] : resamplerOrder(count)
-            XCTAssertEqual(stamped, expected, "\(count)ch is stamped as something else")
+            XCTAssertEqual(stampedChannelLabels(count), expectedLabels(count),
+                           "\(count)ch is stamped as something else")
         }
     }
 
@@ -151,6 +149,8 @@ final class ChannelLayoutOrderTests: XCTestCase {
             5: kAudioChannelLayoutTag_MPEG_5_0_A,
             6: kAudioChannelLayoutTag_MPEG_5_1_A,
             7: kAudioChannelLayoutTag_AudioUnit_6_1,
+            // CoreAudio's tag for the WAVEFORMATEXTENSIBLE order, which is FFmpeg's 7.1 order.
+            8: kAudioChannelLayoutTag_WAVE_7_1,
         ]
         for (count, tag) in anchors {
             XCTAssertEqual(stampedChannelLabels(count), expandTag(tag),
@@ -165,7 +165,7 @@ final class ChannelLayoutOrderTests: XCTestCase {
     /// built from the resampler's own order puts it. It is the measurement that found #401, kept.
     func testStampedTagPlacesEveryChannelWhereTheResamplerPutIt() throws {
         for count in Int32(2)...8 {
-            let truth = Self.descriptionsLayout(labelsMatching: resamplerOrder(count))
+            let truth = Self.descriptionsLayout(expectedLabels(count))
             let stamped = try XCTUnwrap(AVAudioChannelLayout(layoutTag: audioChannelLayoutTag(for: count)))
             for channel in 0..<Int(count) {
                 let expected = try Self.downmixToStereo(truth, signalAt: channel)
@@ -178,15 +178,44 @@ final class ChannelLayoutOrderTests: XCTestCase {
         }
     }
 
-    private static func descriptionsLayout(labelsMatching names: [String]) -> AVAudioChannelLayout {
-        let byName: [String: AudioChannelLabel] = [
-            "FL": kAudioChannelLabel_Left, "FR": kAudioChannelLabel_Right,
-            "FC": kAudioChannelLabel_Center, "LFE": kAudioChannelLabel_LFEScreen,
-            "BL": kAudioChannelLabel_LeftSurround, "BR": kAudioChannelLabel_RightSurround,
-            "BC": kAudioChannelLabel_CenterSurround,
-            "SL": kAudioChannelLabel_LeftSurroundDirect, "SR": kAudioChannelLabel_RightSurroundDirect,
-        ]
-        let labels = names.map { byName[$0] ?? kAudioChannelLabel_Unknown }
+    /// A stereo downmix cannot tell a side from a rear: both fold into the same front channel at
+    /// the same gain. This routes one channel at a time from the stamped tag to a layout built
+    /// from the expected labels through AVAudioConverter, which maps by label, so a channel that
+    /// is labelled as the wrong surround pair lands on another output index.
+    func testStampedTagRoutesEveryChannelToItsOwnPosition() throws {
+        for count in Int32(2)...8 {
+            let truth = Self.descriptionsLayout(expectedLabels(count))
+            let stamped = try XCTUnwrap(AVAudioChannelLayout(layoutTag: audioChannelLayoutTag(for: count)))
+            XCTAssertEqual(try Self.route(from: stamped, to: truth), Array(0..<Int(count)),
+                           "\(count)ch: a channel lands on another position")
+        }
+    }
+
+    /// For each input channel, the output index an impulse on it reaches at unity gain, -1 if none.
+    private static func route(from source: AVAudioChannelLayout,
+                              to destination: AVAudioChannelLayout) throws -> [Int] {
+        let srcFormat = AVAudioFormat(standardFormatWithSampleRate: 48_000, channelLayout: source)
+        let dstFormat = AVAudioFormat(standardFormatWithSampleRate: 48_000, channelLayout: destination)
+        let converter = try XCTUnwrap(AVAudioConverter(from: srcFormat, to: dstFormat))
+        let frames: AVAudioFrameCount = 64
+        return try (0..<Int(srcFormat.channelCount)).map { impulse in
+            converter.reset()
+            let input = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: frames))
+            input.frameLength = frames
+            for channel in 0..<Int(srcFormat.channelCount) {
+                for frame in 0..<Int(frames) {
+                    input.floatChannelData![channel][frame] = channel == impulse ? 1.0 : 0.0
+                }
+            }
+            let output = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: frames))
+            try converter.convert(to: output, from: input)
+            return (0..<Int(dstFormat.channelCount)).first {
+                abs(output.floatChannelData![$0][Int(frames) / 2] - 1.0) < 0.01
+            } ?? -1
+        }
+    }
+
+    private static func descriptionsLayout(_ labels: [AudioChannelLabel]) -> AVAudioChannelLayout {
         let size = MemoryLayout<AudioChannelLayout>.size
             + (labels.count - 1) * MemoryLayout<AudioChannelDescription>.size
         let raw = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 8)

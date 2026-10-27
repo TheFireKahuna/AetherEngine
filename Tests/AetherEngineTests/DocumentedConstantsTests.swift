@@ -31,11 +31,6 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("Quarantine is bounded to 96 MiB and 10,000 packets", try documentation())
     }
 
-    func testSoftwarePositioningBudgetMatchesDocumentation() throws {
-        XCTAssertEqual(SoftwarePlaybackHost.seekBudgetSeconds, 30)
-        assertDocumented("**30 s positioning\nbudget**", try documentation())
-    }
-
     func testItemDiagnosticBoundsMatchDocumentation() throws {
         let docs = try documentation()
         XCTAssertEqual(ItemDiagnosticReadPool.maximumConcurrentReads, 2)
@@ -77,7 +72,7 @@ final class DocumentedConstantsTests: XCTestCase {
         XCTAssertEqual(FrameSideDataRing.capacity, 32)
         XCTAssertEqual(FrameSideDataRing.jitterToleranceTicks, 300)
         XCTAssertEqual(DoviFelComposer.maxFramesInFlight, 3)
-        XCTAssertEqual(SampleBufferRenderer.felVideoLookaheadFrames, 9)
+        XCTAssertEqual(SoftwareOverlayRenderer.lookaheadFrames, 9)
         XCTAssertEqual(DoviFelComposer.outputPoolAllocationThreshold, 15)
         XCTAssertEqual(DoviFelComposer.outputPoolReserve, 3)
         XCTAssertEqual(DualLayerVideoDecoder.maxBorrowedParamsRun, 3)
@@ -296,17 +291,14 @@ final class DocumentedConstantsTests: XCTestCase {
     /// 7.1-to-5.1 fold is a known limitation an adopter reads before choosing `.lossless`.
     func testAudioBridgeCapsAndRatesAreWhatTheDocsSay() throws {
         let docs = try documentation()
-        XCTAssertEqual(AudioBridge.maxEncodedChannels(for: AV_CODEC_ID_EAC3), 6,
+        XCTAssertEqual(AudioBridge.maxEncodedChannels(for: .eac3), 6,
                        "documented as capping 7.1 sources to 5.1")
-        XCTAssertEqual(AudioBridge.maxEncodedChannels(for: AV_CODEC_ID_FLAC), 8,
-                       "documented as FLAC up to 7.1")
-        XCTAssertEqual(AudioBridge.encoderBitRate(for: AV_CODEC_ID_EAC3, channels: 2), 256_000,
-                       "the stereo rate the #165 cascade still reaches on a build without FLAC")
-        XCTAssertEqual(AudioBridge.encoderBitRate(for: AV_CODEC_ID_EAC3, channels: 6), 768_000,
+        XCTAssertEqual(AudioBridge.maxEncodedChannels(for: .pcm), 8,
+                       "documented as PCM up to 7.1")
+        XCTAssertEqual(AudioBridge.eac3BitRate(channels: 6), 768_000,
                        "documented as 768 kbps 5.1")
-        XCTAssertEqual(AudioBridge.encoderBitRate(for: AV_CODEC_ID_FLAC, channels: 8), 0,
-                       "FLAC is VBR; a rate here would cap a lossless path")
         assertDocumented("128 kbps per channel (768 kbps 5.1)", docs)
+        assertDocumented("the decoded PCM up to 7.1", docs)
         assertDocumented("caps 7.1 sources to 5.1", docs)
         assertDocumented("Two channels or fewer have no surround to carry", docs)
     }

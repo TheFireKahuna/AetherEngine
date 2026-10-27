@@ -226,8 +226,8 @@ struct Issue396SilentAudioBridgeTests {
 
     // MARK: - AE#474: the gate's unit
 
-    /// Raw stereo PCM at 48 kHz. `.surroundCompat` encodes 2 channels or fewer to FLAC, so this is
-    /// the FLAC arm on the DEFAULT mode, and raw PCM lets a packet carry any number of samples.
+    /// Raw stereo PCM at 48 kHz. `.surroundCompat` hands 2 channels or fewer on as PCM, so this is
+    /// the PCM arm on the DEFAULT mode, and raw PCM lets a packet carry any number of samples.
     private func makePCMCodecpar() -> UnsafeMutablePointer<AVCodecParameters> {
         let par = avcodec_parameters_alloc()!
         par.pointee.codec_type = AVMEDIA_TYPE_AUDIO
@@ -241,7 +241,7 @@ struct Issue396SilentAudioBridgeTests {
     }
 
     /// One packet per TrueHD access unit: 40 samples at 48 kHz, the smallest source packet the bridge
-    /// is fed anywhere. 64 of them are 2560 samples, which is what the reporter's device log carried.
+    /// is fed anywhere.
     private func makeTrueHDShapedPCMPackets(count: Int, samplesPerPacket: Int = 40)
         -> [UnsafeMutablePointer<AVPacket>] {
         (0..<count).compactMap { i in
@@ -265,8 +265,8 @@ struct Issue396SilentAudioBridgeTests {
         }
     }
 
-    @Test("start-up on the FLAC arm is not silence: 64 small packets are half of one encoder frame")
-    func flacArmStartUpIsNotReportedAsSilence() throws {
+    @Test("start-up on the PCM arm is not silence: 20 small packets are short of one output packet")
+    func pcmArmStartUpIsNotReportedAsSilence() throws {
         let codecpar = makePCMCodecpar()
         defer {
             var p: UnsafeMutablePointer<AVCodecParameters>? = codecpar
@@ -276,27 +276,27 @@ struct Issue396SilentAudioBridgeTests {
                                      srcTimeBase: AVRational(num: 1, den: 48_000),
                                      mode: .surroundCompat)
         defer { bridge.close() }
-        #expect(bridge.outputCodecID == AV_CODEC_ID_FLAC,
-                "precondition: the default mode encodes a stereo source to FLAC")
+        #expect(bridge.output == .pcm,
+                "precondition: the default mode hands a stereo source on as PCM")
 
-        var packets = makeTrueHDShapedPCMPackets(count: 64)
+        var packets = makeTrueHDShapedPCMPackets(count: 20)
         defer { freeAll(&packets) }
         var outputs: [UnsafeMutablePointer<AVPacket>] = []
         defer { freeAll(&outputs) }
         for p in packets { outputs.append(contentsOf: try bridge.feed(packet: p)) }
 
         let stats = bridge.feedStats
-        #expect(stats.packetsFed == 64)
-        #expect(stats.samplesEnqueued == 2560, "the reporter's own counters, reproduced")
+        #expect(stats.packetsFed == 20)
+        #expect(stats.samplesEnqueued == 800)
         #expect(stats.packetsEmitted == 0,
-                "requireFull declines below frame_size, so no output is POSSIBLE yet")
+                "requireFull declines below a packet's worth, so no output is POSSIBLE yet")
         #expect(stats.isSilent, "silent in the counter's sense, which is not the same as structural")
         #expect(!bridge.silentFeedReported,
-                "AE#474: 2560 samples is short of FLAC's 4608, so nothing could have been emitted")
+                "AE#474: 800 samples is short of the 1024 a PCM packet holds, so nothing could have been emitted")
     }
 
     @Test("the same feed continued past the encoder's frame produces audio and still reports nothing")
-    func flacArmProducesOnceTheFrameIsFull() throws {
+    func pcmArmProducesOnceTheFrameIsFull() throws {
         let codecpar = makePCMCodecpar()
         defer {
             var p: UnsafeMutablePointer<AVCodecParameters>? = codecpar
@@ -348,18 +348,18 @@ struct Issue396SilentAudioBridgeTests {
         startUp.framesDecoded = 64
         startUp.samplesEnqueued = 2560
         startUp.packetsFedSinceLastEnqueue = 0
-        #expect(!AudioBridge.silenceIsStructural(stats: startUp, encoderFrameSize: 4608),
-                "AE#474: below one FLAC frame the encoder has not been asked yet")
+        #expect(!AudioBridge.silenceIsStructural(stats: startUp, encoderFrameSize: 1536),
+                "AE#474: below four E-AC-3 frames the encoder has not been asked enough yet")
         #expect(AudioBridge.silenceIsStructural(stats: startUp, encoderFrameSize: 512),
-                "the same counters ARE structural against an encoder whose frame they cleared")
+                "the same counters ARE structural against an encoder whose frames they cleared")
 
         var fed = startUp
-        fed.samplesEnqueued = 4608 * 4
-        #expect(AudioBridge.silenceIsStructural(stats: fed, encoderFrameSize: 4608))
+        fed.samplesEnqueued = 1024 * 4
+        #expect(AudioBridge.silenceIsStructural(stats: fed, encoderFrameSize: AudioBridge.pcmPacketFrames))
 
         var healthy = fed
         healthy.packetsEmitted = 1
-        #expect(!AudioBridge.silenceIsStructural(stats: healthy, encoderFrameSize: 4608),
+        #expect(!AudioBridge.silenceIsStructural(stats: healthy, encoderFrameSize: AudioBridge.pcmPacketFrames),
                 "a bridge that emitted anything is never silent")
     }
 
@@ -370,12 +370,12 @@ struct Issue396SilentAudioBridgeTests {
         trickle.framesDecoded = 3
         trickle.samplesEnqueued = 120
         trickle.packetsFedSinceLastEnqueue = 897
-        #expect(AudioBridge.silenceIsStructural(stats: trickle, encoderFrameSize: 4608),
-                "120 samples will never reach a FLAC frame, and the FIFO stopped moving 897 packets ago")
+        #expect(AudioBridge.silenceIsStructural(stats: trickle, encoderFrameSize: AudioBridge.pcmPacketFrames),
+                "120 samples will never reach a PCM packet, and the FIFO stopped moving 897 packets ago")
 
         var stillFilling = trickle
         stillFilling.packetsFedSinceLastEnqueue = 1
-        #expect(!AudioBridge.silenceIsStructural(stats: stillFilling, encoderFrameSize: 4608),
+        #expect(!AudioBridge.silenceIsStructural(stats: stillFilling, encoderFrameSize: AudioBridge.pcmPacketFrames),
                 "a FIFO that is still accepting samples is a bridge that has not been asked yet")
     }
 

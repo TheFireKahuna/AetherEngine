@@ -45,6 +45,8 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
     static let primingFrames = 2
     /// Decoded frames without heights after which `verdict(feeding:)` refuses a stream.
     static let verdictFrames = 8
+    /// The DTS decoder's (`AudioStageSpan.dtsDecoderMemory`); the stream is at the rendering rate.
+    let span = AudioStageSpan(latency: 0, memory: AudioStageSpan.dtsDecoderMemory)
 
     private struct Pending {
         var samples: UnsafeMutablePointer<Float>

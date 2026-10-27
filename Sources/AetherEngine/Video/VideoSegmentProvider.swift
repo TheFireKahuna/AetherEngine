@@ -836,7 +836,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private let audioChannelCount: Int?
     /// The served audio is a stream-copied E-AC-3 JOC bitstream, i.e. the objects survived into the
     /// segments. Only then may the rendition claim `"<n>/JOC"`; a JOC source that fell back to the
-    /// FLAC bridge has lost its objects and must advertise its bed count like any other track.
+    /// the bridge's PCM has lost its objects and must advertise its bed count like any other track.
     private let audioIsAtmosStreamCopy: Bool
 
     /// #15: native subtitle cue stores (one per text track) for the WebVTT rendition served to AVPlayer.
@@ -1711,7 +1711,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
         if previousTarget >= 0, index < previousTarget - 2, let restart = restartHandler {
             // Cache gate: backwardWindow=20 covers Continuous-Audio handover refetches (~7-10 segments
-            // backward); unconditional proactive restart re-armed the FLAC bridge and caused audible glitches.
+            // backward); unconditional proactive restart re-armed the bridge and caused audible glitches.
             if cache.peekURL(index: index) != nil {
                 // A sequential origin has no restart to offer (its pump can only read from byte 0)
                 // and keeps every segment it cut, so a resident target is served from the cache.
@@ -2039,7 +2039,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// producer stay anchored where it is?
     ///
     /// The residency gate exists for the Continuous-Audio handover refetch (~7-10 segments backward into
-    /// content the ACTIVE pump is still writing): restarting there re-arms the FLAC bridge and glitches
+    /// content the ACTIVE pump is still writing): restarting there re-arms the bridge and glitches
     /// the audio. Residency of the target segment alone does not carry that, because a scrub band left by
     /// an EARLIER pump is resident too, and it ends. Nothing else aims the producer at the new target, so
     /// the band running out is what finally does it: the consumer asks for the first index above it, the

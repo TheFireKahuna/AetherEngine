@@ -2,7 +2,7 @@ import Foundation
 import AetherLibavcodec
 
 /// Tracks Swift-initiated av_packet_alloc/free calls; `alive = allocs - frees` in the engine memory probe.
-/// Healthy pump steady-state: low single digit (1 in-flight source packet, 1 each for pendingVideoPkt/pendingAudioPkt, 0..N FLAC bridge packets).
+/// Healthy pump steady-state: low single digit (1 in-flight source packet, 1 each for pendingVideoPkt/pendingAudioPkt, 0..N bridge packets).
 /// Linearly rising alive = packet leak (~75 KB/s = 4.5 MB/min per leaked frame-rate packet).
 /// Does NOT count libavformat-internal av_packet_ref/unref (mp4 muxer interleave, matroska side data).
 enum PacketBalanceTracker {
@@ -53,4 +53,10 @@ func trackedPacketFree(_ pkt: inout UnsafeMutablePointer<AVPacket>?) {
         PacketBalanceTracker.recordFree()
     }
     av_packet_free(&pkt)
+}
+
+/// `trackedPacketFree` for a packet held as a non-optional pointer.
+func av_packet_free_safe(_ packet: UnsafeMutablePointer<AVPacket>) {
+    var p: UnsafeMutablePointer<AVPacket>? = packet
+    trackedPacketFree(&p)
 }

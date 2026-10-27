@@ -438,7 +438,7 @@ typed fact rather than as something to reconstruct (AE#462).
 **`.droppedNoPipeline` is the one a fallback ladder acts on**, the same way it demotes on
 `PlaybackErrorKind.audioBridgeProducedNoOutput`. The two are the same user outcome from opposite
 ends of the cascade: that kind fails loudly when a VOD bridge WAS built and then decoded nothing
-(on the FLAC route as well since AE#641, which used to play silently while reporting `.bridged`),
+(on the PCM route as well since AE#641, which used to play silently while reporting `.bridged`),
 this value reports a bridge that could never be built at all. A live session whose bridge decodes
 nothing arrives here as well rather than at the error: its video is playable and a live source has
 no position to hand to a second player, so the engine rebuilds it video-only by itself and the
@@ -457,7 +457,7 @@ player.$audioDelivery
 ```
 
 `$activeAudioDecoder` is the same fact for a human ("Stream-copy (EAC3+JOC Atmos)",
-`"TrueHD → FLAC bridge"`, `"libavcodec AC3 → CoreAudio"`) and stays the right thing to show in a
+`"TrueHD → PCM bridge"`, `"libavcodec AC3 → CoreAudio"`) and stays the right thing to show in a
 stats overlay. Do not classify on it: it cannot separate a source with no audio from a source whose
 audio was dropped, and before AE#462 it was outright wrong on the software path, where it was built
 from the probe's track list and so named a decoder that had refused to open. Both publishers are
@@ -1121,7 +1121,7 @@ already holds the one permitted connection and already demuxes every packet.
 
 The recording is a **stream copy of the source packets into MPEG-TS**, taken before any audio
 bridging. Nothing is decoded and nothing is re-encoded. A TrueHD or DTS channel therefore records
-its original audio while playback is listening to the bridged FLAC rendition, and a file cut short
+its original audio while playback is listening to the bridged PCM rendition, and a file cut short
 by a crash or a kill is still playable up to the truncation, which is why the container is MPEG-TS
 rather than fragmented MP4. The file opens on the first video keyframe after the call, so it starts
 on a decodable picture rather than mid-GOP.
@@ -1402,7 +1402,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `nativeRemoteHLS` | false | Hand a remote `master.m3u8` straight to AVPlayer: no demuxer probe, no loopback. Built for `isLive: true`; a remote HLS VOD URL reaches this route regardless (AE#154). The clock here is item time, see `clock.$sourceTime` (AE#616). |
 | `nativeRemoteHLSIngestFallback` | true | The #168 / #293 carriage recovery and the #363 401/403 bypass refusal recovery. Setting it false turns both off. |
 | `audioOnly` | false | Lean audio pipeline, no video machinery. Also set automatically when the probe finds no video stream. |
-| `audioBridgeMode` | `.surroundCompat` | Bridge encoder for codecs that cannot stream-copy into fMP4. `.surroundCompat` uses EAC3 for a source with more than two channels and FLAC for one with two or fewer (no surround to carry). `.lossless` uses FLAC up to 7.1 throughout and needs a sink that accepts multichannel LPCM. |
+| `audioBridgeMode` | `.lossless` | Bridge encoder for codecs that cannot stream-copy into fMP4. `.lossless` hands on the decoded PCM up to 7.1 throughout and needs a sink that accepts multichannel LPCM (an AVR over HDMI, an AVR or soundbar on eARC); behind legacy ARC it is downmixed to stereo. `.surroundCompat` uses EAC3 for a source with more than two channels and PCM for one with two or fewer (no surround to carry), and keeps surround behind legacy ARC. |
 | `objectAudioRendering` | `.off` | TrueHD Atmos and DTS:X with heights (#731), in a build with the `TrueHDObjectAudio` / `DTSXObjectAudio` package traits (off by default, [README › Optional components](../README.md#optional-components)); without a codec's trait the option is accepted and that codec keeps `audioBridgeMode`. `.apac(SpatialSpeakerLayout)` decodes the Atmos objects, or DTS:X's heights, renders them into that bed (`.l512`, `.l514`, `.l712`, `.l714`, `.l916`) and delivers Apple Positional Audio, which tvOS sends to an Atmos receiver as Dolby MAT and iOS plays as Spatial Audio. Lossy (320 kbps per bed channel) in place of the lossless 7.1 the bridge delivers, so it is the host's choice. Only TrueHD that FFmpeg marks Atmos, and DTS-HD Master Audio whose first frames decode as DTS:X in its standard presentation (whatever FFmpeg's label; DTS:X only into `.l714` or `.l916`), at 48 kHz, on OS 26+; anything else, or any failure to start, keeps `audioBridgeMode` (on the software host, the PCM decode). The software host honours it too on VOD sessions: TrueHD Atmos and DTS:X are rendered as APAC for the sample-buffer audio renderer, and an E-AC-3 JOC track (6 channels, 48 kHz) is handed to the renderer compressed, after the system's Atmos decoder has been registered in the process, so its objects survive instead of the channel-bed core. With it on, the automatic audio pick prefers a TrueHD Atmos or DTS:X-labelled track over the other tracks of the same language (of the `preferredAudioLanguages` match, or of the default track when no preference decides; with no audio track tagged at all, of every track), never across a language or dub and never over `audioSourceStreamIndexOverride`, and only where the bed can be rendered (a VOD video session, on the loopback route or the software host, on OS 26 or later). `SpatialSpeaker` names the positions. See [formats.md](formats.md#truehd-atmos-with-heights) and [DTS:X](formats.md#dtsx-with-heights). Without a codec's trait that codec keeps the channel bridge and the automatic audio pick does not prefer it; `AetherEngine.OptionalComponent` tells a host which codecs a build renders. |
 | `stereoPresentation` | `.automatic` | How a 3D source is presented where the system shows stereo (visionOS; every other system plays it 2D as before). `StereoPresentation.automatic` keeps an MV-HEVC stream's second view (`lhvC` in the init) and presents the side-by-side or over-under packing a container declares (Matroska `StereoMode`); `.sideBySide` / `.overUnder` say what a file's name alone says; `.mono` plays 2D. A stereo session declares `REQ-VIDEO-LAYOUT="CH-STEREO"` (EXT-X-VERSION 12) and a packed frame gets Apple's `vexu` in its sample entry. Frame packing is signalled on HEVC only (AVPlayer refuses a packed H.264 init over HLS), so a packed H.264 frame plays 2D. A tuning field: `reloadAtCurrentPosition(applying:)` carries a change. |
 | `confirmAtmos` | false | Background per-track JOC confirmation, republishing `audioTracks` as tracks confirm. Never on the start path; skipped for live and forward-only readers. |

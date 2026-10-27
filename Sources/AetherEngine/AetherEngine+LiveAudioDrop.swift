@@ -4,8 +4,8 @@ import Foundation
 ///
 /// The load-time cascade already ends in video-only when no pipeline can be BUILT (AE#462). A bridge
 /// that is built and then decodes nothing reaches no such tail: on VOD the first segment cut fails
-/// and the session surfaces `audioBridgeProducedNoOutput` (AE#396), but a live FLAC bridge builds its
-/// sample entry from the encoder's extradata, so segments keep being cut with an audio track that
+/// and the session surfaces `audioBridgeProducedNoOutput` (AE#396), but a live bridge builds its
+/// sample entry from the encoder's parameters, so segments keep being cut with an audio track that
 /// never carries a sample. AVPlayer presents the first picture and waits on the audio for as long as
 /// the session lasts, with nothing surfaced. The reporter's channel was DTS-HD labelled as MPEG audio.
 ///

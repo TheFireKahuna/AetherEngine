@@ -11,7 +11,7 @@ import AetherLibavutil
 /// A/V tfdt mismatches (~160 ms audio lead from FLAC bridge 4096-sample granularity + matroska
 /// audio-ahead interleave). +delay_moov defers moov until the first av_write_frame(nil) so
 /// mov_write_packet can parse EAC3/AC3 bitstream before emitting dec3/dac3 (without it:
-/// -22 "Cannot write moov atom before EAC3/AC3 packets parsed", falling back to FLAC bridge
+/// -22 "Cannot write moov atom before EAC3/AC3 packets parsed", falling back to the bridge
 /// and losing Atmos JOC). NOT +dash (session-long sidx) or +frag_keyframe (interferes with
 /// explicit cut control).
 ///
@@ -528,7 +528,7 @@ final class MP4SegmentMuxer {
     /// Dry-run avformat_write_header to catch cascade failures the lazy muxer init would miss.
     /// The real muxer allocates on the first keep-packet; if write_header would fail (-22 for
     /// EAC3-from-MKV "Cannot write moov atom before EAC3/AC3 packets parsed") the cascade
-    /// never falls back to FLAC bridge. Bytes go to a discarded in-memory AVIO sink.
+    /// never falls back to the bridge. Bytes go to a discarded in-memory AVIO sink.
     static func probeWriteHeader(
         video: VideoConfig,
         audio: AudioConfig?

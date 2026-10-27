@@ -14,8 +14,8 @@ import AetherLibavutil
 ///
 /// A mode is not an encoder. `.surroundCompat` exists to carry SURROUND across a route that cannot take
 /// multichannel LPCM; a source with two channels or fewer has none to carry, so its EAC3 output was lossy
-/// where the FLAC in the same build is lossless, and a Dolby bitstream on every route that can only pass
-/// one through. The encoder is now resolved from the mode AND the source's channel count.
+/// where PCM is the source itself, and a Dolby bitstream on every route that can only pass one through.
+/// The output is resolved from the mode AND the source's channel count.
 ///
 /// Route-blind by construction: the input is the source, never the current output route. #34 measured
 /// route-dependent bridging wrong (AVPlayer downmixes EAC3+JOC natively over A2DP) and it was removed.
@@ -24,40 +24,45 @@ struct Issue395StereoBridgeEncoderTests {
 
     // MARK: - The resolution itself
 
-    @Test("surroundCompat takes EAC3 only where there is surround to carry")
+    @Test("surroundCompat hands on EAC3 only where there is surround to carry")
     func surroundCompatResolvesPerSource() {
         for channels in Int32(1)...2 {
-            #expect(AudioBridge.bridgeEncoder(for: .surroundCompat, sourceChannels: channels)
-                    == AV_CODEC_ID_FLAC)
+            #expect(AudioBridge.output(for: .surroundCompat, sourceChannels: channels) == .pcm)
         }
         for channels in Int32(3)...8 {
-            #expect(AudioBridge.bridgeEncoder(for: .surroundCompat, sourceChannels: channels)
-                    == AV_CODEC_ID_EAC3)
+            #expect(AudioBridge.output(for: .surroundCompat, sourceChannels: channels) == .eac3)
         }
     }
 
-    @Test("lossless is FLAC at every channel count")
-    func losslessIsAlwaysFLAC() {
+    @Test("lossless is PCM at every channel count")
+    func losslessIsAlwaysPCM() {
         for channels in Int32(1)...8 {
-            #expect(AudioBridge.bridgeEncoder(for: .lossless, sourceChannels: channels) == AV_CODEC_ID_FLAC)
+            #expect(AudioBridge.output(for: .lossless, sourceChannels: channels) == .pcm)
         }
     }
 
     /// An unresolved layout (Matroska TrueHD/MLP leave Channels empty) reads as 0 here, and the bridge's
-    /// own fallback is stereo. FLAC is the right answer for that case too: it carries whatever the decoder
+    /// own fallback is stereo. PCM is the right answer for that case too: it carries whatever the decoder
     /// turns out to produce up to 7.1, where EAC3 would have folded it.
     @Test("an unresolved channel count does not claim surround")
-    func unresolvedChannelCountTakesFLAC() {
-        #expect(AudioBridge.bridgeEncoder(for: .surroundCompat, sourceChannels: 0) == AV_CODEC_ID_FLAC)
+    func unresolvedChannelCountTakesPCM() {
+        #expect(AudioBridge.output(for: .surroundCompat, sourceChannels: 0) == .pcm)
     }
 
-    @Test("caps and rates follow the encoder, not the mode")
-    func capsAndRatesFollowTheEncoder() {
-        #expect(AudioBridge.maxEncodedChannels(for: AV_CODEC_ID_EAC3) == 6)
-        #expect(AudioBridge.maxEncodedChannels(for: AV_CODEC_ID_FLAC) == 8)
-        #expect(AudioBridge.encoderBitRate(for: AV_CODEC_ID_FLAC, channels: 2) == 0,
-                "a FLAC context that inherited EAC3's 256 kbps would cap a lossless path")
-        #expect(AudioBridge.encoderBitRate(for: AV_CODEC_ID_EAC3, channels: 6) == 768_000)
+    @Test("caps follow the output, not the mode")
+    func capsFollowTheOutput() {
+        #expect(AudioBridge.maxEncodedChannels(for: .eac3) == 6)
+        #expect(AudioBridge.maxEncodedChannels(for: .pcm) == 8)
+        #expect(AudioBridge.eac3BitRate(channels: 6) == 768_000)
+    }
+
+    /// AE#396: "absent from this FFmpeg build" was true and useless when the build that answered was a
+    /// second FFmpeg the host had linked ahead of ours; it read as a claim about AetherEngine's own build.
+    @Test("a missing encoder names the libavcodec that answered, not 'this build'")
+    func missingEncoderNamesTheAnsweringLibavcodec() {
+        let message = AudioBridge.AudioBridgeError.encoderNotFound(codecID: AV_CODEC_ID_EAC3).description
+        #expect(message.contains("eac3"))
+        #expect(message.contains(FFmpegRuntimeCheck.avcodecIdentity))
     }
 
     // MARK: - What the bridge actually opens
@@ -86,7 +91,6 @@ struct Issue395StereoBridgeEncoderTests {
     private func openBridge(
         channels: Int,
         mode: AudioBridgeMode,
-        forcedEncoder: AVCodecID? = nil,
         _ body: (AudioBridge, [UnsafeMutablePointer<AVPacket>]) throws -> Void
     ) throws {
         let demuxer = Demuxer()
@@ -114,22 +118,20 @@ struct Issue395StereoBridgeEncoderTests {
         }
         let bridge = try AudioBridge(srcCodecpar: stream.pointee.codecpar,
                                      srcTimeBase: stream.pointee.time_base,
-                                     mode: mode,
-                                     forcedEncoder: forcedEncoder)
+                                     mode: mode)
         defer { bridge.close() }
         try body(bridge, packets)
     }
 
     /// The regression this issue is about, at the only place it is observable without a device: what the
     /// muxer is handed for a stereo source under the DEFAULT mode. `ec-3` here is what reached the AirPlay
-    /// route; `fLaC` is what AVPlayer decodes to LPCM on any route at all.
-    @Test("a stereo source under the default mode is handed to the muxer as FLAC")
-    func stereoSourceBridgesToFLAC() throws {
+    /// route; PCM is what AVPlayer plays as LPCM on any route at all.
+    @Test("a stereo source under the default mode is handed to the muxer as PCM")
+    func stereoSourceBridgesToPCM() throws {
         try openBridge(channels: 2, mode: .surroundCompat) { bridge, packets in
-            #expect(bridge.outputCodecID == AV_CODEC_ID_FLAC)
-            #expect(bridge.encoderCodecpar?.pointee.codec_id == AV_CODEC_ID_FLAC)
+            #expect(bridge.output == .pcm)
+            #expect(bridge.encoderCodecpar?.pointee.codec_id == AV_CODEC_ID_PCM_S16LE, "a 16-bit source stays 16-bit")
             #expect(bridge.encoderCodecpar?.pointee.ch_layout.nb_channels == 2)
-            #expect(bridge.encoderCodecpar?.pointee.bit_rate == 0, "FLAC is VBR")
             var outputs: [UnsafeMutablePointer<AVPacket>] = []
             for p in packets { outputs.append(contentsOf: try bridge.feed(packet: p)) }
             defer {
@@ -150,26 +152,6 @@ struct Issue395StereoBridgeEncoderTests {
             #expect(bridge.encoderCodecpar?.pointee.codec_id == AV_CODEC_ID_EAC3)
             #expect(bridge.encoderCodecpar?.pointee.ch_layout.nb_channels == 6)
             #expect(bridge.encoderCodecpar?.pointee.bit_rate == 768_000)
-            var outputs: [UnsafeMutablePointer<AVPacket>] = []
-            for p in packets { outputs.append(contentsOf: try bridge.feed(packet: p)) }
-            defer {
-                for o in outputs {
-                    var oo: UnsafeMutablePointer<AVPacket>? = o
-                    trackedPacketFree(&oo)
-                }
-            }
-            #expect(!outputs.isEmpty)
-        }
-    }
-
-    /// The #165 retry path: the route forces the other encoder when the resolved one is absent from the
-    /// build, and the forced choice has to reach the encoder context AND the PCM intermediate format, or
-    /// the encoder opens with a sample format it cannot take.
-    @Test("a forced encoder overrides the resolution and still opens")
-    func forcedEncoderOverridesTheResolution() throws {
-        try openBridge(channels: 2, mode: .surroundCompat, forcedEncoder: AV_CODEC_ID_EAC3) { bridge, packets in
-            #expect(bridge.outputCodecID == AV_CODEC_ID_EAC3)
-            #expect(bridge.encoderCodecpar?.pointee.bit_rate == 256_000)
             var outputs: [UnsafeMutablePointer<AVPacket>] = []
             for p in packets { outputs.append(contentsOf: try bridge.feed(packet: p)) }
             defer {

@@ -583,8 +583,8 @@ public struct LoadOptions: Sendable, Equatable {
 
     /// Bridge encoder for codecs that cannot stream-copy into fMP4 (TrueHD, DTS, DTS-HD MA, MP3, Opus, EAC3-from-MKV-without-dec3-extradata).
     ///
-    /// - `.surroundCompat` (default): EAC3 128 kbps/ch. Surround on every sink, including a soundbar behind legacy ARC. Lossy; downmixes 7.1 to 5.1.
-    /// - `.lossless`: FLAC up to 7.1. Needs a sink that takes multichannel LPCM (an AVR over HDMI, or an AVR or soundbar on eARC); legacy-ARC routes silently downmix to stereo. The engine cannot tell the two apart from the route (AE#794).
+    /// - `.lossless` (default): FLAC up to 7.1, bit for bit. Needs a sink that takes multichannel LPCM (an AVR over HDMI, or an AVR or soundbar on eARC); legacy-ARC routes silently downmix to stereo. The engine cannot tell the two apart from the route (AE#794), so a host whose sink sits behind legacy ARC sets `.surroundCompat`.
+    /// - `.surroundCompat`: EAC3 128 kbps/ch. Surround on every sink, including a soundbar behind legacy ARC. Lossy; downmixes 7.1 to 5.1.
     public var audioBridgeMode: AudioBridgeMode
 
     /// TrueHD Atmos and DTS:X delivery (#731). `.off` (default) keeps `audioBridgeMode`'s 7.1 channel
@@ -1663,6 +1663,13 @@ import AetherLibavutil
 ///
 /// Every tag below was verified channel by channel against the resampler's order through a real
 /// downmix: all of them place all channels identically.
+///
+/// A downmix to stereo cannot see a side/rear swap, and 7.1 still had one: MPEG_7_1_C expands to
+/// L R C LFE Ls Rs Rls Rrs, and in CoreAudio's 7.1 Ls/Rs are the SIDE pair (AVAudioConverter from
+/// MPEG_7_1_C to WAVE_7_1 moves channels 5-6 to 7-8), so FFmpeg's back pair was played from the
+/// side speakers and its side pair from the rears. WAVE_7_1 (L R C LFE Rls Rrs Ls Rs) is
+/// CoreAudio's tag for the WAVEFORMATEXTENSIBLE order, which is FFmpeg's. Measured per channel
+/// through AVAudioConverter against the exact labels; every other count already matched.
 func audioChannelLayoutTag(for channels: Int32) -> AudioChannelLayoutTag {
     switch channels {
     case 1:  return kAudioChannelLayoutTag_Mono            // FC, and a mono track is not a centre
@@ -1672,7 +1679,7 @@ func audioChannelLayoutTag(for channels: Int32) -> AudioChannelLayoutTag {
     case 5:  return kAudioChannelLayoutTag_MPEG_5_0_A      // FL FR FC BL BR
     case 6:  return kAudioChannelLayoutTag_MPEG_5_1_A      // FL FR FC LFE BL BR
     case 7:  return kAudioChannelLayoutTag_MPEG_6_1_A      // FL FR FC LFE BL BR BC
-    case 8:  return kAudioChannelLayoutTag_MPEG_7_1_C      // FL FR FC LFE BL BR Ls Rs
+    case 8:  return kAudioChannelLayoutTag_WAVE_7_1        // FL FR FC LFE BL BR SL SR
     default: return kAudioChannelLayoutTag_DiscreteInOrder | UInt32(channels)
     }
 }
