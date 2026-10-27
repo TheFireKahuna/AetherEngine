@@ -929,30 +929,112 @@ extension HLSVideoEngine {
         return type + Int(nal[i])
     }
 
-    /// ADTS AAC from MPEG-TS arrives without an AudioSpecificConfig in `extradata`; the fMP4 `mp4a`/`esds` sample entry can't be written. Synthesizes a 2-byte ASC, installs it, and clears the TS codec_tag the mov muxer rejects. Returns true when applied; caller strips per-frame ADTS headers.
+    /// The MPEG-4 audio object type an AAC stream is coded as (ISO/IEC 14496-3 1.5.1.1): 2 for
+    /// AAC-LC, 5 for HE-AAC (LC with SBR), 29 for HE-AACv2 (SBR and parametric stereo). libavcodec's
+    /// profile names it once a frame has been decoded; a 2048-sample frame alone says SBR, which
+    /// doubles the 1024 samples of an LC frame.
+    static func aacObjectType(profile: Int32, frameSize: Int32) -> Int {
+        switch profile {
+        case 28: return 29                         // AV_PROFILE_AAC_HE_V2
+        case 4: return 5                           // AV_PROFILE_AAC_HE
+        case 0...3: return Int(profile) + 1        // Main, LC, SSR, LTP
+        default: return frameSize == 2048 ? 5 : 2
+        }
+    }
+
+    /// The AudioSpecificConfig (ISO/IEC 14496-3 1.6.2.1) of an AAC stream decoded at `sampleRate`
+    /// into `channels`, nil where the syntax has no value for them (7 channels, more than 8, a rate
+    /// off the index table).
+    ///
+    /// HE-AAC is written with explicit hierarchical signalling: object type 5 (or 29 with
+    /// parametric stereo), the core's rate and channels, the rate SBR outputs as the extension
+    /// rate, then the core's object type, LC, and its GASpecificConfig. SBR doubles the core's rate
+    /// on a 2048-sample frame; parametric stereo makes stereo of a mono core. Declared as LC at the
+    /// output rate instead, AudioToolbox decoded it as garbage (-11821, NBC's HE-AAC), and as LC at
+    /// the core rate a decoder that only finds the SBR as it goes may keep the core rate.
+    static func audioSpecificConfig(objectType: Int, sampleRate: Int32, frameSize: Int32, channels: Int) -> [UInt8]? {
+        let rates: [Int32] = [96000, 88200, 64000, 48000, 44100, 32000,
+                              24000, 22050, 16000, 12000, 11025, 8000, 7350]
+        // channelConfiguration: 1-6 map 1:1, 7 is 8 channels (7.1); 7 channels have no value.
+        func configuration(_ channels: Int) -> Int? {
+            switch channels {
+            case 1...6: return channels
+            case 8: return 7
+            default: return nil
+            }
+        }
+        var bits: [(value: Int, width: Int)] = []
+        if objectType == 5 || objectType == 29 {
+            let coreRate = frameSize == 1024 ? sampleRate : sampleRate / 2
+            guard let core = rates.firstIndex(of: coreRate), let output = rates.firstIndex(of: sampleRate),
+                  let coreChannels = configuration(objectType == 29 ? 1 : channels) else { return nil }
+            bits = [(objectType, 5), (core, 4), (coreChannels, 4), (output, 4),
+                    (2, 5), (0, 1), (0, 1), (0, 1)]   // LC; frameLengthFlag, dependsOnCoreCoder, extensionFlag
+        } else {
+            guard let rate = rates.firstIndex(of: sampleRate), let config = configuration(channels) else { return nil }
+            bits = [(objectType, 5), (rate, 4), (config, 4)]
+        }
+        var out: [UInt8] = []
+        var accumulator = 0, filled = 0
+        for (value, width) in bits {
+            accumulator = accumulator << width | value
+            filled += width
+            while filled >= 8 {
+                filled -= 8
+                out.append(UInt8((accumulator >> filled) & 0xFF))
+            }
+        }
+        if filled > 0 { out.append(UInt8((accumulator << (8 - filled)) & 0xFF)) }
+        return out
+    }
+
+    /// ADTS AAC (an MPEG-TS, a raw .aac) arrives without an AudioSpecificConfig in `extradata`, and the
+    /// fMP4 `mp4a`/`esds` sample entry cannot be written without one. Installs the stream's own
+    /// (`audioSpecificConfig`) and clears the TS codec_tag the mov muxer rejects. Returns true when
+    /// applied; the caller strips the per-frame ADTS headers.
     static func prepareAACForFMP4(
         _ codecpar: UnsafeMutablePointer<AVCodecParameters>
     ) -> Bool {
         guard codecpar.pointee.codec_id == AV_CODEC_ID_AAC else { return false }
         guard codecpar.pointee.extradata == nil || codecpar.pointee.extradata_size == 0 else { return false }
-        let freqTable: [Int32] = [96000, 88200, 64000, 48000, 44100, 32000,
-                                  24000, 22050, 16000, 12000, 11025, 8000, 7350]
-        guard let freqIdx = freqTable.firstIndex(of: codecpar.pointee.sample_rate) else { return false }
-        let channels = max(1, Int(codecpar.pointee.ch_layout.nb_channels))
-        // ASC channelConfiguration: 1-6 map 1:1, 7 = 8ch (7.1); 7-ch has no ASC value. Old `channels<=7?channels:2` mapped 8ch as stereo and 6.1 as 7.1.
-        let chanConfig: Int
-        switch channels {
-        case 1...6: chanConfig = channels
-        case 8:     chanConfig = 7
-        default:    return false  // 7-ch or >8: no ASC representation; bridge handles it
-        }
-        let profile = Int(codecpar.pointee.profile)
-        // audioObjectType: profile maps profile+1 (LC=2); default to 2 (mp4a.40.2) for unknown profiles.
-        let aot = (profile >= 0 && profile <= 3) ? profile + 1 : 2  // audioObjectType
-        let asc: [UInt8] = [
-            UInt8((aot << 3) | (freqIdx >> 1)),
-            UInt8(((freqIdx & 1) << 7) | (chanConfig << 3)),
-        ]
+        let par = codecpar.pointee
+        guard let asc = audioSpecificConfig(
+            objectType: aacObjectType(profile: par.profile, frameSize: par.frame_size),
+            sampleRate: par.sample_rate, frameSize: par.frame_size,
+            channels: max(1, Int(par.ch_layout.nb_channels))) else { return false }
+        return installAudioSpecificConfig(asc, in: codecpar)
+    }
+
+    /// LOAS/LATM AAC (DVB, its IPTV restreams) as the AAC it carries: the codec id, the stream's own
+    /// AudioSpecificConfig (libavcodec's LATM decoder left it in `extradata` while probing, in the bytes
+    /// it started in; `LATM.configuration` cuts it at its end), and no TS codec_tag. Returns the
+    /// configuration the stream's elements must keep (`HLSSegmentProducer.AudioFraming.latm`), nil
+    /// when probing read none or it lies outside what `LATM` reads, which leaves the stream to the
+    /// bridge.
+    static func latmConfiguration(_ codecpar: UnsafePointer<AVCodecParameters>) -> [UInt8]? {
+        guard codecpar.pointee.codec_id == AV_CODEC_ID_AAC_LATM, let extradata = codecpar.pointee.extradata,
+              codecpar.pointee.extradata_size > 0 else { return nil }
+        return LATM.configuration(extradata: UnsafeRawBufferPointer(start: extradata, count: Int(codecpar.pointee.extradata_size)))
+    }
+
+    /// Name the speakers of a linear PCM track the muxer copies. The muxer has to give every channel
+    /// a speaker (`chnl`), and Matroska, like a WAV without a channel mask, states only how many
+    /// there are: such a file is written in the WAVE order, which is the count's default layout, and
+    /// the bridge reads it the same way. A count without a default layout (9, 11, ...) carries no
+    /// speakers anywhere, and the muxer refuses it.
+    static func namePCMSpeakers(_ codecpar: UnsafeMutablePointer<AVCodecParameters>) {
+        guard codecpar.pointee.ch_layout.order == AV_CHANNEL_ORDER_UNSPEC else { return }
+        let channels = codecpar.pointee.ch_layout.nb_channels
+        av_channel_layout_uninit(&codecpar.pointee.ch_layout)
+        av_channel_layout_default(&codecpar.pointee.ch_layout, channels)
+    }
+
+    static func prepareLATMForFMP4(_ codecpar: UnsafeMutablePointer<AVCodecParameters>, config: [UInt8]) -> Bool {
+        codecpar.pointee.codec_id = AV_CODEC_ID_AAC
+        return installAudioSpecificConfig(config, in: codecpar)
+    }
+
+    private static func installAudioSpecificConfig(_ asc: [UInt8], in codecpar: UnsafeMutablePointer<AVCodecParameters>) -> Bool {
         if codecpar.pointee.extradata != nil { av_freep(&codecpar.pointee.extradata) }
         codecpar.pointee.extradata_size = 0
         let total = asc.count + Int(AV_INPUT_BUFFER_PADDING_SIZE)
@@ -965,14 +1047,6 @@ extension HLSVideoEngine {
         codecpar.pointee.extradata_size = Int32(asc.count)
         codecpar.pointee.codec_tag = 0
         return true
-    }
-
-    /// HE-AAC (SBR, profile=4) and HE-AACv2 (PS, profile=28) stream-copy cleanly when an ASC is present (MP4 esds, MKV CodecPrivate). Bridge only when ASC is absent (live ADTS/MPEG-TS): the synthesized 2-byte ASC declares LC at the SBR output rate, which AudioToolbox decodes as garbage (-11821; device repro: NBC HE-AAC). frameSize=2048 also flags SBR.
-    static func aacRequiresBridge(profile: Int32, frameSize: Int32, hasASC: Bool) -> Bool {
-        guard !hasASC else { return false }
-        return profile == 4        // FF_PROFILE_AAC_HE
-            || profile == 28       // FF_PROFILE_AAC_HE_V2
-            || frameSize == 2048   // SBR doubles the LC frame to 2048 samples
     }
 
     /// AE#187 defense-in-depth: strip a zero-sample `sdtp` box from the video track's `stbl` in the captured init.
