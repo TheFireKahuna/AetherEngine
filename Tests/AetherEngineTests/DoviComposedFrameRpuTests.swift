@@ -294,6 +294,11 @@ struct DoviComposedFrameRpuTests {
         #expect(!s.isIdentityMapping)
     }
 
+    static func overlayPacket(_ nals: [[UInt8]], fallback: [UInt8]?, override: [UInt8]? = nil)
+        -> (result: DoviRpuConverter.DualLayerPacketResult, nals: [[UInt8]]) {
+        let r = DoviRpuConverter.separateDualLayers(pkt, packetRpu: .composed(fallback: fallback, override: override))
+    }
+    @Test("The overlay's packet carries a FEL RPU in the composed form")
     // MARK: - Raw base layer: the mapping stays
 
     @Test("The RPU for a frame shown as its raw base layer is Profile 8.1 with the source's mapping and display metadata",

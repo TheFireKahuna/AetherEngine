@@ -198,6 +198,10 @@ public enum DoviRpuConverter {
         var rewritten: [UnsafePointer<DoviData>] = []
         defer { for buffer in rewritten { dovi_data_free(buffer) } }
         let keepRpuBytes = extractEL || extractParams
+        let (composesPacket, composedFallback, composedOverride): (Bool, [UInt8]?, [UInt8]?) = switch packetRpu {
+        case .mode2: (false, nil, nil)
+        case .composed(let fallback, let override): (true, fallback, override)
+        }
         var rawRpuBytes: [UInt8]?
         var convertedRpuBytes: [UInt8]?
         var baseLayerRpuBytes: [UInt8]?
@@ -261,7 +265,7 @@ public enum DoviRpuConverter {
                     degraded = true
                     return
                 }
-                if !useCustomBlockSource {
+                if !useCustomBlockSource, composedOverride == nil {
                     pieces.append(Piece(base: outData, count: out.pointee.len))
                 }
                 converted = true
@@ -327,6 +331,9 @@ public enum DoviRpuConverter {
             // Degenerate: all NALs were RPU/EL. Leave the packet untouched rather than emit a zero-length video packet.
             if total > 0 {
                 if let newRef = buildPacketBuffer(pieces, total: total, emitsStartCodes: framing == .annexB) {
+        // A composed packet carries the override, or without an RPU of its own the fallback, last, where an access
+        // unit's RPU goes.
+        let carried = composesPacket && !useCustomBlockSource ? composedOverride ?? (converted ? nil : composedFallback) : nil
                     av_buffer_unref(&packet.pointee.buf)
                     packet.pointee.buf = newRef
                     packet.pointee.data = newRef.pointee.data

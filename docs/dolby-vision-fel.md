@@ -689,6 +689,20 @@ not a reading of the stream's `chroma_sample_loc_type`, which the 4:2:0 kernel n
   chroma it equals the 4:2:0 result exactly. It costs the chroma pass twice the threads: 0.35 -> 0.72 ms at
   UHD on an M4 Pro (`DoviGpuBenchmark`), the P010 modes unchanged. `DoviChroma422Tests` holds it against
   the CPU model.
+- **Composed-frame RPU override (experiment):** `AetherEngine.felComposedRpuOverride` (`@_spi(Diagnostics)`,
+  trait only; `aetherctl feltest|play --fel-rpu-override <file>`, the probe app's `rpu=<url>` arm option)
+  replaces the converted RPU on every frame the composer produced (`DoviComposedRpuOverride`), base-layer-only
+  compositions included: on the FEL overlay as the RPU in every base-layer packet the segment producer cuts (`FelEnhancementTap`), since the TV
+  applies the RPU in AVPlayer's stream and never the overlay layer's; there it applies from the next segment cut,
+  so the probe sets it before the load. The override is
+  one fixed RPU NAL: an "amplifier" whose luma curve is steep in a narrow window, so sub-10-bit steps
+  in the composed picture become visible on the TV if more than 10 bits survive tvOS's output. The bytes
+  are what `dovi_write_unspec62_nalu` writes (`0x7C 0x01` header, emulation prevention, no start code);
+  `DoviRpuGuard` + libdovi must parse them or the setter refuses and logs. Read per cut
+  packet, process-wide like `felOutputMode`. A frame delivered as its raw base layer (failed
+  composition, no parameters, no composer) keeps its mapping-kept RPU, since its pixels were never reshaped
+  and the amplifier would mean something else on them. `DoviComposedRpuOverrideTests` pins both
+  forms.
 - **Not implemented, by design:** NLQ methods other than linear (the spec defines only linear; an unknown method
   yields no residual), MEL (no residual by definition), NLQ pivots (the linear inverse has one segment).
 - **Not implemented, blocked:** polynomial pieces with `poly_order_minus1 == 0` and `linear_interp_flag`. libdovi is

@@ -5,6 +5,8 @@ import CoreMedia
 import CoreVideo
 import VideoToolbox
 import QuartzCore
+import os
+import Dovi
 import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
@@ -224,6 +226,10 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// closed after releasing it in `flush()`/`close()`.
     private var enhancementDecoder: (any SingleLayerVideoDecoder)?
     private let composer: (any FelComposing)?
+
+    /// This decoder's override in place of the process-wide one, for tests, which run in parallel. Set before
+    /// the first frame.
+    var composedRpuOverrideForTesting: [UInt8]?
 
     /// Every outgoing frame — composed or bypassed — reaches the host through
     /// here (dolby-vision-fel.md §5.7). Owned by the decoder, not the composer.
@@ -1146,7 +1152,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let epoch = req.epoch
         let pts = req.pts
         let hdr10Data = req.hdr10Data
-        let dmNAL = req.dmNAL
+        let dmNAL = composedRpuOverrideForTesting ?? DoviComposedRpuOverride.rpu(forComposed: req.dmNAL)
         let baseLayerNAL = req.baseLayerNAL
         let arrived = req.arrived
         let delivery = orderedDelivery

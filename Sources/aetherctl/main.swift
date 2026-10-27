@@ -116,8 +116,6 @@ func printUsage() {
       aetherctl extract [--at <sec>] [--preview|--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
       aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>
-                         (#95: decode the loopback audio track to mono 48k WAV, print continuity stats;
-                          --software runs a real session through the SW sink, exit 3 if it yields no audible PCM)
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] [--audio-index N] [--reload-decode-path automatic|software] <file>
       aetherctl customio --live [--rate-kbps N] [--seconds N] [--dvr-window N] [--report-size] [--no-wrap] [--malloc-census] [--foundation-reader] [--host-carry none|removeFirst|subdata] [--reload-at S] [--cancel-latches] [--reload-decode-path automatic|software] [--reader-axis absolute|join|mismatched] [--join-offset-mb N] <file.ts>
                          (AE#445: a host-owned live spool behind MediaSource.custom, paced at the mux rate,
@@ -135,10 +133,6 @@ func printUsage() {
                          (#35/#37/#38: rapid-seek burst, wedge report, seek-event ledger)
       aetherctl pktdump [--at S] [--count N] [--profile playback|restartReopen|stillExtraction] <url>
                         (raw demuxer packet timing, before dts repair and muxing)
-      aetherctl bgaudio [--fg N] [--bg N] [--lose-session] <url>
-                        (SW-path background audio headless on macOS; DEBUG builds only.
-                         --lose-session invalidates the VT session mid-foreground and
-                         on entering background, as an iOS screen lock does, AE#739)
       aetherctl smbtest [--reads N] <smb-url>
                         (SMB byte source: throughput pass + random-seek consistency; macOS)
       aetherctl <url>             (alias for `serve`)
@@ -500,6 +494,7 @@ if first == "feltest" {
     var rest = Array(args.dropFirst(2))
     let frames = takeIntFlag("--frames", from: &rest) ?? 100
     let felOutput = takeStringFlag("--fel-output", from: &rest)
+    let felRpuOverride = takeStringFlag("--fel-rpu-override", from: &rest)
     let probeAt = takeStringFlag("--probe-at", from: &rest).map { spec -> (x: Int, y: Int) in
         let v = spec.split(separator: ",").compactMap { Int($0) }
         guard v.count == 2 else { print("ERROR: --probe-at takes X,Y, got '\(spec)'"); exit(64) }
@@ -507,13 +502,14 @@ if first == "feltest" {
     }
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: feltest requires a <file> argument")
-        print("Usage: aetherctl feltest [--frames N] <file>")
+        print("Usage: aetherctl feltest [--frames N] [--fel-output p010|p010-round|p010-bluenoise|p010-full|sv22] [--fel-rpu-override FILE] [--probe-at X,Y] <file>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "feltest")
     #if DualLayerDolbyVision
     applyFelOutputFlag(felOutput)
+    applyFelRpuOverrideFlag(felRpuOverride)
     exit(runFelTest(url: parseSourceURL(urlArg), maxFrames: frames, probePoint: probeAt))
     #else
     print("ERROR: feltest needs the DualLayerDolbyVision trait (swift build --traits DualLayerDolbyVision)")
@@ -805,6 +801,16 @@ if first == "play" {
         #else
         if !playFel { print("[aetherctl] note: --fel-output only changes a session on the dual-layer route; add --fel") }
         applyFelOutputFlag(mode)
+        #endif
+    }
+    // `--fel-rpu-override <file>`: the RPU every composed FEL frame carries in place of its converted one, for the 12-bit experiment.
+    if let path = takeStringFlag("--fel-rpu-override", from: &rest) {
+        #if !DualLayerDolbyVision
+        print("ERROR: --fel-rpu-override needs the DualLayerDolbyVision trait (swift build --traits DualLayerDolbyVision)")
+        exit(64)
+        #else
+        if !playFel { print("[aetherctl] note: --fel-rpu-override only changes a session on the dual-layer route; add --fel") }
+        applyFelRpuOverrideFlag(path)
         #endif
     }
     // `--dv-pin <spec>`: arm the Dolby Vision pin test (DEBUG builds), same grammar `dvsurvey` prints.

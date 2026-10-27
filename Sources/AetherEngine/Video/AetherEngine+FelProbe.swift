@@ -287,6 +287,35 @@ extension AetherEngine {
         set { DoviFelComposer.outputMode = DoviOutputMode(rawValue: newValue.rawValue) ?? .p010 }
     }
 
+    /// One Dolby Vision RPU NAL every composed FEL frame carries in place of its converted (identity-mapping)
+    /// RPU: an "amplifier" RPU whose steep reshaping makes sub-10-bit differences visible on the TV
+    /// (dolby-vision-fel.md, "Composed-frame RPU override"). The bytes are what `dovi_write_unspec62_nalu`
+    /// writes: the `0x7C 0x01` NAL header, emulation prevention in place, no start code or length prefix; a
+    /// payload without the header is accepted too. Bytes libdovi cannot parse are refused with a log line and
+    /// leave the override off. Applies on both routes that compose FEL and to every session in the process. On
+    /// the software host it is each composed frame's attachment, from the next frame on; a frame shown as its raw
+    /// base layer keeps its own RPU. On the native route's FEL overlay (`LoadOptions.felOverlay`) it is the RPU in
+    /// the base-layer packets AVPlayer plays, the one the TV applies, from the next segment cut on: set it before
+    /// the load. nil restores the converted RPU.
+    @_spi(Diagnostics)
+    public nonisolated static var felComposedRpuOverride: Data? {
+        get { DoviComposedRpuOverride.current.map { Data($0) } }
+        set {
+            guard let newValue else {
+                DoviComposedRpuOverride.current = nil
+                return
+            }
+            let nal = DoviComposedRpuOverride.validated(newValue)
+            DoviComposedRpuOverride.current = nal
+            let head = newValue.prefix(8).map { String(format: "%02x", $0) }.joined()
+            if let nal {
+                EngineLog.emit("[FEL] composed-frame RPU override on: \(nal.count) bytes (\(head)…)", category: .engine)
+            } else {
+                EngineLog.emit("[FEL] composed-frame RPU override refused: \(newValue.count) bytes (\(head)…) do not parse as an unspec62 RPU", category: .engine)
+            }
+        }
+    }
+
     /// Off composes every Profile 7 FEL frame without its residual, which is what a MEL stream
     /// decodes to; on is the full FEL result. For A/B viewing (`aetherctl play --cycle-el`): it
     /// takes effect from the next composed frame and applies to every session in the process.
