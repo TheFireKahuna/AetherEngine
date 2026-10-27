@@ -42,12 +42,19 @@ enum AlternativeTransferSEI {
     ) -> UInt8? {
         var preferred: UInt8?
         A53SEIParser.forEachSEIRBSP(data, size, codec: codec, framing: framing) { rbsp in
-            A53SEIParser.forEachSEIPayload(rbsp) { type, offset, payloadSize in
-                guard type == payloadType, payloadSize >= 1 else { return false }
-                preferred = rbsp[offset]
-                return true
-            }
+            preferred = preferredTransfer(inSEIRBSP: rbsp)
             return preferred != nil
+        }
+        return preferred
+    }
+
+    /// `preferred_transfer_characteristics` of the first alternative-transfer message in one SEI RBSP, or nil.
+    static func preferredTransfer(inSEIRBSP rbsp: [UInt8]) -> UInt8? {
+        var preferred: UInt8?
+        A53SEIParser.forEachSEIPayload(rbsp) { type, offset, payloadSize in
+            guard type == payloadType, payloadSize >= 1 else { return false }
+            preferred = rbsp[offset]
+            return true
         }
         return preferred
     }
