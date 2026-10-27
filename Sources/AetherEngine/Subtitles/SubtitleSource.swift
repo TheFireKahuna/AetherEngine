@@ -627,8 +627,15 @@ final class SubtitleSource {
                                        readers: FrameReaders, prefix: Int? = nil,
                                        stop: StopFlag) -> [Int: SourceIndexFrame] {
         guard !blocks.isEmpty else { return [:] }
+        let sources = readers.lanes(min(BlockingWork.readLanes, blocks.count), label: "subpull")
         defer { sources.forEach { $0.close() } }
         guard !sources.isEmpty else { return [:] }
+        let frames = BlockingWork.lanes(count: blocks.count, width: sources.count, isStopped: { stop.isRaised }) { lane, k in
+            index.readFrame(blocks[k], track: track, from: sources[lane], prefix: prefix)
+        }
+        var byPosition: [Int: SourceIndexFrame] = [:]
+        for (k, frame) in frames.enumerated() { if let frame { byPosition[k] = frame } }
+        return byPosition
     }
 
     /// One frame through the decoder as the packet libavformat would hand over (WebVTT settings as side

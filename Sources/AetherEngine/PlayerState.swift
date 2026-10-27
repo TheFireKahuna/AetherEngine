@@ -809,10 +809,13 @@ public struct LoadOptions: Sendable, Equatable {
 
     /// Confirm E-AC-3 JOC (Dolby Atmos) on this session's audio tracks, so `audioTracks` carries an honest
     /// `TrackInfo.isAtmos` for a badge instead of the pre-decode guess. No container reliably declares JOC, so
-    /// this runs the same bounded decode pass as `AetherEngine.probeDetectingAtmos` (see `AtmosDetectionOptions`
-    /// for the caps) on a second handle to the source, once per E-AC-3 track, and republishes `audioTracks` as
-    /// tracks confirm. It starts only after the session is up and runs at utility priority, so it never delays
-    /// the first frame. Skipped for live sources, for forward-only custom readers, which cannot be re-read, and where a second request would cost the video path its link: an origin limited to one request (`maxConcurrentSourceRequests == 1`, or a limit the engine learned from 429/503/509 refusals, re-checked before every track), `sequentialOrigin` and `heldSourceConnection`. One `[AtmosConfirmation]` log line names the reason, or how far a stopped pass got.
+    /// this runs the same bounded decode scan as `AetherEngine.probeDetectingAtmos` (see `AtmosDetectionOptions`
+    /// for the caps) on every E-AC-3 track, fed the packets the session's own reader reads as it plays: a track
+    /// nobody plays is read beside the one that is for about two seconds of its audio, and nothing opens the
+    /// source a second time, so it costs no origin anything and works on every source, live and custom readers
+    /// included. `audioTracks` is republished as tracks confirm. It starts after the session is up, so it never
+    /// delays the first frame. One `[AtmosConfirmation]` log line says what it found, or how far a pass the
+    /// session moved on from got.
     /// Default `false` (#214 follow-up).
     public var confirmAtmos: Bool = false
 

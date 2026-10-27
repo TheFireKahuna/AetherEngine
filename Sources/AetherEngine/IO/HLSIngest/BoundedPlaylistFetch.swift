@@ -10,11 +10,13 @@ enum BoundedPlaylistFetch {
 
     /// The body and response of `request`. A non-2xx answer comes back with an empty body: every
     /// caller throws on the status alone, so its body is not worth reading.
-    static func data(for request: URLRequest, session: URLSession, limit: Int) async throws
+    static func data(for request: URLRequest, session: URLSession, limit: Int,
+                     resourceTimeout: TimeInterval? = nil, owner: EngineHTTPRequests? = nil) async throws
         -> (Data, URLResponse)
     {
         do {
-            return try await BoundedFetch.data(for: request, session: session, limit: limit, role: .hlsPlaylist)
+            return try await BoundedFetch.data(for: request, session: session, limit: limit,
+                                               resourceTimeout: resourceTimeout, owner: owner, role: .hlsPlaylist)
         } catch let error as BoundedFetch.Exceeded {
             throw HLSIngestError.playlistInvalid(reason: "playlist exceeds \(error.limit) bytes")
         }
@@ -54,13 +56,22 @@ enum BoundedFetch {
 
     /// The body and response of `request`. A non-2xx answer comes back with an empty body, since every
     /// caller decides on the status alone. Throws `Exceeded` for a body over `limit`.
-    static func data(for request: URLRequest, session: URLSession, limit: Int, role: SourceNetworkDiagnostics.Role = .boundedBody) async throws
+    ///
+    /// `resourceTimeout` is the whole fetch's ceiling, the per-task form of the session ceiling the
+    /// callers' own sessions used to carry (`EngineHTTP`); its expiry throws `URLError(.timedOut)`, as
+    /// the session's did. `owner` records the task so its owner's teardown can end it.
+    static func data(for request: URLRequest, session: URLSession, limit: Int,
+                     resourceTimeout: TimeInterval? = nil, owner: EngineHTTPRequests? = nil,
+                     role: SourceNetworkDiagnostics.Role = .boundedBody) async throws
         -> (Data, URLResponse)
     {
         let delegate = BoundedBodyDelegate(limit: limit, role: role, context: SourceNetworkDiagnostics.context(for: request))
         defer { withExtendedLifetime(delegate) {} }
         let task = session.dataTask(with: request)
         task.delegate = delegate
+        owner?.track(task)
+        let expired = ExpiryFlag()
+        EngineHTTP.armResourceDeadline(task, seconds: resourceTimeout) { expired.set() }
         let outcome: BoundedBodyDelegate.Outcome = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 // Installed through the delegate's own lock, and it replays an outcome that has already
@@ -83,6 +94,10 @@ enum BoundedFetch {
     }
 
     /// A body read as it arrives (`stream`). For a non-2xx answer `chunks` is empty and finished.
+    struct BodyStream: Sendable {
+        let response: URLResponse
+        let chunks: AsyncThrowingStream<Data, Error>
+    }
 
     /// `data(for:)`, but the body is handed out in the pieces the session delivers rather than held
     /// until it ends, so a consumer can start on a large body (a transport-stream segment) while the
@@ -90,6 +105,47 @@ enum BoundedFetch {
     /// apply (a declared length over `limit` throws `Exceeded` here), and a body that runs past
     /// `limit` ends the stream throwing `Exceeded`. Stopping the iteration, or cancelling the task
     /// iterating, ends the transfer.
+    static func stream(for request: URLRequest, session: URLSession, limit: Int,
+                       resourceTimeout: TimeInterval? = nil, owner: EngineHTTPRequests? = nil,
+                       role: SourceNetworkDiagnostics.Role = .boundedBody) async throws
+        -> BodyStream
+    {
+        let expired = ExpiryFlag()
+        let (chunks, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
+        let delegate = BoundedBodyDelegate(limit: limit, role: role, context: SourceNetworkDiagnostics.context(for: request),
+                                           chunks: continuation, expired: expired)
+        let task = session.dataTask(with: request)
+        task.delegate = delegate
+        owner?.track(task)
+        continuation.onTermination = { _ in task.cancel() }
+        EngineHTTP.armResourceDeadline(task, seconds: resourceTimeout) { expired.set() }
+        let outcome: BoundedBodyDelegate.Outcome = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { head in
+                delegate.installOutcomeHandler { head.resume(returning: $0) }
+                task.resume()
+            }
+        } onCancel: {
+            task.cancel()
+        }
+        switch outcome {
+        case .streaming(let response): return BodyStream(response: response, chunks: chunks)
+        case .refused(let response), .body(_, let response):
+            continuation.finish()
+            return BodyStream(response: response, chunks: chunks)
+        case .exceeded: throw Exceeded(limit: limit)
+        case .failed(let error):
+            if expired.isSet { throw URLError(.timedOut) }
+            throw error
+        }
+    }
+
+    /// Set once by a resource deadline, read after the transfer ends.
+    fileprivate final class ExpiryFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        func set() { lock.lock(); value = true; lock.unlock() }
+        var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+    }
 }
 
 private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, URLSessionDataDelegate,
@@ -125,8 +181,11 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
     private var onOutcome: ((Outcome) -> Void)?
     private var landed: Outcome?
 
-    init(limit: Int, role: SourceNetworkDiagnostics.Role, context: SourceNetworkDiagnostics.Context?) {
+    init(limit: Int, role: SourceNetworkDiagnostics.Role, context: SourceNetworkDiagnostics.Context?,
+         chunks: AsyncThrowingStream<Data, Error>.Continuation? = nil, expired: BoundedFetch.ExpiryFlag? = nil) {
         self.limit = limit
+        self.chunks = chunks
+        self.expired = expired
         trace = .init(role: role, context: context)
         super.init()
     }
@@ -177,7 +236,9 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
             completionHandler(.cancel)
             return
         }
-        if declared > 0 { buffer.reserveCapacity(Int(min(declared, 8 * 1024 * 1024))) }
+        // A stated length is within `limit` (checked above), so the whole body is reserved at once:
+        // growing a 100 MB segment by doubling would copy it several times over, on the session's
+        // one delegate queue that every other engine fetch delivers on too.
         if chunks != nil {
             deliver(.streaming(response))
         } else if declared > 0 {

@@ -28,6 +28,8 @@ struct SubtitleSourceTests {
             url = FileManager.default.temporaryDirectory.appending(path: "subsource-\(UUID().uuidString).mp4")
             try data.write(to: url)
             demuxer = Demuxer()
+            try demuxer.open(url: url, extraHeaders: [:],
+                             profile: .headPackets)
             cueStores = renditions
                 ? Dictionary(uniqueKeysWithValues: demuxer.subtitleStreamIndices().map { ($0, NativeSubtitleCueStore()) })
                 : [:]

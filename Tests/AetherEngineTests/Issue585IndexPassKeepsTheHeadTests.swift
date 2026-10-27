@@ -8,9 +8,10 @@ import Foundation
 /// head away. The cursor is then reset to zero and playback's first read re-fetched the same bytes:
 /// 8 MB re-downloaded per warmed session, the whole warm spent on nothing but the parse.
 ///
-/// The drop rule's own premise is that the read is playback ("moved beyond it or started nowhere
-/// near it"). The index pass is neither, so it says so, and the rule stands unchanged around it.
-@Suite("The index pass keeps the head (#585)")
+/// The head now lives in the source cache, which nothing releases on a read that moved away, so the
+/// index pass needs no bracket and the drop rule is gone: a return to the head is a cache read
+/// whatever ran in between.
+@Suite("A return to the head after the index pass costs no request (#585)")
 struct Issue585IndexPassKeepsTheHeadTests {
 
     private let fileSize: Int64 = 512 * 1024 * 1024
@@ -36,16 +37,11 @@ struct Issue585IndexPassKeepsTheHeadTests {
         try reader.open()
         _ = read(reader, 1 * 1024 * 1024)   // the parse's walk from byte zero
 
-        reader.markOpenPhaseFinished()
-        reader.beginIndexPass()
-
         // The cue prewarm: one bounded excursion to the middle for the container's index.
         let farOffset = fileSize / 2
         #expect(reader.seek(offset: farOffset, whence: SEEK_SET) == farOffset)
         _ = read(reader, 64 * 1024)
         let requestsAfterPrewarm = server.rangeRequestCount
-
-        reader.endIndexPass()
 
         // The cursor reset, and then playback's first read.
         #expect(reader.seek(offset: 4096, whence: SEEK_SET) == 4096)
@@ -56,10 +52,10 @@ struct Issue585IndexPassKeepsTheHeadTests {
                 "the prewarm dropped the head and playback re-fetched it: \(server.requestedRanges)")
     }
 
-    /// The suppression is the pass, not the session. Once it ends, the head is released by the first
-    /// read it cannot answer exactly as #281 leaves it.
-    @Test("the head is released again once the index pass has ended")
-    func endingThePassRestoresTheDropRule() async throws {
+    /// What the drop rule used to give back: playback moving far away and then returning to the
+    /// head. The head stays in the source cache, so the return is a read, not a refetch.
+    @Test("the head stays servable after playback has moved away from it")
+    func theHeadOutlivesAMoveAway() async throws {
         let server = try #require(ThrottledOriginServer(totalSize: fileSize))
         defer { server.stop() }
         let reader = makeReader(server)
@@ -67,20 +63,15 @@ struct Issue585IndexPassKeepsTheHeadTests {
         try reader.open()
         _ = read(reader, 1 * 1024 * 1024)
 
-        reader.markOpenPhaseFinished()
-        reader.beginIndexPass()
-        reader.endIndexPass()
-
-        // Playback moving away, which is what the drop rule exists for.
         let farOffset = fileSize / 2
         #expect(reader.seek(offset: farOffset, whence: SEEK_SET) == farOffset)
         _ = read(reader, 64 * 1024)
         let requestsAfterSeek = server.rangeRequestCount
 
         #expect(reader.seek(offset: 4096, whence: SEEK_SET) == 4096)
-        _ = read(reader, 32 * 1024)
+        #expect(read(reader, 32 * 1024) == 32 * 1024)
 
-        #expect(server.rangeRequestCount > requestsAfterSeek,
-                "the head outlived the index pass: \(server.requestedRanges)")
+        #expect(server.rangeRequestCount == requestsAfterSeek,
+                "the return to the head was fetched again: \(server.requestedRanges)")
     }
 }

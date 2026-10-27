@@ -390,7 +390,7 @@ struct DASHOverHTTPTests {
         try demuxer.open(url: url, extraHeaders: ["X-Session": "s1"])
         defer { demuxer.close() }
         // Its readers fixed their headers at open, so a header update must not promise live requests.
-        #expect(DASHSourceOpener.isKnownManifest(url))
+        #expect(demuxer.isDASHSource)
         #expect(demuxer.videoStreamIndex >= 0)
         #expect(demuxer.audioTrackInfos().map(\.language) == ["eng", "deu"])
         let requests = origin.requests

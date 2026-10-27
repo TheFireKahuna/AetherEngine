@@ -29,28 +29,31 @@ struct HTTPDiscIOReaderTests {
 
     @Test("Disc-image URL detection gates the HTTP disc path")
     func discImageURL() {
-        #expect(Demuxer.isDiscImageURL(URL(string: "https://h/movie.iso")!) == true)
-        #expect(Demuxer.isDiscImageURL(URL(string: "https://h/MOVIE.ISO")!) == true)
-        #expect(Demuxer.isDiscImageURL(URL(string: "https://h/disc.img")!) == true)
-        #expect(Demuxer.isDiscImageURL(URL(string: "https://h/video.mp4")!) == false)
-        #expect(Demuxer.isDiscImageURL(URL(string: "https://h/stream.m3u8")!) == false)
+        #expect(Demuxer.isDiscImageURL(URL(string: "https://h/movie.iso")!, headers: [:]) == true)
+        #expect(Demuxer.isDiscImageURL(URL(string: "https://h/MOVIE.ISO")!, headers: [:]) == true)
+        #expect(Demuxer.isDiscImageURL(URL(string: "https://h/disc.img")!, headers: [:]) == true)
+        #expect(Demuxer.isDiscImageURL(URL(string: "https://h/video.mp4")!, headers: [:]) == false)
+        #expect(Demuxer.isDiscImageURL(URL(string: "https://h/stream.m3u8")!, headers: [:]) == false)
     }
 
-    @Test("Read-ahead window grows on sequential continuation and resets otherwise")
+    @Test("Read-ahead grows on sequential continuation, resets otherwise, and starts at the read's own size")
     func adaptiveWindow() {
-        // Sequential continuation (position == lastFetchEnd) doubles, capped at maxChunk.
-        #expect(HTTPDiscIOReader.nextChunkSize(position: 4096, lastFetchEnd: 4096, current: 4096,
-                                               base: 4096, maxChunk: 32768) == 8192)
-        #expect(HTTPDiscIOReader.nextChunkSize(position: 8192, lastFetchEnd: 8192, current: 8192,
-                                               base: 4096, maxChunk: 32768) == 16384)
-        #expect(HTTPDiscIOReader.nextChunkSize(position: 99999, lastFetchEnd: 99999, current: 32768,
-                                               base: 4096, maxChunk: 32768) == 32768)  // capped
-        // A non-contiguous read (seek) resets to base.
-        #expect(HTTPDiscIOReader.nextChunkSize(position: 200000, lastFetchEnd: 8192, current: 16384,
-                                               base: 4096, maxChunk: 32768) == 4096)
-        // No prior refill yet -> base.
-        #expect(HTTPDiscIOReader.nextChunkSize(position: 0, lastFetchEnd: -1, current: 4096,
-                                               base: 4096, maxChunk: 32768) == 4096)
+        var ahead = ReadAhead(floor: 4096, ceiling: 32768)
+        // No prior fetch: the read's own size, at least the floor.
+        #expect(ahead.size(forReadAt: 0, requested: 100) == 4096)
+        ahead.fetched(at: 0, count: 4096)
+        // Sequential continuation doubles, capped at the ceiling.
+        #expect(ahead.size(forReadAt: 4096, requested: 100) == 8192)
+        ahead.fetched(at: 4096, count: 8192)
+        #expect(ahead.size(forReadAt: 12288, requested: 100) == 16384)
+        ahead.fetched(at: 12288, count: 16384)
+        #expect(ahead.size(forReadAt: 28672, requested: 100) == 32768)
+        ahead.fetched(at: 28672, count: 32768)
+        #expect(ahead.size(forReadAt: 61440, requested: 100) == 32768)   // capped
+        // A non-contiguous read resets to the read's own size.
+        #expect(ahead.size(forReadAt: 200_000, requested: 100) == 4096)
+        // A read larger than the floor fetches what it asks for.
+        #expect(ahead.size(forReadAt: 900_000, requested: 20_000) == 20_000)
     }
 
     // MARK: - Read / seek over a mock range server
@@ -89,6 +92,37 @@ struct HTTPDiscIOReaderTests {
         let n2 = out2.withUnsafeMutableBufferPointer { r.read($0.baseAddress, size: 100) }
         #expect(n2 == 100)
         #expect(Array(out2[0..<100]) == Array(src[8192..<8292]))
+    }
+
+    @Test("A sequential walk fetches the next block while the current one is read, and every byte is right")
+    func sequentialReadAhead() async throws {
+        let src = (0..<2_000_000).map { UInt8(($0 * 7) & 0xff) }
+        let r = try #require(makeReader(src, base: 64 * 1024, maxChunk: 256 * 1024))
+        var out = [UInt8](repeating: 0, count: 4096)
+        var position = 0
+        func readOne() -> Int {
+            let n = out.withUnsafeMutableBufferPointer { r.read($0.baseAddress, size: 4096) }
+            if n > 0 {
+                #expect(Array(out[0..<Int(n)]) == Array(src[position..<position + Int(n)]))
+                position += Int(n)
+            }
+            return Int(n)
+        }
+        // Into the second block: the window has grown past its floor, so the block after it is
+        // fetched while this one is read.
+        while position <= 64 * 1024 { _ = readOne() }
+        let nextBlock = 64 * 1024 + 128 * 1024
+        let deadline = Date().addingTimeInterval(5)
+        while !MockRangeURLProtocol.requestedStarts.contains(nextBlock), Date() < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(position < nextBlock)
+        #expect(MockRangeURLProtocol.requestedStarts.contains(nextBlock),
+                "the block after the one being read was not fetched ahead: \(MockRangeURLProtocol.requestedStarts)")
+        while position < src.count, readOne() > 0 {}
+        #expect(position == src.count)
+        let starts = MockRangeURLProtocol.requestedStarts.dropFirst()  // the size probe
+        #expect(Set(starts).count == starts.count, "a block was fetched twice: \(Array(starts))")
     }
 
     @Test("Reading at EOF returns 0; seek past end then read is empty")
@@ -221,10 +255,15 @@ final class MockRangeURLProtocol: URLProtocol, @unchecked Sendable {
     /// audit NET-9: any request at a non-zero offset gets a full 200 instead of a 206 (a
     /// Range-ignoring proxy or a cache-miss fallback), body starting at byte 0 of the source.
     nonisolated(unsafe) static var plain200AfterProbeFor: Set<String> = []
+    /// The start of every range asked for, in arrival order.
+    private static let startsLock = NSLock()
+    nonisolated(unsafe) private static var _requestedStarts: [Int] = []
+    static var requestedStarts: [Int] { startsLock.withLock { _requestedStarts } }
 
     static func reset() {
         bytesByURL = [:]; disableRangeFor = []; failFirstForURL = [:]
         misrangedFor = []; plain200AfterProbeFor = []
+        startsLock.withLock { _requestedStarts = [] }
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -254,6 +293,7 @@ final class MockRangeURLProtocol: URLProtocol, @unchecked Sendable {
            rv.hasPrefix("bytes=") {
             let parts = rv.dropFirst(6).split(separator: "-", omittingEmptySubsequences: false)
             lower = Int(parts.first ?? "0") ?? 0
+            Self.startsLock.withLock { Self._requestedStarts.append(lower) }
             upper = (parts.count > 1 ? Int(parts[1]) : nil) ?? (total - 1)
             upper = min(upper, total - 1)
             status = 206

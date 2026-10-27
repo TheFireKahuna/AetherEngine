@@ -49,13 +49,13 @@ final class ProbeHTTPReader: IOReader, @unchecked Sendable {
 
     init(url: URL, headers: [String: String], control: ProbeControl,
          boundedWindowBytes: Int? = nil) {
-        isDiscImageURL = Demuxer.isDiscImageURL(url)
+        isDiscImageURL = Demuxer.isDiscImageURL(url, headers: headers)
         reader = AVIOReader(
             url: url, extraHeaders: headers, label: "probe",
             chunkSize: 64 * 1024, prefetchEnabled: false,
             chunkRequestTimeout: 2, chunkMaxRetries: 1,
             boundedInitialFetch: boundedWindowBytes.map { Int64($0) },
-            windowHighWater: boundedWindowBytes, probeControl: control)
+            windowHighWater: boundedWindowBytes, probeControl: control, sourceCache: .shared)
     }
 
     func open() throws { try reader.open() }

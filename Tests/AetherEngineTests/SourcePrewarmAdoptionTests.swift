@@ -2,15 +2,16 @@ import Testing
 import Foundation
 @testable import AetherEngine
 
-extension PrewarmStoreSuites {
+extension PrewarmSuites {
     /// #551: what a warmed source is worth at the next open.
     ///
     /// The claim being pinned is not "fewer bytes" but "no round trip": the reads a cold open pays
-    /// three sequential round trips for (#281) are served out of RAM, and the data connection starts
-    /// where the warm bytes end instead of at byte zero.
+    /// three sequential round trips for (#281) are served out of the source cache the warm filled,
+    /// and the data connection starts where the warm bytes end instead of at byte zero.
     ///
-    /// `.serialized`: the prewarm store is process-wide. The origin budget is too, so nothing here
-    /// resets it globally; each server has its own port and therefore its own origin key.
+    /// Each test warms into a source cache of its own. `.serialized` because the origin budget is
+    /// process-wide, so nothing here resets it globally; each server has its own port and therefore
+    /// its own origin key.
     @Suite("Source prewarm adoption (#551)", .serialized, .timeLimit(.minutes(2)))
     struct SourcePrewarmAdoptionTests {
 
@@ -21,14 +22,19 @@ extension PrewarmStoreSuites {
             URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!
         }
 
-        private func warm(_ server: ThrottledOriginServer, bytes: Int) async throws {
-            _ = await SourcePrewarmFetcher.warm(url: url(server), extraHeaders: [:],
-                                                byteBudget: bytes, into: .shared)
+        private func freshCache() -> SourceByteCache {
+            SourceByteCache(directory: FileManager.default.temporaryDirectory
+                .appending(path: "prewarm-adopt-\(UUID().uuidString)", directoryHint: .isDirectory),
+                            budget: .fixed(64 << 20))
         }
 
-        /// The warm open deliberately does not wait for the data connection, so the request it issues
-        /// is still on the wire when `open()` returns. Waiting for it here is the test's job, not the
-        /// reader's.
+        private func warm(_ server: ThrottledOriginServer, bytes: Int, into cache: SourceByteCache) async {
+            _ = await SourcePrewarmFetcher.warm(url: url(server), extraHeaders: [:],
+                                                byteBudget: bytes, into: cache)
+        }
+
+        /// A request the read loop issues asynchronously is still on the wire when the read that
+        /// caused it returns. Waiting for it here is the test's job, not the reader's.
         private func waitForRequest(_ server: ThrottledOriginServer, startingAt start: Int64) async throws {
             try await waitFor {
                 server.requestedRanges.contains(where: { $0.start == start })
@@ -43,13 +49,13 @@ extension PrewarmStoreSuites {
 
         @Test("the reads inside the warm head cost no request at all")
         func warmHeadServesWithoutTheNetwork() async throws {
-            SourcePrewarmStore.shared.clear()
+            let cache = freshCache()
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))
             defer { server.stop() }
-            try await warm(server, bytes: warmBytes)
+            await warm(server, bytes: warmBytes, into: cache)
             let warmRequests = server.rangeRequestCount
 
-            let reader = AVIOReader(url: url(server))
+            let reader = AVIOReader(url: url(server), sourceCache: cache)
             defer { reader.markClosed(); reader.close() }
             try reader.open()
             #expect(read(reader, 64 * 1024) == 64 * 1024)
@@ -61,18 +67,19 @@ extension PrewarmStoreSuites {
         }
 
         /// The data connection is not skipped, it is moved: playback still needs the bytes behind the
-        /// warm head, and starting that fetch during the open is what overlaps it with the probe.
+        /// warm head, and the reads past it fetch from the warm frontier, never from byte zero.
         @Test("the data connection starts where the warm bytes end")
         func connectionStartsAtTheWarmFrontier() async throws {
-            SourcePrewarmStore.shared.clear()
+            let cache = freshCache()
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))
             defer { server.stop() }
-            try await warm(server, bytes: warmBytes)
+            await warm(server, bytes: warmBytes, into: cache)
             let warmRequests = server.rangeRequestCount
 
-            let reader = AVIOReader(url: url(server))
+            let reader = AVIOReader(url: url(server), sourceCache: cache)
             defer { reader.markClosed(); reader.close() }
             try reader.open()
+            #expect(read(reader, warmBytes + 64 * 1024) > 0)
             try await waitForRequest(server, startingAt: Int64(warmBytes))
 
             let opened = Array(server.requestedRanges.dropFirst(warmRequests))
@@ -87,12 +94,12 @@ extension PrewarmStoreSuites {
         /// saving would be spent there.
         @Test("the size is adopted with the bytes")
         func sizeIsAdopted() async throws {
-            SourcePrewarmStore.shared.clear()
+            let cache = freshCache()
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))
             defer { server.stop() }
-            try await warm(server, bytes: warmBytes)
+            await warm(server, bytes: warmBytes, into: cache)
 
-            let reader = AVIOReader(url: url(server))
+            let reader = AVIOReader(url: url(server), sourceCache: cache)
             defer { reader.markClosed(); reader.close() }
             try reader.open()
 
@@ -104,14 +111,14 @@ extension PrewarmStoreSuites {
         /// open has the head already and must not wait at all.
         @Test("a warm open does not wait for a first byte")
         func warmOpenDoesNotWaitForFirstByte() async throws {
-            SourcePrewarmStore.shared.clear()
+            let cache = freshCache()
             let slow = ThrottledOriginServer(totalSize: fileSize,
                                              firstByteDelayUs: { _ in 2_000_000 })
             let server = try #require(slow)
             defer { server.stop() }
-            try await warm(server, bytes: warmBytes)
+            await warm(server, bytes: warmBytes, into: cache)
 
-            let reader = AVIOReader(url: url(server))
+            let reader = AVIOReader(url: url(server), sourceCache: cache)
             defer { reader.markClosed(); reader.close() }
             let started = Date()
             try reader.open()
@@ -126,14 +133,14 @@ extension PrewarmStoreSuites {
         /// the last byte is a 416, and the open would then look like a refusal.
         @Test("a fully warmed source opens without any connection at all", arguments: [40 * 1024, 128 * 1024])
         func fullyWarmedSourceOpensWithNoConnection(size: Int) async throws {
-            SourcePrewarmStore.shared.clear()
+            let cache = freshCache()
             let small = Int64(size)
             let server = try #require(ThrottledOriginServer(totalSize: small))
             defer { server.stop() }
-            try await warm(server, bytes: 1 << 20)
+            await warm(server, bytes: 1 << 20, into: cache)
             let warmRequests = server.rangeRequestCount
 
-            let reader = AVIOReader(url: url(server))
+            let reader = AVIOReader(url: url(server), sourceCache: cache)
             defer { reader.markClosed(); reader.close() }
             try reader.open()
             #expect(read(reader, Int(small)) == Int32(small))
@@ -153,14 +160,14 @@ extension PrewarmStoreSuites {
 
         @Test("a partial warm still prefetches the missing suffix")
         func partialWarmStillFetchesSuffix() async throws {
-            SourcePrewarmStore.shared.clear()
+            let cache = freshCache()
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))
             defer { server.stop() }
-            try await warm(server, bytes: warmBytes)
+            await warm(server, bytes: warmBytes, into: cache)
             let warmRequests = server.rangeRequestCount
-            #expect(SourcePrewarmStore.shared.isWarm(for: url(server)))
+            #expect(cache.heldLength(SourceCacheKey(url: url(server), headers: [:]), at: 0, expectedSize: nil) > 0)
 
-            let reader = AVIOReader(url: url(server))
+            let reader = AVIOReader(url: url(server), sourceCache: cache)
             defer { reader.markClosed(); reader.close() }
             try reader.open()
             try await waitFor {
@@ -175,11 +182,11 @@ extension PrewarmStoreSuites {
         /// A source nobody warmed keeps the cold path exactly as it was, byte for byte.
         @Test("an unwarmed source still opens from byte zero")
         func coldOpenIsUnchanged() async throws {
-            SourcePrewarmStore.shared.clear()
+            let cache = freshCache()
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))
             defer { server.stop() }
 
-            let reader = AVIOReader(url: url(server))
+            let reader = AVIOReader(url: url(server), sourceCache: cache)
             defer { reader.markClosed(); reader.close() }
             try reader.open()
 
@@ -187,27 +194,28 @@ extension PrewarmStoreSuites {
                     "the cold open did not fetch from byte zero: \(server.requestedRanges)")
         }
 
-        /// Adoption is a take: a second session on the same URL opens cold rather than finding bytes
-        /// the first one is already holding in its own reader.
-        @Test("a second open on the same URL is cold again")
-        func adoptionIsOnce() async throws {
-            SourcePrewarmStore.shared.clear()
+        /// A warm is shared, not taken: a second session on the same URL is served the same bytes, out
+        /// of the same cache, instead of fetching the head again.
+        @Test("a second open on the same URL is warm too")
+        func warmIsShared() async throws {
+            let cache = freshCache()
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))
             defer { server.stop() }
-            try await warm(server, bytes: warmBytes)
+            await warm(server, bytes: warmBytes, into: cache)
 
-            let first = AVIOReader(url: url(server))
+            let first = AVIOReader(url: url(server), sourceCache: cache)
             try first.open()
             first.markClosed(); first.close()
             let afterFirst = server.rangeRequestCount
 
-            let second = AVIOReader(url: url(server))
+            let second = AVIOReader(url: url(server), sourceCache: cache)
             defer { second.markClosed(); second.close() }
             try second.open()
 
+            #expect(read(second, 64 * 1024) == 64 * 1024)
             let opened = Array(server.requestedRanges.dropFirst(afterFirst))
-            #expect(opened.contains(where: { $0.start == 0 }),
-                    "the second open adopted bytes the first one had already taken: \(opened)")
+            #expect(!opened.contains(where: { $0.start == 0 }),
+                    "the second open fetched the head again: \(opened)")
         }
 
         /// The URL is only half the request. An origin that varies on Referer or Authorization answers
@@ -215,15 +223,15 @@ extension PrewarmStoreSuites {
         /// whose headers differ from the warm's opens cold rather than adopting someone else's response.
         @Test("a warm fetched with different headers is not adopted")
         func headerMismatchOpensCold() async throws {
-            SourcePrewarmStore.shared.clear()
+            let cache = freshCache()
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))
             defer { server.stop() }
             _ = await SourcePrewarmFetcher.warm(url: url(server),
                                                 extraHeaders: ["Referer": "http://portal.example/"],
-                                                byteBudget: warmBytes, into: .shared)
+                                                byteBudget: warmBytes, into: cache)
             let warmRequests = server.rangeRequestCount
 
-            let reader = AVIOReader(url: url(server))   // no headers: a different request
+            let reader = AVIOReader(url: url(server), sourceCache: cache)   // no headers: a different request
             defer { reader.markClosed(); reader.close() }
             try reader.open()
             try await waitForRequest(server, startingAt: 0)
@@ -237,19 +245,21 @@ extension PrewarmStoreSuites {
         /// write-once rule treats any positive `fileSize` as settled, so a warm that belongs to a
         /// different response would fix a wrong EOF point for the whole session. The connection that is
         /// actually serving the session gets to overrule it.
-        @Test("a connection that states a different size drops the warm", .timeLimit(.minutes(1)))
+        @Test("a connection that states a different size overrules the warm", .timeLimit(.minutes(1)))
         func sizeMismatchDropsTheWarm() async throws {
-            SourcePrewarmStore.shared.clear()
+            let cache = freshCache()
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))
             defer { server.stop() }
-            try await warm(server, bytes: warmBytes)
+            await warm(server, bytes: warmBytes, into: cache)
             // The source is not what it was when it was warmed.
             let restated: Int64 = 32 * 1024 * 1024
             server.setTotalSize(restated)
 
-            let reader = AVIOReader(url: url(server))
+            let reader = AVIOReader(url: url(server), sourceCache: cache)
             defer { reader.markClosed(); reader.close() }
             try reader.open()
+            // Past the warm head, so a connection to the origin states the size it serves now.
+            #expect(read(reader, warmBytes + 64 * 1024) > 0)
             try await waitFor { reader.resolvedByteSize == restated }
 
             #expect(reader.resolvedByteSize == restated,

@@ -11,31 +11,17 @@ struct SourceFailureDiagnosticsTests {
         func snapshot() -> [SourceNetworkDiagnostics.Event] { lock.withLock { values } }
     }
 
-    /// Feed the real task delegate a response before failing the transport. URLProtocol buffers
-    /// its response until completion, so its ordinary client API cannot model a mid-body failure.
-    private final class FailedPartialResponse: URLProtocol, @unchecked Sendable {
-        override class func canInit(with request: URLRequest) -> Bool { true }
-        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-        override func startLoading() {
-            guard let task = task as? URLSessionDataTask,
-                  let delegate = task.delegate as? URLSessionDataDelegate else {
-                client?.urlProtocol(self, didFailWithError: URLError(.unknown))
-                return
-            }
-            let response = HTTPURLResponse(url: request.url!, statusCode: 206, httpVersion: "HTTP/1.1",
-                headerFields: ["Content-Range": "bytes 0-4095/*", "Content-Length": "4096"])!
-            delegate.urlSession?(.shared, dataTask: task, didReceive: response) { _ in
-                self.client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
-            }
-        }
-        override func stopLoading() {}
-    }
-
     @Test("An abandoned ranged failure does not override a streaming replacement",
           .timeLimit(.minutes(1)), arguments: [200, 403])
     func retiredConnectionDoesNotFailStreamingReplacement(status: Int) async throws {
         let body = Data(repeating: 0x47, count: 8192)
+        // The persistent read's bounded open answers 206 with its head and drops before any body
+        // byte arrives; every other ranged request is answered as by an origin that ignores Range.
         let server = try #require(ScriptedOriginServer { request in
+            if request.range == "bytes=0-4095" {
+                return .init(status: 206, declaredLength: 4096, contentRange: "bytes 0-4095/*", close: true,
+                             contentType: "application/octet-stream")
+            }
             if request.range != nil || request.method == "HEAD" {
                 return .init(status: 200, declaredLength: nil, close: true)
             }
@@ -51,11 +37,7 @@ struct SourceFailureDiagnosticsTests {
             events.add(event)
         }
         defer { SourceNetworkDiagnostics.handler = previous }
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [FailedPartialResponse.self]
-        let session = URLSession(configuration: configuration, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
-        defer { session.invalidateAndCancel() }
-        let reader = AVIOReader(url: url, boundedInitialFetch: 4096, persistentRequestSession: session)
+        let reader = AVIOReader(url: url, boundedInitialFetch: 4096)
         let result = try await withTaskCancellationHandler {
             try await ProbeTestJob {
                 defer { reader.markClosed(); reader.close() }
@@ -77,9 +59,11 @@ struct SourceFailureDiagnosticsTests {
         } else {
             #expect(throws: AVIOReaderError.httpStatus(status)) { try result.get() }
         }
-        #expect(events.snapshot().contains {
-            $0.role == .persistentRead && $0.phase == .completed && $0.urlErrorCode == NSURLErrorNetworkConnectionLost
-        })
+        try await waitFor {
+            events.snapshot().contains {
+                $0.role == .persistentRead && $0.phase == .completed && $0.urlErrorCode == NSURLErrorNetworkConnectionLost
+            }
+        }
         #expect(events.snapshot().contains {
             $0.role == .persistentRead && $0.phase == .response && $0.status == 206
         })
@@ -522,47 +506,23 @@ struct SourceFailureDiagnosticsTests {
             #expect(engine.errorInfo?.underlyingCode == NSURLErrorCannotConnectToHost)
         }
     }
-    /// In-process ranged source: exercise the reader and real URLSession delegates without a server.
-    private final class RangedSource: URLProtocol, @unchecked Sendable {
-        override class func canInit(with request: URLRequest) -> Bool { true }
-        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-        override func startLoading() {
-            let range = (request.value(forHTTPHeaderField: "Range") ?? "bytes=0-")
-                .dropFirst(6).split(separator: "-", omittingEmptySubsequences: false)
-            let start = Int(range.first ?? "0") ?? 0
-            let end = min(16_383, range.count > 1 ? (Int(range[1]) ?? 16_383) : 16_383)
-            guard start <= end else {
-                client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
-                return
-            }
-            let response = HTTPURLResponse(url: request.url!, statusCode: 206, httpVersion: "HTTP/1.1",
-                headerFields: ["Content-Range": "bytes \(start)-\(end)/16384", "Content-Length": "\(end - start + 1)"])!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: Data((start...end).map { UInt8($0 % 251) }))
-            client?.urlProtocolDidFinishLoading(self)
-        }
-        override func stopLoading() {}
-    }
-
     @Test("AVIO reconnects keep the reader owner across real thread boundaries, including nil",
           .timeLimit(.minutes(1)), arguments: [true, false])
     func avioReconnectRetainsCapturedContext(attributed: Bool) async throws {
         let owner = SourceNetworkDiagnostics.Context(playbackID: UUID(), attemptID: UUID())
         let replacement = SourceNetworkDiagnostics.Context(playbackID: UUID(), attemptID: UUID())
-        let url = URL(string: "https://\(UUID().uuidString).invalid/video.bin")!
+        let origin = try #require(KeepAliveRangeOrigin(data: Data((0..<16_384).map { UInt8($0 % 251) })))
+        defer { origin.stop() }
+        let url = URL(string: "http://127.0.0.1:\(origin.port)/\(UUID().uuidString).bin")!
         let events = CorrelationEvents()
         let previous = SourceNetworkDiagnostics.handler
         SourceNetworkDiagnostics.handler = { if $0.originalURL == url { events.add($0) } }
         defer { SourceNetworkDiagnostics.handler = previous }
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [RangedSource.self]
-        let session = URLSession(configuration: config)
-        defer { session.invalidateAndCancel() }
         // One request suppresses speculative tail prefetch; only the playback connection is exercised.
         OriginRequestBudget.shared.setHostLimit(1, for: url)
         defer { OriginRequestBudget.shared.setHostLimit(nil, for: url) }
         let reader = SourceNetworkDiagnostics.$context.withValue(attributed ? owner : nil) {
-            AVIOReader(url: url, boundedInitialFetch: 4096, persistentRequestSession: session)
+            AVIOReader(url: url, boundedInitialFetch: 4096)
         }
         let result = try await withTaskCancellationHandler {
             try await SourceNetworkDiagnostics.$context.withValue(replacement) {
@@ -578,7 +538,7 @@ struct SourceFailureDiagnosticsTests {
                     #expect(bytes == (8192..<8208).map { UInt8($0 % 251) })
                 }.outcome()
             }
-        } onCancel: { reader.markClosed(); session.invalidateAndCancel() }
+        } onCancel: { reader.markClosed(); origin.stop() }
         try result.get()
         try await waitFor { events.snapshot().filter { $0.phase == .completed }.count >= 2 }
         let captured = events.snapshot()

@@ -287,17 +287,14 @@ extension AetherEngine {
     /// The profile's AVIO tuning is not read on this path at all: a controlled probe always opens
     /// through a reader, whose own transport settings live in `ProbeHTTPReader`.
     ///
-    /// The recordless Dolby Vision audit stays off, and that is a real gap rather than a tuning choice:
-    /// it opens the source a SECOND time by URL (`DolbyVisionRecordAudit.rpuProfileOfSource`), traffic
-    /// this probe's budget and cancellation do not reach, and `open(reader:)` clears `auditSource`
-    /// regardless. A controlled probe of an untagged 10-bit HEVC source therefore reports no Dolby
-    /// Vision record where an uncontrolled one does (AE#567).
+    /// The recordless Dolby Vision audit runs as on every open: it peeks at the probe's own first packets
+    /// (`DolbyVisionRecordAudit.addRecordIfProfile5`), so its reads are inside this probe's budget and
+    /// cancellation, and a controlled probe reports the record an uncontrolled one does (AE#567).
     private nonisolated static func probeOpenProfile(limits: ProbeLimits?) -> DemuxerOpenProfile {
         guard let limits else { return .playback }
         var profile = DemuxerOpenProfile.playback
         // FFmpeg has a minimum probe size. The input seam still enforces smaller caller limits.
         profile.probesize = max(32, min(profile.probesize, limits.maxInputBytes))
-        profile.auditsRecordlessDolbyVision = false
         profile.readerLabel = "probe"
         return profile
     }

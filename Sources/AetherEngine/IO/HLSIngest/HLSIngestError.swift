@@ -118,6 +118,7 @@ public enum HLSIngestError: Error, Equatable, CustomStringConvertible, Localized
             case "TARGETDURATION out of range": return .invalidTargetDuration
             case "EXTINF out of range", "segment duration must be positive": return .invalidSegmentDuration
             case "non-UTF8 playlist", "playlist is not bounded UTF-8", "rendition payload is not UTF-8": return .invalidPlaylistEncoding
+            case "segment resume answered another range": return .invalidResponse
             default:
                 if reason.hasPrefix("playlist line exceeds ") { return .playlistLineLimitExceeded }
                 if reason.hasPrefix("playlist exceeds ") { return .playlistSizeLimitExceeded }

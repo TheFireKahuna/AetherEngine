@@ -195,45 +195,16 @@ extension AetherEngine {
             return AtmosDetectionOutcome(stopReason: .notEAC3, packetsRead: 0, bytesRead: 0, decodedProfile: nil)
         }
 
-        guard let codec = avcodec_find_decoder(AV_CODEC_ID_EAC3),
-              let ctx = avcodec_alloc_context3(codec) else {
-            return AtmosDetectionOutcome(stopReason: .decoderOpenFailed, packetsRead: 0, bytesRead: 0, decodedProfile: nil)
-        }
-        var mutableCtx: UnsafeMutablePointer<AVCodecContext>? = ctx
-        defer { avcodec_free_context(&mutableCtx) }
-
-        guard avcodec_parameters_to_context(ctx, codecpar) >= 0,
-              avcodec_open2(ctx, codec, nil) >= 0 else {
-            return AtmosDetectionOutcome(stopReason: .decoderOpenFailed, packetsRead: 0, bytesRead: 0, decodedProfile: nil)
-        }
-
-        var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
-        defer { av_frame_free(&frame) }
-        guard let f = frame else {
+        guard let decoder = AtmosJOCDecoder(codecpar: codecpar, maxPackets: options.maxPackets,
+                                            maxBytes: options.maxBytes) else {
             return AtmosDetectionOutcome(stopReason: .decoderOpenFailed, packetsRead: 0, bytesRead: 0, decodedProfile: nil)
         }
 
         let start = DispatchTime.now()
-        var packetsRead = 0
-        var bytesRead: Int64 = 0
         // Demuxed-but-discarded packets still cost wall clock and I/O, so they need their own fuse --
         // but they must NOT consume the decode budget (see below).
         var packetsSeen = 0
-        var framesDecoded = 0
-        var lastProfile: Int32?
         let fuse = Self.atmosForeignPacketFuse(maxPackets: options.maxPackets)
-
-        // A cap or EOF after a real decode is still a real observation, so it reports .frameDecoded with
-        // what the scan saw rather than discarding it as "gave up".
-        func stopped(_ reason: AtmosDetectionOutcome.StopReason) -> AtmosDetectionOutcome {
-            guard framesDecoded == 0 else {
-                return AtmosDetectionOutcome(
-                    stopReason: .frameDecoded, packetsRead: packetsRead, bytesRead: bytesRead,
-                    decodedProfile: lastProfile)
-            }
-            return AtmosDetectionOutcome(
-                stopReason: reason, packetsRead: packetsRead, bytesRead: bytesRead, decodedProfile: nil)
-        }
 
         // Tell the demuxer to drop every other stream. Without this the caps are a budget over the whole
         // INTERLEAVED container rather than over the audio we care about: on the exact content this
@@ -247,71 +218,109 @@ extension AetherEngine {
         while true {
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
             if let cap = Self.atmosDecodeCapReached(
-                packetsRead: packetsRead, bytesRead: bytesRead,
+                packetsRead: decoder.packetsRead, bytesRead: decoder.bytesRead,
                 elapsed: elapsed, options: options
             ) {
-                return stopped(cap)
+                return decoder.outcome(stoppedBy: cap)
             }
 
             let packet: UnsafeMutablePointer<AVPacket>?
             do {
                 packet = try demuxer.readPacket()
             } catch {
-                return stopped(demuxer.inputByteBudgetExhausted ? .byteCap : .demuxError)
+                return decoder.outcome(stoppedBy: demuxer.inputByteBudgetExhausted ? .byteCap : .demuxError)
             }
             guard let pkt = packet else {
-                return stopped(demuxer.inputByteBudgetExhausted ? .byteCap : .demuxEOF)
+                return decoder.outcome(stoppedBy: demuxer.inputByteBudgetExhausted ? .byteCap : .demuxEOF)
             }
-            let afterRead = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
-            if afterRead >= options.timeBudget {
+            defer {
                 av_packet_unref(pkt)
                 av_packet_free_safe(pkt)
-                return stopped(.timeCap)
             }
+            let afterRead = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
+            if afterRead >= options.timeBudget { return decoder.outcome(stoppedBy: .timeCap) }
 
-            var confirmed = false
             packetsSeen += 1
-            if pkt.pointee.stream_index == targetIndex {
-                guard Int64(pkt.pointee.size) <= options.maxBytes - bytesRead else {
-                    av_packet_unref(pkt)
-                    av_packet_free_safe(pkt)
-                    return stopped(.byteCap)
-                }
-                // Charge the decode budget only for packets actually offered to the decoder, so a coarse
-                // interleave or a large leading video run can never starve the probe of audio.
-                packetsRead += 1
-                bytesRead += Int64(pkt.pointee.size)
-                if avcodec_send_packet(ctx, pkt) >= 0 {
-                    // Drain every frame this packet produced: the profile is per frame, so the JOC one can
-                    // sit behind a plain frame the same send emitted.
-                    while avcodec_receive_frame(ctx, f) >= 0 {
-                        framesDecoded += 1
-                        lastProfile = ctx.pointee.profile
-                        if lastProfile == AtmosDetectionOutcome.eac3JOCProfile {
-                            confirmed = true
-                            break
-                        }
-                    }
-                }
+            if pkt.pointee.stream_index == targetIndex, let outcome = decoder.feed(pkt) {
+                return outcome
             }
-            av_packet_unref(pkt)
-            av_packet_free_safe(pkt)
-
-            if confirmed {
-                // A decoded JOC frame is evidence the pass already paid for. The wall-clock budget bounds
-                // what this pass SPENDS, so an overrun retires the pass, it does not retract its answer:
-                // a caller cannot tell a withheld confirmation apart from a source that carries no Atmos.
-                return AtmosDetectionOutcome(
-                    stopReason: .frameDecoded, packetsRead: packetsRead, bytesRead: bytesRead,
-                    decodedProfile: lastProfile
-                )
-            }
-
             // Independent fuse: AVDISCARD_ALL is honoured by most demuxers but is advisory, so a container
             // that keeps handing back foreign packets still terminates.
-            if packetsSeen >= fuse {
-                return stopped(.packetCap)
+            if packetsSeen >= fuse { return decoder.outcome(stoppedBy: .packetCap) }
+        }
+    }
+}
+
+/// One E-AC-3 decoder that reads the JOC profile off the frames its packets decode to, a packet at a time,
+/// within a packet and a byte budget: the bounded scan `AetherEngine.detectAtmos` drives off a demuxer of its
+/// own, and the session's confirmation feeds from the packets its own reader reads (`Demuxer.observe`).
+///
+/// The scan does not stop at the first decoded frame: `libavcodec/ac3dec.c` assigns the profile per frame,
+/// and a frame whose packet did not carry the dependent substream resets it to unknown. A cap reached after
+/// a frame decoded is still an observation and reports `.frameDecoded` with the last profile seen.
+final class AtmosJOCDecoder {
+    private var context: UnsafeMutablePointer<AVCodecContext>?
+    private var frame: UnsafeMutablePointer<AVFrame>?
+    private let maxPackets: Int
+    private let maxBytes: Int64
+    private(set) var packetsRead = 0
+    private(set) var bytesRead: Int64 = 0
+    private var framesDecoded = 0
+    private var lastProfile: Int32?
+
+    /// nil when no E-AC-3 decoder can be opened on `codecpar`.
+    init?(codecpar: UnsafePointer<AVCodecParameters>, maxPackets: Int, maxBytes: Int64) {
+        guard let codec = avcodec_find_decoder(AV_CODEC_ID_EAC3),
+              let ctx = avcodec_alloc_context3(codec) else { return nil }
+        context = ctx
+        guard avcodec_parameters_to_context(ctx, codecpar) >= 0, avcodec_open2(ctx, codec, nil) >= 0,
+              let made = av_frame_alloc() else {
+            avcodec_free_context(&context)
+            return nil
+        }
+        frame = made
+        self.maxPackets = maxPackets
+        self.maxBytes = maxBytes
+    }
+
+    deinit {
+        av_frame_free(&frame)
+        avcodec_free_context(&context)
+    }
+
+    /// One packet of the stream. The outcome once the scan is over (a JOC frame, or a budget spent); nil while
+    /// it goes on.
+    func feed(_ packet: UnsafeMutablePointer<AVPacket>) -> AtmosDetectionOutcome? {
+        guard let ctx = context, let f = frame else { return outcome(stoppedBy: .decoderOpenFailed) }
+        guard Int64(packet.pointee.size) <= maxBytes - bytesRead else { return outcome(stoppedBy: .byteCap) }
+        // Charged only for packets offered to the decoder, so a coarse interleave or a large leading video
+        // run can never starve the scan of audio.
+        packetsRead += 1
+        bytesRead += Int64(packet.pointee.size)
+        if avcodec_send_packet(ctx, packet) >= 0 {
+            // Every frame this packet produced: the JOC one can sit behind a plain frame the same send emitted.
+            while avcodec_receive_frame(ctx, f) >= 0 {
+                framesDecoded += 1
+                lastProfile = ctx.pointee.profile
+                if lastProfile == AtmosDetectionOutcome.eac3JOCProfile {
+                    // A decoded JOC frame is evidence the scan already paid for; no budget retracts it.
+                    return AtmosDetectionOutcome(stopReason: .frameDecoded, packetsRead: packetsRead,
+                                                 bytesRead: bytesRead, decodedProfile: lastProfile)
+                }
             }
         }
+        if packetsRead >= maxPackets { return outcome(stoppedBy: .packetCap) }
+        if bytesRead >= maxBytes { return outcome(stoppedBy: .byteCap) }
+        return nil
+    }
+
+    /// The scan stopped for `reason`: a decoded frame is still what it saw.
+    func outcome(stoppedBy reason: AtmosDetectionOutcome.StopReason) -> AtmosDetectionOutcome {
+        guard framesDecoded == 0 else {
+            return AtmosDetectionOutcome(stopReason: .frameDecoded, packetsRead: packetsRead, bytesRead: bytesRead,
+                                         decodedProfile: lastProfile)
+        }
+        return AtmosDetectionOutcome(stopReason: reason, packetsRead: packetsRead, bytesRead: bytesRead,
+                                     decodedProfile: nil)
     }
 }

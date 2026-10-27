@@ -57,7 +57,9 @@ struct Issue220BoundedRangeTests {
         // than by being the first bounded request to arrive.
         let bounded = try #require(ranges.first(where: { $0.start == 0 && $0.end != nil }),
                                    "the data connection was open-ended: \(ranges)")
-        #expect(bounded.end! - bounded.start + 1 == AVIOReader.persistentRangeBytes)
+        // An empty window asks for the room under the high water, so the range ends on its own there.
+        #expect(bounded.end! - bounded.start + 1
+                == AVIOReader.rangeAskBytes(highWater: AVIOReader.winHighWaterDefault, ahead: 0))
     }
 
     /// A range that has been delivered IN FULL clears `activeTask` exactly as a dropped one does,

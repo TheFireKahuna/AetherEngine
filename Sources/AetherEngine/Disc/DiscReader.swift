@@ -248,6 +248,11 @@ enum DiscReader {
         }
     }
 
+    /// `BlockingWork.readLanes` at once (`BlockingWork.lanes`) at user-initiated priority, as the first
+    /// frame waits on them. `read(i)` gives file i's bytes and is called from those lanes, several at once;
+    /// it opens the file through `scope` (`DiscRecognitionScope.withFile`), so a stop cancels the files
+    /// being read and the lanes take no more. The results come back in the order asked, empty for a file
+    /// left unread.
     /// Read all bytes of an extent list into memory (small files only: mpls).
     static func readAll(_ base: IOReader, _ exts: [(offset: Int64, length: Int64)]) -> [UInt8] {
         // Extent lengths are untrusted on-disc bytes (up to ~1 GB each). Cap the total before

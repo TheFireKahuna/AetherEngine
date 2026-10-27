@@ -5,9 +5,11 @@ import Foundation
 /// representation file and reads its initialization segment and segment index, which is all the
 /// layout needs: no media byte is fetched before the demuxer asks for one.
 ///
-/// Every request carries the session's headers. `cancel()` is safe from any thread and reaches the
-/// manifest fetch and every reader opened so far, which is what lets a teardown that races the open
-/// end it instead of waiting out the request timeouts (audit DMX-102's rule for the disc path).
+/// Every request goes out on the engine's one session (`EngineHTTP.session`) with the session's
+/// headers, through `BoundedFetch`, so a body is cut off at its bound while it arrives and a request
+/// ends at its resource deadline. `cancel()` is safe from any thread and reaches every request in
+/// flight and every reader opened so far, which is what lets a teardown that races the open end it
+/// instead of waiting out the request timeouts (audit DMX-102's rule for the disc path).
 final class DASHSourceOpener: @unchecked Sendable {
 
     /// A manifest is text; an on-demand one is a few kilobytes. The bound only stops a misrouted
@@ -15,51 +17,31 @@ final class DASHSourceOpener: @unchecked Sendable {
     static let manifestByteLimit = 8 * 1024 * 1024
     /// Init and index further apart than this are read with two requests instead of one.
     static let contiguousHeadSlack: Int64 = 256 * 1024
+    /// A whole request's ceiling. A manifest or a representation's head is small, so a minute only
+    /// ends an origin that trickles.
+    static let resourceTimeoutSeconds: TimeInterval = 60
 
     private let manifestURL: URL
     private let headers: [String: String]
     private let requestTimeout: TimeInterval
-    private let session: URLSession
+    private let requests = EngineHTTPRequests()
 
     private let lock = NSLock()
     private var cancelled = false
     private var openedReaders: [IOReader] = []
 
-    /// Manifest URLs this process has opened as DASH, most recent last. A DASH session's readers
-    /// take their headers at open, like a disc image's, so `updateRequestHeaders` must not promise
-    /// them to live requests; an extensionless manifest is only known to be one after its body was read.
-    private static let knownManifestsLock = NSLock()
-    nonisolated(unsafe) private static var knownManifests: [URL] = []
-
-    static func isKnownManifest(_ url: URL) -> Bool {
-        knownManifestsLock.withLock { knownManifests.contains(url) }
-    }
-
-    private static func noteManifest(_ url: URL) {
-        knownManifestsLock.withLock {
-            knownManifests.removeAll { $0 == url }
-            knownManifests.append(url)
-            if knownManifests.count > 32 { knownManifests.removeFirst() }
-        }
-    }
-
     init(manifestURL: URL, headers: [String: String], requestTimeout: TimeInterval = 30) {
         self.manifestURL = manifestURL
         self.headers = headers
         self.requestTimeout = requestTimeout
-        let config = URLSessionConfiguration.ephemeral
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        session = URLSession(configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
     }
-
-    deinit { session.invalidateAndCancel() }
 
     func cancel() {
         lock.lock()
         cancelled = true
         let readers = openedReaders
         lock.unlock()
-        session.getAllTasks { $0.forEach { $0.cancel() } }
+        requests.cancelAll()
         readers.forEach { $0.cancel() }
     }
 
@@ -71,11 +53,10 @@ final class DASHSourceOpener: @unchecked Sendable {
         let selected = try manifest.selectRepresentations()
         if isCancelled { throw DASHSourceError.cancelled }
 
-        let slots = Slots(count: selected.count)
-        DispatchQueue.concurrentPerform(iterations: selected.count) { i in
-            slots.set(i, Result { try openRepresentation(selected[i]) })
+        // Each representation waits on its head's round trip, so they open side by side.
+        let results = BlockingWork.lanes(count: selected.count, isStopped: { [weak self] in self?.isCancelled ?? true }) {
+            _, i in Result { try self.openRepresentation(selected[i]) }
         }
-        let results = slots.values
         var readers: [IOReader] = []
         var sources: [DASHVirtualLayout.Source] = []
         var failure: Error?
@@ -113,87 +94,123 @@ final class DASHSourceOpener: @unchecked Sendable {
             + "fragmented MP4: \(layout.pieces.count) subsegments, \(layout.totalSize) bytes, "
             + "header \(layout.header.count) bytes; " + tracks.joined(separator: "; "),
             category: .demux)
-        Self.noteManifest(manifestURL)
         return DASHVirtualMP4Reader(layout: layout, sources: readers)
     }
 
     // MARK: - Private
 
-    private final class Slots: @unchecked Sendable {
+    private final class Outcome<T: Sendable>: @unchecked Sendable {
         private let lock = NSLock()
-        private var storage: [Result<(IOReader, DASHVirtualLayout.Source), Error>?]
-        init(count: Int) { storage = Array(repeating: nil, count: count) }
-        func set(_ i: Int, _ value: Result<(IOReader, DASHVirtualLayout.Source), Error>) {
-            lock.withLock { storage[i] = value }
-        }
-        var values: [Result<(IOReader, DASHVirtualLayout.Source), Error>?] { lock.withLock { storage } }
+        private var value: Result<T, Error> = .failure(DASHSourceError.cancelled)
+        func set(_ result: Result<T, Error>) { lock.withLock { value = result } }
+        func get() throws -> T { try lock.withLock { value }.get() }
     }
 
-    /// One GET on the opener's own session, so `cancel()` reaches it.
-    private func fetch(_ url: URL, range: ClosedRange<Int64>? = nil) throws -> (Data, HTTPURLResponse) {
+    /// Runs one fetch and waits for it. The open runs on a blocking thread (the demuxer's open, or one
+    /// of the lanes above); the fetch itself waits on nothing but the session's callbacks.
+    private func run<T: Sendable>(_ fetch: @escaping @Sendable () async throws -> T) throws -> T {
+        if isCancelled { throw DASHSourceError.cancelled }
+        let outcome = Outcome<T>()
+        let done = DispatchSemaphore(value: 0)
+        BlockingWork.detached {
+            do { outcome.set(.success(try await fetch())) } catch { outcome.set(.failure(error)) }
+            done.signal()
+        }
+        done.wait()
+        if isCancelled { throw DASHSourceError.cancelled }
+        return try outcome.get()
+    }
+
+    private func request(_ url: URL, range: ClosedRange<Int64>? = nil) -> URLRequest {
         var request = URLRequest(url: url, timeoutInterval: requestTimeout)
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
         if let range { request.setValue("bytes=\(range.lowerBound)-\(range.upperBound)", forHTTPHeaderField: "Range") }
-        let done = DispatchSemaphore(value: 0)
-        nonisolated(unsafe) var outcome: (Data?, URLResponse?, Error?) = (nil, nil, nil)
-        let task = session.dataTask(with: request) { data, response, error in
-            outcome = (data, response, error)
-            done.signal()
-        }
-        if isCancelled { throw DASHSourceError.cancelled }
-        task.resume()
-        done.wait()
-        if isCancelled { throw DASHSourceError.cancelled }
-        let (data, response, error) = outcome
-        if let error {
-            let ns = error as NSError
-            throw DASHSourceError.representationUnreachable("\(ns.domain) \(ns.code)")
+        return request
+    }
+
+    private static func unreachable(_ error: Error) -> DASHSourceError {
+        let ns = error as NSError
+        return .representationUnreachable("\(ns.domain) \(ns.code)")
+    }
+
+    private func fetchManifest() throws -> (Data, URL) {
+        let request = request(manifestURL)
+        let requests = requests
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try run {
+                try await BoundedFetch.data(for: request, session: EngineHTTP.session, limit: Self.manifestByteLimit,
+                                            resourceTimeout: Self.resourceTimeoutSeconds, owner: requests)
+            }
+        } catch is BoundedFetch.Exceeded {
+            throw DASHSourceError.manifestTooLarge(Self.manifestByteLimit)
+        } catch let error as DASHSourceError {
+            throw error
+        } catch {
+            throw Self.unreachable(error)
         }
         guard let http = response as? HTTPURLResponse else {
             throw DASHSourceError.representationUnreachable("no HTTP response")
         }
         guard (200..<300).contains(http.statusCode) else { throw AVIOReaderError.httpStatus(http.statusCode) }
-        return (data ?? Data(), http)
-    }
-
-    private func fetchManifest() throws -> (Data, URL) {
-        let (data, response) = try fetch(manifestURL)
-        guard data.count <= Self.manifestByteLimit else {
-            throw DASHSourceError.manifestTooLarge(Self.manifestByteLimit)
-        }
         guard DASHManifest.bodyBeginsWithManifest([UInt8](data.prefix(4096))) else {
             throw DASHSourceError.notAManifest
         }
         // Relative BaseURLs resolve against where the manifest was finally served from.
-        return (data, response.url ?? manifestURL)
+        return (data, http.url ?? manifestURL)
     }
 
     /// The bytes of `range` and the file's total size, from a 206 that starts where it was asked to.
     /// The head requests double as the range probe: a file whose origin answers them with a 200
-    /// cannot be addressed by SegmentBase at all.
+    /// cannot be addressed by SegmentBase at all. Only the asked bytes are read; an origin that sends
+    /// more has its transfer ended there.
     private func fetchRange(_ rep: DASHManifest.Representation, _ range: ClosedRange<Int64>) throws -> ([UInt8], Int64) {
         let count = range.upperBound - range.lowerBound + 1
         guard count > 0, count <= 64 * 1024 * 1024 else {
             throw DASHSourceError.malformedIndex("representation \(rep.id) declares a \(count) byte head")
         }
+        let ignoresRange = DASHSourceError.representationUnreachable(
+            "representation \(rep.id): the origin ignores Range requests, which SegmentBase addressing needs")
+        let request = request(rep.url, range: range)
+        let requests = requests
         var attempt = 0
         while true {
             do {
-                let (data, response) = try fetch(rep.url, range: range)
-                guard response.statusCode == 206 else {
-                    throw DASHSourceError.representationUnreachable(
-                        "representation \(rep.id): the origin ignores Range requests, which SegmentBase addressing needs")
+                let (bytes, response): ([UInt8], HTTPURLResponse) = try run {
+                    let body = try await BoundedFetch.stream(
+                        for: request, session: EngineHTTP.session, limit: Int(count),
+                        resourceTimeout: Self.resourceTimeoutSeconds, owner: requests)
+                    guard let http = body.response as? HTTPURLResponse else {
+                        throw DASHSourceError.representationUnreachable("no HTTP response")
+                    }
+                    guard (200..<300).contains(http.statusCode) else { throw AVIOReaderError.httpStatus(http.statusCode) }
+                    guard http.statusCode == 206 else { throw ignoresRange }
+                    var bytes: [UInt8] = []
+                    bytes.reserveCapacity(Int(count))
+                    for try await chunk in body.chunks {
+                        bytes.append(contentsOf: chunk.prefix(Int(count) - bytes.count))
+                        if bytes.count >= Int(count) { break }
+                    }
+                    return (bytes, http)
                 }
                 let contentRange = response.value(forHTTPHeaderField: "Content-Range") ?? ""
                 guard contentRange.hasPrefix("bytes \(range.lowerBound)-"),
                       let total = HTTPDiscIOReader.parseContentRangeTotal(contentRange), total > range.upperBound,
-                      Int64(data.count) >= count else {
+                      Int64(bytes.count) >= count else {
                     throw DASHSourceError.representationUnreachable(
-                        "representation \(rep.id) answered \(data.count) bytes (\(contentRange)) for bytes \(range.lowerBound)-\(range.upperBound)")
+                        "representation \(rep.id) answered \(bytes.count) bytes (\(contentRange)) for bytes \(range.lowerBound)-\(range.upperBound)")
                 }
-                return ([UInt8](data.prefix(Int(count))), total)
-            } catch let error as DASHSourceError where attempt == 0 && error != .cancelled
-                        && !error.description.contains("ignores Range") {
+                return (bytes, total)
+            } catch is BoundedFetch.Exceeded {
+                // A declared body longer than the range asked for: the origin is sending the whole file.
+                throw ignoresRange
+            } catch let error as DASHSourceError {
+                guard attempt == 0, error != .cancelled, error != ignoresRange else { throw error }
+                attempt += 1
+            } catch let error as AVIOReaderError {
+                throw error
+            } catch {
+                guard attempt == 0, !isCancelled else { throw Self.unreachable(error) }
                 attempt += 1
             }
         }

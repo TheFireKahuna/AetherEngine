@@ -294,13 +294,29 @@ struct DolbyVisionRecordAuditTests {
         #expect(r.convertP7ToProfile81 == false)
     }
 
-    @Test("the RPU walk ends on foreign packets and bytes, not only on video packets")
-    func walkIsBoundedByEveryPacket() {
-        #expect(!DolbyVisionRecordAudit.walkExhausted(packetsRead: 63, bytesRead: 0, packetBudget: 4))
-        #expect(DolbyVisionRecordAudit.walkExhausted(packetsRead: 64, bytesRead: 0, packetBudget: 4))
-        #expect(DolbyVisionRecordAudit.walkExhausted(
-            packetsRead: 1, bytesRead: DolbyVisionRecordAudit.walkByteBudget, packetBudget: 4))
-        #expect(!DolbyVisionRecordAudit.walkExhausted(packetsRead: 1, bytesRead: 0, packetBudget: Int.max))
+    @Test("the RPU read holds every packet it looked at for the next reader, in order")
+    func peekLeavesThePacketsInPlace() throws {
+        let data = try TailHeavyMatroska.make(foreignBytes: 64 * 1024, junkTail: false)
+        try ProbeTestFixtures.withFile(data) { url in
+            func firstPackets(_ demuxer: Demuxer, _ count: Int) throws -> [Data] {
+                var out: [Data] = []
+                while out.count < count, let packet = try demuxer.readPacket() {
+                    var owned: UnsafeMutablePointer<AVPacket>? = packet
+                    defer { av_packet_free(&owned) }
+                    out.append(Data(bytes: packet.pointee.data, count: Int(packet.pointee.size)))
+                }
+                return out
+            }
+            let fresh = Demuxer()
+            defer { fresh.close() }
+            try fresh.open(url: url)
+            let expected = try firstPackets(fresh, 6)
+            let audited = Demuxer()
+            defer { audited.close() }
+            try audited.open(url: url)
+            #expect(DolbyVisionRecordAudit.rpuProfile(peeking: audited, streamIndex: audited.videoStreamIndex) == nil)
+            #expect(try firstPackets(audited, 6) == expected)
+        }
     }
 
     // MARK: - Against real media
@@ -308,15 +324,19 @@ struct DolbyVisionRecordAuditTests {
     @Test("the relabelled fixture's RPU reports the profile its record hides",
           .enabled(if: relabelledFixtureExists(), "see relabelledFixtureURL for the two-byte recipe"))
     func relabelledFixtureRPUSaysEight() throws {
-        #expect(DolbyVisionRecordAudit.rpuProfileOfSource(
-            url: relabelledFixtureURL(), extraHeaders: [:]) == 8)
+        let demuxer = Demuxer()
+        defer { demuxer.close() }
+        try demuxer.open(url: relabelledFixtureURL())
+        #expect(DolbyVisionRecordAudit.rpuProfile(peeking: demuxer, streamIndex: demuxer.videoStreamIndex) == 8)
     }
 
     @Test("a genuine Profile 5 asset's RPU agrees with its record, so nothing is corrected",
           .enabled(if: genuineProfile5FixtureExists(), "see genuineProfile5FixtureURL for the download"))
     func genuineFixtureRPUSaysFive() throws {
-        let rpu = DolbyVisionRecordAudit.rpuProfileOfSource(
-            url: genuineProfile5FixtureURL(), extraHeaders: [:])
+        let demuxer = Demuxer()
+        defer { demuxer.close() }
+        try demuxer.open(url: genuineProfile5FixtureURL())
+        let rpu = DolbyVisionRecordAudit.rpuProfile(peeking: demuxer, streamIndex: demuxer.videoStreamIndex)
         #expect(rpu == 5)
         #expect(DolbyVisionRecordAudit.correctedProfile(record: 5, rpu: rpu) == nil)
     }

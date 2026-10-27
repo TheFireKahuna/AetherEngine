@@ -32,10 +32,8 @@ enum SourcePrewarmFetcher {
 
     static let defaultByteBudget = 8 * 1024 * 1024
 
-    private static let session: URLSession = URLSession(
-        configuration: AVIOReader.makeSessionConfig(),
-        delegate: EngineTLS.sessionDelegate,
-        delegateQueue: AVIOReader.makePlaybackDelegateQueue())
+    /// The engine's one pool (`EngineHTTP`), so a warm and the session that plays it share a connection.
+    private static let session: URLSession = EngineHTTP.session
 
     /// One warm at a time, process-wide.
     ///
@@ -52,7 +50,10 @@ enum SourcePrewarmFetcher {
     static func warm(url: URL,
                      extraHeaders: [String: String],
                      byteBudget: Int,
-                     into store: SourcePrewarmStore = .shared) async -> SourcePrewarmReport {
+                     into cache: SourceByteCache = .shared) async -> SourcePrewarmReport {
+        // Everything a warm learns is filed under the request a load will make: the source URL and
+        // the load's headers, whatever URL and headers actually served it.
+        let key = SourceCacheKey(url: url, headers: extraHeaders)
         let budget = max(0, byteBudget)
         guard budget > 0 else { return decline(url, "byte budget is zero") }
         // The same early-out the tail prefetch takes: on an origin metered down to one request at a
@@ -67,7 +68,8 @@ enum SourcePrewarmFetcher {
         do {
             head = try await RangeFetch.run(url: url, extraHeaders: extraHeaders,
                                             requestedStart: 0, requestedLength: budget,
-                                            label: "prewarm head", session: session)
+                                            label: "prewarm head", session: session,
+                                            cache: cache, cacheKey: key)
         } catch let error as PrewarmDecline {
             return decline(url, error.reason)
         } catch {
@@ -84,56 +86,55 @@ enum SourcePrewarmFetcher {
         let tailURL = head.respondedURL ?? url
         let tailHeaders = RedirectHeaderPolicy.headersToReplay(
             extraHeaders: extraHeaders, originalURL: url, redirectURL: tailURL)
-        var tail: ResidentSpan?
+        var tail: (start: Int64, bytes: Int)?
         switch SourcePrewarmPlan.trailing(head: head.body, total: head.total) {
         case .none:
             break
         case .suffix where head.total > Int64(head.body.count) + Int64(tailBytes):
             tail = await fetchTail(url: tailURL, extraHeaders: tailHeaders, source: url,
-                                   start: head.total - Int64(tailBytes), length: tailBytes)
+                                   start: head.total - Int64(tailBytes), length: tailBytes,
+                                   cache: cache, cacheKey: key)
         case .suffix:
             break
         case .range(let start):
             let length = Int(clamping: head.total - start)
             if length > 0 {
                 tail = await fetchTail(url: tailURL, extraHeaders: tailHeaders, source: url,
-                                       start: start, length: length)
+                                       start: start, length: length, cache: cache, cacheKey: key)
             }
         }
         if Task.isCancelled { return decline(url, "cancelled") }
 
-        let warmed = PrewarmedSource(head: ResidentSpan(start: 0, data: head.body),
-                                     tail: tail,
-                                     contentLength: head.total,
-                                     requestHeaders: extraHeaders,
-                                     resolvedURL: head.respondedURL,
-                                     contentType: head.contentType)
-        guard store.store(warmed, for: url) else {
-            return decline(url, "\(warmed.byteCount) bytes exceed the prewarm store's cap")
-        }
+        // The resolved target and the content type ride with the bytes, so a load pins the target
+        // instead of paying the 302 again (#551 round 2) and recognizes an extensionless disc image
+        // (AE#860); the warm reports done only once its bytes are servable.
+        cache.noteResolvedURL(head.respondedURL, for: key)
+        cache.noteContentType(head.contentType, for: key)
+        await cache.flushWrites()
+        let retained = head.body.count + (tail?.bytes ?? 0)
         EngineLog.emit(
             "[SourcePrewarm] warmed \(url.lastPathComponent): head=\(head.body.count)B "
-            + "tail=\(tail?.data.count ?? 0)B at \(tail.map { String($0.start) } ?? "-") "
+            + "tail=\(tail?.bytes ?? 0)B at \(tail.map { String($0.start) } ?? "-") "
             + "of \(head.total)B"
-            + (warmed.resolvedURL.map { ", resolved to host=\($0.host ?? "?")" } ?? "")
+            + (head.respondedURL.map { ", resolved to host=\($0.host ?? "?")" } ?? "")
             + " (#551)",
             category: .demux)
-        return SourcePrewarmReport(retainedBytes: warmed.byteCount,
-                                   contentLength: head.total,
-                                   declined: nil)
+        return SourcePrewarmReport(retainedBytes: retained, contentLength: head.total, declined: nil)
     }
 
     private static func fetchTail(url: URL,
                                   extraHeaders: [String: String],
                                   source: URL,
                                   start: Int64,
-                                  length: Int) async -> ResidentSpan? {
+                                  length: Int,
+                                  cache: SourceByteCache,
+                                  cacheKey: SourceCacheKey) async -> (start: Int64, bytes: Int)? {
         if let fetched = try? await RangeFetch.run(
             url: url, extraHeaders: extraHeaders,
             requestedStart: start, requestedLength: length,
-            label: "prewarm tail", session: session),
+            label: "prewarm tail", session: session, cache: cache, cacheKey: cacheKey),
            fetched.range.start == start {
-            return ResidentSpan(start: start, data: fetched.body)
+            return (start, fetched.body.count)
         }
         EngineLog.emit("[SourcePrewarm] trailing object not retained for \(source.lastPathComponent); "
                        + "the head alone is warm", category: .demux)
@@ -167,6 +168,8 @@ enum RangeFetch {
         /// The URL that actually answered, redirects followed. A warm that resolved a 302 knows the
         /// target the session would otherwise resolve again (#551 round 2).
         let respondedURL: URL?
+        /// The body the response stated: `total` and the origin's validators.
+        let version: SourceVersion
         var contentType: String? = nil
     }
 
@@ -175,7 +178,9 @@ enum RangeFetch {
                     requestedStart: Int64,
                     requestedLength: Int,
                     label: String,
-                    session: URLSession) async throws -> Result {
+                    session: URLSession,
+                    cache: SourceByteCache,
+                    cacheKey: SourceCacheKey) async throws -> Result {
         guard let ticket = OriginRequestBudget.shared.tryAcquire(for: url, label: label) else {
             throw PrewarmDecline(reason: "no origin request slot free (#377)")
         }
@@ -189,6 +194,7 @@ enum RangeFetch {
                                           requestedLength: requestedLength)
         let task = session.dataTask(with: request)
         task.delegate = delegate
+        EngineHTTP.armResourceDeadline(task, seconds: AVIOReader.boundedResourceSeconds)
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Result, Error>) in
@@ -200,7 +206,12 @@ enum RangeFetch {
                 delegate.installOutcomeHandler { outcome in
                     OriginRequestBudget.shared.release(ticket)
                     switch outcome {
-                    case .body(let result): continuation.resume(returning: result)
+                    case .body(let result):
+                        SourceByteLedger.shared.record(SourceByteLedger.Source(url), reader: label, offset: result.range.start,
+                                                       count: result.body.count)
+                        cache.noteVersion(result.version, for: cacheKey)
+                        cache.store(result.body, at: result.range.start, version: result.version, for: cacheKey)
+                        continuation.resume(returning: result)
                     case .rejected(let reason): continuation.resume(throwing: PrewarmDecline(reason: reason))
                     }
                 }
@@ -225,6 +236,7 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
     private var contentRange: (start: Int64, end: Int64, total: Int64)?
     private var rejection: String?
     private var respondedURL: URL?
+    private var validators: (etag: String?, lastModified: String?) = (nil, nil)
     private var contentType: String?
 
     /// Guards the handoff between the caller's thread, which installs the handler, and the
@@ -330,9 +342,11 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
             return
         }
         contentRange = parsed
+        buffer.reserveCapacity(Int(servedLength))
         // `http.url` is the URL that answered, redirects followed, which is the one a later load
         // should start at instead of resolving the chain again (#551 round 2).
         respondedURL = http.url
+        validators = (http.value(forHTTPHeaderField: "ETag"), http.value(forHTTPHeaderField: "Last-Modified"))
         contentType = http.value(forHTTPHeaderField: "Content-Type")
         completionHandler(.allow)
     }
@@ -365,6 +379,8 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
                                        range: (start: range.start, end: range.end),
                                        total: range.total,
                                        respondedURL: respondedURL,
+                                       version: SourceVersion(size: range.total, etag: validators.etag,
+                                                              lastModified: validators.lastModified),
                                        contentType: contentType))
     }
 

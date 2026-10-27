@@ -20,7 +20,14 @@ import Foundation
 /// dropping a range produces as readily as a corrupt file) is not, so the next consumer tries again.
 /// The parse reads through whatever source the caller opened, which over HTTP is a cache-backed
 /// exact range reader: bytes another reader already fetched cost nothing.
+///
+/// An index lives as long as its source does in the source cache (`SourceByteCache`): while a reader
+/// has it open, through the grace after the last one closes (so a reload or a track switch finds
+/// it), and not past the source being let go or replaced by another body. A source the cache does
+/// not hold (a local file, a host's own reader) keeps its index only while it is being read, for
+/// the consumers racing for it.
 final class SourceIndexRegistry: @unchecked Sendable {
+    static let shared = SourceIndexRegistry(cache: .shared)
 
     /// Proof that a read was asked for by the registry. The index readers require one, so a second
     /// read of a source cannot be added anywhere else by accident.
@@ -49,9 +56,15 @@ final class SourceIndexRegistry: @unchecked Sendable {
         }
     }
 
+    private let cache: SourceByteCache
     private let lock = NSLock()
     private var entries: [Key: Task<Outcome, Never>] = [:]
     private var parses = 0
+
+    init(cache: SourceByteCache) {
+        self.cache = cache
+        cache.observeReleases { [weak self] source in self?.forget(source) }
+    }
 
     /// The index of `url` as asked for with `headers`, which `demuxer` opened, read (if it has not
     /// been) through `reader`. The key is derived here, from the request and the reader's own size, so
@@ -78,9 +91,14 @@ final class SourceIndexRegistry: @unchecked Sendable {
     }
 
     /// The index of the source at `key`. Read by the first caller, with `read`, and by no caller after
+    /// it while the source cache holds the source at that size. The read runs on its own task, so a
+    /// caller that is cancelled while waiting leaves it to finish for the others.
     func index(for key: Key, read: @escaping @Sendable (ParseToken) throws -> any SourceIndex) async -> Outcome {
         let task = parseTask(for: key, read: read)
         let outcome = await task.value
+        let broken: Bool
+        if case .unavailable(.malformed) = outcome { broken = true } else { broken = false }
+        if broken || cache.knownSize(key.source) != key.size { forget(key, ifStill: task) }
         return outcome
     }
 
@@ -89,6 +107,7 @@ final class SourceIndexRegistry: @unchecked Sendable {
         -> Task<Outcome, Never>
     {
         lock.lock(); defer { lock.unlock() }
+        if let existing = entries[key] { return existing }
         let task = BlockingWork.detached(priority: .utility) { [self] () -> Outcome in
             noteParse()
             do {
@@ -107,6 +126,18 @@ final class SourceIndexRegistry: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard entries[key] == task else { return }
         entries[key] = nil
+    }
+
+    /// The source cache let `source` go: its index, at every size, goes with it.
+    private func forget(_ source: SourceCacheKey) {
+        lock.lock(); defer { lock.unlock() }
+        entries = entries.filter { $0.key.source != source }
+    }
+
+    /// Indexes held now, a running read included.
+    var heldCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return entries.count
     }
 
     /// How many parses have run since the process started (or the last reset). Diagnostics and the

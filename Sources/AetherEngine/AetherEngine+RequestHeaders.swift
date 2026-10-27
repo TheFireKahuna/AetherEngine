@@ -42,12 +42,14 @@ extension AetherEngine {
                            category: .engine)
             return .noActiveSession
         }
+        // Disc and DASH readers take their headers at open; the session's demuxer knows which it opened.
+        let readersFixedAtOpen = Demuxer.isDiscImageURL(url, headers: loadedOptions.httpHeaders)
+            || sourceDemuxer?.isDiscSource == true || sourceDemuxer?.isDASHSource == true
         setLoadedHTTPHeaders(headers)
         sessionRequestHeaders.replace(headers)
         let outcome = RequestHeaderUpdateOutcome.forSession(
             isCustomSource: isCustomSource,
-            isDiscImage: !isCustomSource
-                && (Demuxer.isDiscImageURL(url) || DASHSourceOpener.isKnownManifest(url)),
+            isDiscImage: !isCustomSource && readersFixedAtOpen,
             route: videoRoute,
             audioRequestsOwnedByAVFoundation: audioSessionRequestsOwnedByAVFoundation)
         // Names only: the values are credentials.

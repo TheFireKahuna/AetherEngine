@@ -60,6 +60,22 @@ final class Issue377ReaderTransportLogTests: XCTestCase {
         XCTAssertEqual(tap.matching("origin transport:").count, 2)
     }
 
+    /// A dual-stack origin's line says which family the connection landed on, so a session that fell
+    /// back to v4 is visible without a packet capture.
+    func testTransportLineNamesTheAddressFamily() {
+        ReaderTransportLog.note(protocolName: "h3", reusedConnection: false,
+                                originKey: "https://media.example.com",
+                                remoteAddress: "2404:e80:8b7d:1::23")
+        ReaderTransportLog.note(protocolName: "h2", reusedConnection: false,
+                                originKey: "https://cdn.example.com", remoteAddress: "192.168.10.23")
+        ReaderTransportLog.note(protocolName: "h2", reusedConnection: false,
+                                originKey: "https://other.example.com")
+        let lines = tap.matching("origin transport:")
+        XCTAssertTrue(lines.contains { $0.contains("h3 over IPv6 at https://media.example.com") }, "\(lines)")
+        XCTAssertTrue(lines.contains { $0.contains("h2 over IPv4 at https://cdn.example.com") }, "\(lines)")
+        XCTAssertTrue(lines.contains { $0.contains("h2 at https://other.example.com") }, "\(lines)")
+    }
+
     // MARK: The reuse tally
 
     /// The defect this file exists for: a first connection is not evidence about reuse, so nothing may

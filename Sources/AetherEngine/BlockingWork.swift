@@ -37,6 +37,57 @@ enum BlockingWork {
     }
 }
 
+extension BlockingWork {
+    /// Lanes for reads that wait on the network: a remote range read costs a round trip each (about 40 ms
+    /// measured through a reverse proxy), so they go out side by side.
+    static let readLanes = 12
+
+    /// `DispatchQueue.concurrentPerform` for blocking work. `body(lane, i)` runs for every `i` in
+    /// `0..<count` on `width` lanes, lane `l` taking `l`, `l + width`, ... in turn, so a lane can hold a
+    /// resource of its own (a reader) for all of its items. A lane takes no more once `isStopped()`.
+    /// Returns the results in the order asked, nil for an item not run or that answered nil, once every
+    /// lane has finished; the calling thread waits.
+    ///
+    /// Each lane is a thread of its own, at `qos` (by default the caller's). Not `concurrentPerform`, which
+    /// sizes its width to the CPUs it finds idle: right for CPU work, it ran network reads one at a time on
+    /// a loaded machine. Not GCD's global queues either, where `detached` runs: their pool is bounded and
+    /// shared by all of the engine's blocking work, and lanes parked on round trips there (a whole-film
+    /// subtitle pull is thousands) held it from everything else, which failed tests across the suite.
+    static func lanes<T: Sendable>(count: Int, width: Int = readLanes,
+                                   qos: QualityOfService = Thread.current.qualityOfService,
+                                   isStopped: @escaping @Sendable () -> Bool = { false },
+                                   _ body: @escaping @Sendable (_ lane: Int, _ index: Int) -> T?) -> [T?] {
+        guard count > 0, width > 0 else { return [] }
+        let results = LaneResults<T>(count)
+        let lanes = min(width, count)
+        let done = DispatchGroup()
+        for lane in 0..<lanes {
+            done.enter()
+            let thread = Thread {
+                defer { done.leave() }
+                for i in stride(from: lane, to: count, by: lanes) {
+                    guard !isStopped() else { break }
+                    results.set(i, body(lane, i))
+                }
+            }
+            thread.name = "aether.lane.\(lane)"
+            thread.qualityOfService = qos
+            thread.start()
+        }
+        done.wait()
+        return results.all
+    }
+}
+
+/// What `BlockingWork.lanes` collects, written from its lanes.
+private final class LaneResults<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [T?]
+    init(_ count: Int) { items = Array(repeating: nil, count: count) }
+    func set(_ i: Int, _ item: T?) { lock.withLock { items[i] = item } }
+    var all: [T?] { lock.withLock { items } }
+}
+
 /// Runs each job on the GCD global queue that matches its priority. Stateless and shared, so a
 /// task's preference never outlives what it points at.
 @available(visionOS 2, *)

@@ -388,6 +388,7 @@ final class MP4SegmentMuxer {
         counter.fd = firstFd
         counter.memory = inMemory ? NSMutableData() : nil
         counter.onStorageExhausted = onStorageExhausted
+        counter.onBytesStaged = onBytesStaged
         self.byteCounter = counter
 
         let sampleEntryOverride = audio?.soundSampleEntryOverride
@@ -1387,6 +1388,9 @@ private final class ByteCounter {
     var writeFailed: Bool = false
     /// Reports a staging write that hit a full volume to the session's cache.
     var onStorageExhausted: (@Sendable () -> Void)?
+    /// Told after each fragment write lands in the staging file, so a reader following the file
+    /// wakes on the write.
+    var onBytesStaged: (@Sendable () -> Void)?
     var lifetimeFragmentBytes: Int = 0
     var fragmentCuts: Int = 0
 }

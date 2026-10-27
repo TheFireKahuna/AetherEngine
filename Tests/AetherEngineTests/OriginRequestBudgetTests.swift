@@ -215,6 +215,81 @@ struct OriginRequestBudgetTests {
         tickets.forEach { budget.release($0) }
     }
 
+    @Test("each status is read as what it means", arguments: [
+        (429, 1, false), (429, 2, true), (503, 1, false), (503, 3, true), (509, 1, true),
+    ])
+    func refusalKinds(status: Int, open: Int, lowers: Bool) {
+        let budget = freshBudget()
+        let tickets = (0..<open).map { budget.acquire(for: url, label: "path\($0)", timeout: 0.1) }
+        let limit = budget.noteRefusal(for: url, status: status)
+        #expect((limit != nil) == lowers,
+                "\(status) with \(open) request(s) open: limit \(limit.map(String.init) ?? "none")")
+        #expect(budget.snapshot(for: url)?.paced == true, "every refusal paces the origin")
+        tickets.forEach { budget.release($0) }
+    }
+
+    @Test("a learned ceiling climbs a slot per clean interval and lifts past where it was learned")
+    func ceilingRecoversAdditively() {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+        let tickets = (0..<4).map { budget.acquire(for: url, label: "path\($0)", timeout: 0.1) }
+        #expect(budget.noteRefusal(for: url, status: 509) == 2)
+        tickets.forEach { budget.release($0) }
+
+        clock.advance(by: OriginRequestBudget.limitProbeSeconds - 1)
+        #expect(budget.limit(for: url) == 2, "no slot inside the interval")
+        clock.advance(by: 2)
+        #expect(budget.limit(for: url) == 3)
+        clock.advance(by: OriginRequestBudget.limitProbeSeconds)
+        #expect(budget.limit(for: url) == 4)
+        clock.advance(by: OriginRequestBudget.limitProbeSeconds)
+        #expect(budget.limit(for: url) == nil, "past the four it was learned from, the ceiling goes")
+    }
+
+    @Test("a refusal while capped doubles the wait before the next slot")
+    func refusalWhileCappedBacksOff() {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+        let tickets = (0..<4).map { budget.acquire(for: url, label: "path\($0)", timeout: 0.1) }
+        #expect(budget.noteRefusal(for: url, status: 509) == 2)
+        #expect(budget.noteRefusal(for: url, status: 509) == 1)
+        tickets.forEach { budget.release($0) }
+
+        clock.advance(by: OriginRequestBudget.limitProbeSeconds + 1)
+        #expect(budget.limit(for: url) == 1, "a second refusal must slow the climb")
+        clock.advance(by: OriginRequestBudget.limitProbeSeconds)
+        #expect(budget.limit(for: url) == 2)
+    }
+
+    @Test("a host ceiling is never probed past")
+    func hostCeilingHolds() {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+        budget.setHostLimit(1, for: otherOrigin)
+        budget.noteRefusal(for: otherOrigin, status: 509)
+        clock.advance(by: OriginRequestBudget.maximumLimitProbeSeconds * 2)
+        #expect(budget.limit(for: otherOrigin) == 1, "the host's own ceiling is not ours to lift")
+    }
+
+    @Test("a new slot releases the requests parked behind the ceiling", .timeLimit(.minutes(1)))
+    func probeReleasesParkedWaiters() async throws {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+        let first = budget.acquire(for: url, label: "pump", timeout: 0.1)
+        let second = budget.acquire(for: url, label: "detour", timeout: 0.1)
+        #expect(budget.noteRefusal(for: url, status: 509) == 1)
+        budget.release(second)
+        clock.advance(by: 30)  // past the pacer's first quiet period, inside the probe interval
+        let parked = Task.detached { budget.acquire(for: url, label: "detour", timeout: 30) }
+        while budget.snapshot(for: url)?.waiting != 1 { try await Task.sleep(for: .milliseconds(5)) }
+        clock.advance(by: OriginRequestBudget.limitProbeSeconds)
+        _ = budget.limit(for: url)
+        let ticket = await parked.value
+        #expect(ticket?.granted == true, "the waiter is let through when the ceiling gains a slot")
+        budget.release(ticket)
+        budget.release(first)
+    }
+
     @Test("an unrefused origin never arms the request-rate pacer")
     func unrefusedOriginIsNeverPaced() {
         let clock = ManualDispatchClock()
@@ -449,7 +524,8 @@ struct OriginRequestBudgetTests {
     func cleanGrantsDoNotDisarmPacing() {
         let clock = ManualDispatchClock()
         let budget = freshBudget(now: clock.now)
-        budget.noteRefusal(for: url, status: 429)
+        // A connection cap, so a ceiling is learned beside the pacer (a lone 429 only paces).
+        budget.noteRefusal(for: url, status: 509)
         clock.advance(by: 2)
 
         for grant in 0..<20 {
@@ -560,7 +636,8 @@ struct OriginRequestBudgetTests {
         let proxy = URL(string: "https://proxy.example.com/dl/abc")!
         let cdn = URL(string: "https://edge-7.cdn.example.net/signed/abc?exp=1&sig=x")!
 
-        budget.noteRefusal(for: cdn, status: 429)
+        // A connection cap, the refusal that teaches a ceiling on its own (a lone 429 only paces).
+        budget.noteRefusal(for: cdn, status: 509)
         budget.noteRefusalWitnessed(for: proxy)
 
         #expect(budget.refusedRecently(proxy, within: 60),

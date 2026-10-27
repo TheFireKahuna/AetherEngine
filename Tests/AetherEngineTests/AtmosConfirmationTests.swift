@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// Unit tests for the `LoadOptions.confirmAtmos` session pass (#214 follow-up): which tracks earn a
@@ -117,13 +118,9 @@ struct AtmosConfirmationTests {
         #expect(LoadOptions(confirmAtmos: true).confirmAtmos == true)
     }
 
-    // MARK: - The session pass's open profile, against real media
-    //
-    // The pass opens with skipStreamInfo, betting that codec_id and codec_type come off the container
-    // header alone. If that bet were wrong the decode would never start and the badge would never appear,
-    // so it is worth exercising against a real E-AC-3 file rather than only in the abstract.
+    // MARK: - The session pass, fed by the session's own reads
 
-    /// Writes the shared plain-EAC3 fixture to a temp file so the URL branch of the open is the one under test.
+    /// Writes the shared plain-EAC3 fixture to a temp file.
     private func withEAC3FixtureURL(_ body: (URL) throws -> Void) throws {
         let bytes = try #require(
             Data(base64Encoded: AtmosDetectionProbeIntegrationTests.eac3PlainBase64,
@@ -135,56 +132,79 @@ struct AtmosConfirmationTests {
         try body(url)
     }
 
-    @Test("the confirmation open resolves the E-AC-3 stream without find_stream_info, and decodes it")
-    func openProfileReachesTheDecoder() throws {
+    private final class Confirmed: @unchecked Sendable {
+        let lock = NSLock()
+        var streams: [Int32] = []
+    }
+
+    /// The reader discards the candidate, as a session reading another track does: the candidate is read for
+    /// the pass alone, and the reader gets none of it.
+    @Test("a stream the reader discards is read for the pass alone, and the pass answers from it")
+    func discardedCandidateIsReadForThePass() throws {
         try withEAC3FixtureURL { url in
             let demuxer = Demuxer()
             defer { demuxer.close() }
-            #expect(AetherEngine.openAtmosConfirmationDemuxer(
-                demuxer, url: url, reader: nil, formatHint: nil, headers: [:],
-                callerProbesize: nil, callerMaxAnalyzeDuration: nil))
-
-            let outcome = AetherEngine.detectAtmos(
-                demuxer: demuxer, targetIndex: 0, options: AtmosDetectionOptions())
-            // Reaching .frameDecoded proves the skipStreamInfo open still handed the decoder a usable
-            // codec_id; a plain (non-JOC) track then correctly declines to confirm.
-            #expect(outcome.stopReason == .frameDecoded)
-            #expect(outcome.confirmedAtmos == false)
+            try demuxer.open(url: url)
+            demuxer.discardAllStreamsExcept([])
+            let confirmed = Confirmed()
+            // A scan of four packets, so it answers inside the short fixture.
+            let pass = try #require(AtmosConfirmationPass(
+                candidates: [0], demuxer: demuxer, options: AtmosDetectionOptions(maxPackets: 4)) { index in
+                confirmed.lock.withLock { confirmed.streams.append(index) }
+            })
+            demuxer.observe(Set(pass.streams)) { pass.feed($0) }
+            var delivered = 0
+            while let packet = try demuxer.readPacket() {
+                var owned: UnsafeMutablePointer<AVPacket>? = packet
+                av_packet_free(&owned)
+                delivered += 1
+            }
+            // A plain E-AC-3 track decodes and is not JOC; the pass has its answer.
+            #expect(confirmed.lock.withLock { confirmed.streams }.isEmpty)
+            #expect(pass.unfinishedSummary(stopReason: "test") == nil)
+            // Once answered, the stream went back to the reader's discard, and nothing reached the reader.
+            #expect(delivered == 0)
         }
     }
 
-    @Test("an unopenable source is a silent false, never a throw into the host")
-    func unopenableSourceIsSilent() {
-        let missing = FileManager.default.temporaryDirectory
-            .appendingPathComponent("atmos-confirmation-does-not-exist-\(UUID().uuidString).mkv")
-        let demuxer = Demuxer()
-        defer { demuxer.close() }
-        #expect(AetherEngine.openAtmosConfirmationDemuxer(
-            demuxer, url: missing, reader: nil, formatHint: nil, headers: [:],
-            callerProbesize: nil, callerMaxAnalyzeDuration: nil) == false)
+    @Test("a stream the reader keeps is delivered as well as observed")
+    func keptCandidateIsStillDelivered() throws {
+        try withEAC3FixtureURL { url in
+            let demuxer = Demuxer()
+            defer { demuxer.close() }
+            try demuxer.open(url: url)
+            demuxer.discardAllStreamsExcept([0])
+            let pass = try #require(AtmosConfirmationPass(candidates: [0], demuxer: demuxer) { _ in })
+            var observed = 0
+            demuxer.observe(Set(pass.streams)) { observed += 1; return pass.feed($0) }
+            var delivered = 0
+            while let packet = try demuxer.readPacket() {
+                var owned: UnsafeMutablePointer<AVPacket>? = packet
+                av_packet_free(&owned)
+                delivered += 1
+            }
+            #expect(observed > 0)
+            #expect(delivered >= observed)
+        }
+    }
+
+    @Test("a pass the session moves on from says how far it got")
+    func endedEarlySummary() throws {
+        try withEAC3FixtureURL { url in
+            let demuxer = Demuxer()
+            defer { demuxer.close() }
+            try demuxer.open(url: url)
+            let pass = try #require(AtmosConfirmationPass(candidates: [0], demuxer: demuxer) { _ in })
+            demuxer.observe(Set(pass.streams)) { pass.feed($0) }
+            demuxer.endObservation()
+            #expect(pass.unfinishedSummary(stopReason: "the session moved on")
+                    == "[AtmosConfirmation] stopped (the session moved on) after 0 of 1 E-AC-3 track(s), confirmed JOC on none")
+        }
     }
 }
 
-/// The pass is a second handle on the source per E-AC-3 track. On an origin that rations requests every
-/// read it makes takes the video pump's slot, so it must not run there at all.
-@Suite("Atmos confirmation: origin gate and summary line")
-struct AtmosConfirmationOriginGateTests {
-
-    @Test("an unrestricted origin runs the pass")
-    func unrestrictedOriginRuns() {
-        #expect(AetherEngine.atmosConfirmationDeclineReason(
-            originSerial: false, sequentialOrigin: false, heldSourceConnection: false) == nil)
-    }
-
-    @Test("a one-request origin, a sequential origin and a held connection each decline the pass")
-    func rationedOriginsDecline() {
-        #expect(AetherEngine.atmosConfirmationDeclineReason(
-            originSerial: true, sequentialOrigin: false, heldSourceConnection: false) != nil)
-        #expect(AetherEngine.atmosConfirmationDeclineReason(
-            originSerial: false, sequentialOrigin: true, heldSourceConnection: false) != nil)
-        #expect(AetherEngine.atmosConfirmationDeclineReason(
-            originSerial: false, sequentialOrigin: false, heldSourceConnection: true) != nil)
-    }
+@Suite("Atmos confirmation: summary line")
+struct AtmosConfirmationSummaryTests {
 
     @Test("a completed pass keeps the summary format reports already grep for")
     func completedSummary() {

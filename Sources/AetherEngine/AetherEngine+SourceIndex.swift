@@ -16,6 +16,10 @@ extension AetherEngine {
                                                 requestTimeout: TimeInterval = 30, maxRetries: Int = 3)
         -> HTTPDiscIOReader?
     {
+        HTTPDiscIOReader(url: url, extraHeaders: headers, baseChunkSize: 4096, maxChunkSize: 4 * 1024 * 1024,
+                         maxRetries: maxRetries, requestTimeout: requestTimeout,
+                         knownSize: SourceByteCache.shared.knownSize(SourceCacheKey(url: url, headers: headers)),
+                         sourceCache: .shared, label: label)
     }
 
     /// What a source's index and frames are read through: the file itself, or the exact range reader

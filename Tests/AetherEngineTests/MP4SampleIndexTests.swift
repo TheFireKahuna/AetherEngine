@@ -286,6 +286,11 @@ struct MP4SampleIndexTests {
         defer { demuxer.close() }
         let reader = try #require(AetherEngine.indexReader(url: url, headers: [:], label: "test"))
         defer { reader.close() }
+        let cache = SourceByteCache(directory: FileManager.default.temporaryDirectory
+            .appending(path: "mp4-index-\(UUID().uuidString)", directoryHint: .isDirectory), budget: .fixed(0),
+            removesDirectory: true)
+        let outcome = await SourceIndexRegistry(cache: cache).index(
+            of: url, headers: [:], demuxer: demuxer, through: reader)
         let index = try #require(outcome.index)
         let subtitles = demuxer.subtitleStreamIndices()
         let plan = SubtitleSource.plan(

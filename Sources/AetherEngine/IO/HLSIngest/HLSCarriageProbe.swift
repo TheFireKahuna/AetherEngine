@@ -20,18 +20,13 @@ enum HLSCarriageProbe {
     /// Probe verdict granularity: re-inspect after this much fresh payload, packet-aligned.
     static let segmentHeadChunkBytes = 188 * 32
 
-    /// One process-wide session rather than one per probe: an uninvalidated `URLSession` outlives its
-    /// caller. The request timeout is short because a verdict that arrives after the watchdog grace has
-    /// already been overtaken by the grace it was meant to replace.
-    private static let sharedSession: URLSession = {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 10
-        // The request timeout is an idle timeout; without a resource ceiling an origin trickling a
-        // byte every few seconds kept a probe open for the 7-day default (audit NET-10).
-        configuration.timeoutIntervalForResource = 30
-        return URLSession(
-            configuration: configuration, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
-    }()
+    /// The engine's one pool (`EngineHTTP`). The request timeout is short because a verdict that
+    /// arrives after the watchdog grace has already been overtaken by the grace it was meant to
+    /// replace; it is an idle timeout, so the probe also carries a ceiling, without which an origin
+    /// trickling a byte every few seconds kept a probe open for the 7-day default (audit NET-10).
+    private static let sharedSession: URLSession = EngineHTTP.session
+    private static let idleTimeoutSeconds: TimeInterval = 10
+    private static let resourceTimeoutSeconds: TimeInterval = 30
 
     /// AE#296: what the playlist chain established, and whether a media byte is still needed to settle it.
     /// The two stages are separated because they have different costs: playlists are free of a per-token
@@ -134,7 +129,6 @@ enum HLSCarriageProbe {
     ) async throws -> MPEGTransportStreamCodecProbe.Verdict {
         var request = SourceNetworkDiagnostics.request(makeRequest(url, httpHeaders: httpHeaders), context: diagnosticContext)
         request.setValue("bytes=0-\(maximumSegmentHeadBytes - 1)", forHTTPHeaderField: "Range")
-        let trace = SourceNetworkDiagnostics.Trace(role: .hlsSegment, context: SourceNetworkDiagnostics.context(for: request))
         let stream = try await openSegment(request, session: session, limit: .max)
         return try await readHead(of: stream).verdict
     }
@@ -142,6 +136,18 @@ enum HLSCarriageProbe {
     /// A segment's head, classified, with the rest of its response still open: the VOD ingest starts
     /// its producer on the same response rather than asking for the segment again, which would put a
     /// second round trip in front of the first frame. `limit` bounds the whole body.
+    static func openSegmentHead(
+        url: URL,
+        httpHeaders: [String: String],
+        session: URLSession,
+        limit: Int,
+        owner: EngineHTTPRequests? = nil,
+        diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context
+    ) async throws -> (head: SegmentHead, rest: SegmentStream) {
+        let request = SourceNetworkDiagnostics.request(makeRequest(url, httpHeaders: httpHeaders), context: diagnosticContext)
+        let stream = try await openSegment(request, session: session, limit: limit, owner: owner)
+        return (try await readHead(of: stream), stream)
+    }
 
     /// What the head read settled on, and the bytes it took to get there.
     struct SegmentHead {
@@ -256,10 +262,13 @@ enum HLSCarriageProbe {
         credentialOrigin: URL,
         session: URLSession
     ) async throws -> (HLSPlaylist, URL) {
-        let request = makeRequest(
+        var request = makeRequest(
             url, httpHeaders: RedirectHeaderPolicy.scoped(httpHeaders, grantedFor: credentialOrigin, sentTo: url))
+        let pooled = session === EngineHTTP.session
+        if pooled { request.timeoutInterval = idleTimeoutSeconds }
         let (data, response) = try await BoundedPlaylistFetch.data(
-            for: request, session: session, limit: maximumPlaylistBytes)
+            for: request, session: session, limit: maximumPlaylistBytes,
+            resourceTimeout: pooled ? resourceTimeoutSeconds : nil)
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else {
             throw HLSIngestError.playlistUnreachable(status: status)

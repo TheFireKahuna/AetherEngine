@@ -228,7 +228,7 @@ final class HeldSourceConnection: @unchecked Sendable {
         configuration.timeoutIntervalForResource = .greatestFiniteMagnitude
         let session = URLSession(configuration: configuration,
                                  delegate: EngineTLS.sessionDelegate,
-                                 delegateQueue: AVIOReader.makePlaybackDelegateQueue())
+                                 delegateQueue: EngineHTTP.delegateQueue)
         let task = session.streamTask(withHostName: host, port: port)
 
         stateLock.lock()

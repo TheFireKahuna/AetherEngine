@@ -109,6 +109,14 @@ public enum SourceNetworkDiagnostics {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var observer: (@Sendable (Event) -> Void)?
 
+    /// The handler runs synchronously on the transfer's callback queue (`EngineHTTP.delegateQueue`), in event
+    /// order. That queue is serial and carries every byte of every source, so a handler hands slow work (writing
+    /// to disk) off itself. `event` is only built when a handler is set.
+    static func deliver(_ event: @autoclosure () -> Event) {
+        guard let receive = handler else { return }
+        receive(event())
+    }
+
     static func urlErrorCode(_ error: Error?) -> Int? {
         var next = error as NSError?
         for _ in 0..<8 {
@@ -131,7 +139,7 @@ public enum SourceNetworkDiagnostics {
 
         func record(_ phase: Phase, originalURL: URL, url: URL, status: Int? = nil,
                     bytes: Int64 = 0, error: Error? = nil) {
-            handler?(Event(requestID: id, role: role, phase: phase,
+            SourceNetworkDiagnostics.deliver(Event(requestID: id, role: role, phase: phase,
                            originalURL: originalURL, url: url, status: status,
                            urlErrorCode: urlErrorCode(error), bytes: bytes,
                            elapsedMilliseconds: Int(max(0, ProcessInfo.processInfo.systemUptime - start) * 1_000),
@@ -158,20 +166,20 @@ public enum SourceNetworkDiagnostics {
                   context: context)
         }
         func response(task: URLSessionTask, response: URLResponse) {
-            handler?(event(.response, task: task, url: response.url, status: (response as? HTTPURLResponse)?.statusCode))
+            SourceNetworkDiagnostics.deliver(event(.response, task: task, url: response.url,
+                                                   status: (response as? HTTPURLResponse)?.statusCode))
         }
         func redirect(task: URLSessionTask, response: HTTPURLResponse, request: URLRequest) {
-            handler?(event(.redirect, task: task, url: request.url, status: response.statusCode))
+            SourceNetworkDiagnostics.deliver(event(.redirect, task: task, url: request.url, status: response.statusCode))
         }
         func completed(task: URLSessionTask, error: Error?, phase: Phase = .completed) {
-            handler?(event(phase, task: task, error: error))
+            SourceNetworkDiagnostics.deliver(event(phase, task: task, error: error))
         }
         func metrics(task: URLSessionTask, metrics: URLSessionTaskMetrics) {
-            guard let receive = handler else { return }
             for transaction in metrics.transactionMetrics {
-                receive(event(.metrics, task: task, url: transaction.request.url,
-                              status: (transaction.response as? HTTPURLResponse)?.statusCode,
-                              transaction: transaction))
+                SourceNetworkDiagnostics.deliver(event(.metrics, task: task, url: transaction.request.url,
+                                                       status: (transaction.response as? HTTPURLResponse)?.statusCode,
+                                                       transaction: transaction))
             }
         }
     }

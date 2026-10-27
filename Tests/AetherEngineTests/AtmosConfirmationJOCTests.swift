@@ -37,18 +37,16 @@ private func lateAudioFixtureExists() -> Bool {
 }
 
 /// The positive half of the Atmos story, which no synthetic fixture can reach: a genuinely JOC track has
-/// to come back confirmed, through the same open profile and the same bounded pass the session uses.
+/// to come back confirmed, through the same bounded scan the session uses.
 @Suite("Atmos confirmation against real E-AC-3 JOC media")
 struct AtmosConfirmationJOCTests {
 
-    @Test("a genuine JOC track is confirmed through the session's open profile",
+    @Test("a genuine JOC track is confirmed by the bounded scan",
           .enabled(if: jocFixtureExists(), "drop Dolby's DDP JOC test signal at Fixtures/user/ddp-joc.mp4"))
     func realJOCIsConfirmed() throws {
         let demuxer = Demuxer()
         defer { demuxer.close() }
-        #expect(AetherEngine.openAtmosConfirmationDemuxer(
-            demuxer, url: jocFixtureURL(), reader: nil, formatHint: nil, headers: [:],
-            callerProbesize: nil, callerMaxAnalyzeDuration: nil))
+        try demuxer.open(url: jocFixtureURL())
 
         let targetIndex = demuxer.audioStreamIndex
         #expect(targetIndex >= 0)

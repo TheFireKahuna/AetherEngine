@@ -25,7 +25,7 @@ struct DiscImageMediaTypeTests {
     }
 }
 
-extension PrewarmStoreSuites {
+extension PrewarmSuites {
     /// AE#860: an extensionless URL whose origin declares a disc image type reaches the disc
     /// adapter; the type stays a hint that the disc readers confirm.
     /// `.serialized`: the warm case and the recognized-URL memo are process-wide.
@@ -43,13 +43,13 @@ extension PrewarmStoreSuites {
             let origin = try #require(KeepAliveRangeOrigin(data: Self.iso, contentType: "application/x-iso9660-image"))
             defer { origin.stop() }
             let source = url(origin)
-            #expect(!Demuxer.isDiscImageURL(source))
+            #expect(!Demuxer.isDiscImageURL(source, headers: [:]))
 
             let demuxer = Demuxer()
             defer { demuxer.close() }
             try demuxer.open(url: source)
             #expect(demuxer.isDiscSource, "the declared disc image was handed to libavformat raw")
-            #expect(Demuxer.isDiscImageURL(source), "a recognized disc URL was not remembered")
+            #expect(Demuxer.isDiscImageURL(source, headers: [:]), "a recognized disc URL was not remembered")
         }
 
         @Test("a warm open learns the type from the warm")
@@ -58,8 +58,7 @@ extension PrewarmStoreSuites {
             defer { origin.stop() }
             let source = url(origin)
             _ = await SourcePrewarmFetcher.warm(url: source, extraHeaders: [:], byteBudget: 1 << 20, into: .shared)
-            #expect(SourcePrewarmStore.shared.isWarm(for: source), "the warm was not taken")
-            defer { _ = SourcePrewarmStore.shared.take(for: source) }
+            #expect(AetherEngine.isPrewarmed(url: source), "the warm was not made")
 
             let demuxer = Demuxer()
             defer { demuxer.close() }
@@ -77,7 +76,7 @@ extension PrewarmStoreSuites {
             defer { demuxer.close() }
             try demuxer.open(url: source)
             #expect(!demuxer.isDiscSource)
-            #expect(!Demuxer.isDiscImageURL(source))
+            #expect(!Demuxer.isDiscImageURL(source, headers: [:]))
         }
 
         @Test("a mislabelled media body is not taken for a disc and still plays")
@@ -90,7 +89,7 @@ extension PrewarmStoreSuites {
             defer { demuxer.close() }
             try demuxer.open(url: source)
             #expect(!demuxer.isDiscSource)
-            #expect(!Demuxer.isDiscImageURL(source), "a body with no disc structure was remembered as a disc")
+            #expect(!Demuxer.isDiscImageURL(source, headers: [:]), "a body with no disc structure was remembered as a disc")
         }
 
         @Test("a controlled probe enables the disc probe once the response declares an ISO type")

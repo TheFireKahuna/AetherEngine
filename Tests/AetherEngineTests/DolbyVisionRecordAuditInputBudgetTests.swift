@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import AetherEngine
 
-/// Audit BIT-103: the RPU walk bounded packets and the bytes of the packets it was handed, but not the
+/// Audit BIT-103: the RPU read bounded packets and the bytes of the packets it was handed, but not the
 /// bytes libavformat consumes inside one `av_read_frame`. Matroska resyncs byte by byte through data no
 /// element starts in, so a video stream followed by junk read the whole source before the walk got to
 /// count anything. The fixture is that shape: two HEVC frames, then zeros.
@@ -32,7 +32,7 @@ struct DolbyVisionRecordAuditInputBudgetTests {
     }
 
     private func open(_ demuxer: Demuxer, _ url: URL, reader: CountingReader?) throws {
-        let profile = DemuxerOpenProfile.dolbyVisionRecordAuditDemuxer(callerProbesize: nil, callerMaxAnalyzeDuration: nil)
+        let profile = DemuxerOpenProfile.headPackets
         if let reader {
             try demuxer.open(reader: reader, profile: profile)
         } else {
@@ -49,7 +49,7 @@ struct DolbyVisionRecordAuditInputBudgetTests {
             defer { demuxer.close() }
             try open(demuxer, url, reader: reader)
             let atOpen = reader.bytesRead
-            #expect(DolbyVisionRecordAudit.rpuProfile(walking: demuxer, byteBudget: Self.budget) == nil)
+            #expect(DolbyVisionRecordAudit.rpuProfile(peeking: demuxer, streamIndex: demuxer.videoStreamIndex, byteBudget: Self.budget) == nil)
             #expect(demuxer.inputByteBudgetExhausted)
             #expect(reader.bytesRead - atOpen <= Self.budget)
         }
@@ -62,7 +62,7 @@ struct DolbyVisionRecordAuditInputBudgetTests {
             let demuxer = Demuxer()
             defer { demuxer.close() }
             try open(demuxer, url, reader: nil)
-            #expect(DolbyVisionRecordAudit.rpuProfile(walking: demuxer, byteBudget: Self.budget) == nil)
+            #expect(DolbyVisionRecordAudit.rpuProfile(peeking: demuxer, streamIndex: demuxer.videoStreamIndex, byteBudget: Self.budget) == nil)
             #expect(demuxer.inputByteBudgetExhausted)
         }
     }
@@ -76,7 +76,7 @@ struct DolbyVisionRecordAuditInputBudgetTests {
             defer { demuxer.close() }
             try open(demuxer, url, reader: reader)
             let atOpen = reader.bytesRead
-            #expect(DolbyVisionRecordAudit.rpuProfile(walking: demuxer, byteBudget: Int64(data.count) * 2) == nil)
+            #expect(DolbyVisionRecordAudit.rpuProfile(peeking: demuxer, streamIndex: demuxer.videoStreamIndex, byteBudget: Int64(data.count) * 2) == nil)
             #expect(!demuxer.inputByteBudgetExhausted)
             #expect(reader.bytesRead - atOpen > Self.budget)
         }

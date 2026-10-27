@@ -197,6 +197,60 @@ struct HLSOriginRelayAddressingTests {
         #expect(rewritten.contains("http://127.0.0.1:51234/\(token)\(HLSOriginRelay.route)"))
     }
 
+    @Test("A redirected playlist resolves its relative URIs against where it was served from (RFC 3986 5.1.3)")
+    func redirectedPlaylistUsesTheFinalURLAsItsBase() async throws {
+        let upstream = try #require(await RedirectingHLSOrigin())
+        defer { upstream.stop() }
+        let relay = HLSOriginRelay()
+        let server = HLSLocalServer(relay: relay)
+        try server.start()
+        defer { server.stop(); relay.stop() }
+
+        let entry = URL(string: "http://127.0.0.1:\(upstream.port)/entry/media.m3u8")!
+        let local = try #require(server.relayURL(for: entry))
+        let (body, _) = try await URLSession.shared.data(for: URLRequest(url: local))
+        let playlist = String(decoding: body, as: UTF8.self)
+
+        let segLine = try #require(playlist.components(separatedBy: "\n")
+            .first { !$0.hasPrefix("#") && !$0.isEmpty })
+        let query = try #require(URL(string: segLine)?.query)
+        let recovered = try #require(relay.originURL(fromQuery: query))
+        #expect(recovered.path == "/moved/deep/seg0.ts",
+                "the segment resolved against the URL asked for, not the one that answered: \(recovered)")
+    }
+
+    @Test("Only the URI attribute is a URI; an attribute that ends in URI is not taken for it")
+    func uriAttributeIsMatchedByName() {
+        var seen: [String] = []
+        let rewritten = HLSOriginRelay.rewriteURIAttribute(
+            in: #"#EXT-X-FUTURE:SERVER-URI="https://s.example/x",URI="part1.mp4""#) { value in
+                seen.append(value)
+                return "LOCAL"
+            }
+        #expect(seen == ["part1.mp4"])
+        #expect(rewritten == #"#EXT-X-FUTURE:SERVER-URI="https://s.example/x",URI="LOCAL""#)
+        #expect(HLSOriginRelay.rewriteURIAttribute(in: #"#EXT-X-KEY:METHOD=AES-128,URI="k""#) { _ in "L" }
+                == #"#EXT-X-KEY:METHOD=AES-128,URI="L""#)
+    }
+
+    @Test("Content Steering is removed, since its manifest could send the client past the relay")
+    func contentSteeringIsRemoved() {
+        let relay = HLSOriginRelay()
+        let origin = URL(string: "https://media.example.com/hls/master.m3u8")!
+        relay.grantCredentials(to: origin)
+        let master = """
+            #EXTM3U
+            #EXT-X-CONTENT-STEERING:SERVER-URI="https://steer.example.com/manifest.json",PATHWAY-ID="CDN-A"
+            #EXT-X-STREAM-INF:BANDWIDTH=5000000,PATHWAY-ID="CDN-A"
+            https://cdn-a.example.com/v0/index.m3u8
+            """
+        let rewritten = relay.rewritePlaylist(master, relativeTo: origin, port: 51234, token: token)
+        #expect(!rewritten.contains("EXT-X-CONTENT-STEERING"))
+        #expect(!rewritten.contains("steer.example.com"))
+        #expect(rewritten.contains("#EXT-X-STREAM-INF:BANDWIDTH=5000000"))
+        #expect(!rewritten.contains("cdn-a.example.com"), "the variant must still go through the relay")
+    }
+
     @Test("A host discovered in a playlist becomes fetchable, one that was never named does not")
     func allowListFollowsThePlaylist() async throws {
         let relay = HLSOriginRelay()
@@ -342,7 +396,9 @@ struct HLSOriginRelayAddressingTests {
         // this test's own, which is what keeps the counter this test's own.
         let snapshot = try #require(OriginRequestBudget.shared.snapshot(for: origin))
         #expect(snapshot.refusals == 1, "a 429 through the relay was charged \(snapshot.refusals) times")
-        #expect(snapshot.limit == 1, "the refusal did not bring the origin's concurrency down")
+        // One request refused on its own is rate limiting (RFC 6585), not a statement about how many
+        // may be open: it paces the origin and leaves concurrency where it was.
+        #expect(snapshot.limit == nil, "a lone 429 lowered the origin's concurrency")
     }
 
     @Test("An origin that says the resource is gone is not rewritten into a playlist")
@@ -630,6 +686,62 @@ struct HLSOriginRelayAddressingTests {
             server.serve_forever()
             """
         }
+    }
+
+
+    /// Plain HTTP origin whose media playlist is reached through a 302 to another path, with a
+    /// relative segment that only resolves correctly against the redirect target.
+    final class RedirectingHLSOrigin {
+        let port: UInt16
+        private let process: Process
+        private let workDir: URL
+
+        init?() async {
+            guard let launched = await PythonOrigin.launch(prefix: "aether-redirect-origin", script: Self.serverPy)
+            else { return nil }
+            process = launched.process
+            port = launched.port
+            workDir = launched.workDir
+        }
+
+        func stop() {
+            process.terminate()
+            try? FileManager.default.removeItem(at: workDir)
+        }
+
+        private static let serverPy = """
+            import http.server
+
+            MEDIA = b"#EXTM3U\\n#EXT-X-TARGETDURATION:6\\n#EXTINF:6.0,\\nseg0.ts\\n#EXT-X-ENDLIST\\n"
+
+            class Handler(http.server.BaseHTTPRequestHandler):
+                protocol_version = "HTTP/1.1"
+
+                def log_message(self, *args):
+                    pass
+
+                def do_GET(self):
+                    if self.path.startswith("/entry/media.m3u8"):
+                        self.send_response(302)
+                        self.send_header("Location", "/moved/deep/media.m3u8")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    if self.path.startswith("/moved/deep/media.m3u8"):
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                        self.send_header("Content-Length", str(len(MEDIA)))
+                        self.end_headers()
+                        self.wfile.write(MEDIA)
+                        return
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            print("READY", server.server_address[1], flush=True)
+            server.serve_forever()
+            """
     }
 
 

@@ -43,6 +43,9 @@ final class ScriptedOriginServer: @unchecked Sendable {
         var body: Data? = nil
         /// A `Location` header, for a scripted redirect.
         var location: String? = nil
+        /// A `Content-Type` header. Without one URLSession sniffs the body before it hands over the
+        /// response, so a head that is never followed by a body byte is never reported.
+        var contentType: String? = nil
     }
 
     private let listener: LoopbackListener
@@ -137,6 +140,7 @@ final class ScriptedOriginServer: @unchecked Sendable {
         if let declared = r.declaredLength { head += "Content-Length: \(declared)\r\n" }
         if let cr = r.contentRange { head += "Content-Range: \(cr)\r\n" }
         if let location = r.location { head += "Location: \(location)\r\n" }
+        if let type = r.contentType { head += "Content-Type: \(type)\r\n" }
         head += "Accept-Ranges: bytes\r\n"
         head += "Connection: \(keepAlive ? "keep-alive" : "close")\r\n\r\n"
         guard writeFully(fd, Array(head.utf8)) else { return false }

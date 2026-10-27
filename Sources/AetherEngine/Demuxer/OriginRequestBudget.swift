@@ -18,9 +18,27 @@ import Foundation
 /// Counting is unconditional; capping is not. With no limit set, `acquire` hands out a ticket
 /// immediately and only tallies, so a healthy origin sees exactly the behaviour it saw before this
 /// existed. A limit arrives one of two ways: the host names it (`LoadOptions.maxConcurrentSourceRequests`),
-/// or the origin does, by answering 429/503/509, after which the budget halves from the concurrency
-/// it had actually reached. There is no automatic increase: an origin that has metered us once is
-/// treated as metering for the rest of the process, which costs some parallelism and no correctness.
+/// or the origin does, by refusing, after which the budget halves from the concurrency it had actually
+/// reached. Each refusal is read as what its status means (`RefusalKind`):
+///
+/// - 429 Too Many Requests (RFC 6585) is rate limiting: it arms the request-rate pacer and honours
+///   `Retry-After`. RFC 6585 leaves how the server counts undefined, and some count connections, so
+///   it lowers concurrency too, but only when another of our requests was open when it answered: a
+///   lone request refused says nothing about concurrency.
+/// - 503 Service Unavailable (RFC 9110 15.6.4) is a temporary overload or maintenance: the origin is
+///   held for `Retry-After` (how long it expects to be unavailable) or an exponential wait, and
+///   concurrency comes down on the same evidence as 429, since a lone request cannot be the overload.
+///   A transcoder restarting behind a single pump request therefore costs a pause and nothing else.
+/// - 509 is not a registered status: Apache and cPanel answer it for a bandwidth allotment, and the
+///   IPTV panels the engine meets answer it while a connection slot is still taken. Both are a cap
+///   on what is open at once, so it always lowers concurrency.
+///
+/// A learned ceiling recovers additively: one more slot after every `limitProbeSeconds` without a
+/// refusal, until it passes the concurrency it was learned from and is lifted. A refusal while
+/// capped doubles that interval (up to `maximumLimitProbeSeconds`), so an origin that really meters
+/// is probed rarely and settles just under its limit, while one refusal from a hiccup is forgotten
+/// within minutes. Apple's guidance for URLSession clients is the same shape: retrying is the app's
+/// to build, the server's stated retry time wins, and a wait is bounded.
 /// A refusal also arms a request-rate pacer for that origin. It is deliberately learned rather than
 /// host-configured: the measured CDN served eight parallel 32 MB reads but first refused a run of
 /// 256 KB reads after 36 requests in 10 seconds, so concurrency and request rate are separate limits.
@@ -51,6 +69,39 @@ final class OriginRequestBudget: @unchecked Sendable {
     private static let firstQuietPeriod: TimeInterval = 2
     private static let maximumQuietPeriod: TimeInterval = 15
     private static let quietSecondsToDisarm: TimeInterval = 60
+    /// Clean time at a learned ceiling before it gains a slot: the pacer's own quiet disarm, so a
+    /// ceiling never climbs inside the refusal window it was learned in.
+    static let limitProbeSeconds: TimeInterval = 60
+    /// Longest the probe interval grows to for an origin that keeps refusing while capped.
+    static let maximumLimitProbeSeconds: TimeInterval = 600
+
+    /// What a refusal says about the origin, from its status (see the type's documentation).
+    enum RefusalKind: Equatable {
+        /// 429: too many requests in a given time.
+        case rateLimited
+        /// 503: temporarily unable to serve, from overload or maintenance.
+        case unavailable
+        /// 509: a cap on what is open at once (a bandwidth allotment, a connection slot).
+        case capped
+
+        init?(status: Int) {
+            switch status {
+            case 429: self = .rateLimited
+            case 503: self = .unavailable
+            case 509: self = .capped
+            default: return nil
+            }
+        }
+
+        /// Whether this refusal lowers concurrency, given how many of our requests were open when it
+        /// answered (itself included).
+        func lowersConcurrency(openRequests: Int) -> Bool {
+            switch self {
+            case .capped: return true
+            case .rateLimited, .unavailable: return openRequests > 1
+            }
+        }
+    }
     /// Longest single wait a paced caller takes before re-reading the books. Only an injected clock
     /// needs this to be shorter than the whole debt: a clock that moves without the wall clock
     /// cannot shorten a wait that has already been entered.
@@ -143,6 +194,12 @@ final class OriginRequestBudget: @unchecked Sendable {
         var lastRefillAt: DispatchTime?
         var quietUntil: DispatchTime?
         var refusalStreak = 0
+        /// The concurrency a learned ceiling was learned from: recovery lifts the ceiling once it
+        /// climbs past this.
+        var learnedFrom: Int?
+        /// When a learned ceiling next gains a slot, and the clean interval that took.
+        var nextProbeAt: DispatchTime?
+        var probeInterval: TimeInterval = 0
         /// FIFO of waiters. Front is served first, so the pump cannot re-take the slot it just
         /// released ahead of a detour that has been waiting.
         var waiters: [DispatchSemaphore] = []
@@ -290,11 +347,33 @@ final class OriginRequestBudget: @unchecked Sendable {
         state.refusalStreak = 0
     }
 
-    private func disarmPacerIfQuietLocked(_ state: inout OriginState, at instant: DispatchTime) {
-        guard state.quietUntil != nil, let refusedAt = state.lastRefusalAt,
-              Self.elapsedSeconds(from: refusedAt, to: instant) >= Self.quietSecondsToDisarm
-        else { return }
-        disarmPacerLocked(&state)
+    /// Disarms the pacer after `quietSecondsToDisarm` from the last refusal, and gives a learned (not
+    /// host-set) ceiling one more slot each time its probe interval passes clean.
+    private func relaxIfQuietLocked(_ state: inout OriginState, at instant: DispatchTime) {
+        if let refusedAt = state.lastRefusalAt, state.quietUntil != nil,
+           Self.elapsedSeconds(from: refusedAt, to: instant) >= Self.quietSecondsToDisarm {
+            disarmPacerLocked(&state)
+        }
+        if state.hostLimit == nil, let limit = state.limit, let probeAt = state.nextProbeAt,
+           instant >= probeAt {
+            let raised = limit + 1
+            if raised > (state.learnedFrom ?? limit) {
+                state.limit = nil
+                state.learnedFrom = nil
+                state.nextProbeAt = nil
+                state.probeInterval = 0
+                state.peakInflight = state.inflight
+            } else {
+                state.limit = raised
+                state.nextProbeAt = instant + state.probeInterval
+            }
+            // Waiters parked behind the old ceiling go as far as the new one allows.
+            while !state.waiters.isEmpty, state.inflight < (state.limit ?? Int.max) {
+                state.inflight += 1
+                state.waiters.removeFirst().signal()
+            }
+            state.peakInflight = max(state.peakInflight, state.inflight)
+        }
     }
 
     private func refillPacerLocked(_ state: inout OriginState, at instant: DispatchTime) {
@@ -336,7 +415,7 @@ final class OriginRequestBudget: @unchecked Sendable {
             lock.lock()
             let key = headLocked(raw)
             var state = origins[key] ?? OriginState()
-            disarmPacerIfQuietLocked(&state, at: instant)
+            relaxIfQuietLocked(&state, at: instant)
 
             guard let quietUntil = state.quietUntil else {
                 origins[key] = state
@@ -537,7 +616,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         let key = headLocked(raw)
         var state = origins[key] ?? OriginState()
         let instant = now()
-        disarmPacerIfQuietLocked(&state, at: instant)
+        relaxIfQuietLocked(&state, at: instant)
         guard state.inflight < (state.limit ?? Int.max) else {
             origins[key] = state
             return nil
@@ -604,7 +683,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         lock.lock()
         let key = headLocked(raw)
         var state = origins[key] ?? OriginState()
-        disarmPacerIfQuietLocked(&state, at: instant)
+        relaxIfQuietLocked(&state, at: instant)
         state.refusals += 1
         state.lastRefusalAt = instant
         state.refusalStreak += 1
@@ -621,11 +700,23 @@ final class OriginRequestBudget: @unchecked Sendable {
             state.quietUntil = instant + (quietPeriodCapForTesting.map { min(asked, $0) } ?? asked)
         }
         let previous = state.limit
+        let open = state.inflight
+        let kind = RefusalKind(status: status)
         if let hostLimit = state.hostLimit {
             state.limit = hostLimit
-        } else {
+        } else if let kind, kind.lowersConcurrency(openRequests: open) {
             let basis = state.limit ?? max(1, state.peakInflight)
             state.limit = max(1, basis / 2)
+            state.learnedFrom = max(state.learnedFrom ?? 0, basis)
+            // Refused again while capped: the next probe waits twice as long.
+            state.probeInterval = previous == nil
+                ? Self.limitProbeSeconds
+                : min(Self.maximumLimitProbeSeconds, max(Self.limitProbeSeconds, state.probeInterval * 2))
+            state.nextProbeAt = instant + state.probeInterval
+        } else if state.limit != nil {
+            // A refusal that says nothing about concurrency still says the origin is not ready for
+            // more: the ceiling holds its next probe off for another interval.
+            state.nextProbeAt = instant + state.probeInterval
         }
         let limitNow = state.limit
         let peak = state.peakInflight
@@ -634,9 +725,13 @@ final class OriginRequestBudget: @unchecked Sendable {
 
         if previous != limitNow, let limitNow {
             EngineLog.emit(
-                "[OriginBudget] \(key) answered \(status); concurrency budget "
+                "[OriginBudget] \(key) answered \(status) with \(open) request(s) open; concurrency budget "
                 + "\(previous.map(String.init) ?? "uncapped") -> \(limitNow) (peak was \(peak))",
                 category: .demux)
+        } else if previous == nil, limitNow == nil {
+            EngineLog.emit(
+                "[OriginBudget] \(key) answered \(status) to a lone request; pacing it, concurrency "
+                + "left as it was", category: .demux, level: .verbose)
         }
         return limitNow
     }
@@ -757,7 +852,11 @@ final class OriginRequestBudget: @unchecked Sendable {
     func limit(for url: URL) -> Int? {
         guard let raw = Self.originKey(for: url) else { return nil }
         lock.lock(); defer { lock.unlock() }
-        return origins[headLocked(raw)]?.limit
+        let key = headLocked(raw)
+        guard var state = origins[key] else { return nil }
+        relaxIfQuietLocked(&state, at: now())
+        origins[key] = state
+        return state.limit
     }
 
     /// True when this origin is down to one request at a time. The reader asks this to switch OFF
@@ -778,7 +877,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         let key = headLocked(raw)
         guard var state = origins[key] else { return false }
-        disarmPacerIfQuietLocked(&state, at: now())
+        relaxIfQuietLocked(&state, at: now())
         origins[key] = state
         return state.quietUntil != nil
     }
@@ -789,7 +888,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         let key = headLocked(raw)
         guard var state = origins[key] else { return nil }
         let instant = now()
-        disarmPacerIfQuietLocked(&state, at: instant)
+        relaxIfQuietLocked(&state, at: instant)
         origins[key] = state
         let since = state.lastRefusalAt.map {
             Self.elapsedSeconds(from: $0, to: instant)
@@ -851,13 +950,23 @@ enum ReaderTransportLog {
         guard let key = OriginRequestBudget.originKey(for: url),
               let transaction = metrics.transactionMetrics.last,
               let proto = transaction.networkProtocolName else { return }
-        note(protocolName: proto, reusedConnection: transaction.isReusedConnection, originKey: key)
+        note(protocolName: proto, reusedConnection: transaction.isReusedConnection, originKey: key,
+             remoteAddress: transaction.remoteAddress)
+    }
+
+    /// Which address family the connection actually landed on, from the transaction's remote
+    /// address. A dual-stack origin is the case it exists for: whether Happy Eyeballs picked v6 is
+    /// a property of the path, not the URL, and this line is the only place that sees it.
+    static func addressFamily(_ remoteAddress: String?) -> String? {
+        guard let remoteAddress, !remoteAddress.isEmpty else { return nil }
+        return remoteAddress.contains(":") ? "IPv6" : "IPv4"
     }
 
     /// Split out from the metrics callback so the tally is reachable from a test:
     /// `URLSessionTaskMetrics` has no public initializer, so nothing about this could be pinned
     /// through the other entry point.
-    static func note(protocolName proto: String, reusedConnection reused: Bool, originKey key: String) {
+    static func note(protocolName proto: String, reusedConnection reused: Bool, originKey key: String,
+                     remoteAddress: String? = nil) {
         lock.lock()
         let existing = tallies[key]
         var tally = existing ?? Tally(proto: proto, connections: 0, reused: 0, reportedReuse: false)
@@ -872,7 +981,9 @@ enum ReaderTransportLog {
         if announceTransport {
             let multiplexed = proto.hasPrefix("h2") || proto.hasPrefix("h3")
             EngineLog.emit(
-                "[AVIOReader] origin transport: \(proto) at \(key) "
+                "[AVIOReader] origin transport: \(proto)"
+                + (addressFamily(remoteAddress).map { " over \($0)" } ?? "")
+                + " at \(key) "
                 + (multiplexed
                    ? "(multiplexed, so a per-session connection cap bounds nothing)"
                    : "(one request per connection, so a per-session connection cap bounds requests)"),

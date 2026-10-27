@@ -19,6 +19,26 @@ final class FileIOReaderTests: XCTestCase {
         r.close()
     }
 
+    func test_readRangeLeavesTheCursor() throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("fioreader-\(UUID().uuidString).bin")
+        let bytes = Data((0..<100).map { UInt8($0) })
+        try bytes.write(to: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let r = try XCTUnwrap(FileIOReader(url: tmp))
+        XCTAssertEqual(r.seek(offset: 10, whence: SEEK_SET), 10)
+        XCTAssertEqual(r.readRange(at: 40, count: 5), Data(40..<45))
+        XCTAssertEqual(r.readRange(at: 95, count: 20), Data(95..<100))   // clamped at EOF
+        XCTAssertEqual(r.readRange(at: 100, count: 4), Data())
+        var buf = [UInt8](repeating: 0, count: 3)
+        let n = buf.withUnsafeMutableBufferPointer { r.read($0.baseAddress, size: 3) }
+        XCTAssertEqual(n, 3)
+        XCTAssertEqual(buf, [10, 11, 12], "a range read moved the cursor")
+        r.close()
+        XCTAssertNil(r.readRange(at: 0, count: 1))
+    }
+
     func test_initNilForMissingFile() {
         XCTAssertNil(FileIOReader(url: URL(fileURLWithPath: "/no/such/file.iso")))
     }

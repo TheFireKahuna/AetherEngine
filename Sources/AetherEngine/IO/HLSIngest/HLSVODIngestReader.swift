@@ -29,7 +29,11 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     private let playlistURL: URL
     private let httpHeaders: [String: String]
     private let session: URLSession
-    private let ownsSession: Bool
+    /// This reader's requests on `EngineHTTP.session`, ended at close instead of the pool.
+    private let requests = EngineHTTPRequests()
+    /// The idle timeout its own session used to carry, now on each request (`EngineHTTP`). No
+    /// resource ceiling: a large segment from a slow origin that keeps arriving is never cut off (#732).
+    private static let idleTimeoutSeconds: TimeInterval = 15
     /// AE#732: set under `LoadOptions.heldSourceConnection`. Every request of this reader then goes over
     /// one persistent HTTP/1.1 connection per origin, segments one at a time, instead of `session`.
     private let transport: PersistentHTTP1Transport?
@@ -87,22 +91,9 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         self.playlistURL = playlistURL
         self.httpHeaders = httpHeaders
         transport = persistentHTTP1 ? PersistentHTTP1Transport(label: "vod") : nil
-        if let session {
-            self.session = session
-            ownsSession = false
-        } else {
-            let configuration = URLSessionConfiguration.ephemeral
-            // The request timeout is the idle one, the longest wait for the next byte. No resource
-            // ceiling: a large segment from a slow origin that keeps arriving is never cut off (#732).
-            configuration.timeoutIntervalForRequest = 15
-            configuration.timeoutIntervalForResource = .greatestFiniteMagnitude
-            configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-            configuration.urlCache = nil
-            self.session = URLSession(
-                configuration: configuration, delegate: EngineTLS.sessionDelegate,
-                delegateQueue: nil)
-            ownsSession = true
-        }
+        // The engine's one pool unless a caller hands its own; the idle timeout rides each request
+        // (`makeRequest`).
+        self.session = session ?? EngineHTTP.session
     }
 
     /// Returns a pre-resolved reader only when the finite playlist has positive
@@ -314,9 +305,8 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         task?.cancel()
         primed?.abandon()
         transport?.close()
-        if ownsSession {
-            session.invalidateAndCancel()
-        }
+        // An injected session is its caller's; the pool is everyone's, so only this reader's own go.
+        if session === EngineHTTP.session { requests.cancelAll() }
     }
 
     /// No independent cursor: a second reader would mean a second full HTTP ingest of the same VOD
@@ -745,6 +735,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     /// Credentials only where the host's playlist is (audit NET-7).
     func makeRequest(_ url: URL) -> URLRequest {
         var request = URLRequest(url: url)
+        if session === EngineHTTP.session { request.timeoutInterval = Self.idleTimeoutSeconds }
         for (field, value) in scopedHeaders(url) {
             request.setValue(value, forHTTPHeaderField: field)
         }
@@ -768,7 +759,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             }
         } else {
             (data, response) = try await BoundedPlaylistFetch.data(
-                for: makeRequest(url), session: session, limit: Self.maximumPlaylistBytes)
+                for: makeRequest(url), session: session, limit: Self.maximumPlaylistBytes, owner: requests)
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else {
@@ -790,7 +781,8 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
                                                      diagnosticContext: diagnosticContext, role: role)
                 (data, response) = (answer.body, answer.response)
             } else {
-                (data, response) = try await BoundedFetch.data(for: makeRequest(url), session: session, limit: limit, role: role)
+                (data, response) = try await BoundedFetch.data(for: makeRequest(url), session: session, limit: limit,
+                                                               owner: requests, role: role)
             }
         } catch is BoundedFetch.Exceeded {
             throw HLSIngestError.playlistInvalid(reason: "body exceeds \(limit) bytes")
@@ -833,8 +825,13 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         }
         // The whole segment is asked for and the head read off its front: an HEVC source keeps the
         // response for its producer, any other ends it here.
+        let (head, rest) = try await HLSCarriageProbe.openSegmentHead(
             url: url,
+            httpHeaders: scopedHeaders(url),
             session: session,
+            limit: BoundedFetch.segmentLimit(forDuration: duration),
+            owner: session === EngineHTTP.session ? requests : nil,
+            diagnosticContext: diagnosticContext)
         if head.verdict == .hevcInMPEGTS {
             prime(PrimedSegment(url: url, head: head.bytes, rest: .pooled(rest)))
         }

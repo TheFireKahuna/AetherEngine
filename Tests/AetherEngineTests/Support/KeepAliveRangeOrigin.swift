@@ -5,23 +5,34 @@ import Foundation
 /// counts the connections that are still open. A client that leaves its `URLSession` uninvalidated
 /// leaves its pooled socket here, which is the only place that leak is visible from outside: the
 /// session has no public liveness and the origin is the one party that sees the socket.
+///
+/// `replace(with:etag:)` swaps the file behind the URL, as a server whose file was replaced does.
 final class KeepAliveRangeOrigin: @unchecked Sendable {
     let port: UInt16
     private let listener: LoopbackListener
-    private let data: Data
+    private var data: Data
+    private var etag: String?
     private let contentType: String?
     private let lock = NSLock()
     private var connections: Set<Int32> = []
     private var stopped = false
     private var accepted = 0
 
-    init?(data: Data, contentType: String? = nil) {
+    init?(data: Data, etag: String? = nil, contentType: String? = nil) {
         self.data = data
+        self.etag = etag
         self.contentType = contentType
         guard let listener = LoopbackListener(backlog: 16) else { return nil }
         self.listener = listener
         port = listener.port
         listener.start { [self] fd in admit(fd) }
+    }
+
+    func replace(with data: Data, etag: String?) {
+        lock.withLock {
+            self.data = data
+            self.etag = etag
+        }
     }
 
     var openConnectionCount: Int { lock.withLock { connections.count } }
@@ -60,6 +71,7 @@ final class KeepAliveRangeOrigin: @unchecked Sendable {
             lock.unlock()
         }
         while let head = readRequestHead(fd) {
+            let (data, etag) = lock.withLock { (self.data, self.etag) }
             var start = 0
             var end = data.count - 1
             if let range = Self.range(in: head) {
@@ -74,6 +86,7 @@ final class KeepAliveRangeOrigin: @unchecked Sendable {
             let header = "HTTP/1.1 206 Partial Content\r\n"
                 + "Content-Length: \(end - start + 1)\r\n"
                 + "Content-Range: bytes \(start)-\(end)/\(data.count)\r\n"
+                + (etag.map { "ETag: \($0)\r\n" } ?? "")
                 + (contentType.map { "Content-Type: \($0)\r\n" } ?? "")
                 + "Accept-Ranges: bytes\r\nConnection: keep-alive\r\n\r\n"
             guard writeAll(fd, Data(header.utf8)),

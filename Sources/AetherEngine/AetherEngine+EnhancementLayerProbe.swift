@@ -27,7 +27,11 @@ extension AetherEngine {
     ) throws -> DolbyVisionEnhancementLayer? {
         let demuxer = Demuxer()
         defer { demuxer.close() }
+        // No `find_stream_info`: the extradata the RPU read needs for its NAL framing survives without it.
+        try demuxer.open(url: url, extraHeaders: options.httpHeaders, profile: .headPackets)
         let videoIdx = demuxer.videoStreamIndex
         guard videoIdx >= 0 else { return nil }
+        return DolbyVisionRecordAudit.probeEnhancementLayerType(peeking: demuxer, streamIndex: videoIdx)
+            .flatMap(DolbyVisionEnhancementLayer.init(rawValue:))
     }
 }

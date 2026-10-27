@@ -4,9 +4,9 @@ import Foundation
 ///
 /// A HINT, never a verdict. It sends the open to the disc adapter, and `DiscReader.wrap` decides from
 /// the ISO 9660 / UDF structure whether there is a disc there at all; a mislabelled response falls
-/// back to the streaming reader. A URL that did turn out to be a disc is remembered, so the paths
-/// that gate on `Demuxer.isDiscImageURL` before any byte is read (request-header updates, the probe
-/// reader, the next open of the same item) treat it like an `.iso` without asking the origin again.
+/// back to the streaming reader. A source that did turn out to be a disc is recorded on its source cache
+/// entry, so the paths that gate on `Demuxer.isDiscImageURL` before any byte is read (the probe reader,
+/// the next open of the same item) treat it like an `.iso` without asking the origin again.
 enum DiscImageMediaType {
 
     /// `application/x-iso9660-image` is what most servers send for `.iso`, `application/x-cd-image`
@@ -26,24 +26,5 @@ enum DiscImageMediaType {
               let essence = contentType.split(separator: ";", omittingEmptySubsequences: false).first
         else { return false }
         return mediaTypes.contains(essence.trimmingCharacters(in: .whitespaces).lowercased())
-    }
-
-    private static let knownLock = NSLock()
-    nonisolated(unsafe) private static var known: [URL] = []
-
-    static func isKnownDiscImage(_ url: URL) -> Bool {
-        knownLock.withLock { known.contains(url) }
-    }
-
-    static func noteDiscImage(_ url: URL) {
-        knownLock.withLock {
-            known.removeAll { $0 == url }
-            known.append(url)
-            if known.count > 32 { known.removeFirst() }
-        }
-    }
-
-    static func forgetDiscImage(_ url: URL) {
-        knownLock.withLock { known.removeAll { $0 == url } }
     }
 }
