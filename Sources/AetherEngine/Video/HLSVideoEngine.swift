@@ -1,3 +1,4 @@
+import QuartzCore
 import AVFoundation
 import Foundation
 import AetherLibavformat
@@ -84,6 +85,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Whether the panel was already in HDR at load time (`currentEDRHeadroom > 1`). When true,
     /// master-playlist routing is safe regardless of `matchContentEnabled` (AetherEngine#4).
     private let panelIsInHDRMode: Bool
+    /// The load's panel answer when its startup plan decided it before the display switch: the session is
+    /// prepared for the playlist it implies (`plannedServesMaster`) and `serve(panelIsInHDRMode:)` serves it.
+    /// nil leaves the answer to `serve(panelIsInHDRMode:)`, from the settled panel.
+    var plannedPanelIsInHDRMode: Bool?
+    /// The playlist `serve(panelIsInHDRMode:)` will hand AVPlayer, known from `prepare()` on when the load
+    /// planned the panel answer: true for the master, false for the media playlist, nil until `serve`.
+    private(set) var plannedServesMaster: Bool?
+    /// How this session's output carries its audio (`HLSOutputShape`), decided in `prepare()` before the first
+    /// producer is built, from the playlist the load planned.
+    private(set) var outputShape: HLSOutputShape = .muxed
+    /// The demuxed shape's audio rendition: its segments, on the video's indices. Nil when muxed. Guarded by
+    /// `restartLock` with `cache`.
+    var audioRenditionCache: SegmentCache?
 
     /// `dvModeAvailable || keepDvh1TagWithoutDV`; DV routing branches key off this.
     var effectiveDvMode: Bool { dvModeAvailable || keepDvh1TagWithoutDV }
@@ -248,7 +262,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     public private(set) var companionAudioTracks: [TrackInfo] = []
 
     var videoStreamIndex: Int32 = -1
+    /// The video stream the producer muxes: the source's on a native session, the placeholder's on an overlay one.
     var savedVideoConfig: HLSSegmentProducer.StreamConfig?
+    /// The source's own video stream, for everything that decodes its pictures (the keyframe reader, scrub stills,
+    /// the I-frame stills): `savedVideoConfig` on a native session.
+    var sourceVideoConfig: HLSSegmentProducer.StreamConfig?
     var savedAudioConfig: HLSSegmentProducer.AudioConfig?
 
     /// When true, the session exposes the native subtitle WebVTT rendition (separate from the A/V
@@ -259,13 +277,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// AE#682: the host asked for an I-frame rendition. Whether the session can serve one is decided
     /// in `start()` and read back as `iFrameRenditionVerdict`.
     var iFramePlaylistRequested = false
-    /// AE#682: an independent reader for a custom-IO source, which this session cannot reopen by URL.
-    /// Set before `start()`. The session owns it from then on and closes it: through the side reader
-    /// that took it, at once when the rendition stays absent, or in `stop()`.
-    var customIFrameReader: (reader: IOReader, formatHint: String?)?
+    /// An independent reader for a custom-IO source, which this session cannot reopen by URL: what the
+    /// session's keyframe reader reads through (`sessionKeyframeReader`). Set before `start()`. The session
+    /// owns it from then on and closes it: through the keyframe reader that took it, or in `stop()`.
+    var customKeyframeReader: (reader: IOReader, formatHint: String?)?
+    /// The keyframe reader reads a custom source's clone, which has no origin to ration. Set with the reader.
+    private var isCustomKeyframeSource = false
     private(set) var iFrameRenditionVerdict: IFrameRenditionEligibility.Verdict = .absent(.notRequested)
     /// False for a Dolby Vision Profile 5 / 10.0 source in a build without the
-    /// `DolbyVisionStillReshaping` trait: none of its frames can become a correct still.
+    /// `DualLayerDolbyVision` trait: none of its frames can become a correct still.
     private(set) var yieldsStills = true
     /// Dolby Vision without a displayable base layer (Profile 5, AV1 Profile 10.0): only the system
     /// compositor shows it in colour, so scrub previews go through `compositorPreviewFile`.
@@ -295,14 +315,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Native subtitle rendition marked DEFAULT=YES in the master (Sodalite#32). Set before `start()`; the
     /// provider advertises this ordinal as the group default so a host-selected legible track renders.
     var nativeSubtitleDefaultOrdinal: Int = 0
-
-    /// Serve the SUBTITLES rendition as one whole-program .vtt (Sodalite#32). Set before `start()`.
-    var nativeSubtitleWholeProgram: Bool = false
-
-    /// Source position (seconds) the playback stream started at (resume/seek). Device-confirmed AVKit anchors a
-    /// whole-program VOD .vtt's time 0 to the stream start, so whole-program cues shift by this so cue-for-source-S
-    /// lands at currentTime S (from-start = 0 = no shift). Set before `start()`. Sodalite#32.
-    var subtitleStreamStartSeconds: Double = 0
 
     /// Source position (seconds, playlist axis) the session will start at (resume/seek). Set
     /// before `start()`; anchors the FIRST producer at the matching segment instead of seg0
@@ -377,6 +389,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Guarded by subtitleTapLock: an abandoned wedged producer's final packets can race the replacement
     /// producer's tap.
     private var subtitleTapRoutes: [Int32: (decoder: EmbeddedSubtitleDecoder, store: NativeSubtitleCueStore)] = [:]
+    /// Streams the tap leaves alone: the ones the session's subtitle source reads from the index, whose
+    /// renditions the index fills whole at load. Under `subtitleTapLock`.
+    private var subtitleTapExcludedStreams: Set<Int32> = []
     private let subtitleTapLock = NSLock()
 
     /// #112 rework: session-lifetime retention of every embedded subtitle stream's packets,
@@ -479,20 +494,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         subtitleTapLock.lock()
         defer { subtitleTapLock.unlock() }
         subtitleTapRoutes.removeAll()
-        guard let dem = demuxer else { return }
-        let w = savedVideoConfig.map { Int32($0.codecpar.pointee.width) } ?? 1920
-        let h = savedVideoConfig.map { Int32($0.codecpar.pointee.height) } ?? 1080
+        guard demuxer != nil else { return }
         for (ordinal, sidx) in nativeSubtitleSourceStreamIndicesForSession.enumerated() {
-            guard let sidx, ordinal < nativeSubtitleCueStoresForSession.count else { continue }
-            // Audit DMX-108: see `makeOverlayDecoder`.
-            let made = dem.withStream(at: sidx) { stream in
-                EmbeddedSubtitleDecoder(stream: stream,
-                                        sourceVideoWidth: w > 0 ? w : 1920,
-                                        sourceVideoHeight: h > 0 ? h : 1080,
-                                        preserveASSMarkup: preserveASSMarkupForSubtitleTap,
-                                        teletextPage: teletextPageForSubtitleTap)
-            }
-            guard let decoder = made ?? nil else { continue }
+            guard let sidx, !subtitleTapExcludedStreams.contains(sidx), ordinal < nativeSubtitleCueStoresForSession.count,
+                  let decoder = makeOverlayDecoder(streamIndex: sidx) else { continue }
             subtitleTapRoutes[sidx] = (decoder, nativeSubtitleCueStoresForSession[ordinal])
         }
         if !subtitleTapRoutes.isEmpty {
@@ -513,6 +518,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let prod = producer
         restartLock.unlock()
         guard hasRoutes else { return }
+        rebuildSubtitleTapRoutes()
+        armSubtitleTap(on: prod)
+    }
+
+    /// Layer 3 step 3: the subtitle source's routes are settled, and `streams` are read from the index. The
+    /// tap stops decoding them, on this producer and every later one.
+    func excludeFromSubtitleTap(_ streams: Set<Int32>) {
+        subtitleTapLock.lock()
+        subtitleTapExcludedStreams = streams
+        subtitleTapLock.unlock()
+        restartLock.lock()
+        let prod = producer
+        restartLock.unlock()
         rebuildSubtitleTapRoutes()
         armSubtitleTap(on: prod)
     }
@@ -541,6 +559,46 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
     }
 
+    /// Where the installed producer began reading and how far it has read, for the cue stores' reading spans
+    /// (`noteSourceRead`). Under `subtitleTapLock`.
+    private var sourceReadRun: (epoch: UInt64, from: Double)?
+
+    /// Pump thread: the installed producer has read the source through `seconds` (`.infinity`: to its end).
+    /// Its run of the harvest coverage (#416) begins at its first read and extends with every later one, so
+    /// the drain and the OCR worker can tell a stretch with no subtitle in it from one nobody read; each text
+    /// stream the tap decodes has every cue before it, so its rendition can answer a request there at once.
+    /// A cue store is told a margin short of the read: a muxer interleaves a subtitle block by its own time,
+    /// which can trail the video packet in hand.
+    private func noteSourceRead(through seconds: Double, producerEpoch: UInt64) {
+        subtitleTapLock.lock()
+        defer { subtitleTapLock.unlock() }
+        guard let run = sourceReadRun, run.epoch == producerEpoch else {
+            sourceReadRun = (producerEpoch, seconds)
+            subtitlePacketStore.noteHarvestAnchor(at: seconds)
+            return
+        }
+        guard seconds.isFinite else {
+            subtitlePacketStore.noteHarvestEnd()
+            for route in subtitleTapRoutes.values { route.store.noteRead(from: run.from, through: .infinity) }
+            onSourceReadToEnd?()
+            return
+        }
+        subtitlePacketStore.noteHarvestProgress(through: seconds)
+        let through = seconds - AetherEngine.nativeSubtitleReadMarginSeconds
+        guard through > run.from else { return }
+        for route in subtitleTapRoutes.values { route.store.noteRead(from: run.from, through: through) }
+    }
+
+    /// The installed producer read the source to its end: every subtitle packet is in the store.
+    var onSourceReadToEnd: (@Sendable () -> Void)?
+
+    /// The segment that holds `subtitleReadAheadThrough`, one past it so the read covers its end; nil while
+    /// nobody asks. On the playlist axis the plan is stamped on: source time less the seam shift.
+    private func subtitleReadAheadSegmentIndex() -> Int? {
+        guard let through = subtitleReadAheadThrough?(), through.isFinite else { return nil }
+        return segmentIndexForPlaylistTime(through - playlistShiftSeconds) + 1
+    }
+
     /// Pump-thread callback: decode the tapped packet into its ordinal's cue store. Text subtitle decode
     /// is a parse (microseconds), so it runs inline; the lock serializes an abandoned producer's tail
     /// against the replacement producer.
@@ -555,10 +613,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
     }
 
-    /// Per-frame fallback durations in source time_base for backfilling `pkt->duration`
-    /// when the matroska demuxer drops per-block durations. Computed once in `start()`.
+    /// Per-frame fallback duration in source time_base for backfilling `pkt->duration` when the
+    /// matroska demuxer drops per-block durations. Computed once in `start()`; audio's is its
+    /// `AudioConfig.frameDuration`.
     private var videoFallbackDurationPts: Int64 = 40
-    private var audioFallbackDurationPts: Int64 = 0
 
     /// First video keyframe PTS in source video TB. Non-zero on MKV remuxes where the IDR lives
     /// past PTS=0. Producer subtracts this from every packet so seg-0's tfdt aligns with the
@@ -569,6 +627,30 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `playlistShiftSeconds` (updated dynamically per gate open).
     public private(set) var firstKeyframeSeconds: Double = 0
 
+    /// The video is decoded by the session's own decoder and shown in the software overlay, AVPlayer served a
+    /// placeholder of its format (`OverlayPlaceholder`): a stream AVPlayer cannot decode itself. Set by the engine
+    /// before `prepare()`.
+    var overlayDecodesVideo = false
+    /// That placeholder, made by `prepare()`; every producer of the session serves it in place of the source's video.
+    private(set) var overlayPlaceholder: OverlayPlaceholder?
+    /// The overlay session's own decode of the source, fed by every producer and shown by `DecodedPictureSource`.
+    /// Made by `prepare()`.
+    private(set) var overlayDecodeTap: OverlayDecodeTap?
+    /// What the overlay's decoder does with interlaced carriage, as the load decided. Set before `prepare()`.
+    var overlayDeinterlace = DeinterlaceConfig()
+    /// The overlay decoder's A53 captions, in presentation order on the source axis (the native route's are read off
+    /// the packets, `a53CaptionObserverForSession`, and AVPlayer is served placeholder bytes here).
+    var overlayCaptionObserverForSession: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
+
+    #if DualLayerDolbyVision
+    /// `LoadOptions.felOverlay`: every producer of the session hands its enhancement layer to this tap, which
+    /// the FEL overlay reads. Set by the engine before the session starts.
+    var felTap: FelEnhancementTap?
+    /// Whether the video's parameter sets state full range, which is the range AVPlayer decodes the picture with:
+    /// the FEL overlay asks for the matching format so it reads the base layer's own codes. Set by `prepare()`.
+    private(set) var parameterSetsStateFullRange = false
+    #endif
+
     /// AE#270: source PTS the container's timeline starts at, clamped at 0. The published playhead folds
     /// it out so it stays on the same 0-based axis as `duration`.
     public private(set) var sourceStartSeconds: Double = 0
@@ -576,8 +658,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// mutable demuxer from the main actor while playback is reading or tearing down.
     private(set) var openedSourceIsSeekable = false
 
-    /// Result of the stream-copy / FLAC-bridge / video-only cascade. Possible values:
-    /// `"Stream-copy (EAC3+JOC Atmos)"`, `"Stream-copy (<CODEC>)"`, `"<CODEC> → FLAC bridge"`.
+    /// Result of the stream-copy / bridge / video-only cascade. Possible values:
+    /// `"Stream-copy (EAC3+JOC Atmos)"`, `"Stream-copy (<CODEC>)"`, `"<CODEC> → PCM bridge"`, `"<CODEC> → EAC3 bridge"`.
     /// nil when no audio pipeline is live.
     public internal(set) var audioPipelineDescription: String?
 
@@ -613,62 +695,24 @@ public final class HLSVideoEngine: @unchecked Sendable {
         shiftLock.lock(); _playlistShiftSeconds = value; shiftLock.unlock()
     }
 
-    /// AE#418 round 2 + PR #533: what each epoch left at the index it opened on, both what its first
-    /// segment adds to the axis and what all of its bytes carry. See `EpochAxisTable`.
     private let anchorShiftLock = NSLock()
-    private(set) var epochAxisByIndex = EpochAxisTable()   // internal read for the superseded-producer tests
-    /// PR #533 round 2: how far AVPlayer's OWN timeline is displaced from the playlist, which is the
-    /// quantity every AE#418 rule is about.
-    ///
-    /// The published axis is this plus the normalization the bytes carry, and on a source whose
-    /// timestamps start at zero those are one number, which is why eleven rounds could compose the
-    /// whole axis and be right. Measured on the 600 s twin: a second placement worth 596.833 s
-    /// composed onto a standing 599.625 s published **1196.458 s** and put the seam at item
-    /// -531.625 s, i.e. it added the source origin a second time. Zero at load, because a fresh
-    /// item's timeline is undisplaced on any source.
-    private var placementOffsetSeconds: Double = 0
-    /// AE#418 round 8: how far below the axis it composed on the last measured placement actually
-    /// landed, in seconds. Zero until a placement has been read back, which is also what makes an
-    /// item's FIRST placement compose onto the axis itself.
-    ///
-    /// Rounds 5 to 7 carried this as a multiple of the epoch's presentation lead, on the premise that
-    /// the distance is a geometry of the source. It is not: `tc-cues-lie.mkv` has no frame reordering
-    /// at all, so every gate opens with a lead of exactly zero, and its third placement still sits a
-    /// frame below its axis (2 runs of 2). No coefficient can express that, and on `tc-bf1-cues-lie`
-    /// one source places twice and reads 0.000 then 0.083. So the distance is measured in the units
-    /// it corrects, and every reading teaches it, including the ones that confirm.
-    private var lastPlacementDisplacement: Double = 0
-    /// AE#418 round 7: what the local server did with the request each placement was counted from,
-    /// stamped with the serial of the answer. `true` once its bytes went out, `false` when the
-    /// response failed. A placement is a request that was ANSWERED, and until it is answered there is
-    /// nothing to conclude from an empty buffer. The serial is what keeps an OLD answer for the same
-    /// index (a segment served once, seeked back to, and requested again) from answering for a
-    /// request still in flight.
-    private var segmentDeliveryByIndex: [Int: (serial: Int, delivered: Bool)] = [:]
-    private var segmentDeliverySerial = 0
-    /// AE#418 round 3: the placement this session last published an axis for, so the prediction can be
-    /// checked against where AVPlayer actually put those bytes.
-    private var lastPublishedPlacement: PublishedPlacement?
-    /// AE#481: the first segment the local server answered after the most recent seek, which is the one
-    /// whose content opens the run that landing sits in. Identifying it is what makes the landing
-    /// reading a question about ONE segment: asked of the whole plan, "does this run open on a playlist
-    /// position" is a coincidence 31 boundaries wide.
-    private var firstDeliveredIndexSinceSeek: Int?
-    /// The last index a fetch declared. A cold fetch reaches the provider BEFORE the producer has
-    /// opened its gate, so the placement can precede the offset it is worth; this is what lets the
-    /// gate publish for a placement that already happened.
-    private var lastPlacedIndex: Int = .min
-    /// AE#412: the index the most recent gate open belongs to and what it opened with. Separate from
-    /// `epochAxisByIndex` because a re-cut BLOCKS on it: a waiter needs something to be signalled on,
-    /// which a dictionary is not. Signalled through `gateOpenCondition`.
-    private var lastGateOpen: (index: Int, axis: EpochAxis)?
+    /// The source-to-item normalization each VOD segment's bytes were written with, by index: a frame's
+    /// time in the segment file plus this is its source time. Reported by the producer as each segment
+    /// is finalized (`HLSSegmentProducer.onSegmentWritten`); read for scrub thumbnails, which decode
+    /// the file itself. Guarded by `anchorShiftLock`.
+    private var carriedSecondsByIndex: [Int: Double] = [:]
+    /// docs/segment-axis.md: the in-band clock's last reading, from which the published axis moves only
+    /// when a reading differs (`noteInBandClock`). Guarded by `anchorShiftLock`.
+    private var lastClockReading: (itemSeconds: Double, axis: Double)?
+    /// AE#412: the index the most recent gate open belongs to and how far below its boundary it
+    /// opened. A re-cut BLOCKS on it, so it is signalled through `gateOpenCondition`.
+    private var lastGateOpen: (index: Int, backoffSeconds: Double)?
     private let gateOpenCondition = NSCondition()
-    /// AE#412: indices whose epoch an AE#412 re-cut started. Such a segment goes into a timeline
-    /// AVPlayer is already building, and it puts it at its own tfdt there (measured 3 of 3 with
-    /// `play --picture-probe`: `axisErr` 0.000 at offsets of 1, 5 and 9 s), so its distance to its
-    /// advertised start is not an axis offset and must not compose into one. Guarded by
-    /// `anchorShiftLock`, alongside the table it keeps entries out of.
-    private var recutMark: RecutMark?
+    /// The index of the last gate open a re-cut can wait on (internal read for the superseded-producer tests).
+    var gateOpenedIndex: Int? {
+        gateOpenCondition.lock(); defer { gateOpenCondition.unlock() }
+        return lastGateOpen?.index
+    }
     /// Epoch of `producer`, mirrored under `anchorShiftLock` (audit SEG-104).
     private var installedProducerEpoch: UInt64?
     private let shiftLock = NSLock()
@@ -689,10 +733,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// and can still be in AVPlayer's buffer, so the host records a seam rather than replacing the scalar (#260).
     var onPlaylistShiftChanged: (@Sendable (Double, Double) -> Void)?
 
-    /// #240: link arbitration shared with the engine's subtitle side readers. Set by `AetherEngine`
-    /// before `start()`; nil when the session is driven without one (`aetherctl`, tests), which
-    /// leaves the readers ungated exactly as before.
-    var sideReaderLinkGate: SideReaderLinkGate?
+    /// #240: whether a seek is in flight, which a scrub thumbnail's read waits out. Set by `AetherEngine`
+    /// before `start()`; nil when the session is driven without one (`aetherctl`, tests).
+    var seekInFlight: SeekInFlightSignal?
+
+    /// Layer 3 step 5: how far on the source axis the subtitle consumers want a stream only the pump reads
+    /// to have been read; nil while nobody asks. Read by every producer where it parks, which then reads
+    /// on past its forward window to the segment that holds it. Set by `AetherEngine` before `start()`.
+    var subtitleReadAheadThrough: (@Sendable () -> Double?)?
 
     /// Fires when AVKit scrub drives a producer restart (AetherEngine#38). `(true, playlistTime)`
     /// at restart-run start; `(false, nil)` when settled. `playlistTime` folds with
@@ -771,6 +819,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Fires on live program-boundary rebase: `(newShiftSeconds, seamOutputSeconds)`. AetherEngine
     /// defers applying the shift until playback crosses `seamOutputSeconds` so the clock doesn't jump.
     var onPlaylistShiftRebased: (@Sendable (Double, Double) -> Void)?
+    /// A live programme's video colour from the item time it starts at (`HLSSegmentProducer.onLiveVideoColour`).
+    var onLiveVideoColour: (@Sendable (_ itemSeconds: Double, _ colour: ColorDescription) -> Void)?
     /// Fires when a longer finalized segment requires a new live playlist URL.
     var onLivePlaylistRenewal: (@Sendable () -> Void)?
     func renewedLivePlaylistURL(replacing url: URL) -> URL? {
@@ -843,10 +893,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
     }
     private let silentBridgeSurfaceLock = NSLock()
     private var silentBridgeFailureSurfaced = false
-    /// Session-long FLAC bridge for codecs illegal in fMP4. Engine-owned (not producer-owned) so
-    /// encoder state survives producer restarts; `startSegment()` rebases PTS on each restart.
+    /// Session-long audio bridge for codecs illegal in fMP4, or the runs that make each segment of a
+    /// seekable VOD session (`AudioSegmentRuns`). Engine-owned (not producer-owned) so the muxer's
+    /// parameters and a single run's encoder survive producer restarts; `startSegment()` rebases a
+    /// single run's PTS on each restart, and drops the segment runs.
     var audioBridge: (any AudioTranscodingBridge)?
     var segmentPlan: [Segment] = []
+    /// AE#682: every indexed keyframe of a keyframe-aligned plan, on its axis; the I-frame timeline is
+    /// thinned from these (`iFrameEntries`). Empty for every other plan.
+    var planKeyframePts: [Int64] = []
 
     /// AE#408: true only while `segmentPlan` is the keyframe-aligned plan, whose boundaries are
     /// container index entries and therefore CLAIM to be random-access points. The producer re-aims
@@ -870,10 +925,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// that has already been cut; `AetherEngine.setAudioDelay` writes it as part of a reload, which is
     /// what actually replaces the segments and the item holding them.
     public var audioDelaySeconds: Double = 0
-
-    /// `LoadOptions.progressiveSegmentDelivery`, handed to the provider and to every producer this
-    /// session builds. Set before `start()`.
-    var servesSegmentsProgressively = false
 
     /// Serializes restart requests among themselves. Held across waits (unlike `restartLock`);
     /// only other restarts contend on it.
@@ -979,6 +1030,27 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Target segment duration (4 s). Apple spec recommends 6 s; 4 s cuts ~370 ms first-segment
     /// latency on a 24 fps 1440p LAN source and stays within the spec's 2-6 s range.
     static let targetSegmentDuration: Double = 4.0
+
+    /// Cut target of the VOD keyframe plan (2 s). A native seek is served the whole segment holding its
+    /// target before AVPlayer sees a byte, and AVPlayer buffers about one segment before it starts, so the
+    /// segment length is the seek latency: on a UHD remux a 4 s cut measured 0.62 s to serve and 1.46 s
+    /// from seek to motion on the device. Live and the uniform-stride fallback keep `targetSegmentDuration`:
+    /// live window sizing is tuned around it, and a grid finer than an unmeasured GOP advertises segments
+    /// no keyframe opens (#358). A GOP longer than this still cuts once per GOP.
+    static let vodKeyframeSegmentTarget: Double = 2.0
+
+    /// `LoadOptions.forwardBufferSegments` and the cache's backward window count `targetSegmentDuration`
+    /// segments. A VOD session holds this many of its own per counted one, so both keep their depth in
+    /// seconds.
+    static let vodSegmentsPerCountedSegment = Int((targetSegmentDuration / vodKeyframeSegmentTarget).rounded())
+
+    /// The session's forward window in its own segments: the clamped request, scaled for VOD.
+    static func sessionForwardWindow(requested: Int?, isLive: Bool) -> Int {
+        let counted = clampedForwardWindow(requested)
+        guard !isLive else { return counted }
+        let (scaled, overflow) = counted.multipliedReportingOverflow(by: vodSegmentsPerCountedSegment)
+        return overflow ? counted : scaled
+    }
 
     /// Live cut target under `LiveJoinProfile.fastZap` (AE#195): cut at every keyframe past 0.5 s, so
     /// segments quantize to the source GOP and the served TARGETDURATION (whose 3 x holdback gates the
@@ -1105,6 +1177,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         undecodableAudioStreamIndices: Set<Int32> = [],
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         objectAudioRendering: ObjectAudioRendering = .off,
+        objectDialogueGain: Float = 0,
         stereoPresentation: StereoPresentation = .automatic,
         stereoOnAnySystem: Bool = false,
         isLiveSession: Bool = false,
@@ -1163,6 +1236,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.undecodableAudioStreamIndices = undecodableAudioStreamIndices
         self.audioBridgeMode = audioBridgeMode
         self.objectAudioRendering = objectAudioRendering
+        self.objectDialogueGain = objectDialogueGain
         self.stereoPresentation = stereoPresentation
         self.stereoOnAnySystem = stereoOnAnySystem
         self.isLiveSession = isLiveSession
@@ -1200,7 +1274,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.sourceReopenableByURL = sourceReopenableByURL
         self.customSourceReopenFactory = customSourceReopenFactory
         self.companionAudioReader = companionAudioReader
-        self.forwardWindowSegments = Self.clampedForwardWindow(forwardBufferSegments)
+        self.forwardWindowSegments = Self.sessionForwardWindow(requested: forwardBufferSegments,
+                                                               isLive: isLiveSession)
         self.requestedSessionCacheBudgetBytes = sessionCacheByteBudget.map { max(0, $0) }
     }
 
@@ -1289,6 +1364,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// TrueHD Atmos and DTS:X delivery (#731, see `ObjectAudioRendering`); consulted before `audioBridgeMode`.
     let objectAudioRendering: ObjectAudioRendering
+    /// `LoadOptions.objectDialogueGain`, in dB.
+    let objectDialogueGain: Float
 
     /// Pre-opened demuxer reused by `start()` to skip `avformat_find_stream_info` (~1-3 s on slow CDN).
     /// Consumed in `start()`; unconsumed instances are closed by `stop()`.
@@ -1412,35 +1489,34 @@ public final class HLSVideoEngine: @unchecked Sendable {
         guard videoIndex >= 0, let videoStream = dem.stream(at: videoIndex) else {
             throw HLSVideoEngineError.noVideoStream
         }
-        let codecpar = videoStream.pointee.codecpar!
-        let isHEVC = codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
-        let isH264 = codecpar.pointee.codec_id == AV_CODEC_ID_H264
-        let isAV1 = codecpar.pointee.codec_id == AV_CODEC_ID_AV1
+        let sourceCodecpar = videoStream.pointee.codecpar!
+        let isHEVC = sourceCodecpar.pointee.codec_id == AV_CODEC_ID_HEVC
+        let isH264 = sourceCodecpar.pointee.codec_id == AV_CODEC_ID_H264
+        let isAV1 = sourceCodecpar.pointee.codec_id == AV_CODEC_ID_AV1
 
         // Log codecpar for AVPlayer -11821 triage: interlaced field_order and malformed Annex-B
         // extradata are the two candidates when channels mux cleanly but VT chokes post readyToPlay.
-        let extraSize = Int(codecpar.pointee.extradata_size)
+        let extraSize = Int(sourceCodecpar.pointee.extradata_size)
         var extraHead = "none"
-        if extraSize > 0, let extra = codecpar.pointee.extradata {
+        if extraSize > 0, let extra = sourceCodecpar.pointee.extradata {
             let n = min(extraSize, 8)
             extraHead = (0..<n).map { String(format: "%02x", extra[$0]) }.joined()
         }
         EngineLog.emit(
-            "[HLSVideoEngine] video codecpar: codec=\(codecpar.pointee.codec_id.rawValue) "
-            + "\(codecpar.pointee.width)x\(codecpar.pointee.height) "
-            + "profile=\(codecpar.pointee.profile) level=\(codecpar.pointee.level) "
-            + "fieldOrder=\(codecpar.pointee.field_order.rawValue) "
+            "[HLSVideoEngine] video codecpar: codec=\(sourceCodecpar.pointee.codec_id.rawValue) "
+            + "\(sourceCodecpar.pointee.width)x\(sourceCodecpar.pointee.height) "
+            + "profile=\(sourceCodecpar.pointee.profile) level=\(sourceCodecpar.pointee.level) "
+            + "fieldOrder=\(sourceCodecpar.pointee.field_order.rawValue) "
             + "extradata=\(extraSize)B head=\(extraHead)",
             category: .session
         )
 
-        // AV1: gated on VTCapabilityProbe.av1Available (false on all current Apple TV chips;
-        // load() routes AV1 to SoftwarePlaybackHost instead). VP9: excluded despite VT HW
-        // decode capability because AVPlayer's HLS manifest parser rejects the `vp09` CODECS
-        // attribute; load() routes VP9 to SoftwarePlaybackHost.
+        // AVPlayer decodes HEVC, H.264 and, where VideoToolbox has it, AV1 (no current Apple TV chip). Everything
+        // else (VP9, whose `vp09` CODECS AVPlayer's HLS parser rejects, MPEG-2, VC-1, AV1 in software) plays in
+        // the software overlay, whatever its codec.
         let av1OK = isAV1 && VTCapabilityProbe.av1Available
-        guard isHEVC || isH264 || av1OK else {
-            throw HLSVideoEngineError.unsupportedCodec(rawCodecID: codecpar.pointee.codec_id.rawValue)
+        guard overlayDecodesVideo || isHEVC || isH264 || av1OK else {
+            throw HLSVideoEngineError.unsupportedCodec(rawCodecID: sourceCodecpar.pointee.codec_id.rawValue)
         }
 
         let videoTimeBase = videoStream.pointee.time_base
@@ -1479,22 +1555,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // a repaired stream and the container's own index have to describe one ladder.
             dem.decideCompositionOffsetRepair()
 
-            // AE#585: everything from here to the cursor reset in step 6 is index work, and it ends
-            // where it began. Without this bracket the prewarm's seek to the middle reads as
-            // playback moving away, the retained head is released, and playback's first read at
-            // offset zero re-fetches the bytes the open (or the warm) already paid for.
-            dem.beginIndexPass()
-
             // 2. Prewarm MKV Cues so libavformat's keyframe index is populated (1-2 byte-range reads).
             //    Bounded: a missing/out-of-bounds Cues index degrades into a multi-GB linear scan;
             //    abort past the deadline and fall back to the uniform-stride plan.
             //    #268: a segmented time-seekable source (HLS VOD ingest) has no index libavformat could
             //    load, and each reposition refetches a segment, so prewarming would buy the same
             //    uniform-stride plan for the price of two segment downloads at every session start.
-            if !Self.cuePrewarmMayRun(hasSegmentedReader: dem.timeSeekableReader != nil,
-                                      isSourceSeekable: dem.isSourceSeekable) {
+            if !Self.cuePrewarmMayRun(dem) {
                 EngineLog.emit(
-                    dem.timeSeekableReader != nil
+                    !dem.loadsIndexOnFirstSeek
+                        ? "[HLSVideoEngine] cue prewarm: skipped, \(dem.containerFormatName ?? "this container") has no index a seek loads"
+                        : dem.timeSeekableReader != nil
                         ? "[HLSVideoEngine] cue prewarm: skipped for a segmented source (no index to load, every reposition refetches a segment)"
                         : "[HLSVideoEngine] cue prewarm: skipped for a forward-only source (the seek would be a linear read, "
                           + "and the prefix it consumes is the producer's only pass)"
@@ -1553,12 +1624,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     sourceDurationSeconds: durationSeconds
                 )
                 planBoundariesClaimRandomAccess = true
+                planKeyframePts = keyframes
                 keyframeBytePositions = Dictionary(keyframeEntries.map { ($0.pts, $0.pos) },
                                                    uniquingKeysWith: { first, _ in first })
-                // AE#561: these boundaries ARE this container's index entries, so they carry its
-                // stamping. Read from the demuxer that produced them, never from the URL or the
-                // host's metadata: on a remux session the delivered container is the one indexed.
-                planBoundaryAxis = PlanBoundaryAxis.forContainer(formatName: dem.containerFormatName)
+                // AE#561: these boundaries ARE the source's index entries (a Blu-ray title's EP maps),
+                // so they carry its stamping. Read from the demuxer that produced them, never from the
+                // URL or the host's metadata: on a remux session the delivered container is the one indexed.
+                planBoundaryAxis = dem.keyframeIndexAxis
                 let firstKeyframePts = keyframes.sorted().first ?? 0
                 self.firstKeyframePts = firstKeyframePts
                 let firstKeyframeSeconds = Double(firstKeyframePts) * Double(videoTimeBase.num) / Double(videoTimeBase.den)
@@ -1575,15 +1647,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
             } else {
                 // Anchor the uniform plan at the content start so seg 0 is the first real keyframe, not an
                 // empty source-0 segment the producer never emits (which strands AVPlayer's seg0 fetch; #64
-                // follow-up). Prefer the first indexed keyframe; fall back to the video stream start_time.
+                // follow-up): the first IRAP the spacing scan reads from the head (`uniformPlanAnchor`),
+                // without a scan the first indexed entry or the stream's start_time.
                 let sorted = keyframes.sorted()
                 let streamStart = videoStream.pointee.start_time
-                let anchorPts = sorted.first ?? (streamStart != Int64.min ? max(0, streamStart) : 0)
+                let provisionalAnchor = sorted.first ?? (streamStart != Int64.min ? max(0, streamStart) : 0)
                 // #358: a grid finer than the GOP advertises boundaries no keyframe sits on, and the
                 // keyframe-gated cutter leaves every one of them without a segment while the playlist
                 // still offers it. Measure the spacing instead of assuming the target fits it.
-                let anchorSeconds = Double(anchorPts) * Double(videoTimeBase.num) / Double(videoTimeBase.den)
                 let spacing: KeyframeSpacing
+                var scan: KeyframeScan?
                 let stride: Double
                 if sequentialOriginPinsProducerToZero {
                     // #370: the spacing scan starts with a seek (a silent no-op on the non-seekable
@@ -1595,14 +1668,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     spacing = .unknown
                     stride = Self.targetSegmentDuration
                 } else {
-                    spacing = measureKeyframeSpacing(
+                    let measured = Self.measureKeyframeSpacing(
                         demuxer: dem,
                         videoStreamIndex: videoIndex,
-                        videoTimeBase: videoTimeBase,
-                        fromSeconds: anchorSeconds
+                        videoTimeBase: videoTimeBase
                     )
+                    scan = measured
+                    spacing = measured.spacing
                     stride = Self.uniformStrideSeconds(spacing: spacing)
                 }
+                let anchorPts = Self.uniformPlanAnchor(scan: scan, axis: planBoundaryAxis, provisional: provisionalAnchor)
                 plan = Self.buildUniformSegmentPlan(
                     videoTimeBase: videoTimeBase,
                     sourceDurationSeconds: durationSeconds,
@@ -1642,17 +1717,38 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     }
                 }
                 EngineLog.emit(
-                    "[HLSVideoEngine] segment plan: uniform stride fallback (\(reason), anchorPts=\(anchorPts), "
+                    "[HLSVideoEngine] segment plan: uniform stride fallback (\(reason), anchorPts=\(anchorPts) "
+                    + "(\(scan?.firstKeyframe != nil ? "first IRAP read" : "no IRAP read, index or stream start")), "
                     + "\(spacingText) → stride=\(String(format: "%.3f", stride))s, \(plan.count) segments)",
                     category: .session
                 )
             }
         }
 
+        // 3b. The software overlay: from here on the session describes the placeholder AVPlayer is served, and
+        //     only the packet scans below read the source's own parameters.
+        let sourceFraming = normalizeVideoFraming(demuxer: dem, videoStreamIndex: videoIndex,
+                                                  codecpar: sourceCodecpar, isLive: isLiveSession)
+        let codecpar: UnsafeMutablePointer<AVCodecParameters>
+        if overlayDecodesVideo {
+            let framing = sourceFraming.measuredFraming ?? A53SEIParser.nalFraming(
+                codec: .hevc, extradata: sourceCodecpar.pointee.extradata.map { UnsafePointer($0) },
+                size: Int(sourceCodecpar.pointee.extradata_size))
+            guard let placeholder = OverlayPlaceholder(source: sourceCodecpar, framing: framing) else {
+                throw HLSVideoEngineError.openFailed(reason: "no HEVC encoder for the overlay's placeholder")
+            }
+            let placeholderParams = try placeholder.codecParameters(source: sourceCodecpar)
+            ownedCodecParams.append(placeholderParams)
+            overlayPlaceholder = placeholder
+            codecpar = placeholderParams.ptr
+        } else {
+            codecpar = sourceCodecpar
+        }
+
         // 4. Classify DV variant; per-profile policy in `resolveCodecRoute`.
         let route = try resolveCodecRoute(codecpar: codecpar)
         let codecTagOverride = route.codecTagOverride
-        let videoRange = route.videoRange
+        var videoRange = route.videoRange
         let primaryCodecs = route.primaryCodecs
         let supplementalCodecs = route.supplementalCodecs
         let doviConfig = route.doviConfig
@@ -1682,12 +1778,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         //       muxer reads that as "the bitstream is Annex B too" and rewrites every sample; when the
         //       packets are in fact length-prefixed it empties them. Measured on packets, then the
         //       record is converted so the muxer's own test comes out right.
-        let framingNormalization = normalizeVideoFraming(
-            demuxer: dem,
-            videoStreamIndex: videoIndex,
-            codecpar: codecpar,
-            isLive: isLiveSession
-        )
+        //    The overlay's placeholder record is the encoder's own, length-prefixed: none of this applies.
+        let framingNormalization = overlayDecodesVideo
+            ? VideoFramingNormalization(extradataOverride: nil, measuredFraming: .lengthPrefixed(size: 4))
+            : sourceFraming
         let measuredVideoNALFraming = framingNormalization.measuredFraming
 
         // Resolved here, before the config record is rebuilt: an MV-HEVC session keeps one SEI the AE#187
@@ -1700,7 +1794,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             systemPresentsStereo: stereoOnAnySystem || StereoVideoSignal.systemPresentsStereo
         )
         let hevcExtradataOverride: [UInt8]?
-        if let normalized = framingNormalization.extradataOverride {
+        if overlayDecodesVideo {
+            hevcExtradataOverride = nil
+        } else if let normalized = framingNormalization.extradataOverride {
             hevcExtradataOverride = normalized
         } else if let rebuilt = rebuildHEVCExtradataWithInBandParameterSets(
             demuxer: dem,
@@ -1730,6 +1826,28 @@ public final class HLSVideoEngine: @unchecked Sendable {
             hevcExtradataOverride = nil
         }
 
+        // 5b. HDR10 static metadata stated only in-band (MPEG-TS, a Matroska remuxed from one): read
+        //     the SEI so movenc writes `mdcv` / `clli`, and for a `dvh1` sample entry or a composed FEL the
+        //     first RPU's base-layer range and L6. See `InBandHDRStaticMetadata`.
+        let inBandHDRMetadata = scanInBandHDRStaticMetadata(
+            demuxer: dem,
+            videoStreamIndex: videoIndex,
+            codecpar: sourceCodecpar,
+            framing: sourceFraming.measuredFraming,
+            isLive: isLiveSession,
+            readsDolbyVisionRPU: codecTagOverride == "dvh1" || composesFEL
+        )
+        let sdrUpgradedToHLG = inBandHDRMetadata.videoRange(upgrading: videoRange) != videoRange
+        if sdrUpgradedToHLG {
+            videoRange = .hlg
+            EngineLog.emit(
+                "[HLSVideoEngine] alternative transfer SEI names ARIB STD-B67 over a "
+                + "trc=\(codecpar.pointee.color_trc.rawValue) VUI: backward-compatible HLG, "
+                + "VIDEO-RANGE=HLG and colr transfer 18",
+                category: .session
+            )
+        }
+
         // 6. Reset demuxer cursor to 0 (cue prewarm moved it mid-file). Skipped for live
         //    (no prewarm, forward-only feed), and for a forward-only VOD source: the prewarm did not
         //    run there, so the cursor never left the head, and a seek on a pb that cannot rewind
@@ -1737,7 +1855,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         //    stream has got to (a remote MKV lost its first second, on the software path 30 s).
         if !isLiveSession {
             if dem.isSourceSeekable { dem.seek(to: 0) }
-            dem.endIndexPass()      // AE#585: the next read that lands outside a span is playback's
         }
         demuxerAtInitialProducerStart = false
 
@@ -1752,7 +1869,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage
         #endif
-        let capRelaxed = Self.retentionCapRelaxed(forwardWindowSegments: forwardWindowSegments)
+        // The ceiling counts 4 s segments, so the opt-in reads the host's request, not the scaled window.
+        let capRelaxed = Self.retentionCapRelaxed(
+            forwardWindowSegments: forwardWindowSegments / (isLiveSession ? 1 : Self.vodSegmentsPerCountedSegment))
         // Size the custom byte ceiling against capacity left by other running sessions.
         var resolvedBudget: SessionCacheBudgetResolution?
         let claim = RetentionClaims.shared.claim(volumeAvailableBytes: availableBytes) { remaining in
@@ -1768,6 +1887,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let retentionBudget = claim.bytes
         let segmentCache = SegmentCache(
             forwardWindow: forwardWindowSegments,
+            backwardWindow: SegmentCache.defaultBackwardWindow
+                * (isLiveSession ? 1 : Self.vodSegmentsPerCountedSegment),
             retentionBudgetBytes: retentionBudget,
             nativeLiveDVRPolicy: isLiveSession ? nativeLiveDVRPolicy : nil,
             onResidentSetChanged: { [weak self] in self?.noteResidentSetChanged() }
@@ -1798,10 +1919,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // color_trc/primaries/space all unspecified, so AVPlayer's DV decoder won't engage on the dvh1
         // sample entry (MKV reads Colour element directly into codecpar; MP4 demuxer has no fallback).
         // Forcing the canonical IPT-PQ-c2 tuple writes `colr nclx` so AVPlayer sees the PQ signal.
-        // Primaries/transfer/matrix are spec-fixed for P5, so this is a repair. Range is preserved if
-        // already signaled (full-range P5 is legal, #20); unspecified defaults to limited.
+        // Primaries/transfer/matrix are spec-fixed for P5, so this is a repair (range: see below).
         // The AE#455 P8.1-as-P5 route needs the same guarantee for the same reason, and lands on the
         // same tuple: an HDR10 base layer is BT.2020 / PQ / BT.2020-NCL by definition.
+        // The range is the RPU's `bl_video_full_range_flag` (a Profile 5 base layer is full range, and its SPS
+        // often has no VUI to say so), then the parameter sets', then the container's, then limited.
         // Keyed on the sample entry the route chose, not on the variant: a Profile 5 record served as
         // its base layer (`dolbyVisionHandling = .baseLayerOnly`) is plain hvc1 whose VUI the muxer
         // stream-copies as it stands.
@@ -1811,16 +1933,35 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // bitstream in two containers, Dolby's P5 asset with and without its `dvcC`: with the record
         // `init.mp4` is 883 B carrying `colr nclx` 9 / 16 / 9 full range, without it and without this
         // override 864 B and no `colr` at all, which would be two deliveries of one picture.
+        // The range every init's `colr` states is the one its picture is decoded with: the parameter sets'
+        // (`BitstreamVideoRange`), not codecpar's, where FFmpeg keeps a container's range over the SPS.
+        let initRecord: [UInt8] = hevcExtradataOverride
+            ?? codecpar.pointee.extradata.map { Array(UnsafeBufferPointer(start: $0, count: Int(codecpar.pointee.extradata_size))) }
+            ?? []
+        let parameterSetRange = BitstreamVideoRange.range(codecID: codecpar.pointee.codec_id, record: initRecord)
+        #if DualLayerDolbyVision
+        parameterSetsStateFullRange = parameterSetRange == AVCOL_RANGE_JPEG
+        #endif
         let p5ColorOverride: MP4SegmentMuxer.ColorOverride?
         if codecTagOverride == "dvh1" {
             let sourceRange = codecpar.pointee.color_range
+            // An overlay's placeholder is its own picture, coded limited; the source RPU describes the source's.
+            let rpuRange = overlayDecodesVideo ? nil
+                : inBandHDRMetadata.dolbyVisionBaseLayerFullRange.map { $0 ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG }
+            let range = rpuRange ?? parameterSetRange
+                ?? (sourceRange == AVCOL_RANGE_UNSPECIFIED ? AVCOL_RANGE_MPEG : sourceRange)
+            EngineLog.emit(
+                "[HLSVideoEngine] dvh1 colr range \(range == AVCOL_RANGE_JPEG ? "full" : "limited") from "
+                + (rpuRange != nil ? "the RPU's bl_video_full_range_flag"
+                   : parameterSetRange != nil ? "the parameter sets (no RPU read)" : "the container (no RPU, no sets)")
+                + " (container: \(av_color_range_name(sourceRange).map { String(cString: $0) } ?? "?"))",
+                category: .session
+            )
             p5ColorOverride = MP4SegmentMuxer.ColorOverride(
                 primaries: AVCOL_PRI_BT2020,
                 trc: AVCOL_TRC_SMPTE2084,
                 space: AVCOL_SPC_BT2020_NCL,
-                range: sourceRange == AVCOL_RANGE_UNSPECIFIED
-                    ? AVCOL_RANGE_MPEG
-                    : sourceRange
+                range: range
             )
         } else {
             p5ColorOverride = nil
@@ -1830,6 +1971,34 @@ public final class HLSVideoEngine: @unchecked Sendable {
             throw HLSVideoEngineError.openFailed(reason: "codecpar copy failed")
         }
         ownedCodecParams.append(ownedVideoParams)
+        if let parameterSetRange, parameterSetRange != ownedVideoParams.ptr.pointee.color_range {
+            func name(_ r: AVColorRange) -> String { av_color_range_name(r).map { String(cString: $0) } ?? "?" }
+            EngineLog.emit(
+                "[HLSVideoEngine] colr range \(name(parameterSetRange)) from the parameter sets, over the "
+                + "container's \(name(ownedVideoParams.ptr.pointee.color_range)): VideoToolbox decodes by the SPS",
+                category: .session
+            )
+            ownedVideoParams.ptr.pointee.color_range = parameterSetRange
+        }
+        let liftedHDRBoxes = inBandHDRMetadata.attach(to: ownedVideoParams.ptr)
+        // A session whose FEL is composed over AVPlayer shows the master, so its init describes the master: the
+        // RPU's L6 over the base layer's grade (`DolbyVisionLevel6`).
+        if composesFEL, let level6 = inBandHDRMetadata.dolbyVisionLevel6 {
+            let described = level6.describeMaster(on: ownedVideoParams.ptr)
+            if !described.isEmpty {
+                EngineLog.emit("[HLSVideoEngine] composed FEL: init states the master's L6, "
+                               + described.joined(separator: ", "), category: .session)
+            }
+        }
+        // The `colr` the MPEG-TS delivery of the same stream carries (see `InBandHDRStaticMetadata`).
+        if sdrUpgradedToHLG { ownedVideoParams.ptr.pointee.color_trc = AVCOL_TRC_ARIB_STD_B67 }
+        if !liftedHDRBoxes.isEmpty {
+            EngineLog.emit(
+                "[HLSVideoEngine] HDR10 static metadata stated only in-band: lifted the SEI into the "
+                + "stream side data, init carries \(liftedHDRBoxes.joined(separator: " + "))",
+                category: .session
+            )
+        }
         // movenc writes `pasp` from the output codecpar alone, and a container-declared ratio never
         // reaches codecpar: Matroska's DisplayWidth quotient and MP4's own `pasp` land on AVStream
         // (matroskadec.c / mov.c), which is where a DVD remuxed to MKV carries its anamorphic ratio.
@@ -1897,6 +2066,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
         self.videoStreamIndex = videoIndex
         self.savedVideoConfig = videoConfig
+        if overlayDecodesVideo {
+            guard let ownedSourceParams = OwnedCodecParameters(copying: sourceCodecpar) else {
+                throw HLSVideoEngineError.openFailed(reason: "codecpar copy failed")
+            }
+            ownedCodecParams.append(ownedSourceParams)
+            self.sourceVideoConfig = HLSSegmentProducer.StreamConfig(
+                codecpar: UnsafePointer(ownedSourceParams.ptr), timeBase: videoTimeBase, codecTagOverride: nil,
+                nalFramingOverride: sourceFraming.measuredFraming)
+            overlayDecodeTap = OverlayDecodeTap(
+                parameters: ownedSourceParams.ptr, timeBase: videoTimeBase,
+                containerSAR: videoStream.pointee.sample_aspect_ratio, deinterlace: overlayDeinterlace
+            ) { [weak self] triplets, sourceSeconds in self?.overlayCaptionObserverForSession?(triplets, sourceSeconds) }
+        } else {
+            self.sourceVideoConfig = videoConfig
+        }
         // Fold degenerate sub-frame segments (keyframe clusters make buildKeyframeSegmentPlan emit
         // ~40 ms segments the producer cannot cut, wedging the near-EOF resume; the plan and producer
         // share these boundaries, so the merge fixes both at once).
@@ -2014,7 +2198,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             audioDem = dem
         }
 
-        // 6a. Audio routing: stream-copy (common case: ec-3/Atmos JOC) → FLAC bridge (EINVAL on
+        // 6a. Audio routing: stream-copy (common case: ec-3/Atmos JOC) → bridge (EINVAL on
         //     EAC3-from-MKV without dec3) → video-only. Override validated; stale index logs + falls back.
         var autoAudioStreamIndex = audioDem.audioStreamIndex
         // av_find_best_stream skips streams with empty codecpar (live TS probe bails early, -1381258232).
@@ -2083,17 +2267,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             resolveUnlabelledTrueHDAtmos(
                 audioStream: audioStream, audioDemuxer: audioDem, streamIndex: audioStreamIndex)
             let compat = AudioCodecCompat.from(codecID)
-            // HE-AAC needs bridging only when there is no ASC (live ADTS/MPEG-TS): synthesized ASC
-            // would declare LC at the SBR output rate, decoded as garbage by AudioToolbox (-11821).
-            // Movie containers already carry a correct ASC so stream-copy works (AetherEngine#33).
-            let acpForHE = audioStream.pointee.codecpar.pointee
-            let hasASC = acpForHE.extradata != nil && acpForHE.extradata_size > 0
-            let isHEAAC = acpForHE.codec_id == AV_CODEC_ID_AAC
-                && Self.aacRequiresBridge(
-                    profile: acpForHE.profile,
-                    frameSize: acpForHE.frame_size,
-                    hasASC: hasASC
-                )
+            let sourceAudio = audioStream.pointee.codecpar.pointee
+            let latmConfig = Self.latmConfiguration(audioStream.pointee.codecpar)
+            let bluRayLPCM = BluRayLPCM(codecpar: audioStream.pointee.codecpar)
             // AE#764: CoreMedia refuses a FLAC min_blocksize under 192 and hangs on frames smaller than the
             // field claims, so a stream with small blocks cannot be copied, only decoded.
             let flacBlocksTooSmall = compat == .flac
@@ -2107,23 +2283,25 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     + "\(FLACStreamInfo.coreMediaMinimumBlockSize), bridging instead of stream-copy",
                     category: .session
                 )
-            } else if compat.requiresBridge || isHEAAC {
+            } else if compat.requiresBridge || (compat == .aacLatm && latmConfig == nil)
+                        || (compat == .bluRayLPCM && bluRayLPCM == nil) {
                 bridgePreferred = true
                 EngineLog.emit(
-                    isHEAAC
-                        ? "[HLSVideoEngine] audio: HE-AAC (profile=\(acpForHE.profile) frameSize=\(acpForHE.frame_size)), ADTS stream-copy would mis-signal SBR, bridging instead"
-                        : "[HLSVideoEngine] audio: codec=\(compat) (bridge required), decoding + "
+                    "[HLSVideoEngine] audio: codec=\(compat) "
+                        + (compat == .aacLatm ? "(no AudioSpecificConfig read out of it while probing)"
+                            : compat == .bluRayLPCM ? "(no format read out of it while probing)"
+                            : "(bridge required)")
+                        + ", decoding + "
                           + (Self.spatialRenderingLayout(
-                                rendering: objectAudioRendering, codecID: acpForHE.codec_id,
-                                profile: acpForHE.profile, sampleRate: acpForHE.sample_rate)
+                                rendering: objectAudioRendering, codecID: sourceAudio.codec_id,
+                                profile: sourceAudio.profile, sampleRate: sourceAudio.sample_rate)
                              .map { layout in
-                                 Self.objectAudioSource(codecID: acpForHE.codec_id, profile: acpForHE.profile) == .trueHDAtmos
+                                 Self.objectAudioSource(codecID: sourceAudio.codec_id, profile: sourceAudio.profile) == .trueHDAtmos
                                      ? "Atmos object render into \(layout.rawValue), APAC"
                                      : "DTS:X render into \(layout.rawValue) if its first frame decodes as DTS:X, APAC"
                              }
-                             ?? Self.encoderLabel(AudioBridge.bridgeEncoder(
-                                for: audioBridgeMode,
-                                sourceChannels: acpForHE.ch_layout.nb_channels)).uppercased())
+                             ?? (AudioBridge.output(for: audioBridgeMode,
+                                                    sourceChannels: sourceAudio.ch_layout.nb_channels) == .eac3 ? "EAC3" : "PCM"))
                           + " re-encode",
                     category: .session
                 )
@@ -2133,8 +2311,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 // pump strips per-frame ADTS headers.
                 let stripAdts = Self.prepareAACForFMP4(audioStream.pointee.codecpar)
                 if stripAdts {
+                    let asc = audioStream.pointee.codecpar.pointee
                     EngineLog.emit(
-                        "[HLSVideoEngine] audio: AAC/ADTS from TS, synthesised ASC + stripping ADTS for fMP4 stream-copy (no FLAC bridge)",
+                        "[HLSVideoEngine] audio: AAC/ADTS, AudioSpecificConfig "
+                        + (0..<Int(asc.extradata_size)).map { String(format: "%02x", asc.extradata[$0]) }.joined()
+                        + " (object type \(Self.aacObjectType(profile: asc.profile, frameSize: asc.frame_size))) "
+                        + "+ stripping ADTS for fMP4 stream-copy",
                         category: .session
                     )
                 }
@@ -2143,39 +2325,42 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     throw HLSVideoEngineError.openFailed(reason: "audio codecpar copy failed")
                 }
                 ownedCodecParams.append(ownedAudioParams)
+                // LATM: the muxer is given the AAC inside it; the demuxer's own stream stays LATM.
+                if let latmConfig {
+                    guard Self.prepareLATMForFMP4(ownedAudioParams.ptr, config: latmConfig) else {
+                        throw HLSVideoEngineError.openFailed(reason: "audio AudioSpecificConfig allocation failed")
+                    }
+                    EngineLog.emit(
+                        "[HLSVideoEngine] audio: AAC/LATM, AudioSpecificConfig "
+                        + latmConfig.map { String(format: "%02x", $0) }.joined()
+                        + " + unwrapping LATM for fMP4 stream-copy",
+                        category: .session
+                    )
+                }
+                // Linear PCM: the muxer names every channel's speaker.
+                if compat == .pcm { Self.namePCMSpeakers(ownedAudioParams.ptr) }
+                // Blu-ray LPCM: the muxer is given the samples behind its headers, as big-endian PCM.
+                if let bluRayLPCM {
+                    guard bluRayLPCM.describe(ownedAudioParams.ptr) else {
+                        throw HLSVideoEngineError.openFailed(reason: "audio channel layout allocation failed")
+                    }
+                    EngineLog.emit(
+                        "[HLSVideoEngine] audio: Blu-ray LPCM, \(bluRayLPCM.speakers.count) channels "
+                        + "\(bluRayLPCM.bitsPerSample)-bit \(bluRayLPCM.sampleRate) Hz"
+                        + (bluRayLPCM.isPadded ? ", its unused channel dropped," : "")
+                        + " + taking the headers off for fMP4 stream-copy as ipcm",
+                        category: .session
+                    )
+                }
                 streamCopyAudio = HLSSegmentProducer.AudioConfig(
+                    copying: audioStream,
                     codecpar: UnsafePointer(ownedAudioParams.ptr),
-                    timeBase: audioStream.pointee.time_base,
                     sourceStreamIndex: audioStreamIndex,
-                    inputTimeBase: audioStream.pointee.time_base,
-                    sourceTimeBase: audioStream.pointee.time_base,
-                    bridge: nil,
-                    stripAacAdts: stripAdts,
+                    framing: latmConfig.map { .latm(config: $0) }
+                        ?? bluRayLPCM.map { .bluRayLPCM($0) } ?? (stripAdts ? .adts : .raw),
                     language: audioLanguage
                 )
-                // Audio fallback duration from codec-fixed frame sizes (AC3/EAC3=1536, AAC=1024).
                 let acp = audioStream.pointee.codecpar.pointee
-                let sampleRate = Int64(acp.sample_rate)
-                let frameSamples: Int64 = {
-                    if acp.frame_size > 0 { return Int64(acp.frame_size) }
-                    if let declared = FLACStreamInfo.fixedBlockSize(UnsafePointer(audioStream.pointee.codecpar)) {
-                        return declared
-                    }
-                    switch acp.codec_id {
-                    case AV_CODEC_ID_AC3, AV_CODEC_ID_EAC3: return 1536
-                    case AV_CODEC_ID_AAC: return 1024
-                    case AV_CODEC_ID_MP3: return 1152
-                    case AV_CODEC_ID_FLAC, AV_CODEC_ID_ALAC: return 4096
-                    default: return 1024
-                    }
-                }()
-                let audioTb = audioStream.pointee.time_base
-                self.audioFallbackDurationPts = {
-                    guard sampleRate > 0, audioTb.num > 0, audioTb.den > 0 else { return 1 }
-                    let num = frameSamples * Int64(audioTb.den)
-                    let den = sampleRate * Int64(audioTb.num)
-                    return max(1, num / den)
-                }()
                 // Always `ec-3` per RFC 6381 (never `ec+3`: tvOS 26.5 enforces strict RFC 6381,
                 // same as iOS; `ec+3` produced -11848/-15517, Vincent test 2026-05-26). JOC/Atmos
                 // signaling lives in the per-segment `dec3` box, not the CODECS string (#34).
@@ -2183,11 +2368,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 // `probeWriteHeader` in buildProducerWithAudioCascade catches and bridges that.
                 let isJOC = compat == .eac3 && acp.profile == 30
                 audioIsAtmosStreamCopy = isJOC
-                audioHLSCodecs = compat.hlsCodecsString
+                // RFC 6381: AAC is mp4a.40 and the object type, so HE-AAC is 40.5 and HE-AACv2
+                // 40.29; PCM is its sample entry, `fpcm` for float and `ipcm` for integer.
+                audioHLSCodecs = compat == .aac || compat == .aacLatm
+                    ? "mp4a.40.\(Self.aacObjectType(profile: acp.profile, frameSize: acp.frame_size))"
+                    : compat == .pcm && acp.codec_id == AV_CODEC_ID_PCM_F32LE ? "fpcm" : compat.hlsCodecsString
                 EngineLog.emit(
                     "[HLSVideoEngine] audio: codec=\(compat) → stream-copy as `\(audioHLSCodecs ?? "?")` "
                     + "\(isJOC ? "[JOC=Atmos] " : "")"
-                    + "(fallback duration=\(audioFallbackDurationPts) in audioTb \(audioTb.num)/\(audioTb.den))",
+                    + "(frame \(streamCopyAudio?.frameDuration ?? 0) samples)",
                     category: .session
                 )
             } else {
@@ -2195,7 +2384,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 // decoder by id, not for a routing-table entry, so a codec the table does not name
                 // still gets sound as long as the FFmpeg build carries its decoder (measured
                 // 2026-09-10 on Nellymoser-in-FLV before its table entry existed: this line, then a
-                // NELLYMOSER -> FLAC bridge and a session with audio). What the missing entry costs
+                // NELLYMOSER -> bridge and a session with audio). What the missing entry costs
                 // is the stream-copy decision, which is why the next thing that happens is a bridge.
                 // The genuinely silent case is one line further down: no decoder in the build at
                 // all, which the cascade reports as `falling back to SILENT video-only`.
@@ -2241,7 +2430,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         }
 
-        // 6b. Run the stream-copy / FLAC-bridge / video-only cascade.
+        // docs/demuxed-audio.md: the playlist the load planned, and with it the output's shape, decided before the
+        // first producer is built. The audio the source carries stands in for the cascade's verdict: the cascade
+        // can only take audio away, and a master without an audio group plays a session left video-only.
+        let carriesAudio = audioStreamIndex >= 0
+        if let planned = plannedPanelIsInHDRMode {
+            plannedServesMaster = playlistDecision(
+                codecpar: codecpar, demuxer: dem, frameRate: frameRate, carriesAudio: carriesAudio,
+                videoRange: videoRange, panelIsInHDRMode: planned).useMaster
+        }
+        outputShape = .forPlan(servesMaster: plannedServesMaster, carriesAudio: carriesAudio)
+        if outputShape == .demuxed, let audioStream = audioDem.stream(at: audioStreamIndex) {
+            makeAudioRenditionCache(audioCodecpar: audioStream.pointee.codecpar)
+        }
+        EngineLog.emit("[HLSVideoEngine] output shape: \(outputShape.rawValue) "
+                       + "(planned master: \(plannedServesMaster.map { "\($0)" } ?? "at serve"))", category: .session)
+
+        // 6b. Run the stream-copy / bridge / video-only cascade.
         let prod: HLSSegmentProducer
         prod = try buildProducerWithAudioCascade(
             preferBridge: bridgePreferred,
@@ -2255,6 +2460,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
         self.producer = prod
         self.activeAudioSourceStreamIndex = savedAudioConfig != nil ? audioStreamIndex : -1
+        // A cascade that ended video-only has no audio to serve as a rendition: the session goes back to one
+        // file per segment, its video's, and its cache takes the whole budget again.
+        if savedAudioConfig == nil, let audioCache = audioRenditionCache {
+            restartLock.lock()
+            audioRenditionCache = nil
+            restartLock.unlock()
+            _ = audioCache.close(reason: .sessionStopped)
+            if retentionBudgetBytes > 0 { segmentCache.setRetentionBudget(retentionBudgetBytes) }
+            outputShape = .muxed
+            EngineLog.emit("[HLSVideoEngine] output shape: muxed (the audio cascade left the session video-only)",
+                           category: .session)
+        }
         // AE#458: only when the audio actually reached the variant. A cascade that fell through to
         // video-only must not advertise an audio rendition that is not in the segments, and must not
         // force the master for one either.
@@ -2274,22 +2491,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         // 7. Wire provider, server, and URL.
         let manifestCodecs = audioHLSCodecs.map { "\(primaryCodecs),\($0)" } ?? primaryCodecs
-        // AE#418: a segment AVPlayer places is what moves the axis it reads.
-        var segmentPlacedHandler: (@Sendable (Int) -> Void)?
-        var segmentServedHandler: (@Sendable (Int, Bool) -> Void)?
-        if !isLiveSession {
-            segmentPlacedHandler = { [weak self] idx in
-                guard let self else { return }
-                self.handleSegmentPlaced(at: idx)
-            }
-            // AE#418 round 7: a placement is a request that was ANSWERED, and an empty buffer says
-            // nothing while the answer is outstanding.
-            segmentServedHandler = { [weak self] idx, delivered in
-                self?.recordSegmentDelivery(index: idx, delivered: delivered)
-            }
-        }
         let prov = VideoSegmentProvider(
             cache: segmentCache,
+            audioRendition: audioRenditionCache,
             segments: plan,
             codecsString: manifestCodecs,
             supplementalCodecs: supplementalCodecs,
@@ -2305,7 +2509,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
             audioIsAtmosStreamCopy: servedAudioIsAtmosStreamCopy,
             videoLayout: stereoSignal != nil ? StereoVideoSignal.videoLayout : nil,
             isLive: isLiveSession,
-            servesSegmentsProgressively: servesSegmentsProgressively,
             // Sequential archives: playlist grows with the producer's REAL cut durations. The
             // static plan's uniform EXTINF lies whenever the archive's GOP cadence does not
             // divide the cut target (1.92 s GOPs vs a 4.0 s plan put every segment's media up
@@ -2355,11 +2558,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             nativeSubtitleLanguages: nativeSubtitleLanguagesForSession,
             nativeSubtitleRenditionInfos: nativeSubtitleRenditionInfosForSession,
             stripASSMarkupInVTT: preserveASSMarkupForSubtitleTap,
-            nativeSubtitleDefaultOrdinal: nativeSubtitleDefaultOrdinal,
-            nativeSubtitleWholeProgram: nativeSubtitleWholeProgram,
-            currentShiftSeconds: { [weak self] in (self?.playlistShiftSeconds ?? 0) + (self?.subtitleStreamStartSeconds ?? 0) },
-            segmentPlacedHandler: segmentPlacedHandler,
-            segmentServedHandler: segmentServedHandler
+            nativeSubtitleDefaultOrdinal: nativeSubtitleDefaultOrdinal
         )
         self.provider = prov
         // AE#520 round 2: the close reads it on the playlist-build thread, so it is a closure over a
@@ -2395,7 +2594,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             let openIndex = max(0, min(initialProducerBaseIndex, plan.count - 1))
             let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
             subtitlePacketStore.noteHarvestAnchor(
-                .pump, at: Double(plan[openIndex].startPts) * Double(tb.num) / Double(tb.den))
+                at: Double(plan[openIndex].startPts) * Double(tb.num) / Double(tb.den))
         }
         prod.start()
         preparedServe = PreparedServe(
@@ -2445,58 +2644,56 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // the standard sourceIsHDR && panelReadyForHDR check routes them correctly.
         // #15: a SUBTITLES rendition lives only in a master; the pure decision below forces the
         // master for routing-safe subtitled sources so PiP can show subtitles.
-        let stillsAvailable = FrameDecodeContext.yieldsStill(
-            dolbyVisionNoBaseLayer: FrameDecodeContext.isDVNoBaseLayer(codecpar: codecpar))
+        // The load's planned answer wins over a later one: the session was prepared for it (`plannedServesMaster`).
+        let panelIsInHDRMode = plannedPanelIsInHDRMode ?? panelIsInHDRMode
+        let decision = playlistDecision(codecpar: codecpar, demuxer: dem, frameRate: frameRate,
+                                        carriesAudio: savedAudioConfig != nil,
+                                        videoRange: videoRange, panelIsInHDRMode: panelIsInHDRMode)
+        let stillsAvailable = decision.stillsAvailable
         yieldsStills = stillsAvailable
         previewNeedsCompositor = FrameDecodeContext.isDVNoBaseLayer(codecpar: codecpar)
         if !stillsAvailable {
             EngineLog.emit("[HLSVideoEngine] Dolby Vision Profile 5 / 10.0 stills are not built in "
-                           + "(DolbyVisionStillReshaping trait off): no scrub thumbnails or I-frame stills; "
+                           + "(DualLayerDolbyVision trait off): no scrub thumbnails or I-frame stills; "
                            + "scrub previews and the held picture go through the system compositor", category: .session)
         }
-        // AE#682: decided before the routing below, because an I-frame rendition is one of the
-        // reasons to serve a master at all.
-        let iFrameCandidate = IFrameRenditionEligibility.candidate(.init(
-            requested: iFramePlaylistRequested,
+        let iFrameCandidate = decision.iFrameCandidate
+        // A scrub still past the resident window reads off the source by the same rule, whether or not the
+        // rendition was asked for.
+        if case .served(let timeline) = IFrameRenditionEligibility.candidate(.init(
+            requested: true,
             isLive: isLiveSession,
             planBoundariesClaimRandomAccess: planBoundariesClaimRandomAccess,
+            seeksToTimeWithoutIndex: dem.seeksToTimeWithoutIndex,
             sequentialOrigin: sequentialOrigin,
             heldSourceConnection: openProfile.avioHeldConnection,
             originIsSerial: sourceReopenableByURL
                 && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
-            isDiscSource: dem.isDiscSource,
-            secondReaderAvailable: sourceReopenableByURL || customIFrameReader != nil,
-            stillsUnavailable: !stillsAvailable))
-        // The compositor preview reads by URL only: a custom reader's clone belongs to the rendition.
+            secondReaderAvailable: sourceReopenableByURL || customKeyframeReader != nil,
+            stillsUnavailable: !stillsAvailable)) {
+            sourceStillTimeline = timeline
+        } else {
+            // Nothing will read a picture off this source, so a custom source's clone is not kept for it.
+            closeUnusedCustomKeyframeReader()
+        }
+        // The compositor preview reads by URL only: a custom reader's clone belongs to the rendition. It reads
+        // the plan's keyframes, so it needs the keyframe timeline.
         previewReadsSource = previewNeedsCompositor && IFrameRenditionEligibility.candidate(.init(
             requested: true,
             isLive: isLiveSession,
             planBoundariesClaimRandomAccess: planBoundariesClaimRandomAccess,
+            seeksToTimeWithoutIndex: false,
             sequentialOrigin: sequentialOrigin,
             heldSourceConnection: openProfile.avioHeldConnection,
             originIsSerial: sourceReopenableByURL
                 && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
-            isDiscSource: dem.isDiscSource,
-            secondReaderAvailable: sourceReopenableByURL)) == .served
-        let hasNativeSubs = enableNativeSubtitleTrackForSession && !nativeSubtitleCueStoresForSession.isEmpty
-        // AE#187: tvOS HW HEVC needs the codec advertised in a master's CODECS attribute; a bare media
-        // playlist (H.264 is fine media-direct) fails the item with tracks count=0 / -12848. Scope to
-        // tvOS: iOS/macOS build the HEVC track from the init hvcC media-direct and are left unperturbed.
-        #if os(tvOS)
-        let videoCodecNeedsMasterSignaling = codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
-        #else
-        let videoCodecNeedsMasterSignaling = false
-        #endif
-        let useMasterPlaylist = !keepsMediaPlaylistRoute && (AetherEngine.forceMasterPlaylistForTesting
-            || Self.resolveUseMasterPlaylist(
-            videoRange: videoRange, effectiveDvMode: effectiveDvMode,
-            panelIsInHDRMode: panelIsInHDRMode, displaySupportsHDR: displaySupportsHDR,
-            hasNativeSubs: hasNativeSubs,
-            builtInPanelEngagesOnDemand: Self.builtInPanelEngagesOnDemand,
-            frameRateKnown: frameRate != nil,
-            videoCodecNeedsMasterSignaling: videoCodecNeedsMasterSignaling,
-            hasAudioRendition: servedAudioLanguage != nil || servedAudioIsAtmosStreamCopy,
-            hasIFrameRendition: iFrameCandidate == .served))
+            secondReaderAvailable: sourceReopenableByURL)) == .served(.keyframes)
+        // A demuxed session's audio is a rendition, which only a master names: it was prepared for the master.
+        let useMasterPlaylist = outputShape == .demuxed || decision.useMaster
+        if let planned = plannedServesMaster, planned != useMasterPlaylist {
+            EngineLog.emit("[HLSVideoEngine] planned playlist (\(planned ? "master" : "media")) differs from the "
+                           + "one served (\(useMasterPlaylist ? "master" : "media"))", category: .session)
+        }
         let resolvedURL: URL? = useMasterPlaylist
             ? srv.playlistURL
             : srv.mediaPlaylistURL
@@ -2507,16 +2704,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.servingMasterPlaylist = useMasterPlaylist
         iFrameRenditionVerdict = IFrameRenditionEligibility.resolve(
             candidate: iFrameCandidate, servingMaster: useMasterPlaylist)
-        if iFrameRenditionVerdict == .served,
-           let rendition = makeIFrameRendition(plan: plan, cache: segmentCache,
-                                               sourceIsHDR: videoRange != .sdr || dvVariant != .none) {
+        if case .served(let timeline) = iFrameRenditionVerdict,
+           let rendition = makeIFrameRendition(plan: plan, timeline: timeline, cache: segmentCache,
+                                               sourceIsHDR: videoRange != .sdr || dvVariant != .none,
+                                               servedRange: videoRange) {
             iFrameRendition = rendition
             prov.setIFrameSource(rendition)
             EngineLog.emit("[HLSVideoEngine] i-frame rendition: served segments=\(plan.count) "
-                           + "format=\(rendition.format.logName)", category: .session)
+                           + "entries=\(rendition.entries.count) "
+                           + "format=\(rendition.format.logName) "
+                           + "sdrCompanion=\(rendition.companionFormat?.logName ?? "none")", category: .session)
         } else if iFramePlaylistRequested {
-            closeUnusedCustomIFrameReader()
-            if iFrameRenditionVerdict == .served { iFrameRenditionVerdict = .absent(.noSecondReader) }
+            if iFrameRenditionVerdict.isServed { iFrameRenditionVerdict = .absent(.noSecondReader) }
             if case .absent(let reason) = iFrameRenditionVerdict {
                 EngineLog.emit("[HLSVideoEngine] i-frame rendition: absent reason=\(reason.rawValue)",
                                category: .session)
@@ -2526,6 +2725,86 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.servedDolbyVisionConversion = convertP7ToProfile81 ? .profile7ToProfile81 : nil
         EngineLog.emit("[HLSVideoEngine] serving on \(url.absoluteString) (dvModeAvailable=\(dvModeAvailable) effectiveDvMode=\(effectiveDvMode) panelIsHDR=\(panelIsInHDRMode) displaySupportsHDR=\(displaySupportsHDR) matchContent=\(matchContentEnabled) sourceIsHDR=\(videoRange != .sdr || effectiveDvMode) useMaster=\(useMasterPlaylist) videoRange=\(videoRange) dvVariant=\(dvVariant) audioLang=\(servedAudioLanguage ?? "none"))")
         return url
+    }
+
+    /// The demuxed shape's audio rendition cache, beside `cache`. Each keeps resident its rendition's share of the
+    /// session's retention budget, the share of the session's bitrate its rendition is, so both keep about the
+    /// same span of the title; the claim counts both.
+    private func makeAudioRenditionCache(audioCodecpar: UnsafePointer<AVCodecParameters>) {
+        guard let videoCache = cache else { return }
+        let budget = retentionBudgetBytes
+        let par = audioCodecpar.pointee
+        let audioRate = AudioBridge.peakBitRate(bitRate: par.bit_rate, channels: par.ch_layout.nb_channels,
+                                                sampleRate: par.sample_rate, bitsPerRawSample: par.bits_per_raw_sample)
+        let sessionRate = max(sourceBitrate, audioRate + 1)
+        let audioShare = budget > 0 ? Int(Int64(budget) * min(audioRate, sessionRate) / sessionRate) : 0
+        let audioCache = SegmentCache(
+            forwardWindow: forwardWindowSegments,
+            backwardWindow: SegmentCache.defaultBackwardWindow
+                * (isLiveSession ? 1 : Self.vodSegmentsPerCountedSegment),
+            retentionBudgetBytes: audioShare,
+            nativeLiveDVRPolicy: isLiveSession ? nativeLiveDVRPolicy : nil,
+            onResidentSetChanged: { [weak self] in self?.noteResidentSetChanged() }
+        )
+        if budget > 0 { videoCache.setRetentionBudget(budget - audioShare) }
+        restartLock.lock()
+        audioRenditionCache = audioCache
+        retentionClaim?.track { [weak videoCache, weak audioCache] in
+            (videoCache?.totalBytes ?? 0) + (audioCache?.totalBytes ?? 0)
+        }
+        restartLock.unlock()
+        EngineLog.emit("[HLSVideoEngine] audio rendition: \(audioShare / (1 << 20)) MiB of the "
+                       + "\(budget / (1 << 20)) MiB retention budget (\(audioRate) of \(sessionRate) bps)",
+                       category: .session)
+    }
+
+    /// Which playlist AVPlayer is handed, from facts `prepare()` already has and the panel answer.
+    ///
+    /// Side-effect free, so `prepare()` can ask it for a load that decided the panel answer before the display
+    /// switch (`plannedPanelIsInHDRMode`) and `serve(panelIsInHDRMode:)` asks it again with the same inputs.
+    private func playlistDecision(
+        codecpar: UnsafeMutablePointer<AVCodecParameters>, demuxer dem: Demuxer, frameRate: Double?,
+        carriesAudio: Bool, videoRange: HLSVideoRange, panelIsInHDRMode: Bool
+    ) -> (useMaster: Bool, iFrameCandidate: IFrameRenditionEligibility.Verdict, stillsAvailable: Bool) {
+        let stillsAvailable = FrameDecodeContext.yieldsStill(
+            dolbyVisionNoBaseLayer: FrameDecodeContext.isDVNoBaseLayer(codecpar: codecpar))
+        // AE#682: decided before the routing below, because an I-frame rendition is one of the
+        // reasons to serve a master at all.
+        let iFrameCandidate = IFrameRenditionEligibility.candidate(.init(
+            requested: iFramePlaylistRequested,
+            isLive: isLiveSession,
+            planBoundariesClaimRandomAccess: planBoundariesClaimRandomAccess,
+            seeksToTimeWithoutIndex: dem.seeksToTimeWithoutIndex,
+            sequentialOrigin: sequentialOrigin,
+            heldSourceConnection: openProfile.avioHeldConnection,
+            originIsSerial: sourceReopenableByURL
+                && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
+            secondReaderAvailable: sourceReopenableByURL || customKeyframeReader != nil,
+            stillsUnavailable: !stillsAvailable))
+        let hasNativeSubs = enableNativeSubtitleTrackForSession && !nativeSubtitleCueStoresForSession.isEmpty
+        // AE#187: tvOS HW HEVC needs the codec advertised in a master's CODECS attribute; a bare media
+        // playlist (H.264 is fine media-direct) fails the item with tracks count=0 / -12848. Scope to
+        // tvOS: iOS/macOS build the HEVC track from the init hvcC media-direct and are left unperturbed.
+        #if os(tvOS)
+        let videoCodecNeedsMasterSignaling = codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
+        #else
+        let videoCodecNeedsMasterSignaling = false
+        #endif
+        // AE#849: an audio switch on a session the display refused the HDR master for stays on the
+        // media playlist; planned with it, so the output is muxed too.
+        let useMaster = !keepsMediaPlaylistRoute && (AetherEngine.forceMasterPlaylistForTesting
+            || Self.resolveUseMasterPlaylist(
+            videoRange: videoRange, effectiveDvMode: effectiveDvMode,
+            panelIsInHDRMode: panelIsInHDRMode, displaySupportsHDR: displaySupportsHDR,
+            hasNativeSubs: hasNativeSubs,
+            builtInPanelEngagesOnDemand: Self.builtInPanelEngagesOnDemand,
+            frameRateKnown: frameRate != nil,
+            videoCodecNeedsMasterSignaling: videoCodecNeedsMasterSignaling,
+            // Audio is served as a rendition of its own, and a rendition lives in the master: any audio is a reason
+            // to serve one where it plays.
+            hasAudioRendition: carriesAudio,
+            hasIFrameRendition: iFrameCandidate.isServed))
+        return (useMaster, iFrameCandidate, stillsAvailable)
     }
 
     /// Built-in panels that engage EDR on demand once HDR content renders; the tvOS SDR-parked-
@@ -2976,7 +3255,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         guard let seg = prov.thumbnailSegment(atSeconds: seconds),
               let initData = prov.peekInitSegment() else { return nil }
         anchorShiftLock.lock()
-        let carried = isLiveSession ? 0 : epochAxisByIndex.carried(at: seg.index)
+        let carried = isLiveSession ? 0 : carriedSecondsByIndex[seg.index]
         anchorShiftLock.unlock()
         // The cache replaces/unlinks immutable files. An index alone cannot
         // identify bytes after a same-session re-cut/restart rewrites that index.
@@ -3064,7 +3343,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     }
 
     /// The preview for a position outside the resident window: the keyframe that opens its plan
-    /// segment, read off the source by a side demuxer as the I-frame rendition reads it, wrapped
+    /// segment, read off the source as the I-frame rendition reads it (`IFrameKeyframeReader`), wrapped
     /// with the session's own sample entry, `dvcC` and `colr`. Nothing is decoded; the compositor
     /// colours it like the resident preview. Skipped when a newer request arrived meanwhile.
     private func sourceKeyframePreviewFile(atSeconds seconds: Double, request: Int) -> CompositorPreviewFile? {
@@ -3116,7 +3395,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return file
     }
 
-    /// The side reader and builder behind `sourceKeyframePreviewFile`, made on the first request
+    /// The keyframe reader and builder behind `sourceKeyframePreviewFile`, made on the first request
     /// that needs them and torn down by `stop()`, which drains a read in flight before it frees the
     /// codec parameters the builder reads.
     private func previewKeyframeSource(plan: [Segment], directory: URL)
@@ -3140,10 +3419,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             IFrameRendition.Entry(startPts: $0.startPts, startSeconds: $0.startSeconds,
                                   durationSeconds: $0.durationSeconds)
         }
-        let keyframes = makeKeyframeRendition(
-            config: cfg, entries: entries,
-            cache: IFramePayloadCache(directory: directory.appendingPathComponent("payloads", isDirectory: true)),
-            format: .keyframes, buildFragment: { _, _, _ in nil }, custom: nil)
+        guard let keyframes = makeKeyframeRendition(
+            entries: entries, cache: IFramePayloadCache(),
+            format: .keyframes, buildFragment: { _, _, _ in nil }) else { return nil }
         previewKeyframes = keyframes
         previewKeyframeBuilder = builder
         EngineLog.emit("[HLSVideoEngine] compositor preview: source keyframe reader ready "
@@ -3189,11 +3467,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     public func stop(reason: SessionCacheCleanupReason) {
         preparedServe = nil
+        #if DualLayerDolbyVision
+        felTap?.close()
+        #endif
         cancelResidentRangesPublish()
         // Sodalite#32: drop the tap routes first so a pump still draining its last packets no-ops
         // instead of decoding into stores being torn down.
         subtitleTapLock.lock()
         subtitleTapRoutes.removeAll()
+        subtitleTapExcludedStreams.removeAll()
         subtitleTapLock.unlock()
         // Snapshot resources under the lock, then clear instance state and hand them to a
         // detached cleanup task (#10: SwiftUI releases @State on main; detach avoids a 3 s freeze
@@ -3209,6 +3491,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         server = nil
         let c = cache
         cache = nil
+        let audioRendition = audioRenditionCache
+        audioRenditionCache = nil
         let cacheStatusCallback = onSessionCacheStatusChanged
         let cacheRequestedBudget = requestedSessionCacheBudgetBytes.map { max(0, $0) }
         let cacheEffectiveBudget = sessionCacheBaseEffectiveBytes
@@ -3235,8 +3519,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
         previewKeyframes = nil
         let previewBuilder = previewKeyframeBuilder
         previewKeyframeBuilder = nil
-        closeUnusedCustomIFrameReader()
+        closeUnusedCustomKeyframeReader()
+        keyframeReaderLock.lock()
+        let keyframes = keyframeReader
+        keyframeReader = nil
+        keyframeReaderLock.unlock()
+        // Ends a read in flight, so the shutdowns below do not wait it out.
+        keyframes?.interrupt()
+        sourceStillLock.lock()
+        let stillDecoder = sourceStillDecoder
+        sourceStillDecoder = nil
+        sourceStillTimeline = nil
+        sourceStillLock.unlock()
         savedVideoConfig = nil
+        sourceVideoConfig = nil
+        overlayPlaceholder = nil
+        overlayDecodeTap?.close()
+        overlayDecodeTap = nil
         savedAudioConfig = nil
         let ownedParams = ownedCodecParams
         ownedCodecParams = []
@@ -3248,6 +3547,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let reopenReader = reopenCustomReader
         reopenCustomReader = nil
         segmentPlan = []
+        planKeyframePts = []
         restartLock.unlock()
         reopening?.markClosed()
         // The restart that opened it closes it once it sees the epoch moved.
@@ -3274,9 +3574,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
         BlockingWork.detached {
             iFrames?.shutdown()
             previewFrames?.shutdown()
+            keyframes?.close()
+            stillDecoder?.close()
             previewBuilder?.close()
             _ = p?.waitForFinish(timeout: 3.0)
             s?.stop()
+            _ = audioRendition?.close(reason: reason)
             if let c {
                 _ = c.close(reason: reason)
                 cacheStatusCallback?(c.status(
@@ -3301,20 +3604,78 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     // MARK: - I-frame rendition (AE#682)
 
-    /// `sourceIsHDR` picks the format: AVKit shows no scrub thumbnail from a PQ or Dolby Vision
-    /// keyframe, so those sessions serve tone-mapped JPEG stills instead of the keyframes themselves.
-    private func makeIFrameRendition(plan: [Segment], cache segmentCache: SegmentCache,
-                                     sourceIsHDR: Bool) -> IFrameRendition? {
-        guard let cfg = savedVideoConfig, !plan.isEmpty else { return nil }
-        let directory = segmentCache.sessionDir.appendingPathComponent("iframes", isDirectory: true)
-        let staging = directory.appendingPathComponent("staging", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-        } catch {
-            EngineLog.emit("[HLSVideoEngine] i-frame rendition: staging dir failed: \(error)",
-                           category: .session)
-            return nil
+    /// The keyframes are always served with their own range, so the main player scans on them in HDR. An HDR
+    /// source adds the SDR HEVC stills tvOS requires (`IFrameStillBuilder`): AVKit's scrub thumbnail player is
+    /// capped at SDR and takes the lowest video range on offer. A source with no keyframe list
+    /// (`Timeline.stills`) serves those SDR stills alone, one a second, each the picture at its time. A software
+    /// overlay session serves placeholder pictures, so its keyframes are stills too, in the variant's range
+    /// (`servedRange`): the main player of an HDR session drops an SDR tier, and scans on nothing then.
+    private func makeIFrameRendition(plan: [Segment], timeline: IFrameRenditionEligibility.Timeline,
+                                     cache segmentCache: SegmentCache, sourceIsHDR: Bool,
+                                     servedRange: HLSVideoRange) -> IFrameRendition? {
+        guard let cfg = savedVideoConfig, let source = sourceVideoConfig, !plan.isEmpty else { return nil }
+        let par = source.codecpar.pointee
+        // The decoder reads the samples as the session serves them: Annex B ones with the source's own
+        // extradata, length-prefixed ones with the record the muxer writes.
+        func makeStillBuilder(maxWidth: Int = IFrameStillBuilder.defaultWidth,
+                              destination: ColorAttachments.Tags = StillRenderer.sdr) -> IFrameStillBuilder? {
+            guard let size = IFrameStillBuilder.size(
+                codedWidth: Int(par.width), codedHeight: Int(par.height),
+                sarNum: par.sample_aspect_ratio.num, sarDen: par.sample_aspect_ratio.den, maxWidth: maxWidth) else { return nil }
+            return IFrameStillBuilder(
+                decoder: FrameDecodeContext(streamParameters: source.codecpar, timeBase: source.timeBase,
+                                            extradata: source.convertsAnnexBSamples ? nil : source.extradataOverride),
+                width: size.width, height: size.height, destination: destination)
         }
+        func stillsFormat(_ still: IFrameStillBuilder, entries: [IFrameRendition.Entry],
+                          range: HLSVideoRange = .sdr) -> IFrameRenditionFormat {
+            let durations = entries.map(\.durationSeconds).filter { $0 > 0 }
+            let shortest = durations.min() ?? 1
+            let mean = durations.isEmpty ? 1 : durations.reduce(0, +) / Double(durations.count)
+            return .stills(width: still.width, height: still.height, codecs: still.codecs,
+                           bandwidth: IFrameStillBuilder.bandwidth(shortestSegmentSeconds: shortest),
+                           averageBandwidth: IFrameStillBuilder.averageBandwidth(meanSegmentSeconds: mean),
+                           videoRange: range)
+        }
+        func stillBuild(_ still: IFrameStillBuilder) -> (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output? {
+            { payload, index, entry in
+                still.build(payload: payload, index: index, startSeconds: entry.startSeconds,
+                            durationSeconds: entry.durationSeconds)
+                    .map { IFrameFragmentBuilder.Output(initSegment: $0.initSegment, fragment: $0.fragment) }
+            }
+        }
+        if timeline == .stills {
+            guard let still = makeStillBuilder() else { return nil }
+            let entries = Self.denseStillEntries(plan: plan, timeBaseSeconds: sourceVideoTbSeconds)
+            // The read is the picture's run, decoded and encoded on the rendition's queue, so what the cache
+            // keeps per entry is the still itself.
+            return makeKeyframeRendition(
+                entries: entries, cache: IFramePayloadCache(), format: stillsFormat(still, entries: entries),
+                read: { reader, entry in reader.pictureRun(atPts: entry.startPts).flatMap { still.encode(run: $0) } },
+                buildFragment: { sample, index, entry in
+                    let built = still.output(sample: sample, index: index, startSeconds: entry.startSeconds,
+                                             durationSeconds: entry.durationSeconds)
+                    return IFrameFragmentBuilder.Output(initSegment: built.initSegment, fragment: built.fragment)
+                })
+        }
+
+        let entries = Self.iFrameEntries(plan: plan, keyframes: planKeyframePts,
+                                         timeBaseSeconds: sourceVideoTbSeconds)
+        var companion: (format: IFrameRenditionFormat,
+                        build: (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?)?
+        if sourceIsHDR, let still = makeStillBuilder() {
+            companion = (stillsFormat(still, entries: entries), stillBuild(still))
+        }
+        if let placeholder = overlayPlaceholder {
+            guard let scan = makeStillBuilder(maxWidth: Self.overlayScanStillWidth, destination: placeholder.tags) else { return nil }
+            return makeKeyframeRendition(
+                entries: entries, cache: IFramePayloadCache(),
+                format: stillsFormat(scan, entries: entries, range: servedRange), buildFragment: stillBuild(scan),
+                companion: companion)
+        }
+        // Fragments are muxed in memory and payloads cached in memory: nothing here is written to disk, so
+        // the directory below is only the name the muxer is given, never created.
+        let staging = segmentCache.sessionDir.appendingPathComponent("iframes", isDirectory: true)
         let keyframeBuilder = IFrameFragmentBuilder(
             video: MP4SegmentMuxer.VideoConfig(
                 codecpar: cfg.codecpar, timeBase: cfg.timeBase,
@@ -3323,92 +3684,183 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 convertsAnnexBSamples: cfg.convertsAnnexBSamples,
                 nalFramingLatch: cfg.nalFramingLatch, stereo: cfg.stereo),
             stagingDir: staging)
-        let format: IFrameRenditionFormat
-        let buildFragment: (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?
-        let par = cfg.codecpar.pointee
-        if sourceIsHDR, let size = IFrameJPEGBuilder.size(
-            codedWidth: Int(par.width), codedHeight: Int(par.height),
-            sarNum: par.sample_aspect_ratio.num, sarDen: par.sample_aspect_ratio.den) {
-            let jpeg = IFrameJPEGBuilder(keyframe: keyframeBuilder, width: size.width, height: size.height)
-            let shortest = plan.map(\.durationSeconds).filter { $0 > 0 }.min() ?? 1
-            format = .jpeg(width: size.width, height: size.height,
-                           bandwidth: IFrameJPEGBuilder.bandwidth(shortestSegmentSeconds: shortest))
-            buildFragment = { payload, index, entry in
-                jpeg.build(payload: payload, index: index,
-                           startSeconds: entry.startSeconds, durationSeconds: entry.durationSeconds)
-            }
-        } else {
-            format = .keyframes
-            buildFragment = { payload, index, entry in
-                keyframeBuilder.build(payload: payload, index: index,
-                                      startSeconds: entry.startSeconds, durationSeconds: entry.durationSeconds)
-            }
-        }
-        // The side reader owns the clone from here; `stop()` must not close it a second time.
-        let custom = customIFrameReader
-        customIFrameReader = nil
-        let entries = plan.map {
-            IFrameRendition.Entry(startPts: $0.startPts, startSeconds: $0.startSeconds,
-                                  durationSeconds: $0.durationSeconds)
+        let buildKeyframe: (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output? = { payload, index, entry in
+            keyframeBuilder.build(payload: payload, index: index,
+                                  startSeconds: entry.startSeconds, durationSeconds: entry.durationSeconds)
         }
         return makeKeyframeRendition(
-            config: cfg, entries: entries,
-            cache: IFramePayloadCache(directory: directory.appendingPathComponent("payloads", isDirectory: true)),
-            format: format, buildFragment: buildFragment, custom: custom)
+            entries: entries, cache: IFramePayloadCache(),
+            format: .keyframes, buildFragment: buildKeyframe, companion: companion)
     }
 
-    /// The side-read half every keyframe consumer shares: a demuxer of its own on the source, the
-    /// P7 conversion the playing samples get, and the gates that keep it off a busy or serial origin.
-    private func makeKeyframeRendition(
-        config cfg: HLSSegmentProducer.StreamConfig,
-        entries: [IFrameRendition.Entry],
-        cache: IFramePayloadCache,
-        format: IFrameRenditionFormat,
-        buildFragment: @escaping (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?,
-        custom: (reader: IOReader, formatHint: String?)?
-    ) -> IFrameRendition {
+    /// An overlay session's scan tier: the panel shows it full screen while AVPlayer scans, and 1080p is sharp
+    /// there at any scan rate, where the source's own size would cost the encoder four times as much a still.
+    static let overlayScanStillWidth = 1920
+
+    /// The session's one reader of single pictures off the source (`IFrameKeyframeReader`): the I-frame
+    /// rendition's, the compositor preview's and the scrub stills' past the resident window. The keyframe
+    /// from the source's index, or from a demuxer of its own where only libavformat can read the container,
+    /// with the P7 conversion the playing samples get. Made on the first request that needs it, over the
+    /// custom source's clone when there is one; `stop()` interrupts and closes it. Under `keyframeReaderLock`.
+    private var keyframeReader: IFrameKeyframeReader?
+    private let keyframeReaderLock = NSLock()
+
+    private func sessionKeyframeReader() -> IFrameKeyframeReader? {
+        keyframeReaderLock.lock()
+        defer { keyframeReaderLock.unlock() }
+        if let keyframeReader { return keyframeReader }
+        guard let cfg = sourceVideoConfig, let session = demuxer else { return nil }
         let framing = cfg.nalFramingOverride ?? A53SEIParser.nalFraming(
             codec: cfg.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC ? .hevc : .h264,
             extradata: cfg.codecpar.pointee.extradata.map { UnsafePointer($0) },
             size: Int(cfg.codecpar.pointee.extradata_size))
-        let url = sourceURL, headers = sourceHTTPHeaders, headerStore = requestHeaders
-        let reader = IFrameSideReader(
-            open: { dem in
+        let url = sourceURL, headerStore = requestHeaders
+        let positions: [Int64: Int64] = Dictionary(
+            session.indexedKeyframeEntries(streamIndex: session.videoStreamIndex).map { ($0.pts, $0.pos) },
+            uniquingKeysWith: { first, _ in first })
+        // The reader owns the clone from here; `stop()` must not close it a second time.
+        let custom = customKeyframeReader
+        customKeyframeReader = nil
+        isCustomKeyframeSource = custom != nil
+        let reader = IFrameKeyframeReader(
+            resolveIndex: { [weak session] in
+                guard let session else { return .failed("the session's demuxer is gone") }
+                return await Self.iFrameKeyframeIndex(url: url, headers: headerStore.current, demuxer: session,
+                                                      custom: custom?.reader)
+            },
+            position: { positions[$0] },
+            // Over exact range reads of the source, through the source cache: a seek reads what it lands
+            // on and nothing streams ahead of it. A disc title is opened as the session's.
+            open: { [weak session] dem in
+                let title = session?.selectedDiscTitleID
                 if let custom {
-                    try dem.open(reader: custom.reader, formatHint: custom.formatHint,
-                                 profile: .iFrameSideDemuxer)
-                } else {
-                    try dem.open(url: url, extraHeaders: headers,
-                                 profile: DemuxerOpenProfile.iFrameSideDemuxer.withRequestHeaders(headerStore),
-                                 isLive: false)
+                    try dem.open(reader: custom.reader, formatHint: custom.formatHint, profile: .iFrameSideDemuxer,
+                                 selectTitleID: title, discCacheKey: url.absoluteString)
+                    return {}
                 }
+                guard let reader = AetherEngine.indexReader(url: url, headers: headerStore.current, label: "iframe",
+                                                            requestTimeout: 8, maxRetries: 1) else {
+                    throw DemuxerError.openFailed(code: -1)
+                }
+                do {
+                    try dem.open(reader: reader, profile: .iFrameSideDemuxer, selectTitleID: title,
+                                 discCacheKey: url.absoluteString)
+                } catch {
+                    reader.close()
+                    throw error
+                }
+                return { reader.close() }
+            },
+            knownKeyframes: { [weak session] in
+                guard let session else { return [] }
+                return session.recordedKeyframes(streamIndex: session.videoStreamIndex)
             },
             cleanup: { custom?.reader.close() },
             convertP7ToProfile81: cfg.convertP7ToProfile81,
             nalFraming: framing)
+        keyframeReader = reader
+        return reader
+    }
+
+    /// What a scrub still past the resident window reads off the source (`sourceStill`): the plan's keyframes,
+    /// or the picture at a time on a source with no keyframe list; nil while this session may not read one.
+    /// Decided in `serve()` by the I-frame rendition's own rule.
+    private(set) var sourceStillTimeline: IFrameRenditionEligibility.Timeline?
+    /// The decoder `sourceStill` turns a keyframe or a picture run into an image with, made on first use.
+    /// Under `sourceStillLock`, which also keeps one still at a time on it.
+    private var sourceStillDecoder: FrameDecodeContext?
+    private let sourceStillLock = NSLock()
+
+    /// A still of the picture at `seconds` (playlist axis), read off the source through the session's keyframe
+    /// reader, for a scrub preview past the resident window: the keyframe at or before it where the plan lists
+    /// keyframes, the picture at it where the source seeks to a time. nil while no picture can be read off this
+    /// source, when the origin has no room for a read, or when the read fails. Blocks; any thread but main.
+    func sourceStill(atSeconds seconds: Double, maxWidth: Int) -> CGImage? {
+        guard let timeline = sourceStillTimeline, seconds.isFinite, keyframeReadsAllowed() else { return nil }
+        restartLock.lock()
+        let plan = segmentPlan
+        let keyframes = planKeyframePts.sorted()
+        let cfg = sourceVideoConfig
+        restartLock.unlock()
+        let tb = sourceVideoTbSeconds
+        guard let cfg, tb > 0, !plan.isEmpty else { return nil }
+        // The plan's segment holding `seconds`, and the target on the source axis inside it.
+        var first = 0, past = plan.count
+        while first < past {
+            let mid = (first + past) / 2
+            if plan[mid].startSeconds <= seconds { first = mid + 1 } else { past = mid }
+        }
+        let segment = plan[max(0, first - 1)]
+        let target = segment.startPts + Int64((max(0, seconds - segment.startSeconds) / tb).rounded())
+        guard let reader = sessionKeyframeReader() else { return nil }
+        waitForKeyframeLink { false }
+        sourceStillLock.lock()
+        defer { sourceStillLock.unlock() }
+        if sourceStillDecoder == nil {
+            // The decoder reads the samples as the session serves them: Annex B ones with the source's own
+            // extradata, length-prefixed ones with the record the muxer writes.
+            sourceStillDecoder = FrameDecodeContext(
+                streamParameters: cfg.codecpar, timeBase: cfg.timeBase,
+                extradata: cfg.convertsAnnexBSamples ? nil : cfg.extradataOverride)
+        }
+        guard let decoder = sourceStillDecoder, (try? decoder.ensureOpen()) != nil else { return nil }
+        let decodeStart = CACurrentMediaTime()
+        defer { StageTimes.alongsidePlayback.record("source still decode", ms: (CACurrentMediaTime() - decodeStart) * 1000) }
+        switch timeline {
+        case .keyframes:
+            // The keyframe at or before the target: what playing from there would show first.
+            var low = 0, high = keyframes.count
+            while low < high {
+                let mid = (low + high) / 2
+                if keyframes[mid] <= target { low = mid + 1 } else { high = mid }
+            }
+            let keyframe = low > 0 ? keyframes[low - 1] : segment.startPts
+            return reader.payload(startPts: keyframe).flatMap { decoder.decodeStill(keyframe: $0, targetWidth: maxWidth) }
+        case .stills:
+            return reader.pictureRun(atPts: target).flatMap { decoder.decodeStill(run: $0, targetWidth: maxWidth) }
+        }
+    }
+
+    /// Whether a read off the source may go out now. The budget learns its limits mid-session (a 429 halves
+    /// them and arms a pacer), so the check `start()` made is repeated before every read. A custom reader has
+    /// no origin.
+    private func keyframeReadsAllowed() -> Bool {
+        isCustomKeyframeSource || !(OriginRequestBudget.shared.requiresSerialRequests(sourceURL)
+                                    || OriginRequestBudget.shared.isPaced(sourceURL))
+    }
+
+    /// A seek or a producer restart owns the link for a moment; a picture can wait that out, but not
+    /// ordinary fetching, or it would stall whenever the pump is busy.
+    private func waitForKeyframeLink(_ shouldStop: () -> Bool) {
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline, !shouldStop(), restartInFlight || (seekInFlight?.isSeeking ?? false) {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+    }
+
+    /// A rendition over the session's keyframe reader: what each entry reads (`read`), and how a read
+    /// becomes a fragment. nil when the reader cannot be made (the session has no demuxer).
+    private func makeKeyframeRendition(
+        entries: [IFrameRendition.Entry],
+        cache: IFramePayloadCache,
+        format: IFrameRenditionFormat,
+        read: @escaping (IFrameKeyframeReader, IFrameRendition.Entry) -> Data? = { reader, entry in
+            reader.payload(startPts: entry.startPts)
+        },
+        buildFragment: @escaping (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?,
+        companion: (format: IFrameRenditionFormat,
+                    build: (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?)? = nil
+    ) -> IFrameRendition? {
+        guard let reader = sessionKeyframeReader() else { return nil }
         return IFrameRendition(
             entries: entries,
             cache: cache,
             format: format,
-            readPayload: { reader.payload(startPts: $0.startPts) },
+            readPayload: { read(reader, $0) },
             buildFragment: buildFragment,
-            waitForLink: { [weak self] shouldStop in
-                // A seek or a producer restart owns the link for a moment; a thumbnail can wait that
-                // out, but not ordinary fetching, or it would stall whenever the pump is busy.
-                let deadline = Date().addingTimeInterval(2)
-                while Date() < deadline, !shouldStop(), let self,
-                      self.restartInFlight || (self.sideReaderLinkGate?.state.seeking ?? false) {
-                    Thread.sleep(forTimeInterval: 0.05)
-                }
-            },
-            // The budget learns its limits mid-session (a 429 halves them and arms a pacer), so the
-            // check `start()` made is repeated before every read. A custom reader has no origin.
-            sourceReadsAllowed: {
-                custom != nil || !(OriginRequestBudget.shared.requiresSerialRequests(url)
-                                   || OriginRequestBudget.shared.isPaced(url))
-            },
-            interruptReads: { reader.interrupt() },
-            closeReader: { reader.close() })
+            companion: companion,
+            waitForLink: { [weak self] shouldStop in self?.waitForKeyframeLink(shouldStop) },
+            sourceReadsAllowed: { [weak self] in self?.keyframeReadsAllowed() ?? false })
     }
 
     /// Stop answering I-frame requests. The shutdown waits for a read in flight, so it runs off the
@@ -3421,9 +3873,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
         DispatchQueue.global(qos: .utility).async { rendition.shutdown() }
     }
 
-    private func closeUnusedCustomIFrameReader() {
-        customIFrameReader?.reader.close()
-        customIFrameReader = nil
+    private func closeUnusedCustomKeyframeReader() {
+        keyframeReaderLock.lock()
+        let custom = customKeyframeReader
+        customKeyframeReader = nil
+        keyframeReaderLock.unlock()
+        custom?.reader.close()
     }
 
     // MARK: - Producer construction + restart
@@ -3444,7 +3899,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // Audio target set dynamically after video lands.
         let videoTarget: Int64
         let desiredVideoTfdt: Int64
-        let desiredAudioTfdt: Int64
         if let endSeconds = liveReopenOutputEndSeconds {
             // Live reopen: no scan target (join head), but tfdt must continue where the
             // failed producer's last segment ended (seam carries #EXT-X-DISCONTINUITY).
@@ -3452,9 +3906,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
             desiredVideoTfdt = sourceVideoTbSeconds > 0
                 ? Int64(endSeconds / sourceVideoTbSeconds)
                 : 0
-            desiredAudioTfdt = savedAudioConfig.map {
-                av_rescale_q(desiredVideoTfdt, cfg.timeBase, $0.sourceTimeBase)
-            } ?? 0
         } else if baseIndex > 0, baseIndex < segmentPlan.count {
             videoTarget = segmentPlan[baseIndex].startPts
             // The produced timeline continues at the segment's ADVERTISED item-axis start, never at
@@ -3465,15 +3916,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             desiredVideoTfdt = sourceVideoTbSeconds > 0
                 ? Int64((segmentPlan[baseIndex].startSeconds / sourceVideoTbSeconds).rounded())
                 : segmentPlan[baseIndex].startPts - firstKeyframePts
-            // Rescale into source audio TB (not bridge.inputTimeBase=1/48000). The pre-fix bug
-            // was FLAC-bridge-only: shift=-152485195 (off by 48x); stream-copy unaffected.
-            desiredAudioTfdt = savedAudioConfig.map {
-                av_rescale_q(desiredVideoTfdt, cfg.timeBase, $0.sourceTimeBase)
-            } ?? 0
         } else {
             videoTarget = Int64.min
             desiredVideoTfdt = 0
-            desiredAudioTfdt = 0
         }
 
         // Segment boundary slice: startPts per segment + endPts of final (producer upper bound).
@@ -3492,10 +3937,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             audio: savedAudioConfig,
             sideAudioDemuxer: sideAudioDemuxer,
             cache: cache,
+            audioRendition: audioRenditionCache,
             baseIndex: baseIndex,
             targetSegmentDurationSeconds: liveCutTargetSeconds,
             videoFallbackDurationPts: videoFallbackDurationPts,
-            audioFallbackDurationPts: audioFallbackDurationPts,
             restartTargetVideoPts: videoTarget,
             boundaryClaimsRandomAccess: planBoundariesClaimRandomAccess,
             planBoundaryAxis: planBoundaryAxis,
@@ -3503,7 +3948,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
             subtitleTapStreamIndices: Set(nativeSubtitleSourceStreamIndicesForSession.compactMap { $0 }),
             subtitlePacketStreamIndices: allEmbeddedSubtitleStreamIndices,   // #112 rework
             desiredFirstVideoTfdtPts: desiredVideoTfdt,
-            desiredFirstAudioTfdtPts: desiredAudioTfdt,
             segmentBoundaries: segmentBoundaries,
             planAnchorVideoPts: firstKeyframePts,
             isLive: isLiveSession,
@@ -3524,16 +3968,26 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // AE#464: read here rather than pushed, so every producer this session builds (seek
             // restart, live reopen, #99 revive) cuts with the offset currently in force.
             audioDelaySeconds: audioDelaySeconds,
-            servesSegmentsProgressively: servesSegmentsProgressively,
             epoch: producerEpoch
         )
-        // #240: threaded onto every producer (initial + restart), like the wedge-detector providers
-        // below. The side readers read one gate for the whole session, so a restart must not leave
-        // a gap where nobody claims the link.
-        prod.sideReaderLinkGate = sideReaderLinkGate
+        // Layer 3 step 5: every producer (initial + restart) reads on for the subtitle consumers, and
+        // states how far it has read.
+        prod.subtitleReadAheadReach = { [weak self] in self?.subtitleReadAheadSegmentIndex() }
+        prod.onSourceReadThrough = { [weak self] seconds in
+            guard let self, self.isInstalledProducer(producerEpoch) else { return }
+            self.noteSourceRead(through: seconds, producerEpoch: producerEpoch)
+        }
+        #if DualLayerDolbyVision
+        prod.felTap = felTap
+        #endif
+        prod.overlayPlaceholder = overlayPlaceholder
+        prod.overlayDecodeTap = overlayDecodeTap
         prod.playedMediaLedger = playedMediaLedger
         prod.onFirstHDR10PlusDetected = { [weak self] in
             self?.notifyHDR10PlusOnce()
+        }
+        prod.onSegmentWritten = { [weak self] index, carriedSeconds in
+            self?.recordCarried(carriedSeconds, at: index)
         }
         prod.onVideoShiftKnown = { [weak self] shiftPts, firstItemTfdtPts, normalizationShiftPts in
             self?.handleVideoShiftKnown(
@@ -3544,6 +3998,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: seamOutputSeconds,
                                            producerEpoch: producerEpoch)
         }
+        prod.onLiveVideoColour = { [weak self] startSeconds, colour in self?.onLiveVideoColour?(startSeconds, colour) }
         prod.onPumpFinished = { [weak self, weak prod] reason in
             guard let self, let prod else { return }
             self.handlePumpFinished(prod, reason: reason)
@@ -3648,761 +4103,51 @@ public final class HLSVideoEngine: @unchecked Sendable {
             publishPlaylistShift(seconds, seamItemSeconds: seamItemSeconds)
             return
         }
-        // AE#418 round 2: on VOD the axis moves when AVPlayer PLACES this segment, not when the
-        // producer writes it. Record what the segment is worth and let the placement publish it; an
-        // epoch AVPlayer never fetches from must not move the clock at all.
+        // On VOD the axis is what AVPlayer reports in band (`noteInBandClock`); a gate open only answers
+        // an AE#412 re-cut waiting on it, with how far below its boundary it opened.
         let index = segmentIndexForPlaylistTime(seamItemSeconds)
-        anchorShiftLock.lock()
         // Audit SEG-104: a restart that was replaced while its first read was in flight can still
-        // open its gate. Its epoch describes bytes nobody will store, and recording it would drop
-        // the entries at and above its index.
-        guard installedProducerEpoch == producerEpoch else {
-            anchorShiftLock.unlock()
+        // open its gate, for bytes nobody will store.
+        guard isInstalledProducer(producerEpoch) else {
             EngineLog.emit(
                 "[HLSVideoEngine] gate open at seg\(index) from a superseded producer, ignored",
                 category: .session)
             return
         }
-        // AE#412: a re-cut opens below its boundary on purpose, and AVPlayer places what it produces
-        // at its own tfdt, so the epoch is worth nothing to the axis. Recording zero still drops the
-        // entries at and above it, which is what the rewrite calls for.
-        let isRecut = recutMark?.isOpened(byProducerEpoch: producerEpoch, at: index) == true
-        if isRecut { recutMark = nil }
-        // PR #533: the run keeps the source-to-item normalization its bytes were written with, even
-        // where its opening segment has no placement offset left to carry. Those are the same number
-        // only on a source whose timestamps start at zero.
-        let axis = EpochAxis(
-            presented: seconds,
-            carried: normalizationShiftPts == Int64.min
-                ? 0 : Double(normalizationShiftPts) * sourceVideoTbSeconds,
-            isRecut: isRecut)
-        epochAxisByIndex.record(axis, at: index)
-        let placementAlreadyHappened = lastPlacedIndex == index
-        anchorShiftLock.unlock()
+        let carried = normalizationShiftPts == Int64.min ? 0 : Double(normalizationShiftPts) * sourceVideoTbSeconds
         gateOpenCondition.lock()
-        lastGateOpen = (index: index, axis: axis)
+        lastGateOpen = (index: index, backoffSeconds: seconds - carried)
         gateOpenCondition.broadcast()
         gateOpenCondition.unlock()
-        if placementAlreadyHappened {
-            handleSegmentPlaced(at: index)
-        }
     }
 
-    /// AE#418 round 2: AVPlayer put the segment at `index` into its timeline, so whatever that
-    /// segment carries below its advertised start moves the axis by that much.
+    /// docs/segment-axis.md: AVPlayer played the segment that states `stamp` at item time
+    /// `itemSeconds` (`InBandClock`, read back through `AVPlayerItemMetadataOutput`), so from there on
+    /// `source = item + (stamp.sourceSeconds - itemSeconds)`, measured, whatever AVPlayer did with the
+    /// segment: a run it opened, one it appended to, a timeline it rebuilt.
     ///
-    /// Measured with `play --picture-probe` on a fixture whose picture states its own source time,
-    /// at re-aims of 1, 3, 5, 7, 9 and 11 s: the offset **composes**. A run keeps the offset it has
-    /// across every boundary it plays through (round 1 measured that), and re-placing an overlong
-    /// segment adds its offset again on top: a resume that opened 9 s below its boundary reads
-    /// `axisErr=-9.000`, and a seek that makes AVPlayer fetch that same segment a second time reads
-    /// `-18.000`, not `-9.000` and not the `0.000` round 1 published there.
-    ///
-    /// Round 1 keyed this to "the run began here" and answered it from the fetch sequence, which is
-    /// what the reporter's seek burst falsified: a fetch that does not follow its predecessor happens
-    /// while AVPlayer stays inside the run it is already playing, and the axis was then dropped to
-    /// zero under a picture that had not moved. Reproduced on the fixture (`start 53`, seek to 80:
-    /// `capErr=-8.983`), and gone once the axis only ever moves by what a placed segment is worth.
-    func handleSegmentPlaced(at index: Int) {
-        guard !isLiveSession else { return }
+    /// Readings arrive about four seconds ahead in item order, and again for the segment a seek or the
+    /// mount lands in. The axis is published when a reading differs from the last one (a new run's
+    /// offset), and whenever a reading is at or before the last one's position, which is a seek: its
+    /// seam then also clears whatever the old position's readings had put ahead of it.
+    func noteInBandClock(itemSeconds: Double, stamp: InBandClock.Stamp) {
+        guard !isLiveSession, itemSeconds.isFinite else { return }
+        let axis = stamp.sourceSeconds - itemSeconds
         anchorShiftLock.lock()
-        lastPlacedIndex = index
-        // AE#448: the table answers "is this an epoch's FIRST segment", not "is it worth anything".
-        // Every other index is cut on its own boundary inside a run that already carries an axis, and
-        // has nothing to say about where that run begins.
-        let epoch = epochAxisByIndex.opening(at: index)
-        // AE#418 round 8: how far below its axis the last measured placement landed. Zero until one
-        // has been read back, which is what makes an item's first placement compose onto the axis.
-        let displacement = lastPlacementDisplacement
-        let offset = placementOffsetSeconds
+        let last = lastClockReading
+        lastClockReading = (itemSeconds, axis)
         anchorShiftLock.unlock()
-        guard let epoch else { return }
-        restartLock.lock()
-        let plannedStart = index >= 0 && index < segmentPlan.count
-            ? segmentPlan[index].startSeconds : nil
-        restartLock.unlock()
-        guard let plannedStart else { return }
-        let current = playlistShiftSeconds
-        // The base this placement lands on is the displacement in force LESS however far below it the
-        // last placement was measured to sit, which is where AVPlayer puts a segment it composes into
-        // a timeline it already has.
-        //
-        // PR #533 round 2: in DISPLACEMENT, not in axis. What composes is what AVPlayer's timeline is
-        // displaced by; the normalization the bytes carry is added once, at the end, by the epoch
-        // that wrote them. Composing the axis added the source origin again per placement.
-        let base = Self.placementBase(offset: offset, displacement: displacement)
-        let composedOffset = Self.placementOffset(
-            after: offset, placing: epoch.placedOffset, displacement: displacement)
-        let composed = epoch.carried + composedOffset
-        let seam = Self.seamItemSeconds(advertisedStart: plannedStart, currentShift: base)
-        // AE#418 round 3: keep what this composition assumed, so the placement can be checked against
-        // AVPlayer's own account of where it put the bytes.
-        anchorShiftLock.lock()
-        let superseded = lastPublishedPlacement
-        lastPublishedPlacement = PublishedPlacement(
-            index: index, advertisedStart: plannedStart, epoch: epoch, assumedBase: base,
-            offsetInForce: offset, deliverySerialAtCompose: segmentDeliverySerial)
-        placementOffsetSeconds = composedOffset
-        anchorShiftLock.unlock()
-        if let superseded {
-            // AE#418 round 4: named rather than left silent. A placement whose successor arrives before
-            // its window closes never gets a verdict, and the reporter read that silence as a check
-            // that had not run. It needs none: this placement measures the base AVPlayer composed onto,
-            // which is the whole composition below it, including the one being dropped here.
-            EngineLog.emit(
-                "[HLSVideoEngine] #418 seg\(superseded.index) superseded before it was measured; "
-                + "seg\(index) measures the axis it left behind",
-                category: .session
-            )
-        }
+        if let last, itemSeconds > last.itemSeconds, abs(axis - last.axis) < Self.axisReadingEpsilonSeconds { return }
         EngineLog.emit(
-            "[HLSVideoEngine] #418 seg\(index) placed (advertised \(String(format: "%.3f", plannedStart))s, "
-            + "worth \(String(format: "%.3f", epoch.openingSourceAxis))s, sitting "
-            + "\(String(format: "%.3f", displacement))s below its axis): axis shift "
-            + "\(String(format: "%.3f", current))s -> \(String(format: "%.3f", composed))s "
-            + "from item \(String(format: "%.3f", seam))s",
-            category: .session
-        )
-        publishPlaylistShift(composed, seamItemSeconds: seam, offset: composedOffset)
+            "[HLSVideoEngine] seg\(stamp.segmentIndex) plays from item \(String(format: "%.3f", itemSeconds))s at "
+            + "source \(String(format: "%.3f", stamp.sourceSeconds))s: axis \(String(format: "%.3f", axis))s",
+            category: .session)
+        publishPlaylistShift(axis, seamItemSeconds: itemSeconds)
     }
 
-    /// AE#418 round 2: how far AVPlayer's timeline is displaced after it places a segment whose gate
-    /// opened `epochOffset` below its boundary. It composes, because AVPlayer puts the placed
-    /// segment's advertised start where its CURRENT mapping says that position is, not where the
-    /// playlist says it is.
-    ///
-    /// PR #533 round 2: in DISPLACEMENT. Rounds 2 to 9 measured this on sources whose timestamps
-    /// start at zero, where the displacement and the published axis are one number, and composing the
-    /// axis then added the source origin once per placement (measured: 599.625 + 596.833 = 1196.458).
-    /// The normalization is not composed, it is added once by the epoch that wrote the bytes.
-    ///
-    /// AE#418 round 5: and it composes onto a BASE, which can sit below the axis. Rounds 5 to 7 read
-    /// that distance as a multiple of the epoch's presentation lead: round 5 shipped the multiple as
-    /// arithmetic, round 6 measured it per source, round 7 took the median of its readings. Round 8
-    /// measured the distance itself with `play --picture-probe` over a throttled origin, on three
-    /// clips identical but for their reorder depth and the same burst arm, 2 runs each, every run
-    /// identical:
-    ///
-    /// | fixture | reorder | lead | placement 2 | placement 3 |
-    /// | --- | --- | --- | --- | --- |
-    /// | `tc-cues-lie.mkv` | none | 0.000 | 0.000 | **0.042** |
-    /// | `tc-bf1-cues-lie.mkv` | one frame | 0.042 | 0.000 | 0.083 |
-    /// | `tc-bf-cues-lie.mkv` | two frames | 0.083 | 0.083 | 0.125 |
-    ///
-    /// The bold cell is what retires the model: that clip has `has_b_frames=0` and every gate opens
-    /// with `lead=0`, yet its third placement sits a frame below its axis. A quantity that is nonzero
-    /// where the lead is exactly zero is not a multiple of the lead. The middle row retires the
-    /// source-law premise separately: one source, two placements, 0.000 then 0.083.
-    ///
-    /// So the distance is carried in the units it corrects, and the reading that already measures the
-    /// base measures it. See [[reference_an_offset_about_presentation_is_measured_at_the_pts]].
-    static func placementOffset(
-        after currentOffset: Double, placing epochOffset: Double, displacement: Double
-    ) -> Double {
-        return placementBase(offset: currentOffset, displacement: displacement) + epochOffset
-    }
-
-    /// The base a placement lands on: the displacement in force, less how far below it the last
-    /// placement was measured to sit. This is the value the reading takes back out of AVPlayer's
-    /// buffer (`advertisedStart - observedItemStart` is a statement about its timeline and nothing
-    /// else), so the prediction is checkable against it on every placement that opens its own run.
-    static func placementBase(offset: Double, displacement: Double) -> Double {
-        return offset - displacement
-    }
-
-    /// AE#418 round 8: how far below the displacement it composed on a placement actually landed.
-    ///
-    /// Every reading produces one, a confirmation included, which is what the lead coefficient could
-    /// not do: it needed a placement carrying a lead, and on a source with no frame reordering, or a
-    /// session whose placements are AE#412 re-cuts (worth 0 and lead 0 by construction), there is
-    /// never one. Measured on `tc-wide-cues-lie.mkv`, 13 of 13 placements across two runs carried
-    /// `lead 0.000s`; the reporter's three arms produced a single sample between them.
-    ///
-    /// AE#418 round 9: the distance is a MEASUREMENT of a session, and a session's readings can
-    /// disagree by a frame. Reproduced on a ten-placement chain (`--seek-count 24` over a throttled
-    /// origin, 3 of 3 runs byte-identical): nine placements read 0.000 and `seg5` reads 0.042, so the
-    /// composition after it is one frame out and the reading after THAT puts it back. That is the
-    /// reporter's arm 1 exactly (`-0.036`, then `+0.004`, then a placement a frame out). What the two
-    /// disagree on is which reading is the outlier: on the fixture the standing value is 0.000 and one
-    /// reading deviates, on his 23.976 fps asset it is -0.041 and holds to 2 ms across two arms and
-    /// two placements. So neither a median (round 7's rule, which lags a genuine step by one reading
-    /// and would have cost him 0.041 s at `seg589`) nor a hold-until-confirmed rule is right on both,
-    /// and last-wins is kept: the deviation is one frame, it is undone by the next measurable
-    /// placement, and no instrument here resolves better than the frame it would be chasing. The
-    /// picture probe quantises at one frame too.
-    static func placementDisplacement(offset: Double, measuredBase: Double) -> Double {
-        let raw = offset - measuredBase
-        guard raw.isFinite else { return 0 }
-        // Below the epsilon a re-publish moves nothing anyone can see, so the placement is ON its
-        // axis rather than a signed hair off it. This is also what keeps a chain of confirmations
-        // from printing `-0.000s` at a reader.
-        guard abs(raw) > axisRepublishEpsilonSeconds else { return 0 }
-        return min(max(raw, -maxPlacementDisplacementSeconds), maxPlacementDisplacementSeconds)
-    }
-
-    /// A reading can be wrong once (round 4 accepts that on purpose), so what it carries into the NEXT
-    /// composition is bounded. The widest placement measured is three frames at 24 fps; this is well
-    /// past that and well inside `placementSeamToleranceSeconds`, so a stray can never move a
-    /// composition by anything a reader would call a seam.
-    static let maxPlacementDisplacementSeconds = 0.25
-
-    /// The item position the placed segment's content begins at: its advertised start, read through
-    /// the axis that was in effect before it landed. Everything below that is still the old epoch's.
-    static func seamItemSeconds(advertisedStart: Double, currentShift: Double) -> Double {
-        return advertisedStart - currentShift
-    }
-
-    /// AVPlayer discards a sub-second axis offset at a seek and snaps back to the playlist; a larger
-    /// one it keeps. Measured on the fixture: `-0.500` and `-0.875` read `axisErr=0.000` after a seek,
-    /// `-1.000`, `-1.083`, `-1.292`, `-1.500`, `-3.000`, `-4.000`, `-7.000`, `-9.000` and `-11.000`
-    /// all survive one unchanged. Anything below this is worth less than the frame it would move.
-    static let axisSnapsBelowSeconds = 1.0
-
-    /// AE#534: the size of the axis was never the thing that decided this, it only correlated with it.
-    /// What AVPlayer actually throws an offset away at is a seek that makes it REBUILD its timeline,
-    /// and a seek whose landing it already holds rebuilds nothing, so it keeps the displacement and
-    /// this rule has to keep it too. Measured on `tc-cues-lie.mkv` over `slowrange.py` at 600 kbps /
-    /// 300 ms, same standing axis of -0.375 in both arms, 2 of 2 runs each:
-    ///
-    /// | seek | landing | placed ranges | AVPlayer | `capErr` on `main` |
-    /// | --- | --- | --- | --- | --- |
-    /// | 73 -> 78 | 78.375 | 72.000-84.337, holds it | KEEPS -0.375 | **-0.400**, wrong for the run |
-    /// | 73 -> 80 | 80.375 | 72.000-80.343, does not | discards it | -0.025, right |
-    ///
-    /// The round 2 arms that measured the size boundary all LEFT the buffer, which is why the proxy
-    /// held for them and why they stay exactly as they were here.
-    ///
-    /// Read the placement off `AVPlayerItem.loadedTimeRanges` and nothing else. The producer's own
-    /// buffered frontier is a different number in both directions on these very arms (95.62 against a
-    /// placed 84.337, and 75.62 against a placed 80.343): a fetch is not a placement (AE#418), and
-    /// only the placement says whether there is a timeline to rebuild.
-    static func axisShiftAfterSeek(_ shift: Double, landingIsPlaced: Bool) -> Double {
-        if landingIsPlaced { return shift }
-        return abs(shift) < axisSnapsBelowSeconds ? 0 : shift
-    }
-
-    /// AE#418 round 2: the host seeked and the axis was small enough for AVPlayer to throw away.
-    /// Publishing zero from the landing forward is what keeps the clock over the picture; the seam
-    /// leaves everything below the landing on the axis its bytes were placed with.
-    func snapAxisAfterSeek(landingItemSeconds: Double, landingIsPlaced: Bool) {
-        guard !isLiveSession else { return }
-        // AE#481: the landing reading asks about the segment that opens the run it lands in, so the
-        // record starts empty at every seek. A stale one would describe the run before this seek.
-        anchorShiftLock.lock()
-        firstDeliveredIndexSinceSeek = nil
-        anchorShiftLock.unlock()
-        let current = playlistShiftSeconds
-        let snapped = Self.axisShiftAfterSeek(current, landingIsPlaced: landingIsPlaced)
-        guard snapped != current else {
-            // AE#534: say so when the gate is what kept it. Without this the two cases that matter,
-            // "the axis was too large to discard" and "the landing was already held", leave the same
-            // silence behind, and a report about a clock sitting off the picture cannot be read.
-            if landingIsPlaced, current != 0, abs(current) < Self.axisSnapsBelowSeconds {
-                EngineLog.emit(String(
-                    format: "[HLSVideoEngine] #534 axis %.3fs kept at the seek landing %.3fs "
-                    + "(AVPlayer already holds it, so nothing rebuilds)",
-                    current, landingItemSeconds), category: .session)
-            }
-            return
-        }
-        EngineLog.emit(
-            "[HLSVideoEngine] #418 axis \(String(format: "%.3f", current))s discarded at the seek "
-            + "landing \(String(format: "%.3f", landingItemSeconds))s (AVPlayer snaps a sub-second axis)",
-            category: .session
-        )
-        // Round 3: AVPlayer threw this placement's offset away, so there is no longer a placement for
-        // the check to measure. Left standing, the record would be read against a run now sitting on
-        // the raw playlist, the base would measure 0, and the correction would put back exactly the
-        // axis this snap just removed.
-        anchorShiftLock.lock()
-        lastPublishedPlacement = nil
-        anchorShiftLock.unlock()
-        // Still asked of the AXIS rather than of the displacement, which is the second half of AE#534
-        // and deliberately not this change: on a source whose timestamps begin at 600 s the rule
-        // cannot fire at all, and the one arm that separates the two geometries says inert is the
-        // right answer there. With the placement gate above that arm is now inert for the right
-        // reason rather than by accident, which is what the displacement half needs before it moves.
-        publishPlaylistShift(
-            snapped, seamItemSeconds: landingItemSeconds, offset: snapped - sourceStartSeconds)
-    }
-
-    /// AE#481: what the run holding a seek landing carries, read off the playlist instead of inherited
-    /// from a composition measured somewhere else.
-    ///
-    /// The #418 axis is published once, at the advertised start of the segment whose gate re-aimed, and
-    /// it stands for everything after that seam. Measured with `play --picture-probe` on the #418 chain
-    /// with the re-anchoring seek LAST (`--seek-count 5 --seek-pattern 65,60,70,58,75`, `slowrange.py`
-    /// at 600 kbps / 300 ms), the picture says the axis is narrower than that:
-    ///
-    /// | item | 53.000 | 67.833 | 79.000 | 84.917 | ... | 119.958 |
-    /// | --- | --- | --- | --- | --- | --- | --- |
-    /// | `pic - picItem` | **-9.000** | 0.000 | 0.000 | 0.000 | | 0.000 |
-    ///
-    /// The offset belongs to the run `seg13` opened. A seek that opens a NEW run at a segment the
-    /// producer wrote at its planned position lands on a source-true stretch, and nothing tells this
-    /// side: `capErr` reads `+9.017` from the landing to the end of the session (2 of 2 runs at
-    /// 600 kbps / 300 ms, 1 of 1 at 1200 kbps / 200 ms, and not at 3200 kbps / 100 ms, where the
-    /// landing stays inside the run already playing). Ten rounds of #418 never saw it standing because
-    /// a seek burst heals it inside a second: the next seek composes a placement, and its reading comes
-    /// off the changed timeline.
-    ///
-    /// **The discriminator is where the run OPENS, asked of ONE segment.** A segment advertised at A
-    /// goes into a timeline carrying an axis at the seam that axis predicts, and into a timeline
-    /// carrying nothing at A itself, which is round 7's pair of admissible answers. The segment to ask
-    /// is the first one the local server answered after the seek, because that is the one whose content
-    /// opens the run the landing sits in. Asked of the PLAN instead ("does this run open on some
-    /// playlist position"), the same rule publishes on a coincidence: 31 boundaries over 120 s against a
-    /// half-second tolerance, and measured on the #418 chain it wrote a 0.000 axis into a timeline
-    /// carrying -27.875 s, taking `capErr` from +0.092 to -27.883 in one tick. A wrong candidate now
-    /// costs silence rather than an axis: neither answer matches and nothing is published.
-    static func landingAxisReading(
-        landingItemSeconds: Double,
-        ranges: [(Double, Double)],
-        openingSegmentStart: Double,
-        worth: Double,
-        assumedBase: Double,
-        standingAxis: Double
-    ) -> (axis: Double, runStart: Double)? {
-        guard let holding = ranges.first(where: {
-            $0.0.isFinite && $0.1.isFinite && $0.0 <= landingItemSeconds && landingItemSeconds <= $0.1
-        }) else { return nil }
-        let predicted = seamItemSeconds(advertisedStart: openingSegmentStart, currentShift: assumedBase)
-        // Round 7's two admissible answers, asked at a landing instead of at a placement: a run opens
-        // where the timeline this session knows would put this segment, or at the segment's own
-        // playlist position, which is what a timeline carrying nothing there does.
-        //
-        // Both halves are load-bearing. Asking only "does the run open on SOME playlist position"
-        // publishes on a coincidence: the plan has 31 boundaries over 120 s and the tolerance is half a
-        // second, and measured on the #418 chain that read a 0.000 axis into a timeline carrying
-        // -27.875 s (`capErr` +0.092 to -27.883 in one tick). One segment can be asked; the plan cannot.
-        guard abs(holding.0 - predicted) > placementSeamToleranceSeconds,
-              abs(holding.0 - openingSegmentStart) <= placementSeamToleranceSeconds else { return nil }
-        let base = measuredPlacementBase(
-            advertisedStart: openingSegmentStart, observedItemStart: holding.0)
-        let axis = base + worth
-        guard abs(axis - standingAxis) > axisRepublishEpsilonSeconds else { return nil }
-        return (axis, holding.0)
-    }
-
-    /// AE#481: read the axis where a seek landed and publish it when the timeline disagrees with the
-    /// composition it inherited. Returns whether anything was published.
-    func applyLandingAxisReading(landingItemSeconds: Double, ranges: [(Double, Double)]) -> Bool {
-        guard !isLiveSession else { return false }
-        anchorShiftLock.lock()
-        let pending = lastPublishedPlacement
-        let epochs = epochAxisByIndex
-        let displacement = lastPlacementDisplacement
-        let standingOffset = placementOffsetSeconds
-        let opening = firstDeliveredIndexSinceSeek
-        anchorShiftLock.unlock()
-        // A placement awaiting measurement has the more specific reading (round 7) and measures the
-        // same ranges; two writers on one axis would race, and the placement knows what it composed.
-        //
-        // PR #533: a run AVPlayer rebuilt at the segment's own playlist position has no placement
-        // offset left, and is NOT therefore source-true. Its bytes still map item time back onto the
-        // source with the normalization the producer folded into them, and reading a zero there cost
-        // a 600 s source origin its whole axis.
-        guard pending == nil, let opening,
-              let openingSourceShift = epochs.sourceAxis(at: opening) else { return false }
-        restartLock.lock()
-        let advertisedStart = opening >= 0 && opening < segmentPlan.count
-            ? segmentPlan[opening].startSeconds : nil
-        restartLock.unlock()
-        guard let advertisedStart else { return false }
-        let standing = playlistShiftSeconds
-        guard let reading = Self.landingAxisReading(
-            landingItemSeconds: landingItemSeconds, ranges: ranges,
-            openingSegmentStart: advertisedStart, worth: openingSourceShift,
-            assumedBase: Self.placementBase(offset: standingOffset, displacement: displacement),
-            standingAxis: standing)
-        else { return false }
-        EngineLog.emit(
-            "[HLSVideoEngine] #481 the run holding the landing at item "
-            + "\(String(format: "%.3f", landingItemSeconds))s opens at "
-            + "\(String(format: "%.3f", reading.runStart))s, which is seg\(opening)'s own playlist "
-            + "position \(String(format: "%.3f", advertisedStart))s, so it carries "
-            + "\(String(format: "%.3f", reading.axis))s and not the "
-            + "\(String(format: "%.3f", standing))s this session was mapping with",
-            category: .session
-        )
-        let carried: Double = epochs.carried(at: opening) ?? 0
-        publishPlaylistShift(
-            reading.axis, seamItemSeconds: reading.runStart, offset: reading.axis - carried)
-        return true
-    }
-
-    /// AE#418 round 3: one placement, kept so the composition that was published for it can be checked
-    /// against AVPlayer's own account of where those bytes landed.
-    struct PublishedPlacement: Sendable {
-        let index: Int
-        /// The segment's start in the playlist, which is the position AVPlayer reads through its axis.
-        let advertisedStart: Double
-        /// PR #533: the epoch that wrote these bytes, both what its first segment shows against its
-        /// advertised start and the normalization every packet of the run carries. Kept here rather
-        /// than looked up at measurement time: a backward restart between the composition and its
-        /// reading drops this epoch's entry, which is the pruning rule working, and the late lookup
-        /// would then answer with an older run's numbers.
-        let epoch: EpochAxis
-        /// What the segment carries below its advertised start, in AXIS terms, which is what a
-        /// reading adds the measured base to. Negative for a gate that opened early on a source whose
-        /// timestamps start at zero.
-        var worth: Double { epoch.openingSourceAxis }
-        /// The displacement the composition assumed AVPlayer's timeline was carrying when it placed
-        /// this.
-        let assumedBase: Double
-        /// The displacement in force when it was composed. This is what turns a reading into the
-        /// distance the next composition uses, and what a rollback returns to.
-        let offsetInForce: Double
-        /// AE#418 round 7: how many segment responses this session had completed when the placement
-        /// was composed, so a later answer can be told from the one before it.
-        let deliverySerialAtCompose: Int
-    }
-
-    /// Below this a re-publish moves nothing anyone can see, and publishing anyway would have the
-    /// measurement re-trigger its own verification for the rest of the session.
-    static let axisRepublishEpsilonSeconds = 0.001
-
-    /// The axis AVPlayer's timeline was carrying when it placed a segment advertised at
-    /// `advertisedStart` with its content beginning at `observedItemStart`.
-    ///
-    /// AVPlayer puts a placed segment's first sample at its advertised start read through the axis the
-    /// timeline already carries, so that one subtraction inverts the placement: the reading is the base
-    /// it composed onto, whatever this side assumed.
-    static func measuredPlacementBase(advertisedStart: Double, observedItemStart: Double) -> Double {
-        return advertisedStart - observedItemStart
-    }
-
-    /// AE#418 round 7: the run AVPlayer opened for THIS placement, identified by where it begins.
-    ///
-    /// A placed segment's first sample goes to its advertised start read through the base its timeline
-    /// carries, so the run it opens begins at the seam the composition predicts, give or take the
-    /// presentation lead the reading exists to measure. That is an identity, not a yardstick: the run
-    /// is picked by where it opens, and the base is then read off it, residual and all.
-    ///
-    /// A timeline AVPlayer threw away carries no base at all, so the same segment then opens at its
-    /// advertised start itself. Measured on `tc-wide-cues-lie.mkv` (a 60 s keyframe drought), seeking
-    /// 35 s back out of the buffer: the composition predicted item 62.333 on an axis of -10.333 and
-    /// AVPlayer opened `[52.000-75.969]` for an advertised 52.000, base 0.000. That reading is 10.3 s
-    /// from the prediction and it is right, the picture reads -12.000 for the rest of the run. So the
-    /// placement has two admissible answers, both of them "the run begins where the segment begins".
-    ///
-    /// Round 4 asked instead which run was NEW against a baseline of what the item held, and during a
-    /// seek burst that is a different question with a different answer. Measured on the fixture over a
-    /// throttled origin (`--seek-every 1 --seek-count 4 --seek-pattern 70,53,71,54`), with the picture
-    /// as witness: a placement predicting its seam at item 53.000 had its own run in hand for four
-    /// samples (`[53.083-70.035]`, one lead above the seam) and every one was refused for opening
-    /// below an overlapping baseline; the fifth sample found a later seek's run at `[74.208-86.099]`,
-    /// which is new by every baseline test, and adopting it published a 21 s error against a picture
-    /// that read -10.125. The same burst on the wide fixture adopted a run 41.667 s away by the
-    /// disjoint-from-the-baseline test, for a segment whose bytes were nowhere near it.
-    static func placementRunStart(
-        ranges: [(Double, Double)], predictedSeam: Double, rawSeam: Double? = nil
-    ) -> (start: Double, source: ReadingSource)? {
-        if let own = runOpening(at: predictedSeam, in: ranges) { return (own, .ownRun) }
-        if let raw = rawSeam, let rebuilt = runOpening(at: raw, in: ranges) {
-            return (rebuilt, .rebuiltTimeline)
-        }
-        return nil
-    }
-
-    private static func runOpening(at seam: Double, in ranges: [(Double, Double)]) -> Double? {
-        return ranges
-            .filter { $0.0.isFinite && abs($0.0 - seam) <= placementSeamToleranceSeconds }
-            .min(by: { abs($0.0 - seam) < abs($1.0 - seam) })?.0
-    }
-
-    /// How far from its predicted seam a run can open and still be this placement's.
-    ///
-    /// The distance is a presentation lead or two: 0.083 s on the two-frame-reorder fixture, 0.042 s
-    /// on the reporter's 23.976 fps asset. Half a second is past every geometry measured and still far
-    /// inside one segment, so nothing that belongs to another placement can be inside it.
-    static let placementSeamToleranceSeconds = 0.5
-
-    /// Whether AVPlayer holds anything where this placement said its bytes would land.
-    ///
-    /// AE#418 round 7: the composition is a statement about bytes in AVPlayer's timeline, so bytes
-    /// nobody holds never moved the axis. The reporter's run 1 kept a composition of -28.028 s for a
-    /// placement whose producer was torn down with its segment discarded: unmeasurable, kept, and
-    /// 4.5 s later the next measurable placement found the axis 33 ms from where it stood before it.
-    static func placementIsHeld(ranges: [(Double, Double)], seam: Double) -> Bool {
-        return ranges.contains { $0.0.isFinite && $0.1.isFinite && $0.0 <= seam && seam <= $0.1 }
-    }
-
-    /// What a placement measured out of AVPlayer's own buffer says the axis is.
-    struct PlacementReading: Equatable {
-        /// The base AVPlayer composed onto, read out of where it holds the bytes.
-        let base: Double
-        /// The axis that base and this segment's worth make together.
-        let axis: Double
-        /// The item position the segment's content begins at, read through the measured base.
-        let seam: Double
-        /// What the composition had wrong. Zero on a session whose predictions are all landing.
-        let residual: Double
-    }
-
-    /// AE#418 round 4: the reading IS the axis. Round 3 measured the same number and then collapsed it
-    /// onto the nearest value this side had already published, which made the prediction the yardstick
-    /// for the measurement that was supposed to check it: a placement whose real base matched no
-    /// prediction was thrown away (the reporter's session kept composing to -26.152 s while two
-    /// readings 400 s of media apart both said -10.93 s), and a placement whose real base was a frame
-    /// or two off the prediction was called a confirmation, so that difference stayed in the axis and
-    /// the next placement composed on top of it. Six such confirmations walked the error from 0.000 to
-    /// 0.290 s, at which point the same check refused every reading for the rest of the session.
-    static func placementReading(
-        advertisedStart: Double, worth: Double, assumedBase: Double, observedItemStart: Double
-    ) -> PlacementReading? {
-        let base = measuredPlacementBase(
-            advertisedStart: advertisedStart, observedItemStart: observedItemStart)
-        guard base.isFinite else { return nil }
-        return PlacementReading(
-            base: base, axis: base + worth, seam: advertisedStart - base, residual: base - assumedBase)
-    }
-
-    /// AE#418 round 3: check the axis just published against where AVPlayer says it put the bytes, and
-    /// correct it when the two disagree.
-    ///
-    /// The composition itself is right and measured: AVPlayer places a segment at its advertised start
-    /// read through the axis its timeline already carries, so an epoch that opens below its boundary
-    /// moves the axis by that much on top of what was there. What this side cannot see is whether a
-    /// placement it counted ever reached that timeline. A fetch is not a placement: during a seek burst
-    /// AVPlayer asks for a segment and then seeks away before the bytes are used, so the axis was
-    /// composed onto a base its timeline never carried, permanently, for every placement after it.
-    ///
-    /// The reporting case (a six-seek burst): a resume worth `-3.045` and then two restarts worth
-    /// `-2.043` and `-5.589` published `-10.677`, while the item's own loaded range began at `791.2`
-    /// against an advertised `788.204`, which is a base of `-3.045`. The middle fetch moved nothing,
-    /// the honest axis was `-8.634`, and the captions ran the difference behind the picture.
-    ///
-    /// Round 4 ADOPTS what it reads. What is left open is a seek that opens a fresh run at some other
-    /// segment inside the window, without restarting the producer and so without recording a placement
-    /// of its own: this would then measure one segment's advertised start against another segment's
-    /// run. That is a wrong adoption, and it is undone by the next placement, which measures again from
-    /// nothing. The refusal it replaces was permanent, and cost a reporter 42.6 s of axis for the rest
-    /// of a session, so the asymmetry decides it: a measurement that can be wrong once beats a
-    /// prediction that cannot be corrected.
-    func reconcileAxisWithObservedPlacement(
-        observedItemStart: Double, itemClock: Double, source: ReadingSource = .ownRun
-    ) {
-        guard !isLiveSession else { return }
-        anchorShiftLock.lock()
-        let placement = lastPublishedPlacement
-        // One placement is measured once. Publishing below re-enters this through the shift hook, and
-        // the run this reading came from is by then part of the next baseline anyway.
-        lastPublishedPlacement = nil
-        anchorShiftLock.unlock()
-        guard let placement else { return }
-        // PR #533 round 2: one worth, whichever timeline this was read off. A placement's bytes map
-        // item time onto the source with the normalization they carry plus what their gate backed
-        // off, and that is true of the run AVPlayer opened for them and of one it rebuilt; what the
-        // two disagree about is the BASE, which is measured. Round 1 branched here because the
-        // composition still worked in axis terms, where an AE#412 re-cut is worth nothing.
-        guard let reading = Self.placementReading(
-                advertisedStart: placement.advertisedStart, worth: placement.worth,
-                assumedBase: placement.assumedBase, observedItemStart: observedItemStart)
-        else { return }
-        // Round 7: only the run this placement opened says anything about where a placement sits. A
-        // timeline AVPlayer rebuilt puts the segment on a base that is a statement about the rebuild,
-        // and round 6 let exactly those readings set the parameter (the reporter's 2.00x, and a 21 s
-        // residual on the fixture teaching the same value).
-        let teaching: DisplacementTeaching
-        if source == .ownRun {
-            teaching = learnPlacementDisplacement(from: placement, measuredBase: reading.base)
-        } else {
-            anchorShiftLock.lock()
-            let standing = lastPlacementDisplacement
-            anchorShiftLock.unlock()
-            teaching = .notTaught(standing: standing)
-        }
-        // PR #533: against the axis this placement COMPOSED, not against the residual. They are the
-        // same test only while the reading is worth what the composition was: a rebuilt reading
-        // measures the same base and arrives at a different axis, and asking the residual would call
-        // that a confirmation and publish nothing.
-        let composedAxis = placement.assumedBase + placement.worth
-        guard abs(reading.axis - composedAxis) > Self.axisRepublishEpsilonSeconds else {
-            // Said out loud, because a check that only speaks when it disagrees cannot be told from one
-            // that never ran. This is the line that says the axis is measured on this session.
-            EngineLog.emit(
-                "[HLSVideoEngine] #418 seg\(placement.index) placement confirmed: AVPlayer holds it "
-                + "from item \(String(format: "%.3f", observedItemStart))s, base "
-                + "\(String(format: "%.3f", reading.base))s as published; \(teaching.clause)",
-                category: .session
-            )
-            return
-        }
-        EngineLog.emit(
-            "[HLSVideoEngine] #418 seg\(placement.index) placed on base \(String(format: "%.3f", reading.base))s, "
-            + "not \(String(format: "%.3f", placement.assumedBase))s (AVPlayer holds it from item "
-            + "\(String(format: "%.3f", observedItemStart))s, clock \(String(format: "%.3f", itemClock))s, "
-            + "residual \(String(format: "%+.3f", reading.residual))s): axis "
-            + "\(String(format: "%.3f", composedAxis))s -> "
-            + "\(String(format: "%.3f", reading.axis))s; \(teaching.clause)",
-            category: .session
-        )
-        publishPlaylistShift(
-            reading.axis, seamItemSeconds: reading.seam,
-            offset: reading.base + placement.epoch.placedOffset)
-    }
-
-    /// AE#418 round 8: a placement that opened a run of its own says how far below the axis it
-    /// composed on AVPlayer actually put it, and the next composition starts there.
-    ///
-    /// Learned from every reading, the confirmations included: a confirmation is the standing value
-    /// being right, and recording it is what keeps it from drifting unchallenged. Round 6 and 7
-    /// learned instead from the subset of placements carrying a presentation lead, which on a source
-    /// without frame reordering, and on any session whose placements are AE#412 re-cuts, is none of
-    /// them.
-    @discardableResult
-    private func learnPlacementDisplacement(
-        from placement: PublishedPlacement, measuredBase: Double
-    ) -> DisplacementTeaching {
-        let sample = Self.placementDisplacement(
-            offset: placement.offsetInForce, measuredBase: measuredBase)
-        anchorShiftLock.lock()
-        let previous = lastPlacementDisplacement
-        lastPlacementDisplacement = sample
-        anchorShiftLock.unlock()
-        guard abs(sample - previous) > Self.axisRepublishEpsilonSeconds else {
-            return .taught(sample: sample, moved: false)
-        }
-        EngineLog.emit(
-            "[HLSVideoEngine] #418 seg\(placement.index) sat "
-            + "\(String(format: "%.3f", sample))s below the axis it composed on, not "
-            + "\(String(format: "%.3f", previous))s; the next composition starts there "
-            + "(displacement \(String(format: "%.3f", placement.offsetInForce))s, base measured "
-            + "\(String(format: "%.3f", measuredBase))s)",
-            category: .session
-        )
-        return .taught(sample: sample, moved: true)
-    }
-
-    /// AE#418 round 9: what a reading did to the standing distance, said on the reading's own line.
-    ///
-    /// Round 8 taught from every own-run reading and printed only the moves, so a reading that taught
-    /// the value it already had and a reading that was not allowed to teach at all printed the same
-    /// verdict. The reporter's round-8 retest ends on exactly that: three `placement confirmed` lines
-    /// with no `sat` line under them, and no way from the log to tell which of the two had happened.
-    /// A standing value that every later `placed` line quotes needs its provenance on the line that
-    /// sets it, not in the reader's head.
-    enum DisplacementTeaching: Equatable {
-        /// An own-run reading. `moved` is false when it taught the value already standing, which is a
-        /// confirmation of the distance rather than silence about it.
-        case taught(sample: Double, moved: Bool)
-        /// A reading off a timeline AVPlayer rebuilt, which is a statement about the rebuild and not
-        /// about where a placement sits below its axis (round 7). It corrects the axis and teaches
-        /// nothing.
-        case notTaught(standing: Double)
-
-        var clause: String {
-            switch self {
-            case .taught(let sample, let moved):
-                return moved
-                    ? "taught the distance \(String(format: "%.3f", sample))s"
-                    : "taught the standing distance \(String(format: "%.3f", sample))s again"
-            case .notTaught(let standing):
-                return "taught nothing, read off a rebuilt timeline; the distance stays "
-                    + "\(String(format: "%.3f", standing))s"
-            }
-        }
-    }
-
-    /// AE#418 round 7: the window closed with no run this placement could be read from, so the
-    /// question left is whether AVPlayer holds those bytes at all.
-    ///
-    /// Round 4 named this case and kept the composition, which is right when the placement happened
-    /// and its run merged into one already there, and wrong when the placement never reached the
-    /// timeline. Both printed the same line. The reporter's run 1: a placement worth -28.028 s was
-    /// composed, could not be measured, was kept, and the producer that opened for it was torn down
-    /// with its segment discarded (`seg-738.m4s partial at teardown ... not adopted`); 4.5 s later the
-    /// next measurable placement found the axis 33 ms from where it had stood before. A composition is
-    /// a statement about bytes in AVPlayer's timeline, so bytes nobody holds never moved the axis.
-    func resolveUnreadablePlacement(heldInBuffer: Bool, answered: Bool) {
-        anchorShiftLock.lock()
-        let placement = lastPublishedPlacement
-        lastPublishedPlacement = nil
-        anchorShiftLock.unlock()
-        guard let placement else { return }
-        let composed = placement.assumedBase + placement.worth
-        // A request still being answered says nothing: a deep re-aim can leave the producer scanning
-        // for seconds, and rolling back there would drop a placement that is about to land. Only a
-        // request that WAS answered turns an empty buffer into a verdict.
-        guard answered else {
-            EngineLog.emit(
-                "[HLSVideoEngine] #418 seg\(placement.index) is still being served; nothing to read "
-                + "yet, keeping the composed axis \(String(format: "%.3f", composed))s",
-                category: .session
-            )
-            return
-        }
-        guard !heldInBuffer else {
-            EngineLog.emit(
-                "[HLSVideoEngine] #418 seg\(placement.index) opened no run of its own to measure, but "
-                + "AVPlayer holds those bytes; keeping the composed axis "
-                + "\(String(format: "%.3f", composed))s",
-                category: .session
-            )
-            return
-        }
-        EngineLog.emit(
-            "[HLSVideoEngine] #418 seg\(placement.index) never reached AVPlayer's timeline (nothing "
-            + "held at item \(String(format: "%.3f", placement.advertisedStart - placement.assumedBase))s); "
-            + "rolling the composed axis \(String(format: "%.3f", composed))s back to "
-            + "\(String(format: "%.3f", placement.epoch.carried + placement.offsetInForce))s",
-            category: .session
-        )
-        publishPlaylistShift(
-            placement.epoch.carried + placement.offsetInForce,
-            seamItemSeconds: Self.seamItemSeconds(
-                advertisedStart: placement.advertisedStart, currentShift: placement.assumedBase),
-            offset: placement.offsetInForce)
-    }
-
-    /// AE#418 round 7: what the local server made of the request this placement was counted from. A
-    /// placement is a request that was ANSWERED, and a buffer that holds nothing says nothing while
-    /// the answer is still outstanding.
-    func recordSegmentDelivery(index: Int, delivered: Bool) {
-        guard !isLiveSession else { return }
-        anchorShiftLock.lock()
-        segmentDeliverySerial += 1
-        if segmentDeliveryByIndex.count > 128 {
-            // Only the neighbourhood of what is being served can still be waited on; a placement is
-            // checked within seconds of its own request.
-            segmentDeliveryByIndex = segmentDeliveryByIndex.filter { abs($0.key - index) <= 64 }
-        }
-        segmentDeliveryByIndex[index] = (segmentDeliverySerial, delivered)
-        if delivered, firstDeliveredIndexSinceSeek == nil { firstDeliveredIndexSinceSeek = index }
-        anchorShiftLock.unlock()
-    }
-
-    /// Where a reading came from, which decides what it is allowed to teach.
-    enum ReadingSource: Sendable { case ownRun, rebuiltTimeline }
-
-    /// nil while the request behind the pending placement is still outstanding. An answer recorded
-    /// BEFORE that placement was composed belongs to an earlier request for the same index.
-    var pendingPlacementDelivery: Bool? {
-        anchorShiftLock.lock()
-        defer { anchorShiftLock.unlock() }
-        guard let placement = lastPublishedPlacement,
-              let answer = segmentDeliveryByIndex[placement.index],
-              answer.serial > placement.deliverySerialAtCompose
-        else { return nil }
-        return answer.delivered
-    }
-
-    /// Where the placement being checked says its bytes begin: through the base the composition
-    /// assumed, and through no base at all for a timeline AVPlayer rebuilt.
-    var pendingPlacement: (seam: Double, rawSeam: Double)? {
-        anchorShiftLock.lock()
-        defer { anchorShiftLock.unlock() }
-        guard let placement = lastPublishedPlacement else { return nil }
-        return (placement.advertisedStart - placement.assumedBase, placement.advertisedStart)
-    }
-
-    /// Whether a placement is waiting to be measured. Nothing to verify means nothing to sample for.
-    var hasPlacementAwaitingMeasurement: Bool {
-        anchorShiftLock.lock()
-        defer { anchorShiftLock.unlock() }
-        return lastPublishedPlacement != nil
-    }
+    /// Below this two readings state one axis: a stamp's time is printed to the microsecond and a frame
+    /// is tens of milliseconds, so anything finer is rounding.
+    static let axisReadingEpsilonSeconds = 0.0005
 
     /// AE#412: how long to give a re-cut its gate open before the seek goes out without it. A restart
     /// is a demuxer seek plus a scan to the covering random-access point; past this the seek is worth
@@ -4440,7 +4185,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// already within reach below the target, or a re-cut whose gate did not open in time.
     func preparedSeekLanding(itemSeconds: Double) -> Double {
         guard !isLiveSession, let provider else { return itemSeconds }
-        dropUnstartedRecut()
         let index = segmentIndexForPlaylistTime(itemSeconds)
         guard let reach = provider.videoReach(at: index) else { return itemSeconds }
         guard let advertised = advertisedStartSeconds(index) else { return itemSeconds }
@@ -4473,56 +4217,24 @@ public final class HLSVideoEngine: @unchecked Sendable {
             return itemSeconds
         }
         EngineLog.emit(
-            // PR #533: the BACKOFF, not the gate's shift. The shift also carries the source origin,
-            // so on a source whose timestamps start at 600 s this line read "opened 591.000s below
-            // its boundary" for a re-cut that opened 9 s below it.
             "[HLSVideoEngine] #412 seg\(index) re-cut opened "
-            + "\(String(format: "%.3f", opened.gateBackoffSeconds))s below its "
+            + "\(String(format: "%.3f", -opened))s below its "
             + "boundary and now covers item \(String(format: "%.3f", itemSeconds))s",
             category: .session
         )
         return itemSeconds
     }
 
-    /// Audit HLS-105: an AE#412 re-cut, owned by the restart that performs it rather than by the seek
-    /// waiting on it. The restart binds its producer's epoch at install, and only that producer's gate
-    /// open is the re-cut; the seek's wait timing out leaves it alone.
-    struct RecutMark: Equatable {
-        let index: Int
-        private(set) var producerEpoch: UInt64?
-
-        init(index: Int) { self.index = index }
-
-        /// The mark that survives a restart installing `producerEpoch` at `restartIndex`: bound when
-        /// it is the marked index, kept while the marked restart has yet to run, dropped once the
-        /// restart it was bound to has been replaced by one elsewhere.
-        func installing(producerEpoch epoch: UInt64, at restartIndex: Int) -> RecutMark? {
-            guard restartIndex == index else { return producerEpoch == nil ? self : nil }
-            var bound = self
-            bound.producerEpoch = epoch
-            return bound
-        }
-
-        func isOpened(byProducerEpoch epoch: UInt64, at gateIndex: Int) -> Bool {
-            producerEpoch == epoch && gateIndex == index
-        }
-    }
-
+    /// A re-cut waits for the gate of the restart it asks for, not an earlier one.
     func markRecut(at index: Int) {
         gateOpenCondition.lock()
         lastGateOpen = nil
         gateOpenCondition.unlock()
-        anchorShiftLock.lock()
-        recutMark = RecutMark(index: index)
-        anchorShiftLock.unlock()
     }
 
-    /// A newer seek supersedes a re-cut whose restart never installed a producer (dropped with the
-    /// coalescer's superseded slot, or failed), so a later unrelated restart at that index does not
-    /// inherit the mark.
-    private func dropUnstartedRecut() {
+    func recordCarried(_ seconds: Double, at index: Int) {
         anchorShiftLock.lock()
-        if recutMark?.producerEpoch == nil { recutMark = nil }
+        carriedSecondsByIndex[index] = seconds
         anchorShiftLock.unlock()
     }
 
@@ -4582,34 +4294,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return best
     }
 
-    /// Blocks until the epoch anchored at `index` has opened its video gate, and answers what it
-    /// opened with. nil on timeout. Polls against the condition rather than nesting locks: the pump
-    /// records under `anchorShiftLock` and signals under `gateOpenCondition`, and taking them in the
-    /// other order here would be the classic inversion.
-    private func awaitGateOpen(forIndex index: Int, timeout: TimeInterval) -> EpochAxis? {
+    /// Blocks until the epoch anchored at `index` has opened its video gate, and answers how far below
+    /// its boundary it opened (seconds, negative below). nil on timeout.
+    private func awaitGateOpen(forIndex index: Int, timeout: TimeInterval) -> Double? {
         let deadline = Date().addingTimeInterval(timeout)
         while true {
             gateOpenCondition.lock()
             if let open = lastGateOpen, open.index == index {
                 gateOpenCondition.unlock()
-                return open.axis
+                return open.backoffSeconds
             }
             let signalled = gateOpenCondition.wait(until: deadline)
             gateOpenCondition.unlock()
             if !signalled, Date() >= deadline { return nil }
         }
-    }
-
-    /// Publishes an axis together with the displacement it is made of, so the two cannot drift apart:
-    /// every axis this session states is `the run's normalization + displacement`, and the next
-    /// composition works on the second term alone (PR #533 round 2).
-    private func publishPlaylistShift(
-        _ seconds: Double, seamItemSeconds: Double, offset: Double
-    ) {
-        anchorShiftLock.lock()
-        placementOffsetSeconds = offset
-        anchorShiftLock.unlock()
-        publishPlaylistShift(seconds, seamItemSeconds: seamItemSeconds)
     }
 
     private func publishPlaylistShift(_ seconds: Double, seamItemSeconds: Double) {
@@ -4970,16 +4668,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         }
 
-        // Seek to the exact video-stream plan timestamp with the target as the lower bound. A
-        // global time seek can choose a much earlier sync point in a multi-stream MP4 (#191).
         // Seek outside restartLock (network-bound). Concurrent stop() calls markClosed() so the
         // seek fails fast instead of racing teardown.
         let seekStart = DispatchTime.now()
-        // Disc plans use folded multi-clip timestamps that are not valid raw seek targets.
-        if activeDem.isDiscSource || !activeDem.seek(to: targetStartPts, streamIndex: videoStreamIndex) {
-            let absoluteTargetSeconds = Double(targetStartPts) * Double(videoTb.num) / Double(videoTb.den)
-            activeDem.seek(to: absoluteTargetSeconds)
-        }
+        seekToProducerStart(activeDem, targetPts: targetStartPts, readStart: producerReadStart(activeDem))
         // AE#782: after the seek, so a container whose seek reads (a TS bisection) spends none of it.
         activeDem.notePlaybackRepositioned()
         // Re-arm bridge PTS rebase so the encoder timeline starts from the new demuxer cursor.
@@ -5016,9 +4708,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         do {
             let newProd = try makeProducer(baseIndex: idx)
             producer = newProd
-            anchorShiftLock.lock()
-            recutMark = recutMark?.installing(producerEpoch: newProd.epoch, at: idx)
-            anchorShiftLock.unlock()
             restartLock.unlock()
             newProd.start()
         } catch {
@@ -5035,7 +4724,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // #416: the outgoing pump's run ends where it got to and the new one begins here. Whatever
         // lies between the two was skipped, and a subtitle set stranded on the near side of that
         // gap can no longer be read as the line still on screen at the landing.
-        subtitlePacketStore.noteHarvestAnchor(.pump, at: absoluteTargetSeconds)
+        subtitlePacketStore.noteHarvestAnchor(at: absoluteTargetSeconds)
         // build = everything after the seek (re-validation, muxer/producer construction, start).
         let buildMs = max(0, elapsedMs - stopWaitMs - (reopenMs ?? 0) - seekMs)
         EngineLog.emit(
@@ -5055,11 +4744,53 @@ extension HLSVideoEngine {
     func seekToInitialProducerStart(_ dem: Demuxer) {
         let plan = segmentPlan
         guard initialProducerBaseIndex > 0, initialProducerBaseIndex < plan.count else { return }
-        let targetPts = plan[initialProducerBaseIndex].startPts
-        // Disc plans use folded multi-clip timestamps that are not valid raw seek targets.
-        if dem.isDiscSource || !dem.seek(to: targetPts, streamIndex: videoStreamIndex) {
-            let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
-            dem.seek(to: Double(targetPts) * Double(tb.num) / Double(tb.den))
+        seekToProducerStart(dem, targetPts: plan[initialProducerBaseIndex].startPts,
+                            readStart: producerReadStart(dem))
+    }
+
+    /// How far before its first segment a producer reads: as far back as the stage that remembers
+    /// furthest, so every stage reaches the boundary in the state continuous playback left it in and the
+    /// producer cuts the segment continuous playback cut.
+    /// - The audio bridge's runs (`AudioTranscodingBridge.preRollSeconds`), and a positive audio delay
+    ///   on top: the sound that plays at the boundary was read that much earlier.
+    /// - Copied audio: the packet playing across the boundary opens the segment (`AudioRunPlan`). A
+    ///   container that seeks each stream to its own sample reads it with an at-or-before seek to the
+    ///   boundary itself; any other reads it only from before the boundary.
+    /// - Where the container stores no decode times (`Demuxer.storesDecodeTimes`), libavformat's
+    ///   rebuilding of them from the `video_delay` pictures before each packet.
+    /// What must be read from before the boundary is before its keyframe, and a read starts there only
+    /// at the keyframe before, so those stages ask for a tick before it.
+    func producerReadStart(_ dem: Demuxer) -> (preRollSeconds: Double, atOrBefore: Bool) {
+        var seconds = (audioBridge?.preRollSeconds ?? 0) + max(0, audioDelaySeconds)
+        var atOrBefore = false
+        let tick = dem.stream(at: videoStreamIndex).flatMap { stream -> Double? in
+            let tb = stream.pointee.time_base
+            return tb.den > 0 ? Double(tb.num) / Double(tb.den) : nil
+        } ?? 0
+        if savedAudioConfig != nil, audioBridge == nil {
+            if dem.seeksEachStream { atOrBefore = true } else { seconds = max(seconds, tick) }
+        }
+        if !dem.storesDecodeTimes, let stream = dem.stream(at: videoStreamIndex),
+           stream.pointee.codecpar.pointee.video_delay > 0 {
+            seconds = max(seconds, tick)
+        }
+        return (seconds, atOrBefore || seconds > 0)
+    }
+
+    /// Where a producer starting at the plan's `targetPts` reads from. Without pre-roll: the exact
+    /// video-stream plan timestamp as the lower bound, since a global time seek can choose a much
+    /// earlier sync point in a multi-stream MP4 and leave the producer scanning a whole GOP over the
+    /// origin (#191). With it, or where a stage reads at or before the boundary (`producerReadStart`):
+    /// the sync point at or before, the producer dropping the video up to the target's keyframe.
+    func seekToProducerStart(_ dem: Demuxer, targetPts: Int64,
+                             readStart: (preRollSeconds: Double, atOrBefore: Bool)) {
+        let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
+        let preRollTicks = tb.num > 0 ? Int64((readStart.preRollSeconds * Double(tb.den) / Double(tb.num)).rounded(.up)) : 0
+        let readFrom = targetPts - preRollTicks
+        // Disc plans use folded multi-clip timestamps that are not valid raw seek targets; their
+        // tables seek to the sync point at or before.
+        if dem.isDiscSource || !dem.seek(to: readFrom, streamIndex: videoStreamIndex, atOrBefore: readStart.atOrBefore) {
+            dem.seek(to: Double(readFrom) * Double(tb.num) / Double(tb.den))
         }
     }
 }

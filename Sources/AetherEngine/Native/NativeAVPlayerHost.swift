@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import AVKit
 import Combine
+import os
 #if os(tvOS) || os(iOS)
 import MediaPlayer
 #endif
@@ -11,7 +12,7 @@ import UIKit
 
 /// NativeAVPlayerHost: AVPlayer + AVPlayerLayer wrapper for the HLS-fMP4 loopback path.
 /// tvOS exposes the HDMI DV/HDR handshake only through AVPlayer-rooted playback, not AVSampleBufferDisplayLayer.
-/// Covers HEVC, H.264, and HW-AV1; SW fallback (AV1/VP9) lives in SoftwarePlaybackHost.
+/// Covers HEVC, H.264, and HW-AV1; software-decoded video (AV1/VP9) is drawn by the overlay above it.
 /// DisplayCriteriaController writes preferredDisplayCriteria before item load so the handshake is in flight first.
 /// AE#422: what the seek-deadline loop needs from AVPlayer, as one off-main reading.
 /// AE#422 / AE#287: what the premature-end recovery needs from AVPlayer, as one off-main reading.
@@ -289,6 +290,11 @@ final class NativeAVPlayerHost {
     private var loadedVideoObservation: NSKeyValueObservation?
     private var videoHealthSummaryAt: Double?
     var onVideoPresentationRecovery: ((VideoPresentationProgress.Action, Double) -> Void)?
+    /// The in-band clock of the segment AVPlayer is about to play: the item time it plays it at and
+    /// what the segment states (`InBandClock`).
+    var onInBandClock: ((Double, InBandClock.Stamp) -> Void)?
+    /// The current item's in-band clock reader; replaced with the item.
+    private var inBandClockReader: InBandClockReader?
     var pictureInPictureActive = false {
         didSet {
             // Detach BEFORE AVKit takes the layer, not on the first background polling tick.
@@ -698,6 +704,30 @@ final class NativeAVPlayerHost {
                 self.seekableEnd = end
                 self.seekableStart = start
             }
+        }
+
+        // docs/segment-axis.md: every VOD segment states its source time in band (`InBandClock`), and
+        // this is where AVPlayer reports the item time it played each one at. Attached with the item:
+        // attached later, the segment the mount lands in is never reported. Live states nothing.
+        if !contract.isLive {
+            let reader = InBandClockReader { [weak self] itemSeconds, stamp in
+                // A reading belongs to the item it was taken from; one in flight across a swap is dropped.
+                Task { @MainActor in
+                    guard let self, self.sessionID == sid else { return }
+                    self.onInBandClock?(itemSeconds, stamp)
+                }
+            }
+            // Every identifier, filtered here (`InBandClock.stamps`): asked for the ID3 `TXXX` identifier
+            // alone, the output stamps a group with the segment's raw `tfdt` rather than the item time
+            // AVPlayer plays it at (measured on a segment AVPlayer placed 0.225 s below its `tfdt`: 75.125
+            // filtered, 74.900 unfiltered, the picture agreeing with the second).
+            let output = AVPlayerItemMetadataOutput(identifiers: nil)
+            output.setDelegate(reader, queue: reader.queue)
+            output.advanceIntervalForDelegateInvocation = InBandClockReader.advanceSeconds
+            item.add(output)
+            inBandClockReader = reader
+        } else {
+            inBandClockReader = nil
         }
 
         // Observe on the item's queue; do not poll a potentially wedged media server on main.
@@ -3402,5 +3432,60 @@ extension NativeAVPlayerHost {
                                      underlyingCode: code)
         }
         return PlaybackErrorInfo(kind: .nativeItemFailed, message: desc, underlying: itemError)
+    }
+}
+
+
+/// Reads the in-band clock (`InBandClock`) back out of `AVPlayerItemMetadataOutput`: each group is the
+/// `emsg` of a segment AVPlayer is about to play, stamped with the item time it plays it at.
+final class InBandClockReader: NSObject, AVPlayerItemMetadataOutputPushDelegate, @unchecked Sendable {
+    /// How far ahead of playback AVPlayer reports a segment's clock. Measured on the Apple TV with 5:
+    /// about four seconds, every segment of every run, and the segment a seek or the mount lands in at
+    /// the landing.
+    static let advanceSeconds: TimeInterval = 5
+
+    let queue = DispatchQueue(label: "aether.inbandclock", qos: .userInitiated)
+    private let deliver: @Sendable (Double, InBandClock.Stamp) -> Void
+    /// Groups whose text was not loaded when they arrived, in order, read by one task that loads it, and how many it
+    /// has not delivered yet: while any are waiting, later groups wait behind them, so the segments' clocks are
+    /// delivered in the order AVPlayer reports them. A group the output delivers loaded is delivered on arrival, on
+    /// `queue`, as the segment a seek lands in has to be.
+    private let loading: AsyncStream<InBandClock.Candidates>.Continuation
+    private let backlog = OSAllocatedUnfairLock(initialState: 0)
+    /// `queue` only.
+    private var loggedLoading = false
+
+    init(deliver: @escaping @Sendable (Double, InBandClock.Stamp) -> Void) {
+        self.deliver = deliver
+        let (stream, loading) = AsyncStream<InBandClock.Candidates>.makeStream()
+        self.loading = loading
+        super.init()
+        let backlog = backlog
+        Task(priority: .userInitiated) {
+            for await group in stream {
+                for stamp in await group.stamps() { deliver(group.itemSeconds, stamp) }
+                backlog.withLock { $0 -= 1 }
+            }
+        }
+    }
+
+    deinit { loading.finish() }
+
+    func metadataOutput(_ output: AVPlayerItemMetadataOutput, didOutputTimedMetadataGroups groups: [AVTimedMetadataGroup],
+                        from track: AVPlayerItemTrack?) {
+        for group in groups {
+            guard let candidates = InBandClock.Candidates(group) else { continue }
+            if backlog.withLock({ $0 }) == 0, let stamps = candidates.loadedStamps() {
+                for stamp in stamps { deliver(candidates.itemSeconds, stamp) }
+            } else {
+                if !loggedLoading {
+                    loggedLoading = true
+                    EngineLog.emit("[InBandClock] a segment's stamp arrived unloaded; it and the stamps after it are delivered once loaded",
+                                   category: .session)
+                }
+                backlog.withLock { $0 += 1 }
+                loading.yield(candidates)
+            }
+        }
     }
 }

@@ -27,6 +27,10 @@ import AetherLibavutil
 /// to onInitCaptured (init.mp4) and moof+mdat bytes to the staging POSIX file.
 /// The APAC track the splitter adds the pre-roll group to, set from the init (splitter-thread only).
 
+/// What the splitter stamps a segment's first `moof` with (`InBandClock`): which segment the muxer is
+/// writing, the earliest picture written to it so far, on the muxer's video time base. Written by the
+/// muxer as packets go in, read by the splitter as the fragment goes out, both on the pump thread.
+
 final class MP4SegmentMuxer {
 
     // MARK: - Types
@@ -174,7 +178,10 @@ final class MP4SegmentMuxer {
 
     // MARK: - State
 
-    private(set) var currentSegmentIndex: Int
+    private(set) var currentSegmentIndex: Int {
+        didSet { clockState.segmentIndex = currentSegmentIndex }
+    }
+    private let clockState: SegmentClockState
     /// Same volume as cache adopt target so rename is metadata-only.
     private let sessionDir: URL
     private var currentStagingPath: URL
@@ -339,6 +346,8 @@ final class MP4SegmentMuxer {
         onStorageExhausted: (@Sendable () -> Void)? = nil,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
+        let clockState = SegmentClockState(segmentIndex: initialSegmentIndex)
+        self.clockState = clockState
         self.currentSegmentIndex = initialSegmentIndex
         self.sessionDir = sessionDir
         self.haveAudio = audio != nil
@@ -399,6 +408,7 @@ final class MP4SegmentMuxer {
         self.splitter = FragmentSplitter(
             onHeaderComplete: { initBytes in
                 var initBytes = Self.installingSoundSampleEntry(sampleEntryOverride, in: initBytes)
+                if sampleEntryOverride != nil { preRoll.trackID = APACPreRollGroup.apacTrackID(inInit: initBytes) }
                 if case .framePacked(let packing)? = stereo {
                     if let packed = StereoVideoSignal.installingViewPacking(packing, in: initBytes) {
                         initBytes = packed
@@ -419,6 +429,12 @@ final class MP4SegmentMuxer {
                 onInitCaptured(clean)
             },
             onFragmentBytes: { ptr, count in
+                if let memory = counter.memory {
+                    memory.append(ptr, length: count)
+                    counter.bytesWrittenCurrentSegment += count
+                    counter.lifetimeFragmentBytes += count
+                    return
+                }
                 guard !counter.writeFailed, counter.fd >= 0 else { return }
                 var written = 0
                 while written < count {
@@ -438,6 +454,24 @@ final class MP4SegmentMuxer {
                 }
                 counter.bytesWrittenCurrentSegment += count
                 counter.lifetimeFragmentBytes += count
+                counter.onBytesStaged?()
+            },
+            moofRewriter: sampleEntryOverride == nil && segmentClock == nil ? nil : { moof in
+                var out = moof
+                if sampleEntryOverride != nil, let trackID = preRoll.trackID {
+                    out = APACPreRollGroup.addingPreRoll(toMoof: out, trackID: trackID) ?? out
+                }
+                // A segment's first fragment opens with its in-band clock (`InBandClock`), timed on its
+                // first picture: an `emsg` is a top-level box ahead of the `moof`, and every `trun`
+                // offset is relative to its `moof`, so it moves no sample.
+                if let segmentClock, counter.bytesWrittenCurrentSegment == 0,
+                   clockState.pictureFirstPts != Int64.min,
+                   clockState.timeBase.num == 1, clockState.timeBase.den > 0,
+                   let stamp = segmentClock(clockState.segmentIndex, clockState.pictureFirstPts, clockState.timeBase) {
+                    out = InBandClock.eventMessage(stamp, presentationTime: clockState.pictureFirstPts,
+                                                   timescale: UInt32(clockState.timeBase.den)) + out
+                }
+                return out
             }
         )
 

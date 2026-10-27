@@ -10,28 +10,16 @@ extension AetherEngine {
     /// but must not treat a false as a request to restore a poster or as evidence of lost playback.
     /// Unavailable metrics (including visionOS 1.0), cancellation and a superseded session return false.
     public func hasRenderedVideoFrame() async -> Bool {
-        await hasRenderedVideoFrame(readSoftwareMetrics: { await $0.loadRenderMetrics() })
-    }
-
-    // Keep the asynchronous read injectable so a replacement load can be tested while it is pending.
-    func hasRenderedVideoFrame(
-        readSoftwareMetrics: @MainActor (SoftwarePlaybackHost) async -> SampleBufferRenderer.RenderMetrics?
-    ) async -> Bool {
         guard !Task.isCancelled else { return false }
         switch playbackBackend {
         case .native:
+            // An overlay session's AVPlayerLayer shows the placeholder stream, so its readiness says nothing about
+            // the picture on screen; the overlay renderer of the current item answers instead. It is rebuilt for
+            // every item, so its counter cannot carry the outgoing item's pictures.
+            if let overlay = softwareOverlay { return overlay.counters.presented > 0 }
             // A reused layer may still hold the outgoing item's picture until the next load mounts.
             return hasFirstFrameReadyForDisplay && nativePlayerLayer?.isReadyForDisplay == true
-        case .software:
-            guard let host = softwareHost else { return false }
-            let generation = loadGeneration
-            guard let metrics = await readSoftwareMetrics(host),
-                  !Task.isCancelled, loadGeneration == generation,
-                  playbackBackend == .software, softwareHost === host else { return false }
-            // Each software host owns one renderer for its lifetime, so host identity also fences
-            // the surface whose asynchronous counters answered.
-            return metrics.total > metrics.dropped
-        case .none, .audio, .aether:
+        case .software, .none, .audio, .aether:
             return false
         }
     }
@@ -143,103 +131,6 @@ extension AetherEngine {
         }
     }
 
-    /// AE#418 round 3: check a just-published VOD axis against AVPlayer's own account of the placement
-    /// it describes, and let the session correct it when the base it composed onto was never carried.
-    ///
-    /// Polled rather than awaited on an edge, because the publish happens when the segment is FETCHED
-    /// and the ranges only move once AVPlayer has taken the bytes.
-    ///
-    /// Round 4: the first sample is the BASELINE, taken before AVPlayer can have the bytes, and every
-    /// later sample is read against it. Only a run that overlaps nothing in the baseline is this
-    /// placement's; the run that was already there answers a different question, and its own start
-    /// moves while it is asked, because AVPlayer backfills below a run after it opens. Reading the
-    /// first range that happened to hold the playhead is what let a stale run be reported as a
-    /// confirmation, one to two frames at a time, until the accumulated difference exceeded the check
-    /// itself.
-    /// Samples taken once the request behind the placement has been answered.
-    static let placementVerificationAttempts = 6
-    /// How long to keep waiting while it has NOT been. A deep re-aim makes the producer scan seconds
-    /// of source before its first segment lands, and an empty buffer says nothing about a placement
-    /// whose bytes have not gone out yet. The #93 slow-serve window reaches 25 to 50 s in the worst
-    /// case, so the wait outlasts the sampling rate: the first samples are 250 ms apart, and once the
-    /// answer is overdue they drop to one a second for the rest of it.
-    static let placementVerificationWaitSeconds = 30.0
-    static let placementVerificationIntervalMS = 250
-    static let placementVerificationSlowIntervalMS = 1000
-
-    /// AE#481: how long after a seek the landing's run is read for. The reading needs a run that
-    /// HOLDS the target, so it has to outlast the landing itself; three seconds covers a landing that
-    /// buffers on a shaped link (measured: the run holding the landing was there within 1.5 s on every
-    /// arm at 600 kbps / 300 ms) without keeping a sampler alive into the next seek.
-    static let landingAxisWaitSeconds = 3.0
-
-    /// AE#481: read what the run holding a seek landing carries, and correct the axis when the timeline
-    /// disagrees with the composition it inherited. Silent in every session whose landing stays inside
-    /// the run it was already playing, which is what a fast link produces.
-    func verifyAxisAtSeekLanding(session: HLSVideoEngine, landingItemSeconds: Double) {
-        landingAxisTask?.cancel()
-        landingAxisTask = Task { @MainActor [weak self, weak session] in
-            var waited = 0.0
-            while waited < Self.landingAxisWaitSeconds {
-                try? await Task.sleep(for: .milliseconds(Self.placementVerificationIntervalMS))
-                waited += Double(Self.placementVerificationIntervalMS) / 1000
-                guard !Task.isCancelled, let self, let session else { return }
-                let ranges = await self.avPlayerLoadedRanges()
-                guard !Task.isCancelled else { return }
-                // A publication is the end of it: the axis it wrote is the one every later reading
-                // composes onto, and sampling on would re-read what this just published.
-                if session.applyLandingAxisReading(
-                    landingItemSeconds: landingItemSeconds, ranges: ranges) { return }
-            }
-        }
-    }
-
-    func verifyPlacementAgainstLoadedRanges(session: HLSVideoEngine) {
-        placementVerificationTask?.cancel()
-        guard session.hasPlacementAwaitingMeasurement else { return }
-        placementVerificationTask = Task { @MainActor [weak self, weak session] in
-            var samplesSinceAnswered = 0
-            var lastRanges: [(Double, Double)] = []
-            var waited = 0.0
-            while waited < Self.placementVerificationWaitSeconds {
-                let intervalMS = samplesSinceAnswered > 0 || waited < 2.0
-                    ? Self.placementVerificationIntervalMS
-                    : Self.placementVerificationSlowIntervalMS
-                waited += Double(intervalMS) / 1000
-                try? await Task.sleep(for: .milliseconds(intervalMS))
-                guard !Task.isCancelled, let self, let session else { return }
-                let ranges = await self.avPlayerLoadedRanges()
-                guard !Task.isCancelled, let pending = session.pendingPlacement else { return }
-                lastRanges = ranges
-                // AE#418 round 7: the run that opens where this placement's segment begins is its own,
-                // through the axis the timeline carried or, on a timeline AVPlayer rebuilt, through no
-                // axis at all. Asked as "which run is new here", a later seek's run answers for it
-                // (measured against the picture: 21 s of error, and 41.667 s on the wide fixture).
-                if let run = HLSVideoEngine.placementRunStart(
-                    ranges: ranges, predictedSeam: pending.seam, rawSeam: pending.rawSeam) {
-                    session.reconcileAxisWithObservedPlacement(
-                        observedItemStart: run.start, itemClock: self.nativeClockSeconds,
-                        source: run.source)
-                    return
-                }
-                switch session.pendingPlacementDelivery {
-                case .some(false):
-                    // The response failed, so these bytes are never arriving.
-                    samplesSinceAnswered = Self.placementVerificationAttempts
-                case .some(true):
-                    samplesSinceAnswered += 1
-                case .none:
-                    break
-                }
-                if samplesSinceAnswered >= Self.placementVerificationAttempts { break }
-            }
-            guard !Task.isCancelled, let session, let pending = session.pendingPlacement else { return }
-            session.resolveUnreadablePlacement(
-                heldInBuffer: HLSVideoEngine.placementIsHeld(ranges: lastRanges, seam: pending.seam),
-                answered: session.pendingPlacementDelivery != nil)
-        }
-    }
-
     // MARK: - Memory diagnostic
 
     /// Cancel any prior probe, then emit one EngineLog line every 30 s under `.engine`. Line shape is documented on `memoryProbeTask`.
@@ -335,20 +226,10 @@ extension AetherEngine {
                 // and the #174 field crash it was built against (HTTPS origin, boringssl in
                 // the stack) was on this path. Reporting software-only hid that.
                 let pumpWin = self.pumpIOWindow
-                let prefetchWin = self.subtitleForwardPrefetchDemuxer?.ioWindowDiagnostics
                 let readerStr = Self.readerWindowFragment(
-                    pump: pumpWin, prefetch: prefetchWin,
-                    pumpFetchedBytes: self.softwareHost?.demuxerBytesFetched
-                        ?? self.nativeVideoSession?.demuxerBytesFetched,
-                    prefetchFetchedBytes: self.subtitleForwardPrefetchDemuxer?.avioBytesFetched)
+                    pump: pumpWin,
+                    pumpFetchedBytes: self.nativeVideoSession?.demuxerBytesFetched)
 
-                // #303: the software path's own read-ahead, and what the display did with it.
-                // `avBufAhead` covers the AVPlayer path only, and `frameAhead` is the native
-                // producer-shift fold that reads 0 here whatever the buffer is doing, so a software
-                // session used to leave a trace with no cushion figure in it at all.
-                let swStr = Self.softwareReadAheadFragment(
-                    cushionSeconds: self.softwareHost?.displayCushionSeconds,
-                    metrics: await self.softwareHost?.loadRenderMetrics())
 
                 let line = "[AetherEngine] memprobe t=\(elapsed)s "
                     + "rss=\(rssMB)MB "
@@ -380,11 +261,11 @@ extension AetherEngine {
                     + "pktAlive=\(pktAlive) pktTotal=\(pktTotal) "
                     + "subCues=\(cueCount) "
                     + readerStr
-                    // #220: the lead is the live tell. It is visible minutes before a kill and
-                    // separates "reads fast while building its lead" from "the lead never settles".
-                    + SubtitlePrefetchTelemetry.probeFragment(playhead: self.sourceTime)
-                    + "swFrames=\(self.softwareHostFramesEnqueued) "
-                    + swStr
+                    // How far the subtitle consumers ask the pump to read, and how far it has.
+                    + Self.subtitleReadAheadFragment(
+                        asked: self.subtitleReadAheadLeads.readAhead(playhead: self.sourceTime),
+                        read: self.activeSubtitlePacketStore?.harvestReach(from: self.sourceTime)
+                            .map { $0 - self.sourceTime })
                     + "audioTracks=\(self.audioTracks.count) "
                     + "subTracks=\(self.subtitleTracks.count) "
                     + "subActive=\(self.isSubtitleActive) "
@@ -478,15 +359,11 @@ extension AetherEngine {
     /// fired (#310: the end replaced the suspend, so the overshoot is bounded by one
     /// delivery's in-flight amount rather than by whatever a suspended task lets through).
     ///
-    /// #240: `FetchedMB` per reader is the link attribution. The aggregate `avioFetchedMB` cannot
-    /// answer "who took the bandwidth", and the reporter of #240 had to infer a second reader from
-    /// connection-start lines that carried no identity. Two counters side by side answer it directly:
-    /// a session whose `prefFetchedMB` tracks `pumpFetchedMB` is reading the stream twice.
+    /// #240: `FetchedMB` is the pump's share of the link; the aggregate `avioFetchedMB` beside it says
+    /// whether anything else read the source.
     nonisolated static func readerWindowFragment(
         pump: (windowBytes: Int, aheadBytes: Int, parked: Bool)?,
-        prefetch: (windowBytes: Int, aheadBytes: Int, parked: Bool)?,
-        pumpFetchedBytes: Int64? = nil,
-        prefetchFetchedBytes: Int64? = nil
+        pumpFetchedBytes: Int64? = nil
     ) -> String {
         func fragment(
             _ prefix: String,
@@ -500,27 +377,15 @@ extension AetherEngine {
                 + (fetched.map { "\(prefix)FetchedMB=\($0 / 1024 / 1024) " } ?? "")
         }
         return fragment("pump", pump, pumpFetchedBytes)
-            + fragment("pref", prefetch, prefetchFetchedBytes)
     }
 
-    /// #303: the software path's read-ahead, and the display's own account of what it did with it.
-    /// Empty on a native session, so the line does not carry three fields that can only read zero
-    /// there. Each half is independently optional: the cushion exists as soon as a frame has been
-    /// enqueued, while the metrics need an OS and a queue target that can answer for them.
-    nonisolated static func softwareReadAheadFragment(
-        cushionSeconds: Double?,
-        metrics: SampleBufferRenderer.RenderMetrics?
-    ) -> String {
-        var out = ""
-        if let cushionSeconds {
-            out += "swAhead=\(String(format: "%.2f", cushionSeconds))s "
-        }
-        if let metrics {
-            out += "swDropped=\(metrics.dropped)/\(metrics.total) "
-            if metrics.corrupted > 0 { out += "swCorrupt=\(metrics.corrupted) " }
-            out += "swDelay=\(String(format: "%.2f", metrics.accumulatedDelay))s "
-        }
-        return out
+    /// The subtitle read-ahead: how far past the playhead the consumers of a stream only the pump reads
+    /// ask it to have read (`off` when none asks), and how far the harvest has read on from the playhead
+    /// (`none` when the playhead itself was not read).
+    nonisolated static func subtitleReadAheadFragment(asked: Double?, read: Double?) -> String {
+        let askedText = asked.map { String(format: "%.0f", $0) + "s" } ?? "off"
+        let readText = read.map { $0 == .infinity ? "eof" : String(format: "%.1f", $0) + "s" } ?? "none"
+        return "subReadAhead=\(askedText) subRead=\(readText) "
     }
 
     // MARK: - Live telemetry bridge
@@ -552,66 +417,31 @@ extension AetherEngine {
 
     /// Lifetime bytes the session's playback reader pulled from the source. Feeds the sampler's
     /// instant + average bitrate and `LiveTelemetry.demuxerBytesFetched`. 0 before a reader exists.
-    ///
-    /// #306: software first, native second, the same precedence the memprobe has always read the pump
-    /// with. A software session owns no `HLSVideoEngine`, so the native-only form returned 0 for the
-    /// whole session and every byte-derived figure a host can show (bitrate, throughput, transferred)
-    /// read zero on the one path that carries the exotic content.
     var demuxerBytesFetched: Int64 {
-        Self.pumpBytesFetched(software: softwareHost?.demuxerBytesFetched,
-                              native: nativeVideoSession?.demuxerBytesFetched)
+        nativeVideoSession?.demuxerBytesFetched ?? 0
     }
 
-    /// AE#514: the played-media ledger of whichever path owns the pump, same precedence as the byte
-    /// counter above. nil before a pipeline exists and on the paths with no pump to feed one.
+    /// AE#514: the played-media ledger of the pump. nil before a pipeline exists and on the paths
+    /// with no pump to feed one.
     var playedMediaLedger: PlayedMediaLedger? {
-        softwareHost?.playedMediaLedger ?? nativeVideoSession?.playedMediaLedger
+        nativeVideoSession?.playedMediaLedger
     }
 
-    /// #306: the precedence itself, as a function, so the ordering is assertable without a live
-    /// session on either path. Software first: only one of the two exists per session, and a
-    /// software session's counter is the one that used to be dropped.
-    nonisolated static func pumpBytesFetched(software: Int64?, native: Int64?) -> Int64 {
-        software ?? native ?? 0
-    }
-
-    /// The playback pump reader's sliding-window snapshot, from whichever path owns the reader.
-    /// nil for sources with no `AVIOReader` (disc, custom provider) and before the reader exists.
-    /// Named for the pump to keep it apart from the subtitle side reader, which has a window of its own.
+    /// The playback pump reader's sliding-window snapshot. nil for sources with no `AVIOReader`
+    /// (disc, custom provider) and before the reader exists.
     var pumpIOWindow: (windowBytes: Int, aheadBytes: Int, parked: Bool)? {
-        softwareHost?.ioWindowDiagnostics ?? nativeVideoSession?.demuxer?.ioWindowDiagnostics
+        nativeVideoSession?.demuxer?.ioWindowDiagnostics
     }
 
-    /// Compressed resident bytes: software packet spool or native loopback segment cache.
+    /// Compressed resident bytes of the native loopback segment cache.
     var cachedBytes: Int64? {
-        if let bytes = softwareHost?.cachedVODBytes { return bytes }
         guard let bytes = nativeVideoSession?.segmentCacheTotalBytes else { return nil }
         return Int64(bytes)
-    }
-
-    /// Short metadata lock only; never reads the packet store from the main actor.
-    var softwarePacketCacheSnapshot: SoftwarePacketReadAhead.Snapshot? {
-        softwareHost?.vodPacketCacheSnapshot
     }
 
     /// Freshly stat-ed on-disk footprint of the segment cache. nil when no native session is active. Used by `aetherctl live --report-cache-bytes`.
     public var segmentCacheDiskBytes: Int64? {
         nativeVideoSession?.segmentCacheDiskBytes
-    }
-
-    /// Frames the SW host enqueued into AVSampleBufferDisplayLayer. Zero on native path or pre-start.
-    ///
-    /// #288: the software-path answer to "is there a picture, or is this audio into a black view".
-    /// `AVPlayerItemVideoOutput.hasNewPixelBuffer` answers it on the native path, but a software
-    /// session has no AVPlayer at all, so a host watchdog built on that probe alone reads every
-    /// dav1d/libavcodec session as picture-less and kills healthy playback. Pair it with
-    /// `currentAVPlayer == nil` to pick the backend, then watch this counter for movement.
-    ///
-    /// Monotonic within a session only: it belongs to the current SW host, and a `load()` that
-    /// builds a new one restarts it at zero. A watchdog measuring deltas must treat a decrease as
-    /// a new session, not as a stall.
-    public var softwareHostFramesEnqueued: Int {
-        softwareHost?.framesEnqueued ?? 0
     }
 
     /// Producer restart count for the current session. Zero on SW path or pre-start.

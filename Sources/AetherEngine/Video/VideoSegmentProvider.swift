@@ -849,11 +849,6 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private let nativeSubRenditionInfos: [NativeSubtitleRenditionInfo]
     /// Ordinal advertised as DEFAULT=YES in the master SUBTITLES group (Sodalite#32).
     let nativeSubtitleDefaultOrdinal: Int
-    /// AE#418: fired with the index AVPlayer just placed into its timeline. What that segment
-    /// carries below its advertised start is what moves the axis every consumer folds with.
-    private let segmentPlacedHandler: (@Sendable (Int) -> Void)?
-    /// AE#418 round 7: what the server made of that request. Set alongside the placed handler.
-    private let segmentServedHandler: (@Sendable (Int, Bool) -> Void)?
     /// One segment per video segment: the loopback never serves a whole-program rendition.
     var nativeSubtitleWholeProgram: Bool { false }
     /// Sodalite#32 Phase 2: tap-fed stores can carry raw ASS event lines (the overlay renders the
@@ -1091,8 +1086,6 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         nativeSubtitleRenditionInfos: [NativeSubtitleRenditionInfo] = [],
         stripASSMarkupInVTT: Bool = false,
         nativeSubtitleDefaultOrdinal: Int = 0,
-        segmentPlacedHandler: (@Sendable (Int) -> Void)? = nil,
-        segmentServedHandler: (@Sendable (Int, Bool) -> Void)? = nil
     ) {
         self.cache = cache
         self.segments = segments
@@ -1140,8 +1133,6 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.nativeSubRenditionInfos = nativeSubtitleRenditionInfos
         self.stripASSMarkupInVTT = stripASSMarkupInVTT
         self.nativeSubtitleDefaultOrdinal = nativeSubtitleDefaultOrdinal
-        self.segmentPlacedHandler = segmentPlacedHandler
-        self.segmentServedHandler = segmentServedHandler
     }
 
     /// AE#684: where a live segment's sound begins and ends on the output axis, by segment index.
@@ -1617,26 +1608,6 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         case fail
     }
 
-    /// AE#418 round 7: the server's account of a media-segment response, forwarded to the session so
-    /// a placement can tell a request still being answered from one that never will be.
-    func didServeMediaSegment(index: Int, delivered: Bool) {
-        segmentServedHandler?(index, delivered)
-    }
-
-    /// AE#418 round 2: whether this request puts a segment into AVPlayer's timeline anew.
-    ///
-    /// Round 1 asked a narrower question here, whether the fetch BEGAN a decode run, and answered it
-    /// from the fetch order: anything that did not follow its predecessor. The reporter's seek burst
-    /// falsified that. A fetch out of sequence happens while AVPlayer stays inside the run it is
-    /// already playing, so the axis was republished from under a picture that had not moved.
-    ///
-    /// What the axis actually turns on is placement, and every fetch is one, whatever its order.
-    /// Asking for the SAME index again is the one exception: that is a retry of a placement already
-    /// counted, and counting it twice would move the axis by an offset AVPlayer applied once.
-    static func placesSegmentAnew(index: Int, previousTarget: Int) -> Bool {
-        return index != previousTarget
-    }
-
     static func foldedTargetDecision(folds: Int, alreadyReanchoredHere: Bool) -> FoldedTargetDecision {
         guard folds > 0 else { return .wait }
         if folds >= HLSVideoEngine.foldsProvingUnrecoverableGap { return .fail }
@@ -1656,14 +1627,6 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         stateLock.unlock()
         let previousTarget = cache.targetIndex
         cache.declareTarget(index)
-
-        // AE#418: AVPlayer places this segment at the position the PLAYLIST gives it, read through
-        // the axis its timeline already carries (measured with `play --picture-probe`). So a segment
-        // whose content starts below its advertised start moves the axis by that much, every time it
-        // is placed. A re-request of the same index is a retry of one placement, not a second one.
-        if Self.placesSegmentAnew(index: index, previousTarget: previousTarget) {
-            segmentPlacedHandler?(index)
-        }
 
         // #358: the consumer is asking for a plan index a pump folded away, because no keyframe
         // reached its boundary. The playlist offers it regardless, so waiting here is waiting for
