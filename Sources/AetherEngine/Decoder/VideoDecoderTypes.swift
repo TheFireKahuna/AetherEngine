@@ -188,6 +188,22 @@ enum ColorAttachments {
         return CVImageBufferCreateColorSpaceFromAttachments(attachments)?.takeRetainedValue()
     }
 
+    /// The H.273 code points CoreVideo tags name, by inverting `primaries`, `transfer` and `matrix`: the lowest code
+    /// point that maps to each tag (so the BT.709 curve, which BT.601 and SDR BT.2020 share, comes back as BT.709).
+    /// Unspecified for a nil or unknown tag. For a `colr` written from colour CoreMedia read (an in-band HEVC SPS).
+    static func description(primaries: CFString?, transfer: CFString?, matrix: CFString?,
+                            fullRange: Bool?) -> ColorDescription {
+        func code<T>(_ tag: CFString?, _ make: (UInt32) -> T, _ forward: (T) -> CFString?) -> T? {
+            guard let tag else { return nil }
+            return (1..<64).lazy.map(make).first { forward($0).map { CFEqual($0, tag) } ?? false }
+        }
+        return ColorDescription(
+            primaries: code(primaries, AVColorPrimaries.init(rawValue:), Self.primaries) ?? AVCOL_PRI_UNSPECIFIED,
+            transfer: code(transfer, AVColorTransferCharacteristic.init(rawValue:), Self.transfer) ?? AVCOL_TRC_UNSPECIFIED,
+            matrix: code(matrix, AVColorSpace.init(rawValue:), Self.matrix) ?? AVCOL_SPC_UNSPECIFIED,
+            range: fullRange.map { $0 ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG } ?? AVCOL_RANGE_UNSPECIFIED)
+    }
+
     /// PQ (ST 2084) or HLG transfer means the stream is HDR.
     static func isHDRTransfer(_ trc: AVColorTransferCharacteristic) -> Bool {
         trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67

@@ -614,8 +614,21 @@ extension HLSVideoEngine {
         else { return VideoFramingNormalization(extradataOverride: nil, measuredFraming: nil) }
 
         // Live is Annex B on both ends by construction (MPEG-TS, HLS ingest), so the two agree and
-        // there is nothing to repair; the probe would only cost packets off a forward-only feed.
+        // there is nothing to repair; the probe would only cost packets off a forward-only feed. HEVC
+        // still gets the muxer a length-prefixed record and its samples converted here, as on VOD
+        // below: movenc's own conversion drops every in-band parameter set under `hvc1`, and a live
+        // encoder that sends a new PPS mid-stream then decodes against the init's.
         guard !isLive else {
+            if codecID == AV_CODEC_ID_HEVC, let extradata = codecpar.pointee.extradata {
+                let source = [UInt8](UnsafeBufferPointer(start: extradata, count: Int(codecpar.pointee.extradata_size)))
+                if let record = VideoConfigRecord.fromAnnexB(
+                    VideoConfigRecord.canonicalizeAnnexBHEVCConfigRecord(source) ?? source, codecID: codecID,
+                    width: codecpar.pointee.width, height: codecpar.pointee.height) {
+                    var result = VideoFramingNormalization(extradataOverride: record, measuredFraming: .annexB)
+                    result.convertsAnnexBSamples = true
+                    return result
+                }
+            }
             return VideoFramingNormalization(extradataOverride: nil, measuredFraming: .annexB)
         }
 

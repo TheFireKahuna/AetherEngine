@@ -282,6 +282,233 @@ extension HLSVideoEngine {
         return "hvc1.2.4.L\(hevcLevel)"
     }
 
+    /// RFC 6381 `av01.P.LLT.DD.M.CCC.cp.tc.mc.F` (AV1-ISOBMFF §5 "Codecs Parameter String") read off
+    /// the av1C the muxer stream-copies into the init, the AV1 counterpart of `hevcCodecsString`.
+    /// Profile, level, tier, bit depth, monochrome and chroma subsampling / sample position are the
+    /// record's fixed header; the colour fields are the sequence header OBU's `color_config` when its
+    /// configOBUs carry one that describes colour, else the container's (`primaries` .. `range`, the
+    /// codecpar), which is what movenc writes into `colr`. With colour stated nowhere and every other
+    /// optional field at its default, the optional fields are omitted together, which is what
+    /// `MP4Box -info` prints for such a file and what the spec defines as 0.110.01.01.01.0.
+    ///
+    /// The route formatted `av01.%d.%02dM.%02d.0.111.cp.tc.mc.0` instead: tier always Main, chroma
+    /// `111` (4:2:0, vertical position) and limited range hard-coded, and the triplet chosen from the
+    /// transfer alone, so a BT.601 or a BT.2020 SDR encode was declared BT.709. nil when the buffer is
+    /// not an av1C (marker / version byte 0x81, four header bytes).
+    static func av1CodecsString(
+        fromConfigRecord av1C: [UInt8],
+        primaries: AVColorPrimaries = AVCOL_PRI_UNSPECIFIED,
+        transfer: AVColorTransferCharacteristic = AVCOL_TRC_UNSPECIFIED,
+        matrix: AVColorSpace = AVCOL_SPC_UNSPECIFIED,
+        range: AVColorRange = AVCOL_RANGE_UNSPECIFIED
+    ) -> String? {
+        guard av1C.count >= 4, av1C[0] == 0x81 else { return nil }
+        let profile = Int(av1C[1] >> 5)
+        let level = Int(av1C[1] & 0x1F)
+        let b2 = av1C[2]
+        let tier = (b2 >> 7) & 1 == 1 ? "H" : "M"
+        let bitDepth = (b2 >> 5) & 1 == 1 ? 12 : ((b2 >> 6) & 1 == 1 ? 10 : 8)
+        let mono = Int((b2 >> 4) & 1)
+        let ssx = Int((b2 >> 3) & 1), ssy = Int((b2 >> 2) & 1)
+        let samplePosition = (ssx == 1 && ssy == 1) ? Int(b2 & 3) : 0
+        let colour = av1SequenceHeaderColour(configOBUs: Array(av1C[4...]))
+        return av1CodecsString(
+            profile: profile, level: level, tier: tier, bitDepth: bitDepth, mono: mono,
+            chroma: "\(ssx)\(ssy)\(samplePosition)",
+            described: colour?.described == true ? colour : nil,
+            primaries: primaries, transfer: transfer, matrix: matrix,
+            fullRange: colour.map { $0.fullRange } ?? (range == AVCOL_RANGE_JPEG))
+    }
+
+    /// The colour fields shared by the av1C path and the codecpar fallback below.
+    private static func av1CodecsString(
+        profile: Int, level: Int, tier: String, bitDepth: Int, mono: Int, chroma: String,
+        described: (primaries: Int, transfer: Int, matrix: Int, fullRange: Bool, described: Bool)?,
+        primaries: AVColorPrimaries, transfer: AVColorTransferCharacteristic, matrix: AVColorSpace,
+        fullRange: Bool
+    ) -> String {
+        let head = String(format: "av01.%d.%02d%@.%02d", profile, level, tier, bitDepth)
+        let cp: Int, tc: Int, mc: Int
+        if let described {
+            (cp, tc, mc) = (described.primaries, described.transfer, described.matrix)
+        } else if primaries != AVCOL_PRI_UNSPECIFIED || transfer != AVCOL_TRC_UNSPECIFIED
+                    || matrix != AVCOL_SPC_UNSPECIFIED {
+            // Each unstated field as AV1's own "unspecified" (2), the value FFmpeg's enums share.
+            (cp, tc, mc) = (Int(primaries.rawValue), Int(transfer.rawValue), Int(matrix.rawValue))
+        } else if mono == 0, chroma == "110", !fullRange {
+            return head
+        } else {
+            (cp, tc, mc) = (2, 2, 2)
+        }
+        return head + String(format: ".%d.%@.%02d.%02d.%02d.%d", mono, chroma, cp, tc, mc, fullRange ? 1 : 0)
+    }
+
+    /// `color_config` (AV1 §5.5.2) of the first sequence header OBU among an av1C's configOBUs:
+    /// the colour triplet when `color_description_present_flag` is set, and `color_range`, which
+    /// every sequence header states. nil when there is no sequence header or it does not parse.
+    static func av1SequenceHeaderColour(
+        configOBUs obus: [UInt8]
+    ) -> (primaries: Int, transfer: Int, matrix: Int, fullRange: Bool, described: Bool)? {
+        var offset = 0
+        while offset < obus.count {
+            let header = obus[offset]
+            offset += 1
+            guard header & 0x80 == 0 else { return nil }
+            let type = (header >> 3) & 0xF
+            if header & 0x04 != 0 { offset += 1 }          // obu_extension_header
+            var size = obus.count - offset
+            if header & 0x02 != 0 {                          // obu_has_size_field: leb128
+                size = 0
+                var i = 0
+                while true {
+                    guard offset < obus.count, i < 8 else { return nil }
+                    let byte = obus[offset]
+                    offset += 1
+                    size |= Int(byte & 0x7F) << (7 * i)
+                    i += 1
+                    if byte & 0x80 == 0 { break }
+                }
+            }
+            guard size >= 0, offset + size <= obus.count else { return nil }
+            if type == 1 {
+                return av1ColorConfig(sequenceHeader: Array(obus[offset..<(offset + size)]))
+            }
+            offset += size
+        }
+        return nil
+    }
+
+    /// Walks sequence_header_obu() up to and through color_config(); every field before it is read
+    /// only to find where color_config starts.
+    private static func av1ColorConfig(
+        sequenceHeader payload: [UInt8]
+    ) -> (primaries: Int, transfer: Int, matrix: Int, fullRange: Bool, described: Bool)? {
+        var r = H264SPS.BitReader(payload)
+        func uvlc() -> Int? {
+            var zeros = 0
+            while true {
+                guard let b = r.u(1) else { return nil }
+                if b == 1 { break }
+                zeros += 1
+                if zeros >= 32 { return nil }
+            }
+            return zeros == 0 ? 0 : r.u(zeros).map { $0 + (1 << zeros) - 1 }
+        }
+        guard let seqProfile = r.u(3), r.u(1) != nil, let reduced = r.flag() else { return nil }
+        if reduced {
+            guard r.u(5) != nil else { return nil }                       // seq_level_idx[0]
+        } else {
+            guard let timingInfo = r.flag() else { return nil }
+            var decoderModelInfo = false
+            var bufferDelayLength = 0
+            if timingInfo {
+                guard r.u(32) != nil, r.u(32) != nil, let equal = r.flag() else { return nil }
+                if equal { guard uvlc() != nil else { return nil } }      // num_ticks_per_picture_minus_1
+                guard let dmi = r.flag() else { return nil }
+                decoderModelInfo = dmi
+                if dmi {
+                    guard let bdl = r.u(5), r.u(32) != nil, r.u(5) != nil, r.u(5) != nil else { return nil }
+                    bufferDelayLength = bdl + 1
+                }
+            }
+            guard let initialDisplayDelay = r.flag(), let count = r.u(5) else { return nil }
+            for _ in 0...count {
+                guard r.u(12) != nil, let seqLevel = r.u(5) else { return nil }
+                if seqLevel > 7 { guard r.u(1) != nil else { return nil } } // seq_tier
+                if decoderModelInfo {
+                    guard let present = r.flag() else { return nil }
+                    if present {
+                        guard r.u(bufferDelayLength) != nil, r.u(bufferDelayLength) != nil,
+                              r.u(1) != nil else { return nil }
+                    }
+                }
+                if initialDisplayDelay {
+                    guard let present = r.flag() else { return nil }
+                    if present { guard r.u(4) != nil else { return nil } }
+                }
+            }
+        }
+        guard let widthBits = r.u(4), let heightBits = r.u(4),
+              r.u(widthBits + 1) != nil, r.u(heightBits + 1) != nil else { return nil }
+        if !reduced {
+            guard let frameIDs = r.flag() else { return nil }
+            if frameIDs { guard r.u(7) != nil else { return nil } }
+        }
+        guard r.u(3) != nil else { return nil }        // 128x128 superblock, filter intra, intra edge
+        if !reduced {
+            guard r.u(4) != nil, let orderHint = r.flag() else { return nil }
+            if orderHint { guard r.u(2) != nil else { return nil } }      // jnt_comp, ref_frame_mvs
+            guard let chooseScreenContent = r.flag() else { return nil }
+            var forceScreenContent = 2
+            if !chooseScreenContent { guard let f = r.u(1) else { return nil }; forceScreenContent = f }
+            if forceScreenContent > 0 {
+                guard let chooseIntegerMV = r.flag() else { return nil }
+                if !chooseIntegerMV { guard r.u(1) != nil else { return nil } }
+            }
+            if orderHint { guard r.u(3) != nil else { return nil } }      // order_hint_bits_minus_1
+        }
+        guard r.u(3) != nil else { return nil }        // superres, cdef, restoration
+        // color_config()
+        guard let highBitDepth = r.flag() else { return nil }
+        if seqProfile == 2, highBitDepth { guard r.u(1) != nil else { return nil } }   // twelve_bit
+        var mono = false
+        if seqProfile != 1 { guard let m = r.flag() else { return nil }; mono = m }
+        guard let described = r.flag() else { return nil }
+        var cp = 2, tc = 2, mc = 2
+        if described {
+            guard let p = r.u(8), let t = r.u(8), let m = r.u(8) else { return nil }
+            (cp, tc, mc) = (p, t, m)
+        }
+        let fullRange: Bool
+        if !mono, cp == 1, tc == 13, mc == 0 {
+            fullRange = true                            // sRGB: color_range implied, not coded
+        } else {
+            guard let range = r.flag() else { return nil }
+            fullRange = range
+        }
+        return (cp, tc, mc, fullRange, described)
+    }
+
+    /// The av01 CODECS for an AV1 route: the av1C when the source carries one (MP4, Matroska), else
+    /// the codecpar fields, with the colour stated as the codecpar has it rather than picked from the
+    /// transfer and the chroma read off the pixel format and chroma location.
+    private func av1Codecs(codecpar: UnsafePointer<AVCodecParameters>) -> String {
+        let par = codecpar.pointee
+        if let ed = par.extradata, par.extradata_size > 0,
+           let derived = Self.av1CodecsString(
+               fromConfigRecord: Array(UnsafeBufferPointer(start: ed, count: Int(par.extradata_size))),
+               primaries: par.color_primaries, transfer: par.color_trc,
+               matrix: par.color_space, range: par.color_range) {
+            return derived
+        }
+        let profileRaw = Int(par.profile)
+        let level = Int(par.level)
+        let isHDR = par.color_trc == AVCOL_TRC_SMPTE2084 || par.color_trc == AVCOL_TRC_ARIB_STD_B67
+        let bitDepthRaw = Int(par.bits_per_raw_sample)
+        var mono = 0, ssx = 1, ssy = 1
+        if par.format >= 0, let desc = av_pix_fmt_desc_get(AVPixelFormat(rawValue: par.format)) {
+            mono = desc.pointee.nb_components == 1 ? 1 : 0
+            ssx = Int(desc.pointee.log2_chroma_w)
+            ssy = Int(desc.pointee.log2_chroma_h)
+        }
+        // AVCHROMA_LOC_LEFT is AV1's CSP_VERTICAL (1), AVCHROMA_LOC_TOPLEFT its CSP_COLOCATED (2).
+        let samplePosition: Int
+        switch par.chroma_location {
+        case AVCHROMA_LOC_LEFT where ssx == 1 && ssy == 1: samplePosition = 1
+        case AVCHROMA_LOC_TOPLEFT where ssx == 1 && ssy == 1: samplePosition = 2
+        default: samplePosition = 0
+        }
+        return Self.av1CodecsString(
+            profile: (0...2).contains(profileRaw) ? profileRaw : 0,
+            // seq_level_idx 0..23; default 8 = level 4.0 (~4K@30fps).
+            level: (0...23).contains(level) ? level : 8,
+            tier: "M",
+            bitDepth: bitDepthRaw > 0 ? bitDepthRaw : (isHDR ? 10 : 8),
+            mono: mono, chroma: "\(ssx)\(ssy)\(samplePosition)", described: nil,
+            primaries: par.color_primaries, transfer: par.color_trc, matrix: par.color_space,
+            fullRange: par.color_range == AVCOL_RANGE_JPEG)
+    }
+
     func resolveCodecRoute(
         codecpar: UnsafePointer<AVCodecParameters>
     ) throws -> CodecRoute {
@@ -334,12 +561,6 @@ extension HLSVideoEngine {
             let dvRecord = (effectiveDvMode && !presentsBaseLayer) ? sourceRecord : nil
             let dvVariant = classifyDVVariant(dvRecord, codecID: AV_CODEC_ID_AV1)
 
-            let av1ProfileRaw = Int(codecpar.pointee.profile)
-            let av1Profile = (av1ProfileRaw >= 0 && av1ProfileRaw <= 2) ? av1ProfileRaw : 0
-            let av1LevelRaw = Int(codecpar.pointee.level)
-            // seq_level_idx 0..23; default 8 = level 4.0 (~4K@30fps).
-            let av1Level = (av1LevelRaw >= 0 && av1LevelRaw <= 23) ? av1LevelRaw : 8
-            let bitDepthRaw = Int(codecpar.pointee.bits_per_raw_sample)
             let dvLevelRaw = Int(dvRecord?.dv_level ?? 0)
             let dvLevel = dvLevelRaw > 0 ? dvLevelRaw : 6
             let dvLevelStr = String(format: "%02d", dvLevel)
@@ -363,15 +584,10 @@ extension HLSVideoEngine {
                 // (P10.0, the analogue of HEVC P5); a cross-compatible profile carries its base layer's
                 // own sample entry so a client that does not know Dolby Vision still plays it, and the
                 // brand in SUPPLEMENTAL-CODECS is what makes AVPlayer engage the RPU (AE#547).
-                let bd = bitDepthRaw > 0 ? bitDepthRaw : 10
-                let primary = String(
-                    format: "av01.%d.%02dM.%02d.0.111.09.16.09.0",
-                    av1Profile, av1Level, bd
-                )
                 return CodecRoute(
                     codecTagOverride: "av01",
                     videoRange: .pq,
-                    primaryCodecs: primary,
+                    primaryCodecs: av1Codecs(codecpar: codecpar),
                     supplementalCodecs: "dav1.10.\(dvLevelStr)/db1p",
                     doviConfig: .keep,
                     convertP7ToProfile81: false,
@@ -379,15 +595,10 @@ extension HLSVideoEngine {
                 )
             case .av1Profile104:
                 // P10.4: HLG-compat base; av01 + SUPPLEMENTAL dav1/db4h. Analogous to HEVC P8.4.
-                let bd = bitDepthRaw > 0 ? bitDepthRaw : 10
-                let primary = String(
-                    format: "av01.%d.%02dM.%02d.0.111.09.18.09.0",
-                    av1Profile, av1Level, bd
-                )
                 return CodecRoute(
                     codecTagOverride: "av01",
                     videoRange: .hlg,
-                    primaryCodecs: primary,
+                    primaryCodecs: av1Codecs(codecpar: codecpar),
                     supplementalCodecs: "dav1.10.\(dvLevelStr)/db4h",
                     doviConfig: .keep,
                     convertP7ToProfile81: false,
@@ -407,27 +618,10 @@ extension HLSVideoEngine {
                         category: .session
                     )
                 }
-                let trc = codecpar.pointee.color_trc
-                let videoRange: HLSVideoRange
-                let cp: Int, tc: Int, mc: Int, bd: Int
-                if trc == AVCOL_TRC_ARIB_STD_B67 {
-                    videoRange = .hlg; cp = 9; tc = 18; mc = 9
-                    bd = bitDepthRaw > 0 ? bitDepthRaw : 10
-                } else if trc == AVCOL_TRC_SMPTE2084 {
-                    videoRange = .pq; cp = 9; tc = 16; mc = 9
-                    bd = bitDepthRaw > 0 ? bitDepthRaw : 10
-                } else {
-                    videoRange = .sdr; cp = 1; tc = 1; mc = 1
-                    bd = bitDepthRaw > 0 ? bitDepthRaw : 8
-                }
-                let primary = String(
-                    format: "av01.%d.%02dM.%02d.0.111.%02d.%02d.%02d.0",
-                    av1Profile, av1Level, bd, cp, tc, mc
-                )
                 return CodecRoute(
                     codecTagOverride: "av01",
-                    videoRange: videoRange,
-                    primaryCodecs: primary,
+                    videoRange: manifestVideoRange(codecpar),
+                    primaryCodecs: av1Codecs(codecpar: codecpar),
                     supplementalCodecs: nil,
                     doviConfig: (dvVariant == .av1Profile102 || presentsBaseLayer) ? .strip : .keep,
                     convertP7ToProfile81: false,
@@ -652,7 +846,7 @@ extension HLSVideoEngine {
             )
         case .profile7:
             // P7 dual-layer (UHD-BD). With preferDualLayerDolbyVision on and the box able to afford it,
-            // VideoRoutingPolicy sends a FEL to the software dual-layer route instead (SoftwarePlaybackHost +
+            // VideoRoutingPolicy sends a FEL to the software dual-layer route instead (the composed overlay,
             // DualLayerVideoDecoder), which keeps the enhancement layer; every other P7 load lands here.
             //
             // Native route: convert the RPU P7 -> P8.1 per packet (DoviRpuConverter, libdovi

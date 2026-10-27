@@ -202,7 +202,7 @@ struct DolbyVisionBaseLayerTests {
                                handling: .baseLayerOnly)
         #expect(r.codecTagOverride == "av01")
         #expect(r.videoRange == .pq)
-        #expect(r.primaryCodecs == "av01.0.08M.10.0.111.09.16.09.0")
+        #expect(r.primaryCodecs == "av01.0.08M.10.0.110.09.16.09.0")
         #expect(r.supplementalCodecs == nil)
         #expect(r.doviConfig == .strip)
         #expect(r.dvVariant == .av1Profile101)

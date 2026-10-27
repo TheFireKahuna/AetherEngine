@@ -119,8 +119,11 @@ enum HDR10PlusMetadataScan {
     /// abandoning a confirmed payload because a later NAL in the same packet is malformed would be a
     /// false negative on the one carriage this scan exists to find. `payload` validates one registered
     /// T.35 message (its bytes start at the country code), so HDR Vivid shares this walk.
+    /// `payloadType` picks the SEI message handed to `payload` (4, registered T.35, unless a caller
+    /// reads another one: the in-band HDR static metadata scan reads 137 / 144 / 148).
     static func scanNALs(
         _ bytes: UnsafeBufferPointer<UInt8>, codecID: AVCodecID, framing: VideoNALFraming,
+        payloadType: Int = 4,
         payload: (UnsafePointer<UInt8>, Int) -> Bool
     ) -> Bool {
         var found = false
@@ -138,7 +141,8 @@ enum HDR10PlusMetadataScan {
             }
             guard isSEI else { return true }
             guard let rbsp = unescape(bytes, start: start + headerSize, end: end),
-                  let carriesMetadata = scanSEI(rbsp, payload: payload) else { return false }
+                  let carriesMetadata = scanSEI(rbsp, payloadType: payloadType, payload: payload)
+            else { return false }
             found = found || carriesMetadata
             return true
         }
@@ -203,7 +207,9 @@ enum HDR10PlusMetadataScan {
     /// Nil denotes malformed SEI framing; false is a well-formed SEI without HDR10+. A message this
     /// walk has already VALIDATED outranks framing it cannot finish reading, so nil is only ever the
     /// answer when nothing was confirmed.
-    private static func scanSEI(_ bytes: [UInt8], payload: (UnsafePointer<UInt8>, Int) -> Bool) -> Bool? {
+    private static func scanSEI(
+        _ bytes: [UInt8], payloadType: Int = 4, payload: (UnsafePointer<UInt8>, Int) -> Bool
+    ) -> Bool? {
         var offset = 0
         var found = false
         func extendedValue() -> Int? {
@@ -222,7 +228,7 @@ enum HDR10PlusMetadataScan {
             if offset == bytes.count - 1, bytes[offset] == 0x80 { return found }
             guard let type = extendedValue(), let size = extendedValue(),
                   size <= bytes.count - offset else { return found ? true : nil }
-            if type == 4 {
+            if type == payloadType {
                 let valid = bytes.withUnsafeBufferPointer {
                     payload($0.baseAddress! + offset, size)
                 }
