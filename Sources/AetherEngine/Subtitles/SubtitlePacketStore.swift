@@ -3,7 +3,7 @@ import AetherLibavcodec
 import AetherLibavutil
 
 /// #112 rework: session-lifetime retention of compressed subtitle packets harvested
-/// from the owning host's demux pump (HLSSegmentProducer or SoftwarePlaybackHost).
+/// from the owning host's demux pump (HLSSegmentProducer).
 /// Written on the pump thread, read by the MainActor overlay drainer; all state is
 /// lock-guarded (same pattern as NativeSubtitleCueStore).
 struct StoredSubtitlePacket: Sendable {
@@ -42,12 +42,12 @@ final class SubtitlePacketStore: @unchecked Sendable {
     /// cues starved permanently). Oldest entries evict first when a stream exceeds the cap: text
     /// tracks stay far below it and keep the whole session; a bitmap track keeps a wide trailing
     /// window. A backward seek past a bitmap stream's evicted edge is the deferred windowed-re-read
-    /// case (#125). Forward exposure from the pump is bounded by the producer's forward park (#102);
-    /// on VOD sessions the forward prefetcher (#151) extends it to the drainer's lead window.
+    /// case (#125). Forward exposure from the pump is bounded by the producer's forward park (#102),
+    /// which a subtitle consumer's read-ahead extends to its lead window (#151).
     static let perStreamByteCap: Int = 32 * 1024 * 1024
 
-    /// #166: the per-stream cap alone is unbounded in aggregate. Both the pump tap and the forward
-    /// prefetcher harvest EVERY embedded subtitle stream (so a track switch backfills instantly,
+    /// #166: the per-stream cap alone is unbounded in aggregate. The pump harvests EVERY embedded
+    /// subtitle stream (so a track switch backfills instantly,
     /// #112), so a source with many embedded tracks (99 in the field repro, mostly bitmap) climbed
     /// toward N x perStreamByteCap (~3.2GB) and the host hit the iOS jetsam limit. This is the
     /// ceiling on the SUM across all streams: the active drain targets are protected and keep their
@@ -59,17 +59,8 @@ final class SubtitlePacketStore: @unchecked Sendable {
     /// Ceiling for one in-assembly PGS display set (a 4K set stays far below this); a pending
     /// buffer past it is malformed or mis-parsed and gets dropped rather than grown unbounded.
     /// Audit SUB-111: pending sets also count toward the aggregate cap, so 16 MiB per set was
-    /// room for 16 MiB x 2 writers x every PID of a crafted transport stream.
+    /// room for 16 MiB x every PID of a crafted transport stream.
     static let maxPendingDisplaySetBytes: Int = 4 * 1024 * 1024
-
-    /// #151: which reader is writing. The pump and the forward prefetcher can both feed the same
-    /// stream; a completed entry re-harvested by the other collapses on a byte-identical payload in
-    /// appendLocked (#235: the PTS alone does not identify it), but an in-assembly display set must
-    /// stay private to its writer or the two would interleave chunks into one corrupt set.
-    enum Writer: Hashable, Sendable {
-        case pump
-        case prefetch
-    }
 
     /// One PGS display set being reassembled from split MPEG-TS PES chunks (see harvestChunk).
     private struct PendingDisplaySet {
@@ -79,15 +70,10 @@ final class SubtitlePacketStore: @unchecked Sendable {
         var payload: Data
     }
 
-    private struct PendingKey: Hashable {
-        let streamIndex: Int32
-        let writer: Writer
-    }
-
     private let lock = NSLock()
     private var entriesByStream: [Int32: [StoredSubtitlePacket]] = [:]
     private var bytesByStream: [Int32: Int] = [:]
-    private var pendingSetByStream: [PendingKey: PendingDisplaySet] = [:]
+    private var pendingSetByStream: [Int32: PendingDisplaySet] = [:]
     /// Audit SUB-103: same-PTS runs longer than `linearDedupeRun` answer "was this payload already
     /// stored here" from a hash set instead of comparing against every packet of the run. The set is
     /// only a filter: it may hold hashes of evicted packets (a stale hit costs one scan) but never
@@ -116,6 +102,13 @@ final class SubtitlePacketStore: @unchecked Sendable {
     private var protectedStreams: Set<Int32> = []
     private var lastTouchByStream: [Int32: UInt64] = [:]
     private var touchCounter: UInt64 = 0
+    /// Layer 3 step 3: the streams the subtitle source reads from the container's index on request
+    /// (`SubtitleSource.pull`). Their packets come from the pulls alone, so a harvest of one is passed
+    /// over; what was pulled is recorded per stream (`pulled`), and eviction keeps what lies nearest the
+    /// last pull (`pullFocus`), since anything evicted can be pulled again.
+    private var pulledStreams: Set<Int32> = []
+    private var pulled: [Int32: PulledSpans] = [:]
+    private var pullFocus: [Int32: Double] = [:]
 
     init(perStreamByteCap: Int = SubtitlePacketStore.perStreamByteCap,
          aggregateByteCap: Int = SubtitlePacketStore.aggregateByteCap) {
@@ -143,23 +136,29 @@ final class SubtitlePacketStore: @unchecked Sendable {
     /// #416: a reader has positioned at `seconds` and reads forwards from there. Announced by every
     /// reposition of every reader that writes here, because an unannounced one would let the run
     /// below be extended across ground nobody read.
-    func noteHarvestAnchor(_ writer: Writer, at seconds: Double) {
+    func noteHarvestAnchor(at seconds: Double) {
         lock.lock(); defer { lock.unlock() }
-        coverage.noteAnchor(writer, at: seconds)
+        coverage.noteAnchor(at: seconds)
     }
 
     /// #416: that reader's current run has read one step further, through `seconds`.
-    func noteHarvestProgress(_ writer: Writer, through seconds: Double) {
+    func noteHarvestProgress(through seconds: Double) {
         lock.lock(); defer { lock.unlock() }
-        coverage.noteProgress(writer, through: seconds)
+        coverage.noteProgress(through: seconds)
     }
 
     /// #416: that reader's current run has REACHED `seconds` from its anchor, however far that is
     /// in one note. For a claim resting on an invariant rather than on observed steps; see
     /// `SubtitleHarvestCoverage.noteReach`.
-    func noteHarvestReach(_ writer: Writer, through seconds: Double) {
+    func noteHarvestReach(through seconds: Double) {
         lock.lock(); defer { lock.unlock() }
-        coverage.noteReach(writer, through: seconds)
+        coverage.noteReach(through: seconds)
+    }
+
+    /// #416: that reader's current run read on to the end of the source.
+    func noteHarvestEnd() {
+        lock.lock(); defer { lock.unlock() }
+        coverage.noteEnd()
     }
 
     /// #416: was the whole span between `from` and `through` read by some run this session?
@@ -172,10 +171,52 @@ final class SubtitlePacketStore: @unchecked Sendable {
         return coverage.isEmpty || coverage.covers(from: from, through: through)
     }
 
+    /// #416: how far the harvest has read on unbroken from `from`; nil when nothing was ever noted or
+    /// `from` was never read. Unlike `hasReadSpan`, ignorance answers nil here: the caller turns the answer
+    /// into a claim that a track holds no line in that stretch, and that claim needs a reading behind it.
+    func harvestReach(from: Double) -> Double? {
+        lock.lock(); defer { lock.unlock() }
+        return coverage.reach(from: from)
+    }
+
     /// Introspection for tests and diagnostics.
     var harvestCoverageSpans: [SubtitleHarvestCoverage.Span] {
         lock.lock(); defer { lock.unlock() }
         return coverage.sortedSpans()
+    }
+
+    // MARK: - Pulled streams (layer 3 step 3)
+
+    /// The streams read from the index on request. A harvest of any of them is passed over from here on.
+    func setPulledStreams(_ indices: Set<Int32>) {
+        lock.lock(); defer { lock.unlock() }
+        pulledStreams = indices
+    }
+
+    func isPulled(_ streamIndex: Int32) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return pulledStreams.contains(streamIndex)
+    }
+
+    /// Every frame of `streamIndex` timed from `from` through `through` is stored (an empty span: the
+    /// index lists none there). `focus` is where the reader stands, which eviction keeps nearest.
+    func notePulled(streamIndex: Int32, from: Double, through: Double, focus: Double) {
+        guard through >= from else { return }
+        lock.lock(); defer { lock.unlock() }
+        pulled[streamIndex, default: PulledSpans()].insert(from: from, through: through)
+        pullFocus[streamIndex] = focus
+    }
+
+    /// How far the pulled spans run on unbroken from `from`; nil when `from` was never pulled.
+    func pulledReach(streamIndex: Int32, from: Double) -> Double? {
+        lock.lock(); defer { lock.unlock() }
+        return pulled[streamIndex]?.reach(from: from)
+    }
+
+    /// Introspection for tests and diagnostics.
+    func pulledSpans(streamIndex: Int32) -> [PulledSpans.Span] {
+        lock.lock(); defer { lock.unlock() }
+        return pulled[streamIndex]?.spans ?? []
     }
 
     func append(streamIndex: Int32, ptsSeconds: Double, durationSeconds: Double,
@@ -207,8 +248,8 @@ final class SubtitlePacketStore: @unchecked Sendable {
                                          sequence: appendCounter)
         // #235: several packets legitimately share a PTS. ASS/SSA authors overlapping lines on
         // identical Start/End, and a karaoke or layered-style track puts a whole burst of distinct
-        // Dialogue events on one timestamp. Only a byte-identical payload is the pump and the
-        // prefetcher re-harvesting the same packet (#151), and only that collapses. Anything else
+        // Dialogue events on one timestamp. Only a byte-identical payload is a restarted pump
+        // re-harvesting the same packet, and only that collapses. Anything else
         // joins the end of the run, so a shared timestamp reaches the drainer in harvest order:
         // the drainer decodes a window in array order and later events layer over earlier ones.
         let run = Self.lowerBound(entries, ptsSeconds)..<Self.upperBound(entries, ptsSeconds)
@@ -224,12 +265,16 @@ final class SubtitlePacketStore: @unchecked Sendable {
             // Audit SUB-103: evict to a low-water mark in one move. Dropping just enough made every
             // append at the cap shift the whole array for one packet.
             let lowWater = perStreamCap - perStreamCap / 10
-            var dropped = 0
-            while bytes > lowWater, dropped < entries.count - 1 {
-                bytes -= entries[dropped].payload.count
-                dropped += 1
+            if pulledStreams.contains(streamIndex), let focus = pullFocus[streamIndex] {
+                evictFarthestLocked(streamIndex, &entries, &bytes, lowWater: lowWater, focus: focus)
+            } else {
+                var dropped = 0
+                while bytes > lowWater, dropped < entries.count - 1 {
+                    bytes -= entries[dropped].payload.count
+                    dropped += 1
+                }
+                entries.removeFirst(dropped)
             }
-            entries.removeFirst(dropped)
             payloadHashesByRun[streamIndex] = nil
         }
         entriesByStream[streamIndex] = entries
@@ -238,6 +283,27 @@ final class SubtitlePacketStore: @unchecked Sendable {
         touchCounter &+= 1
         lastTouchByStream[streamIndex] = touchCounter
         enforceAggregateCapLocked(justTouched: streamIndex)
+    }
+
+    /// A pulled stream over its cap gives up whichever end lies farther from where its reader stands, and
+    /// its pulled spans stop short of what went, so a later pull reads it again rather than a drain reading
+    /// the gap as silence.
+    private func evictFarthestLocked(_ streamIndex: Int32, _ entries: inout [StoredSubtitlePacket], _ bytes: inout Int,
+                                     lowWater: Int, focus: Double) {
+        var head = 0
+        var tail = entries.count
+        while bytes > lowWater, tail - head > 1 {
+            if abs(entries[head].ptsSeconds - focus) >= abs(entries[tail - 1].ptsSeconds - focus) {
+                bytes -= entries[head].payload.count
+                head += 1
+            } else {
+                tail -= 1
+                bytes -= entries[tail].payload.count
+            }
+        }
+        if head > 0 { pulled[streamIndex]?.clip(above: entries[head - 1].ptsSeconds) }
+        if tail < entries.count { pulled[streamIndex]?.clip(below: entries[tail].ptsSeconds) }
+        entries = Array(entries[head..<tail])
     }
 
     /// Index within `run` of the packet `payload` duplicates, nil when it is new. A long run is
@@ -259,8 +325,8 @@ final class SubtitlePacketStore: @unchecked Sendable {
         return seenBefore ? scan() : nil
     }
 
-    /// First index at or past `ptsSeconds` in a PTS-sorted run. Harvest is near-monotonic, but the
-    /// forward prefetcher (#151) backfills far behind the frontier, so the position is searched
+    /// First index at or past `ptsSeconds` in a PTS-sorted run. Harvest is near-monotonic, but a
+    /// pump restarted behind the frontier (a backward seek) harvests far below it, so the position is searched
     /// rather than assumed. Searched in log time rather than scanned from the front: the scan made
     /// one append O(n) and a session's harvest O(n^2) in retained packets, which #235 turned from
     /// academic into load-bearing, since a dense ASS track now keeps every event on a shared
@@ -298,23 +364,21 @@ final class SubtitlePacketStore: @unchecked Sendable {
     /// (least-recently-touched) NON-protected stream first, then the next coldest, until the total
     /// is back under `aggregateCap` or only protected streams remain. Protected streams (the active
     /// drain targets) and the stream just written keep their per-stream window; a fully drained
-    /// cold stream is dropped and re-harvested from the pump/prefetcher if it is selected later.
+    /// cold stream is dropped and re-harvested from the pump if it is selected later.
     private func enforceAggregateCapLocked(justTouched: Int32) {
         guard totalBytes > aggregateCap else { return }
         // Audit SUB-103: down to a low-water mark, so the pass does not rerun on the next append, and
         // each victim loses its leading packets in one `removeFirst(k)`.
         let lowWater = aggregateCap - aggregateCap / 10
         var streams = Set(bytesByStream.keys)
-        for key in pendingSetByStream.keys { streams.insert(key.streamIndex) }
+        for key in pendingSetByStream.keys { streams.insert(key) }
         let candidates = streams
             .filter { !protectedStreams.contains($0) && $0 != justTouched }
             .sorted { (lastTouchByStream[$0] ?? 0) < (lastTouchByStream[$1] ?? 0) }
         for idx in candidates {
             guard totalBytes > lowWater else { break }
             // Audit SUB-111: an unfinished display set of a cold stream goes before anything complete.
-            for writer in [Writer.pump, Writer.prefetch] {
-                _ = takePendingLocked(PendingKey(streamIndex: idx, writer: writer))
-            }
+            _ = takePendingLocked(idx)
             guard totalBytes > lowWater, var entries = entriesByStream.removeValue(forKey: idx) else {
                 if entriesByStream[idx] == nil { lastTouchByStream[idx] = nil }
                 continue
@@ -327,11 +391,13 @@ final class SubtitlePacketStore: @unchecked Sendable {
                 totalBytes -= removed
                 dropped += 1
             }
+            if dropped > 0 { pulled[idx]?.clip(above: entries[dropped - 1].ptsSeconds) }
             entries.removeFirst(dropped)
             payloadHashesByRun[idx] = nil
             if entries.isEmpty {
                 bytesByStream[idx] = nil
                 lastTouchByStream[idx] = nil
+                pulled[idx] = nil
             } else {
                 entriesByStream[idx] = entries
                 bytesByStream[idx] = bytes
@@ -341,17 +407,17 @@ final class SubtitlePacketStore: @unchecked Sendable {
 
     /// A display set in assembly leaves the dictionary while it is worked on, so appending to it is in
     /// place, and its bytes leave the aggregate count with it. `putPendingLocked` is the way back.
-    private func takePendingLocked(_ key: PendingKey) -> PendingDisplaySet? {
+    private func takePendingLocked(_ key: Int32) -> PendingDisplaySet? {
         guard let pending = pendingSetByStream.removeValue(forKey: key) else { return nil }
         totalBytes -= pending.payload.count
         return pending
     }
 
-    private func putPendingLocked(_ pending: PendingDisplaySet, _ key: PendingKey) {
+    private func putPendingLocked(_ pending: PendingDisplaySet, _ key: Int32) {
         pendingSetByStream[key] = pending
         totalBytes += pending.payload.count
         touchCounter &+= 1
-        lastTouchByStream[key.streamIndex] = touchCounter
+        lastTouchByStream[key] = touchCounter
     }
 
     /// Shared pump-side harvest for both hosts: convert a raw AVPacket into a stored entry on
@@ -364,7 +430,7 @@ final class SubtitlePacketStore: @unchecked Sendable {
     /// storage would drop or collapse the palette/object segments and every set would fail
     /// with "Invalid palette id" at its END. Armed streams route through the reassembler.
     func harvest(streamIndex: Int32, packet: UnsafeMutablePointer<AVPacket>, timeBase: AVRational,
-                 assembleSplitDisplaySets: Bool = false, writer: Writer = .pump) {
+                 assembleSplitDisplaySets: Bool = false) {
         let pts = packet.pointee.pts
         guard let data = packet.pointee.data, packet.pointee.size > 0,
               timeBase.den != 0 else { return }
@@ -375,7 +441,6 @@ final class SubtitlePacketStore: @unchecked Sendable {
                      flags: packet.pointee.flags,
                      payload: Data(bytes: data, count: Int(packet.pointee.size)),
                      assembleSplitDisplaySets: assembleSplitDisplaySets,
-                     writer: writer,
                      webvttSettings: WebVTTCueSettings.settings(onPacket: packet))
     }
 
@@ -383,18 +448,20 @@ final class SubtitlePacketStore: @unchecked Sendable {
     /// dropped on the per-packet path, folded into the pending set on the assembly path.
     func harvestChunk(streamIndex: Int32, ptsSeconds: Double?, durationSeconds: Double,
                       flags: Int32, payload: Data, assembleSplitDisplaySets: Bool,
-                      writer: Writer = .pump, webvttSettings: String? = nil) {
-        // Audit FEA-101: the pump, the software-host tap and the prefetcher all store through here,
+                      webvttSettings: String? = nil) {
+        // Audit FEA-101: the pump and the software-host tap both store through here,
         // and the drain scales these seconds back into Int64 milliseconds. Same rule as the
         // demuxer's bound: an implausible time is unset, an implausible duration is 0.
         let bound = SourceTimestampBounds.maxPlausibleSeconds
         let ptsSeconds = ptsSeconds.flatMap { $0.isFinite && abs($0) < bound ? $0 : nil }
         let durationSeconds = durationSeconds.isFinite && durationSeconds < bound ? Swift.max(0, durationSeconds) : 0
         lock.lock(); defer { lock.unlock() }
-        // #416: a harvested packet is a position its writer demonstrably read, so the run reaches
+        // #416: a harvested packet is a position the pump demonstrably read, so the run reaches
         // it. This is what gives the pump the forward lookahead its playhead-based note cannot
         // state, which is the region a backward seek into already-produced content lands in.
-        if let ptsSeconds { coverage.noteReach(writer, through: ptsSeconds) }
+        if let ptsSeconds { coverage.noteReach(through: ptsSeconds) }
+        // A pulled stream is the pulls' alone (`setPulledStreams`): one reader per route.
+        guard !pulledStreams.contains(streamIndex) else { return }
         guard assembleSplitDisplaySets else {
             guard let ptsSeconds else { return }
             appendLocked(streamIndex: streamIndex, ptsSeconds: ptsSeconds,
@@ -409,7 +476,7 @@ final class SubtitlePacketStore: @unchecked Sendable {
         if chunk.count > 10, chunk[chunk.startIndex] == 0x50, chunk[chunk.startIndex + 1] == 0x47 {
             chunk = chunk.dropFirst(10)
         }
-        let key = PendingKey(streamIndex: streamIndex, writer: writer)
+        let key = streamIndex
         while !chunk.isEmpty {
             var pending = takePendingLocked(key)
             // A backward pts jump under an open set means the pump re-anchored mid-set;
@@ -530,6 +597,7 @@ final class SubtitlePacketStore: @unchecked Sendable {
         for (idx, entries) in entriesByStream {
             let kept = entries.drop { $0.ptsSeconds < cutoff }
             if kept.count != entries.count {
+                pulled[idx]?.clip(above: entries[entries.count - kept.count - 1].ptsSeconds)
                 let newBytes = kept.reduce(0) { $0 + $1.payload.count }
                 totalBytes += newBytes - (bytesByStream[idx] ?? 0)
                 entriesByStream[idx] = Array(kept)
@@ -551,5 +619,61 @@ final class SubtitlePacketStore: @unchecked Sendable {
         touchCounter = 0
         appendCounter = 0
         coverage = SubtitleHarvestCoverage()
+        pulledStreams.removeAll()
+        pulled.removeAll()
+        pullFocus.removeAll()
+    }
+}
+
+/// Layer 3 step 3: the spans of one stream whose frames are all stored, as the subtitle source pulled
+/// them. Sorted and disjoint; two spans that touch are one. A span with no packet in it is a stretch the
+/// index lists nothing in, which is an answer, unlike a stretch nobody pulled.
+struct PulledSpans: Sendable, Equatable {
+    struct Span: Sendable, Equatable {
+        var from: Double
+        var through: Double
+    }
+
+    private(set) var spans: [Span] = []
+
+    mutating func insert(from: Double, through: Double) {
+        var merged = Span(from: from, through: through)
+        var out: [Span] = []
+        out.reserveCapacity(spans.count + 1)
+        var placed = false
+        for span in spans {
+            if span.through < merged.from {
+                out.append(span)
+            } else if span.from > merged.through {
+                if !placed { out.append(merged); placed = true }
+                out.append(span)
+            } else {
+                merged.from = min(merged.from, span.from)
+                merged.through = max(merged.through, span.through)
+            }
+        }
+        if !placed { out.append(merged) }
+        spans = out
+    }
+
+    /// The end of the span holding `from`; nil when no span does.
+    func reach(from: Double) -> Double? {
+        spans.first { $0.from <= from && from <= $0.through }?.through
+    }
+
+    /// Nothing at or below `seconds` is held any more.
+    mutating func clip(above seconds: Double) {
+        spans = spans.compactMap { span in
+            guard span.through > seconds else { return nil }
+            return Span(from: max(span.from, seconds.nextUp), through: span.through)
+        }
+    }
+
+    /// Nothing at or above `seconds` is held any more.
+    mutating func clip(below seconds: Double) {
+        spans = spans.compactMap { span in
+            guard span.from < seconds else { return nil }
+            return Span(from: span.from, through: min(span.through, seconds.nextDown))
+        }
     }
 }

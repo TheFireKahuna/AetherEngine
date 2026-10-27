@@ -29,8 +29,8 @@ struct SubtitleHarvestCoverage: Sendable, Equatable {
     }
 
     /// Two runs that meet within this are treated as one. It exists for the seam between a run that
-    /// stopped and the one that took over from it, which never line up to the sample: the pump
-    /// re-opens on a keyframe boundary, the side reader on a subtitle packet. It is deliberately
+    /// stopped and the one that took over from it, which never line up to the sample: a restarted pump
+    /// re-opens on a keyframe boundary, not where the last one stopped. It is deliberately
     /// far smaller than any authored dwell, so a real hole can never hide inside it.
     static let seamSeconds: Double = 0.25
 
@@ -47,17 +47,18 @@ struct SubtitleHarvestCoverage: Sendable, Equatable {
     static let maxSpans: Int = 128
 
     private var closed: [Span] = []
-    private var open: [SubtitlePacketStore.Writer: Span] = [:]
+    /// The pump's current run: from where it last positioned to how far it has read since.
+    private var open: Span?
 
     /// No note has ever been made. Callers read this as "nothing is known", never as "nothing was
     /// read": a path whose readers do not report has to keep behaving exactly as it did before.
-    var isEmpty: Bool { closed.isEmpty && open.isEmpty }
+    var isEmpty: Bool { closed.isEmpty && open == nil }
 
-    /// A run starts here: this reader has positioned at `seconds` and will read forwards from it.
-    mutating func noteAnchor(_ writer: SubtitlePacketStore.Writer, at seconds: Double) {
+    /// A run starts here: the reader has positioned at `seconds` and will read forwards from it.
+    mutating func noteAnchor(at seconds: Double) {
         guard seconds.isFinite else { return }
-        closeRun(writer)
-        open[writer] = Span(from: seconds, through: seconds)
+        closeRun()
+        open = Span(from: seconds, through: seconds)
     }
 
     /// One step of a reader working its way forwards: its loop has read through `seconds`.
@@ -68,21 +69,21 @@ struct SubtitleHarvestCoverage: Sendable, Equatable {
     /// mode this type must not have: extending a run across ground nobody read would put the defect
     /// back silently. Callers whose claim rests on an invariant rather than on observed steps use
     /// `noteReach` instead.
-    mutating func noteProgress(_ writer: SubtitlePacketStore.Writer, through seconds: Double) {
+    mutating func noteProgress(through seconds: Double) {
         guard seconds.isFinite else { return }
-        guard var run = open[writer] else {
+        guard var run = open else {
             // No anchor yet: the position itself is all that is known, and a point covers nothing.
-            open[writer] = Span(from: seconds, through: seconds)
+            open = Span(from: seconds, through: seconds)
             return
         }
         guard seconds > run.through else { return }
         guard seconds - run.through <= Self.maxUnannouncedAdvanceSeconds else {
-            closeRun(writer)
-            open[writer] = Span(from: seconds, through: seconds)
+            closeRun()
+            open = Span(from: seconds, through: seconds)
             return
         }
         run.through = seconds
-        open[writer] = run
+        open = run
     }
 
     /// The caller states that this reader's current run has reached `seconds` from its anchor,
@@ -97,16 +98,24 @@ struct SubtitleHarvestCoverage: Sendable, Equatable {
     ///
     /// This trusts every reposition to be announced with `noteAnchor`. For the pump that is the
     /// producer's open and restart on the native path (`makeProducer` has exactly those two
-    /// callers) and the host reposition on the software path.
-    mutating func noteReach(_ writer: SubtitlePacketStore.Writer, through seconds: Double) {
+    /// callers, and each producer anchors again at its first read) and the host reposition on the
+    /// software path.
+    mutating func noteReach(through seconds: Double) {
         guard seconds.isFinite else { return }
-        guard var run = open[writer] else {
-            open[writer] = Span(from: seconds, through: seconds)
+        guard var run = open else {
+            open = Span(from: seconds, through: seconds)
             return
         }
         guard seconds > run.through else { return }
         run.through = seconds
-        open[writer] = run
+        open = run
+    }
+
+    /// The current run read on to the end of the source: nothing past it is left unread.
+    mutating func noteEnd() {
+        guard var run = open else { return }
+        run.through = .infinity
+        open = run
     }
 
     /// Was every second between `from` and `through` read by some run? An empty or inverted span is
@@ -122,14 +131,28 @@ struct SubtitleHarvestCoverage: Sendable, Equatable {
         return cursor >= through
     }
 
+    /// How far the reading runs on unbroken from `from`: the end of the covered stretch that holds it, nil
+    /// when `from` itself was never read. The walk is `covers(from:through:)`'s, kept going to the end.
+    func reach(from: Double) -> Double? {
+        guard from.isFinite else { return nil }
+        var cursor: Double?
+        for span in sortedSpans() {
+            let at = cursor ?? from
+            guard span.from <= at + Self.seamSeconds else { break }
+            if span.through >= from { cursor = max(at, span.through) }
+        }
+        return cursor
+    }
+
     /// Every span this ledger holds, open runs included, sorted by start. Small by construction
     /// (`maxSpans` plus one run per writer), so the sort is cheaper than keeping a second index.
     func sortedSpans() -> [Span] {
-        (closed + open.values).sorted { $0.from < $1.from }
+        (closed + (open.map { [$0] } ?? [])).sorted { $0.from < $1.from }
     }
 
-    private mutating func closeRun(_ writer: SubtitlePacketStore.Writer) {
-        guard let run = open.removeValue(forKey: writer) else { return }
+    private mutating func closeRun() {
+        guard let run = open else { return }
+        open = nil
         insert(run)
     }
 

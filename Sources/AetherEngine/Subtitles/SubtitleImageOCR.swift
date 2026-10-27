@@ -50,13 +50,13 @@ enum SubtitleImageOCR {
     /// Swift cooperative worker (including Task.detached), so recognition cannot exhaust the
     /// executor. Admission is process-wide and stays occupied until the native call returns,
     /// even if its caller is cancelled.
+    /// `afterCancel` receives a result that arrived after the caller was cancelled and had stopped waiting.
     nonisolated static func recognizeText(
         in image: CGImage, language: String?,
-        recognition: @escaping @Sendable (CGImage, String?) -> String? = recognizeSynchronously
+        recognition: @escaping @Sendable (CGImage, String?) -> String? = recognizeSynchronously,
+        afterCancel: (@Sendable (String?) -> Void)? = nil
     ) async -> String? {
-        await executor.run {
-            recognition(image, language)
-        }
+        await executor.run({ recognition(image, language) }, afterCancel: afterCancel)
     }
 
     /// One synchronous Vision pass, called only by the recognition thread.
@@ -131,8 +131,12 @@ enum SubtitleImageOCR {
             if Task.isCancelled { break }
             switch cue.body {
             case .image(let image):
-                if let text = await recognizeText(in: image.cgImage, language: language,
-                                                  recognition: recognition) {
+                // A batch cancelled while this cue is being read stops waiting for it, and the cue still
+                // lands in the store the batch was filling once its pass finishes.
+                if let text = await recognizeText(in: image.cgImage, language: language, recognition: recognition,
+                                                  afterCancel: { text in
+                                                      if let text { store.appendCues([cue.with(body: .text(text))]) }
+                                                  }) {
                     out.append(cue.with(body: .text(text)))
                 }
             case .text, .richText:
@@ -154,23 +158,61 @@ enum SubtitleImageOCR {
         private var waiting: [Waiter] = []
         var pendingCount: Int { waiting.count }
 
-        func run(_ recognition: @escaping @Sendable () -> String?) async -> String? {
+        func run(_ recognition: @escaping @Sendable () -> String?,
+                 afterCancel: (@Sendable (String?) -> Void)? = nil) async -> String? {
             guard await acquire() else { return nil }
             guard !Task.isCancelled else {
                 release()
                 return nil
             }
-            let result = await withCheckedContinuation { continuation in
-                let worker = Thread {
-                    let result = autoreleasepool(invoking: recognition)
-                    continuation.resume(returning: result)
+            // The slot is the thread's until Vision returns; the caller's wait is not. A Vision pass can block for
+            // as long as the Neural Engine takes to hand its model over (it never returned in one full test run
+            // under load), and a cancelled caller (a closed fill, a test's time limit) must not wait that out.
+            let answer = Answer()
+            return await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    answer.install(continuation)
+                    let worker = Thread {
+                        let value = autoreleasepool(invoking: recognition)
+                        if !answer.resume(value) { afterCancel?(value) }
+                        Task { await self.release() }
+                    }
+                    worker.name = "com.aetherengine.subtitle.ocr"
+                    worker.qualityOfService = .utility
+                    worker.start()
                 }
-                worker.name = "com.aetherengine.subtitle.ocr"
-                worker.qualityOfService = .utility
-                worker.start()
+            } onCancel: {
+                answer.resume(nil)
             }
-            release()
-            return result
+        }
+
+        /// The caller's continuation, resumed once: by the recognition thread, or with nil on cancellation.
+        private final class Answer: @unchecked Sendable {
+            private let lock = NSLock()
+            private var continuation: CheckedContinuation<String?, Never>?
+            private var resolved: String??
+
+            func install(_ continuation: CheckedContinuation<String?, Never>) {
+                let early: String?? = lock.withLock {
+                    if let resolved { return resolved }
+                    self.continuation = continuation
+                    return nil
+                }
+                if let early { continuation.resume(returning: early) }
+            }
+
+            /// Whether `value` is the answer: false when the caller had already been answered (a cancellation).
+            @discardableResult
+            func resume(_ value: String?) -> Bool {
+                let (first, waiting): (Bool, CheckedContinuation<String?, Never>?) = lock.withLock {
+                    guard resolved == nil else { return (false, nil) }
+                    resolved = .some(value)
+                    defer { continuation = nil }
+                    return (true, continuation)
+                }
+                waiting?.resume(returning: value)
+                return first
+            }
         }
 
         private func acquire() async -> Bool {

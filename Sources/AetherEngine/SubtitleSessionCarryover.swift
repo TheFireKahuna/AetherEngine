@@ -36,6 +36,8 @@ struct SubtitleSessionCarryover: Sendable, Equatable {
     /// against the reloaded table, which the seeded externals can grow or reorder; a diverging
     /// host-positional ordinal replays positionally like the #65 recovery.
     var reapplyOrdinalMatchesActiveTrack = false
+    /// The active track was shown as forced subtitles (`selectForcedSubtitleTrack`).
+    var forcedSubtitleSelection = false
 }
 
 /// What the post-reload session must do to return to the pre-reload subtitle selection.
@@ -74,12 +76,13 @@ extension AetherEngine {
         matchesActiveTrack: Bool,
         previousActiveTrack: Int?,
         currentOrdinal: Int?,
-        table: [NativeSubtitleTrackEntry]
+        table: [NativeSubtitleTrackEntry],
+        forced: Bool = false
     ) -> Int? {
         guard let previousOrdinal else { return nil }
         guard currentOrdinal == nil else { return nil }
         if matchesActiveTrack, let track = previousActiveTrack,
-           let recomputed = nativeSubtitleOrdinal(forActiveTrack: track, in: table) {
+           let recomputed = nativeSubtitleOrdinal(forActiveTrack: track, in: table, forced: forced) {
             return recomputed
         }
         return previousOrdinal

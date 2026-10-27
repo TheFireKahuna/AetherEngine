@@ -775,6 +775,32 @@ public struct LoadOptions: Sendable, Equatable {
     /// Declare a mov_text track in the init moov so text subtitles survive PiP / AirPlay / external display via AVMediaSelection. Bitmap codecs (PGS / DVB / DVD) excluded automatically. Default `false` (#55).
     public var prepareNativeSubtitles: Bool = false
 
+    /// Forced subtitles handed to tvOS natively, for a host whose subtitles are AVKit's own (its native
+    /// controls and subtitle menu): the subtitle track (an id `selectSubtitleTrack(index:)` takes) whose
+    /// forced lines are the ones to show. Exactly one rendition is declared forced,
+    /// `FORCED=YES,AUTOSELECT=YES,DEFAULT=NO` (HLS Authoring Specification 5.11): the track's own when the
+    /// track is a forced one, or, for an embedded bitmap track (PGS / DVB / DVD) that only flags its forced
+    /// lines, a second rendition holding just those (the full track still holds them too, 5.8). AVKit
+    /// keeps a forced rendition out of its subtitle menu, and tvOS selects it by itself when it matches
+    /// the audio's language and the viewer's subtitle settings call for forced subtitles; the engine fills
+    /// it from the moment the player asks for it. The host's choice decides WHICH lines (its language and
+    /// track preferences); tvOS decides WHEN they show. Name the track for the audio the session plays.
+    /// Only meaningful with `prepareNativeSubtitles`. A track the container itself flags forced is declared
+    /// forced either way (`declaresForcedSubtitles`).
+    public var forcedSubtitleTrack: Int? = nil
+
+    /// Declare every subtitle track the container flags forced as a forced rendition (`FORCED=YES,
+    /// AUTOSELECT=YES`), so tvOS shows it by itself when the viewer has no subtitles on and the audio's
+    /// language matches, the way the system treats forced subtitles everywhere. `false` declares only
+    /// `forcedSubtitleTrack`'s: for a host whose viewer turned automatic forced subtitles off. Only
+    /// meaningful with `prepareNativeSubtitles`. Default `true`.
+    public var declaresForcedSubtitles: Bool = true
+
+    /// The subtitle delay the session starts with, in seconds: positive shows every line later. The native
+    /// renditions serve it (every cue time is written with it), so AVKit draws it from the first fetch; a
+    /// change during the session goes through `setSubtitleDelay(_:)`. Default `0`.
+    public var subtitleDelaySeconds: Double = 0
+
     /// Start the native WebVTT subtitle readers eagerly at load (instead of lazily on `setNativeSubtitleSelected`), so the `/subs_N_M.vtt` segments are already populated when AVKit fetches them under a host-independent selection (e.g. an `EXT-X-MEDIA ... DEFAULT=YES` rendition that AVKit auto-selects). Equivalent to a fully-populated static VOD subtitle file. Only meaningful with `prepareNativeSubtitles`. Default `false` (Sodalite#32 probe).
     public var eagerNativeSubtitleReaders: Bool = false
 
@@ -1020,12 +1046,14 @@ public struct LoadOptions: Sendable, Equatable {
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
         preferDualLayerDolbyVision: Bool = false,
+        felOverlay: Bool = true,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
         panelPresentsDolbyVision: Bool = false,
-        audioBridgeMode: AudioBridgeMode = .surroundCompat,
+        audioBridgeMode: AudioBridgeMode = .lossless,
         objectAudioRendering: ObjectAudioRendering = .off,
+        objectDialogueGain: Float = 0,
         stereoPresentation: StereoPresentation = .automatic,
         isLive: Bool = false,
         audioOnly: Bool = false,
@@ -1042,6 +1070,9 @@ public struct LoadOptions: Sendable, Equatable {
         nativeRemoteHLSIngestFallback: Bool = true,
         preserveASSMarkup: Bool = false,
         prepareNativeSubtitles: Bool = false,
+        forcedSubtitleTrack: Int? = nil,
+        declaresForcedSubtitles: Bool = true,
+        subtitleDelaySeconds: Double = 0,
         eagerNativeSubtitleReaders: Bool = false,
         serveIFramePlaylist: Bool = false,
         confirmAtmos: Bool = false,
@@ -1100,6 +1131,9 @@ public struct LoadOptions: Sendable, Equatable {
         self.nativeRemoteHLSIngestFallback = nativeRemoteHLSIngestFallback
         self.preserveASSMarkup = preserveASSMarkup
         self.prepareNativeSubtitles = prepareNativeSubtitles
+        self.forcedSubtitleTrack = forcedSubtitleTrack
+        self.declaresForcedSubtitles = declaresForcedSubtitles
+        self.subtitleDelaySeconds = subtitleDelaySeconds
         self.eagerNativeSubtitleReaders = eagerNativeSubtitleReaders
         self.serveIFramePlaylist = serveIFramePlaylist
         self.confirmAtmos = confirmAtmos

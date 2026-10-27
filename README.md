@@ -318,17 +318,14 @@ player.selectSubtitleTrack(index: track.id)
 // with its absolute AVStream index; tracks sharing a URL are decoded in one pass (#266).
 ExternalSubtitleTrack(url: mkvURL, name: "Spanish", language: "es", sourceStreamIndex: 3)
 
-// Native WebVTT subtitle renditions (subtitles in PiP / AirPlay / external display; opt-in
-// via LoadOptions.prepareNativeSubtitles, details in docs/formats.md)
+// Native WebVTT subtitle renditions (opt-in via LoadOptions.prepareNativeSubtitles, details in
+// docs/formats.md): AVFoundation's selection is what shows, whoever made it. AVKit draws text tracks;
+// styled ASS and bitmap tracks are the host overlay's (AVKit suppressed); every track reaches PiP /
+// AirPlay / an external display through its rendition.
 player.$nativeSubtitleTracks                   // [NativeSubtitleTrack]: ordinal, language, displayName
-player.setNativeSubtitleSelected(track: 2)     // engage a rendition (e.g. on PiP entry); nil deselects
-
-// The SYSTEM turned captions on by itself: iOS 26 Settings > Accessibility > Subtitles & Captioning
-// > Automatic Subtitles (show when muted, on skip back, on a language mismatch). Those toggles have
-// no read API, so the selection is the only way to see the ask. The engine deselects the option (a
-// rendition rendered in fullscreen draws a caption box over the host's own subtitles) and forwards
-// the request; a host that wants the behaviour picks its own matching track. Subscribe per session.
-player.systemCaptionRequest                    // PassthroughSubject<SystemCaptionRequest, Never>
+player.$primarySubtitleDrawnByAVKit            // true: AVKit draws the track; false: draw subtitleCues
+player.setNativeSubtitleRendering(true)        // the rendition is the display (PiP / AirPlay / external)
+player.setSubtitleDelay(0.5)                   // a delay changed mid-session (LoadOptions.subtitleDelaySeconds at load)
 
 // Second simultaneous subtitle track (bilingual / language learning)
 player.selectSecondarySubtitleTrack(index: streamID)
@@ -365,25 +362,9 @@ player.$currentAVPlayerItem                       // items swap in place; this i
 player.setNativeVideoFrameTimeObserver { frame in
     frame.source; frame.item; frame.segmentIndex; frame.isKeyframe; frame.epoch
 }
-
-// The same question on the software path (#311), where the engine decodes and enqueues the source
-// timestamp unchanged: one axis, no segments, and the reports arrive past the reorder buffer in
-// ASCENDING presentation order. `generation` moves on every renderer flush, i.e. on a seek, and
-// rises across a load() the same way `epoch` does.
-player.softwarePresentationTimebase               // the master clock, on the source axis
-player.setSoftwareVideoFrameTimeObserver { frame in
-    frame.presentation; frame.generation
-}
-
-// The rectangle those frames land in (#353): coded dimensions under the pixel aspect ratio the
-// decoder attached, read off the format description the renderer enqueues. `sourceVideoWidth` and
-// `sourceVideoHeight` are the CODED size, so anamorphic content laid out against them is off by the
-// pixel aspect (720x576 at 64:45 presents as 1024x576). nil off the software path and before the
-// first frame; it follows a mid-stream format change and is cleared with the session.
-player.softwareDisplaySize                        // CGSize?, @Published
 ```
 
-Subtitle cues land in raw source PTS; render the overlay against `player.sourceTime` (see [docs/formats.md › Subtitles](docs/formats.md#subtitles)). A host compositing its own overlay onto the native path (libass and friends) needs the item axis too, since that is what the compositor pairs its samples against: `presentationAxisMap` converts arbitrary positions, `setNativeVideoFrameTimeObserver` reports the frames themselves. On the software path neither is needed: `softwarePresentationTimebase` hands out the clock the frames are presented against and `setSoftwareVideoFrameTimeObserver` reports them, both on the same axis as the cues, and `softwareDisplaySize` gives the rectangle to lay the overlay out in (the native path measures its own on `AVPlayerLayer.videoRect`). Both return nothing rather than a guess when no axis is established, because a defaulted shift is indistinguishable from a measured one at the call site. The 1 Hz diagnostics snapshot lives on `player.diagnostics.liveTelemetry`, off-the-engine for the same render-stability reason. Frame extraction and authored-ASS styling are documented in [docs/formats.md](docs/formats.md); the full published surface, including the contracts that require the host to act rather than to read, is [docs/api.md](docs/api.md).
+Subtitle cues land in raw source PTS; render the overlay against `player.sourceTime` (see [docs/formats.md › Subtitles](docs/formats.md#subtitles)). A host compositing its own overlay onto the native path (libass and friends) needs the item axis too, since that is what the compositor pairs its samples against: `presentationAxisMap` converts arbitrary positions, `setNativeVideoFrameTimeObserver` reports the frames themselves. The native path measures the picture's rectangle on `AVPlayerLayer.videoRect`. Both return nothing rather than a guess when no axis is established, because a defaulted shift is indistinguishable from a measured one at the call site. The 1 Hz diagnostics snapshot lives on `player.diagnostics.liveTelemetry`, off-the-engine for the same render-stability reason. Frame extraction and authored-ASS styling are documented in [docs/formats.md](docs/formats.md); the full published surface, including the contracts that require the host to act rather than to read, is [docs/api.md](docs/api.md).
 
 Install via Swift Package Manager:
 

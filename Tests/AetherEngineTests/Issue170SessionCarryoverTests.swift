@@ -241,12 +241,13 @@ struct Issue170PendingRenderingLatchTests {
         #expect(engine.pendingNativeRenderingRequest == false)
     }
 
-    @Test("outside a reload the request maps immediately (deselect when nothing is active)")
+    @Test("outside a reload the request applies at once and moves no selection")
     func normalPathUnaffected() throws {
         let engine = try AetherEngine()
         engine.setNativeSubtitleSelected(track: 1)
-        engine.setNativeSubtitleRendering(true)   // no active track -> deselect, documented contract
-        #expect(engine.nativeSubtitleReapplyOrdinal == nil)
+        engine.setNativeSubtitleRendering(true)   // the rendition is the display; the selection stays
+        #expect(engine.nativeSubtitleReapplyOrdinal == 1)
+        #expect(engine.nativeSubtitleRenderingRequested)
         #expect(engine.pendingNativeRenderingRequest == nil)
     }
 }

@@ -71,7 +71,7 @@ struct PumpQoSRelaxationTests {
     @Test("A relaxed pump that is stopped and waited on unwinds at the responsive class",
           .timeLimit(.minutes(1)))
     func relaxedPumpUnwindsResponsive() async throws {
-        let data = try #require(Data(base64Encoded: Issue234SideReaderSeekAnchorTests.fixtureBase64,
+        let data = try #require(Data(base64Encoded: MatroskaKeyframePerSecondFixture.fixtureBase64,
                                      options: .ignoreUnknownCharacters))
         let demuxer = Demuxer()
         try demuxer.open(reader: DataIOReader(data: data), formatHint: "matroska")

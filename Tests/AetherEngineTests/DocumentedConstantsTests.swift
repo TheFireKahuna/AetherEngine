@@ -272,13 +272,13 @@ final class DocumentedConstantsTests: XCTestCase {
     func testSubtitleWindowsAreWhatTheDocsSay() throws {
         let docs = try documentation()
         XCTAssertEqual(AetherEngine.subtitleDrainLeadSeconds, 60, "documented as the 60 s lead window")
-        XCTAssertEqual(AetherEngine.subtitleForwardPrefetchLeadMarginSeconds, 15, "documented as a 15 s margin")
+        XCTAssertEqual(AetherEngine.subtitleReadAheadMarginSeconds, 15, "documented as a 15 s margin")
         XCTAssertEqual(AetherEngine.subtitleOCRLeadSeconds, 240, "documented as the OCR worker's 240 s window")
-        XCTAssertEqual(AetherEngine.subtitleOCRPrefetchLeadSeconds, 270, "documented as raised to 270 s while OCR is armed")
+        XCTAssertEqual(AetherEngine.subtitleOCRReadAheadSeconds, 270, "documented as raised to 270 s while OCR is armed")
 
-        XCTAssertGreaterThan(AetherEngine.subtitleForwardPrefetchLeadMarginSeconds, 0,
+        XCTAssertGreaterThan(AetherEngine.subtitleReadAheadMarginSeconds, 0,
                              "the margin IS the fix for #362: at parity the set at the edge has its clear stored nowhere")
-        XCTAssertGreaterThan(AetherEngine.subtitleOCRPrefetchLeadSeconds, AetherEngine.subtitleOCRLeadSeconds,
+        XCTAssertGreaterThan(AetherEngine.subtitleOCRReadAheadSeconds, AetherEngine.subtitleOCRLeadSeconds,
                              "the prefetch has to clear the OCR window, or the store does not hold what the worker reads")
         assertDocumented("60 s lead window", docs)
         assertDocumented("15 s margin", docs)

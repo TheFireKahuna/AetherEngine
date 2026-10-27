@@ -938,15 +938,24 @@ extension AetherEngine {
         session.requestHeaders = sessionRequestHeaders
         // AE#464: every producer this session builds reads it off the session. Set before start().
         session.audioDelaySeconds = loadedOptions.audioDelaySeconds
-        // #240: the pump claims the source link through this gate while it is fetching, so the
-        // subtitle side readers can stay out of its way. Set before start().
-        session.sideReaderLinkGate = sideReaderLinkGate
         #if DualLayerDolbyVision
         // LoadOptions.felOverlay: the session's own read of the source feeds the overlay's enhancement layer.
         session.felTap = felOverlayWanted ? FelEnhancementTap() : nil
         #endif
         session.overlayDeinterlace = DeinterlaceConfig(fieldRate: loadedOptions.deinterlaceFieldRate, film: loadFilmCarriage,
                                                        softTelecine: loadSoftTelecine)
+        // #240: a scrub thumbnail waits out a seek in flight. Set before start().
+        session.seekInFlight = seekInFlight
+        // How far the subtitle consumers ask the pump to have read on the source axis: the playback clock
+        // plus the furthest lead of a consumer of a stream only the pump reads. Read where the pump parks.
+        let leads = subtitleReadAheadLeads, clock = sourcePlayheadClock
+        session.subtitleReadAheadThrough = {
+            guard let playhead = clock.seconds, let lead = leads.readAhead(playhead: playhead) else { return nil }
+            return playhead + lead
+        }
+        session.onSourceReadToEnd = { [weak self] in
+            Task { @MainActor [weak self] in self?.emitSubtitleResolutionStatements(reason: .eof) }
+        }
         // AE#682: set before start(), where the session decides whether it can serve the rendition.
         // A custom-IO source is not reopenable by URL, so the side reader gets a clone of its own;
         // a reader that cannot clone leaves the rendition absent.
@@ -1266,7 +1275,8 @@ extension AetherEngine {
             NativeSubtitleTrackEntry(sourceStreamIndex: track.isExternal ? nil : track.id,
                                      externalID: track.isExternal ? track.id : nil,
                                      language: track.language,
-                                     isForced: track.isForced)
+                                     isForced: track.isForced,
+                                     isHearingImpaired: track.isHearingImpaired)
         }
         // Rendition metadata built ONCE (unique NAMEs + FORCED); the published track list and the
         // master's EXT-X-MEDIA tags must agree, and duplicate names collapse AVFoundation's
@@ -1275,7 +1285,18 @@ extension AetherEngine {
         // text and CC entries so existing ordinals stay byte-stable. Unique NAMEs are computed
         // over text+bitmap together: a same-language pair must get the numbered suffix, or
         // AVFoundation collapses the legible options.
-        let bitmapEntries = Self.bitmapOCRSubtitleEntries(from: subtitleTracks, isLive: loadedOptions.isLive)
+        var bitmapEntries = Self.bitmapOCRSubtitleEntries(from: subtitleTracks, isLive: loadedOptions.isLive)
+        // LoadOptions.forcedSubtitleTrack: one rendition declared forced. A forced-only one comes after every
+        // bitmap one, so the full tracks' ordinals are the same with the option as without it.
+        if let source = loadedOptions.forcedSubtitleTrack {
+            let declaration = Self.declareForcedSubtitleSource(
+                source, text: &nativeSubtitleTrackTable, bitmap: &bitmapEntries)
+            EngineLog.emit("[AetherEngine] forced subtitles from track \(source): \(declaration)", category: .engine)
+        }
+        if loadedOptions.declaresForcedSubtitles {
+            Self.declareTrackForcedness(&nativeSubtitleTrackTable)
+            Self.declareTrackForcedness(&bitmapEntries)
+        }
         let combinedInfos = Self.nativeSubtitleRenditionInfos(for: nativeSubtitleTrackTable + bitmapEntries)
         let renditionInfos = Array(combinedInfos.prefix(nativeSubtitleTrackTable.count))
         let bitmapInfos = Array(combinedInfos.suffix(bitmapEntries.count))
@@ -1297,7 +1318,7 @@ extension AetherEngine {
         // packet-store drainer, not by tap-event forwarding.
         session.preserveASSMarkupForSubtitleTap = loadedOptions.preserveASSMarkup
         session.teletextPageForSubtitleTap = loadedOptions.teletextPage
-        EngineLog.emit("[AetherEngine] native subtitles: prepare=\(loadedOptions.prepareNativeSubtitles) eager=\(loadedOptions.eagerNativeSubtitleReaders) textTracks=\(nativeSubtitleTrackTable.count) bitmapOCR=\(bitmapEntries.count) enable=\(session.enableNativeSubtitleTrackForSession)", category: .engine)
+        EngineLog.emit("[AetherEngine] native subtitles: prepare=\(loadedOptions.prepareNativeSubtitles) textTracks=\(nativeSubtitleTrackTable.count) bitmapOCR=\(bitmapEntries.count) enable=\(session.enableNativeSubtitleTrackForSession)", category: .engine)
 
         // #77: arm the in-band CC tap before start() so the first producer keeps the CC stream.
         setupClosedCaptionTapIfNeeded(session: session)
@@ -1357,16 +1378,15 @@ extension AetherEngine {
                 nativeSubtitleTracks.append(NativeSubtitleTrack(
                     ordinal: ordinal, language: entry.language, displayName: bitmapInfos[i].name))
             }
-            // Sodalite#32: with eager readers the whole cue set is available up front, so serve the rendition as
-            // one whole-program .vtt (the AVPlayer-reliable shape). VOD only (a live program has no fixed end).
-            // Sodalite#32: whole-program renders reliably but is anchored to the stream start, so it breaks on
-            // scrub (the loopback producer-restarts + re-anchors the video on seek, but AVKit keeps the cached
-            // VOD .vtt). Use the WINDOWED shape (per-segment, 1:1 with the video segments) which AVKit re-fetches
-            // at each position and is seek-robust; combined now with a COMPLETE store (read-to-EOF) so no window
-            // is served empty (the earlier windowed sparse-fetch was tested with an incomplete parking reader).
-            session.nativeSubtitleWholeProgram = false
-            session.subtitleStreamStartSeconds = startPosition ?? 0
-            EngineLog.emit("[AetherEngine] native subtitle default ordinal=\(defaultOrdinal) wholeProgram=\(session.nativeSubtitleWholeProgram) prefLangs=\(loadedOptions.nativeSubtitlePreferredLanguages) trackLangs=\(nativeSubtitleTrackTable.map { $0.language ?? "?" })", category: .engine)
+            // AVKit fetching a rendition's playlist is AVKit selecting it, whoever asked it to (the viewer, the
+            // host, or tvOS by itself for a forced or SDH rendition), so that is when its reading starts.
+            let stores = session.nativeSubtitleCueStoresForSession
+            for ordinal in nativeSubtitleTrackTable.indices where ordinal < stores.count {
+                stores[ordinal].onRenditionRequested { [weak self] in
+                    Task { @MainActor in self?.nativeRenditionRequested(ordinal: ordinal) }
+                }
+            }
+            EngineLog.emit("[AetherEngine] native subtitle default ordinal=\(defaultOrdinal) prefLangs=\(loadedOptions.nativeSubtitlePreferredLanguages) trackLangs=\(nativeSubtitleTrackTable.map { $0.language ?? "?" })", category: .engine)
         }
 
         // #93 residual: hand the resume position to the session so the FIRST producer anchors at
@@ -1451,31 +1471,26 @@ extension AetherEngine {
             let stores = session.nativeSubtitleCueStoresForSession
             if !stores.isEmpty {
                 let shift = session.playlistShiftSeconds
-                stores.forEach { $0.setShiftSeconds(shift) }
-                nativeSubtitleReaderParams = (url: url, stores: stores)
-                // #88: load-declared external tracks fill their stores with one whole-file decode
-                // each (no side demuxer); embedded tracks keep the pump-tap / reader paths below.
-                startExternalNativeStoreFill(session: session)
-                // Sodalite#32: the producer's pump tap fills these stores for the whole produced region at
-                // zero side-channel bandwidth, so the eager at-load readers (which competed with playback
-                // for the remote link at startup) are only a fallback for sessions whose tap could not arm
-                // (no demuxable stream indices, e.g. all-sidecar). The lazy reader on PiP selection stays:
-                // it covers AVKit's ~240s forward .vtt prefetch burst beyond the produced region.
-                let tapArmed = session.nativeSubtitleSourceStreamIndicesForSession.contains { $0 != nil }
-                if loadedOptions.eagerNativeSubtitleReaders && !tapArmed {
-                    // Anchor at the SESSION START POSITION (resume), not 0, and read straight to EOF (no
-                    // read-ahead parking). A from-0 read behind a resume position spent the whole session
-                    // catching up over a remote link and never covered the playhead (device: readMax 48s vs
-                    // playhead 304s, every .vtt served empty).
-                    let readEOF = !loadedOptions.isLive
-                    startNativeSubtitleReaders(url: url, stores: stores,
-                                               readToEOF: readEOF, startAtSeconds: startPosition ?? 0)
-                    EngineLog.emit("[AetherEngine] native subtitle eager readers started: stores=\(stores.count) readToEOF=\(readEOF) startAt=\(String(format: "%.1f", startPosition ?? 0))", category: .engine)
-                } else if tapArmed {
-                    EngineLog.emit("[AetherEngine] pump tap active; eager readers skipped (lazy reader covers the select burst)", category: .engine)
+                // The delay the renditions serve: the load's, or across a session-preserving reload the one
+                // the viewer has now, which is what such a reload exists to serve.
+                let delay = sessionPreservingReloadInFlight ? currentSubtitleDelaySeconds
+                    : loadedOptions.subtitleDelaySeconds
+                stores.forEach {
+                    $0.setShiftSeconds(shift)
+                    $0.setServedDelaySeconds(delay)
                 }
+                servedSubtitleDelaySeconds = delay
+                currentSubtitleDelaySeconds = delay
+                // #88: load-declared external tracks fill their stores with one whole-file decode
+                // each (no side demuxer); embedded tracks are the pump tap's and the subtitle source's.
+                startExternalNativeStoreFill(session: session)
             }
         }
+        // The session's one subtitle reader. Built after the stores exist, so the text renditions the
+        // container indexes in full are filled whole now, before AVKit asks for them, as are the forced bitmap
+        // renditions of indexed streams.
+        startSubtitleSource()
+        fillIndexedForcedRenditions()
 
         // Reuse the existing host across native->native reloads (issue #15): a fresh AVPlayer breaks AVKit's MediaRemote re-registration ("Code=14 client callback"), blanking the Control Center widget. stopInternal kept the host alive (keepNativeHost).
         let host: NativeAVPlayerHost
@@ -1502,6 +1517,9 @@ extension AetherEngine {
             self.nativeVideoSession?.armLiveItemAxisStatement()
             self.liveItemAxisArmedGeneration = attaching.itemGeneration
         }
+        host.onDidAttachItem = { [weak self] item in
+            self?.armNativeItemObservers(on: item)
+        }
         applyDesiredVolume(to: host)
         applyDesiredRate(to: host)
         // Publish before wiring mirrors so subscribers see the AVPlayer before the first time update. Only emit on change: re-publishing the same instance retriggers the AVKit re-registration this reuse path avoids.
@@ -1519,13 +1537,8 @@ extension AetherEngine {
         host.$renderedTime
             .sink { [weak self] value in
                 guard let self = self else { return }
-                let shift = self.presentationAxis.shiftSeconds(atItemSeconds: value)
-                    ?? self.playlistShiftSeconds
-                // #93 PiP skips: AVKit-side seeks never reach the engine seek API; a far rendered-
-                // time jump is the engine-visible signal to re-anchor the subtitle readers.
-                if Self.isSubtitleReanchorJump(from: self.renderedPositionMirror.get(), to: value) {
-                    self.scheduleNativeSubtitleReanchor()
-                }
+                let shift = self.nativeItemShiftSeconds(atItemSeconds: value)
+                self.sourcePlayheadClock.noteShift(self.nativeSourceSeconds(atItemSeconds: value) - value)
                 // #93 retest: retire the pending recovery seek target when it lands (rendered
                 // reaches its neighbourhood) or goes stale (organic progress far from it, i.e.
                 // AVPlayer abandoned the seek and playback runs elsewhere).
@@ -1579,7 +1592,7 @@ extension AetherEngine {
                 // would break both the documented `sourceTime == currentTime in steady play` relation
                 // and host-rendered sidecar cues (whose times are relative to the archive start, i.e.
                 // the item axis). Every other source keeps true source PTS for cue alignment.
-                self.clock.sourceTime = self.displayAxisIsItemAxis ? value : value + shift
+                self.clock.sourceTime = self.nativeSourceSeconds(atItemSeconds: value)
                 // bufferedPosition = the end of the contiguous safe range (origin -> disk), expressed on
                 // the display axis as the playhead plus contiguously available seconds ahead of it: the
                 // segments AVPlayer already fetched, plus the disk SegmentCache band above them, which is
@@ -1990,7 +2003,6 @@ extension AetherEngine {
                       audioIsAtmosStreamCopy: nativeVideoSession?.audioIsAtmosStreamCopy == true,
                       nativeVideoFrameDiagnostics: loadedOptions.nativeVideoFrameDiagnostics,
                       nativeVideoFrameRecovery: loadedOptions.nativeVideoFrameRecovery))
-        forceNativeLegibleDeselectedUntilHostSelects()
         // Sodalite#175: from the session's own pick, since a track-switch reload has no active index yet.
         let sessionAudioPick = nativeVideoSession.map(\.activeAudioSourceStreamIndex).flatMap { $0 >= 0 ? Int($0) : nil }
         let audioPick = sessionAudioPick ?? audioSourceStreamIndex.flatMap { Int(exactly: $0) } ?? activeAudioTrackIndex
@@ -2428,7 +2440,7 @@ extension AetherEngine {
         loadedURL = url
         lastDetectedVideoCodec = preservedVideoCodec
 
-        // Custom sources: no URL to reopen; rebuild on the retained reader. Demuxer opens at byte 0; loadSoftware/loadNative seek to startPosition.
+        // Custom sources: no URL to reopen; rebuild on the retained reader. Demuxer opens at byte 0; loadNative seeks to startPosition.
         // Preserve the caller's probe budget (#68) across the reopen so an audio/title switch doesn't re-incur the full find_stream_info cost the caller paid to avoid.
         let reloadProfile = DemuxerOpenProfile.playback.withProbeBudget(
             probesize: loadedOptions.probesize, maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration)
@@ -2593,7 +2605,7 @@ extension AetherEngine {
                 try await loadNative(
                     url: url,
                     sourceHTTPHeaders: loadedOptions.httpHeaders,
-                    // Live rejoins at the live edge (see loadSoftware above).
+                    // Live rejoins at the live edge .
                     startPosition: LiveReloadPolicy.resumePosition(
                         isLive: loadedOptions.isLive, currentTime: resumeAt),
                     audioSourceStreamIndex: audioStreamIndex,

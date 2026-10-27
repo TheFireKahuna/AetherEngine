@@ -71,15 +71,16 @@ struct StoppedPumpInFlightReadTests {
         var reason: HLSSegmentProducer.PumpExitReason? { lock.withLock { _reason } }
     }
 
-    /// Start of the SimpleBlock element carrying the 7.2 s frame of the Issue234 fixture (15 s of
-    /// H.264 at 5 fps in Matroska): past everything the open's stream probe reads, and on an element
+    /// Start of the SimpleBlock element carrying the 7.2 s frame of `MatroskaSubRipFixture` (15 s of
+    /// H.264 at 5 fps in Matroska, with a SubRip track): past everything the open's stream probe reads, and on an element
     /// boundary, so the parked read comes back as a clean end of file rather than a torn element.
     private static let parkOffset = 2237
+
 
     @Test("a read that returns end of file after stop() exits as a stop and adopts nothing",
           .timeLimit(.minutes(1)))
     func eofAfterStopAdoptsNothing() async throws {
-        let data = try #require(Data(base64Encoded: Issue234SideReaderSeekAnchorTests.fixtureBase64,
+        let data = try #require(Data(base64Encoded: MatroskaSubRipFixture.base64,
                                      options: .ignoreUnknownCharacters))
         let reader = ParkingReader(data)
         let demuxer = Demuxer()

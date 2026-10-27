@@ -1,9 +1,9 @@
-import AVFoundation
 import Foundation
 
-// Phase D: native-selection-armed worker feeding a bitmap track's native WebVTT rendition with
+// Phase D: selection-armed worker feeding a bitmap track's native WebVTT rendition with
 // OCR-recognized text cues, so PGS/DVB/DVD subtitles survive PiP / AirPlay / external display
-// on the native path. Packet source is the session SubtitlePacketStore (#112 harvest); the tick
+// on the native path. Packet source is the session SubtitlePacketStore: an indexed stream's window is
+// pulled by the tick itself, a pumped one's kept ahead by the worker's demand on the pump; the tick
 // plans and resolves on the MainActor, decodes off it (AE#628), and Vision runs on a dedicated thread.
 extension AetherEngine {
 
@@ -12,9 +12,19 @@ extension AetherEngine {
         cancelSubtitleOCRWorker()
         guard let store = nativeStore(atOrdinal: ordinal) else { return }
         subtitleOCRArmedOrdinal = ordinal
+        // A pumped stream has to be in the packet store before the worker gets there: the pump reads a
+        // margin past the window, as far as the player asks the rendition. An indexed one is pulled by each
+        // tick.
+        subtitleSource?.demand(.ocr, streams: [streamIndex], lead: { playhead in
+            Self.subtitleReadAhead(base: Self.subtitleOCRReadAheadSeconds, playhead: playhead,
+                                   requested: store.furthestRequestedSourceSeconds())
+        })
         let language = ordinal < nativeSubtitleTrackTable.count
             ? nativeSubtitleTrackTable[ordinal].language : nil
-        EngineLog.emit("[SubtitleOCR] worker armed: ordinal=\(ordinal) stream=\(streamIndex)", category: .engine)
+        // A forced-only rendition (`LoadOptions.forcedSubtitleTrack`) keeps just the compositions the
+        // track flags as forced, dropped before recognition so the rest costs no OCR.
+        let forcedOnly = ordinal < nativeSubtitleTrackTable.count && nativeSubtitleTrackTable[ordinal].forcedCuesOnly
+        EngineLog.emit("[SubtitleOCR] worker armed: ordinal=\(ordinal) stream=\(streamIndex) forcedOnly=\(forcedOnly)", category: .engine)
         subtitleOCRWorkerTask = BlockingWork.detached(priority: .utility) { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -25,11 +35,12 @@ extension AetherEngine {
                     return self.subtitleOCRPlanTick(ordinal: ordinal, streamIndex: streamIndex)
                 }
                 let decoded = planned?.decodeHandoff.decode().first ?? []
-                let batch = await MainActor.run { [weak self] in
-                    guard !Task.isCancelled, let self, let planned else { return [SubtitleCue]() }
-                    let batch = self.subtitleOCRFinishTick(planned, events: decoded)
+                let (batch, read) = await MainActor.run { [weak self] () -> ([SubtitleCue], (from: Double, through: Double)?) in
+                    guard !Task.isCancelled, let self, let planned else { return ([], nil) }
+                    var batch = self.subtitleOCRFinishTick(planned, events: decoded)
+                    if forcedOnly { batch = batch.filter(\.isForced) }
                     self.subtitleOCRBatchInFlight = !batch.isEmpty
-                    return batch
+                    return (batch, self.subtitleOCRReadSpan(planned))
                 }
                 if !batch.isEmpty {
                     await SubtitleImageOCR.appendRecognized(cues: batch, language: language, to: store)
@@ -37,9 +48,45 @@ extension AetherEngine {
                         if !Task.isCancelled { self.subtitleOCRBatchInFlight = false }
                     }
                 }
+                // Only once its lines are in the store: the reading is what the pre-fill and the segment
+                // server take as proof that a stretch with no line in it truly has none.
+                if let read, !Task.isCancelled { store.noteRead(from: read.from, through: read.through) }
                 try? await Task.sleep(nanoseconds: AetherEngine.subtitleDrainTickNanoseconds)
             }
         }
+    }
+
+    /// Whether AVKit draws the rendition: only while the host says the picture is off its own view hierarchy (PiP,
+    /// AirPlay, an external display), and never while a Picture in Picture window shows the software overlay, whose
+    /// pictures carry their own subtitles.
+    var nativeRenditionIsDisplayed: Bool {
+        nativeSubtitleRenderingRequested && !(pictureInPictureActive && softwareOverlay != nil)
+    }
+
+    /// The selected bitmap track's OCR rendition only matters while AVKit draws it, so the worker follows where the
+    /// picture is instead of the selection alone. Armed, it raises the subtitle source's demand to
+    /// `subtitleOCRReadAheadSeconds`, and on Matroska that read pulls every cluster: measured upstream on a 4K remux,
+    /// 434 MB of prefetch in 90 s against 17 MB without it, which a viewer who never left fullscreen paid for nothing.
+    /// A worker a forced rendition armed (`fillForcedRendition`) is the player's request and is left to it.
+    func syncSubtitleOCRWithNativeRendition() {
+        let selected: Int? = activeEmbeddedSubtitleStreamIndex >= 0
+            ? Self.nativeSubtitleOrdinal(forActiveTrack: Int(activeEmbeddedSubtitleStreamIndex),
+                                         in: nativeSubtitleTrackTable, forced: forcedSubtitleSelection)
+            : nil
+        let ocrOrdinal = selected.flatMap { $0 < nativeSubtitleTrackTable.count && nativeSubtitleTrackTable[$0].needsOCR ? $0 : nil }
+        if let ocrOrdinal, nativeRenditionIsDisplayed {
+            guard subtitleOCRArmedOrdinal != ocrOrdinal else { return }
+            startSubtitleOCRWorker(ordinal: ocrOrdinal, streamIndex: activeEmbeddedSubtitleStreamIndex)
+        } else if let ocrOrdinal, subtitleOCRArmedOrdinal == ocrOrdinal {
+            cancelSubtitleOCRWorker()
+            resumeForcedRenditionFill()
+        }
+    }
+
+    /// `base`, or further when the player has asked the armed rendition for windows beyond it.
+    func subtitleOCRDemandLead(base: Double, playhead: Double) -> Double {
+        let requested = subtitleOCRArmedOrdinal.flatMap { nativeStore(atOrdinal: $0)?.furthestRequestedSourceSeconds() }
+        return Self.subtitleReadAhead(base: base, playhead: playhead, requested: requested)
     }
 
     /// Completed coverage survives a re-arm; an abandoned batch must be collected again.
@@ -47,9 +94,11 @@ extension AetherEngine {
         if subtitleOCRBatchInFlight, let ordinal = subtitleOCRArmedOrdinal {
             subtitleOCRCursors.removeValue(forKey: ordinal)
             subtitleOCRPendingStates.removeValue(forKey: ordinal)
+            subtitleOCRReadStarts.removeValue(forKey: ordinal)
         }
         subtitleOCRBatchInFlight = false
         subtitleOCRArmedOrdinal = nil
+        subtitleSource?.withdraw(.ocr)
         subtitleOCRWorkerTask?.cancel()
         subtitleOCRWorkerTask = nil
         subtitleOCRSidecarFillTask?.cancel()
@@ -58,101 +107,12 @@ extension AetherEngine {
         subtitleOCRLastTickUptime = nil   // #271
     }
 
-    /// The OCR rendition only matters while the host shows it (PiP / AirPlay / external display), so
-    /// the worker follows the native selection instead of the overlay selection. Armed, it also
-    /// raises the forward prefetch to `subtitleOCRPrefetchLeadSeconds`, and on Matroska that reader
-    /// pulls every cluster: measured on a 4K remux, ten times the bytes of the overlay-only lead,
-    /// which a viewer who never leaves fullscreen paid for nothing (DerPicknicker, A10X).
-    func syncSubtitleOCRWithNativeSelection(ordinal: Int?) {
-        let wanted = ordinal.flatMap { o -> (ordinal: Int, stream: Int32)? in
-            guard o < nativeSubtitleTrackTable.count, nativeSubtitleTrackTable[o].needsOCR,
-                  let source = nativeSubtitleTrackTable[o].sourceStreamIndex,
-                  Int32(source) == activeEmbeddedSubtitleStreamIndex else { return nil }
-            return (o, Int32(source))
-        }
-        if let wanted {
-            guard subtitleOCRArmedOrdinal != wanted.ordinal else { return }
-            startSubtitleOCRWorker(ordinal: wanted.ordinal, streamIndex: wanted.stream)
-        } else {
-            guard subtitleOCRArmedOrdinal != nil else { return }
-            cancelSubtitleOCRWorker()
-        }
-        // Rebuilds the running session only when the lead actually changed.
-        startSubtitleForwardPrefetcher()
-    }
-
-    /// Whether the worker has recognized every stored composition through the window AVKit takes in
-    /// one burst at selection. A worker armed on demand starts that window empty, and AVKit caches
-    /// what it is handed, so the native select waits for this instead of the cue-end heuristic.
-    func subtitleOCRCoversNativeWindow(ordinal: Int) -> Bool {
-        guard subtitleOCRArmedOrdinal == ordinal, !subtitleOCRBatchInFlight,
-              ordinal < nativeSubtitleTrackTable.count,
-              let source = nativeSubtitleTrackTable[ordinal].sourceStreamIndex,
-              let packets = activeSubtitlePacketStore,
-              let cursor = subtitleOCRCursors[ordinal] else { return false }
-        let from = sourceTime
-        var through = from + Self.subtitleOCRLeadSeconds
-        if duration > 0 { through = min(through, duration) }
-        return Self.subtitleOCRWindowCovered(
-            harvestRead: packets.hasReadSpan(from: from, through: through),
-            undecodedPackets: packets.entries(streamIndex: Int32(source),
-                                              from: cursor.lastDecodedPts.nextUp,
-                                              through: through).count)
-    }
-
-    /// What `subtitleOCRCoversNativeWindow` saw, for the line that reports a gate that never opened.
-    func subtitleOCRCoverageState(ordinal: Int) -> String {
-        let from = sourceTime
-        var through = from + Self.subtitleOCRLeadSeconds
-        if duration > 0 { through = min(through, duration) }
-        let cursor = subtitleOCRCursors[ordinal].map { String(format: "%.2f", $0.lastDecodedPts) } ?? "nil"
-        var read = "?", undecoded = "?"
-        if ordinal < nativeSubtitleTrackTable.count,
-           let source = nativeSubtitleTrackTable[ordinal].sourceStreamIndex,
-           let packets = activeSubtitlePacketStore {
-            read = "\(packets.hasReadSpan(from: from, through: through))"
-            if let c = subtitleOCRCursors[ordinal] {
-                undecoded = "\(packets.entries(streamIndex: Int32(source), from: c.lastDecodedPts.nextUp, through: through).count)"
-            }
-        }
-        return "armed=\(subtitleOCRArmedOrdinal.map(String.init) ?? "nil") inFlight=\(subtitleOCRBatchInFlight) "
-            + "window=\(String(format: "%.1f", from))-\(String(format: "%.1f", through)) read=\(read) "
-            + "cursor=\(cursor) undecoded=\(undecoded)"
-    }
-
-    nonisolated static func subtitleOCRWindowCovered(harvestRead: Bool, undecodedPackets: Int) -> Bool {
-        harvestRead && undecodedPackets == 0
-    }
-
-    /// Polls `subtitleOCRCoversNativeWindow` until it holds, the store finished, or the request moved
-    /// on (track change, deselect, new item). No deadline: refusing an empty rendition leaves nothing
-    /// that retries it, and selecting a partial one makes AVKit cache the rest empty, while a slow
-    /// first recognition is real (Vision took over 60 s for one 4K composition in 2 of 7 Mac runs).
-    /// Returns the reason, for the pre-fill line.
-    func awaitSubtitleOCRCoverage(ordinal: Int, store: NativeSubtitleCueStore,
-                                  item: AVPlayerItem) async -> String {
-        let reportAt = Date().addingTimeInterval(Self.subtitleOCRPrefillReportSeconds)
-        var reported = false
-        while true {
-            if store.isFinished { return "finished" }
-            if subtitleOCRCoversNativeWindow(ordinal: ordinal) { return "covered" }
-            guard nativeSubtitleReapplyOrdinal == ordinal, currentAVPlayer?.currentItem === item
-            else { return "superseded" }
-            if !reported, Date() >= reportAt {
-                reported = true
-                EngineLog.emit("[AetherEngine] native subtitle OCR pre-fill still waiting after "
-                               + "\(Int(Self.subtitleOCRPrefillReportSeconds))s: "
-                               + subtitleOCRCoverageState(ordinal: ordinal), category: .engine)
-            }
-            try? await Task.sleep(nanoseconds: 250_000_000)
-        }
-    }
-
     /// Load/stop teardown: forget covered-region state too (new session, new axis).
     func resetSubtitleOCRState() {
         cancelSubtitleOCRWorker()
         subtitleOCRCursors.removeAll()
         subtitleOCRPendingStates.removeAll()
+        subtitleOCRReadStarts.removeAll()
     }
 
     /// MainActor half before the decode: plan the window (drainer pacing, larger lead) and pick the
@@ -160,23 +120,24 @@ extension AetherEngine {
     /// `subtitleOCRFinishTick` resolves composition ends into CLOSED cues for off-main OCR.
     fileprivate func subtitleOCRPlanTick(ordinal: Int, streamIndex: Int32) -> SubtitleOCRTickPlan? {
         guard let packetStore = activeSubtitlePacketStore else { return nil }
-        let playhead = sourceTime
+        let playhead = subtitleDrainPlayhead()
+        let landingGeneration = subtitleLandingGeneration
         // #271: same rule as the overlay drainer, a tick that ran long is not a seek.
         let tickUptime = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
         let elapsed = subtitleOCRLastTickUptime.map { tickUptime - $0 } ?? 0
         subtitleOCRLastTickUptime = tickUptime
         let plan = SubtitleOverlayDrainer.drainPlan(
             cursor: subtitleOCRCursors[ordinal], playhead: playhead,
-            lead: Self.subtitleOCRLeadSeconds,
+            lead: subtitleOCRDemandLead(base: Self.subtitleOCRLeadSeconds, playhead: playhead),
             backscan: Self.subtitleDrainBackscanSeconds,
-            jumpThreshold: Self.subtitleDrainJumpThresholdSeconds,
-            elapsedSinceLastPlan: elapsed)
+            repositioning: subtitleRepositioning(elapsedSinceLastPlan: elapsed))
         let window: (from: Double, through: Double)
         switch plan {
         case .idle:
             subtitleOCRCursors[ordinal]?.lastPlayhead = playhead
-            return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, plan: plan,
-                                       window: (playhead, playhead), decoder: nil, batch: [])
+            return SubtitleOCRTickPlan(ordinal: ordinal, streamIndex: streamIndex, pulled: false,
+                                       playhead: playhead, landingGeneration: landingGeneration,
+                                       plan: plan, window: (playhead, playhead), decoder: nil, batch: [])
         case .decode(let from, let through):
             window = (from, through)
         case .resetAndDecode(let from, let through):
@@ -187,11 +148,20 @@ extension AetherEngine {
             subtitleOCRDecoder = makeSubtitleDrainDecoder(streamIndex: streamIndex)
         }
         guard let decoder = subtitleOCRDecoder else {
-            return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, plan: .idle,
-                                       window: window, decoder: nil, batch: [])
+            return SubtitleOCRTickPlan(ordinal: ordinal, streamIndex: streamIndex, pulled: false,
+                                       playhead: playhead, landingGeneration: landingGeneration,
+                                       plan: .idle, window: window, decoder: nil, batch: [])
         }
-        let entries = packetStore.entries(streamIndex: streamIndex,
-                                          from: window.from, through: window.through)
+        // Layer 3 step 3: an indexed stream is pulled, and decodes what the pulls have brought.
+        let pulls = subtitleStreamIsPulled(streamIndex)
+        var decodableThrough = window.through
+        if pulls {
+            subtitleSource?.pull(streamIndex, from: window.from, through: window.through, focus: playhead)
+            decodableThrough = min(window.through,
+                                   packetStore.pulledReach(streamIndex: streamIndex, from: window.from) ?? -.infinity)
+        }
+        let entries = decodableThrough >= window.from
+            ? packetStore.entries(streamIndex: streamIndex, from: window.from, through: decodableThrough) : []
         // #271: the cap has to fall on a PTS boundary. The cursor is a bare PTS advanced by
         // `lastDecodedPts.nextUp`, so a cut inside a same-PTS run skips its remainder instead of
         // resuming it next tick. One composition per PTS is the norm on a bitmap track, but a
@@ -200,8 +170,36 @@ extension AetherEngine {
         let batchEnd = SubtitleOverlayDrainer.batchEnd(
             count: entries.count, cap: Self.subtitleOCRMaxPacketsPerTick,
             ptsAt: { entries[$0].ptsSeconds })
-        return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, plan: plan, window: window,
-                                   decoder: decoder, batch: entries[..<batchEnd])
+        return SubtitleOCRTickPlan(ordinal: ordinal, streamIndex: streamIndex, pulled: pulls,
+                                   playhead: playhead, landingGeneration: landingGeneration,
+                                   plan: plan, window: window, decoder: decoder, batch: entries[..<batchEnd],
+                                   windowComplete: batchEnd == entries.count)
+    }
+
+    /// The stretch a finished tick has read for its rendition: from where this run of the worker began
+    /// through the end of what it decoded, cut back to where the reading stops, the pulls' or the harvest's (a packet
+    /// not yet harvested is a line not yet seen) and to the earliest composition still open (its line
+    /// reaches the store only when its end is known). Nil for a tick that read nothing or was dropped.
+    fileprivate func subtitleOCRReadSpan(_ tick: SubtitleOCRTickPlan) -> (from: Double, through: Double)? {
+        let ordinal = tick.ordinal
+        guard let decoder = tick.decoder, subtitleOCRArmedOrdinal == ordinal, subtitleOCRDecoder === decoder,
+              let packetStore = activeSubtitlePacketStore else { return nil }
+        let isReset: Bool
+        switch tick.plan {
+        case .idle: return nil
+        case .decode: isReset = false
+        case .resetAndDecode: isReset = true
+        }
+        if isReset || subtitleOCRReadStarts[ordinal] == nil { subtitleOCRReadStarts[ordinal] = tick.window.from }
+        // What was read: for a pulled stream the pulls themselves, for a pumped one the harvest's reading.
+        let reach = tick.pulled
+            ? packetStore.pulledReach(streamIndex: tick.streamIndex, from: tick.window.from)
+            : packetStore.harvestReach(from: tick.window.from)
+        guard let start = subtitleOCRReadStarts[ordinal], let reach else { return nil }
+        var through = min(tick.window.through, reach)
+        if !tick.windowComplete, let last = tick.batch.last?.ptsSeconds { through = min(through, last) }
+        if let open = subtitleOCRPendingStates[ordinal]?.earliestPendingStart { through = min(through, open) }
+        return through > start ? (start, through) : nil
     }
 
     /// MainActor half after the decode: resolve composition ends and return the CLOSED cues. A
@@ -231,7 +229,8 @@ extension AetherEngine {
             lastDecoded = tick.window.from
         }
         subtitleOCRCursors[ordinal] = SubtitleDrainCursor(
-            lastDecodedPts: lastDecoded ?? tick.window.from, lastPlayhead: tick.playhead)
+            lastDecodedPts: lastDecoded ?? tick.window.from, lastPlayhead: tick.playhead,
+            landingGeneration: tick.landingGeneration)
         return closed
     }
 
@@ -258,11 +257,18 @@ extension AetherEngine {
 /// decodes nothing (idle, or no decoder could be built), which still expires pending cues.
 fileprivate struct SubtitleOCRTickPlan: @unchecked Sendable {
     let ordinal: Int
+    let streamIndex: Int32
+    /// The stream is pulled from the index (layer 3 step 3).
+    let pulled: Bool
     let playhead: Double
+    /// The landing count the tick planned against (`SubtitleRepositioning.signalled`).
+    let landingGeneration: UInt64
     let plan: SubtitleDrainPlan
     let window: (from: Double, through: Double)
     let decoder: EmbeddedSubtitleDecoder?
     let batch: ArraySlice<StoredSubtitlePacket>
+    /// The batch is every stored packet in the window (the per-tick cap did not cut it).
+    var windowComplete = false
 
     var decodeHandoff: SubtitleDrainDecodeHandoff {
         SubtitleDrainDecodeHandoff(jobs: decoder.map { [($0, batch)] } ?? [])

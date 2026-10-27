@@ -125,7 +125,6 @@ struct ForwardOnlyHeadIsKeptTests {
         #expect(!demuxer.seek(to: 0), "a forward-only source was asked to rewind")
         #expect(!demuxer.seek(to: 0, streamIndex: demuxer.videoStreamIndex))
         #expect(!demuxer.seekBounded(to: 0, timeout: 1))
-        #expect(!demuxer.seekByteEstimate(to: 1, knownDuration: 8, timeout: 1))
 
         #expect(try readSome(demuxer, 12) == expected, "a refused seek flushed the packets behind it")
     }

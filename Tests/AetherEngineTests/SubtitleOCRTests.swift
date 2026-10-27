@@ -159,7 +159,7 @@ struct SubtitleOCRExecutorTests {
         #expect(await recognition.value == "recognized")
     }
 
-    @Test("cancellation keeps active admission occupied and removes queued work")
+    @Test("cancellation frees the caller at once, keeps active admission occupied and removes queued work")
     func cancellationKeepsAdmissionUntilNativeReturn() async throws {
         let executor = SubtitleImageOCR.Executor()
         let entered = AtomicBool(false)
@@ -185,6 +185,8 @@ struct SubtitleOCRExecutorTests {
         #expect(await queued.value == nil)
         #expect(!queuedRan.get())
         recognition.cancel()
+        // A Vision pass that never returns must not hold its cancelled caller (or a test's time limit) with it.
+        #expect(await recognition.value == nil)
         let replacement = Task {
             await executor.run { replacementRan.set(true); return "replacement" }
         }
@@ -192,7 +194,6 @@ struct SubtitleOCRExecutorTests {
         try await waitFor { await executor.pendingCount == 1 }
         #expect(!replacementRan.get(), "cancellation must not free a running native operation's slot")
         release.signal()
-        #expect(await recognition.value == "completed cue")
         #expect(await replacement.value == "replacement")
     }
 
@@ -274,6 +275,8 @@ struct SubtitleOCRExecutorTests {
         fill.cancel()
         release.signal()
         await fill.value
+        // The cancelled batch stopped waiting; the pass it had started hands its cue over when it returns.
+        try await waitFor { original.cueCount > 0 }
         let retained = original.snapshotCues()
         #expect(retained.count == 1)
         #expect(retained.first?.text == "completed cue")

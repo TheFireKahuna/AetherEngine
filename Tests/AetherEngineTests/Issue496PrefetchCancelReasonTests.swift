@@ -7,61 +7,94 @@ import Testing
 /// running on for another eight minutes. The exit line says a `cancel()` happened and nothing
 /// else, and it lands whenever the parked loop next looks, so the cause had to be reconstructed
 /// from what else happened to log nearby: a whole-file subtitle reader that opened 67 microseconds
-/// later. Two rounds went into that reconstruction. These pin the routing that makes it a read.
+/// later. Two rounds went into that reconstruction. These pin the routing that makes it a read, now that
+/// the reading ahead is the pump's, asked for by the session's subtitle source for its consumers.
 struct Issue496PrefetchCancelReasonTests {
 
+    /// An engine whose subtitle source has the pump reading ahead for the overlay.
     @MainActor
-    private func engineWithLivePrefetcher() throws -> AetherEngine {
+    private func engineWithLivePrefetcher() async throws -> AetherEngine {
         let engine = try AetherEngine()
         engine.loadedURL = URL(string: "https://s/movie.mov")!
         engine.softwareSubtitlePacketStore = SubtitlePacketStore()
+        engine.startSubtitleSource()
         engine.subtitleDrainTargets[.primary] = 2
-        engine.subtitleForwardPrefetchTask = Task {}
+        engine.demandOverlaySubtitles()
+        let deadline = Date().addingTimeInterval(10)
+        while engine.subtitleSource?.isReadingAhead != true, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        try #require(engine.subtitleSource?.isReadingAhead == true)
         return engine
+    }
+
+    /// The stop is judged after the turn of the main actor that withdrew the last demand.
+    @MainActor
+    private func settle() async throws {
+        try await Task.sleep(nanoseconds: 50_000_000)
     }
 
     @MainActor
     @Test("a sidecar taking over the primary names itself, not the mechanism it shares with teardown")
-    func sidecarSelectionNamesItself() throws {
-        let engine = try engineWithLivePrefetcher()
+    func sidecarSelectionNamesItself() async throws {
+        let engine = try await engineWithLivePrefetcher()
+        defer { engine.subtitleSource?.close() }
+        #expect(engine.subtitleSource?.isReadingAhead == true)
         engine.clearSubtitleDrainTarget(channel: .primary, reason: .sidecarSelected)
+        try await settle()
         #expect(engine.lastSubtitleDrainStopReason == .sidecarSelected)
-        #expect(engine.subtitleForwardPrefetchTask == nil)
+        #expect(engine.subtitleSource?.isReadingAhead == false)
     }
 
     @MainActor
     @Test("session teardown is distinguishable from a track switch, which is the whole ambiguity")
-    func sessionStopIsADifferentReason() throws {
-        let engine = try engineWithLivePrefetcher()
+    func sessionStopIsADifferentReason() async throws {
+        let engine = try await engineWithLivePrefetcher()
+        defer { engine.subtitleSource?.close() }
         engine.stopSubtitleDrainer(reason: .sessionStopped)
+        try await settle()
         #expect(engine.lastSubtitleDrainStopReason == .sessionStopped)
     }
 
     @MainActor
-    @Test("a rebuild is not a loss and says so")
-    func rebuildIsItsOwnReason() throws {
-        let engine = try engineWithLivePrefetcher()
-        engine.cancelSubtitleForwardPrefetcher(reason: .prefetchRebuild)
-        #expect(engine.lastSubtitleDrainStopReason == .prefetchRebuild)
+    @Test("closing the session's source while it reads is a session stop")
+    func closeIsASessionStop() async throws {
+        let engine = try await engineWithLivePrefetcher()
+        engine.subtitleSource?.close()
+        #expect(engine.lastSubtitleDrainStopReason == .sessionStopped)
     }
 
     @MainActor
     @Test("clearing the secondary while the primary still drains cancels nothing and claims nothing")
-    func secondaryClearLeavesTheRunningPrefetcherAlone() throws {
-        let engine = try engineWithLivePrefetcher()
+    func secondaryClearLeavesTheRunningPrefetcherAlone() async throws {
+        let engine = try await engineWithLivePrefetcher()
+        defer { engine.subtitleSource?.close() }
         engine.subtitleDrainTargets[.secondary] = 3
         engine.clearSubtitleDrainTarget(channel: .secondary, reason: .secondarySidecarSelected)
+        try await settle()
         #expect(engine.lastSubtitleDrainStopReason == nil)
-        #expect(engine.subtitleForwardPrefetchTask != nil)
-        engine.subtitleForwardPrefetchTask?.cancel()
+        #expect(engine.subtitleSource?.isReadingAhead == true)
+    }
+
+    @MainActor
+    @Test("another consumer still asking keeps the reading, and the overlay's stop claims nothing")
+    func anotherConsumerKeepsTheReading() async throws {
+        let engine = try await engineWithLivePrefetcher()
+        defer { engine.subtitleSource?.close() }
+        engine.subtitleSource?.demand(.rendition, streams: [2], lead: { _ in 300 })
+        engine.clearSubtitleDrainTarget(channel: .primary, reason: .sidecarSelected)
+        try await settle()
+        #expect(engine.lastSubtitleDrainStopReason == nil)
+        #expect(engine.subtitleSource?.isReadingAhead == true)
     }
 
     @MainActor
     @Test("a cancel with no prefetcher running claims no reason, so the field never reads a stale one")
-    func noRunningTaskRecordsNothing() throws {
+    func noRunningTaskRecordsNothing() async throws {
         let engine = try AetherEngine()
         engine.subtitleDrainTargets[.primary] = 2
         engine.clearSubtitleDrainTarget(channel: .primary, reason: .sidecarSelected)
+        try await settle()
         #expect(engine.lastSubtitleDrainStopReason == nil)
     }
 
@@ -71,7 +104,7 @@ struct Issue496PrefetchCancelReasonTests {
         let all: [SubtitleDrainStopReason] = [
             .sidecarSelected, .secondarySidecarSelected, .externalStoreBackfill,
             .closedCaptionsSelected, .injectedRenditionSelected, .liveRenditionSelected,
-            .subtitlesCleared, .sessionStopped, .prefetchRebuild,
+            .subtitlesCleared, .sessionStopped,
         ]
         #expect(Set(all.map(\.rawValue)).count == all.count)
     }

@@ -135,7 +135,7 @@ struct Issue276RetainedCoverageTests {
             fence: .init(loadGeneration: 3, seekGeneration: 8),
             streamIndex: 4,
             coveredFrom: 15, windowThrough: 90, decodedThrough: .nan,
-            prefetchFrontier: 92, prefetchAtEndOfFile: false,
+            readThrough: 92,
             retainedFrom: retained.from, reason: .reconstruction)
         #expect(s.coveredFrom == 15)
         #expect(s.retainedFrom == -15)
@@ -164,7 +164,7 @@ struct Issue276RetainedCoverageTests {
             fence: .init(loadGeneration: 1, seekGeneration: 1),
             streamIndex: 4,
             coveredFrom: 15, windowThrough: 90, decodedThrough: .nan,
-            prefetchFrontier: nil, prefetchAtEndOfFile: false,
+            readThrough: nil,
             retainedFrom: nil, reason: .tick)
         #expect(SubtitleResolutionStatement.format(s).contains("retainedFrom=none "))
     }

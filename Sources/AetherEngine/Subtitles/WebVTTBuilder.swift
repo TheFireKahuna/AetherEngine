@@ -1,17 +1,27 @@
 import Foundation
 
-/// Builds a WebVTT body from decoded cue tuples on the AVPlayer timeline (#15). Text is sanitized
-/// separate HLS SUBTITLES rendition so AVKit renders subtitles in the PiP window (the on-frame overlay is not
-/// in the PiP layer); muxing timed text into the A/V fMP4 is non-conformant for HLS (see #55).
+/// Builds a WebVTT body from decoded cues on the AVPlayer timeline (#15). Text goes through
 /// `cueText(_:)`: escaped, blank lines collapsed, italic/bold/underline kept, everything else of the
+/// ASS markup stripped; a cue's placement rides as its cue settings. Served as a separate HLS
+/// SUBTITLES rendition, which AVKit selects and draws; muxing timed text into the A/V fMP4 is
+/// non-conformant for HLS (see #55).
 enum WebVTTBuilder {
+    /// One cue as served: its times, its text with the inline markup `cueText(_:)` reads (SRT tags or
+    /// ASS overrides), and the cue settings that place it (`WebVTTCueSettings.settings(for:)`).
+    struct Cue: Equatable, Sendable {
+        var start: Double
+        var end: Double
+        var text: String
+        var settings: String? = nil
+    }
+
     /// `WEBVTT` header followed by one cue block per non-empty cue: `HH:MM:SS.mmm --> HH:MM:SS.mmm` + text.
-    static func body(cues: [(start: Double, end: Double, text: String)]) -> String {
+    static func body(cues: [Cue]) -> String {
         var out = "WEBVTT\n\n"
         for cue in cues {
             let text = cueText(cue.text)
             if text.isEmpty { continue }
-            out += "\(timestamp(cue.start)) --> \(timestamp(max(cue.start, cue.end)))\n\(text)\n\n"
+            out += "\(timing(cue.start, max(cue.start, cue.end), cue.settings))\n\(text)\n\n"
         }
         return out
     }
@@ -25,7 +35,7 @@ enum WebVTTBuilder {
     /// if PiP subtitles appear shifted by the segment's start offset, flip `relativeToStart` to true at the
     /// single provider call site (`VideoSegmentProvider.nativeSubtitleVTT(ordinal:segmentIndex:)`); that
     /// rebases every cue to LOCAL time relative to `segmentStart` while keeping MPEGTS:0.
-    static func segment(cues: [(start: Double, end: Double, text: String)],
+    static func segment(cues: [Cue],
                         segmentStart: Double = 0,
                         relativeToStart: Bool = false) -> String {
         var out = "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n\n"
@@ -35,10 +45,35 @@ enum WebVTTBuilder {
             if text.isEmpty { continue }
             let s = max(0, cue.start - offset)
             let e = max(s, cue.end - offset)
-            out += "\(timestamp(s)) --> \(timestamp(e))\n\(text)\n\n"
+            out += "\(timing(s, e, cue.settings))\n\(text)\n\n"
+        }
         return out
+    }
+
+    /// A cue's timing line, its settings after the end time as the grammar places them.
+    private static func timing(_ start: Double, _ end: Double, _ settings: String?) -> String {
+        let line = "\(timestamp(start)) --> \(timestamp(end))"
+        guard let settings, !settings.isEmpty else { return line }
+        return line + " " + settings
+    }
+
+    /// Rich-text runs as the inline markup `cueText(_:)` reads: each run's italic, bold and underline as
+    /// SRT tags around its text. Colour, font and size have no WebVTT form AVKit draws; the viewer's
+    /// caption style and the host's text style rules decide them.
+    static func markup(_ runs: [SubtitleTextRun]) -> String {
+        runs.map { run in
+            var text = run.text
+            if run.isUnderlined { text = "<u>" + text + "</u>" }
+            if run.isItalic { text = "<i>" + text + "</i>" }
+            if run.isBold { text = "<b>" + text + "</b>" }
+            return text
+        }.joined()
+    }
 
     /// Inline styles WebVTT and the cue sources share: `<i>`, `<b>`, `<u>`.
+    private enum InlineStyle: Character {
+        case italic = "i", bold = "b", underline = "u"
+    }
 
     /// Cue text as a valid WebVTT cue payload.
     ///
@@ -58,7 +93,95 @@ enum WebVTTBuilder {
     /// `MovTextSampleBuilder.sanitize`. SRT/HTML tags WebVTT has no tag for (`<font ...>`, `<s>`,
     /// `<span ...>`) are dropped rather than escaped: escaping would print them on screen, where a
     /// WebVTT parser used to swallow them as unknown tags.
+    static func cueText(_ raw: String) -> String {
+        let text = SubtitleRectText.capped(raw)
+        var styled: [(char: Character, styles: [InlineStyle])] = []
+        var active: [InlineStyle] = []   // in activation order, so `<b><i>` re-emits as written
+        var drawing = false
+
+        func set(_ style: InlineStyle, _ on: Bool) {
+            active.removeAll { $0 == style }
+            if on { active.append(style) }
         }
+
+        let chars = Array(text)
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if c == "\\", i + 1 < chars.count {
+                let n = chars[i + 1]
+                if n == "N" || n == "n" { styled.append(("\n", active)); i += 2; continue }
+                if n == "h" { if !drawing { styled.append((" ", active)) }; i += 2; continue }
+            }
+            if c == "{", let close = chars[(i + 1)...].firstIndex(of: "}") {
+                for tag in String(chars[(i + 1)..<close]).split(separator: "\\") {
+                    if tag == "r" || (tag.hasPrefix("r") && !tag.hasPrefix("rnd")) {
+                        active.removeAll()
+                    } else if let v = assInt(tag, after: "b") {
+                        set(.bold, v != 0)
+                    } else if let v = assInt(tag, after: "i") {
+                        set(.italic, v != 0)
+                    } else if let v = assInt(tag, after: "u") {
+                        set(.underline, v != 0)
+                    } else if let v = assInt(tag, after: "p") {
+                        drawing = v != 0
+                    }
+                }
+                i = close + 1
+                continue
+            }
+            if c == "<", let (style, opens, length) = srtTag(chars, at: i) {
+                set(style, opens)
+                i += length
+                continue
+            }
+            if c == "<", let length = unrepresentableTagLength(chars, at: i) {
+                i += length
+                continue
+            }
+            if !drawing || c == "\n" { styled.append((c, active)) }
+            i += 1
+        }
+
+        // Drop whitespace-only lines (blank lines end a WebVTT cue), which also trims the edges.
+        var lines: [ArraySlice<(char: Character, styles: [InlineStyle])>] = []
+        var lineStart = 0
+        for index in 0...styled.count where index == styled.count || styled[index].char == "\n" {
+            let line = styled[lineStart..<index]
+            if !line.allSatisfy({ $0.char.isWhitespace }) { lines.append(line) }
+            lineStart = index + 1
+        }
+
+        var out = ""
+        var open: [InlineStyle] = []
+        // Close down to the longest prefix of `open` that `styles` still wants.
+        func close(keeping styles: [InlineStyle]) {
+            var keep = 0
+            while keep < open.count, styles.contains(open[keep]) { keep += 1 }
+            for style in open[keep...].reversed() { out += "</\(style.rawValue)>" }
+            open.removeSubrange(keep...)
+        }
+        for (number, line) in lines.enumerated() {
+            if number > 0 {
+                // Close what the next line drops before the break, not after it.
+                close(keeping: line.first?.styles ?? [])
+                out += "\n"
+            }
+            for (char, styles) in line {
+                close(keeping: styles)
+                for style in styles where !open.contains(style) {
+                    out += "<\(style.rawValue)>"
+                    open.append(style)
+                }
+                switch char {
+                case "&": out += "&amp;"
+                case "<": out += "&lt;"
+                case ">": out += "&gt;"
+                default: out.append(char)
+                }
+            }
+        }
+        close(keeping: [])
         return out
     }
 

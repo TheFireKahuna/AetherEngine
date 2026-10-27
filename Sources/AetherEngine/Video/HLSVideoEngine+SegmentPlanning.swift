@@ -37,6 +37,7 @@ extension HLSVideoEngine {
     /// reposition refetches a segment.
     static func cuePrewarmMayRun(hasSegmentedReader: Bool, isSourceSeekable: Bool) -> Bool {
         !hasSegmentedReader && isSourceSeekable
+    /// entries the plan then refused as too sparse. The pump asks here.
     }
 
     /// True when the indexed keyframe list is dense enough AND wide enough to trust for a keyframe-aligned plan (#64, #91).

@@ -20,17 +20,16 @@ struct Issue416LandingGroundTests {
         )
     }
 
-    /// A reader working its way forwards, reporting as it goes. Notes land in steps rather than in
-    /// one leap on purpose: that is what every reader here does, and a leap is what the ledger
-    /// treats as a reposition nobody announced.
+    /// The pump positioned at `from` and working its way forwards, reporting as it goes. Notes land in
+    /// steps rather than in one leap on purpose: that is what the pump does, and a leap is what the
+    /// ledger treats as a reposition nobody announced.
     private func read(_ coverage: inout SubtitleHarvestCoverage,
-                      _ writer: SubtitlePacketStore.Writer,
                       from: Double, to: Double, step: Double = 0.5) {
-        coverage.noteAnchor(writer, at: from)
+        coverage.noteAnchor(at: from)
         var position = from
         while position < to {
             position = min(to, position + step)
-            coverage.noteProgress(writer, through: position)
+            coverage.noteProgress(through: position)
         }
     }
 
@@ -47,7 +46,7 @@ struct Issue416LandingGroundTests {
     @Test("a run covers what it read and nothing beyond it")
     func runCoversItsOwnSpan() {
         var coverage = SubtitleHarvestCoverage()
-        read(&coverage, .prefetch, from: 100, to: 187.4)
+        read(&coverage, from: 100, to: 187.4)
         #expect(coverage.covers(from: 120, through: 180))
         #expect(coverage.covers(from: 100, through: 187.4))
         #expect(!coverage.covers(from: 180, through: 190))
@@ -57,7 +56,7 @@ struct Issue416LandingGroundTests {
     @Test("an empty or inverted span is covered by definition")
     func emptySpanIsCovered() {
         var coverage = SubtitleHarvestCoverage()
-        read(&coverage, .pump, from: 10, to: 20)
+        read(&coverage, from: 10, to: 20)
         #expect(coverage.covers(from: 500, through: 500))
         #expect(coverage.covers(from: 500, through: 499))
     }
@@ -65,13 +64,14 @@ struct Issue416LandingGroundTests {
     @Test("the reporter's shape: two runs that met nowhere leave the stretch between them unread")
     func reAnchoredRunLeavesAHole() {
         var coverage = SubtitleHarvestCoverage()
-        // The run that harvested the set at 184 and was re-aimed before it reached the clear at 190.
-        read(&coverage, .prefetch, from: 100, to: 187.4)
-        read(&coverage, .prefetch, from: 197, to: 260)
+        // The run that harvested the set at 184 and was re-aimed before it reached the clear at 190,
+        // and the one after the re-aim.
+        read(&coverage, from: 100, to: 187.4)
+        read(&coverage, from: 197, to: 260)
         // The pump, restarted on the boundary below the seek target: one anchor, then the drain
         // tick stating that playback is rendering at the landing.
-        coverage.noteAnchor(.pump, at: 192)
-        coverage.noteProgress(.pump, through: 197)
+        coverage.noteAnchor(at: 192)
+        coverage.noteProgress(through: 197)
 
         #expect(!coverage.covers(from: 184, through: 197))   // the set's claim to the landing
         #expect(coverage.covers(from: 192, through: 197))    // a set the restarted pump read
@@ -81,17 +81,17 @@ struct Issue416LandingGroundTests {
     @Test("runs that meet at a seam read as one")
     func adjacentRunsMerge() {
         var coverage = SubtitleHarvestCoverage()
-        read(&coverage, .prefetch, from: 100, to: 192.0)
-        read(&coverage, .pump, from: 192.1, to: 200)
+        read(&coverage, from: 100, to: 192.0)
+        read(&coverage, from: 192.1, to: 200)
         #expect(coverage.covers(from: 180, through: 199))
     }
 
     @Test("a step no reader announced starts a new run rather than claiming the jump")
     func unannouncedJumpDoesNotClaimTheGround() {
         var coverage = SubtitleHarvestCoverage()
-        read(&coverage, .pump, from: 100, to: 110)
+        read(&coverage, from: 100, to: 110)
         // A reposition nobody reported: the next note is 200 s further on.
-        coverage.noteProgress(.pump, through: 310)
+        coverage.noteProgress(through: 310)
         #expect(!coverage.covers(from: 150, through: 200))
         #expect(coverage.covers(from: 100, through: 110))
     }
@@ -99,8 +99,8 @@ struct Issue416LandingGroundTests {
     @Test("a run is extended, not restarted, over the step from a fresh anchor to the landing")
     func anchorToLandingIsOneRun() {
         var coverage = SubtitleHarvestCoverage()
-        coverage.noteAnchor(.pump, at: 192)
-        coverage.noteProgress(.pump, through: 197)   // the first drain tick after the landing
+        coverage.noteAnchor(at: 192)
+        coverage.noteProgress(through: 197)   // the first drain tick after the landing
         #expect(coverage.covers(from: 193, through: 197))
     }
 
@@ -109,16 +109,16 @@ struct Issue416LandingGroundTests {
         // A track selected an hour into a film: the drain's first note is an hour-long step over
         // ground the pump certainly read, and it has to count.
         var coverage = SubtitleHarvestCoverage()
-        coverage.noteAnchor(.pump, at: 0)
-        coverage.noteReach(.pump, through: 3600)
+        coverage.noteAnchor(at: 0)
+        coverage.noteReach(through: 3600)
         #expect(coverage.covers(from: 3585, through: 3600))
     }
 
     @Test("reach still cannot reach below its own anchor")
     func reachStartsAtTheAnchor() {
         var coverage = SubtitleHarvestCoverage()
-        coverage.noteAnchor(.pump, at: 192)
-        coverage.noteReach(.pump, through: 260)
+        coverage.noteAnchor(at: 192)
+        coverage.noteReach(through: 260)
         #expect(!coverage.covers(from: 184, through: 197))
         #expect(coverage.covers(from: 192, through: 260))
     }
@@ -134,12 +134,12 @@ struct Issue416LandingGroundTests {
     @Test("a store that is told about its readers answers from the ledger")
     func storeAnswersFromTheLedger() {
         let store = SubtitlePacketStore()
-        store.noteHarvestAnchor(.prefetch, at: 100)
+        store.noteHarvestAnchor(at: 100)
         for position in stride(from: 100.5, through: 187.4, by: 0.5) {
-            store.noteHarvestProgress(.prefetch, through: position)
+            store.noteHarvestProgress(through: position)
         }
-        store.noteHarvestAnchor(.pump, at: 192)
-        store.noteHarvestReach(.pump, through: 197)
+        store.noteHarvestAnchor(at: 192)
+        store.noteHarvestReach(through: 197)
         #expect(!store.hasReadSpan(from: 184, through: 197))
         #expect(store.hasReadSpan(from: 193, through: 197))
         store.clear()
@@ -226,8 +226,8 @@ struct Issue416LandingGroundTests {
     func sessionAxisAnchorSwallowsTheOffset() {
         let sessionZero = 24_514.545
         var coverage = SubtitleHarvestCoverage()
-        coverage.noteAnchor(.pump, at: 35.29)                       // session axis: the defect
-        coverage.noteReach(.pump, through: 35.29 + sessionZero)     // source axis: the pump's note
+        coverage.noteAnchor(at: 35.29)                       // session axis: the defect
+        coverage.noteReach(through: 35.29 + sessionZero)     // source axis: the pump's note
         #expect(coverage.covers(from: 200, through: 20_000))
     }
 
@@ -237,8 +237,8 @@ struct Issue416LandingGroundTests {
         var coverage = SubtitleHarvestCoverage()
         let anchor = SWClockAnchorPolicy.sourceSeconds(forSession: 35.29,
                                                        sessionZeroSeconds: sessionZero)
-        coverage.noteAnchor(.pump, at: anchor)
-        coverage.noteReach(.pump, through: anchor + 1.5)
+        coverage.noteAnchor(at: anchor)
+        coverage.noteReach(through: anchor + 1.5)
         #expect(coverage.covers(from: anchor, through: anchor + 1.5))
         #expect(!coverage.covers(from: 200, through: 20_000))
         #expect(!coverage.covers(from: anchor - 10, through: anchor))

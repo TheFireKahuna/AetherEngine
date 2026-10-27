@@ -108,10 +108,19 @@ the public-API contract.
 - **The Atmos output activator's pause grace checks the host again when it ends (AE#848).** It paused the
   silent stream outright, so a host that started playing without a refresh in between lost Dolby Atmos on
   the receiver sixty seconds into playback.
+- **The bitmap OCR worker runs only while AVKit draws its rendition.** Selecting a PGS, DVB or DVD track
+  armed the worker for its native WebVTT rendition at once, and with it the 270 s subtitle read-ahead, which
+  on Matroska pulls every cluster (434 MB in 90 s on a 4K remux, measured upstream), for a rendition nothing
+  showed while the overlay drew the bitmaps. The worker now follows `setNativeSubtitleRendering(_:)` (PiP,
+  AirPlay, an external display), and stays off while a Picture in Picture window shows the software overlay,
+  whose pictures carry the cues.
 - **A placeholder stream never reaches an AirPlay receiver.** AVPlayer handed a receiver the stream of a
   for those sessions, the picture stays on the device and the audio follows the route, and
 - **A retained paused session recovers a failed overlay layer on its return** (AE#870). With
   suspended stayed black until a picture was refused; it is flushed on the return to the foreground.
+- **A cancelled subtitle recognition no longer waits for Vision.** A recognition holds the OCR slot until
+  Vision returns, which under load took longer than a test's whole time limit; its caller now stops waiting
+  when cancelled, and the slot is still held until the native call returns.
 
 - **A media services reset is recovered from when it happens.** The reset only flagged the next load, so a
   session open at the time ran on dead objects until something failed: a native item with -11819, a software

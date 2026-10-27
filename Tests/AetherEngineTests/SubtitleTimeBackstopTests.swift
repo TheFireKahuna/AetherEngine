@@ -32,14 +32,14 @@ struct SubtitleTimeBackstopTests {
         _ = AetherEngine.decodeStoredSubtitlePacket(infinite, with: decoder)
     }
 
-    @Test("the store unsets implausible times and zeroes implausible durations for every writer")
+    @Test("the store unsets implausible times and zeroes implausible durations for every packet")
     func harvestBoundsTimes() throws {
         let (demuxer, decoder) = try subripDecoder()
         defer { demuxer.close() }
         let store = SubtitlePacketStore()
         let payload = Data("line".utf8)
         store.harvestChunk(streamIndex: 0, ptsSeconds: 1, durationSeconds: 9.2e15, flags: 0,
-                           payload: payload, assembleSplitDisplaySets: false, writer: .prefetch)
+                           payload: payload, assembleSplitDisplaySets: false)
         store.harvestChunk(streamIndex: 0, ptsSeconds: 2, durationSeconds: .infinity, flags: 0,
                            payload: payload, assembleSplitDisplaySets: false)
         store.harvestChunk(streamIndex: 0, ptsSeconds: 3, durationSeconds: 0.5, flags: 0,
@@ -80,9 +80,9 @@ struct SubtitleTimeBackstopTests {
     @Test("the WebVTT body survives cues at huge and non-finite times")
     func webVTTTimestamps() {
         let vtt = WebVTTBuilder.body(cues: [
-            (start: 1, end: 2, text: "near"),
-            (start: 1e19, end: .infinity, text: "far"),
-            (start: .nan, end: .nan, text: "nan"),
+            .init(start: 1, end: 2, text: "near"),
+            .init(start: 1e19, end: .infinity, text: "far"),
+            .init(start: .nan, end: .nan, text: "nan"),
         ])
         #expect(vtt.contains("00:00:01.000 --> 00:00:02.000\nnear"))
         #expect(vtt.contains("far"))
