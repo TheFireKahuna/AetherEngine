@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 extension AetherEngine {
@@ -8,11 +9,17 @@ extension AetherEngine {
     func refreshSoftwareOverlay() {
         softwareOverlay?.stop()
         softwareOverlay = nil
+        softwarePiPSource = nil
+        overlaySubtitleCues = nil
         defer { followOverlayWithExternalPlayback() }
         guard let item = currentAVPlayerItem, let source = makeOverlaySource() else { return }
         let renderer = SoftwareOverlayRenderer(item: item, source: source)
         renderer.start()
         softwareOverlay = renderer
+        softwarePiPSource = SoftwarePiPSource(layer: renderer.layer, isLive: isLive, engine: self)
+        // A published value reaches a sink before the property holds it, so the cues are taken from the sink.
+        overlaySubtitleCues = Publishers.CombineLatest($subtitleCues, $secondarySubtitleCues)
+            .sink { [weak self] primary, secondary in self?.syncOverlaySubtitles(cues: primary + secondary) }
         EngineLog.emit("[AetherEngine] software overlay attached to the native item", category: .engine)
     }
 
@@ -22,6 +29,17 @@ extension AetherEngine {
     func followOverlayWithExternalPlayback() {
         currentAVPlayer?.allowsExternalPlayback = !pictureDrawnLocally
         recomputeAirPlayPictureStaysLocal()
+    }
+
+    /// Hands the overlay what a Picture in Picture window shows over its pictures: whether the window is up, the cues of
+    /// both channels, the viewer's delay, and the offset of the source axis the cues are timed on from the item's.
+    func syncOverlaySubtitles(cues: [SubtitleCue]? = nil) {
+        guard let overlay = softwareOverlay else { return }
+        let itemSeconds = currentAVPlayerItem?.currentTime().seconds ?? 0
+        let shift = itemSeconds.isFinite ? nativeSourceSeconds(atItemSeconds: itemSeconds) - itemSeconds : 0
+        let active = pictureInPictureActive, delay = currentSubtitleDelaySeconds
+        let cues = cues ?? subtitleCues + secondarySubtitleCues
+        overlay.subtitles.update(.init(active: active, cues: cues, delaySeconds: delay, sourceShift: shift))
     }
 
     /// What the current session's overlay shows, nil when AVPlayer's own picture is the one to show.

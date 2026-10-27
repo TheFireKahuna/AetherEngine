@@ -146,6 +146,10 @@ the public-API contract.
   showed while the overlay drew the bitmaps. The worker now follows `setNativeSubtitleRendering(_:)` (PiP,
   AirPlay, an external display), and stays off while a Picture in Picture window shows the software overlay,
   whose pictures carry the cues.
+- **Overlay Picture in Picture subtitles follow the viewer's caption settings.** Text cues drawn into the
+  overlay's pictures used the default look whatever the system caption style said, unlike AVKit's own
+  drawing in fullscreen. They now take the style when the window first comes up and follow later changes;
+  bitmaps are drawn as they are.
 - **A placeholder stream never reaches an AirPlay receiver.** AVPlayer handed a receiver the stream of a
   session the software overlay draws, which there is only the black placeholder. External playback is off
   for those sessions, the picture stays on the device and the audio follows the route, and

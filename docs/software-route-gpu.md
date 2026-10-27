@@ -91,6 +91,10 @@ FEL overlay counts late frames today.
    - **At scan rates** (rate other than 0 or 1), AVPlayer plays the I-frame tier and the renderer shows the frames
      its video output decodes.
    - **PiP** takes the overlay layer itself, with lossless pixels
+     (`AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer:playbackDelegate:)`). The window shows that
+     layer alone, so while it is up the overlay draws every subtitle track (AVKit's text tracks too) into its pictures:
+     the cue set drawn once and turned into the picture's own coding (reference white at 203 nits PQ, 75% HLG), then a
+     luma and a chroma blend into a copy of each picture with a cue on it, handed to the layer in order.
 2. **`OverlayPacketTap`** (`Video/`) is `FelEnhancementTap`'s store, runs, keyframe restarts and decode loop, shared
    by both sources.
    - **Storage:** each unit on disk, its packet and its composer parameters (`SpilledUnits`), read back just before it
@@ -677,6 +681,7 @@ about 150 pipelines) and `prewarmDualLayerDolbyVision()`, at utility priority.
 - **dav1d throughput on the A15** at 4K 10-bit (with and without film grain) is unmeasured; it sets the decode-ahead
   the segment gating needs.
 - **The finisher's speed on the Apple TV** is unmeasured (all figures are M4 Pro), and so are the grain's cost
+  (the synthesis kernels' span, the per-sample application inside the finisher) and the software route's frame timing
   since 9.2 (to be read from the overlay's counters against the build before it).
 - **GPU-wide timeouts in several-suite test runs: fixed (fa911014, LibDeinterlace 2.0.1).** Every command buffer in
   flight failing at once with Metal's timeout was a freed pipeline running on the GPU: two threads made the same
@@ -706,5 +711,12 @@ about 150 pipelines) and `prewarmDualLayerDolbyVision()`, at utility priority.
    the M4 Pro, a batch's own set (a rotating 3 of 12 4K slabs, tables, textures) costs 3.9 us to commit with its
    submission, against 2.7 us with slabs and tables in a set on the queue: about a microsecond a frame, for lifetime
    registration in every owner of a long-lived buffer.
+7. Sodalite's log-export QR code drawn on the CPU (it is Core Image GPU work outside the layer). The PiP subtitle
+   compositor's `CIContext` (`SubtitleFrameCompositor`) is not ported: it belongs to `SampleBufferRenderer`, the
+   retired software host's, and goes with it. Done: PiP for an overlay session takes the overlay's layer
+   (`softwarePiPSource`, published with the overlay), and its subtitles are blend kernels over the overlay's pictures
+   while the window is up (`OverlaySubtitles`, `SubtitleBlend.metal`; the cue layout is still
+   `SubtitleFrameCompositor.renderOverlay`, drawn on the CPU once per cue set). Not yet run on the Apple TV, where in
+   July sample-buffer PiP never became possible (FB9751461); `SampleBufferPiPProbeTests` in Sodalite answers that.
 8. Two long-running threads still drain no autorelease pool per iteration: the HLS segment producer's pump and the
    loopback audio reader.

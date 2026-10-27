@@ -1,11 +1,9 @@
 import AVFoundation
 import CoreMedia
 
-/// SW-PiP bridge (Sodalite SW-PiP Phase A): everything a host needs to build an
-/// AVPictureInPictureController ContentSource around the software path, WITHOUT AVKit entering the
-/// engine. The analog of `currentAVPlayer` for sample-buffer PiP: the layer plus the four transport
-/// answers backing AVPictureInPictureSampleBufferPlaybackDelegate. Time answers live here because
-/// the enqueued frames' PTS axis (source axis, synchronizer clock) is engine knowledge.
+/// What a host needs to build an `AVPictureInPictureController` around the software overlay: its layer, and the
+/// answers behind `AVPictureInPictureSampleBufferPlaybackDelegate`. AVPlayer's own rendering is suppressed under the
+/// overlay, so the overlay's layer is the picture a PiP window has to take; AVPlayer stays the transport.
 @MainActor
 public final class SoftwarePiPSource {
     public let layer: AVSampleBufferDisplayLayer
@@ -18,15 +16,15 @@ public final class SoftwarePiPSource {
         self.engine = engine
     }
 
-    /// Playable range on the enqueued frames' PTS axis (source axis). Live sources report an
-    /// indefinite range so the window shows live UI.
+    /// The playable range on the layer's timebase, which must contain the layer's current time. Live sources report
+    /// an indefinite range so the window shows live UI.
     public func timeRange() -> CMTimeRange {
         guard let engine else {
             return CMTimeRange(start: .negativeInfinity, duration: .positiveInfinity)
         }
         return AetherEngine.softwarePiPTimeRange(
             isLive: isLive,
-            sourceTime: engine.sourceTime,
+            layerTime: layer.sampleBufferRenderer.timebase.time.seconds,
             currentTime: engine.currentTime,
             duration: engine.duration
         )
@@ -38,9 +36,13 @@ public final class SoftwarePiPSource {
         if playing { engine?.play() } else { engine?.pause() }
     }
 
-    public func skip(by seconds: Double) {
-        guard let engine else { return }
+    /// Seeks by `seconds` and calls `completion` once the seek has landed, as the window's skip contract asks.
+    public func skip(by seconds: Double, completion: @escaping () -> Void) {
+        guard let engine else { completion(); return }
         let target = max(0, engine.currentTime + seconds)
-        Task { await engine.seek(to: target) }
+        Task {
+            await engine.seek(to: target)
+            completion()
+        }
     }
 }

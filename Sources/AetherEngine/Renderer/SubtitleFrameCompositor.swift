@@ -82,7 +82,6 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
     /// snapshot that a `setStyle` has since superseded can never be served.
     private var cachedStyle: SubtitleCaptionStyle?
     private var loggedFailure = false
-    private let styleProvider: @Sendable () -> SubtitleCaptionStyle
     private var style: SubtitleCaptionStyle = .standard
     private var styleLoaded = false
     private var styleObservation: SubtitleCaptionStyle.Observation?
@@ -105,10 +104,8 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
     /// The one system read, with the observation seeded from it. Runs outside the lock: a settings
     /// change can arrive on another thread and call `setStyle`.
     private func loadStyle() {
-        let initial = styleProvider()
-        let observation = observesSystemStyle
-            ? SubtitleCaptionStyle.observeChanges(startingFrom: initial) { [weak self] in self?.setStyle($0) }
-            : nil
+        let initial = SubtitleCaptionStyle.current()
+        let observation = SubtitleCaptionStyle.observeChanges(startingFrom: initial) { [weak self] in self?.setStyle($0) }
         lock.lock()
         // A `setStyle` that got in first is newer than what was just read.
         if !styleLoaded {

@@ -99,6 +99,8 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
     private let videoRenderer: AVSampleBufferVideoRenderer
     private let rendererIO: VideoRendererIO
     let source: any OverlayFrameSource
+    /// The session's subtitles, drawn into the pictures while Picture in Picture shows this layer.
+    let subtitles: OverlaySubtitles
     /// Test seam: every presented picture with the item time it shows, on the render queue.
     public var onPresented: (@Sendable (CMTime, CVPixelBuffer) -> Void)?
 
@@ -156,6 +158,10 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
     private var lastClock = CMTime.invalid
     /// Frames taken for the make queue whose pictures are not back yet.
     private var making = 0
+    /// Pictures handed to the subtitle blend that are not back yet.
+    private var blending = 0
+    /// The newest picture handed on: to the layer, or to the subtitle blend ahead of it.
+    private var lastHanded = CMTime.invalid
     /// Bumped on every restart (render queue), read on the make queue: a frame or a picture of an older generation is
     /// for a left position.
     private let generation = OSAllocatedUnfairLock(initialState: 0)
@@ -184,6 +190,9 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         // The overlay is the item's picture: AVPlayer keeps decoding into the output but stops rendering its
         // own, so one video pipeline presents.
         output.suppressesPlayerRendering = true
+        var recommended: [String: Any] = [:]
+        if #available(macOS 26, iOS 26, tvOS 26, *) { recommended = videoRenderer.__recommendedPixelBufferAttributes }
+        subtitles = OverlaySubtitles(bufferAttributes: recommended)
         layer.videoGravity = .resizeAspect
         // AVPlayer no longer presents video, so the layer says that video is playing.
         layer.preventsDisplaySleepDuringVideoPlayback = true
@@ -374,6 +383,36 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         // A frame the source had nothing for yet is offered again at every refresh until it has.
         if making > 0 { makeQueue.async { self.makeTaken() } }
         var took = false
+        while making + blending + queued.count < Self.lookaheadFrames {
+            // A frame AVPlayer is served is asked for half a millisecond past its whole-millisecond time: at or
+            // past its own time, short of the next frame's. One the clock has passed is behind the picture
+            // on screen, and the frame at the clock is taken instead. With none taken since a restart, the first is
+            // the first AVPlayer has from the clock on: after a seek AVPlayer starts its clock short of the target,
+            // and the frames before the target are never put out.
+            let itemTime: CMTime
+            if lastPulled.isValid {
+                guard let next = source.frameTime(after: lastPulled.seconds) else { break }
+                itemTime = CMTimeMaximum(CMTime(seconds: next + 0.0005, preferredTimescale: 1_000_000_000), clock)
+            } else if let first = firstOutputTime(from: clock) {
+                itemTime = first
+            } else {
+                countersLock.withLock { _counters.atOutputEdge += 1 }
+                break
+            }
+            guard output.hasNewPixelBuffer(forItemTime: itemTime) else {
+                countersLock.withLock { _counters.atOutputEdge += 1 }
+                break
+            }
+            let pullStart = CACurrentMediaTime()
+            guard let (frame, frameTime) = outputFrame(forItemTime: itemTime), frameTime.isValid else { break }
+            stages.record("pull", ms: (CACurrentMediaTime() - pullStart) * 1000)
+            stages.record("pulled ahead of the clock", ms: (frameTime - clock).seconds * 1000)
+            countersLock.withLock { _counters.pulled += 1 }
+            noteFrame(frameTime)
+            took = true
+            take(frame, at: frameTime)
+        }
+        if making + blending + queued.count >= Self.lookaheadFrames { countersLock.withLock { _counters.atLookahead += 1 } }
         if lastQueued.isValid { stages.record("queued ahead of the clock", ms: (lastQueued - clock).seconds * 1000) }
         if took {
             lastNewFrame = CACurrentMediaTime()
@@ -439,6 +478,7 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
                         return
                     }
                     self.stages.record("to render queue", ms: (CACurrentMediaTime() - made) * 1000)
+                    self.present(picture, at: frameTime, pictureMs: pictureMs)
                 }
             }
         }
@@ -457,11 +497,14 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         let clock = CMTimebaseGetTime(itemTimebase)
         source.advance(to: clock.seconds)
         dropPassed(clock)
+        let room = Self.lookaheadFrames - queued.count - blending
         if room > 0 {
+            let pictures = source.pictures(after: lastHanded.isValid ? lastHanded : nil, at: clock.seconds)
             if pictures.isEmpty, queued.isEmpty { countersLock.withLock { _counters.notReady += 1 } }
             if !pictures.isEmpty { lastNewFrame = CACurrentMediaTime() }
             for (picture, time) in pictures.prefix(room) {
                 noteFrame(time)
+                present(picture, at: time, pictureMs: 0)
             }
         } else {
             countersLock.withLock { _counters.atLookahead += 1 }
@@ -614,10 +657,32 @@ public final class SoftwareOverlayRenderer: @unchecked Sendable {
         videoRenderer.presentationTimeExpectation = .monotonicallyIncreasing
         lastPulled = .invalid
         lastQueued = .invalid
+        lastHanded = .invalid
         onScreen = .invalid
         queued.removeAll()
         making = 0
+        blending = 0
         generation.withLock { $0 += 1 }
+    }
+
+    /// Render queue: hands a made picture on to the layer, through the subtitle blend while it draws (and until every
+    /// picture handed to it is back, so none overtakes another).
+    private func present(_ picture: CVPixelBuffer, at time: CMTime, pictureMs: Double) {
+        lastHanded = time
+        guard subtitles.routesPictures else {
+            enqueue(picture, at: time, pictureMs: pictureMs)
+            return
+        }
+        blending += 1
+        let generation = self.generation.withLock { $0 }
+        subtitles.draw(on: picture, atItemSeconds: time.seconds) { [weak self] drawn in
+            guard let self else { return }
+            self.queue.async {
+                guard generation == self.generation.withLock({ $0 }) else { return }
+                self.blending -= 1
+                self.enqueue(drawn, at: time, pictureMs: pictureMs)
+            }
+        }
     }
 
     /// Render queue: enqueues `picture` for `presentation` on the layer's timeline (the picture's own item time, or

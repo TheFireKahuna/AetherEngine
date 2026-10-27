@@ -6,9 +6,9 @@ import Foundation
 import MediaAccessibility
 @testable import AetherEngine
 
-/// The software host reads the system caption style itself (there is no AVKit legible output to
-/// apply it), so what is tested is the mapping from the system's values to a style, how a style
-/// resolves against a cue's own styling, and that a style change reaches the rendered overlay.
+/// The overlay's Picture in Picture window draws its own subtitles (AVKit's legible output does not reach it), so it
+/// reads the system caption style itself: what is tested is the mapping from the system's values to a style, how a
+/// style resolves against a cue's own styling, and that a style change reaches the pictures the window shows.
 @Suite("System caption style for software subtitles")
 struct SubtitleCaptionStyleTests {
 
@@ -270,103 +270,84 @@ struct SubtitleCaptionStyleTests {
         #expect(background.values.first ?? 0 > counts.visible / 2)
     }
 
-    private func frameBytes(_ buffer: CVPixelBuffer) -> Data {
-        CVPixelBufferLockBaseAddress(buffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-        return Data(bytes: CVPixelBufferGetBaseAddress(buffer)!,
-                    count: CVPixelBufferGetBytesPerRow(buffer) * CVPixelBufferGetHeight(buffer))
-    }
-
-    @Test("a style change reaches the next composited frame, not just the next cue")
-    func styleChangeInvalidatesCache() throws {
-        var source: CVPixelBuffer?
-        let status = CVPixelBufferCreate(nil, 320, 180, kCVPixelFormatType_32BGRA,
-                                         [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &source)
-        try #require(status == kCVReturnSuccess, "CVPixelBufferCreate failed: \(status)")
-        let input = try #require(source)
-        CVPixelBufferLockBaseAddress(input, [])
-        memset(CVPixelBufferGetBaseAddress(input), 0x40, CVPixelBufferGetBytesPerRow(input) * 180)
-        CVPixelBufferUnlockBaseAddress(input, [])
-
-        let compositor = SubtitleFrameCompositor(styleProvider: { .standard }, observesSystemStyle: false)
-        compositor.update(cues: [cue], enabled: true, delaySeconds: 0)
-        let before = frameBytes(compositor.composite(input, ptsSeconds: 1))
-        #expect(before != frameBytes(input))
-        #expect(before == frameBytes(compositor.composite(input, ptsSeconds: 1.1)))
-
-        compositor.setStyle(SubtitleCaptionStyle(backgroundOpacity: .init(0), windowOpacity: .init(1)))
-        let after = frameBytes(compositor.composite(input, ptsSeconds: 1.2))
-        #expect(after != before)
-    }
-
-    @Test("the system style is read once, on the first enable, and never while disabled")
-    func styleReadIsLazyAndSingle() {
-        final class Counter: @unchecked Sendable {
-            private let lock = NSLock(); private var n = 0
-            func bump() -> Int { lock.lock(); defer { lock.unlock() }; n += 1; return n }
-            var value: Int { lock.lock(); defer { lock.unlock() }; return n }
+    /// A black 8-bit 4:2:0 SDR picture, the shape the overlay's PiP blend reads.
+    private func blackPicture() throws -> CVPixelBuffer {
+        var made: CVPixelBuffer?
+        let attributes: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+                                           kCVPixelBufferMetalCompatibilityKey: true]
+        CVPixelBufferCreate(kCFAllocatorDefault, 640, 360, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                            attributes as CFDictionary, &made)
+        let picture = try #require(made)
+        CVBufferSetAttachment(picture, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+        CVBufferSetAttachment(picture, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+        CVBufferSetAttachment(picture, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+        CVPixelBufferLockBaseAddress(picture, [])
+        for (plane, code) in [(0, UInt8(16)), (1, UInt8(128))] {
+            let base = try #require(CVPixelBufferGetBaseAddressOfPlane(picture, plane))
+            base.assumingMemoryBound(to: UInt8.self).update(
+                repeating: code, count: CVPixelBufferGetBytesPerRowOfPlane(picture, plane) * CVPixelBufferGetHeightOfPlane(picture, plane))
         }
-        let reads = Counter()
-        let compositor = SubtitleFrameCompositor(styleProvider: { _ = reads.bump(); return .standard },
-                                                 observesSystemStyle: true)
-        #expect(reads.value == 0)
-        compositor.update(cues: [], enabled: false, delaySeconds: 0)
-        #expect(reads.value == 0)
-        compositor.update(cues: [], enabled: true, delaySeconds: 0)
-        compositor.update(cues: [], enabled: true, delaySeconds: 0)
-        #expect(reads.value == 1)
+        CVPixelBufferUnlockBaseAddress(picture, [])
+        return picture
     }
 
-    @Test("an overlay is never served in a style other than the current one")
-    func cacheKeyedByStyle() throws {
-        var source: CVPixelBuffer?
-        let status = CVPixelBufferCreate(nil, 320, 180, kCVPixelFormatType_32BGRA,
-                                         [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &source)
-        try #require(status == kCVReturnSuccess, "CVPixelBufferCreate failed: \(status)")
-        let input = try #require(source)
-        let compositor = SubtitleFrameCompositor(styleProvider: { .standard }, observesSystemStyle: false)
-        compositor.update(cues: [cue], enabled: true, delaySeconds: 0)
-        let standard = frameBytes(compositor.composite(input, ptsSeconds: 1))
-        // Same cue set, different style: the cache entry from the first frame must not answer.
-        compositor.setStyle(SubtitleCaptionStyle(backgroundOpacity: .init(0)))
-        let bare = frameBytes(compositor.composite(input, ptsSeconds: 1.1))
-        #expect(bare != standard)
-        compositor.setStyle(.standard)
-        #expect(frameBytes(compositor.composite(input, ptsSeconds: 1.2)) == standard)
+    private func planeBytes(_ picture: CVPixelBuffer) -> Data {
+        CVPixelBufferLockBaseAddress(picture, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(picture, .readOnly) }
+        return (0..<2).reduce(into: Data()) { data, plane in
+            data.append(Data(bytes: CVPixelBufferGetBaseAddressOfPlane(picture, plane)!,
+                             count: CVPixelBufferGetBytesPerRowOfPlane(picture, plane) * CVPixelBufferGetHeightOfPlane(picture, plane)))
+        }
     }
 
-    @Test("a notification already in flight cannot reach the handler once the token is released")
-    func observationStops() {
-        final class Box: @unchecked Sendable {
-            private let lock = NSLock()
-            private var calls = 0
-            private var fire: (@Sendable (Notification) -> Void)?
-            func bump() { lock.lock(); calls += 1; lock.unlock() }
-            var count: Int { lock.lock(); defer { lock.unlock() }; return calls }
-            func store(_ f: @escaping @Sendable (Notification) -> Void) { lock.lock(); fire = f; lock.unlock() }
-            func deliver() { lock.lock(); let f = fire; lock.unlock(); f?(Notification(name: .init("x"))) }
-        }
-        // The seeded style differs from the live one, so an open observation always has news to deliver.
-        let seed = SubtitleCaptionStyle(backgroundOpacity: .init(0.123))
+    private struct Box: @unchecked Sendable {
+        let picture: CVPixelBuffer
+    }
 
-        // Control, on an observation of its own: an open one delivers.
-        let control = Box()
-        let open = SubtitleCaptionStyle.observeChanges(startingFrom: seed, fireSink: { control.store($0) }) { _ in
-            control.bump()
-        }
-        control.deliver()
-        #expect(control.count == 1)
-        withExtendedLifetime(open) {}
+    private func drawn(_ subtitles: OverlaySubtitles, on picture: CVPixelBuffer, at seconds: Double) async -> CVPixelBuffer {
+        await withCheckedContinuation { continuation in
+            let box = Box(picture: picture)
+            subtitles.draw(on: box.picture, atItemSeconds: seconds) { continuation.resume(returning: Box(picture: $0)) }
+        }.picture
+    }
 
-        // The observation under test never delivers before release, so the delivery after it is its
-        // first and nothing but the gate can stop it (dedup has nothing to drop). Releasing the token
-        // removes the observers, but a delivery already under way holds the closure.
-        let box = Box()
-        var observation: SubtitleCaptionStyle.Observation? = SubtitleCaptionStyle.observeChanges(
-            startingFrom: seed, fireSink: { box.store($0) }) { _ in box.bump() }
-        observation = nil
-        box.deliver()
-        #expect(box.count == 0)
-        _ = observation
+    /// The overlay's subtitles in Picture in Picture, pinned to `style` whatever the machine's own setting is.
+    private func overlaySubtitles(style: SubtitleCaptionStyle) -> OverlaySubtitles {
+        let subtitles = OverlaySubtitles(bufferAttributes: [:])
+        subtitles.setStyle(style)
+        subtitles.update(.init(active: true, cues: [cue], delaySeconds: 0, sourceShift: 0))
+        return subtitles
+    }
+
+    @Test("a style change reaches the next picture of an overlay Picture in Picture window, not just the next cue")
+    func styleChangeReachesOverlayPictures() async throws {
+        let picture = try blackPicture()
+        let subtitles = overlaySubtitles(style: .standard)
+        let before = planeBytes(await drawn(subtitles, on: picture, at: 1))
+        #expect(before != planeBytes(picture))
+        #expect(before == planeBytes(await drawn(subtitles, on: picture, at: 1.1)))
+        subtitles.setStyle(SubtitleCaptionStyle(textColor: .init(SubtitleColor(r: 255, g: 0, b: 0))))
+        #expect(planeBytes(await drawn(subtitles, on: picture, at: 1.2)) != before)
+    }
+
+    @Test("the overlay never serves cues drawn in a style other than the current one")
+    func overlayCacheKeyedByStyle() async throws {
+        let picture = try blackPicture()
+        let subtitles = overlaySubtitles(style: .standard)
+        let standard = planeBytes(await drawn(subtitles, on: picture, at: 1))
+        subtitles.setStyle(SubtitleCaptionStyle(textColor: .init(SubtitleColor(r: 0, g: 0, b: 255))))
+        #expect(planeBytes(await drawn(subtitles, on: picture, at: 1.1)) != standard)
+        subtitles.setStyle(.standard)
+        #expect(planeBytes(await drawn(subtitles, on: picture, at: 1.2)) == standard)
+    }
+
+    @Test("a customised system reaches the overlay through the style it maps to")
+    func systemStyleReachesOverlay() async throws {
+        var system = Self.untouched()
+        system.textColor = .init(user: SubtitleColor(r: 255, g: 255, b: 0), factory: Self.white)
+        let picture = try blackPicture()
+        let standard = planeBytes(await drawn(overlaySubtitles(style: .standard), on: picture, at: 1))
+        let custom = planeBytes(await drawn(overlaySubtitles(style: SubtitleCaptionStyle(system)), on: picture, at: 1))
+        #expect(custom != standard)
     }
 }

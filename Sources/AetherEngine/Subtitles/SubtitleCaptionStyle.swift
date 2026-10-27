@@ -271,7 +271,6 @@ public struct SubtitleCaptionStyle: Sendable, Equatable {
 
     /// `observeChanges` for a caller that has just read the style and wants no second read.
     static func observeChanges(startingFrom initial: SubtitleCaptionStyle,
-                               fireSink: (@Sendable (@escaping @Sendable (Notification) -> Void) -> Void)? = nil,
                                _ handler: @escaping @Sendable (SubtitleCaptionStyle) -> Void) -> Observation {
         let last = LastStyle(initial)
         let gate = Gate()
@@ -282,7 +281,6 @@ public struct SubtitleCaptionStyle: Sendable, Equatable {
             guard gate.isOpen, last.replace(with: style) else { return }
             handler(style)
         }
-        fireSink?(fire)   // test seam: lets a test deliver a notification that is already in flight
         var tokens = [NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil, using: fire)]
         #if os(macOS)
         // The setting is changed in another process, and macOS delivers it on the distributed centre.

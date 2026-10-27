@@ -63,7 +63,14 @@ enum EngineShaders {
 }
 
 @_spi(ShaderArchive) public enum EngineShaderArchive {
+    /// Every pipeline of the archive (`Scripts/build-shader-archive.sh`): the finisher's planned set and the overlay's
+    /// subtitle blends on `library` (the engine's default.metallib from a tvOS build, loaded on the Mac) and, with the
+    /// `DualLayerDolbyVision` trait, every pipeline of the FEL composer on `felLibrary` (AetherFELShaders' from the same
+    /// build).
     public static func requests(library: MTLLibrary, felLibrary: MTLLibrary?) -> [EngineShaderArchiveRequest] {
+        var requests = (PlanarFrameFinisher.archivedRequests(library: library) + OverlaySubtitles.archivedRequests()).map {
+            EngineShaderArchiveRequest(library: library, function: $0.function, constants: $0.constants)
+        }
         #if DualLayerDolbyVision
         if let felLibrary {
             requests += DoviFelComposer.SharedPipelines.archivedRequests().map {

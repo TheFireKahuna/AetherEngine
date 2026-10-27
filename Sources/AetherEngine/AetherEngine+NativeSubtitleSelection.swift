@@ -20,8 +20,14 @@ import AVFoundation
 /// on tvOS 27 (DolbyVisionPulse, https://github.com/TheFireKahuna/DolbyVisionPulse, `SEQ=subs`, 2026-10-25).
 extension AetherEngine {
 
+    /// Whether the overlay draws the track at `ordinal` of the rendition table rather than AVKit: every track while a
+    /// Picture in Picture window shows the software overlay; a bitmap track; ASS when the host draws its styling
+    /// (`LoadOptions.preserveASSMarkup`); and a text track while the subtitle delay differs from the one its rendition
+    /// serves, which only the overlay can apply at once.
     func overlayDrawsNativeTrack(ordinal: Int) -> Bool {
         guard ordinal < nativeSubtitleTrackTable.count else { return false }
+        // A Picture in Picture window showing the software overlay shows nothing AVKit draws.
+        if pictureInPictureActive, softwareOverlay != nil { return true }
         let entry = nativeSubtitleTrackTable[ordinal]
         if entry.needsOCR { return true }
         if loadedOptions.preserveASSMarkup, let id = entry.sourceStreamIndex ?? entry.externalID,
