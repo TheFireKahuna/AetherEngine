@@ -12,6 +12,56 @@ the public-API contract.
 
 ### Added
 
+- **TrueHD Atmos as APAC objects, personal builds only** (`APACObjectOutput` trait, off by default, with
+  `AETHER_APAC_OBJECTS=1`). Every element of the object presentation goes to APAC as a positioned object
+  (the LFE on a bed) for tvOS to render, instead of the engine's speaker bed. Private AudioCodec properties
+  Mac against the engine's own render of the same exact decode: same level and speaker split. The playlist
+  announces the stream as the 7.1.4 tier (`apac.31.03`, `CHANNELS="12"`) whatever its own profile: announced
+  as `apac.05.00`, a tvOS 27.2 Apple TV delivered it as multichannel PCM instead of Dolby MAT. Zone masks
+  and divergence, which the system renderer ignores, are rendered by the engine (TS 103 448) onto eleven
+  fixed objects on the 7.1.4 speakers, crossfading over the update's ramp; an object switched off fades
+  where it is instead of gliding to the room's centre. An object that jumps across the room ramps as Atmos
+  does, fading out where it was (on the bus) and in where it goes, instead of sweeping through the
+  speakers between; 3–5% of position changes in films are such jumps. Objects are rendered for the output tvOS actually renders to (7.1.4
+  for Dolby Atmos over HDMI and for headphones, otherwise the route's 7.1, 5.1 or stereo), followed as the
+  route changes: the speaker bus sits on that output's speakers, trims are that layout's, objects go to
+  layouts without heights at ear level (tvOS would lower them by their height), and on stereo every object
+  is rendered by the engine, as tvOS's stereo pan law is not TS 103 448's. Measured through Apple's
+  renderer on each output against the engine's TS 103 448 render: within 0.04 dB and 0.12 points.
+  `SpatialSpeakerLayout` gains `.l20`, `.l51` and `.l71` for this; they are outputs, not beds, so
+  `allCases` leaves them out and `objectAudioRendering` refuses them. Object metadata leaves more room in APAC's 2,048-byte
+  metadata channel: a restatement of where an object already is no longer costs a block (the largest
+  packet on Helicopter fell from 1,888 to 1,392 bytes), and a packet that still does not fit halves the
+  block budget of its busiest object first instead of every object's. The session log reports the largest
+  packet and any reductions. **Codec quality:** every object is now coded at its own 1 Mbit/s (the Object
+  component's `Bit Rate`, honoured although the codec lists it as not allowed), where the encoder codes to
+  quality rather than rate. Without it every object got 128 kbit/s whatever the stream's target, and a full
+  scene came back at 24–28 dB SNR with its top octave gone. Measured through Apple's renderer against the
+  exact objects: Helicopter 50 dB at 1.5 Mbit/s, Unfold 50 dB at 7.5 Mbit/s (peak 10.3), a Furiosa action
+  minute 60 dB at 5.5 Mbit/s, the last above the 7.1.4 bed encoder's 55 dB on the same scene. The playlist
+  declares 17 Mbit/s for the audio. Slot and bus gain ramps now step as TS 103 448's do (ramp + 1 steps,
+  the first on the update's frame), so a crossfaded jump sums exactly; a jump arriving mid-ramp hands the
+  bus what the slot is actually playing, with a second bus voice per object so a fade still running
+  finishes; and on stereo, bed channels are rendered by the engine too. An object stream no longer loses
+  all its metadata (every object at the room's centre) when a bed encoder in the process ends its stream
+  between the object codec's set-up and its first frames: the object encoder now sets its codec up for
+  coding when it codes them, and after a reset, under a lock it shares with the bed encoder's end of
+  stream (`APACCodecGate`). This was the placement test that failed now and then beside the bridge suite.
+
+
+- **Object size along each axis** (TS 103 448 pseudocodes 7-14 with object_width_X, _Y, _Z): OAMD width,
+  depth and height each shape the spread, instead of the largest standing for all three. Apple's renderer
+  takes one size for every axis, so on object APAC an object sized differently along its axes is rendered
+  by the engine on the speaker bus. Matches an independent implementation of the clause to 1e-4.
+
+
+- **TrueHD Atmos at 96 and 192 kHz is rendered with its objects** instead of falling back to the channel
+  48 kHz right after decoding (`ObjectAudioDecimator`: linear-phase FIR, flat to 20 kHz, over 100 dB down
+  from 28 kHz), with its delay taken up front so every frame and every metadata update keeps its time;
+  payload interval implies (TS 103 420 5.3: 1536 per frame of metadata). Measuring it takes two
+  payloads, so at the start of such a stream its first metadata comes one payload interval (up to
+  32 ms) later, covered by the hold the engine already keeps; seeks within the stream reuse it.
+
 - **`EngineLog.structuredHandler` hands a host each line with its category and level (AE#897, thanks
   @mschirrmeister).** A log viewer that files lines by subsystem had only the text and guessed the category from the
   `[Prefix]` convention. The new handler gets the same redacted lines as `handler`, plus the `Category` the line was
@@ -19,13 +69,17 @@ the public-API contract.
   unchanged.
 
 - **Hosts can query presentation-backed first-frame evidence with `hasRenderedVideoFrame()` (AE#901, thanks @jonluca).**
-  Native playback reads the current layer after this load's readiness edge; software playback reads
-  the current renderer's non-dropped frame count. Unlike the load-scoped readiness latch, this does
-  not infer a local picture from an external player's readiness. A stopped or replaced session
-  cannot answer with an older asynchronous metrics result.
+  Native playback reads the current layer after this load's readiness edge; a session the software
+  overlay draws reads that overlay's first presented picture, since its player layer only shows the
+  placeholder stream. Unlike the load-scoped readiness latch, this does not infer a local picture from
+  an external player's readiness.
 
 ### Fixed
 
+- **The audio tap delivers audio on TrueHD Atmos and DTS:X sessions.** Their loopback audio is APAC, which
+  libavcodec cannot decode, so the tap's stream stayed empty for the whole session. The tap now decodes APAC
+  with AudioToolbox, from the cookie the init segment carries, and downmixes the bed to its mono 48 kHz format
+  on the same clock as every other codec.
 - **A placeholder stream never reaches an AirPlay receiver.** AVPlayer handed a receiver the stream of a
   for those sessions, the picture stays on the device and the audio follows the route, and
 - **A retained paused session recovers a failed overlay layer on its return** (AE#870). With
@@ -66,6 +120,14 @@ the public-API contract.
   `reactivateAudioSession()` makes the session active again for a resume on the paths the engine owns it
   (software, audio-only) and leaves the native path to AVKit, for hosts that called `setActive` themselves.
 
+- **APAC fragments state their pre-roll, as Apple's HLS writer writes them.** Every APAC packet reports one
+  packet of pre-roll (`AudioStreamPacketDependencyDescription`), which Apple's own HLS fMP4 carries as a
+  fragment-local `prol` sample group with roll distance 1; movenc, muxing the track as its ALAC stand-in,
+  wrote none, so a player starting at a fragment could not know the first packet wants the one before it. The
+  APAC track's `moof`s now carry it, every size and data offset corrected. On the software route, where an
+  automatic renderer flush (AE#549) restarts the decoder mid-stream, the packet before goes in again first,
+  trimmed for its whole duration.
+
 - **CM v4.0 RPUs with a level 253 block keep their Dolby Vision on the Profile 7 routes.** Disney+ v4.0
   RPUs carry L253 (0x55 filler, up to 66 bytes), which `dolby_vision` 3.4.0 refused as an unknown level, so
   every RPU of a hybrid built on such a donor was dropped and the title played as its base layer.
@@ -94,6 +156,7 @@ the public-API contract.
   TheFireKahuna/dovi_tool at 2.3.4. Same crate version, 3.4.0, plus the unreleased level 253 support;
   the header change is additive (`DoviDmData.level253`, two constants). Every upstream slice ships;
   upstream's pin is kept in a comment in `Package.swift`.
+
 ## [7.48.0] - 2026-10-26
 
 ### Added

@@ -1,0 +1,179 @@
+// Only with the APACObjectOutput trait (personal builds, off by default).
+#if APACObjectOutput
+import Foundation
+
+/// One object's position, size and gain over time, kept the way `ObjectAudioRenderer` applies
+/// metadata: an update moves each value from where it is (mid-ramp included) to its new value over
+/// the update's ramp, linearly, and a ramp of 0 (or the first update after a reset) jumps.
+///
+/// Atmos ramps speaker gains (TS 103 448 5.5), the renderer ramps positions. The two agree for a
+/// ramp to or from silence only if the object does not move meanwhile, so it fades where it was
+/// and comes in where it is going: an object switched off would otherwise glide to the default
+/// position (the room's centre) as it fades out, and back from there when it returns.
+///
+/// The object encoder needs it twice per 1024-frame packet: per sample, to apply the gain to the
+/// audio, and once at the packet's end, to describe its motion as `APACObjectMetadata.Block`s. The
+/// renderer moves an object linearly over each block's interpolation length (measured, README
+/// §3.20), so a trajectory made of linear pieces is described exactly by a block wherever a piece
+/// starts or a ramp ends.
+struct APACObjectTrajectory {
+
+    /// The values one update sets.
+    struct Values: Equatable {
+        var position: SIMD3<Float>
+        var size: Float
+        var gain: Float
+
+        /// The same as far as the renderer is told: position and size (the gain is in the audio).
+        func placed(like other: Values) -> Bool { position == other.position && size == other.size }
+
+        func lerp(to other: Values, _ t: Float) -> Values {
+            Values(position: position + (other.position - position) * t,
+                   size: size + (other.size - size) * t,
+                   gain: gain + (other.gain - gain) * t)
+        }
+    }
+
+    /// A linear piece: `from` at `start`, `to` at `start + length` and after.
+    private struct Piece {
+        var start: Int64
+        var length: Int64
+        var from: Values
+        var to: Values
+        /// The gain on the frame before `start`, which a ramp steps from.
+        var before: Float
+
+        /// Position and size move as the renderer interpolates a block: `from` at `start`, `to` after
+        /// `length` frames. The gain, applied to the audio here, ramps as TS 103 448 ramps speaker
+        /// gains (pseudocode 19): length + 1 steps, the first on the update's own frame, so a fade on
+        /// a slot and one on the speaker bus (`ObjectAudioRenderer`) step together.
+        func value(at t: Int64) -> Values {
+            guard length > 0, t < start + length else { return to }
+            guard t >= start else { return from }
+            var v = from.lerp(to: to, Float(t - start) / Float(length))
+            v.gain = from.gain + (to.gain - from.gain) * Float(t - start + 1) / Float(length + 1)
+            return v
+        }
+
+        /// The gain played on the frame before `t`. A jump at `t` itself already holds: a second update
+        /// on its frame (the encoder silences a slot and fades it in again) starts from it.
+        func gain(before t: Int64) -> Float {
+            if t > start { return value(at: t - 1).gain }
+            return length == 0 ? to.gain : before
+        }
+
+    }
+
+    /// The piece in force now, and the ones it replaced since the last `blocks` call (oldest first),
+    /// which the packet being built still needs.
+    private var piece: Piece
+    private var replaced: [Piece] = []
+    private var hasMetadata = false
+    /// The renderer has no position for this object yet (stream start, encoder restart), so the next
+    /// packet opens with a jump to it rather than a glide from the renderer's default.
+    private(set) var needsJump = true
+
+    init(_ initial: Values) {
+        piece = Piece(start: 0, length: 0, from: initial, to: initial, before: initial.gain)
+    }
+
+    func value(at t: Int64) -> Values { piece.value(at: t) }
+
+    /// The gain played on the frame before `t`, where a ramp starting at `t` steps from (TS 103 448
+    /// pseudocode 19 takes mix_gain as it stands before the update's frame).
+    func gain(before t: Int64) -> Float { piece.gain(before: t) }
+
+    /// Apply an update at absolute frame `t`. Updates come in time order, none before the start of
+    /// the packet `blocks` will describe next.
+    mutating func apply(_ values: Values, at t: Int64, rampFrames: Int) {
+        // A restatement of where the object already is, with no ramp in flight, changes nothing; as a
+        // piece it would cost a metadata block saying so. (One mid-ramp restarts the ramp, as in Atmos.)
+        if hasMetadata, values == piece.to, t >= piece.start + piece.length { return }
+        let jump = rampFrames <= 0 || !hasMetadata
+        hasMetadata = true
+        var now = piece.value(at: t)
+        now.gain = piece.gain(before: t)
+        replaced.append(piece)
+        if jump {
+            piece = Piece(start: t, length: 0, from: values, to: values, before: now.gain)
+            return
+        }
+        var to = values
+        var from = now
+        if to.gain == 0 {
+            to.position = now.position
+            to.size = now.size
+        } else if from.gain == 0 {
+            from.position = to.position
+            from.size = to.size
+        }
+        piece = Piece(start: t, length: Int64(rampFrames), from: from, to: to, before: now.gain)
+    }
+
+    /// Hold every value where it has got to: the encoder restarted at `t`, and the renderer starts
+    /// again from its default.
+    mutating func restart(at t: Int64) {
+        let now = piece.value(at: t)
+        piece = Piece(start: t, length: 0, from: now, to: now, before: now.gain)
+        replaced.removeAll()
+        needsJump = true
+    }
+
+    /// The next update describes the far side of a gap in the source: apply it as a jump.
+    mutating func markDiscontinuity() { hasMetadata = false }
+
+    /// Blocks describing `[packetStart, packetStart + 1024)`, at most `maxBlocks`. Call after every
+    /// update before the packet's end and before any at or after it, then `finishPacket`.
+    func blocks(
+        packetStart: Int64, maxBlocks: Int, map: (Values) -> (APACObjectMetadata.Point, Float)
+    ) -> [APACObjectMetadata.Block] {
+        let end = packetStart + 1024
+        let pieces = replaced + [piece]
+        /// The value just after `t` (the latest piece starting at or before it) or just before it.
+        func value(_ t: Int64, justAfter: Bool) -> Values {
+            let p = pieces.last(where: { justAfter ? $0.start <= t : $0.start < t }) ?? pieces[0]
+            return p.value(at: t)
+        }
+        // Where something changes inside the packet: a piece starts (jump or new ramp) or a ramp ends.
+        var points: Set<Int64> = []
+        for p in pieces {
+            if p.start > packetStart, p.start < end { points.insert(p.start) }
+            let rampEnd = p.start + p.length
+            if p.length > 0, rampEnd > packetStart, rampEnd < end { points.insert(rampEnd) }
+        }
+        var boundaries = [packetStart] + points.sorted()
+        // Over budget: evenly spaced boundaries instead (a jump between two of them becomes a glide
+        // over at most 1024 / (maxBlocks / 2) frames). Half, since a jump costs two blocks.
+        let budget = max(maxBlocks / 2, 1)
+        if boundaries.count > budget {
+            boundaries = (0..<budget).map { packetStart + Int64($0) * 1024 / Int64(budget) }
+        }
+
+        var blocks: [APACObjectMetadata.Block] = []
+        func add(_ t: Int64, _ interpolation: Int64, _ v: Values) {
+            let (point, size) = map(v)
+            blocks.append(.init(start: Int(t - packetStart), interpolation: Int(interpolation), position: point, size: size))
+        }
+        for (i, t) in boundaries.enumerated() {
+            let next = i + 1 < boundaries.count ? boundaries[i + 1] : end
+            let after = value(t, justAfter: true)
+            let target = value(next, justAfter: false)
+            let jumps = (t == packetStart && needsJump) || !value(t, justAfter: false).placed(like: after)
+            if jumps {
+                add(t, 0, after)
+                if !target.placed(like: after) { add(t, next - t, target) }
+            } else {
+                add(t, next - t, target)
+            }
+        }
+        return Array(blocks.prefix(maxBlocks))
+    }
+
+    /// The packet `blocks` described has been written: the renderer now knows the object, and the
+    /// pieces it replaced are no longer needed.
+    mutating func finishPacket() {
+        replaced.removeAll()
+        needsJump = false
+    }
+}
+#endif

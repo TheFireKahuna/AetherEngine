@@ -45,27 +45,68 @@ enum APACSampleEntry {
         return String(format: "apac.31.%02d", level)
     }
 
+    /// HLS `CODECS` value read from the encoder's magic cookie (the `dapa` box): the profile is the
+    /// top 6 bits of the configuration's byte 2 and the level the 4 bits after them. The channel bed
+    /// encoder's cookies read 31 / 3 for 7.1.4 and 31 / 4 for 9.1.6, matching `codecsString(channelCount:)`;
+    /// object APAC reads profile 5 (low), level 0. Nil for a cookie too short to hold them.
+    static func codecsString(magicCookie: Data) -> String? {
+        let b = [UInt8](magicCookie)
+        // size(4) 'dapa'(4) version/flags(4), then the configuration.
+        guard b.count >= 16, String(bytes: b[4..<8], encoding: .ascii) == "dapa" else { return nil }
+        let profile = Int(b[14] >> 2)
+        let level = Int((b[14] & 0x03) << 2 | b[15] >> 6)
+        return String(format: "apac.%02d.%02d", profile, level)
+    }
+
     /// `initBytes` with the sound track's first sample entry replaced by `entry`, or nil when the
     /// init has no parseable sound track (the caller then forwards it unchanged, and the failure
     /// shows up as a load error naming the audio rather than as corrupt bytes).
     static func replacingSoundSampleEntry(in initBytes: Data, with entry: Data) -> Data? {
         let b = [UInt8](initBytes)
-        let n = b.count
-
-        func u32(_ o: Int) -> UInt32? {
-            guard o >= 0, o + 4 <= n else { return nil }
-            return (UInt32(b[o]) << 24) | (UInt32(b[o + 1]) << 16) | (UInt32(b[o + 2]) << 8) | UInt32(b[o + 3])
+        guard let found = soundSampleEntry(in: b) else { return nil }
+        let first = found.entry
+        var out = Array(b[0..<first.start])
+        out.append(contentsOf: entry)
+        out.append(contentsOf: b[first.end..<b.count])
+        let delta = entry.count - (first.end - first.start)
+        // Every ancestor's header precedes the replaced entry, so its offset is the same in `out`.
+        for ancestor in found.ancestors {
+            let old = Int(u32(b, ancestor.start)!)
+            // Size 0 means "to the end of the file", which stays true after the splice.
+            if old == 0 { continue }
+            let new = UInt32(old + delta)
+            out.replaceSubrange(ancestor.start..<ancestor.start + 4, with: bigEndian(new))
         }
+        return Data(out)
+    }
+
+    /// The `dapa` cookie in `initBytes` when its sound track's first sample entry is `apac`, as
+    /// ``sampleEntry(magicCookie:sampleRate:)`` writes it: what a decoder of the track needs to start.
+    /// Nil for any other entry.
+    static func magicCookie(inInit initBytes: Data) -> Data? {
+        let b = [UInt8](initBytes)
+        guard let entry = soundSampleEntry(in: b)?.entry, entry.type == "apac" else { return nil }
+        // The AudioSampleEntry v0 fields take the 28 bytes after the box header; the cookie follows them.
+        let cookieStart = entry.payload + 28
+        guard cookieStart < entry.end else { return nil }
+        return Data(b[cookieStart..<entry.end])
+    }
+
+    private struct Box { let start: Int; let type: String; let payload: Int; let end: Int }
+
+    /// The sound track's first sample entry and the boxes holding it, innermost first (`stsd` to
+    /// `moov`). Nil when there is no sound track, or its `stsd` holds no entry.
+    private static func soundSampleEntry(in b: [UInt8]) -> (entry: Box, ancestors: [Box])? {
+        let n = b.count
         func fourcc(_ o: Int) -> String? {
             guard o >= 0, o + 4 <= n else { return nil }
             return String(bytes: b[o..<o + 4], encoding: .ascii)
         }
-        struct Box { let start: Int; let type: String; let payload: Int; let end: Int }
         func boxes(_ start: Int, _ end: Int) -> [Box] {
             var out: [Box] = []
             var o = start
             while o + 8 <= end {
-                guard let size = u32(o), size != 1, let t = fourcc(o + 4) else { break }
+                guard let size = u32(b, o), size != 1, let t = fourcc(o + 4) else { break }
                 let boxSize = size == 0 ? (end - o) : Int(size)
                 guard boxSize >= 8, o + boxSize <= end else { break }
                 out.append(Box(start: o, type: t, payload: o + 8, end: o + boxSize))
@@ -88,22 +129,14 @@ enum APACSampleEntry {
             else { continue }
             // stsd: version/flags(4) + entry_count(4), then the entries.
             guard let first = boxes(stsd.payload + 8, stsd.end).first else { return nil }
-
-            var out = Array(b[0..<first.start])
-            out.append(contentsOf: entry)
-            out.append(contentsOf: b[first.end..<n])
-            let delta = entry.count - (first.end - first.start)
-            // Every ancestor's header precedes the replaced entry, so its offset is the same in `out`.
-            for ancestor in [stsd, stbl, minf, mdia, trak, moov] {
-                let old = Int(u32(ancestor.start)!)
-                // Size 0 means "to the end of the file", which stays true after the splice.
-                if old == 0 { continue }
-                let new = UInt32(old + delta)
-                out.replaceSubrange(ancestor.start..<ancestor.start + 4, with: bigEndian(new))
-            }
-            return Data(out)
+            return (first, [stsd, stbl, minf, mdia, trak, moov])
         }
         return nil
+    }
+
+    private static func u32(_ b: [UInt8], _ o: Int) -> UInt32? {
+        guard o >= 0, o + 4 <= b.count else { return nil }
+        return (UInt32(b[o]) << 24) | (UInt32(b[o + 1]) << 16) | (UInt32(b[o + 2]) << 8) | UInt32(b[o + 3])
     }
 
     private static func bigEndian(_ v: UInt32) -> [UInt8] {

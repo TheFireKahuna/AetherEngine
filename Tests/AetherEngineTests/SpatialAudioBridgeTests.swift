@@ -21,6 +21,7 @@ struct SpatialAudioBridgeTests {
     /// the first `skipAfterReset` access units after a reset are discarded as a real decoder does
     /// while it looks for a major sync, and `dropAt` discards a run mid-stream like a corrupt span.
     final class SyntheticDecoder: ObjectAudioDecoding {
+        let span = AudioStageSpan.instant
         let framesPerAU = 40
         var skipAfterReset: Int
         var dropAt: (push: Int, count: Int)?
@@ -78,6 +79,7 @@ struct SpatialAudioBridgeTests {
 
     /// Stand-in decoder that refuses every access unit, as a corrupt or foreign stream would.
     final class RejectingDecoder: ObjectAudioDecoding {
+        let span = AudioStageSpan.instant
         struct Refused: Error {}
         func push(_ bytes: UnsafeRawBufferPointer) throws { throw Refused() }
         func nextBlock() throws -> ObjectAudioDecodedBlock? { nil }
@@ -88,6 +90,7 @@ struct SpatialAudioBridgeTests {
     /// contiguous from the first push, and the left bed channel carries a 3 ms 1 kHz burst
     /// starting at input frame `clickFrame`.
     final class ClickDecoder: ObjectAudioDecoding {
+        let span = AudioStageSpan.instant
         let clickFrame: Int64
         private var inputFrames: Int64 = 0
         private var blocks: [(offset: Int64, frames: Int)] = []
@@ -146,14 +149,19 @@ struct SpatialAudioBridgeTests {
     #endif
 
     #if TrueHDObjectAudio
-    @Test("only TrueHD that FFmpeg marks Atmos, at 48 kHz or not yet known, is rendered")
+    @Test("only TrueHD that FFmpeg marks Atmos, at 48, 96 or 192 kHz or not yet known, is rendered")
     func eligibility() {
         let on = ObjectAudioRendering.apac(.l714)
         #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 48_000) == .l714)
         #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 0) == .l714)
         #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_TRUEHD, profile: 0, sampleRate: 48_000) == nil,
                 "TrueHD without Atmos keeps its lossless 7.1")
-        #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 96_000) == nil)
+        for rate: Int32 in [96_000, 192_000] {
+            #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: rate) == .l714,
+                    "decimated to 48 kHz after decoding")
+        }
+        #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 88_200) == nil)
+        #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 44_100) == nil)
         #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_EAC3, profile: 30, sampleRate: 48_000) == nil,
                 "E-AC-3 JOC is already Atmos and stream-copies")
         #expect(HLSVideoEngine.spatialRenderingLayout(rendering: .off, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 48_000) == nil)
@@ -204,7 +212,10 @@ struct SpatialAudioBridgeTests {
         // frame plays on the anchor.
         #expect(packets.first?.pts == Int64(48_200))
         #expect(zip(packets, packets.dropFirst()).allSatisfy { $1.pts - $0.pts == 1024 })
-        #expect(packets.allSatisfy { $0.key && $0.size > 0 })
+        #expect(packets.allSatisfy { $0.size > 0 })
+        // The run's sync packets, keyframes to the muxer: every interval from its first packet.
+        #expect(packets.indices.filter { packets[$0].key }
+                == Array(stride(from: 0, to: packets.count, by: APACEncoder.syncPacketInterval)))
         // 96000 frames in, 200 of them skipped, after two packets of priming; the flush pads the
         // last partial packet.
         #expect(packets.count == 2 + Int((Double(96_000 - 200) / 1024).rounded(.up)))
@@ -326,6 +337,7 @@ struct SpatialAudioBridgeTests {
     /// Like `ClickDecoder`, but returns nothing after a reset until the bridge asks for what it
     /// holds, as the TrueHD decoder does while it waits for the first object metadata.
     final class HoldingDecoder: ObjectAudioDecoding {
+        let span = AudioStageSpan.instant
         private let inner = ClickDecoder(clickFrame: 30_000)
         private var holding = true
         private(set) var releases = 0
@@ -533,9 +545,44 @@ struct SpatialAudioBridgeTests {
         #expect(abs(heard - 0.25) < 0.001, "the click decodes at \(heard) s, not at its source position 0.25 s")
     }
 
-    /// Decodes the track to PCM and returns when the left channel first rises above the click
-    /// threshold, or nil when it never does. Blocks until AVFoundation has decoded that far.
-    private static func clickOnset(asset: AVURLAsset, track: AVAssetTrack) throws -> Double? {
+    #if APACObjectOutput
+    @Test("object output: the init segment carries a low-profile apac entry, announced as 7.1.4")
+    func objectOutputMuxedInit() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714,
+            decoder: SyntheticDecoder(skipAfterReset: 0), objectOutput: true)
+        defer { bridge.close() }
+        // Announced as the 7.1.4 tier tvOS delivers it as (see `SpatialAudioBridge.init`); the stream
+        // itself is low profile, level 0.
+        #expect(bridge.hlsCodecs == "apac.31.03")
+        #expect(APACSampleEntry.codecsString(magicCookie: try #require(bridge.soundSampleEntryOverride).suffix(from: 36)) == "apac.05.00")
+        guard let muxed = try muxWithProbeVideo(bridge, startMs: 0, count: 50) else { return }
+        defer { try? FileManager.default.removeItem(at: muxed.sessionDir) }
+        #expect(muxed.initBytes.range(of: bridge.soundSampleEntryOverride!) != nil)
+        #expect(try Data(contentsOf: muxed.segment).count > 1000, "the segment carries audio")
+    }
+
+    @Test("object output: CODECS and CHANNELS both name the 7.1.4 tier, whatever bed layout was asked for",
+          arguments: [SpatialSpeakerLayout.l714, .l916, .l512])
+    func objectOutputAnnouncesItsTier(layout: SpatialSpeakerLayout) throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: layout,
+            decoder: SyntheticDecoder(skipAfterReset: 0), objectOutput: true)
+        defer { bridge.close() }
+        #expect(bridge.hlsCodecs == "apac.31.03")
+        #expect(bridge.servedChannelCount == 12)
+    }
+
+    /// The timestamp contract again, with the click carried by an object (`APACObjectEncoder`): its
+    /// priming and packet stamping have to put it where the source did, like the bed encoder's.
+    #endif
+
+    /// Decodes the track to PCM and returns when the left channel (any channel with `anyChannel`)
+    /// first rises above the click threshold, or nil when it never does. Blocks until AVFoundation has
+    /// decoded that far.
+    private static func clickOnset(asset: AVURLAsset, track: AVAssetTrack, anyChannel: Bool = false) throws -> Double? {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
             AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 32,
@@ -556,7 +603,8 @@ struct SpatialAudioBridgeTests {
                 bufferListSize: MemoryLayout<AudioBufferList>.size, blockBufferAllocator: nil,
                 blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: &block)
             guard let samples = list.mBuffers.mData?.assumingMemoryBound(to: Float.self) else { continue }
-            if let i = (0..<frames).first(where: { abs(samples[$0 * channels]) > 0.2 }) {
+            let width = anyChannel ? channels : 1
+            if let i = (0..<frames).first(where: { f in (0..<width).contains { abs(samples[f * channels + $0]) > 0.2 } }) {
                 return start + Double(i) / 48_000
             }
         }
@@ -724,6 +772,7 @@ extension SpatialAudioBridgeTests {
     /// Contiguous like `ClickDecoder`, but at push `panicAt` it fails the way the real one does on a
     /// caught panic: the push throws, the decoder resets itself, and its offsets start from zero.
     final class SelfResettingDecoder: ObjectAudioDecoding {
+        let span = AudioStageSpan.instant
         let panicAt: Int
         private var pushes = 0
         private var inputFrames: Int64 = 0
@@ -758,6 +807,7 @@ extension SpatialAudioBridgeTests {
 
     /// Decodes fine at a rate the renderer refuses, so every block throws.
     final class WrongRateDecoder: ObjectAudioDecoding {
+        let span = AudioStageSpan.instant
         private var pending = 0
         private let plane = UnsafeMutablePointer<Float>.allocate(capacity: 4096)
         deinit { plane.deallocate() }

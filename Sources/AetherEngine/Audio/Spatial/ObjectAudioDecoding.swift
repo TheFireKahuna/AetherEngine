@@ -40,6 +40,9 @@ protocol ObjectAudioDecoding: AnyObject {
     /// How often the decoder has reset ITSELF after an internal failure. Its input offsets count from
     /// zero again afterwards, so the caller has to re-anchor its timeline.
     var selfResetCount: Int { get }
+    /// What its output at a position takes input from (`AudioStageSpan`), from where a read starts:
+    /// the wait for a point the bitstream decodes from, and the history the decode is coded against.
+    var span: AudioStageSpan { get }
 }
 
 extension ObjectAudioDecoding {

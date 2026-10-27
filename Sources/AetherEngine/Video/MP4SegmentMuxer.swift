@@ -25,6 +25,8 @@ import AetherLibavutil
 /// av_write_frame(nil) (gated by `moovFlushed`) handles FFmpeg splitting ftyp+moov and
 /// moof+mdat across calls; subsequent cuts are single-call. FragmentSplitter routes ftyp+moov
 /// to onInitCaptured (init.mp4) and moof+mdat bytes to the staging POSIX file.
+/// The APAC track the splitter adds the pre-roll group to, set from the init (splitter-thread only).
+
 final class MP4SegmentMuxer {
 
     // MARK: - Types
@@ -366,7 +368,10 @@ final class MP4SegmentMuxer {
         self.byteCounter = counter
 
         let sampleEntryOverride = audio?.soundSampleEntryOverride
-        let stereo = video.stereo
+        // The APAC track's fragments carry the pre-roll group its encoder states (`APACPreRollGroup`); the
+        // track is found in the init the moment it is written, before any fragment.
+        let preRoll = PreRollTrack()
+        let stereo = video?.stereo
         self.splitter = FragmentSplitter(
             onHeaderComplete: { initBytes in
                 var initBytes = Self.installingSoundSampleEntry(sampleEntryOverride, in: initBytes)

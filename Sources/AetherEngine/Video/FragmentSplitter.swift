@@ -9,11 +9,17 @@ final class FragmentSplitter {
     /// Called for every fragment-box byte (moof, mdat, styp, sidx), including box headers.
     let onFragmentBytes: (UnsafePointer<UInt8>, Int) -> Void
 
+    /// When set, each `moof` is held whole and forwarded as this returns it (the APAC pre-roll group,
+    /// `APACPreRollGroup`). A moof is a few hundred bytes to a few KB; the mdat after it still streams.
+    let moofRewriter: ((Data) -> Data)?
+    private var moofBuffer = Data()
+
     private enum Phase {
         case awaitingBoxHeader
         case awaitingLargeSize(boxType: String)
         case insideHeaderBox(boxType: String, bytesRemaining: Int)
         case insideFragmentBox(boxType: String, bytesRemaining: Int)
+        case insideHeldMoof(bytesRemaining: Int)
         case insideDiscardBox(boxType: String, bytesRemaining: Int)
     }
     private var phase: Phase = .awaitingBoxHeader
@@ -23,9 +29,11 @@ final class FragmentSplitter {
     private var headerBuffer = Data()
 
     init(onHeaderComplete: @escaping (Data) -> Void,
-         onFragmentBytes: @escaping (UnsafePointer<UInt8>, Int) -> Void) {
+         onFragmentBytes: @escaping (UnsafePointer<UInt8>, Int) -> Void,
+         moofRewriter: ((Data) -> Data)? = nil) {
         self.onHeaderComplete = onHeaderComplete
         self.onFragmentBytes = onFragmentBytes
+        self.moofRewriter = moofRewriter
         self.pendingHeaderBytes.reserveCapacity(16)
     }
 
@@ -64,6 +72,21 @@ final class FragmentSplitter {
                     phase = .awaitingBoxHeader
                 } else {
                     phase = .insideFragmentBox(boxType: boxType, bytesRemaining: newRemaining)
+                }
+
+            case .insideHeldMoof(let remaining):
+                let take = min(remaining, count - offset)
+                moofBuffer.append(bytes.advanced(by: offset), count: take)
+                offset += take
+                if remaining - take == 0 {
+                    let out = moofRewriter?(moofBuffer) ?? moofBuffer
+                    out.withUnsafeBytes { raw in
+                        if let base = raw.bindMemory(to: UInt8.self).baseAddress { onFragmentBytes(base, out.count) }
+                    }
+                    moofBuffer = Data()
+                    phase = .awaitingBoxHeader
+                } else {
+                    phase = .insideHeldMoof(bytesRemaining: remaining - take)
                 }
 
             case .insideDiscardBox(let boxType, let remaining):
@@ -140,11 +163,26 @@ final class FragmentSplitter {
         return offset
     }
 
+    /// A moof with no body (never written by movenc) completes at its header.
+    private func feedHeldMoofCompletion() {
+        let out = moofRewriter?(moofBuffer) ?? moofBuffer
+        out.withUnsafeBytes { raw in
+            if let base = raw.bindMemory(to: UInt8.self).baseAddress { onFragmentBytes(base, out.count) }
+        }
+        moofBuffer = Data()
+        phase = .awaitingBoxHeader
+    }
+
     private func startBox(type: String, headerBytes: [UInt8], bodySize: Int) {
         switch type {
         case "ftyp", "moov":
             headerBuffer.append(contentsOf: headerBytes)
             phase = .insideHeaderBox(boxType: type, bytesRemaining: bodySize)
+
+        case "moof" where moofRewriter != nil && bodySize < 1 << 24:
+            moofBuffer = Data(headerBytes)
+            phase = .insideHeldMoof(bytesRemaining: bodySize)
+            if bodySize == 0 { feedHeldMoofCompletion() }
 
         case "moof", "mdat", "styp", "sidx":
             headerBytes.withUnsafeBufferPointer { buf in

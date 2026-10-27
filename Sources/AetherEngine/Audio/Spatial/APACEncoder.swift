@@ -1,5 +1,4 @@
 import AVFAudio
-import CoreMedia
 import AudioToolbox
 import Foundation
 
@@ -17,8 +16,15 @@ import Foundation
 /// - the encoder primes 2048 frames (`primeInfo.leadingFrames`). AVFoundation removes them on
 ///   playback by presenting each packet's audio 2048 frames before its timestamp, so the caller
 ///   keeps the priming packets and stamps them from the anchor;
-/// - with the converter's defaults every packet is independently decodable (an Audio Sync Packet),
-///   which is what lets any fMP4 fragment, and so any HLS segment, start on one (HLS authoring 7.9);
+/// - a packet decodes in full only after the one before it (its `mPreRollCount` is 1), except an Audio
+///   Sync Packet, which refreshes the decoder on its own (pre-roll 0). The encoder makes one every
+///   `audioSyncPacketFrequency` packets, counted from its first; without that setting, none. Measured
+///   with a fresh decoder: from a sync packet the output is a continuous decode's from its first
+///   sample, from any other packet its first 1024 frames are wrong and the rest identical;
+/// - in the default rate control (long-term average) the encoder keeps a rate of its own, whatever
+///   the target says (Helicopter's 7.1.4 bed: 3.8 to 3.9 Mbit/s asked for 3.84 or 5.0, segments up
+///   to 4.27); in constant mode it holds the target to the segment, plus each sync packet, about one
+///   packet's worth more;
 /// - the magic cookie IS the complete `dapa` box the sample entry carries;
 /// - the encoder's latency is set by its dynamic range control (DRC) analysis. With DRC off it
 ///   holds only the 2048 priming frames; the `.capture` default holds ~1.56 s (74,752 frames) and
@@ -29,7 +35,7 @@ final class APACEncoder {
 
     struct Packet {
         let data: Data
-        /// Independently decodable (an APAC Audio Sync Packet).
+        /// An Audio Sync Packet: decodes in full without the packet before it.
         let isSync: Bool
     }
 
@@ -50,6 +56,30 @@ final class APACEncoder {
     }
 
     static let framesPerPacket = 1024
+    /// How far ahead of a segment boundary an encoder run has to start for its packets there to be
+    /// a continuous encode's in all but rate control. The encoder's rate control never forgets where
+    /// a run began (no start converges on the packets of another), so a segment that has to come out
+    /// the same from every run gets a run of its own, started this far ahead. Measured at 3.84 Mbit/s
+    /// in constant-rate mode on a 7.1.4 bed, two runs spliced at a boundary against one continuous
+    /// run, error around the seam: 43.6 dB after 2048 frames of lead, 45.4 after 16384, and after
+    /// 32768 the continuous run's own 47.4 (50.2 over the next 20 ms, as continuous).
+    static let segmentRunLeadFrames = 32768
+
+    /// Packets from one Audio Sync Packet to the next, counted from an encoder run's first: the run's
+    /// lead in packets, so the packet a segment starts on is one (`AudioSegmentRuns` starts a run that
+    /// far ahead, on the packet grid), and the segment decodes on its own after a seek. Each costs
+    /// about one packet's worth more (a 7.1.4 bed at 3.84 Mbit/s in constant mode: 3.96 on average),
+    /// which `peakBitRate` counts.
+    static let syncPacketInterval = segmentRunLeadFrames / framesPerPacket
+
+    /// The most bits per second a constant-mode stream at `target` carries over any stretch of at
+    /// least `syncPacketInterval` packets: the target, and the sync packets' extra packet each. A
+    /// stretch holds at most one sync packet more than its length over the interval, so up to two per
+    /// interval's length (measured: 3.97 Mbit/s over six seconds of a 3.84 target, nine sync packets
+    /// in 281). Only a stream's last segment can be shorter, and it plays for less than a second.
+    static func peakBitRate(target: Int) -> Int {
+        (target * (syncPacketInterval + 2) + syncPacketInterval - 1) / syncPacketInterval
+    }
 
     let layout: SpatialSpeakerLayout
     let sampleRate: Double
@@ -57,12 +87,6 @@ final class APACEncoder {
     let magicCookie: Data
     /// Frames of encoder delay at the head of the stream (and again after every `reset`).
     let leadingFrames: Int
-    /// The packets' format as a sample-buffer format description, for a renderer fed the packets directly.
-    /// It carries the `dapa` cookie and 1024 frames per packet: the encoder's own output format has
-    /// neither, and a renderer given that cannot configure its decoder. It then fails every packet
-    /// inside, while its status stays `rendering` and its error stays nil, so the output is silent
-    /// and nothing says so.
-    let formatDescription: CMAudioFormatDescription
 
     private let pcmFormat: AVAudioFormat
     private let converter: AVAudioConverter
@@ -71,9 +95,10 @@ final class APACEncoder {
     private let outputBuffer: AVAudioCompressedBuffer
     private var ended = false
 
-    /// `bitRate` is the target in bits per second. Apple's HLS table recommends 384 kbps for 7.1,
-    /// but the source here is lossless and the bed carries height channels, so the caller asks for
-    /// considerably more (a few Mbit/s, still a fraction of TrueHD's own rate).
+    /// `bitRate` is the target in bits per second, held in constant mode. Apple's HLS table
+    /// recommends 384 kbps for 7.1, but the source here is lossless and the bed carries height
+    /// channels, so the caller asks for considerably more (a few Mbit/s, still a fraction of TrueHD's
+    /// own rate). A sync packet comes every `syncPacketInterval` packets from the first.
     init(layout: SpatialSpeakerLayout, sampleRate: Double = 48_000, bitRate: Int, maxInputFrames: Int = 8192) throws {
         self.layout = layout
         self.sampleRate = sampleRate
@@ -94,6 +119,8 @@ final class APACEncoder {
             throw EncoderError.converterUnavailable(layout)
         }
         conv.bitRate = bitRate
+        conv.bitRateStrategy = AVAudioBitRateStrategy_Constant
+        conv.audioSyncPacketFrequency = Self.syncPacketInterval
         // Film/TV mastered offline, which is what a TrueHD Atmos track is.
         conv.contentSource = .appleAV_Spatial_Offline
         conv.dynamicRangeControlConfiguration = .none
@@ -101,37 +128,10 @@ final class APACEncoder {
         guard let cookie = conv.magicCookie, !cookie.isEmpty else { throw EncoderError.converterUnavailable(layout) }
         magicCookie = cookie
         leadingFrames = Int(conv.primeInfo.leadingFrames)
-        guard let described = Self.cookiedFormatDescription(
-            apac: apac, cookie: cookie, layoutTag: layout.channelLayoutTag) else {
-            throw EncoderError.converterUnavailable(layout)
-        }
-        formatDescription = described
         precondition(maxInputFrames > 0, "APACEncoder needs room for at least one input frame")
         inputBuffer = AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: AVAudioFrameCount(maxInputFrames))!
         outputBuffer = AVAudioCompressedBuffer(
             format: apac, packetCapacity: 16, maximumPacketSize: max(conv.maximumOutputPacketSize, 1))
-    }
-
-    /// The APAC format description with a magic cookie and a packet size, which is what a decoder
-    /// needs to start. Pure, so the tests can build it without playing anything.
-    static func cookiedFormatDescription(
-        apac: AVAudioFormat, cookie: Data, layoutTag: AudioChannelLayoutTag
-    ) -> CMAudioFormatDescription? {
-        // Without the cookie the description is the one that plays silence.
-        guard !cookie.isEmpty else { return nil }
-        var asbd = apac.streamDescription.pointee
-        if asbd.mFramesPerPacket == 0 { asbd.mFramesPerPacket = UInt32(framesPerPacket) }
-        var layout = AudioChannelLayout()
-        layout.mChannelLayoutTag = layoutTag
-        var description: CMAudioFormatDescription?
-        let status = cookie.withUnsafeBytes { bytes in
-            CMAudioFormatDescriptionCreate(
-                allocator: kCFAllocatorDefault, asbd: &asbd,
-                layoutSize: MemoryLayout<AudioChannelLayout>.size, layout: &layout,
-                magicCookieSize: bytes.count, magicCookie: bytes.baseAddress,
-                extensions: nil, formatDescriptionOut: &description)
-        }
-        return status == noErr ? description : nil
     }
 
     /// Queue `frameCount` frames (one plane per layout channel) and return every packet the encoder
@@ -161,7 +161,7 @@ final class APACEncoder {
         guard !ended else { return [] }
         ended = true
         var packets: [Packet] = []
-        try drain(feeding: nil, endOfStream: true, into: &packets)
+        try APACCodecGate.lock.withLock { try drain(feeding: nil, endOfStream: true, into: &packets) }
         return packets
     }
 
@@ -207,9 +207,21 @@ final class APACEncoder {
         for k in 0..<count {
             let d = descriptions[k]
             let data = Data(bytes: base + Int(d.mStartOffset), count: Int(d.mDataByteSize))
-            // No dependency table means a format without dependent packets, where every packet is sync.
-            let sync = dependencies.map { $0[k].mIsIndependentlyDecodable != 0 } ?? true
+            // A sync packet needs no packet before it. No dependency table means a format without
+            // dependent packets, where every packet is one.
+            let sync = dependencies.map { $0[k].mPreRollCount == 0 } ?? true
             packets.append(Packet(data: data, isSync: sync))
         }
     }
+}
+
+/// A lock the APAC encoders in a process share. Measured on macOS 27: a bed encoder (`APACEncoder`)
+/// that was running when an object encoder's codec (`APACObjectEncoder`) was initialized, ending its
+/// stream before that codec has coded its first frames, leaves the whole object stream without its
+/// metadata, every object at the room's centre (6 streams in 6, one thread). Ending it any later does
+/// no harm, nor does disposing of it without ending its stream, nor a bed encoder started after the
+/// object codec. So the object encoder initializes its codec when it codes its first frames, and
+/// that and the end of a bed stream never overlap.
+enum APACCodecGate {
+    static let lock = NSLock()
 }

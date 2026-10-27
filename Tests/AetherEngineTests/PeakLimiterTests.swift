@@ -8,15 +8,23 @@ import Foundation
 struct PeakLimiterTests {
 
     private func run(_ limiter: inout PeakLimiter, _ channels: [[Float]]) -> [[Float]] {
+    /// Through the limiter and out the other side: what it hands on, then what it still holds, so
+    /// frame `i` of the result is frame `i` of the input.
         let frames = channels[0].count
         let planes = channels.map { c -> UnsafeMutablePointer<Float> in
-            let p = UnsafeMutablePointer<Float>.allocate(capacity: frames)
+            let p = UnsafeMutablePointer<Float>.allocate(capacity: frames + PeakLimiter.attackFrames)
             p.initialize(from: c, count: frames)
             return p
         }
         defer { planes.forEach { $0.deallocate() } }
-        limiter.process(planes, frameCount: frames)
-        return planes.map { Array(UnsafeBufferPointer(start: $0, count: frames)) }
+        var out = Array(repeating: [Float](), count: channels.count)
+        let handed = limiter.process(planes, frameCount: frames, lfe: lfe)
+        for c in out.indices { out[c] += UnsafeBufferPointer(start: planes[c], count: handed) }
+        let drained = limiter.drain(into: planes, lfe: lfe)
+        for c in out.indices { out[c] += UnsafeBufferPointer(start: planes[c], count: drained) }
+        return out
+
+    /// Fed in `chunk`-frame pieces without draining, as the bridge feeds it: what comes out, in order.
     }
 
     private func tone(_ amplitude: Float, frames: Int, hz: Float = 1000) -> [Float] {
@@ -25,7 +33,7 @@ struct PeakLimiterTests {
 
     @Test("a bed under the threshold passes bit for bit")
     func transparentBelowThreshold() {
-        var limiter = PeakLimiter(sampleRate: 48_000)
+        var limiter = PeakLimiter(sampleRate: 48_000, channels: 2)
         let input = [tone(0.9, frames: 4800), tone(0.5, frames: 4800, hz: 300)]
         #expect(run(&limiter, input) == input)
         #expect(limiter.takeLimitedFrames().frames == 0)
@@ -33,7 +41,7 @@ struct PeakLimiterTests {
 
     @Test("no sample leaves above the threshold, however loud the input")
     func neverAboveThreshold() {
-        var limiter = PeakLimiter(sampleRate: 48_000)
+        var limiter = PeakLimiter(sampleRate: 48_000, channels: 2)
         let out = run(&limiter, [tone(4, frames: 9600), tone(1.5, frames: 9600, hz: 70)])
         let peak = out.flatMap { $0 }.map(abs).max()!
         #expect(peak <= PeakLimiter.threshold + 1e-6)
@@ -45,7 +53,7 @@ struct PeakLimiterTests {
 
     @Test("one gain for every channel, so an object between two speakers stays where it is")
     func linkedAcrossChannels() {
-        var limiter = PeakLimiter(sampleRate: 48_000)
+        var limiter = PeakLimiter(sampleRate: 48_000, channels: 2)
         let left = tone(2, frames: 4800)
         let right = left.map { $0 * 0.5 }
         let out = run(&limiter, [left, right])
@@ -56,7 +64,7 @@ struct PeakLimiterTests {
 
     @Test("after a loud burst the gain recovers instead of staying down")
     func releases() {
-        var limiter = PeakLimiter(sampleRate: 48_000)
+        var limiter = PeakLimiter(sampleRate: 48_000, channels: 1)
         _ = run(&limiter, [tone(3, frames: 2400)])
         // Two seconds of quiet programme: eight release time constants later it passes untouched.
         let quiet = tone(0.5, frames: 96_000)
@@ -67,10 +75,20 @@ struct PeakLimiterTests {
 
     @Test("a reset forgets the burst")
     func resetForgets() {
-        var limiter = PeakLimiter(sampleRate: 48_000)
+        var limiter = PeakLimiter(sampleRate: 48_000, channels: 1)
         _ = run(&limiter, [tone(3, frames: 2400)])
         limiter.reset()
         let quiet = tone(0.5, frames: 4800)
         #expect(run(&limiter, [quiet]) == [quiet])
     }
+    // MARK: - Span
+
+    @Test("every frame comes out where it went in, `attackFrames` later, whatever the chunking")
+
+
+    @Test("the reduction is already in place when the peak arrives, eased in rather than stepped")
+
+    @Test("a reduction deeper than the rate can release in time still ends within the limit")
+
+    @Test("a shallow reduction releases at the rate, as the exponential envelope did")
 }

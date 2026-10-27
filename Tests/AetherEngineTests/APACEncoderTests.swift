@@ -4,8 +4,9 @@ import Foundation
 
 /// The APAC encoder is Apple's, reached through `AVAudioConverter`. The spatial bridge stamps its
 /// packets by count (#731), so the facts it relies on are pinned against the real encoder here:
-/// packet length, priming, the cookie being the whole `dapa` box, every packet independently
-/// decodable, and no multi-second lookahead with dynamic range control off.
+/// packet length, priming, the cookie being the whole `dapa` box, an Audio Sync Packet on every
+/// `syncPacketInterval`-th packet from the first, a rate held to its target, and no multi-second
+/// lookahead with dynamic range control off.
 @Suite("APAC encoder")
 struct APACEncoderTests {
 
@@ -38,7 +39,12 @@ struct APACEncoderTests {
         #expect(APACEncoder.framesPerPacket == 1024)
     }
 
-    @Test("packets come out as fast as frames go in: priming plus input, a packet per 1024 frames, all sync")
+    /// An Audio Sync Packet's header has its top bit set, the others not (measured, macOS 27): what the
+    /// stream itself says, against what the encoder reports.
+    @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
+    static func headerSaysSync(_ packet: APACEncoder.Packet) -> Bool { (packet.data.first ?? 0) & 0x80 != 0 }
+
+    @Test("packets come out as fast as frames go in: priming plus input, a packet per 1024 frames, a sync packet every interval")
     func packetCadence() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let layout = SpatialSpeakerLayout.l714
@@ -54,7 +60,9 @@ struct APACEncoderTests {
         // With DRC off the encoder holds only its priming. A lookahead of seconds (DRC on) would leave
         // this one second of input with no packets at all.
         #expect(packets.count >= frames / 1024 - 2, "got \(packets.count) packets for 1 s of input")
-        #expect(packets.allSatisfy { $0.isSync })
+        #expect(packets.indices.filter { packets[$0].isSync }
+                == Array(stride(from: 0, to: packets.count, by: APACEncoder.syncPacketInterval)))
+        #expect(packets.allSatisfy { $0.isSync == Self.headerSaysSync($0) }, "the stream says the same")
         #expect(packets.allSatisfy { !$0.data.isEmpty })
         let tail = try encoder.flush()
         let total = packets.count + tail.count
@@ -71,9 +79,43 @@ struct APACEncoderTests {
         _ = try withPlanes(layout, frames: 8192) { try encoder.encode(planes: $0, frameCount: 8192) }
         _ = try encoder.flush()
         encoder.reset()
-        let again = try withPlanes(layout, frames: 8192) { try encoder.encode(planes: $0, frameCount: 8192) }
-        #expect(again.count >= 4)
-        #expect(again.first?.isSync == true)
+        let frames = (APACEncoder.syncPacketInterval + 4) * 1024
+        let again = try withPlanes(layout, frames: frames) { try encoder.encode(planes: $0, frameCount: frames) }
+        #expect(again.count > APACEncoder.syncPacketInterval)
+        #expect(again.indices.filter { again[$0].isSync } == [0, APACEncoder.syncPacketInterval],
+                "the cadence starts over with the run")
+    }
+
+    @Test("constant mode holds the target: every six seconds within the declared peak, none far under the target")
+    func rateHoldsItsTarget() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let layout = SpatialSpeakerLayout.l714
+        let target = layout.channelCount * 320_000
+        let encoder = try APACEncoder(layout: layout, bitRate: target)
+        // Busy enough to want more than the target: a tone per channel over noise.
+        var seed: UInt64 = 7
+        let frames = 18 * 48_000
+        var packets: [APACEncoder.Packet] = []
+        let chunk = 4096
+        let planes = (0..<layout.channelCount).map { _ in UnsafeMutablePointer<Float>.allocate(capacity: chunk) }
+        defer { planes.forEach { $0.deallocate() } }
+        for start in stride(from: 0, to: frames, by: chunk) {
+            for (c, p) in planes.enumerated() {
+                for i in 0..<chunk {
+                    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                    p[i] = 0.2 * sin(Float(start + i) * 2 * .pi * Float(150 + 97 * c) / 48_000)
+                        + 0.2 * (Float(seed >> 40) / Float(1 << 24) * 2 - 1)
+                }
+            }
+            packets += try encoder.encode(planes: planes.map { UnsafePointer($0) }, frameCount: chunk)
+        }
+        let perSegment = 6 * 48_000 / 1024
+        for start in stride(from: 0, to: packets.count - perSegment, by: perSegment) {
+            let bits = packets[start..<(start + perSegment)].reduce(0) { $0 + $1.data.count * 8 }
+            let rate = bits * 48_000 / (perSegment * 1024)
+            #expect(rate <= APACEncoder.peakBitRate(target: target), "\(rate) bit/s from packet \(start)")
+            #expect(rate >= target * 97 / 100, "\(rate) bit/s from packet \(start)")
+        }
     }
 
     @Test("an input longer than the converter's buffer is fed in slices, nothing dropped")

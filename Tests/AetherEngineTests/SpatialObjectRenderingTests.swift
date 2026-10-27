@@ -36,6 +36,22 @@ struct SpatialObjectRenderingTests {
         } } }
     }
 
+    @Test("a position exactly on a speaker row or column gives that speaker all of it and the others nothing",
+          arguments: SpatialSpeakerLayout.allCases + [.l20, .l51, .l71])
+    func exactRowsAndColumns(layout: SpatialSpeakerLayout) {
+        let panner = AllocentricPanner(layout: layout)
+        var gains: [Float] = []
+        for speaker in layout.speakers where !speaker.isLFE {
+            panner.pointGains(speaker.position, into: &gains)
+            let own = layout.speakers.firstIndex(of: speaker)!
+            #expect(gains.indices.allSatisfy { gains[$0] == ($0 == own ? 1 : 0) }, "\(layout.rawValue) \(speaker): \(gains)")
+        }
+        for size: Float in [0.3, 0.9] {
+            panner.objectGains(position: SIMD3(0, 0.5, 0), size: size, into: &gains)
+            #expect(gains.allSatisfy { $0.isFinite && $0 >= 0 }, "\(layout.rawValue) size \(size)")
+        }
+    }
+
     @Test("an overhead object in the middle of the room splits evenly across the four tops")
     func overheadCentre() {
         let layout = SpatialSpeakerLayout.l714
@@ -87,19 +103,98 @@ struct SpatialObjectRenderingTests {
         #expect(abs(power(gains) - 1) < 1e-5)
     }
 
-    @Test("snap routes to the nearest speaker; size spreads with unit power")
-    func snapAndSize() {
-        let layout = SpatialSpeakerLayout.l916
+    @Test("divergence splits an object either side of it along x; size spreads with unit power")
+    func divergenceAndSize() {
+        let layout = SpatialSpeakerLayout.l714
         let panner = AllocentricPanner(layout: layout)
         var gains: [Float] = []
-        panner.objectGains(position: SIMD3(0.05, 0.3, 0.1), size: 0, snap: true, into: &gains)
-        #expect(gains[layout.speakers.firstIndex(of: .wideLeft)!] == 1)
-        #expect(abs(power(gains) - 1) < 1e-6)
+        // TS 103 448 pseudocode 15: at the centre with divergence 1, halves at x = 0 and x = 1.
+        panner.objectGains(position: SIMD3(0.5, 0, 0), size: 0, divergence: 1, into: &gains)
+        let half = Float(0.5).squareRoot()
+        #expect(abs(gains[layout.speakers.firstIndex(of: .left)!] - half) < 1e-5)
+        #expect(abs(gains[layout.speakers.firstIndex(of: .right)!] - half) < 1e-5)
+        #expect(gains[layout.speakers.firstIndex(of: .center)!] < 1e-6)
+        // Near a wall the spread shrinks to keep both halves inside: at x = 0.1 it is 0.2.
+        panner.objectGains(position: SIMD3(0.1, 0, 0), size: 0.5, divergence: 1, into: &gains)
+        var reference: [Float] = []
+        panner.pointGains(SIMD3(0, 0, 0), into: &reference)
+        var other: [Float] = []
+        panner.pointGains(SIMD3(0.2, 0, 0), into: &other)
+        let sum = zip(reference, other).map(+)
+        let norm = power(sum).squareRoot()
+        for c in gains.indices { #expect(abs(gains[c] - sum[c] / norm) < 1e-5) }
 
-        panner.objectGains(position: SIMD3(0.5, 0.5, 0.5), size: 0.6, snap: false, into: &gains)
+        panner.objectGains(position: SIMD3(0.5, 0.5, 0.5), size: 0.6, into: &gains)
         #expect(abs(power(gains) - 1) < 1e-4)
         #expect(gains.filter { $0 > 0.01 }.count >= 10, "a large object reaches most of the room")
         #expect(gains[layout.lfeIndex] == 0)
+    }
+
+    @Test("size follows TS 103 448's size panner (pseudocodes 7-14), as the reference probe computes it")
+    func sizePanner() {
+        // probes/ts103448_size.py on 7.1.4, channel order L R C Ls Rs Lrs Rrs Vhl Vhr Ltr Rtr.
+        let cases: [(SIMD3<Float>, Float, [Float])] = [
+            (SIMD3(0.5, 0, 0), 0.25, [0.273602, 0.273602, 0.861703, 0.207717, 0.207717, 0, 0, 0.103585, 0.103585, 0, 0]),
+            (SIMD3(0.25, 0.4, 0.6), 0.5, [0.304005, 0.169154, 0.265656, 0.346168, 0.203891, 0.218110, 0.180817,
+                                          0.492804, 0.299801, 0.411259, 0.254663]),
+            (SIMD3(0, 1, 0), 1, [0.225163, 0.196513, 0.245808, 0.348137, 0.316066, 0.327558, 0.300895,
+                                 0.326882, 0.295649, 0.360861, 0.326882]),
+            (SIMD3(0.5, 0.5, 1), 0.1, [0, 0, 0, 0, 0, 0, 0, 0.5, 0.5, 0.5, 0.5]),
+        ]
+        let layout = SpatialSpeakerLayout.l714
+        let panner = AllocentricPanner(layout: layout)
+        var gains: [Float] = []
+        for (position, size, expected) in cases {
+            panner.objectGains(position: position, size: size, into: &gains)
+            let withoutLFE = gains.enumerated().filter { $0.offset != layout.lfeIndex }.map(\.element)
+            for (got, want) in zip(withoutLFE, expected) { #expect(abs(got - want) < 1e-4, "\(position) size \(size)") }
+        }
+    }
+
+    @Test("a size along each axis follows TS 103 448's size panner, as the reference probe computes it")
+    func sizePannerPerAxis() {
+        // probes/ts103448_size.py size_pan(x, y, z, wx, wy, wz) on 7.1.4, order L R C Ls Rs Lrs Rrs Vhl Vhr Ltr Rtr.
+        let cases: [(SIMD3<Float>, SIMD3<Float>, [Float])] = [
+            (SIMD3(0.5, 0, 0), SIMD3(0.6, 0.1, 0),
+             [0.529456, 0.529456, 0.649200, 0.073168, 0.073168, 0, 0, 0.059937, 0.059937, 0, 0]),
+            (SIMD3(0.25, 0.4, 0.6), SIMD3(0.1, 0.5, 0.3),
+             [0.326264, 0, 0.321510, 0.325460, 0.277318, 0.291610, 0.248326, 0.489826, 0.234784, 0.336904, 0.228239]),
+            (SIMD3(0.5, 0.5, 0), SIMD3(0, 0, 0.8),
+             [0.004500, 0.004500, 0.063247, 0.632035, 0.632035, 0.044973, 0.044973, 0.219645, 0.219645, 0.219645, 0.219645]),
+            (SIMD3(0.7, 0.2, 0.3), SIMD3(0.3, 0.9, 0.05),
+             [0.098501, 0.413013, 0.486043, 0.172151, 0.227997, 0.272433, 0.455654, 0.167888, 0.306361, 0.157123, 0.270721]),
+        ]
+        let layout = SpatialSpeakerLayout.l714
+        let panner = AllocentricPanner(layout: layout)
+        var gains: [Float] = []
+        for (position, size, expected) in cases {
+            panner.objectGains(position: position, size: size, into: &gains)
+            let withoutLFE = gains.enumerated().filter { $0.offset != layout.lfeIndex }.map(\.element)
+            for (got, want) in zip(withoutLFE, expected) { #expect(abs(got - want) < 1e-4, "\(position) size \(size)") }
+        }
+    }
+
+    @Test("default trims leave 7.1.4 alone and pull the back and top down on smaller layouts")
+    func defaultTrim() {
+        let trim = ObjectAudioTrim.defaults
+        #expect(trim.gain(at: SIMD3(0, 1, 1), on: .l714) == 1)
+        // 5.1.2: num_mid 2, num_top 2, max_trim = -4.5 + 1.5 + 0.75 = -2.25 dB (pseudocode 16).
+        let back = 20 * log10(trim.gain(at: SIMD3(0.5, 1, 0), on: .l512))
+        #expect(abs(back + 2.25) < 1e-4)
+        #expect(trim.gain(at: SIMD3(0.5, 0, 0), on: .l512) == 1, "on the screen wall, at ear level")
+        // Halfway to full effect in y (0.3 of 0.6): half the maximum.
+        #expect(abs(20 * log10(trim.gain(at: SIMD3(0.5, 0.3, 0), on: .l512)) + 1.125) < 1e-4)
+    }
+
+    @Test("custom trims follow pseudocode 17 for the layout's trim configuration")
+    func customTrim() {
+        var configs = [ObjectAudioTrim.Mode](repeating: .default, count: 9)
+        configs[4] = .custom(centre: 0, surround: -3, height: -6)   // 5.1.2: trim_cfg 4
+        configs[8] = .disabled                                       // 7.1.4
+        let trim = ObjectAudioTrim(configs: configs)
+        #expect(trim.gain(at: SIMD3(0, 1, 1), on: .l714) == 1)
+        #expect(abs(20 * log10(trim.gain(at: SIMD3(0.5, 1, 1), on: .l512)) + 9) < 1e-4)
+        #expect(abs(20 * log10(trim.gain(at: SIMD3(0.5, 0.25, 0.5), on: .l512)) + 4.5) < 1e-4)
     }
 
     // MARK: - Renderer
@@ -159,7 +254,8 @@ struct SpatialObjectRenderingTests {
         #expect(out[l][49] == 1)
         #expect(abs(out[l][99] - 0.5) < 0.02 && abs(out[r][99] - 0.5) < 0.02)
         out = render(renderer, inputs: [ones], frames: 100, updates: [])
-        #expect(abs(out[l][49]) < 1e-5 && abs(out[r][49] - 1) < 1e-5)
+        // ramp_duration + 1 frames: the last step lands 100 frames after the update's.
+        #expect(abs(out[l][50]) < 1e-5 && abs(out[r][50] - 1) < 1e-5)
         #expect(abs(out[r][99] - 1) < 1e-5)
     }
 
@@ -204,12 +300,110 @@ struct SpatialObjectRenderingTests {
         let right = ObjectAudioElementState(position: SIMD3(1, 0, 0))
         let out = render(renderer, inputs: [ones, [Float](repeating: 0, count: 200)], frames: 200, updates: [
             .init(frameOffset: 0, rampFrames: 0, states: [left, left]),
-            .init(frameOffset: 0, rampFrames: 200, states: [right, nil]),
+            .init(frameOffset: 0, rampFrames: 199, states: [right, nil]),
             // Element 0 restated as unchanged halfway: its ramp must not restart.
             .init(frameOffset: 100, rampFrames: 0, states: [nil, right]),
         ])
         #expect(abs(out[r][149] - 0.75) < 0.02)
         #expect(abs(out[r][199] - 1) < 1e-5)
+    }
+
+    @Test("an update restating an element restarts its ramp from where it has got to (pseudocode 19)")
+    func restatementRestartsRamp() {
+        let layout = SpatialSpeakerLayout.l714
+        let renderer = ObjectAudioRenderer(layout: layout, roles: [.object])
+        let ones = [Float](repeating: 1, count: 300)
+        let r = layout.speakers.firstIndex(of: .right)!
+        let left = ObjectAudioElementState(position: SIMD3(0, 0, 0))
+        let right = ObjectAudioElementState(position: SIMD3(1, 0, 0))
+        let out = render(renderer, inputs: [ones], frames: 300, updates: [
+            .init(frameOffset: 0, rampFrames: 0, states: [left]),
+            .init(frameOffset: 0, rampFrames: 199, states: [right]),
+            // Restated at frame 100, halfway, over another 200 frames: from 0.5, a quarter of the way on at 149.
+            .init(frameOffset: 100, rampFrames: 199, states: [right]),
+        ])
+        #expect(abs(out[r][149] - 0.625) < 0.01)
+        #expect(abs(out[r][299] - 1) < 1e-5)
+    }
+
+    /// Block `b` of a programme whose updates come every 32 frames: ramps of 41 frames, each cut
+    /// short by the next update, until `settleFrom`, then ramps of 21 that end before the next.
+    private func settlingUpdates(block b: Int, settleFrom: Int) -> [ObjectAudioMetadataUpdate] {
+        [0, 32].map { offset in
+            let n = Float(2 * b + offset / 32)
+            let state = ObjectAudioElementState(position: SIMD3((n * 0.37).truncatingRemainder(dividingBy: 1), 0.3, 0),
+                                                gain: 0.5 + 0.5 * (n * 0.61).truncatingRemainder(dividingBy: 1))
+            return .init(frameOffset: offset, rampFrames: b < settleFrom ? 40 : 20, states: [state, ObjectAudioElementState()])
+        }
+    }
+
+    @Test("a run started mid-programme matches continuous playback bit for bit from the moment it says it has settled")
+    func settledMeansContinuous() {
+        let layout = SpatialSpeakerLayout.l714
+        let roles: [ObjectAudioRole] = [.object, .bed(.left)]
+        let signal = (0..<64).map { Float($0 % 13) / 13 - 0.4 }
+        let continuous = ObjectAudioRenderer(layout: layout, roles: roles)
+        var whole: [[[Float]]] = []
+        for b in 0..<30 {
+            whole.append(render(continuous, inputs: [signal, signal], frames: 64,
+                                updates: settlingUpdates(block: b, settleFrom: 20)))
+        }
+        let restarted = ObjectAudioRenderer(layout: layout, roles: roles)
+        for b in 8..<30 {
+            let out = render(restarted, inputs: [signal, signal], frames: 64,
+                             updates: settlingUpdates(block: b, settleFrom: 20))
+            if b < 20 {
+                #expect(!restarted.isSettled, "block \(b): every ramp so far was cut short")
+            } else {
+                #expect(restarted.isSettled, "block \(b): the ramp from frame 0 ended at 21, before the next update")
+            }
+            if b == 10 { #expect(out != whole[b], "before settling, the cut-short ramps still differ") }
+            if b > 20 { #expect(out == whole[b], "block \(b)") }
+        }
+    }
+
+    @Test("an update without a ramp settles its element at once, and a reset unsettles it")
+    func jumpSettles() {
+        let layout = SpatialSpeakerLayout.l714
+        let renderer = ObjectAudioRenderer(layout: layout, roles: [.object])
+        let ones = [Float](repeating: 1, count: 64)
+        #expect(!renderer.isSettled)
+        _ = render(renderer, inputs: [ones], frames: 64, updates: [
+            .init(frameOffset: 0, rampFrames: 1536, states: [ObjectAudioElementState(position: SIMD3(0, 0, 0))])])
+        #expect(!renderer.isSettled, "the first update jumps here, but continuous playback is still ramping")
+        _ = render(renderer, inputs: [ones], frames: 64, updates: [
+            .init(frameOffset: 10, rampFrames: 0, states: [ObjectAudioElementState(position: SIMD3(1, 0, 0))])])
+        #expect(renderer.isSettled)
+        renderer.reset()
+        #expect(!renderer.isSettled)
+    }
+
+    @Test("after a resync the next update settles its element, since every run jumps on it")
+    func discontinuitySettlesOnNextUpdate() {
+        let layout = SpatialSpeakerLayout.l714
+        let renderer = ObjectAudioRenderer(layout: layout, roles: [.object])
+        let ones = [Float](repeating: 1, count: 64)
+        _ = render(renderer, inputs: [ones], frames: 64, updates: [
+            .init(frameOffset: 0, rampFrames: 1536, states: [ObjectAudioElementState(position: SIMD3(0, 0, 0))])])
+        renderer.markDiscontinuity()
+        _ = render(renderer, inputs: [[Float](repeating: 1, count: 4096)], frames: 4096, updates: [])
+        #expect(!renderer.isSettled, "the ramp it was waiting on stopped where it was")
+        _ = render(renderer, inputs: [ones], frames: 64, updates: [
+            .init(frameOffset: 0, rampFrames: 1536, states: [ObjectAudioElementState(position: SIMD3(1, 0, 0))])])
+        #expect(renderer.isSettled)
+    }
+
+    @Test("a custom trim's balance fades the far end of the room (TS 103 420 5.6.5.9-12)")
+    func trimBalance() {
+        // Towards the back by 0.5 at ear level: the front wall at half its level, the back untouched.
+        #expect(ObjectAudioTrim.balanceGain(at: SIMD3(0.5, 0, 0), top: 0, listener: 0.5) == 0.5)
+        #expect(ObjectAudioTrim.balanceGain(at: SIMD3(0.5, 1, 0), top: 0, listener: 0.5) == 1)
+        // Towards the front by 1 overhead: the back of the ceiling silent, halfway up half of it.
+        #expect(ObjectAudioTrim.balanceGain(at: SIMD3(0.5, 1, 1), top: -1, listener: 0) == 0)
+        #expect(ObjectAudioTrim.balanceGain(at: SIMD3(0.5, 1, 0.5), top: -1, listener: 0) == 0.5)
+        var configs = [ObjectAudioTrim.Mode](repeating: .default, count: 9)
+        configs[1] = .custom(centre: 0, surround: 0, height: 0, balanceTop: 0, balanceListener: 0.5)   // 5.1: trim_cfg 1
+        #expect(abs(ObjectAudioTrim(configs: configs).gain(at: SIMD3(0.5, 0, 0), on: .l51) - 0.5) < 1e-6)
     }
 
     @Test("a new target mid-ramp starts from where the ramp had got to")
@@ -229,7 +423,7 @@ struct SpatialObjectRenderingTests {
 
     // MARK: - Review round 1 (#731)
 
-    @Test("a ramp lands frame by frame on (k + 1) / total of the way, and finishes on the target")
+    @Test("a ramp of d lands frame by frame on (k + 1) / (d + 1) of the way, and finishes on the target")
     func rampIsExactPerFrame() {
         let layout = SpatialSpeakerLayout.l714
         let renderer = ObjectAudioRenderer(layout: layout, roles: [.object])
@@ -246,12 +440,13 @@ struct SpatialObjectRenderingTests {
             let out = render(renderer, inputs: [[Float](repeating: 1, count: 40)], frames: 40, updates: updates)
             left += out[l]; right += out[r]
         }
-        for k in 0..<100 {
-            let t = Float(k + 1) / 100
+        // TS 103 448 pseudocode 19: ramp_duration + 1 steps, the first on the update's frame.
+        for k in 0...100 {
+            let t = Float(k + 1) / 101
             #expect(abs(left[k] - (1 - t)) < 1e-5, "frame \(k)")
             #expect(abs(right[k] - t) < 1e-5, "frame \(k)")
         }
-        #expect(left[100...].allSatisfy { abs($0) < 1e-6 } && right[100...].allSatisfy { abs($0 - 1) < 1e-6 })
+        #expect(left[101...].allSatisfy { abs($0) < 1e-6 } && right[101...].allSatisfy { abs($0 - 1) < 1e-6 })
     }
 
     @Test("a resync mid-ramp freezes the object where the ramp had got to")
@@ -262,7 +457,7 @@ struct SpatialObjectRenderingTests {
         let l = layout.speakers.firstIndex(of: .left)!, r = layout.speakers.firstIndex(of: .right)!
         _ = render(renderer, inputs: [ones], frames: 50, updates: [
             .init(frameOffset: 0, rampFrames: 0, states: [ObjectAudioElementState(position: SIMD3(0, 0, 0))]),
-            .init(frameOffset: 0, rampFrames: 100, states: [ObjectAudioElementState(position: SIMD3(1, 0, 0))])])
+            .init(frameOffset: 0, rampFrames: 99, states: [ObjectAudioElementState(position: SIMD3(1, 0, 0))])])
         renderer.markDiscontinuity()
         let out = render(renderer, inputs: [ones], frames: 50, updates: [])
         #expect(abs(out[l][0] - 0.5) < 1e-5 && abs(out[l][49] - 0.5) < 1e-5)
@@ -290,19 +485,62 @@ struct SpatialObjectRenderingTests {
         #expect(out.allSatisfy { $0.allSatisfy { $0 == 0 } })
     }
 
-    @Test("7.1 bed surrounds fold onto a 5.1 layout's surround pair, never into the front", arguments: [
-        SpatialSpeakerLayout.l512, .l514])
+    /// One bed channel's gains on `layout`, the rest of a `bed` silent.
+    private func bedGains(_ speaker: SpatialSpeaker, of bed: [SpatialSpeaker], on layout: SpatialSpeakerLayout) -> [Float] {
+        let renderer = ObjectAudioRenderer(layout: layout, roles: bed.map { .bed($0) })
+        let inputs = bed.map { [Float](repeating: $0 == speaker ? 1 : 0, count: 4) }
+        return render(renderer, inputs: inputs, frames: 4, updates: []).map { $0[0] }
+    }
+
+    private static let bed712: [SpatialSpeaker] = [.left, .right, .center, .sideLeft, .sideRight, .rearLeft, .rearRight,
+                                                   .topMiddleLeft, .topMiddleRight]
+    private static let bed514: [SpatialSpeaker] = [.left, .right, .center, .sideLeft, .sideRight,
+                                                   .topFrontLeft, .topFrontRight, .topRearLeft, .topRearRight]
+
+    @Test("TS 103 448 table 6: a 7.1 bed's sides and backs fold onto 5.1's surrounds at -3 dB each, never into the front",
+          arguments: [SpatialSpeakerLayout.l51, .l512, .l514])
     func bedSurroundsFoldOnFiveOne(layout: SpatialSpeakerLayout) {
-        let renderer = ObjectAudioRenderer(
-            layout: layout, roles: [.bed(.sideLeft), .bed(.rearRight)])
-        let ones = [Float](repeating: 1, count: 16)
-        let zeros = [Float](repeating: 0, count: 16)
-        var out = render(renderer, inputs: [ones, zeros], frames: 16, updates: [])
-        #expect(out[layout.speakers.firstIndex(of: .surroundLeft)!] == ones)
-        #expect(out[layout.speakers.firstIndex(of: .left)!] == zeros)
-        out = render(renderer, inputs: [zeros, ones], frames: 16, updates: [])
-        #expect(out[layout.speakers.firstIndex(of: .surroundRight)!] == ones)
-        #expect(out[layout.speakers.firstIndex(of: .right)!] == zeros)
+        let m = Float(0.5).squareRoot()
+        for (speaker, target) in [(SpatialSpeaker.sideLeft, SpatialSpeaker.surroundLeft), (.rearRight, .surroundRight)] {
+            let g = bedGains(speaker, of: Self.bed712, on: layout)
+            #expect(abs(g[layout.speakers.firstIndex(of: target)!] - m) < 1e-6, "\(speaker)")
+            #expect(abs(power(g) - 0.5) < 1e-6, "\(speaker) only there")
+        }
+        // A 5.1 bed has no backs: its surrounds go straight through (g = 1).
+        let g = bedGains(.sideLeft, of: Self.bed514, on: layout)
+        #expect(g[layout.speakers.firstIndex(of: .surroundLeft)!] == 1)
+    }
+
+    @Test("TS 103 448 table 6 on stereo: centre and surrounds at -3 dB, backs, tops and wides at -6 dB")
+    func bedOnStereo() {
+        let m = Float(0.5).squareRoot()
+        let (l, r) = (0, 1)
+        let centre = bedGains(.center, of: Self.bed712, on: .l20)
+        #expect(abs(centre[l] - m) < 1e-6 && abs(centre[r] - m) < 1e-6)
+        // With backs, g = m: a side surround at g * m.
+        #expect(abs(bedGains(.sideRight, of: Self.bed712, on: .l20)[r] - 0.5) < 1e-6)
+        #expect(abs(bedGains(.sideRight, of: Self.bed514, on: .l20)[r] - m) < 1e-6)
+        for speaker in [SpatialSpeaker.rearLeft, .topMiddleLeft] {
+            let g = bedGains(speaker, of: Self.bed712, on: .l20)
+            #expect(g[l] == 0.5 && g[r] == 0, "\(speaker)")
+        }
+        #expect(bedGains(.topFrontRight, of: Self.bed514, on: .l20) == [0, 0.5, 0])
+    }
+
+    @Test("TS 103 448 table 6: top channels a layout lacks fold onto the surrounds or split between the tops it has")
+    func bedTopsFold() {
+        let m = Float(0.5).squareRoot()
+        // 7.1.2's top middles on 7.1.4: half the power to the front and back tops.
+        let onAtmos = bedGains(.topMiddleLeft, of: Self.bed712, on: .l714)
+        #expect(abs(onAtmos[SpatialSpeakerLayout.l714.speakers.firstIndex(of: .topFrontLeft)!] - m) < 1e-6)
+        #expect(abs(onAtmos[SpatialSpeakerLayout.l714.speakers.firstIndex(of: .topRearLeft)!] - m) < 1e-6)
+        // On 7.1, onto the sides at -3 dB; on 5.1, onto the surrounds.
+        let onSeven = bedGains(.topRearRight, of: Self.bed514, on: .l71)
+        #expect(abs(onSeven[SpatialSpeakerLayout.l71.speakers.firstIndex(of: .sideRight)!] - m) < 1e-6)
+        #expect(abs(power(onSeven) - 0.5) < 1e-6)
+        // 5.1.4's tops on 7.1.2: onto the top middles at -3 dB.
+        let onTwo = bedGains(.topFrontLeft, of: Self.bed514, on: .l712)
+        #expect(abs(onTwo[SpatialSpeakerLayout.l712.speakers.firstIndex(of: .topMiddleLeft)!] - m) < 1e-6)
     }
 
     @Test("a 5.1 bed's surrounds land on a 7.1 layout's sides")
@@ -339,7 +577,7 @@ struct SpatialObjectRenderingTests {
             let panner = AllocentricPanner(layout: layout, excluded: mask)
             for size: Float in [0, 0.1, 0.5, 1] {
                 for p in [SIMD3<Float>(0.1, 0.9, 0.7), SIMD3(0.5, 0.5, 0), SIMD3(1, 0, 1)] {
-                    panner.objectGains(position: p, size: size, snap: false, into: &gains)
+                    panner.objectGains(position: p, size: size, into: &gains)
                     #expect(abs(power(gains) - 1) < 1e-4, "\(layout.rawValue) size \(size) at \(p)")
                     #expect(gains[layout.lfeIndex] == 0)
                 }

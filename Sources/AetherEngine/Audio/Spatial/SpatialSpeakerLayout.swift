@@ -12,12 +12,25 @@ import Foundation
 ///
 /// Channel order is CoreAudio's for the matching `kAudioChannelLayoutTag_Atmos_*` tag, because
 /// that tag is what the APAC encoder is opened with and the encoder reads planes in that order.
+///
+/// 2.0, 5.1 and 7.1 are not beds: they are the outputs tvOS can render object APAC to when the route
+/// is not Atmos, at the positions TS 103 448 gives them (tables A.2 to A.4), and `allCases` leaves
+/// them out.
 public enum SpatialSpeakerLayout: String, Sendable, CaseIterable, Codable {
     case l512 = "5.1.2"
     case l514 = "5.1.4"
     case l712 = "7.1.2"
     case l714 = "7.1.4"
     case l916 = "9.1.6"
+    case l20 = "2.0"
+    case l51 = "5.1"
+    case l71 = "7.1"
+
+    /// The bed layouts, the ones a host can ask to render into.
+    public static var allCases: [SpatialSpeakerLayout] { [.l512, .l514, .l712, .l714, .l916] }
+
+    /// Whether this is a bed (it has height speakers) rather than one of the plain outputs.
+    var isBed: Bool { trimTopCount > 0 }
 
     /// Speakers in CoreAudio channel order for `channelLayoutTag`.
     public var speakers: [SpatialSpeaker] {
@@ -32,10 +45,18 @@ public enum SpatialSpeakerLayout: String, Sendable, CaseIterable, Codable {
         case .l916: return [.left, .right, .center, .lfe, .sideLeft, .sideRight, .rearLeft, .rearRight,
                             .wideLeft, .wideRight, .topFrontLeft, .topFrontRight,
                             .topMiddleLeft, .topMiddleRight, .topRearLeft, .topRearRight]
+        case .l20: return [.left, .right, .lfe]
+        case .l51: return [.left, .right, .center, .lfe, .surroundLeft, .surroundRight]
+        case .l71: return [.left, .right, .center, .lfe, .sideLeft, .sideRight, .rearLeft, .rearRight]
         }
     }
 
     public var channelCount: Int { speakers.count }
+
+    /// TS 103 448 table A.1's num_mid and num_top, which pick a layout's trim configuration: the
+    /// ear-level speakers other than the front three, and the height speakers.
+    var trimMidCount: Int { speakers.filter { !$0.isLFE && !$0.isHeight && ![.left, .right, .center].contains($0) }.count }
+    var trimTopCount: Int { speakers.filter(\.isHeight).count }
 
     /// Whether every channel of DTS:X's standard presentation, the 7.1 bed and the four heights, has
     /// a speaker of its own here, so each plays where it was authored and nothing is re-panned or
@@ -56,10 +77,13 @@ public enum SpatialSpeakerLayout: String, Sendable, CaseIterable, Codable {
         case .l712: return kAudioChannelLayoutTag_Atmos_7_1_2
         case .l714: return kAudioChannelLayoutTag_Atmos_7_1_4
         case .l916: return kAudioChannelLayoutTag_Atmos_9_1_6
+        case .l20: return kAudioChannelLayoutTag_DVD_4
+        case .l51: return kAudioChannelLayoutTag_MPEG_5_1_A
+        case .l71: return kAudioChannelLayoutTag_MPEG_7_1_C
         }
     }
 
-    /// Index of the LFE channel. Every layout here has exactly one, in slot 3.
+    /// Index of the LFE channel. Every layout here has exactly one: in slot 3, or 2 for 2.0.
     public var lfeIndex: Int { speakers.firstIndex(of: .lfe)! }
 }
 
@@ -84,6 +108,7 @@ public enum SpatialSpeaker: String, Sendable, CaseIterable {
     case surroundLeft, surroundRight
     case sideLeft, sideRight
     case rearLeft, rearRight
+    /// Where TS 103 448 table A.9 has them, 1 - 1/sqrt(2) of the way back (M±60 on the side walls).
     case wideLeft, wideRight
     case topFrontLeft, topFrontRight
     case topMiddleLeft, topMiddleRight
@@ -102,8 +127,8 @@ public enum SpatialSpeaker: String, Sendable, CaseIterable {
         case .sideRight:      return SIMD3(1, 0.5, 0)
         case .rearLeft:       return SIMD3(0, 1, 0)
         case .rearRight:      return SIMD3(1, 1, 0)
-        case .wideLeft:       return SIMD3(0, 0.25, 0)
-        case .wideRight:      return SIMD3(1, 0.25, 0)
+        case .wideLeft:       return SIMD3(0, 0.2929, 0)
+        case .wideRight:      return SIMD3(1, 0.2929, 0)
         case .topFrontLeft:   return SIMD3(0.25, 0.25, 1)
         case .topFrontRight:  return SIMD3(0.75, 0.25, 1)
         case .topMiddleLeft:  return SIMD3(0.25, 0.5, 1)
@@ -115,6 +140,17 @@ public enum SpatialSpeaker: String, Sendable, CaseIterable {
 
     var isLFE: Bool { self == .lfe }
     var isHeight: Bool { position.z > 0 }
+    var isRight: Bool { position.x > 0.5 }
+
+    /// The speaker at the same place on the other side of the room (itself on the centre line).
+    var mirrored: SpatialSpeaker {
+        let p = position
+        let x = SIMD3(1 - p.x, p.y, p.z)
+        return Self.allCases.first { $0 != .lfe && $0.position == x && $0.isSurroundStyle == isSurroundStyle } ?? self
+    }
+
+    /// The 5.1-style surrounds, which share their position with the 7.1 sides.
+    private var isSurroundStyle: Bool { self == .surroundLeft || self == .surroundRight }
 
     /// The CoreAudio label for this position, so the bed's log line names channels the way the
     /// route line and CoreAudioBaseTypes.h do. 5.1-style surrounds and 7.1 sides share

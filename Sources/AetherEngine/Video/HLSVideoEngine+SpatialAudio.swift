@@ -3,6 +3,20 @@ import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
 
+/// Personal builds only, with the APACObjectOutput trait: with this environment variable set to 1,
+/// TrueHD Atmos elements are sent to APAC as positioned objects (`APACObjectEncoder`) rather than
+/// rendered into the layout. Without the trait it is always off and that path is not built.
+enum APACObjectOutputSwitch {
+    static let variable = "AETHER_APAC_OBJECTS"
+    static var isOn: Bool {
+        #if APACObjectOutput
+        ProcessInfo.processInfo.environment[variable] == "1"
+        #else
+        false
+        #endif
+    }
+}
+
 extension HLSVideoEngine {
 
     /// The object-audio format a source would be rendered as, before it is confirmed.
@@ -56,9 +70,11 @@ extension HLSVideoEngine {
         profile: Int32,
         sampleRate: Int32
     ) -> SpatialSpeakerLayout? {
-        guard let layout = rendering.layout,
+        // TrueHD at 96 or 192 kHz is brought to 48 kHz after decoding (`ObjectAudioDecimator`).
+        let rates = codecID == AV_CODEC_ID_TRUEHD ? [0, 48_000, 96_000, 192_000] : [0, 48_000]
+        guard let layout = rendering.layout, layout.isBed,
               objectAudioSource(codecID: codecID, profile: profile)?.isBuiltIn == true,
-              sampleRate == 0 || sampleRate == Int32(ObjectAudioRendering.sampleRate)
+              rates.contains(Int(sampleRate))
         else { return nil }
         if objectAudioSource(codecID: codecID, profile: profile) == .dtsHDMasterAudio,
            !layout.carriesDTSXOneToOne {
@@ -224,7 +240,7 @@ extension HLSVideoEngine {
             } else if par.codec_id == AV_CODEC_ID_TRUEHD {
                 if objectAudioRendering != .off {
                     EngineLog.emit(
-                        "[HLSVideoEngine] object rendering requested but TrueHD is not 48 kHz Atmos "
+                        "[HLSVideoEngine] object rendering requested but TrueHD is not Atmos at 48, 96 or 192 kHz "
                         + "(profile=\(par.profile) rate=\(par.sample_rate)); keeping the channel bridge",
                         category: .session
                     )
@@ -346,7 +362,8 @@ extension HLSVideoEngine {
                 #endif
             }
             bridge = try SpatialAudioBridge(
-                srcTimeBase: audioStream.pointee.time_base, layout: layout, decoder: decoder)
+                srcTimeBase: audioStream.pointee.time_base, layout: layout, decoder: decoder,
+                objectOutput: source == .trueHDAtmos && APACObjectOutputSwitch.isOn)
         } catch {
             EngineLog.emit(
                 "[HLSVideoEngine] ERROR: \(source.name) rendering unavailable (\(error)); keeping the channel bridge",
@@ -381,13 +398,14 @@ extension HLSVideoEngine {
             audioHLSCodecs = bridge.hlsCodecs
             // Short on purpose: hosts append it to a track title in one-line stats rows.
             audioPipelineDescription = source == .trueHDAtmos
-                ? "\(sourceCodecLabel) Atmos → APAC \(layout.rawValue)"
+                ? "\(sourceCodecLabel) Atmos → APAC \(APACObjectOutputSwitch.isOn ? "objects" : layout.rawValue)"
                 : "DTS:X → APAC \(layout.rawValue)"
             audioDelivery = .bridged
             audioIsAPAC = true
-            audioAPACIsFromDolbyAtmos = source == .trueHDAtmos
             let rendering: String
             switch source {
+            case .trueHDAtmos where APACObjectOutputSwitch.isOn:
+                rendering = "elements sent as APAC objects (\(APACObjectOutputSwitch.variable), personal build)"
             case .trueHDAtmos:
                 rendering = "objects rendered into \(layout.rawValue)"
             case .dtsHDMasterAudio:

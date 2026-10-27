@@ -18,6 +18,8 @@ struct AudioTapChunk {
 final class AudioTapDecoder: @unchecked Sendable {
 
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
+    /// The track's decoder when it is APAC (`APACTapPacketDecoder`), in place of `codecContext`.
+    private var apacDecoder: AnyObject?
     private var swrContext: OpaquePointer?
     private let stateLock = NSLock()
     private var timeBase = AVRational(num: 1, den: 90_000)
@@ -49,9 +51,21 @@ final class AudioTapDecoder: @unchecked Sendable {
         var errorDescription: String? { description }
     }
 
-    func open(stream: UnsafeMutablePointer<AVStream>) throws {
+    /// `apacMagicCookie` is the track's `dapa` cookie when it is APAC (`APACSampleEntry.magicCookie(inInit:)`),
+    /// which AudioToolbox decodes in libavcodec's place.
+    func open(stream: UnsafeMutablePointer<AVStream>, apacMagicCookie: Data? = nil) throws {
         guard let codecpar = stream.pointee.codecpar else { throw TapDecoderError.noCodecParameters }
         timeBase = stream.pointee.time_base
+        if let apacMagicCookie {
+            guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *),
+                  let decoder = APACTapPacketDecoder(magicCookie: apacMagicCookie) else {
+                throw TapDecoderError.unsupportedCodec
+            }
+            stateLock.lock()
+            apacDecoder = decoder
+            stateLock.unlock()
+            return
+        }
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
             throw TapDecoderError.unsupportedCodec
         }
@@ -67,6 +81,12 @@ final class AudioTapDecoder: @unchecked Sendable {
     func decode(packet: UnsafeMutablePointer<AVPacket>) -> [AudioTapChunk] {
         stateLock.lock()
         defer { stateLock.unlock() }
+        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *),
+           let apac = apacDecoder as? APACTapPacketDecoder {
+            var frame = apac.decode(packet)
+            defer { av_frame_free(&frame) }
+            return frame.flatMap { consume($0) }.map { [$0] } ?? []
+        }
         guard let ctx = codecContext else { return [] }
         guard avcodec_send_packet(ctx, packet) >= 0 else { return [] }
         return receiveAll(ctx)
@@ -76,6 +96,8 @@ final class AudioTapDecoder: @unchecked Sendable {
     func drain() -> [AudioTapChunk] {
         stateLock.lock()
         defer { stateLock.unlock() }
+        // APAC decodes each packet whole, so it holds nothing back but the sub-threshold tail.
+        if apacDecoder != nil { return emitPending(force: true).map { [$0] } ?? [] }
         guard let ctx = codecContext else { return [] }
         avcodec_send_packet(ctx, nil)
         var chunks = receiveAll(ctx)
@@ -87,6 +109,7 @@ final class AudioTapDecoder: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         if codecContext != nil { avcodec_free_context(&codecContext) }
+        apacDecoder = nil
         if swrContext != nil { swr_free(&swrContext) }
         configuredInput.release()
         pending.removeAll()
@@ -104,28 +127,31 @@ final class AudioTapDecoder: @unchecked Sendable {
         defer { av_frame_free(&frame) }
         guard let f = frame else { return [] }
         while avcodec_receive_frame(ctx, f) >= 0 {
-            if swrContext == nil, !initResampler(from: f) { continue }
-            // A mid-stream input change (5.1 to stereo at a live program boundary) leaves the context
-            // reading planes the frame no longer carries, which faults inside swr_convert (#452).
-            // The chunk accumulator is already in the fixed output format, so nothing has to be
-            // flushed first and the running clock counts output samples either way.
-            if configuredInput.differ(from: f) {
-                EngineLog.emit(
-                    "[AudioTap] input format changed mid-stream ("
-                    + "\(configuredInput.rate)Hz/\(configuredInput.layout.nb_channels)ch/fmt=\(configuredInput.format.rawValue)"
-                    + " -> \(f.pointee.sample_rate)Hz/\(f.pointee.ch_layout.nb_channels)ch/fmt=\(f.pointee.format)"
-                    + "); rebuilding resampler",
-                    category: .engine)
-                swr_free(&swrContext)
-                if !initResampler(from: f) { continue }
-            }
-            ingest(frame: f)
-            if pending.count >= AudioTapDefaults.minSamplesPerChunk,
-               let chunk = emitPending(force: false) {
-                chunks.append(chunk)
-            }
+            if let chunk = consume(f) { chunks.append(chunk) }
         }
         return chunks
+    }
+
+    /// One decoded frame into the running chunk, and the chunk once it is full.
+    private func consume(_ f: UnsafeMutablePointer<AVFrame>) -> AudioTapChunk? {
+        if swrContext == nil, !initResampler(from: f) { return nil }
+        // A mid-stream input change (5.1 to stereo at a live program boundary) leaves the context
+        // reading planes the frame no longer carries, which faults inside swr_convert (#452).
+        // The chunk accumulator is already in the fixed output format, so nothing has to be
+        // flushed first and the running clock counts output samples either way.
+        if configuredInput.differ(from: f) {
+            EngineLog.emit(
+                "[AudioTap] input format changed mid-stream ("
+                + "\(configuredInput.rate)Hz/\(configuredInput.layout.nb_channels)ch/fmt=\(configuredInput.format.rawValue)"
+                + " -> \(f.pointee.sample_rate)Hz/\(f.pointee.ch_layout.nb_channels)ch/fmt=\(f.pointee.format)"
+                + "); rebuilding resampler",
+                category: .engine)
+            swr_free(&swrContext)
+            if !initResampler(from: f) { return nil }
+        }
+        ingest(frame: f)
+        guard pending.count >= AudioTapDefaults.minSamplesPerChunk else { return nil }
+        return emitPending(force: false)
     }
 
     private func initResampler(from frame: UnsafeMutablePointer<AVFrame>) -> Bool {
@@ -239,7 +265,7 @@ final class AudioTapSegmentDecoder: @unchecked Sendable {
         guard audioIdx >= 0, let stream = demuxer.stream(at: audioIdx) else { return [] }
         let decoder = AudioTapDecoder()
         do {
-            try decoder.open(stream: stream)
+            try decoder.open(stream: stream, apacMagicCookie: APACSampleEntry.magicCookie(inInit: initData))
         } catch {
             return []
         }
