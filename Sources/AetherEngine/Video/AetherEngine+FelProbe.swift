@@ -40,6 +40,14 @@ public struct FelProbeResult: Sendable {
     /// Leading bytes of the first RPU payload, hex. A well-formed payload starts `19`, the
     /// Dolby Vision RPU prefix, because the `unspec62` NAL's 2-byte header has been stripped.
     public let firstDVPayloadPrefix: String
+    /// Of the sampled luma words, the fraction whose bits below the 10-bit code (the low 6 of the
+    /// 16-bit word) are not all zero. Zero for dithered P010; above zero means the composer put
+    /// sub-10-bit precision into the surface (``AetherEngine/felOutputMode`` other than `.p010`).
+    public let lumaSubTenBitFraction: Double
+    /// The raw 16-bit luma word at `probePoint` in each delivered frame, in presentation order (the
+    /// decoder delivers in completion order); empty without a probe point. Bypassed frames are included
+    /// (their word is the base layer's).
+    public let probeWords: [UInt16]
 }
 
 extension AetherEngine {
@@ -50,7 +58,8 @@ extension AetherEngine {
     public nonisolated static func felDecodeProbe(
         url: URL,
         maxPackets: Int = 100,
-        options: LoadOptions = .init()
+        options: LoadOptions = .init(),
+        probePoint: (x: Int, y: Int)? = nil
     ) throws -> FelProbeResult {
         let demuxer = Demuxer()
         try demuxer.open(url: url, extraHeaders: options.httpHeaders)
@@ -80,6 +89,8 @@ extension AetherEngine {
             var sumSqCb: Double = 0
             var sumSqCr: Double = 0
             var pixelSampleCount: Int = 0
+            var subTenBitSamples: Int = 0
+            var probeWords: [(pts: Double, word: UInt16)] = []
             var framesWithDVMetadata = 0
             var dvPayloads = Set<Data>()
             var firstDVPayloadBytes = 0
@@ -126,6 +137,11 @@ extension AetherEngine {
                 let uv16 = uvPlane.assumingMemoryBound(to: UInt16.self)
                 let yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0) / 2
                 let uvStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1) / 2
+                // 2 for 4:2:0 (P010), 1 for 4:2:2 (sv22).
+                let uvRowDivisor = max(1, h / max(1, CVPixelBufferGetHeightOfPlane(pixelBuffer, 1)))
+                if let pt = probePoint, pt.x >= 0, pt.y >= 0, pt.x < w, pt.y < h {
+                    accum.probeWords.append((pts.seconds, y16[pt.y * yStride + pt.x]))
+                }
 
                 // Sample 512 points across active center 50%
                 let stepX = max(1, (w / 2) / 32)
@@ -134,9 +150,11 @@ extension AetherEngine {
                 let startY = (h / 4)
                 for sy in stride(from: startY, to: startY + h / 2, by: stepY) {
                     for sx in stride(from: startX, to: startX + w / 2, by: stepX) {
-                        let lumaVal = Double(y16[sy * yStride + sx] >> 6)
-                        let cbVal = Double(uv16[(sy / 2) * uvStride + (sx / 2) * 2] >> 6)
-                        let crVal = Double(uv16[(sy / 2) * uvStride + (sx / 2) * 2 + 1] >> 6)
+                        let lumaWord = y16[sy * yStride + sx]
+                        let lumaVal = Double(lumaWord >> 6)
+                        if lumaWord & 0x3F != 0 { accum.subTenBitSamples += 1 }
+                        let cbVal = Double(uv16[(sy / uvRowDivisor) * uvStride + (sx / 2) * 2] >> 6)
+                        let crVal = Double(uv16[(sy / uvRowDivisor) * uvStride + (sx / 2) * 2 + 1] >> 6)
 
                         accum.sumLuma += lumaVal
                         accum.sumCb += cbVal
@@ -192,6 +210,8 @@ extension AetherEngine {
         let sumSqCb = accum.sumSqCb
         let sumSqCr = accum.sumSqCr
         let pixelSampleCount = accum.pixelSampleCount
+        let subTenBitSamples = accum.subTenBitSamples
+        let probeWords = accum.probeWords.sorted { $0.pts < $1.pts }.map(\.word)
         let framesWithDVMetadata = accum.framesWithDVMetadata
         let distinctDVPayloads = accum.dvPayloads.count
         let firstDVPayloadBytes = accum.firstDVPayloadBytes
@@ -233,13 +253,40 @@ extension AetherEngine {
             framesWithDVMetadata: framesWithDVMetadata,
             distinctDVPayloads: distinctDVPayloads,
             firstDVPayloadBytes: firstDVPayloadBytes,
-            firstDVPayloadPrefix: firstDVPayloadPrefix
+            firstDVPayloadPrefix: firstDVPayloadPrefix,
+            lumaSubTenBitFraction: pixelSampleCount > 0 ? Double(subTenBitSamples) / Double(pixelSampleCount) : 0,
+            probeWords: probeWords
         )
     }
 
 }
 
 extension AetherEngine {
+    /// The buffer the FEL composer hands the display path. Default ``sv22``, measured to carry more than
+    /// 10 bits through tvOS's Dolby Vision output (dolby-vision-fel.md, `DoviDither.fullPrecision`).
+    @_spi(Diagnostics)
+    public enum FelOutputMode: String, CaseIterable, Sendable {
+        /// P010, ordered-dithered to 10 bits, bit-exact with Dolby's 4:2:0 reference. The fallback.
+        case p010 = "p010"
+        /// P010 rounded to the nearest 10-bit code, no dither: keeps nothing below 10 bits.
+        case p010Rounded = "p010-round"
+        /// P010 with a static blue-noise dither in place of the ordered one.
+        case p010BlueNoise = "p010-bluenoise"
+        /// P010 with the sub-10-bit VDR bits in its low (padding) bits.
+        case p010FullPrecision = "p010-full"
+        /// 16-bit 4:2:2 `sv22` carrying the same full-precision words, where they are defined values, with
+        /// chroma composed at every 4:2:2 site (vertical Catmull-Rom on the base chroma; not bit-exact with
+        /// Dolby's 4:2:0 reference). The default.
+        case sv22 = "sv22"
+    }
+
+    /// Takes effect from the next composed frame and applies to every session in the process.
+    @_spi(Diagnostics)
+    public nonisolated static var felOutputMode: FelOutputMode {
+        get { FelOutputMode(rawValue: DoviFelComposer.outputMode.rawValue) ?? .p010 }
+        set { DoviFelComposer.outputMode = DoviOutputMode(rawValue: newValue.rawValue) ?? .p010 }
+    }
+
     /// Off composes every Profile 7 FEL frame without its residual, which is what a MEL stream
     /// decodes to; on is the full FEL result. For A/B viewing (`aetherctl play --cycle-el`): it
     /// takes effect from the next composed frame and applies to every session in the process.
@@ -247,6 +294,15 @@ extension AetherEngine {
     public nonisolated static var felResidualEnabled: Bool {
         get { DoviFelComposer.residualEnabled }
         set { DoviFelComposer.residualEnabled = newValue }
+    }
+
+    /// FEL / MEL split view: the fraction of the width, from the left, composed with the residual (full
+    /// FEL); the rest is composed without it (what a MEL stream decodes to), with a divider between them.
+    /// nil turns the split off. Takes effect from the next composed frame, for every session in the process.
+    @_spi(Diagnostics)
+    public nonisolated static var felResidualSplit: Double? {
+        get { DoviFelComposer.residualSplit }
+        set { DoviFelComposer.residualSplit = newValue }
     }
 }
 #endif

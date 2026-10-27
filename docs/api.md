@@ -678,6 +678,7 @@ A cold open is not free. On a non-fast-start MP4 it is two to three sequential r
 | Symbol | Contract |
 | --- | --- |
 | `AetherEngine.prewarm(url:httpHeaders:byteBudget:)` | `nonisolated static async -> SourcePrewarmReport`. Discardable. Fetches the opening bytes of a source the engine is not playing, so the next `load()` of that exact URL adopts them instead of fetching them. No engine instance, no audio session, no layer: a host warms while its player is still on the current item. Cancelling the task cancels the fetch and stores nothing. |
+| `AetherEngine.prewarmDualLayerDolbyVision()` | `nonisolated static async -> Bool`. Discardable. Compiles the Profile 7 FEL composer's Metal shaders now (about 300 ms cold) so the first composed frame does not wait for them. Once per process, safe concurrently with playback. False without the `DualLayerDolbyVision` trait, with no Metal device, or when the shaders fail to compile. |
 | `AetherEngine.isPrewarmed(url:)` | `nonisolated static -> Bool`. Whether that URL is warm right now, without consuming it. False again after the load that adopted it. |
 | `AetherEngine.discardPrewarmedSources()` | `nonisolated static`. Drops every warmed source, for a host leaving the context they were made for. |
 | `AetherEngine.defaultPrewarmByteBudget` | `8 * 1024 * 1024`. A byte budget and not a duration, because a duration needs the bitrate, which is known only after the probe this is trying to get ahead of. |

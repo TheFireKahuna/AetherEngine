@@ -78,6 +78,14 @@ struct DoviGpuAdversarialTests {
         return p
     }
 
+    /// An output word the composer can write: a 10-bit code in P010's high bits, or with full precision a 16-bit sum
+    /// within the reconstruction's clip.
+    static func legal(_ word: UInt16, _ p: DoviMetalParams) -> Bool {
+        p.ditherMode == .fullPrecision
+            ? Int(word) <= DoviCpuModelTests.Model.sumMax(vdrMax: p.vdrMax)
+            : word & 0x3F == 0
+    }
+
     static func words(_ b: CVPixelBuffer, plane: Int) -> [UInt16] {
         CVPixelBufferLockBaseAddress(b, .readOnly); defer { CVPixelBufferUnlockBaseAddress(b, .readOnly) }
         let base = CVPixelBufferGetBaseAddressOfPlane(b, plane)!
@@ -95,7 +103,7 @@ struct DoviGpuAdversarialTests {
           arguments: Array(UInt64(1)...48))
     func hostileParameters(seed: UInt64) throws {
         var r = RNG(s: seed &* 0x9E3779B97F4A7C15)
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         let w = 96, h = 48
         for iter in 0..<40 {
             let params = Self.hostile(&r, w: w, h: h)
@@ -115,14 +123,14 @@ struct DoviGpuAdversarialTests {
             let b = try #require(composer.compose(baseBuffer: bl, enhancementBuffer: el, params: params, frameIndex: 0))
             #expect(aY == Self.words(b, plane: 0) && aC == Self.words(b, plane: 1), "seed \(seed) iter \(iter) is not deterministic")
 
-            let bad = aY.filter { ($0 >> 6) < 64 || ($0 >> 6) > 940 }.count + aC.filter { ($0 >> 6) < 64 || ($0 >> 6) > 960 }.count
-            #expect(bad == 0, "seed \(seed) iter \(iter): \(bad) samples outside video range (dither \(params.ditherMode), blMax \(params.blMax), vdrMax \(params.vdrMax), vdrScale \(params.vdrScale))")
+            let bad = (aY + aC).filter { !Self.legal($0, params) }.count
+            #expect(bad == 0, "seed \(seed) iter \(iter): \(bad) samples outside the code space (dither \(params.ditherMode), blMax \(params.blMax), vdrMax \(params.vdrMax), vdrScale \(params.vdrScale))")
         }
     }
 
     @Test("parameters that lie about the buffer size cannot read or write out of bounds")
     func lyingGeometry() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         let bl = try #require(H.makeBuffer(width: 64, height: 32))
         let el = try #require(H.makeBuffer(width: 32, height: 16))
         H.fillPlane(bl, plane: 0, components: 1) { x, y, _ in (x * 7 + y * 13) & 1023 }
@@ -140,7 +148,7 @@ struct DoviGpuAdversarialTests {
             if let out = composer.compose(baseBuffer: bl, enhancementBuffer: el, params: p, frameIndex: 0) {
                 #expect(CVPixelBufferGetWidth(out) == 64 && CVPixelBufferGetHeight(out) == 32, "output must follow the real base buffer, not the claimed size")
                 let y = Self.words(out, plane: 0)
-                #expect(y.allSatisfy { ($0 >> 6) >= 64 && ($0 >> 6) <= 940 })
+                #expect(y.allSatisfy { Self.legal($0, p) })
             }
         }
     }
@@ -151,7 +159,7 @@ extension DoviGpuAdversarialTests {
     /// the synchronous `compose` is single-threaded by contract.
     @Test("concurrent async composes at changing resolutions neither deadlock nor corrupt each other")
     func concurrentComposeWithResolutionChanges() async throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         let sizes = [(64, 16), (128, 32), (96, 48), (256, 64)]
         let results = await withTaskGroup(of: Bool.self, returning: [Bool].self) { group in
             for t in 0..<6 {
@@ -192,7 +200,7 @@ extension DoviGpuAdversarialTests {
     @Test("a curve value of one half lands on exactly 2048, through polynomial and MMR constants",
           arguments: [false, true])
     func halfIsExactlyMidRange(mmr: Bool) throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         var p = DoviGpuEdgeCaseTests.params(flags: [.disableResidual])
         p.ditherMode = .debugRawVDR
         var curve = DoviPolynomialParams()

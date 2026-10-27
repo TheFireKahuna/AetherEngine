@@ -97,7 +97,7 @@ flowchart LR
   P -->|compose| G["DoviFelComposer<br/>composeAsync (Metal)"]
   P -->|bypass| O
   G --> O["OrderedDelivery<br/>fulfil → emit → DoviDisplayMetadata.attach"]
-  O --> R["SampleBufferRenderer<br/>AVSampleBufferDisplayLayer"]
+  O --> R["FelCompositionSource → SoftwareOverlayRenderer<br/>AVSampleBufferDisplayLayer over AVPlayer"]
 ```
 
 | Stage | Code | Thread | What happens per frame |
@@ -266,13 +266,13 @@ passes it into `VideoRoutingPolicy`:
 
 | Source | `dolbyVisionHandling` | `preferDualLayerDolbyVision` | Device | Route |
 |---|---|---|---|---|
-| P7, `el_type` FEL | `.automatic` | true (opt-in; the default is false) | VideoToolbox HEVC hardware + Metal | software host, `DualLayerVideoDecoder` |
+| P7, `el_type` FEL | `.automatic` | true (opt-in; the default is false) | VideoToolbox HEVC hardware + Metal | composed overlay, `DualLayerVideoDecoder` |
 | P7, `el_type` FEL | `.automatic` | false (the default), a build without the `DualLayerDolbyVision` trait, or no VideoToolbox HEVC hardware decode | any | native (8.1 conversion where the display takes Dolby Vision, otherwise the HDR10 base layer) |
 | P7, `el_type` MEL | `.automatic` | any | — | native (as above; the conversion loses nothing for MEL) |
 | P7, any | `.baseLayerOnly` | any | — | HDR10 base layer |
 
-The software host then instantiates `DualLayerVideoDecoder` only for the first row; a Profile 7 forced
-onto the software path by any other combination gets a plain `HardwareVideoDecoder` for the base layer.
+The overlay then instantiates `DualLayerVideoDecoder` only for the first row; a Profile 7 forced onto
+the software-decode route by any other combination gets a plain `HardwareVideoDecoder` for the base layer.
 
 ### 5.2.1 The capability gate and its diagnostic line
 
@@ -296,8 +296,15 @@ layer (every retail FEL title's layout); a 1:1 enhancement layer is not detected
 width or height is unknown (not positive) is refused rather than budgeted at zero. A 24p UHD FEL master needs 80% of the budget. What is measured: the Mac soak runs in the PR
 description (M2 Pro, debug `aetherctl`), and, from earlier development builds on an Apple TV 4K 2nd
 generation, the composer's GPU time of 12.9-14.3 ms per frame against a 41.7 ms frame at 23.976 fps
-(§4.2, a debug build and a previous iteration of the pipeline, not this stack). The 311 Mpx/s ceiling,
-and 30 fps as a margin above 24p, are an assumption until the Apple TV run of this stack. UHD at 60 fps
+(§4.2, a debug build and a previous iteration of the pipeline, not this stack). On an Apple TV 4K (3rd
+generation, A15, tvOS 27.2, Release, sv22, `FelComposerDeviceBenchmarkTests`, 2026-10-27) a UHD composition
+back to back costs 5.9 ms of GPU time (luma 1.8, chroma 4.1). Paced the way playback submits it the same
+work reads 6.8 ms at a batch every 8 ms, 15.8 at 16.7 ms, 20.5 at 25 ms and 17.0 at 41.7 ms (one 24p frame):
+the GPU's clock follows its load, and one composition a frame with the overlay's third of a second of lead
+gives it no reason to rise. So the 18-25 ms the playing overlay's `gpu` stage shows is the work at a low
+clock, not its cost; the cost at full clock is 5.9 ms, 14% of a 24p frame, and the stretched time is
+headroom. The 311 Mpx/s ceiling, and 30 fps as a margin above 24p, are an assumption until a 30 fps
+title is run. UHD at 60 fps
 (200%) and 8K fall back.
 
 A Profile 7 load logs exactly one line, whichever way it goes (other sources log nothing here):
@@ -313,7 +320,7 @@ A Profile 7 load logs exactly one line, whichever way it goes (other sources log
 ```
 
 A missing Metal device does not fall back to the native route: the routing decision above has
-already been made, so the software host keeps the base layer alone on a `HardwareVideoDecoder` (HDR10,
+already been made, so the overlay keeps the base layer alone on a `HardwareVideoDecoder` (HDR10,
 no composition). The same is true after the fact: if the compute shaders fail to compile, the decoder
 stays but every frame goes out as its base layer.
 
@@ -322,30 +329,24 @@ stays but every frame goes out as its base layer.
 The route decision does not look at the display. With `preferDualLayerDolbyVision` on and a display
 that does not take Dolby Vision (an SDR or HDR10-only panel or mode), the route is still taken when
 the gate above passes: the software host composes the full FEL picture and presents it with the
-Profile 8.1 metadata attached (§2), and how tvOS presents that on such a display is up to the platform.
+carries its Profile 8.1 metadata (§2), and how tvOS presents that on such a display is up to the platform.
 The native route, by contrast, strips the Dolby Vision for such a display (`CodecRoutePolicy`) and plays
 the HDR10 base layer. A host that wants the base layer on a non-Dolby-Vision display leaves the flag off,
-or sets it from what it knows of the display. The audio trade-off of §3.1 (an E-AC-3 Atmos track plays as
-its channel-bed core, without the objects unless `objectAudioRendering` is set) applies on this route whatever the display. This is the current
+or sets it from what it knows of the display. This is the current
 behaviour, documented rather than designed; it is not changed here.
 
-### 5.2.3 What the route gives up against the native route
-
 The dual-layer route runs on the software host: there is no `AVPlayer` and no `AVPlayerItem`, and the
-picture is drawn into an `AVSampleBufferDisplayLayer`. Everything that AVKit or the loopback HLS
-server provides to the native route through the item is therefore either replaced by an engine
-equivalent or absent. With `preferDualLayerDolbyVision` off none of this changes. The comparison,
-checked against the code:
+### 5.2.3 What the route keeps from the native route
 
-| Feature | Native route | Dual-layer route |
-|---|---|---|
-| Picture in Picture | `AVPlayer`-based: the stock `AVPlayerViewController` and a host-built `AVPictureInPictureController` both work. | No `AVPlayer`, so no stock player PiP. The engine publishes `SoftwarePiPSource` (the layer plus the transport answers for a sample-buffer PiP content source) and the host builds the `AVPictureInPictureController` around it; while PiP is active, subtitle cues are drawn into the frames by `SubtitleFrameCompositor`, which carries the pixel-buffer attachments through. Whether the PiP window presents the composed picture as Dolby Vision is not measured. |
 | Scrub thumbnails | With `serveIFramePlaylist`, an `EXT-X-I-FRAME-STREAM-INF` rendition next to the master, so a stock `AVPlayerViewController` draws its own thumbnails and scans on I-frames, plus `scrubThumbnail(atSeconds:)`. | No I-frame playlist, so a stock player shows no thumbnails of its own. `scrubThumbnail(atSeconds:)` answers from the software host's retained packet cache (`servesPacketCacheStills`) and only when that cache exists: a local file is read directly and has none, so there the call returns nil. The still is the base layer decoded by libavcodec, not the composed picture. |
 | Subtitles | Text tracks can be declared in the init segment and served as WebVTT renditions (`prepareNativeSubtitles`), so `AVMediaSelection`, PiP and external screens render them. | No renditions and no `AVMediaSelection`. The engine decodes the cues and publishes them; the host draws its own overlay in the app. They appear in a PiP window only through the frame compositor above, and the system caption styling does not apply. |
 | AirPlay | `AVPlayer` hands the receiver the stream (the engine serves the loopback over the LAN address for it). | The layer draws on the device and only the audio renderer follows the route, so a wireless receiver plays sound only. The engine publishes `airPlayPictureStaysLocal` (iOS) so a host can say so. When the host reports that the receiver shows video (`setAirPlayReceiverShowsVideo(_:)`), a FEL source takes the native route instead (8.1 where the display takes Dolby Vision, no enhancement layer) so the receiver gets a picture; an audio-only output such as a HomePod keeps the dual-layer route. This is decided at each load: on a URL source `reloadAtCurrentPosition()` decides again, a custom source keeps its route until the next `load()`. Not applicable where the device is itself the receiver. |
+The composed overlay draws over a loopback `AVPlayer` session, so transport, Now Playing, audio, the
+item's media selection and the I-frame rendition stay the native route's. What differs is the picture:
 
-A host that needs any of these for a Profile 7 title leaves the flag off for it, as for the Atmos
-trade-off of §3.1.
+| Feature | Dual-layer route |
+|---|---|
+| Picture in Picture | The engine publishes `SoftwarePiPSource` (the overlay's layer plus the transport answers for a sample-buffer PiP content source) and the host builds the `AVPictureInPictureController` around it; while PiP is active, subtitle cues are drawn into the overlay's pictures. |
 
 ### 5.3 Packet split
 
@@ -402,7 +403,7 @@ the decoder's lock, and each call is O(K):
 - **Parameters** are written straight into one of `maxFramesInFlight` preallocated shared
   `MTLBuffer`s (`DoviMetalParams.serialize(into:)`), bound with `setBuffer` for both kernels. No `Data`,
   no heap arrays per frame.
-- **Output pool** gets `kCVPixelBufferPoolAllocationThresholdKey` = the renderer's FEL look-ahead (9)
+- **Output pool** gets `kCVPixelBufferPoolAllocationThresholdKey` = the overlay's look-ahead (9)
   + the frame on screen and the one the display layer retains (2) + the in-flight slots (3) + 1, so 15.
   A refused buffer would put a base-layer frame on screen, a visible brightness step, so past the
   threshold a burst draws on a reserve of 3 more. Only with the reserve spent does the composer wait,
@@ -413,7 +414,10 @@ the decoder's lock, and each call is O(K):
   Metal's completion queue.
 - **Pipelines** are compiled once per process, lazily on first composition (a shared `MTLLibrary` and
   pipeline states), so a MEL or bypassed stream never compiles and a second decoder instance does not
-  recompile.
+  recompile. A cold compile is about 300 ms on an M4 Pro (almost all of it source to library; the
+  pipeline states take a millisecond or two), then about 0.4 ms from Metal's shader cache. A host takes
+  it off the first frame with `AetherEngine.prewarmDualLayerDolbyVision()` at launch or on selecting a
+  Profile 7 title; it fills the same shared cache.
 - **Kernels:** a per-frame 1024-entry luma prediction table replaces piece selection and polynomial
   evaluation per pixel whenever luma is polynomial (it is a pure function of the 10-bit base code);
   residual evaluation is skipped per component when that component's NLQ is inactive; threadgroup sizes
@@ -649,8 +653,9 @@ used), so no kernel inverts it exactly. Against the DoViBaker oracle on a fine-d
 plate, band-limited noise) a 4-fetch Catmull-Rom lowered the per-pixel error sd by about 0.7% on luma and
 left chroma unchanged, for four times the enhancement-layer reads. `dovi_sample_el_1d` / `_2d` keep the
 texture size in their signature so a wider filter can replace bilinear without touching the callers.
-The phases are DoViBaker's: luma texel-centre aligned, chroma co-sited with the top-left luma sample in
-both axes (`DoviEnhancementUpsamplerTests`).
+The phases are DoViBaker's: luma texel-centre aligned, and the EL and BL chroma grids sharing their first
+sample in both axes (`DoviEnhancementUpsamplerTests`). That chroma phase is a relation between the two grids,
+not a reading of the stream's `chroma_sample_loc_type`, which the 4:2:0 kernel never consults.
 
 - **Missing or CRC-failed RPU:** the frame borrows the previous real RPU's parameters for up to
   `maxBorrowedParamsRun` (3) frames in a row, then bypasses to the base layer. Reshaping and NLQ are constant
@@ -658,8 +663,32 @@ both axes (`DoviEnhancementUpsamplerTests`).
   stream asks, with no limit. Both are resolved when the packet is demuxed (`recordSideData`), in decode order,
   so "previous" is the previous frame of the stream and each frame reaches pairing with concrete parameters;
   resolving at compose time would follow completion order instead.
-- **Output precision:** `DoviDither.fullPrecision` keeps the VDR bits below the 10-bit code in P010's unused low
-  6 bits. Opt-in, not yet validated on a display path; the default stays rounded or dithered 10-bit.
+- **Output precision:** `DoviDither.fullPrecision` keeps the VDR bits below the 10-bit code: in P010's unused low
+  6 bits (`p010-full`, undefined padding), or as defined values in `sv22`. Measured on an Apple TV 4K (A15,
+  tvOS 27) into an LG G5 with the amplifier-RPU test card (`SEQ=card`): `sv22`'s sub-10-bit precision reaches
+  the TV-led Dolby Vision output (HDMI colour mode 332, 12-bit), the rounded control's does not, and a 4K FEL
+  soak drops no more frames than `p010`. So `sv22` is the default.
+- **Output modes** (`felOutputMode`, `--fel-output`): `sv22` (the default), `p010` (Bayer dither, bit-exact with
+  Dolby's 4:2:0 reference, the fallback), `p010-round`,
+  `p010-bluenoise`, `p010-full` (the full-precision word in P010's padding) and `sv22` (16-bit 4:2:2 with the
+  same words, where they are defined values). The P010 modes compose chroma at its 4:2:0 sites, as Dolby's
+  reference does. `sv22` composes it at every 4:2:2 site instead (`dovi_compose_chroma_422`), because there
+  the composer, not tvOS, does the 4:2:0 -> 4:2:2 conversion, and repeating a 4:2:0 sample on both rows
+  throws away what the reshaping says about each row: under order-3 MMR chroma a luma edge between rows 2k
+  and 2k+1 predicts different chroma for the two. Each output row takes its luma from [1 2 1] on that row
+  alone, its base chroma from a vertical 4-tap Catmull-Rom (B = 0, C = 0.5) over the 4:2:0 rows, kept
+  fractional for the curves, and its enhancement chroma bilinearly at the same row coordinate. The vertical
+  phase follows the base layer's `chroma_location` as FFmpeg read it from the HEVC VUI, stamped onto every
+  frame's parameters by `DualLayerVideoDecoder`: LEFT / CENTER (types 0 / 1, chroma between rows 2k and
+  2k+1) put row 2k at phase 3/4 and row 2k+1 at 1/4 (taps -3, 29, 111, -9 over 128 and mirrored); TOPLEFT /
+  TOP (types 2 / 3, common on UHD Blu-ray) copy chroma row k into row 2k and put row 2k+1 half way
+  ((-1, 9, 9, -1) / 16); BOTTOMLEFT / BOTTOM (types 4 / 5) the mirror. UNSPECIFIED is LEFT, as HEVC infers
+  without `chroma_loc_info`, and FFmpeg already reports LEFT for such a stream (the probe clips carry no
+  `chroma_loc_info`). The composer logs the siting once per session (`sv22 chroma siting: type N`). This is libplacebo's order (chroma upsampled,
+  then reshaped), a deliberate quality choice that is not bit-exact with Dolby's 4:2:0 reference; on flat
+  chroma it equals the 4:2:0 result exactly. It costs the chroma pass twice the threads: 0.35 -> 0.72 ms at
+  UHD on an M4 Pro (`DoviGpuBenchmark`), the P010 modes unchanged. `DoviChroma422Tests` holds it against
+  the CPU model.
 - **Not implemented, by design:** NLQ methods other than linear (the spec defines only linear; an unknown method
   yields no residual), MEL (no residual by definition), NLQ pivots (the linear inverse has one segment).
 - **Not implemented, blocked:** polynomial pieces with `poly_order_minus1 == 0` and `linear_interp_flag`. libdovi is

@@ -70,7 +70,7 @@ extension DoviFelRealFileTests {
 
         init?(limit: Int = 16, stride: Int = 15) {
             self.stride = stride
-            guard let c = DoviFelComposer() else { return nil }
+            guard let c = DoviFelComposer.p010ForTesting() else { return nil }
             inner = c
             self.limit = limit
         }
@@ -130,7 +130,7 @@ extension DoviFelRealFileTests {
         let videoIndex: Int32
     }
 
-    static func open(_ name: String, composer: (any FelComposing)? = DoviFelComposer()) throws -> Session {
+    static func open(_ name: String, composer: (any FelComposing)? = DoviFelComposer.p010ForTesting()) throws -> Session {
         let demuxer = Demuxer()
         try demuxer.open(url: url(name))
         let idx = demuxer.videoStreamIndex

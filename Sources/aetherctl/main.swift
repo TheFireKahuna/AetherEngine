@@ -499,6 +499,12 @@ if first == "dovitest" {
 if first == "feltest" {
     var rest = Array(args.dropFirst(2))
     let frames = takeIntFlag("--frames", from: &rest) ?? 100
+    let felOutput = takeStringFlag("--fel-output", from: &rest)
+    let probeAt = takeStringFlag("--probe-at", from: &rest).map { spec -> (x: Int, y: Int) in
+        let v = spec.split(separator: ",").compactMap { Int($0) }
+        guard v.count == 2 else { print("ERROR: --probe-at takes X,Y, got '\(spec)'"); exit(64) }
+        return (v[0], v[1])
+    }
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: feltest requires a <file> argument")
         print("Usage: aetherctl feltest [--frames N] <file>")
@@ -507,7 +513,8 @@ if first == "feltest" {
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "feltest")
     #if DualLayerDolbyVision
-    exit(runFelTest(url: parseSourceURL(urlArg), maxFrames: frames))
+    applyFelOutputFlag(felOutput)
+    exit(runFelTest(url: parseSourceURL(urlArg), maxFrames: frames, probePoint: probeAt))
     #else
     print("ERROR: feltest needs the DualLayerDolbyVision trait (swift build --traits DualLayerDolbyVision)")
     exit(64)
@@ -783,6 +790,16 @@ if first == "play" {
             }
         }
         t.start()
+        #endif
+    }
+    // `--fel-output <mode>`: the FEL composer's output buffer (p010, p010-round, p010-bluenoise, p010-full, sv22), for the 12-bit experiment.
+    if let mode = takeStringFlag("--fel-output", from: &rest) {
+        #if !DualLayerDolbyVision
+        print("ERROR: --fel-output needs the DualLayerDolbyVision trait (swift build --traits DualLayerDolbyVision)")
+        exit(64)
+        #else
+        if !playFel { print("[aetherctl] note: --fel-output only changes a session on the dual-layer route; add --fel") }
+        applyFelOutputFlag(mode)
         #endif
     }
     // `--dv-pin <spec>`: arm the Dolby Vision pin test (DEBUG builds), same grammar `dvsurvey` prints.

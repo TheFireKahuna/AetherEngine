@@ -89,6 +89,7 @@ struct DualLayerSeekRealignmentTests {
 
     /// A VideoToolbox session stand-in that only counts what the decoder does to it.
     private final class FakeSession: SingleLayerVideoDecoder, @unchecked Sendable {
+        var framesDecoded: UInt64 { 0 }
         private let lock = NSLock()
         private var _flushes = 0
         var flushCount: Int { lock.lock(); defer { lock.unlock() }; return _flushes }
@@ -281,7 +282,8 @@ struct DualLayerSeekRealignmentTests {
         r.decoder.seedRPUForTesting(pts: Self.pts(1), params: Self.params(), displayMetadataNAL: nil)
         r.decoder.handleEnhancementLayerFrame(elBuffer: staleEL, pts: Self.pts(1))
         r.decoder.handleBaseLayerFrame(baseBuffer: staleBL, pts: Self.pts(1), hdr10Data: nil)
-        #expect(r.composer.pairs.count == 1, "the first composition must be on the GPU")
+        // The handler hands the composition to the compose queue; wait until it is on the GPU.
+        try await waitFor { r.composer.pairs.count == 1 }
 
         // The seek lands while it is there.
         r.decoder.flush()

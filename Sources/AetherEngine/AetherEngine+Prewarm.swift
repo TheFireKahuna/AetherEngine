@@ -2,6 +2,13 @@ import Foundation
 
 public extension AetherEngine {
 
+    /// does not wait for them.
+    /// Safe to call any number of times, and concurrently with playback: the compile happens once per
+    /// process, and a composition that starts while it runs waits for it rather than compiling again.
+    /// - Returns: Whether the pipelines are ready. False without the `DualLayerDolbyVision` trait (there is
+    ///   so the dual-layer route then plays the base layer exactly as it would have without the warm.
+    @discardableResult
+
     /// The default number of source bytes a warm retains, 8 MB.
     ///
     /// A byte budget rather than a duration, because a duration would need the bitrate, and the

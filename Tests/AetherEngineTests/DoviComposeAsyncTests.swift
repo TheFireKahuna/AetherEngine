@@ -64,7 +64,7 @@ struct DoviComposeAsyncTests {
 
     @Test("a command buffer that fails delivers a failure, not the half-written destination")
     func gpuErrorIsAFailure() async throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         guard let bl = Self.makeBuffer(width: 256, height: 256, fill: 0x8000),
               let el = Self.makeBuffer(width: 128, height: 128, fill: 0x4000) else { return }
         let params = Self.identityParams(blW: 256, blH: 256, elW: 128, elH: 128)
@@ -86,7 +86,7 @@ struct DoviComposeAsyncTests {
     @Test("after releaseOutputPool a composition is refused, its slot is returned and no pool is rebuilt",
           .timeLimit(.minutes(1)))
     func composeAfterTeardownIsRefused() async throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         let bl = try #require(Self.makeBuffer(width: 256, height: 256, fill: 0x8000))
         let el = try #require(Self.makeBuffer(width: 128, height: 128, fill: 0x4000))
         let params = Self.identityParams(blW: 256, blH: 256, elW: 128, elH: 128)
@@ -110,7 +110,7 @@ struct DoviComposeAsyncTests {
 
     @Test("pool creation is refused once torn down, whatever the caller saw before", .timeLimit(.minutes(1)))
     func poolCreationAfterTeardownIsRefused() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         #expect(composer.ensurePoolForTesting(width: 256, height: 256) != nil)
         composer.releaseOutputPool()
         // The state a racing compose is in when teardown lands after its own look and before its pool request.
@@ -122,7 +122,7 @@ struct DoviComposeAsyncTests {
     @Test("the blocking compose waits for an in-flight slot like composeAsync does", .timeLimit(.minutes(1)))
     func blockingComposeTakesAnInFlightSlot() throws {
         final class Box: @unchecked Sendable { let done = DispatchSemaphore(value: 0); var result: Bool? }
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         nonisolated(unsafe) let bl = try #require(Self.makeBuffer(width: 256, height: 256, fill: 0x8000))
         nonisolated(unsafe) let el = try #require(Self.makeBuffer(width: 128, height: 128, fill: 0x4000))
         let params = Self.identityParams(blW: 256, blH: 256, elW: 128, elH: 128)
@@ -142,7 +142,7 @@ struct DoviComposeAsyncTests {
 
     @Test("composeAsync matches the blocking compose bit for bit")
     func asyncMatchesSync() async throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         guard let bl = Self.makeBuffer(width: 256, height: 256, fill: 0x8000),
               let el = Self.makeBuffer(width: 128, height: 128, fill: 0x4000) else { return }
         let params = Self.identityParams(blW: 256, blH: 256, elW: 128, elH: 128)
@@ -166,7 +166,7 @@ struct DoviComposeAsyncTests {
     @Test("every composeAsync call completes exactly once, and no more than maxFramesInFlight are outstanding",
           .timeLimit(.minutes(1)))
     func completionsAreExactlyOnceAndBounded() async throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         guard let bl = Self.makeBuffer(width: 256, height: 256, fill: 0x8000),
               let el = Self.makeBuffer(width: 128, height: 128, fill: 0x4000) else { return }
         let params = Self.identityParams(blW: 256, blH: 256, elW: 128, elH: 128)
@@ -216,7 +216,7 @@ struct DoviComposeAsyncTests {
     @Test("composeAsync makes progress while the caller holds a lock the completion also needs",
           .timeLimit(.minutes(1)))
     func doesNotDeadlockAgainstTheCallersLock() async throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         guard let bl = Self.makeBuffer(width: 256, height: 256, fill: 0x8000),
               let el = Self.makeBuffer(width: 128, height: 128, fill: 0x4000) else { return }
         let params = Self.identityParams(blW: 256, blH: 256, elW: 128, elH: 128)

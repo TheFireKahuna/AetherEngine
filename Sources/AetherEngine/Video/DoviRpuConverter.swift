@@ -23,12 +23,16 @@ public enum DoviRpuConverter {
     struct DualLayerPacketResult: @unchecked Sendable {
         let elPacket: UnsafeMutablePointer<AVPacket>?
         let rpuData: [UInt8]?
-        /// The Profile 8.1 RPU libdovi produced from `rpuData`, as a complete unspec62 NAL
-        /// (2-byte HEVC NAL header included). On the remux route this is what goes back into
-        /// the packet; on the FEL compose route it is the per-frame display metadata payload
-        /// (L1 statistics, L2 trims, L5/L8/L9/L11), which `DoviDisplayMetadata` attaches to the
-        /// composed pixel buffer. Nil when there was no RPU or the conversion failed.
+        /// The Profile 8.1 RPU libdovi produced from `rpuData` with both curves set to no-op, as a
+        /// complete unspec62 NAL (2-byte HEVC NAL header included): the per-frame display metadata
+        /// payload (L1 statistics, L2 trims, L5/L8/L9/L11) that `DoviDisplayMetadata` attaches to a
+        /// composed pixel buffer (`dualLayerUnspec62`). Nil when there was no RPU, the conversion
+        /// failed, or neither dual-layer output was asked for (the remux route rewrites the packet only).
         let convertedRpu: [UInt8]?
+        /// The same RPU in Profile 8.1 with its luma/chroma mapping kept: what a frame presented as its
+        /// raw base layer carries, so the display side does the reshaping the composer did not. Set
+        /// whenever `convertedRpu` is.
+        let baseLayerRpu: [UInt8]?
         #if DualLayerDolbyVision
         let rpuParams: DoviMetalParams?
         #endif
@@ -42,11 +46,12 @@ public enum DoviRpuConverter {
         let disableResidual: Bool
 
         #if DualLayerDolbyVision
-        init(elPacket: UnsafeMutablePointer<AVPacket>?, rpuData: [UInt8]?, convertedRpu: [UInt8]? = nil, rpuParams: DoviMetalParams? = nil, isFEL: Bool, isMEL: Bool = false, success: Bool, usesPreviousMapping: Bool = false, disableResidual: Bool = false) {
+        init(elPacket: UnsafeMutablePointer<AVPacket>?, rpuData: [UInt8]?, convertedRpu: [UInt8]? = nil, baseLayerRpu: [UInt8]? = nil, rpuParams: DoviMetalParams? = nil, isFEL: Bool, isMEL: Bool = false, success: Bool, usesPreviousMapping: Bool = false, disableResidual: Bool = false) {
             self.rpuParams = rpuParams
             self.elPacket = elPacket
             self.rpuData = rpuData
             self.convertedRpu = convertedRpu
+            self.baseLayerRpu = baseLayerRpu
             self.isFEL = isFEL
             self.isMEL = isMEL
             self.success = success
@@ -54,10 +59,11 @@ public enum DoviRpuConverter {
             self.disableResidual = disableResidual
         }
         #else
-        init(elPacket: UnsafeMutablePointer<AVPacket>?, rpuData: [UInt8]?, convertedRpu: [UInt8]? = nil, isFEL: Bool, isMEL: Bool = false, success: Bool, usesPreviousMapping: Bool = false, disableResidual: Bool = false) {
+        init(elPacket: UnsafeMutablePointer<AVPacket>?, rpuData: [UInt8]?, convertedRpu: [UInt8]? = nil, baseLayerRpu: [UInt8]? = nil, isFEL: Bool, isMEL: Bool = false, success: Bool, usesPreviousMapping: Bool = false, disableResidual: Bool = false) {
             self.elPacket = elPacket
             self.rpuData = rpuData
             self.convertedRpu = convertedRpu
+            self.baseLayerRpu = baseLayerRpu
             self.isFEL = isFEL
             self.isMEL = isMEL
             self.success = success
@@ -135,15 +141,32 @@ public enum DoviRpuConverter {
     /// `dovi_data_free`. This is the pair of calls the library can abort in, so everything that feeds it
     /// goes through `DoviRpuGuard.parse` first, and the tests drive it through this one entry point.
     ///
-    /// Mode 2 and not 5, on the dual-layer route too: by the time a frame reaches the display layer the
-    /// Metal composer has already applied the RPU's luma/chroma reshaping and added the residual, so the
-    /// picture is finished. Mode 2 sets both curves to no-op (and drops the EL/NLQ part) while keeping
-    /// L1/L2 and the rest of the display metadata; an RPU that kept the mapping would make the display
-    /// side reshape a second time. `DoviComposedFrameRpuTests` pins this on the RPU attached to composed frames.
+    /// Mode 2 drops the EL/NLQ part and, for an RPU whose `el_type` is FEL, sets both curves to no-op,
+    /// keeping L1/L2 and the rest of the display metadata. The remux route (which drops the EL) wants
+    /// exactly that. The dual-layer route does not use it for what it attaches to frames: a composed
+    /// frame's RPU must have no mapping whatever its `el_type`, which `dualLayerUnspec62` guarantees and
+    /// `DoviComposedFrameRpuTests` pins.
     static func convertedUnspec62(_ rpu: OpaquePointer) -> UnsafePointer<DoviData>? {
         guard dovi_convert_rpu_with_mode(rpu, 2) == 0 else { return nil }
         return dovi_write_unspec62_nalu(rpu)
     }
+
+    /// The two Profile 8.1 forms a frame of the dual-layer route can carry, as unspec62 NALs: `composed`
+    /// with both curves set to no-op, for a frame whose pixels `DoviFelComposer` produced, and `baseLayer`
+    /// with the luma/chroma mapping kept, for a frame presented as its raw base layer, which the display
+    /// side still has to reshape. nil when libdovi refuses any step; the caller frees both with
+    /// `dovi_data_free`. Mutates `rpu`.
+    ///
+    /// Mode 2 alone is not the composed form: libdovi removes the mapping only when that RPU's own
+    /// `el_type` is FEL, and `el_type` comes from the NLQ block, which is only present when
+    /// `disable_residual_flag` is clear. A FEL stream's RPU with the flag set (or with MEL-like NLQ)
+    /// keeps its curves through mode 2, and the TV would reshape a picture the composer already
+    /// reshaped. `dovi_rpu_remove_mapping` after mode 2 neutralises them for every RPU.
+    ///
+    /// The C API has no mapping-preserving 8.1 mode (`To81MappingPreserved` is not reachable from a
+    /// mode number), so for a FEL RPU `baseLayer` goes through mode 1 first: the NLQ becomes MEL's, the
+    /// recomputed `el_type` is MEL, and mode 2 then leaves the mapping alone. That is the same RPU as
+    /// dovi_tool's mode 5. Other RPUs keep their mapping through mode 2 as they are.
 
     /// Splits a Profile 7 packet into its layers in one walk.
     ///
@@ -177,6 +200,7 @@ public enum DoviRpuConverter {
         let keepRpuBytes = extractEL || extractParams
         var rawRpuBytes: [UInt8]?
         var convertedRpuBytes: [UInt8]?
+        var baseLayerRpuBytes: [UInt8]?
         #if DualLayerDolbyVision
         var rpuParams: DoviMetalParams?
         #endif
@@ -226,22 +250,29 @@ public enum DoviRpuConverter {
                     dovi_rpu_free_header(hdr)
                 }
                 guard let out = Self.convertedUnspec62(rpu) else {
-                    degraded = true
-                    return
+                // The dual-layer outputs need the composed form (no mapping), which mode 2 alone does not
+                let out: UnsafePointer<DoviData>
+                    rewritten.append(forms.composed)
+                    rewritten.append(forms.baseLayer)
+                    composedOut = forms.composed
+                    baseLayerOut = forms.baseLayer
                 }
                 guard let outData = out.pointee.data, out.pointee.len > 0 else {
-                    dovi_data_free(out)
                     degraded = true
                     return
                 }
-                rewritten.append(out)
                 if !useCustomBlockSource {
                     pieces.append(Piece(base: outData, count: out.pointee.len))
                 }
                 converted = true
 
                 rawRpuBytes = thisRaw
-                convertedRpuBytes = keepRpuBytes ? [UInt8](UnsafeBufferPointer(start: outData, count: out.pointee.len)) : nil
+                convertedRpuBytes = composedOut.flatMap { c in
+                    c.pointee.data.map { [UInt8](UnsafeBufferPointer(start: $0, count: c.pointee.len)) }
+                }
+                baseLayerRpuBytes = baseLayerOut.flatMap { b in
+                    b.pointee.data.map { [UInt8](UnsafeBufferPointer(start: $0, count: b.pointee.len)) }
+                }
                 #if DualLayerDolbyVision
                 rpuParams = thisParams
                 #endif
@@ -313,6 +344,7 @@ public enum DoviRpuConverter {
             elPacket: producedElPacket,
             rpuData: rawRpuBytes,
             convertedRpu: convertedRpuBytes,
+            baseLayerRpu: baseLayerRpuBytes,
             rpuParams: rpuParams,
             isFEL: isFEL && !isMEL,
             isMEL: isMEL,
@@ -325,6 +357,7 @@ public enum DoviRpuConverter {
             elPacket: producedElPacket,
             rpuData: rawRpuBytes,
             convertedRpu: convertedRpuBytes,
+            baseLayerRpu: baseLayerRpuBytes,
             isFEL: isFEL && !isMEL,
             isMEL: isMEL,
             success: !degraded && !allocationFailed,

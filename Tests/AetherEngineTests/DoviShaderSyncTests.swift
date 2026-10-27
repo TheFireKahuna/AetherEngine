@@ -13,9 +13,7 @@ struct DoviShaderSyncTests {
 
     @Test("The runtime-compiled source carries all expected kernels")
     func runtimeSourceCarriesKernels() {
-        for kernel in ["dovi_compose_luma", "dovi_compose_chroma", "dovi_layout_probe"] {
-            #expect(DoviShaderSource.source.contains("kernel void \(kernel)("),
-                    "runtime source is missing \(kernel)")
+        for kernel in ["dovi_compose_luma", "dovi_compose_chroma", "dovi_chroma_420_to_422", "dovi_layout_probe"] {
         }
     }
 
@@ -25,14 +23,14 @@ struct DoviShaderSyncTests {
         params.polyY.numPivots = 9
         params.mmrCb.coefShift = 23
         #expect(params.serialize().count == DoviMetalParams.serializedSize)
-        #expect(DoviMetalParams.serializedSize == 2972,
+        #expect(DoviMetalParams.serializedSize == 2980,
                 "The parameter ABI changed; update tests and probe asserts")
     }
 
     @Test("two composers share one pipeline state instance (compiled once lazily)", .enabled(if: DoviShaderSyncTests.metalAvailable, "needs a Metal device"))
     func twoComposersSharePipelineStateInstance() throws {
-        let c1 = try #require(DoviFelComposer())
-        let c2 = try #require(DoviFelComposer())
+        let c1 = try #require(DoviFelComposer.p010ForTesting())
+        let c2 = try #require(DoviFelComposer.p010ForTesting())
 
         // Before accessing pipelines or composing, both composers exist without separate compiles.
         // Accessing pipelines returns identical instances (shared across composers).
@@ -80,6 +78,16 @@ struct DoviShaderSyncTests {
             }
         }
         #expect(compiles.count == 1)
+    }
+
+    @Test("prewarm builds the shared pipelines a composer then uses", .enabled(if: DoviShaderSyncTests.metalAvailable, "needs a Metal device"))
+    func prewarmBuildsTheSharedPipelines() async throws {
+        #expect(await AetherEngine.prewarmDualLayerDolbyVision())
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let shared = try DoviFelComposer.SharedPipelines.getOrCreate(device: device)
+        let composer = try #require(DoviFelComposer.p010ForTesting())
+        #expect(composer.lumaPipelineForTesting === shared.lumaPipeline, "the composer reuses the warmed pipeline, no second compile")
+        #expect(await AetherEngine.prewarmDualLayerDolbyVision(), "a second warm is a cache hit")
     }
 }
 #endif

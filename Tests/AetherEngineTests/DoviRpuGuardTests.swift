@@ -69,6 +69,7 @@ struct DoviRpuGuardTests {
         var cmv29Count: UInt64 = 0
         var cmv29Block: (length: UInt64, level: UInt64)?
         var cmv40Block: (length: UInt64, level: UInt64)?
+        var yccToRgbOffsets: (UInt64, UInt64, UInt64) = (1 << 24, 1 << 27, 1 << 27)
     }
 
     static func writeDM(_ w: inout BitWriter, _ dm: DMPayload) {
@@ -77,7 +78,7 @@ struct DoviRpuGuardTests {
         w.ue(0)                                  // scene_refresh_flag
         if !dm.compressed {                      // 509 bits, valid per libdovi's validate
             for _ in 0..<9 { w.put(0, 16) }      // ycc_to_rgb_coef
-            for _ in 0..<3 { w.put(0, 32) }      // ycc_to_rgb_offset
+            w.put(dm.yccToRgbOffsets.0, 32); w.put(dm.yccToRgbOffsets.1, 32); w.put(dm.yccToRgbOffsets.2, 32)
             for _ in 0..<9 { w.put(0, 16) }      // rgb_to_lms_coef
             w.put(65535, 16); w.put(0, 16); w.put(0, 16); w.put(0, 32)   // signal_eotf (65535 with no params)
             w.put(10, 5); w.put(0, 2); w.put(0, 2); w.put(0, 2)          // depth, color space, chroma, range
@@ -134,9 +135,13 @@ struct DoviRpuGuardTests {
     /// `pivotCount` replaces luma's `num_pivots_minus2` (the pivots written stay the real ones),
     /// `firstMappingIdc` the encoding of luma's first `mapping_idc`, `vdrRpuId` the mapping's id and `dm`
     /// appends a display-management payload after the mapping and NLQ.
+    /// `partitions` sets the two `num_*_partitions_minus1` and `nlqPivots` the two delta-coded
+    /// `nlq_pred_pivot_value`s of a residual RPU.
     static func craft(pieces: [[Piece]], residual: Residual = .none, coefficientDataType: Int = 0,
                       pivotCount: UInt64? = nil, firstMappingIdc: ((inout BitWriter) -> Void)? = nil,
-                      vdrRpuId: ((inout BitWriter) -> Void)? = nil, dm: DMPayload? = nil) -> [UInt8] {
+                      vdrRpuId: ((inout BitWriter) -> Void)? = nil, dm: DMPayload? = nil,
+                      partitions: (UInt64, UInt64) = (0, 0),
+                      nlqPivots: (UInt64, UInt64) = (0, 1023)) -> [UInt8] {
         precondition(coefficientDataType == 0 || residual == .none)
         var w = BitWriter()
         w.put(2, 6); w.put(18, 11)           // rpu_type, rpu_format (libdovi checks the 0x08 0x09 start)
@@ -158,8 +163,8 @@ struct DoviRpuGuardTests {
             if c == 0, let pivotCount { w.ue(pivotCount) } else { w.ue(UInt64(curve.count) - 1) }   // num_pivots_minus2
             for k in 0...curve.count { w.put(UInt64(k * 1023 / curve.count), 10) }
         }
-        if residual != .none { w.put(0, 3); w.put(0, 10); w.put(1023, 10) }   // NLQ method, pivots
-        w.ue(0); w.ue(0)                     // partitions
+        if residual != .none { w.put(0, 3); w.put(nlqPivots.0, 10); w.put(nlqPivots.1, 10) }   // NLQ method, pivots
+        w.ue(partitions.0); w.ue(partitions.1)   // partitions
         /// One coefficient: signed integer part and 23 fraction bits, or (type 1) 32 plain bits.
         func coef(_ w: inout BitWriter, _ int: Int64) {
             if coefficientDataType == 0 { w.se(int); w.put(0, 23) } else { w.put(0, 32) }
@@ -537,3 +542,33 @@ struct DoviRpuGuardTests {
         #expect(Self.verdict(seed.rpu) == (true, false))
     }
 }
+
+#if DualLayerDolbyVision
+extension DoviRpuGuardTests {
+    private static func parameters(_ nal: [UInt8]) -> DoviMetalParams? {
+        nal.withUnsafeBufferPointer { buf -> DoviMetalParams? in
+            guard let rpu = DoviRpuGuard.parse(buf.baseAddress!, buf.count) else { return nil }
+            defer { dovi_rpu_free(rpu) }
+            return DoviFelComposer.parseRpuParameters(rpu: rpu)
+        }
+    }
+
+    @Test("the RPU fields the kernels assume a value for are logged once when a stream carries another")
+    func assumptionsAreLoggedOnce() throws {
+        let capture = EngineLogCapture()
+        defer { capture.end() }
+        DoviFelComposer.resetAssumptionLogForTesting()
+        let pieces: [[Piece]] = [[.polynomial], [.polynomial], [.polynomial]]
+        // The defaults log nothing.
+        _ = try #require(Self.parameters(Self.craft(pieces: pieces, residual: .fel)))
+        let markers = ["nlq_pred_pivot_value = 16...1023", "num_x_partitions_minus1 = 1"]
+        for m in markers { #expect(capture.matching(m).isEmpty, "\(m) logged for a default RPU") }
+        // libdovi 3.4 refuses pivots whose deltas do not sum to the BL maximum, so only the first can differ.
+        let odd = Self.craft(pieces: pieces, residual: .fel, partitions: (1, 2), nlqPivots: (16, 1007))
+        _ = try #require(Self.parameters(odd))
+        _ = try #require(Self.parameters(odd))
+        for m in markers { #expect(capture.matching(m).count == 1, "\(m): \(capture.matching(m).count) lines") }
+        #expect(capture.matching("num_y_partitions_minus1 = 2").count == 1)
+    }
+}
+#endif

@@ -20,6 +20,9 @@ struct DoviGpuEdgeCaseTests {
 
     // MARK: - Fixtures
 
+    /// NLQ at coefficient_log2_denom 23, as every real stream carries: `scale` and `threshold` in Q23, the
+    /// ceiling `vdrInMax` given in 12-bit codes (512 = 0.125, the real streams' value) and stored as Q23 R,
+    /// one 12-bit code being 2^11. The shift is the inverse NLQ's 23 - 5 - 10.
     static func nlq(
         offset: Int32 = 512,
         scale: Int32 = 2048,
@@ -32,8 +35,8 @@ struct DoviGpuEdgeCaseTests {
         n.nlqOffset = offset
         n.nlqScale = scale
         n.nlqThreshold = threshold
-        n.vdrInMax = vdrInMax
-        n.nlqShift = 11
+        n.vdrInMax = vdrInMax << 11
+        n.nlqShift = 8
         return n
     }
 
@@ -99,14 +102,14 @@ struct DoviGpuEdgeCaseTests {
             (511, 512),   // -1 -> 0 -> 512
           ])
     func residualSigns(elY: Int, expected: Int) throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         let out = try Self.composeConstant(composer, bl: (512, 512, 512), el: (elY, 512, 512), params: Self.params())
         #expect(Self.lumaValues(out) == [expected], "el=\(elY)")
     }
 
     @Test("GPU residual: vdr_in_max clamps the magnitude symmetrically")
     func residualClampedByVdrInMax() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         let p = Self.params(nlqY: Self.nlq(vdrInMax: 256))
         // +511 -> clamped to +256 -> (2048 + 256) / 4 = 576 ; -512 -> -256 -> 448
         let hi = try Self.composeConstant(composer, bl: (512, 512, 512), el: (1023, 512, 512), params: p)
@@ -119,7 +122,7 @@ struct DoviGpuEdgeCaseTests {
     func residualThresholdAdded() throws {
         // DoViBaker: dq = (2|r| - 1) * S + 2 * T, all >> (shift + 1). With S = 2048 (one code per EL code), shift 11 and
         // T = 50 codes: |r| = 100 -> (99.5 + 50) = 149.5 -> 149; |r| = 30 -> 29.5 + 50 = 79.5 -> 79; negative mirrors.
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         let p = Self.params(nlqY: Self.nlq(threshold: 50 * 2048))
         let big = try Self.composeConstant(composer, bl: (512, 512, 512), el: (612, 512, 512), params: p)
         let small = try Self.composeConstant(composer, bl: (512, 512, 512), el: (542, 512, 512), params: p)
@@ -131,7 +134,7 @@ struct DoviGpuEdgeCaseTests {
 
     @Test("GPU residual: zero scale, method none and disable_residual each yield the bare base layer")
     func residualOff() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         let cases: [(String, DoviMetalParams)] = [
             ("zero scale", Self.params(nlqY: Self.nlq(scale: 0))),
             ("method none", Self.params(nlqY: Self.nlq(method: .none))),
@@ -146,7 +149,7 @@ struct DoviGpuEdgeCaseTests {
 
     @Test("GPU residual: Cb and Cr are inverted independently and with their own parameters")
     func chromaResidualIndependent() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         // Cr gets half the slope of Cb, so the same +100 EL swing gives +100 and +50.
         let p = Self.params(nlqCb: Self.nlq(scale: 2048), nlqCr: Self.nlq(scale: 1024))
         let out = try Self.composeConstant(composer, bl: (512, 400, 600), el: (512, 612, 612), params: p)
@@ -158,7 +161,7 @@ struct DoviGpuEdgeCaseTests {
 
     @Test("GPU residual: only Cb active leaves Cr at its base value")
     func chromaOneComponentActive() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         let p = Self.params(nlqCr: Self.nlq(scale: 0))
         let out = try Self.composeConstant(composer, bl: (512, 400, 600), el: (512, 612, 612), params: p)
         let uv = Self.allSamples(out, plane: 1, components: 2)
@@ -168,28 +171,28 @@ struct DoviGpuEdgeCaseTests {
 
     // MARK: - Output range
 
-    @Test("GPU clamps to video range: luma 64...940, chroma 64...960")
-    func outputClamps() throws {
-        let composer = try #require(DoviFelComposer())
+    @Test("GPU clips to the code space, not to video range: footroom and headroom pass")
+    func outputClips() throws {
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         let p = Self.params(flags: [.disableResidual])
         let low = try Self.composeConstant(composer, bl: (0, 0, 0), el: (512, 512, 512), params: p)
         let high = try Self.composeConstant(composer, bl: (1023, 1023, 1023), el: (512, 512, 512), params: p)
-        #expect(Self.lumaValues(low) == [64])
-        #expect(Set(Self.allSamples(low, plane: 1, components: 2).flatMap { $0 }) == [64])
-        #expect(Self.lumaValues(high) == [940])
-        #expect(Set(Self.allSamples(high, plane: 1, components: 2).flatMap { $0 }) == [960])
+        #expect(Self.lumaValues(low) == [0])
+        #expect(Set(Self.allSamples(low, plane: 1, components: 2).flatMap { $0 }) == [0])
+        #expect(Self.lumaValues(high) == [1023])
+        #expect(Set(Self.allSamples(high, plane: 1, components: 2).flatMap { $0 }) == [1023])
     }
 
     @Test("GPU residual pushing past the VDR range saturates instead of wrapping")
     func residualSaturates() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         let p = Self.params()
-        // BL 1023 + 511 residual -> 4092 + 511 > 4095 -> clamp -> out 1024 -> luma cap 940.
+        // BL 1023 + 511 residual -> 4092 + 511 > 4095 -> clipped to the top code, 1023.
         let hi = try Self.composeConstant(composer, bl: (1023, 512, 512), el: (1023, 512, 512), params: p)
-        // BL 0 - 512 residual -> negative -> clamp 0 -> luma floor 64.
+        // BL 0 - 512 residual -> negative -> clipped to 0.
         let lo = try Self.composeConstant(composer, bl: (0, 512, 512), el: (0, 512, 512), params: p)
-        #expect(Self.lumaValues(hi) == [940])
-        #expect(Self.lumaValues(lo) == [64])
+        #expect(Self.lumaValues(hi) == [1023])
+        #expect(Self.lumaValues(lo) == [0])
     }
 
     // MARK: - Geometry
@@ -197,7 +200,7 @@ struct DoviGpuEdgeCaseTests {
     @Test("GPU writes every pixel for sizes that are not a multiple of the threadgroup or of 8",
           arguments: [(4, 4), (6, 4), (34, 10), (130, 18), (514, 6), (1030, 10)])
     func oddGeometryCoversEveryPixel(width: Int, height: Int) throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         // Residual of +100 over the whole frame: an unwritten pixel would read 0,
         // and a border pixel that mis-sampled the EL would miss 537.
         let out = try Self.composeConstant(
@@ -211,21 +214,25 @@ struct DoviGpuEdgeCaseTests {
         #expect(Set(uv.map { $0[1] }) == [487], "Cr \(width)x\(height)")
     }
 
-    @Test("a frame whose enhancement chroma plane would be empty is refused, not composed from garbage",
+    /// An enhancement layer one sample high or wide has a chroma plane of one sample along that axis (half the size,
+    /// rounded up, as CoreVideo allocates it), and the composer reads it: every output sample is composed from real
+    /// planes, none left out.
+    @Test("a frame whose enhancement layer is one sample high composes from its one-sample chroma plane",
           arguments: [(2, 2), (6, 2)])
-    func tooSmallForChromaIsRefused(width: Int, height: Int) throws {
-        let composer = try #require(DoviFelComposer())
-        let blBuf = try #require(H.makeBuffer(width: width, height: height))
-        let elBuf = try #require(H.makeBuffer(width: width / 2, height: height / 2))
-        #expect(composer.compose(baseBuffer: blBuf, enhancementBuffer: elBuf, params: Self.params()) == nil)
-        // and the failed attempt must not have leaked a parameter slot
-        let ok = try Self.composeConstant(composer, bl: (512, 512, 512), el: (612, 512, 512), params: Self.params())
-        #expect(Self.lumaValues(ok) == [537])
+    func oneSampleChromaPlaneComposes(width: Int, height: Int) throws {
+        let composer = try #require(DoviFelComposer.p010ForTesting())
+        let out = try Self.composeConstant(composer, blWidth: width, blHeight: height,
+                                           bl: (512, 512, 512), el: (612, 612, 412), params: Self.params())
+        #expect(Self.lumaValues(out) == [537], "luma \(width)x\(height)")
+        let uv = Self.allSamples(out, plane: 1, components: 2)
+        #expect(uv.count == DoviFelComposer.chromaSize(width) * DoviFelComposer.chromaSize(height))
+        #expect(Set(uv.map { $0[0] }) == [537], "Cb \(width)x\(height)")
+        #expect(Set(uv.map { $0[1] }) == [487], "Cr \(width)x\(height)")
     }
 
     @Test("GPU enhancement-layer upsampling preserves a constant field to the last row and column")
     func upsamplingPartitionOfUnity() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         // EL is 1/4 the BL area. A weight set that does not sum to one, or one that
         // reads past the edge, shows up as a border that differs from the interior.
         for (w, h) in [(64, 16), (66, 18), (130, 34)] {
@@ -242,7 +249,7 @@ struct DoviGpuEdgeCaseTests {
 
     @Test("GPU zero-width piece is never selected; the later piece owns the shared pivot")
     func zeroWidthPiece() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         var poly = DoviPolynomialParams()
         poly.numPivots = 4
         poly.pivots[0] = 0; poly.pivots[1] = 500; poly.pivots[2] = 500; poly.pivots[3] = 1023
@@ -266,13 +273,13 @@ struct DoviGpuEdgeCaseTests {
         let out = try #require(composer.compose(baseBuffer: bl, enhancementBuffer: el, params: p))
         let row = H.readPlane(out, plane: 0, components: 1, row: 0).map { $0[0] }
         for code in [100, 499, 500, 501, 900] {
-            #expect(row[code] == min(max(code, 64), 940), "code \(code)")
+            #expect(row[code] == code, "code \(code)")
         }
     }
 
     @Test("GPU luma MMR path reads the base-layer chroma, not just luma")
     func lumaMmrUsesChroma() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         var poly = DoviPolynomialParams()
         poly.numPivots = 2
         poly.pivots[0] = 0; poly.pivots[1] = 1023
@@ -293,7 +300,7 @@ struct DoviGpuEdgeCaseTests {
 
     @Test("GPU luma MMR with a constant term and order 2 matches the hand-computed value")
     func lumaMmrOrderTwo() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         var poly = DoviPolynomialParams()
         poly.numPivots = 2
         poly.pivots[0] = 0; poly.pivots[1] = 1023
@@ -320,10 +327,11 @@ struct DoviGpuEdgeCaseTests {
 
     @Test("GPU dither keeps the mean level and only moves values by one code")
     func ditherStaysWithinOneCode() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         var p = Self.params()
         p.ditherMode = .bayer8x8
-        // Residual +3 (reconstructed as +2) on a 512 base: exactly 512.5, so dither splits 512/513.
+        // EL +3 on a 512 base: r = 16 * 3 - 8 = 40, h = 32808, exactly 512.625 in 10-bit codes: the 8x8 matrix
+        // rounds 40 of its 64 cells up, so the mean is exact.
         let blBuf = try #require(H.makeBuffer(width: 64, height: 64))
         let elBuf = try #require(H.makeBuffer(width: 32, height: 32))
         H.fillPlane(blBuf, plane: 0, components: 1) { _, _, _ in 512 }
@@ -335,7 +343,7 @@ struct DoviGpuEdgeCaseTests {
             let samples = Self.allSamples(out, plane: 0, components: 1).map { $0[0] }
             #expect(samples.allSatisfy { $0 == 512 || $0 == 513 })
             let mean = Double(samples.reduce(0, +)) / Double(samples.count)
-            #expect(abs(mean - 512.5) < 0.01, "frame \(frame) mean \(mean)")
+            #expect(abs(mean - 512.625) < 0.01, "frame \(frame) mean \(mean)")
         }
     }
 
@@ -343,7 +351,7 @@ struct DoviGpuEdgeCaseTests {
 
     @Test("compose refuses degenerate buffers instead of crashing")
     func degenerateBuffers() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         // A non-planar buffer cannot give the six textures the kernels need.
         var bgra: CVPixelBuffer?
         CVPixelBufferCreate(kCFAllocatorDefault, 64, 16, kCVPixelFormatType_32BGRA,
@@ -358,7 +366,7 @@ struct DoviGpuEdgeCaseTests {
 
     @Test("repeated composes at a changing resolution recycle the pool without leaking slots")
     func resolutionChangeMidStream() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         for (w, h) in [(64, 16), (128, 32), (64, 16), (256, 64), (64, 16)] {
             for _ in 0..<8 {
                 let out = try Self.composeConstant(
@@ -385,15 +393,42 @@ extension DoviGpuEdgeCaseTests {
 
     @Test("full-precision output keeps the two VDR bits the 10-bit code drops")
     func fullPrecisionKeepsLowBits() throws {
-        let composer = try #require(DoviFelComposer())
-        // BL 500 -> VDR 2000; +2 residual (reconstructed as +1) -> 2001 = 500.25 in 10-bit codes.
+        let composer = try #require(DoviFelComposer.p010ForTesting())
+        // BL 500 -> v = 500 << 6 = 32000; EL +2 -> r = 16 * 2 - 8 = 24 (12-bit 1.5): the word is h = 32024,
+        // 500.375 in 10-bit codes, the sum before the reconstruction's rounding.
         var p = Self.params(); p.ditherMode = .fullPrecision
         let out = try Self.composeConstant(composer, bl: (500, 512, 512), el: (514, 512, 512), params: p)
-        #expect(Self.rawWord(out, plane: 0) == 2001 * 16)
+        #expect(Self.rawWord(out, plane: 0) == 32024)
         #expect(Self.rawWord(out, plane: 0) >> 6 == 500, "the top 10 bits stay a valid P010 code")
         var r = Self.params(); r.ditherMode = .none
         let rounded = try Self.composeConstant(composer, bl: (500, 512, 512), el: (514, 512, 512), params: r)
         #expect(Self.rawWord(rounded, plane: 0) == 500 << 6)
+    }
+
+    @Test("sv22 output carries the full-precision words in a 4:2:2 buffer, chroma on every row")
+    func sv22KeepsLowBitsAndDoublesChromaRows() throws {
+        let composer = try #require(DoviFelComposer.p010ForTesting())
+        composer.outputModeOverride = .sv22
+        // As fullPrecisionKeepsLowBits: h = 32024, 500.375 in 10-bit codes. Chroma BL 600 with EL +2 ->
+        // 38400 + 24 = 38424, 600.375. The params ask for no dither; sv22 implies full precision.
+        var p = Self.params(); p.ditherMode = .none
+        let out = try Self.composeConstant(composer, bl: (500, 600, 512), el: (514, 514, 512), params: p)
+        #expect(CVPixelBufferGetPixelFormatType(out) == kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange)
+        #expect(CVPixelBufferGetHeightOfPlane(out, 1) == CVPixelBufferGetHeight(out), "4:2:2: one chroma row per luma row")
+        #expect(Self.rawWord(out, plane: 0) == 32024)
+        // Raw 16-bit words (readPlane drops the low 6 bits), over every row of the chroma plane.
+        CVPixelBufferLockBaseAddress(out, .readOnly); defer { CVPixelBufferUnlockBaseAddress(out, .readOnly) }
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(out, 1) / 2
+        let uv = CVPixelBufferGetBaseAddressOfPlane(out, 1)!.assumingMemoryBound(to: UInt16.self)
+        var cb = Set<Int>(), cr = Set<Int>()
+        for row in 0..<CVPixelBufferGetHeightOfPlane(out, 1) {
+            for col in 0..<CVPixelBufferGetWidthOfPlane(out, 1) {
+                cb.insert(Int(uv[row * stride + col * 2]))
+                cr.insert(Int(uv[row * stride + col * 2 + 1]))
+            }
+        }
+        #expect(cb == [38424], "every chroma row composed, odd rows included, sub-10-bit bits kept")
+        #expect(cr == [512 << 6])
     }
 }
 
@@ -425,7 +460,7 @@ extension DoviGpuEdgeCaseTests {
     /// clamped input, in 12-bit VDR codes (x4).
     @Test("MMR inputs are clamped to their own component's pivot range: Cb to poly_cb, Cr to poly_cr, luma to poly_y")
     func mmrInputsClampedToOwnComponentRange() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
 
         // Cb term (u) with poly_cb range [64, 940]: BL Cb 1000 -> 940, BL Cb 30 -> 64.
         var p = Self.rawParams()
@@ -467,10 +502,10 @@ extension DoviGpuEdgeCaseTests {
     }
 
     /// DoViBaker floors the polynomial and the MMR result at 0 (`vv = (vv < 0) ? 0 : vv`) before the residual
-    /// is added, so a negative prediction is not pulled back up by it: 0 + 99, not -410 + 99 -> clamp 0.
+    /// is added, so a negative prediction is not pulled back up by it: 0 + 99.5 -> 100, not -410 + 99.5 -> clamp 0.
     @Test("a negative prediction is floored at 0 before the residual is added")
     func negativePredictionFlooredBeforeResidual() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         var neg = DoviPolynomialParams()
         neg.numPivots = 2; neg.pivots[0] = 0; neg.pivots[1] = 1023
         neg.method[0] = DoviMapping.polynomial.rawValue
@@ -481,23 +516,23 @@ extension DoviGpuEdgeCaseTests {
         p.ditherMode = .debugRawVDR
         p.polyY = neg
         let out = try Self.composeConstant(composer, bl: (512, 512, 512), el: (612, 512, 512), params: p)
-        #expect(Set(DoviTestSupport.rawVDR(out)[0]) == [99])   // +100 EL codes -> +99 residual
+        #expect(Set(DoviTestSupport.rawVDR(out)[0]) == [100])   // +100 EL codes -> +99.5, rounded once
 
-        // The same through MMR (chroma): constant -0.1, residual +99.
+        // The same through MMR (chroma): constant -0.1, residual +99.5.
         var m = DoviMmrParams(); m.coefShift = 23; m.constant[0] = Int32(-0.1 * 8388608.0)
         var mp = DoviPolynomialParams()
         mp.numPivots = 2; mp.pivots[1] = 1023
         mp.method[0] = DoviMapping.mmr.rawValue; mp.order[0] = 1; mp.coefShift[0] = 23
         p.polyCb = mp; p.mmrCb = m
         let c = try Self.composeConstant(composer, bl: (512, 512, 512), el: (512, 612, 512), params: p)
-        #expect(Set(DoviTestSupport.rawVDR(c)[1]) == [99])
+        #expect(Set(DoviTestSupport.rawVDR(c)[1]) == [100])
     }
 
     /// DoViBaker also caps the prediction at full scale (`v > 0xffff ? 0xffff : v`) before the residual, so a
-    /// prediction above it is not pulled back down from there: 4095 - 99, not 4506 - 99 -> clamp 4095.
+    /// prediction above it is not pulled back down from there: 0xffff - 1592 = 63943 -> 3996, not 4506 - 99.5 -> clamp 4095.
     @Test("a prediction above full scale is capped at vdr_max before the residual is added")
     func overRangePredictionCappedBeforeResidual() throws {
-        let composer = try #require(DoviFelComposer())
+        let composer = try #require(DoviFelComposer.p010ForTesting())
         var high = DoviPolynomialParams()
         high.numPivots = 2; high.pivots[0] = 0; high.pivots[1] = 1023
         high.method[0] = DoviMapping.polynomial.rawValue
@@ -508,7 +543,7 @@ extension DoviGpuEdgeCaseTests {
         p.ditherMode = .debugRawVDR
         p.polyY = high
         let out = try Self.composeConstant(composer, bl: (512, 512, 512), el: (412, 512, 512), params: p)
-        #expect(Set(DoviTestSupport.rawVDR(out)[0]) == [3996])   // -100 EL codes -> -99 residual
+        #expect(Set(DoviTestSupport.rawVDR(out)[0]) == [3996])   // -100 EL codes -> -99.5 from 4095.94
 
         // The same through MMR (chroma): constant 1.1, residual -99.
         var m = DoviMmrParams(); m.coefShift = 23; m.constant[0] = Int32(1.1 * 8388608.0)

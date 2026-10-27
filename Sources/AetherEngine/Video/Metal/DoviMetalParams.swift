@@ -1,5 +1,6 @@
 // Only with the DualLayerDolbyVision trait (off by default).
 #if DualLayerDolbyVision
+import CoreVideo
 import Foundation
 
 /// How one reshaping piece is evaluated (`mapping_idc`).
@@ -19,12 +20,47 @@ enum DoviNlqMethod: UInt32, Sendable {
 enum DoviDither: UInt32, Sendable {
     case none = 0
     case bayer8x8 = 1
-    /// Test only: planes hold the un-quantised 12-bit VDR code shifted left 4, not P010.
+    /// Test only: planes hold the reconstructed 12-bit VDR sample shifted left 4, not P010.
     case debugRawVDR = 2
-    /// Undithered, but the VDR bits below the 10-bit code are kept in P010's unused low 6 bits,
-    /// so a consumer that reads the full 16-bit word sees 12-bit (or finer) precision while one
-    /// that reads the top 10 bits sees the truncated code. Not validated on a display path yet.
+    /// Undithered: the 16-bit sum of prediction and residual, before the reconstruction's rounding, so P010's unused low
+    /// 6 bits hold what lies below the 10-bit code; a consumer that reads the full 16-bit word sees all of it,
+    /// one that reads the top 10 bits the truncated code. Not validated on a display path yet.
     case fullPrecision = 3
+    /// Like ``bayer8x8``, a threshold added before the floor, with the same exact 0.5 mean, but taken from a
+    /// per-frame inversion: no fixed-period pattern and no frame-to-frame alternation.
+    case blueNoise = 4
+}
+
+/// The buffer the composer hands downstream, and how the 12-bit VDR code is put into it.
+enum DoviOutputMode: String, CaseIterable, Sendable {
+    /// P010 (`x420`), quantised to 10 bits with the parameters' dither mode (default ordered dither).
+    case p010 = "p010"
+    /// P010 rounded to the nearest 10-bit code, no dither: the control that keeps nothing below 10 bits.
+    case p010Rounded = "p010-round"
+    /// P010 quantised with ``DoviDither/blueNoise`` instead of the ordered dither.
+    case p010BlueNoise = "p010-bluenoise"
+    /// P010 with ``DoviDither/fullPrecision``: the bits below the 10-bit code go in P010's low bits,
+    /// which CoreVideo defines as padding, so whether a consumer keeps them is undefined.
+    case p010FullPrecision = "p010-full"
+    /// 16-bit 4:2:2 (`sv22`) with ``DoviDither/fullPrecision``. Its video range (luma 4096...60160) is
+    /// the 10-bit range shifted left 6, so the full-precision word is a defined `sv22` value: the format
+    /// itself says every bit is picture. Chroma is composed at the 4:2:0 sites, where the reconstruction is defined,
+    /// then brought to 4:2:2 by Dolby's reference vertical chroma filter on the reconstructed picture
+    /// (`dovi_chroma_420_to_422`); on a chroma row that is the 4:2:0 composition itself.
+    case sv22 = "sv22"
+
+    /// The mode a picture of this range is written in. `sv22` has no full-range form (its range is the 10-bit video
+    /// range shifted left 6), so a full-range picture goes to P010, dithered, as the software decoder sends a
+    /// full-range 12-bit picture.
+    func forRange(fullRange: Bool) -> DoviOutputMode {
+        fullRange && self == .sv22 ? .p010 : self
+    }
+
+    /// The output buffer's format for a picture of this range, after ``forRange(fullRange:)``.
+    func pixelFormat(fullRange: Bool) -> OSType {
+        if self == .sv22 { return kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange }
+        return fullRange ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+    }
 }
 
 /// `DoviMetalParams.flags` bits.
@@ -34,9 +70,12 @@ struct DoviComposerFlags: OptionSet, Sendable {
 
     /// `disable_residual_flag`, or the RPU declares `el_type == MEL`.
     static let disableResidual = DoviComposerFlags(rawValue: 0x1)
-    /// The luma curve carries at least one MMR piece, so the luma kernel has to
-    /// read the base-layer chroma planes as well.
+    /// The luma curve carries at least one MMR piece: the composer takes the luma pipeline with the MMR path
+    /// (`dovi_fc_luma_mmr`), which reads the base-layer chroma planes as well.
     static let lumaMmr = DoviComposerFlags(rawValue: 0x2)
+    /// The output chroma plane is 4:2:2 (``DoviOutputMode/sv22``): the 4:2:0 kernel writes its 16-bit sums to the
+    /// intermediate `dovi_chroma_420_to_422` takes to 4:2:2. Set by the composer, not by the parser.
+    static let chroma422 = DoviComposerFlags(rawValue: 0x4)
 }
 
 /// Piecewise reshaping curve for one component; mirrors
@@ -118,7 +157,9 @@ struct DoviNlqParams: Sendable {
     var nlqOffset: Int32 = 0
     var nlqScale: Int32 = 0
     var nlqThreshold: Int32 = 0
+    /// `vdr_in_max` (`fp_hdr_in_max`, R), Q(coefficient_log2_denom): the residual's magnitude ceiling.
     var vdrInMax: Int32 = 0
+    /// The inverse NLQ's final shift, coefficient_log2_denom - 5 - EL_bit_depth, to the 16-bit residual.
     var nlqShift: UInt32 = 0
     /// Decoded (prefix-summed) `nlq_pred_pivot_value`. Carried for diagnostics;
     /// the linear inverse has a single segment and does not consult them.
@@ -176,6 +217,19 @@ struct DoviMetalParams: Sendable {
     var vdrMax: UInt32 = 4095
     /// `1 << (vdr_bit_depth - bl_bit_depth)`; residual and denormalisation scale.
     var vdrScale: UInt32 = 4
+    /// The base layer's chroma siting, FFmpeg's `AVChromaLocation` raw value (`chroma_sample_loc_type` + 1,
+    /// 0 = unspecified), from the stream's codec parameters (`DualLayerVideoDecoder`). Only the sv22 chroma
+    /// kernel reads it, for the vertical phase of each 4:2:2 row; unspecified is taken as LEFT, as HEVC infers.
+    var blChromaLocation: UInt32 = 0
+    /// Luma column from which the residual is left out (FEL left, MEL right); 0 = no split. Set by the
+    /// composer from ``DoviFelComposer/residualSplit``.
+    var residualSplitX: UInt32 = 0
+    /// The RPU's L6, for the HDR10 static metadata a composed frame states (the master's). Swift side only: not
+    /// part of the serialized block.
+    var masterLevel6: DolbyVisionLevel6?
+    /// Whether the composed picture is full range, as the RPU's colour conversion states it
+    /// (``DoviFelComposer/outputFullRange(rpu:)``); the output buffer's format says so downstream. Swift side only.
+    var outputFullRange = false
 
     init() {}
 
@@ -183,7 +237,7 @@ struct DoviMetalParams: Sendable {
     static let serializedSize =
         4 * 8
         + 3 * (DoviPolynomialParams.stride + DoviMmrParams.stride + DoviNlqParams.stride)
-        + 4 * 6
+        + 4 * 8
 
     /// Derives ``blMax``, ``vdrMax`` and ``vdrScale`` from the RPU's declared bit
     /// depths. Returns false, leaving the values untouched, for a combination the
@@ -301,6 +355,8 @@ struct DoviMetalParams: Sendable {
         w.u32(blMax)
         w.u32(vdrMax)
         w.u32(vdrScale)
+        w.u32(blChromaLocation)
+        w.u32(residualSplitX)
 
         precondition(w.offset == Self.serializedSize,
                      "DoviMetalParams serialization is not serializedSize bytes")

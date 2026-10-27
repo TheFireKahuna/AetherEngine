@@ -327,7 +327,7 @@ struct DualLayerVideoDecoderTests {
         try await waitFor { deliveries.count >= 2 }
         let got = deliveries.snapshot
         #expect(CMTimeCompare(got[0].pts, Self.pts(0)) == 0)
-        #expect(got[0].buffer === oldest, "the enhancement layer for frame 0 should have been evicted: it goes out as its base layer")
+        #expect(got[0].buffer !== oldest, "the enhancement layer for frame 0 should have been evicted: it is composed from its base layer alone, not shown raw")
         #expect(CMTimeCompare(got[1].pts, Self.pts(39)) == 0)
         #expect(got[1].buffer !== newest, "the newest enhancement layer should still pair")
     }
@@ -940,7 +940,7 @@ struct DualLayerVideoDecoderTests {
         #expect(frames.count == 3)
         #expect(frames.map { ObjectIdentifier($0.buffer) } == bl.map { ObjectIdentifier($0.value) })
         #expect(Self.isStrictlyIncreasing(frames))
-        #expect(decoder.composedFrameCount == 2, "the two frames with an enhancement layer are composed")
+        #expect(decoder.composedFrameCount == 3, "the two frames with an enhancement layer are composed, and the third from its base layer alone")
         #expect(decoder.stateSnapshotForTesting.blQueueCount == 0)
 
         // The host's flush that follows has nothing left to drop or deliver.
@@ -949,6 +949,132 @@ struct DualLayerVideoDecoderTests {
         decoder.flush()
         decoder.quiesceForTesting()
         #expect(deliveries.count == 3)
+    }
+
+    // MARK: - Base-layer-only frames: which picture, which RPU
+
+    /// Records what it was asked to compose and hands the base buffer back, or fails every composition.
+    private final class FlagRecordingComposer: FelComposing, @unchecked Sendable {
+        struct Call { let base: CVPixelBuffer; let enhancement: CVPixelBuffer; let flags: DoviComposerFlags }
+        private let lock = NSLock()
+        private var _calls: [Call] = []
+        let fails: Bool
+        init(fails: Bool = false) { self.fails = fails }
+        var calls: [Call] { lock.lock(); defer { lock.unlock() }; return _calls }
+        func acquireSlot() {}
+        func releaseSlot() {}
+        func flush() {}
+        func composeAsync(baseBuffer: CVPixelBuffer, enhancementBuffer: CVPixelBuffer, params: DoviMetalParams,
+                          frameIndex: UInt32, completion: @escaping @Sendable (CVPixelBuffer?) -> Void) {
+            composeAsyncWithAcquiredSlot(baseBuffer: baseBuffer, enhancementBuffer: enhancementBuffer,
+                                         params: params, frameIndex: frameIndex, completion: completion)
+        }
+        func composeAsyncWithAcquiredSlot(baseBuffer: CVPixelBuffer, enhancementBuffer: CVPixelBuffer,
+                                          params: DoviMetalParams, frameIndex: UInt32,
+                                          completion: @escaping @Sendable (CVPixelBuffer?) -> Void) {
+            lock.lock(); _calls.append(Call(base: baseBuffer, enhancement: enhancementBuffer, flags: params.flags)); lock.unlock()
+            completion(fails ? nil : baseBuffer)
+        }
+    }
+
+    private static func baseOnlyRig(_ composer: FlagRecordingComposer) -> (DualLayerVideoDecoder, Deliveries) {
+        let deliveries = Deliveries()
+        let decoder = DualLayerVideoDecoder(composer: composer, primaryDecoder: FlushEmittingFakeDecoder(),
+                                            enhancementDecoder: FlushEmittingFakeDecoder())
+        decoder.onFrame = { buffer, pts, hdr10 in deliveries.record(buffer, pts, hdr10) }
+        decoder.primeForTesting(enhancementLayer: true)
+        return (decoder, deliveries)
+    }
+
+    private static func payload(_ nal: [UInt8]) -> Data { Data(nal.dropFirst(2)) }
+
+    @Test("a frame whose enhancement layer never comes is composed with the residual off, and carries the no-mapping RPU")
+    func missingEnhancementLayerComposesBaseOnly() async throws {
+        let composer = FlagRecordingComposer()
+        let (decoder, deliveries) = Self.baseOnlyRig(composer)
+        defer { decoder.close() }
+        let k = DualLayerVideoDecoder.maxLayerSkewFrames
+        var bases: [CVPixelBuffer] = []
+        // Frame 0 never gets an enhancement layer; frames 1...k do, so frame 0 is released on frame k's arrival.
+        for i in 0...k {
+            let bl = try #require(Self.baseLayer())
+            bases.append(bl)
+            decoder.seedRPUForTesting(pts: Self.pts(Int64(i)), params: Self.params(),
+                                      displayMetadataNAL: Self.rpuNAL(tag: UInt8(i)), baseLayerNAL: Self.rpuNAL(tag: 0x80 | UInt8(i)))
+            if i > 0 { decoder.handleEnhancementLayerFrame(elBuffer: try #require(Self.enhancementLayer()), pts: Self.pts(Int64(i))) }
+            decoder.handleBaseLayerFrame(baseBuffer: bl, pts: Self.pts(Int64(i)), hdr10Data: nil)
+        }
+        try await waitFor { deliveries.count == k + 1 }
+        let call = try #require(composer.calls.first { $0.base === bases[0] })
+        #expect(call.enhancement === bases[0], "the base layer stands in for the enhancement texture")
+        #expect(call.flags.contains(.disableResidual))
+        let got = deliveries.snapshot
+        #expect(got.first?.rpuPayload == Self.payload(Self.rpuNAL(tag: 0)), "a composed frame carries the RPU without the mapping")
+        for i in 1...k where i < got.count {
+            #expect(got[i].rpuPayload == Self.payload(Self.rpuNAL(tag: UInt8(i))))
+        }
+        #expect(composer.calls.filter { $0.flags.contains(.disableResidual) }.count == 1, "frames with their EL keep the residual")
+        #expect(decoder.composedFrameCount == k + 1)
+    }
+
+    @Test("a frame with no RPU parameters goes out as its raw base layer, carrying the RPU that keeps the mapping")
+    func rawBaseLayerCarriesTheMapping() async throws {
+        let composer = FlagRecordingComposer()
+        let (decoder, deliveries) = Self.baseOnlyRig(composer)
+        defer { decoder.close() }
+        // Display metadata but no parameters: the frame cannot be composed.
+        decoder.seedRPUForTesting(pts: Self.pts(0), params: nil, displayMetadataNAL: Self.rpuNAL(tag: 1), baseLayerNAL: Self.rpuNAL(tag: 0x81))
+        let bl = try #require(Self.baseLayer())
+        decoder.handleEnhancementLayerFrame(elBuffer: try #require(Self.enhancementLayer()), pts: Self.pts(0))
+        decoder.handleBaseLayerFrame(baseBuffer: bl, pts: Self.pts(0), hdr10Data: nil)
+        try await waitFor { deliveries.count == 1 }
+        #expect(composer.calls.isEmpty)
+        let got = try #require(deliveries.snapshot.first)
+        #expect(got.buffer === bl)
+        #expect(got.rpuPayload == Self.payload(Self.rpuNAL(tag: 0x81)), "the display side has to reshape a raw base layer")
+    }
+
+    @Test("a composition that fails falls back to the raw base layer with the RPU that keeps the mapping")
+    func failedCompositionCarriesTheMapping() async throws {
+        let composer = FlagRecordingComposer(fails: true)
+        let (decoder, deliveries) = Self.baseOnlyRig(composer)
+        defer { decoder.close() }
+        decoder.seedRPUForTesting(pts: Self.pts(0), params: Self.params(), displayMetadataNAL: Self.rpuNAL(tag: 1), baseLayerNAL: Self.rpuNAL(tag: 0x81))
+        let bl = try #require(Self.baseLayer())
+        decoder.handleEnhancementLayerFrame(elBuffer: try #require(Self.enhancementLayer()), pts: Self.pts(0))
+        decoder.handleBaseLayerFrame(baseBuffer: bl, pts: Self.pts(0), hdr10Data: nil)
+        try await waitFor { deliveries.count == 1 }
+        #expect(composer.calls.count == 1)
+        let got = try #require(deliveries.snapshot.first)
+        #expect(got.buffer === bl)
+        #expect(got.rpuPayload == Self.payload(Self.rpuNAL(tag: 0x81)))
+    }
+
+    @Test("a FEL stream whose enhancement decoder never opened composes every frame base-only")
+    func felWithoutEnhancementDecoderComposesBaseOnly() async throws {
+        let composer = FlagRecordingComposer()
+        let deliveries = Deliveries()
+        let decoder = DualLayerVideoDecoder(composer: composer, primaryDecoder: FlushEmittingFakeDecoder(), enhancementDecoder: nil)
+        decoder.onFrame = { buffer, pts, hdr10 in deliveries.record(buffer, pts, hdr10) }
+        defer { decoder.close() }
+        decoder.classifyPacketResultForTesting(DoviRpuConverter.DualLayerPacketResult(
+            elPacket: nil, rpuData: nil, rpuParams: nil, isFEL: true, isMEL: false, success: true))
+        var bases: [CVPixelBuffer] = []
+        for i in 0..<3 {
+            let bl = try #require(Self.baseLayer())
+            bases.append(bl)
+            decoder.seedRPUForTesting(pts: Self.pts(Int64(i)), params: Self.params(),
+                                      displayMetadataNAL: Self.rpuNAL(tag: UInt8(i)), baseLayerNAL: Self.rpuNAL(tag: 0x80 | UInt8(i)))
+            decoder.handleBaseLayerFrame(baseBuffer: bl, pts: Self.pts(Int64(i)), hdr10Data: nil)
+        }
+        try await waitFor { deliveries.count == 3 }
+        let calls = composer.calls
+        #expect(calls.count == 3)
+        #expect(zip(calls, bases).allSatisfy { $0.base === $1 && $0.enhancement === $1 && $0.flags.contains(.disableResidual) })
+        let got = deliveries.snapshot
+        for i in 0..<3 where i < got.count {
+            #expect(got[i].rpuPayload == Self.payload(Self.rpuNAL(tag: UInt8(i))), "frame \(i) is composed: no-mapping RPU")
+        }
     }
 
     // MARK: - Session loss (AE#739)
@@ -1032,6 +1158,7 @@ struct DualLayerVideoDecoderTests {
     }
 
     private final class EpochRecordingFakeDecoder: SingleLayerVideoDecoder, @unchecked Sendable {
+        var framesDecoded: UInt64 { 0 }
         var onFrame: DecodedFrameHandler?
         var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
         var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
@@ -1104,6 +1231,7 @@ struct DualLayerVideoDecoderTests {
     /// with the frames VideoToolbox still owes while the host thread is
     /// blocked inside the flush.
     private final class FlushEmittingFakeDecoder: SingleLayerVideoDecoder, @unchecked Sendable {
+        var framesDecoded: UInt64 { 0 }
         var onFrame: DecodedFrameHandler?
         var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
         var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
@@ -1129,6 +1257,7 @@ struct DualLayerVideoDecoderTests {
     /// Counting fake: records sub-decoder traffic so tests can prove
     /// post-close `decode`/`flush` never reach the torn-down sessions.
     private final class CountingFakeDecoder: SingleLayerVideoDecoder, @unchecked Sendable {
+        var framesDecoded: UInt64 { 0 }
         private let lock = NSLock()
         private var _decodeCount = 0
         private var _flushCount = 0
@@ -1471,6 +1600,7 @@ struct DualLayerVideoDecoderTests {
 
     /// Fake whose in-band open always fails.
     private final class FailingOpenFakeDecoder: SingleLayerVideoDecoder, @unchecked Sendable {
+        var framesDecoded: UInt64 { 0 }
         private let lock = NSLock()
         private var _opens = 0, _decodes = 0
         var openCount: Int { lock.lock(); defer { lock.unlock() }; return _opens }
@@ -2480,6 +2610,8 @@ struct DualLayerVideoDecoderTests {
 
         // Enhancement layer arrives at t = 10.0: pairs and composes
         decoder.handleEnhancementLayerFrame(elBuffer: elBuf, pts: Self.pts(1))
+        // The composition runs on the compose queue: let it finish before the summary counts it.
+        decoder.quiesceForTesting()
 
         // Advance by 0.5s to 10.5: interval (1.0s) has not elapsed yet
         currentTime = 10.5
@@ -2550,6 +2682,7 @@ struct DualLayerVideoDecoderTests {
         decoder.seedRPUForTesting(pts: Self.pts(1), params: Self.params(), displayMetadataNAL: nil)
         decoder.handleBaseLayerFrame(baseBuffer: baseBuf, pts: Self.pts(1), hdr10Data: nil)
         decoder.handleEnhancementLayerFrame(elBuffer: elBuf, pts: Self.pts(1))
+        decoder.quiesceForTesting()
 
         currentTime = 31.1
         decoder.maybeEmitSummary()
