@@ -1,4 +1,6 @@
 import Foundation
+import Metal
+import LibDeinterlace
 import AetherLibavcodec
 import AetherLibavutil
 
@@ -73,19 +75,144 @@ enum InterlaceProbe {
         packetBudget: Int = InterlaceProbe.packetBudget,
         wallClockBudget: TimeInterval = InterlaceProbe.wallClockBudget
     ) -> Verdict {
+        var flaggedAt: Int?
+        let sample = decodeSample(demuxer: demuxer, streamIndex: streamIndex, frameTarget: sampleFrameTarget,
+                                  packetBudget: packetBudget, wallClockBudget: wallClockBudget) { frame, count, _ in
+            guard frame.pointee.flags & AV_FRAME_FLAG_INTERLACED != 0 else { return true }
+            flaggedAt = count
+            return false
+        }
+        if let flaggedAt { return .interlaced(afterFrames: flaggedAt) }
+        if let failure = sample.failure { return .inconclusive(reason: failure) }
+        guard sample.frames >= minimumFrames else {
+            return .inconclusive(reason: "only \(sample.frames) frame(s) decoded")
+        }
+        return .progressive(framesDecoded: sample.frames)
+    }
+
+    /// Soft telecine (docs/software-route-gpu.md 6.1): the film rate when the sample is a film run, that is when
+    /// ``FilmCadence`` has the sample's last picture on its grid and re-timed at least `minimumFrames` of them; nil
+    /// otherwise. The rate is 4/5 of the decoder's carriage rate (24000/1001 from 30000/1001). Moves the demuxer's read
+    /// position, as ``run(demuxer:streamIndex:sampleFrameTarget:minimumFrames:packetBudget:wallClockBudget:)`` does.
+    static func filmRate(
+        demuxer: Demuxer,
+        streamIndex: Int32,
+        sampleFrameTarget: Int = InterlaceProbe.sampleFrameTarget,
+        minimumFrames: Int = InterlaceProbe.minimumFrames,
+        packetBudget: Int = InterlaceProbe.packetBudget,
+        wallClockBudget: TimeInterval = InterlaceProbe.wallClockBudget
+    ) -> AVRational? {
+        guard let stream = demuxer.stream(at: streamIndex) else { return nil }
+        let cadence = FilmCadence(timeBase: stream.pointee.time_base)
+        var retimed = 0
+        var carriage = AVRational(num: 0, den: 1)
+        let sample = decodeSample(demuxer: demuxer, streamIndex: streamIndex, frameTarget: sampleFrameTarget,
+                                  packetBudget: packetBudget, wallClockBudget: wallClockBudget) { frame, _, ctx in
+            carriage = ctx.pointee.framerate
+            _ = cadence.retime(pts: frame.pointee.best_effort_timestamp, interlaced: frame.pointee.flags & AV_FRAME_FLAG_INTERLACED != 0,
+                               repeatPict: frame.pointee.repeat_pict, carriage: carriage)
+            if cadence.isActive { retimed += 1 }
+            return true
+        }
+        guard sample.failure == nil, cadence.isActive, retimed >= minimumFrames, carriage.num > 0, carriage.den > 0 else {
+            return nil
+        }
+        var num: Int32 = 0, den: Int32 = 0
+        av_reduce(&num, &den, Int64(carriage.num) * 4, Int64(carriage.den) * 5, Int64(Int32.max))
+        return AVRational(num: num, den: den)
+    }
+
+    /// Film in interlaced carriage (docs/software-route-gpu.md 6.4): decodes a sample, holds its pictures in slabs and
+    /// classifies them (``classifyFilm(_:submission:allocator:format:width:height:timeBase:frameRate:)``). Nil for video, a
+    /// format inverse telecine does not take, a short sample or no Metal device. Moves the demuxer's read position.
+    static func filmCarriage(
+        demuxer: Demuxer,
+        streamIndex: Int32,
+        sampleFrameTarget: Int = InterlaceProbe.sampleFrameTarget,
+        packetBudget: Int = InterlaceProbe.packetBudget,
+        wallClockBudget: TimeInterval = InterlaceProbe.wallClockBudget
+    ) -> FilmCarriage? {
+        var pictures: [BwdifWindow.Picture] = []
+        var shape: (format: AVPixelFormat, width: Int, height: Int)?
+        var carriage = AVRational(num: 0, den: 1)
+        let sample = decodeSample(demuxer: demuxer, streamIndex: streamIndex, frameTarget: sampleFrameTarget,
+                                  packetBudget: packetBudget, wallClockBudget: wallClockBudget, pixelsMatter: true) { frame, _, ctx in
+            carriage = ctx.pointee.framerate
+            let current = (AVPixelFormat(rawValue: frame.pointee.format), Int(frame.pointee.width), Int(frame.pointee.height))
+            if let shape, shape != current { return false }
+            shape = current
+            guard let copy = allocator.copy(frame), let held = av_frame_clone(frame) else { return false }
+            let storage = BwdifWindow.Storage(frame: held, planes: copy.planes, release: { allocator.release(copy.slab) })
+            pictures.append(BwdifWindow.Picture(storage: storage, pts: frame.pointee.best_effort_timestamp))
+            return true
+        }
+        guard sample.failure == nil, let shape, carriage.num > 0, carriage.den > 0 else { return nil }
+        return classifyFilm(pictures, submission: DeinterlaceGPU(submitter), allocator: allocator, format: shape.format, width: shape.width,
+                            height: shape.height, timeBase: stream.pointee.time_base, frameRate: carriage)
+    }
+
+    /// The verdict on a decoded sample (docs/software-route-gpu.md 6.4), from fieldmatch's own notion of a combed picture
+    /// (calc_combed_score at least `combpel`): no picture combed and the pictures flagged interlaced is 2:2; combed
+    /// pictures that the matcher makes progressive, with a duplicate in every full cycle of five, is 3:2; anything else
+    /// is video (nil). Needs three cycles of pictures.
+    static func classifyFilm(_ pictures: [BwdifWindow.Picture], submission: DeinterlaceGPU, allocator: DecodeFrameAllocator,
+                             format: AVPixelFormat, width: Int, height: Int, timeBase: AVRational,
+                             frameRate: AVRational) -> FilmCarriage? {
+        guard pictures.count >= 15, InverseTelecine.takes(format: format, width: width, height: height),
+              let layout = PictureLayout(format: format) else { return nil }
+        let kernels = DeinterlaceKernels(submission: submission)
+        func combed(_ p: PlaneSet) -> Bool {
+            (kernels.combScore(src: p, other: p, srcParity: 0, layout: layout, width: width, height: height,
+                               cthresh: InverseTelecine.cthresh) ?? Int.max) >= InverseTelecine.combpel
+        }
+        if !pictures.contains(where: { combed($0.storage.planes) }) {
+            return pictures.allSatisfy(\.interlaced) ? .segmented22 : nil
+        }
+        guard let chain = InverseTelecine(kernels: kernels, makePicture: SoftwareVideoDecoder.slabMaker(allocator), format: format,
+                                          width: width, height: height, timeBase: timeBase, frameRate: frameRate) else { return nil }
+        // The sample through the chain, a batch a picture, waited for once: the decisions are read back at the end.
+        var outputs: [InverseTelecine.Output] = []
+        var held: [BwdifWindow.Picture] = []
+        let done = DispatchGroup()
+        for p in pictures {
+            outputs += pushed.outputs
+            held += pushed.touched
+            done.enter()
+            batch.commit { _ in done.leave() }
+        }
+        done.wait()
+        withExtendedLifetime(held) {}
+        let out = outputs.filter { chain.resolve($0) != nil }
+        let cycles = chain.cycles, duplicates = chain.cyclesWithDuplicate
+        let stillCombed = out.filter { combed(chain.shown($0).storage.planes) }.count
+        if cycles >= 2, duplicates == cycles, stillCombed * 10 <= out.count { return .pulldown32 }
+        return nil
+    }
+
+    /// Decodes up to `frameTarget` pictures of `streamIndex` in software, handing each to `onFrame` with the count so
+    /// far and the codec context; `onFrame` returns false to stop. `failure` names why nothing could be decoded.
+    private static func decodeSample(
+        demuxer: Demuxer,
+        streamIndex: Int32,
+        frameTarget: Int,
+        packetBudget: Int,
+        wallClockBudget: TimeInterval,
+        pixelsMatter: Bool = false,
+        onFrame: (UnsafeMutablePointer<AVFrame>, Int, UnsafeMutablePointer<AVCodecContext>) -> Bool
+    ) -> (frames: Int, failure: String?) {
         guard streamIndex >= 0, let stream = demuxer.stream(at: streamIndex),
               let codecpar = stream.pointee.codecpar else {
-            return .inconclusive(reason: "no video stream")
+            return (0, "no video stream")
         }
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id),
               let ctx = avcodec_alloc_context3(codec) else {
-            return .inconclusive(reason: "no decoder")
+            return (0, "no decoder")
         }
         var ownedCtx: UnsafeMutablePointer<AVCodecContext>? = ctx
         defer { avcodec_free_context(&ownedCtx) }
 
         guard avcodec_parameters_to_context(ctx, codecpar) >= 0 else {
-            return .inconclusive(reason: "parameters_to_context failed")
+            return (0, "parameters_to_context failed")
         }
         // Software decode only: the frame flags are what is being measured, and a hwaccel surface
         // adds nothing to that. Mirrors SoftwareVideoDecoder.open's get_format rejection.
@@ -98,9 +225,9 @@ enum InterlaceProbe {
             }
             return AV_PIX_FMT_YUV420P
         }
-        // The sample is thrown away, only its per-frame interlace flags are read, and deblocking
-        // touches neither. Skipping it is the one cheap win that cannot change the answer.
-        ctx.pointee.skip_loop_filter = AVDISCARD_ALL
+        // A sample read for its per-frame flags skips deblocking, which touches none of them: the one cheap win
+        // that cannot change the answer. A sample whose pixels are measured decodes them in full.
+        if !pixelsMatter { ctx.pointee.skip_loop_filter = AVDISCARD_ALL }
         ctx.pointee.thread_count = Int32(min(4, ProcessInfo.processInfo.activeProcessorCount))
         ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
 
@@ -109,35 +236,32 @@ enum InterlaceProbe {
         let openRet = avcodec_open2(ctx, codec, &opts)
         av_dict_free(&opts)
         guard openRet >= 0 else {
-            return .inconclusive(reason: "decoder open failed (\(openRet))")
+            return (0, "decoder open failed (\(openRet))")
         }
 
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
-        guard let f = frame else { return .inconclusive(reason: "frame alloc failed") }
+        guard let f = frame else { return (0, "frame alloc failed") }
         defer { av_frame_free(&frame) }
 
         var framesDecoded = 0
         var packetsRead = 0
+        var stopped = false
         let deadline = Date(timeIntervalSinceNow: wallClockBudget)
 
-        /// Pull everything the decoder has; returns the frame count at which a flagged frame
-        /// appeared, or nil when the drain stayed clean.
-        func drain() -> Int? {
-            while avcodec_receive_frame(ctx, f) >= 0 {
+        func drain() {
+            while !stopped, avcodec_receive_frame(ctx, f) >= 0 {
                 framesDecoded += 1
-                let flagged = (f.pointee.flags & (1 << 3)) != 0  // AV_FRAME_FLAG_INTERLACED
+                if !onFrame(f, framesDecoded, ctx) { stopped = true }
                 av_frame_unref(f)
-                if flagged { return framesDecoded }
             }
-            return nil
         }
 
-        while framesDecoded < sampleFrameTarget, packetsRead < packetBudget, Date() < deadline {
+        while !stopped, framesDecoded < frameTarget, packetsRead < packetBudget, Date() < deadline {
             let packet: UnsafeMutablePointer<AVPacket>?
             do {
                 packet = try demuxer.readPacket()
             } catch {
-                break  // read error: whatever was decoded so far still counts, see the floor below
+                break  // read error: whatever was decoded so far still counts
             }
             guard let packet else { break }  // EOF
             packetsRead += 1
@@ -147,20 +271,18 @@ enum InterlaceProbe {
             }
             guard packet.pointee.stream_index == streamIndex else { continue }
             if avcodec_send_packet(ctx, packet) == FFmpegErr.eagain {
-                if let at = drain() { return .interlaced(afterFrames: at) }
+                drain()
                 _ = avcodec_send_packet(ctx, packet)
             }
-            if let at = drain() { return .interlaced(afterFrames: at) }
+            drain()
         }
 
         // Flush: frame threading holds several frames back, and on a short sample those are a
         // meaningful part of the evidence.
-        _ = avcodec_send_packet(ctx, nil)
-        if let at = drain() { return .interlaced(afterFrames: at) }
-
-        guard framesDecoded >= minimumFrames else {
-            return .inconclusive(reason: "only \(framesDecoded) frame(s) decoded")
+        if !stopped {
+            _ = avcodec_send_packet(ctx, nil)
+            drain()
         }
-        return .progressive(framesDecoded: framesDecoded)
+        return (framesDecoded, nil)
     }
 }

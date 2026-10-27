@@ -3,8 +3,8 @@ import AetherLibavutil
 
 /// Pure codec-and-field-order routing decision extracted from AetherEngine.load's dispatch so it is
 /// unit-testable. Native carries HEVC, H.264 and HW-decodable AV1; every other video codec is
-/// software. The #107 rule sits on top: interlaced H.264 goes software too, so DeinterlaceFilter
-/// (bwdif) can deinterlace it. tvOS AVPlayer does not deinterlace, so 1080i broadcast otherwise combs.
+/// software. The #107 rule sits on top: interlaced H.264 goes software too, so the bwdif deinterlacer
+/// can deinterlace it. tvOS AVPlayer does not deinterlace, so 1080i broadcast otherwise combs.
 enum VideoRoutingPolicy {
 
     /// Field orders that indicate interlaced content warranting software deinterlacing.
@@ -29,7 +29,7 @@ enum VideoRoutingPolicy {
         return canHardwareDecode?() ?? true
     }
 
-    /// True when a video codec must use the software decode path (SoftwarePlaybackHost) instead of
+    /// True when a video codec must use the software decode path (the overlay) instead of
     /// native AVPlayer. `av1Available` is `VTCapabilityProbe.av1Available` (HW AV1 decode support).
     /// Evaluated only for AV1; registering its decoder must not delay unrelated formats.
     /// #150: `spsIndicatesInterlaced` (SPS frame_mbs_only_flag == 0) breaks the tie when the demuxer's
@@ -189,7 +189,7 @@ enum VideoRoutingPolicy {
     /// AE#461: the decode path a session ends up on, given what the routing concluded and what the
     /// host asked for. Pure so the override is unit-testable next to the decisions it overrules.
     ///
-    /// One-way by construction: `.software` moves a session onto `SoftwarePlaybackHost`, and nothing
+    /// One-way by construction: `.software` moves a session onto the software overlay, and nothing
     /// moves one off it. Every route the engine sends to software it sends there because the native
     /// path cannot serve it (AV1 without hardware decode, VP9, a forward-only source, MVC carriage,
     /// a format VideoToolbox cannot hardware-decode), so a `.native` preference would buy a black

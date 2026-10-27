@@ -1,4 +1,5 @@
 import Foundation
+import os
 import CoreVideo
 import AVFoundation
 import AetherLibavformat
@@ -435,13 +436,13 @@ extension AetherEngine {
         let height = stream.pointee.codecpar.pointee.height
 
         let decoder = SoftwareVideoDecoder()
-        // Probe decodes a handful of frames and throws them away: no Metal pipeline for that.
-        decoder.deinterlaceConfig = DeinterlaceConfig(mode: .software)
         // Class for captured-by-reference mutable accumulators; the onFrame closure fires SYNCHRONOUSLY on this same
         // thread inside avcodec_send_packet / receive_frame (the probe drives decode inline, no demux thread). The
         // DecodedFrameHandler is @Sendable for the off-actor playback path, so this single-threaded capture is an
         // honest @unchecked Sendable exception.
         final class Accum: @unchecked Sendable {
+        // Probe decodes a handful of frames and throws them away; it reports the decoder's own pictures.
+        decoder.deinterlaces = false
             var framesDecoded = 0
             var firstFramePixelFormat: String?
             var firstFrameWidth: Int = 0
@@ -870,27 +871,22 @@ extension AetherEngine {
         return "VideoToolbox \(name) (HW)"
     }
 
-    /// User-facing label for the active audio pipeline on the SW path. nil when no audio track. AE#462:
-    /// `activeIndex` is the HOST's resolved index, never the engine's pick. The pick says which track was
-    /// asked for; a session whose decoder refused to open serves none, and this label used to name one
     /// for it. `route` is the host's `audioRoute`: the PCM decode is libavcodec into CoreAudio, the Atmos
     /// routes are named the way the loopback route names its own APAC ("TRUEHD Atmos → APAC 7.1.4").
+    /// User-facing label for the active audio pipeline of the audio-only host: libavcodec into CoreAudio.
+    /// nil when no audio track. AE#462: `activeIndex` is the HOST's resolved index, never the engine's
+    /// pick. The pick says which track was asked for; a session whose decoder refused to open serves
+    /// none, and this label used to name one for it.
     nonisolated static func softwareAudioDecoderLabel(
         audioTracks: [TrackInfo],
-        activeIndex: Int32,
         route: SoftwareAtmosRoute = .pcm
+        activeIndex: Int32
     ) -> String? {
         guard activeIndex >= 0,
               let track = audioTracks.first(where: { $0.id == Int(activeIndex) }) else {
             return nil
         }
-        let codec = track.codec.uppercased()
-        switch route {
-        case .pcm: return "libavcodec \(codec) → CoreAudio"
-        case .compressedEAC3JOC: return "\(codec) Atmos → renderer (compressed)"
-        case .apac(let layout):
-            return codec.hasPrefix("DTS") ? "DTS:X → APAC \(layout.rawValue)" : "\(codec) Atmos → APAC \(layout.rawValue)"
-        }
+        return "libavcodec \(track.codec.uppercased()) → CoreAudio"
     }
 
     // MARK: - Format / frame-rate probing
@@ -1139,8 +1135,13 @@ extension AetherEngine {
     /// Profile + base-layer signal compatibility ID from the dvcC/dvvC record (compat 0 = IPT-only, no
     /// compatible base layer). nil when the stream carries no DV side-data.
     nonisolated static func dvConfig(stream: UnsafeMutablePointer<AVStream>) -> (profile: Int, blCompatID: Int)? {
-        let nb = Int(stream.pointee.codecpar.pointee.nb_coded_side_data)
-        guard nb > 0, let sideData = stream.pointee.codecpar.pointee.coded_side_data else {
+        dvConfig(parameters: stream.pointee.codecpar)
+    }
+
+    /// `dvConfig(stream:)` from the stream's codec parameters, which carry the record as coded side data.
+    nonisolated static func dvConfig(parameters codecpar: UnsafePointer<AVCodecParameters>) -> (profile: Int, blCompatID: Int)? {
+        let nb = Int(codecpar.pointee.nb_coded_side_data)
+        guard nb > 0, let sideData = codecpar.pointee.coded_side_data else {
             return nil
         }
         for i in 0..<nb {
@@ -1187,5 +1188,60 @@ extension AetherEngine {
             return Double(r.num) / Double(r.den)
         }
         return nil
+    }
+
+    /// #7: the rate the display has to run at, which is not the content rate when the software route
+    /// deinterlaces at field rate. The deinterlacer at `DeinterlaceFieldRate.field`, the default, emits
+    /// one picture per field, so 1080i25 goes out at 50 fps while `detectFrameRate` says 25 and the
+    /// panel was asked for 25 Hz: every other field dropped by the display, or judder. Doubled before snapping, so the snap sees the field rate.
+    ///
+    /// Only a declared interlaced field order on a codec the software route takes counts: interlaced
+    /// HEVC plays native and is not deinterlaced. A rate above 30 is already a field rate (a muxer that
+    /// counted fields) and is left alone; no interlaced format carries more than 30 frames a second.
+    /// Measured on generated clips through the linked FFmpeg: MPEG-2 1080i25 (TS), H.264 1080i25 (TS,
+    /// MKV) and 480i29.97 (MPEG-PS, MP4) all report their FRAME rate in both `avg_frame_rate` and
+    /// `r_frame_rate`. When #232's frame sample later refutes the declaration and routes native, the
+    /// panel is at twice a progressive rate, which shows every picture for exactly two refreshes.
+    /// Soft telecine (docs/software-route-gpu.md 6.1) is worth sampling for: a codec the software route always takes that
+    /// signals field repeats (MPEG-2 `repeat_first_field`, VC-1 `RFF` / `RPTFRM`), at a carriage film is telecined into
+    /// (29.97 / 30 frames, or 59.94 / 60 for a progressive sequence). H.264 signals it too (`pic_struct`), but a
+    /// soft-telecined H.264 stream is progressive-flagged and plays native (#232).
+    nonisolated static func carriesSoftTelecine(codecID: AVCodecID, contentRate: Double?) -> Bool {
+        guard codecID == AV_CODEC_ID_MPEG2VIDEO || codecID == AV_CODEC_ID_VC1, let contentRate else { return false }
+        return [30000.0 / 1001, 30, 60000.0 / 1001, 60].contains { abs($0 - contentRate) < 0.01 }
+    }
+
+    nonisolated private static let filmDetectionSwitch = OSAllocatedUnfairLock(initialState: true)
+
+    /// Whether the load looks for film in interlaced carriage (docs/software-route-gpu.md Part 6): soft telecine, hard
+    /// telecine, 2:2. Off, film plays as it did before (the container's rate and timing, interlaced pictures through
+    /// the deinterlacer): the A/B control of the device probe. Read at load; applies to every load in the process.
+    @_spi(Diagnostics)
+    public nonisolated static var filmDetection: Bool {
+        get { filmDetectionSwitch.withLock { $0 } }
+        set { filmDetectionSwitch.withLock { $0 = newValue } }
+    }
+
+    /// Film can sit in this interlaced carriage with its cadence in the pixels (docs/software-route-gpu.md 6.2 - 6.4):
+    /// a codec the software route takes interlaced (MPEG-2, VC-1 always; H.264 declared interlaced, #107) at 25, 29.97
+    /// or 30 frames a second.
+    nonisolated static func mayCarryFilm(codecID: AVCodecID, fieldOrder: AVFieldOrder, contentRate: Double?) -> Bool {
+        guard let contentRate, [25.0, 30000.0 / 1001, 30].contains(where: { abs($0 - contentRate) < 0.01 }) else { return false }
+        if codecID == AV_CODEC_ID_MPEG2VIDEO || codecID == AV_CODEC_ID_VC1 { return true }
+        return codecID == AV_CODEC_ID_H264 && VideoRoutingPolicy.interlacedFieldOrders.contains(fieldOrder)
+    }
+
+    nonisolated static func displayFrameRate(
+        contentRate: Double?,
+        codecID: AVCodecID,
+        fieldOrder: AVFieldOrder,
+        deinterlaceFieldRate: DeinterlaceFieldRate
+    ) -> Double? {
+        guard let contentRate, contentRate > 0, contentRate <= 30.5,
+              deinterlaceFieldRate == .field,
+              VideoRoutingPolicy.interlacedFieldOrders.contains(fieldOrder),
+              VideoRoutingPolicy.requiresSoftwarePath(codecID: codecID, fieldOrder: fieldOrder, av1Available: true)
+        else { return contentRate }
+        return contentRate * 2
     }
 }
