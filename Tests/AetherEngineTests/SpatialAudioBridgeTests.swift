@@ -755,6 +755,31 @@ struct BedLevelMeterTests {
         #expect(after.contains("; objects: up to 0 active, 0 elevated;"))
     }
 
+    @Test("object APAC still gets a line: no bed levels, but the objects and the LFE input")
+    func objectStreamLine() throws {
+        var meter = BedLevelMeter(layout: .l714, sampleRate: 48_000)
+        let roles: [ObjectAudioRole] = [.lfe, .object]
+        meter.observe(roles: roles, updates: [ObjectAudioMetadataUpdate(
+            frameOffset: 0, rampFrames: 0, states: [.init(), .init(position: SIMD3(0.5, 0.5, 1))])])
+        let frames = 48_000
+        let lfe = UnsafeMutablePointer<Float>.allocate(capacity: frames)
+        let object = UnsafeMutablePointer<Float>.allocate(capacity: frames)
+        defer { lfe.deallocate(); object.deallocate() }
+        for i in 0..<frames { lfe[i] = 0.5 * sinf(2 * .pi * Float(i) / 64); object[i] = 0 }
+        meter.measureInput(roles: roles, planes: [UnsafePointer(lfe), UnsafePointer(object)], frameCount: frames)
+        var lines: [String] = []
+        for i in 0..<118 {
+            if let line = meter.addUnmeasured(frameCount: 2048, startSeconds: 10 + Double(i * 2048) / 48_000) { lines.append(line) }
+        }
+        let line = try #require(lines.first)
+        #expect(lines.count == 1)
+        #expect(line.hasPrefix("object stream at 10.0 s over 5.0 s; objects: up to 1 active, 1 elevated;"))
+        #expect(line.hasSuffix("; LFE input -9.0 dBFS, metadata gain 0.0 dB"))
+        // A window measured with the bed again names its channels.
+        let bed = try #require(feed(&meter, chunks: 704).first)
+        #expect(bed.hasPrefix("bed levels 7.1.4"))
+    }
+
     @Test("the line ends with the LFE element's input level and metadata gain, or says there is none")
     func lfeInputAndGain() throws {
         var meter = BedLevelMeter(layout: .l714, sampleRate: 48_000)

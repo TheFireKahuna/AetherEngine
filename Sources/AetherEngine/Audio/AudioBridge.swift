@@ -98,6 +98,10 @@ final class AudioBridge: @unchecked Sendable {
         output == .eac3 ? 6 : 8
     }
 
+    /// The 4- and 5-channel LFE layouts E-AC-3 carries as they are (FFmpeg's encoder takes them, and
+    /// the stream's own channel configuration names them), so no channel is added.
+    static let exactEAC3Layouts = ["3.1", "4.1", "FL+FR+LFE+BC"]
+
     /// The layout E-AC-3 encodes `channels` (already capped) of a source with `hasLFE` into; `sourceIs`
     /// says whether the source is exactly the named layout. FFmpeg's default for the count, except for
     /// a source with an LFE in 4 or 5 channels: the defaults for those counts (4.0, 5.0) have no LFE, and
@@ -351,7 +355,7 @@ final class AudioBridge: @unchecked Sendable {
         // probe -> garbled audio. The full path is correct; the only genuine failures are XLL frames that
         // residual-code channels without a usable core ("Residual encoded channels are present without core",
         // EINVAL -22), which feed() skips per-packet instead of failing the whole feed (#64).
-        let openRet = avcodec_open2(dec, srcCodec, nil)
+        let openRet = openAudioDecoder(dec, srcCodec)
         guard openRet >= 0 else {
             cleanup()
             throw AudioBridgeError.decoderOpenFailed(code: openRet)
@@ -426,6 +430,17 @@ final class AudioBridge: @unchecked Sendable {
         // Cap to the output's max (EAC3 5.1, PCM 7.1). Above-cap downmix happens automatically inside swr_convert
         // when source layout exceeds the encoder's; the resampler picks Apple-compatible ordering.
         let cappedChannels: Int32 = min(resolvedChannels, Self.maxEncodedChannels(for: output))
+        // The layout comes from wherever the count did; an order-less one (count only) says nothing.
+        let sourceLayout = containerChannels > 0 && containerChannels <= 8
+            ? srcCodecpar.pointee.ch_layout : dec.pointee.ch_layout
+        let sourceHasLFE = withUnsafePointer(to: sourceLayout) { channelLayoutHasLFE($0) }
+        let sourceIs = { (name: String) -> Bool in
+            var candidate = AVChannelLayout()
+            defer { av_channel_layout_uninit(&candidate) }
+            return av_channel_layout_from_string(&candidate, name) >= 0
+                && withUnsafePointer(to: sourceLayout) { av_channel_layout_compare($0, &candidate) == 0 }
+        }
+        var encLayout = AVChannelLayout()
         if output == .pcm, sourceLayout.nb_channels == cappedChannels, sourceLayout.order != AV_CHANNEL_ORDER_UNSPEC {
             // PCM names every channel's speaker (`chnl`), so the source's own layout goes out as it is.
             var layout = sourceLayout
@@ -434,7 +449,9 @@ final class AudioBridge: @unchecked Sendable {
                   let name = Self.eac3LayoutName(channels: cappedChannels, hasLFE: sourceHasLFE, sourceIs: sourceIs),
                   av_channel_layout_from_string(&encLayout, name) >= 0 {
         } else {
+            av_channel_layout_default(&encLayout, cappedChannels)
         }
+        let nChannels = encLayout.nb_channels
         let encoderName = avcodec_get_name(encoderCodecID).map { String(cString: $0) } ?? "?"
         let logBitRate: String = output == .eac3
             ? "\(Int64(nChannels) * 128) kbps"
@@ -454,8 +471,6 @@ final class AudioBridge: @unchecked Sendable {
         // EAC3 per-channel bitrate 128 kbps (Dolby reference transparent profile); PCM's is its sample rate.
         if output == .eac3 { enc.pointee.bit_rate = Self.eac3BitRate(channels: nChannels) }
         enc.pointee.time_base = AVRational(num: 1, den: sampleRate)
-        var encLayout = AVChannelLayout()
-        av_channel_layout_default(&encLayout, nChannels)
         let layoutCopyRet = av_channel_layout_copy(&enc.pointee.ch_layout, &encLayout)
         if layoutCopyRet < 0 {
             cleanup()
@@ -493,7 +508,7 @@ final class AudioBridge: @unchecked Sendable {
         if dec.pointee.ch_layout.nb_channels > 0 {
             av_channel_layout_copy(&inLayout, &dec.pointee.ch_layout)
         } else {
-            av_channel_layout_default(&inLayout, nChannels)
+            av_channel_layout_default(&inLayout, cappedChannels)
         }
         // copy() allocates a channel map for custom-order layouts; uninit the stack struct or that map leaks per session.
         defer { av_channel_layout_uninit(&inLayout) }

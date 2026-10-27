@@ -30,7 +30,8 @@ public enum PlaybackBackend: String, Sendable, Equatable {
     case aether
     /// HLS-fMP4 over loopback to AVPlayer + AVPlayerLayer. Default for HEVC / H.264 / VP9.
     case native
-    /// FFmpeg / dav1d + AVSampleBufferDisplayLayer. Used for AV1 on tvOS (no HW decoder).
+    /// Retired: software-decoded video plays as an overlay on a `.native` session. Reserved for hosts
+    /// that still switch on it; never assigned.
     case software
     /// FFmpeg audio + AVSampleBufferAudioRenderer. No video pipeline.
     case audio
@@ -59,7 +60,8 @@ public enum VideoRoute: String, Sendable, Equatable {
     /// Demuxer plus local HLS-fMP4 server feeding AVPlayer. The engine owns the source connection and
     /// the subtitle pipeline; this is the default video route.
     case loopback
-    /// FFmpeg / dav1d into AVSampleBufferDisplayLayer.
+    /// Retired: software-decoded video plays as an overlay on a `.loopback` session. Reserved for hosts
+    /// that still switch on it; never assigned.
     case software
     /// An audio-only session. There is no video pipeline to route.
     case audio
@@ -143,14 +145,12 @@ public enum AudioDelivery: String, Sendable, Equatable, CaseIterable {
                        softwareHost: AudioDelivery?,
                        audioOnlyHost: AudioDelivery?) -> AudioDelivery {
         switch backend {
-        case .none, .aether:
+        case .none, .aether, .software:
             return .none
         case .native:
             // The bypass has no HLSVideoEngine to ask, and a leftover fact from the session before a
             // reroute must not answer for it.
             return nativeRemoteHLS ? .playerManaged : (loopbackSession ?? .none)
-        case .software:
-            return softwareHost ?? .none
         case .audio:
             return audioOnlyHost ?? .none
         }
@@ -377,7 +377,7 @@ public enum DecodePath: String, Sendable, Equatable, CaseIterable {
     /// source seekability. The default, and right for every session that does not have evidence
     /// the engine cannot have.
     case automatic
-    /// Serve this source through `SoftwarePlaybackHost`, whatever the routing concluded. Scoped to
+    /// Serve this source through software decode on the overlay, whatever the routing concluded. Scoped to
     /// the session; it does not touch any other session on the shared engine.
     case software
 }
@@ -1016,7 +1016,7 @@ public struct LoadOptions: Sendable, Equatable {
     ///
     /// When AVPlayer fails the item with a verdict on the MEDIA (`CoreMediaErrorDomain`), every native
     /// recovery answers the same bytes again, so the engine spends one rebuild per session on
-    /// `SoftwarePlaybackHost`, whose libavcodec skips the frame Apple's parser refused. `false`
+    /// the software overlay, whose libavcodec skips the frame Apple's parser refused. `false`
     /// declines that rung: the failure surfaces as `.error` with `PlaybackErrorKind.nativeItemFailed`,
     /// the way it did before 7.9.0, for a host that re-plans a failing title with a ladder of its own
     /// (AE#629). Either way `softwarePathEscalations` says when the rung is taken.
@@ -1695,6 +1695,65 @@ func audioChannelLayoutTag(for channels: Int32) -> AudioChannelLayoutTag {
     case 7:  return kAudioChannelLayoutTag_MPEG_6_1_A      // FL FR FC LFE BL BR BC
     case 8:  return kAudioChannelLayoutTag_WAVE_7_1        // FL FR FC LFE BL BR SL SR
     default: return kAudioChannelLayoutTag_DiscreteInOrder | UInt32(channels)
+    }
+}
+
+/// Whether `layout` carries an LFE.
+func channelLayoutHasLFE(_ layout: UnsafePointer<AVChannelLayout>) -> Bool {
+    av_channel_layout_index_from_channel(layout, AV_CHAN_LOW_FREQUENCY) >= 0
+}
+
+/// Source layouts carrying an LFE that the default layout for their count has no slot for (4 and 5
+/// channels default to 4.0 and 5.0, and swr drops an input channel the output lacks, its
+/// `lfe_mix_level` being 0), but whose own order has an exact CoreAudio tag. They are resampled in
+/// that order and stamped with it. Each tag expands to these channels on tvOS 27.2 as on macOS 27
+/// (its AudioToolboxCore's `AudioFormatProperty_ChannelLayoutForTag`, run under emulation).
+let exactResamplerLayouts: [(name: String, tag: AudioChannelLayoutTag)] = [
+    ("3.1", kAudioChannelLayoutTag_DVD_10),            // FL FR FC LFE     -> L R C LFE
+    ("4.1", kAudioChannelLayoutTag_DVD_11),            // FL FR FC LFE BC  -> L R C LFE Cs
+    ("FL+FR+LFE+BC", kAudioChannelLayoutTag_DVD_5),    // FL FR LFE BC     -> L R LFE Cs
+    ("FL+FR+LFE+BL+BR", kAudioChannelLayoutTag_DVD_6), // FL FR LFE BL BR  -> L R LFE Ls Rs
+]
+
+/// What `AudioDecoder` resamples a source into and how it stamps it: the order the bytes are in and
+/// the tag that names that order come from this one decision (#401).
+struct ResamplerOutput: Equatable {
+    let channels: Int32
+    /// The source's own layout when it is one of `exactResamplerLayouts`; nil for the count's own.
+    let exactLayout: String?
+    let tag: AudioChannelLayoutTag
+
+    init(channels: Int32, exactLayout: String?, tag: AudioChannelLayoutTag) {
+        self.channels = channels
+        self.exactLayout = exactLayout
+        self.tag = tag
+    }
+
+    /// The count's layout and tag (`makeResamplerOutputLayout`, `audioChannelLayoutTag`).
+    init(channels: Int32) {
+        self.init(channels: channels, exactLayout: nil, tag: audioChannelLayoutTag(for: channels))
+    }
+
+    /// For a source of `layout`: its own order where `exactResamplerLayouts` has it; 5.1 for any
+    /// other source of 4 or 5 channels with an LFE; otherwise its count.
+    init(source layout: UnsafePointer<AVChannelLayout>) {
+        for exact in exactResamplerLayouts {
+            var candidate = AVChannelLayout()
+            defer { av_channel_layout_uninit(&candidate) }
+            if av_channel_layout_from_string(&candidate, exact.name) >= 0,
+               av_channel_layout_compare(layout, &candidate) == 0 {
+                self.init(channels: candidate.nb_channels, exactLayout: exact.name, tag: exact.tag)
+                return
+            }
+        }
+        let count = layout.pointee.nb_channels
+        self.init(channels: (4...5).contains(count) && channelLayoutHasLFE(layout) ? 6 : count)
+    }
+
+    /// The layout the resampler writes.
+    func makeLayout(into layout: inout AVChannelLayout) {
+        if let exactLayout, av_channel_layout_from_string(&layout, exactLayout) >= 0 { return }
+        makeResamplerOutputLayout(channels, into: &layout)
     }
 }
 

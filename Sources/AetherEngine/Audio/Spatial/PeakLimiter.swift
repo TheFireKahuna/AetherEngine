@@ -27,6 +27,12 @@ import Foundation
 ///
 /// On a bed that stays under the threshold the limiter does nothing at all: every frame passes bit
 /// for bit, only later.
+///
+/// The LFE is not listened to. It is the source's own channel at its own gain, and lossless LFE
+/// routinely peaks at 0 dBFS (the Dolby demo disc's LFE check does), which at the shared threshold
+/// would duck every channel for a peak that was never over full scale. The shared gain still
+/// applies to the LFE when the other channels trip it, so the LFE keeps its balance with them.
+/// Only an element gain above 0 dB can take the LFE over full scale; a guard of its own holds it
 /// there, at 0 dBFS (the codec's overshoot is a high-frequency effect, and the LFE has none). The
 /// LFE then takes whichever of the two gains is lower, which is what applying the guard to the
 /// already reduced LFE gives.
@@ -34,6 +40,8 @@ struct PeakLimiter {
 
     /// −0.18 dBFS, a margin for the codec's own overshoot (+0.4 dB measured on an 8 kHz tone).
     static let threshold: Float = 0.98
+    /// Where the LFE's own guard starts: full scale.
+    static let lfeThreshold: Float = 1
     /// 2 ms of look-ahead, over which a reduction eases in.
     static let attackFrames = 96
     /// The time constant of the release rate.

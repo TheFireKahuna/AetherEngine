@@ -50,6 +50,8 @@ final class AudioDecoder: @unchecked Sendable {
 
     private(set) var sampleRate: Int32 = 0
     private(set) var channels: Int32 = 0
+    /// The order the resampler writes and the tag stamped on it (see `ResamplerOutput`).
+    private var output = ResamplerOutput(channels: 2)
 
     func open(stream: UnsafeMutablePointer<AVStream>) throws {
         guard let codecpar = stream.pointee.codecpar else {
@@ -74,7 +76,7 @@ final class AudioDecoder: @unchecked Sendable {
             throw AudioDecoderError.parameterCopyFailed
         }
 
-        guard avcodec_open2(ctx, codec, nil) >= 0 else {
+        guard openAudioDecoder(ctx, codec) >= 0 else {
             throw AudioDecoderError.openFailed
         }
 
@@ -145,11 +147,14 @@ final class AudioDecoder: @unchecked Sendable {
         // first frame and again after a mid-stream format change tore the context down (#452).
         if frame.pointee.sample_rate > 0 { sampleRate = frame.pointee.sample_rate }
         let frameChannels = frame.pointee.ch_layout.nb_channels
-        if frameChannels > 0 && frameChannels <= 8 { channels = frameChannels }
+        output = frameChannels > 0 && frameChannels <= 8
+            ? withUnsafePointer(to: &frame.pointee.ch_layout) { ResamplerOutput(source: $0) }
+            : ResamplerOutput(channels: channels)
+        channels = output.channels
 
         var outLayout = AVChannelLayout()
         // #401: this is the order the stamped layout has to name, so both come from one place.
-        makeResamplerOutputLayout(channels, into: &outLayout)
+        output.makeLayout(into: &outLayout)
 
         // Input layout: frame's if valid, else a synthesised default. Key for TrueHD 7.1 (the frame has it right
         // after decoding even when codecpar didn't).
@@ -286,7 +291,7 @@ final class AudioDecoder: @unchecked Sendable {
             mReserved: 0
         )
 
-        let layoutTag = audioChannelLayoutTag(for: channels)
+        let layoutTag = output.tag
         var layout = AudioChannelLayout(
             mChannelLayoutTag: layoutTag,
             mChannelBitmap: [],
@@ -470,4 +475,13 @@ enum AudioDecoderError: Error, CustomStringConvertible, LocalizedError {
     }
 
     var errorDescription: String? { description }
+}
+
+/// Opens an audio decoder at the programme's reference dynamics. FFmpeg's AC-3 and E-AC-3 decoders
+/// apply the stream's dynamic range compression in full by default (`drc_scale` 1); a receiver
+func openAudioDecoder(_ ctx: UnsafeMutablePointer<AVCodecContext>, _ codec: UnsafePointer<AVCodec>) -> Int32 {
+    var options: OpaquePointer?
+    av_dict_set(&options, "drc_scale", "0", 0)
+    defer { av_dict_free(&options) }
+    return avcodec_open2(ctx, codec, &options)
 }
