@@ -124,6 +124,22 @@ the public-API contract.
 
 ### Fixed
 
+- **The overlay names every frame by the time AVPlayer is served it at.** The overlay's taps named frames by the
+  source's whole milliseconds and asked AVPlayer's output for each at that time plus 0.5 ms, which held only while
+  video was served at those milliseconds. With constant-rate Matroska video on its exact frame grid (AE#886) a frame
+  can be served up to a millisecond from that, the request landed before the frame, and the overlay took each frame
+  at the clock instead of about 370 ms ahead: on the Apple TV a Profile 7 FEL title showed 1155 of 1595 frames late
+  and 568 composed without their enhancement layer. The producer now computes each frame's served time once and the
+  taps, their decoders and the renderer all use it; the renderer asks for a frame at the middle of the interval it is
+  served for. Back to about 1 late frame in 10,000 and none without the enhancement layer. docs/timing-model.md.
+- **An overlay resume or seek waits for its own picture, not the segment's first.** The overlay held a run's first
+  segment for a picture within 0.1 s of the run's first keyframe while its decoder worked toward the seek's target,
+  so a resume or seek partway into a group of pictures waited out the 5 s bound (and AVPlayer then logged -12889); a
+  forward seek opened no run and was not held at all; and a backward seek's units were trimmed as they were cut,
+  because the decoder's clock still read where the seek left from, so the first frames went out without their
+  enhancement layer. Every producer now opens a run, the target is AVPlayer's own reported time, and the run being
+  cut is kept. Measured on a Mac from Jellyfin, a FEL resume and three seeks: each held 6 to 9 ms for its picture,
+  with no frame late or without its enhancement layer.
 - **The overlay asks an iPhone's ProMotion display for its film's refresh rate.** With AVPlayer's own rendering
   suppressed for the overlay (a Profile 7 FEL composed over its base layer, a codec AVPlayer cannot decode), nothing
   told the system a film was playing, and an iPhone 17 Pro Max ran a 24p overlay at 60 Hz: frames alternated two
@@ -238,6 +254,12 @@ the public-API contract.
 
 ### Changed
 
+- **VOD loopback segments are always served while they are written; `LoadOptions.progressiveSegmentDelivery` is
+  removed.** It was an opt-in no host set. Every VOD segment is now flushed in 0.5 s fragments and sent as they
+  land; live still serves each segment at its cut. Samples and timestamps are unchanged (the A/V sync suite to the
+  sample, a restarted segment equal to continuous playback's). A seek outside the buffer landed sooner on a Mac
+  (4K HEVC, 97 Mbit/s, TrueHD Atmos from Jellyfin): 398 to 661 ms instead of 489 to 864 ms. `aetherctl play
+  --progressive-segments` is gone with the option. docs/seek-cost.md.
 - **The retired software host is gone.** Software-decoded video (AV1 without hardware decode, VP9, VP8,
   MPEG-2, VC-1, interlaced H.264, a Profile 7 FEL composition, `preferredDecodePath = .software`) has played as
   the overlay over the loopback AVPlayer session since the host stopped being routed to, so `SoftwarePlaybackHost`,

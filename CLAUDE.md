@@ -16,6 +16,8 @@ Read before changing anything non-trivial:
 - `docs/api.md`: the public surface and the host contracts.
 - `docs/formats.md`: per-format behaviour, Dolby Vision / HDR, audio routes.
 - `docs/cli.md`: `aetherctl`, the headless harness that runs the real engine on macOS.
+- `docs/timing-model.md`: how video, sound and the overlay are timed, what AVPlayer does with those times, and the
+  device health check. Read it before touching muxing, timestamps, segments, the overlay or AVPlayer's clock.
 - `CONTRIBUTING.md`: test conventions and the doc-coverage tests.
 
 ## Build and test
