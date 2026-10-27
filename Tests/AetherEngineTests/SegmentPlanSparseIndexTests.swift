@@ -75,11 +75,13 @@ struct SegmentPlanSparseIndexTests {
     func bunchedIndexProducesWholeFileSegment() {
         // Documents the exact bug the coverage guard prevents: no keyframe reaches the first 4 s segment
         // boundary, so buildKeyframeSegmentPlan degenerates to one segment spanning the whole title, from
-        // which AVPlayer loads zero tracks (kFigAssetError_TrackNotFound).
+        // which AVPlayer loads zero tracks (kFigAssetError_TrackNotFound). Pinned to the 4 s cut the bug was
+        // reported at; the 2 s VOD cut reaches one boundary and then degenerates the same way.
         let plan = HLSVideoEngine.buildKeyframeSegmentPlan(
             keyframes: bunchedMKVIndex(),
             videoTimeBase: mkvMs,
-            sourceDurationSeconds: 6843.872
+            sourceDurationSeconds: 6843.872,
+            targetSeconds: HLSVideoEngine.targetSegmentDuration
         )
         #expect(plan.count == 1)
         #expect((plan.first?.durationSeconds ?? 0) > 6000)

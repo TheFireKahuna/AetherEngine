@@ -203,9 +203,13 @@ extension PlaybackPhase {
     /// the whole reason this phase exists. Over a delivering source nothing changes: the reader is
     /// `.flowing` and a seek reads `.seeking` exactly as before, and a seek that can land from cache over a
     /// reconnecting reader clears itself in milliseconds.
+    /// `settlingSeek`: a native seek has landed and AVPlayer is still prerolling the new position (see
+    /// `AetherEngine.nativeSeekSettling`). That wait is the seek's own tail, so it reads `.seeking`, not
+    /// `.rebuffering`, which is reserved for an underrun of playback that was already running.
     static func derive(state: PlaybackState,
                        isBuffering: Bool,
                        isSeeking: Bool,
+                       settlingSeek: Bool = false,
                        stall: ReaderNetworkPhase,
                        transportHasRolled: Bool) -> PlaybackPhase {
         switch state {
@@ -219,7 +223,7 @@ extension PlaybackPhase {
             case .exhausted:    return .stalled(reconnecting: false)
             case .flowing:      break
             }
-            if isSeeking { return .seeking }
+            if isSeeking || settlingSeek { return .seeking }
             // AE#440: `state` is transport INTENT, and every autostart writes it before AVPlayer has
             // rolled anything. On a live join that gap is seconds wide, so a phase of `.playing` there
             // describes a picture that is standing still. Until the transport has moved once, the
@@ -913,18 +917,6 @@ public struct LoadOptions: Sendable, Equatable {
 
     /// Optional temporary session-cache budget. Nil retains automatic sizing; zero keeps only the working window.
     public var sessionCacheByteBudget: Int? = nil
-    /// Compressed-packet storage for seekable software VOD; automatic retains platform defaults.
-    public var softwarePacketCacheStorage: SoftwarePacketCacheStorage = .automatic
-
-    /// Serve each VOD loopback segment while it is being written instead of after its cut. The
-    /// muxer flushes a fragment about every half second and the loopback server sends each one as
-    /// it lands, so AVPlayer can show and start on the first fragments of a segment rather than
-    /// waiting for all of it. On a fast or local source a segment is cut long before AVPlayer asks
-    /// for it and nothing changes; on a slow link it is the difference between waiting for a whole
-    /// segment (seconds of a long GOP at the link's rate) and waiting for its first fragment.
-    /// Default false. VOD only: live keeps its own window and blocking-reload contracts. Ignored for
-    /// `nativeRemoteHLS` and on the software path, which serve no loopback segments.
-    public var progressiveSegmentDelivery: Bool = false
 
     /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
     /// `.playing` state (current behavior, byte-identical). Set `false` to mount PAUSED: a host that
@@ -1055,8 +1047,6 @@ public struct LoadOptions: Sendable, Equatable {
         externalSubtitles: [ExternalSubtitleTrack] = [],
         forwardBufferSegments: Int? = nil,
         sessionCacheByteBudget: Int? = nil,
-        softwarePacketCacheStorage: SoftwarePacketCacheStorage = .automatic,
-        progressiveSegmentDelivery: Bool = false,
         autoplay: Bool = true,
         teletextPage: Int? = nil,
         audioDelaySeconds: Double = 0,
@@ -1114,8 +1104,6 @@ public struct LoadOptions: Sendable, Equatable {
         self.externalSubtitles = externalSubtitles
         self.forwardBufferSegments = forwardBufferSegments
         self.sessionCacheByteBudget = sessionCacheByteBudget
-        self.softwarePacketCacheStorage = softwarePacketCacheStorage
-        self.progressiveSegmentDelivery = progressiveSegmentDelivery
         self.autoplay = autoplay
         self.teletextPage = teletextPage
         self.audioDelaySeconds = audioDelaySeconds

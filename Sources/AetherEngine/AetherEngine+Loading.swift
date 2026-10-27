@@ -551,6 +551,9 @@ extension AetherEngine {
                 @unknown default:
                     break
                 }
+                // A landed seek's preroll ends when the transport rolls or pauses. After the `isBuffering`
+                // write above, so the phase goes from `.seeking` straight to where it lands.
+                if status != .waitingToPlayAtSpecifiedRate { self.endNativeSeekSettle() }
                 // AE#440: the rate is rolling, which is what `playbackPhase` reports as `.playing`.
                 // Last, so this load's `state` and `isBuffering` writes are already in and the phase
                 // recomputes once, onto the roll.
@@ -935,7 +938,6 @@ extension AetherEngine {
         session.requestHeaders = sessionRequestHeaders
         // AE#464: every producer this session builds reads it off the session. Set before start().
         session.audioDelaySeconds = loadedOptions.audioDelaySeconds
-        session.servesSegmentsProgressively = loadedOptions.progressiveSegmentDelivery
         // #240: the pump claims the source link through this gate while it is fetching, so the
         // subtitle side readers can stay out of its way. Set before start().
         session.sideReaderLinkGate = sideReaderLinkGate
@@ -1641,6 +1643,9 @@ extension AetherEngine {
                 let startedPlaying = self.state == .playing || self.state == .paused
                 self.isBuffering = startedPlaying
                     && Self.nativeWaitIsRebuffer(status: status, reason: host?.waitingReason)
+                // A landed seek's preroll ends when the transport rolls or pauses; after the write above,
+                // for the same reason as the latch below.
+                if status != .waitingToPlayAtSpecifiedRate { self.endNativeSeekSettle() }
                 // AE#440: the rate is rolling. The autostart wrote `state = .playing` before AVPlayer had
                 // moved anything, and on a live join AVPlayer can hold a presented first frame still for
                 // seconds past that, so `playbackPhase` reports `.loading` until this latches.

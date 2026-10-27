@@ -24,6 +24,9 @@
 #   decmem/*                      - 12 s of music-like audio in every codec the audio bridge decodes,
 #                                   for AudioDecoderMemoryTests (a decode started anywhere matches a
 #                                   continuous one past the decoder's declared memory)
+#   determinism/*                 - 24 s of moving picture and music-like audio per audio route, for
+#                                   ProducerDeterminismTests (segment N is the same bytes however
+#                                   playback reached it)
 #
 # Real-world DV / Atmos / multichannel sources have to come from your
 # own library. Drop those into ./Fixtures/user/ (also gitignored)
@@ -413,6 +416,26 @@ decmem_clip dts-51.mkv "$DECMEM_51" 48000 -c:a dca -strict -2
 decmem_clip truehd-51.mkv "$DECMEM_51" 48000 -c:a truehd -strict -2
 decmem_clip truehd-96k.mkv "$DECMEM_ST" 96000 -c:a truehd -strict -2
 decmem_clip flac.mkv "$DECMEM_ST" 48000 -c:a flac
+
+# ProducerDeterminismTests: the decmem audio over a moving picture, 24 s in 2 s GOPs (12 segments of
+# the VOD keyframe plan), one clip per audio route: copied from Matroska, MPEG-TS (the uniform grid)
+# and MP4, and bridged from Opus, DTS and TrueHD.
+echo "→ determinism/* (24 s, per audio route)"
+mkdir -p "$FIXTURES_DIR/determinism"
+DET_ST="${DECMEM_ST/d=12/d=24}:s=48000"
+DET_51="${DECMEM_51/d=12/d=24}:s=48000"
+determinism_clip() {  # <name> <audio source> <audio args...>
+    local name="$1" source="$2"; shift 2
+    ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=s=320x240:r=24:d=24" -f lavfi -i "$source" "$@" \
+        -c:v libx264 -bf 3 -g 48 -keyint_min 48 -sc_threshold 0 -pix_fmt yuv420p "$FIXTURES_DIR/determinism/$name"
+}
+determinism_clip aac.mkv "$DET_ST" -c:a aac -b:a 192k
+determinism_clip ac3.ts "$DET_51" -c:a ac3
+determinism_clip eac3.mp4 "$DET_51" -c:a eac3
+determinism_clip flac.mkv "$DET_ST" -c:a flac
+determinism_clip opus.mkv "$DET_ST" -c:a libopus -b:a 128k
+determinism_clip dts.mkv "$DET_51" -c:a dca -strict -2
+determinism_clip truehd.mkv "$DET_51" -c:a truehd -strict -2
 
 echo ""
 echo "Done. Try:"

@@ -293,12 +293,6 @@ the session with `body stalled, no bytes for 30 s after ...`. The engine's own r
 segments from a keep-alive origin at 200 KB/s shared across its connections: each segment then takes
 about 58 s, longer than the 45 s a whole exchange used to be allowed (#732).
 
-`--progressive-segments` sets `LoadOptions.progressiveSegmentDelivery`: each VOD segment is served
-while it is written. Run it against a throttled origin and compare the `FIRSTFRAME` and first
-`PHASE playing` times with and without the flag; the session log shows `serving while it is written`
-for every segment that went out that way. On a local or fast source the segments are cut before
-AVPlayer asks and the two runs look the same.
-
 `--max-concurrent-requests N` sets `LoadOptions.maxConcurrentSourceRequests` (#377): the most requests the reader may have open against the origin at once, across every path it fetches on. `1` also switches off the speculative parallel paths, which is the shape of a connection-metered CDN. Count the requests in the origin's own log, or read the `[AVIOReader]` connection lines, with and without the flag.
 
 `--assert-dv` sets `LoadOptions.panelPresentsDolbyVision` (AE#493), the host's assertion that its display presents Dolby Vision. macOS has no per-mode display capability API, so a Mac run plays a Dolby Vision source as its HDR10 base layer (`effective-format=hdr10`) until the host says otherwise; the flag moves that label and the tvOS criteria request. It does not change the packaging of a Profile 5 / 8.1 / 8.4 source (those carry their `dvcC` and `SUPPLEMENTAL-CODECS` on every display since 6.72.0 / 6.73.0), while Profile 7 and AV1 Dolby Vision are still gated on it. A wrong claim costs one in-place media-playlist fallback, not the item.

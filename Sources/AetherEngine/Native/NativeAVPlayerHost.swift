@@ -109,6 +109,16 @@ final class NativeAVPlayerHost {
     /// its own. Both spend it, and the witness has to name which, because "the wait ended without the
     /// buffer reaching the floor" is the opposite of what happened when the override cut it.
     private var liveJoinImmediateStartCutShort: Bool = false
+    /// The VOD seek whose landing may still be started by hand (`startSeekLandingIfHolding`). Cleared
+    /// by the start, by the landing rolling or pausing on its own, and by a newer seek or load.
+    private var seekLandingStartGeneration: UInt64?
+    /// When that seek was issued; the thin-cushion re-asks stop `seekLandingPatienceSeconds` later.
+    private var seekLandingArmedAt = DispatchTime.now()
+    /// That seek's target, where its cushion is measured from while it is pending.
+    private var seekLandingTarget: Double = .nan
+    /// True while a seek-landing buffer reading is off the main actor, so two hold edges cannot each
+    /// decide on the same landing.
+    private var seekLandingProbeInFlight = false
     /// AE#443: what the items this host has already retired transferred, so `rx` keeps describing the
     /// SESSION across an item swap the session survives.
     ///
@@ -550,6 +560,8 @@ final class NativeAVPlayerHost {
         // at all and read the previous join's spend reason.
         self.liveJoinHoldWitnessStarted = false
         self.liveJoinImmediateStartCutShort = false
+        self.seekLandingStartGeneration = nil
+        self.seekLandingProbeInFlight = false
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
         let sid = sessionID
@@ -815,6 +827,7 @@ final class NativeAVPlayerHost {
                 self.waitingReason = waitingReason.map(AVPlayer.WaitingReason.init(rawValue:))
                 self.timeControlStatus = status
                 self.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
+                self.startSeekLandingIfHolding()
                 // First .playing: re-sample route after 2.5s settle -- AVKit only negotiates HDMI format on playback start (issue #24).
                 // Audit NAT-103: an in-place swap reuses a player that is still `.playing`, and that status
                 // reaches the fresh item before it is ready. Taken as a roll it released the AE#629 hold
@@ -1570,6 +1583,100 @@ final class NativeAVPlayerHost {
         }
     }
 
+    /// A VOD seek, cut short like the AE#440 join. Once the target's segment is in, AVPlayer presents the
+    /// target frame and holds it under `ToMinimizeStalls` while it judges the rate of a second segment,
+    /// which the loopback server only answers once it is whole. On the device it held the seek itself
+    /// open that way, reporting the landing only after the second segment: 0.6 s of still picture
+    /// after a 2 s segment had arrived. So this is armed when the seek is issued, not at its landing,
+    /// and measures the cushion from the seek's target; `playImmediately` during a pending seek still
+    /// lands it at the target (measured on macOS 27). The producer reads a remux several times faster
+    /// than real time, so once a cushion stands ahead of the target the judgement can only delay a start
+    /// that will not stall. The guards are AE#440's (a ready, non-empty buffer of a proven depth, never
+    /// `automaticallyWaitsToMinimizeStalling = false` on the player). A cushion below the floor is read
+    /// again until the next segment lands or the patience runs out, because a segment arriving moves no
+    /// status AVPlayer publishes.
+    private func startSeekLandingIfHolding() {
+        guard let gen = seekLandingStartGeneration else { return }
+        guard gen == seekGeneration, playIntent else {
+            seekLandingStartGeneration = nil
+            return
+        }
+        if timeControlStatus != .waitingToPlayAtSpecifiedRate {
+            // Rolled on its own: the landing is over and the next hold is a rebuffer, AVPlayer's to wait.
+            if timeControlStatus == .playing { seekLandingStartGeneration = nil }
+            return
+        }
+        guard avPlayer.reasonForWaitingToPlay == .toMinimizeStalls,
+              !seekLandingProbeInFlight,
+              let item = playerItem
+        else { return }
+        seekLandingProbeInFlight = true
+        let sid = sessionID
+        let target = seekLandingTarget
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let reading = await Self.liveJoinBufferReading(item, aheadFrom: target)
+            guard self.sessionID == sid else { return }
+            self.seekLandingProbeInFlight = false
+            // The reading is async: decide on the state that exists now (AE#422).
+            guard self.playerItem === item,
+                  self.seekLandingStartGeneration == gen, gen == self.seekGeneration,
+                  self.playIntent,
+                  self.timeControlStatus == .waitingToPlayAtSpecifiedRate
+            else { return }
+            guard Self.shouldStartSeekLandingImmediately(
+                bufferEmpty: reading.bufferEmpty,
+                bufferedAheadSeconds: reading.aheadSeconds,
+                itemIsReadyToPlay: reading.itemStatus == .readyToPlay
+            ) else {
+                guard Self.secondsSince(self.seekLandingArmedAt) < Self.seekLandingPatienceSeconds else {
+                    self.seekLandingStartGeneration = nil
+                    EngineLog.emit(
+                        "[NativeAVPlayerHost] #\(sid) seek landing: leaving the stall-avoidance wait alone "
+                        + "(buffer ahead " + String(format: "%.2f", reading.aheadSeconds)
+                        + "s, empty=\(reading.bufferEmpty), floor "
+                        + String(format: "%.2f", Self.minimumSeekLandingBufferAhead) + "s)",
+                        category: .engine
+                    )
+                    return
+                }
+                try? await Task.sleep(nanoseconds: UInt64(Self.seekLandingRecheckSeconds * 1_000_000_000))
+                self.startSeekLandingIfHolding()
+                return
+            }
+            self.seekLandingStartGeneration = nil
+            // #436: the session's speed lives in `defaultRate`.
+            let rate = self.avPlayer.defaultRate != 0 ? self.avPlayer.defaultRate : 1.0
+            EngineLog.emit(
+                "[NativeAVPlayerHost] #\(sid) seek landing: cutting the stall-avoidance wait short at rate "
+                + "\(rate) (buffer ahead " + String(format: "%.2f", reading.aheadSeconds) + "s, "
+                + String(format: "%.2f", Self.secondsSince(self.seekLandingArmedAt)) + "s after the seek, "
+                + (self.seekInFlight ? "before" : "after") + " its landing)",
+                category: .engine
+            )
+            self.avPlayer.playImmediately(atRate: rate)
+        }
+    }
+
+    /// The seek-landing decision on one buffer reading. Pure; the guards are AE#440's.
+    nonisolated static func shouldStartSeekLandingImmediately(
+        bufferEmpty: Bool,
+        bufferedAheadSeconds: Double,
+        itemIsReadyToPlay: Bool
+    ) -> Bool {
+        guard itemIsReadyToPlay, !bufferEmpty, bufferedAheadSeconds.isFinite else { return false }
+        return bufferedAheadSeconds >= minimumSeekLandingBufferAhead
+    }
+
+    /// Contiguous seconds a landing must hold ahead of its playhead before its wait is cut. AE#440's floor:
+    /// under one 2 s segment, so a landing early in its segment starts at once, and one late in it waits
+    /// for the next segment, which the producer delivers in a fraction of its playing time.
+    nonisolated static let minimumSeekLandingBufferAhead: Double = minimumLiveJoinBufferAhead
+    /// How often a thin landing is read again, and for how long. Past the patience AVPlayer's own wait,
+    /// which the device measured ending within a second, is the better judge.
+    nonisolated static let seekLandingRecheckSeconds: Double = 0.1
+    nonisolated static let seekLandingPatienceSeconds: Double = 3
+
     /// Whether a `.playing` transport status is this item's rate rolling: the event that spends the
     /// AE#440 one-shot, latches #50's `hasEverPlayed` and releases the AE#629 swap hold (audit NAT-103).
     ///
@@ -1784,7 +1891,9 @@ final class NativeAVPlayerHost {
     /// mechanisms is precisely the state where the media server is least likely to answer. A
     /// synchronous `isPlaybackBufferEmpty` there is the shape AE#422 measured at 13.3 s of fully
     /// blocked app, and the depth needs two more reads on top of it.
-    nonisolated static func liveJoinBufferReading(_ item: AVPlayerItem) async -> LiveJoinBufferReading {
+    /// `aheadFrom` measures the cushion from that time instead of the playhead: a pending seek's target.
+    nonisolated static func liveJoinBufferReading(_ item: AVPlayerItem,
+                                                  aheadFrom anchor: Double? = nil) async -> LiveJoinBufferReading {
         await AVFoundationOffMain.read(item, on: Self.offMainReadQueue) { item in
             let now = item.currentTime().seconds
             let ranges = item.loadedTimeRanges.map { value -> (Double, Double) in
@@ -1793,7 +1902,8 @@ final class NativeAVPlayerHost {
             }
             // Contiguous from the playhead, not the sum of every loaded range: an island past a gap
             // cannot sustain a rate that has to cross the gap to reach it.
-            let ahead = NativeAVPlayerHost.contiguousBufferedEnd(ranges: ranges, now: now) - now
+            let from = anchor ?? now
+            let ahead = NativeAVPlayerHost.contiguousBufferedEnd(ranges: ranges, now: from) - from
             let placement = NativeAVPlayerHost.liveJoinPlacement(ranges: ranges, now: now)
             return LiveJoinBufferReading(bufferEmpty: item.isPlaybackBufferEmpty, aheadSeconds: ahead,
                                          playheadSeconds: now,
@@ -2068,6 +2178,10 @@ final class NativeAVPlayerHost {
         // AE#629: this seek's own landing publishes the clock from here on.
         mountSeekPending = false
         latestSeekRenderedTimePublished = false
+        // Armed from the request: AVPlayer can hold the seek itself open (`startSeekLandingIfHolding`).
+        seekLandingStartGeneration = isLiveSession ? nil : gen
+        seekLandingTarget = seconds
+        seekLandingArmedAt = DispatchTime.now()
         let resumeGuard = SeekResumeGuard()
         return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             if let deadlineSeconds, deadlineSeconds > 0 {
@@ -2114,6 +2228,7 @@ final class NativeAVPlayerHost {
                         }
                     }
                     EngineLog.emit("[NativeAVPlayerHost] seek completion target=\(String(format: "%.2f", seconds)) actual=\(String(format: "%.2f", actual)) finished=\(finished) landed=\(landed) current=\(gen == self.seekGeneration)", category: .engine)
+                    if landed { self.startSeekLandingIfHolding() }
                     if resumeGuard.claim() { cont.resume(returning: landed) }
                 }
             }

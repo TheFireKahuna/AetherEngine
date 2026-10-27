@@ -122,10 +122,10 @@ enum HLSCarriageProbe {
         }
     }
 
-    /// Reads the head of a segment and classifies its carriage. The body is streamed and abandoned at the
-    /// first definitive verdict, so a conforming segment costs the two packets that carry PAT and PMT
-    /// rather than the full ceiling; an origin that ignores the Range request is bounded the same way, by
-    /// cancelling the task instead of buffering the segment.
+    /// Reads the head of a segment and classifies its carriage. The body is read in the chunks the
+    /// session delivers and abandoned at the first definitive verdict, so a conforming segment costs
+    /// the two packets that carry PAT and PMT rather than the full ceiling; an origin that ignores the
+    /// Range request is bounded the same way, by ending the transfer instead of buffering the segment.
     static func classifySegmentHead(
         url: URL,
         httpHeaders: [String: String],
@@ -135,40 +135,71 @@ enum HLSCarriageProbe {
         var request = SourceNetworkDiagnostics.request(makeRequest(url, httpHeaders: httpHeaders), context: diagnosticContext)
         request.setValue("bytes=0-\(maximumSegmentHeadBytes - 1)", forHTTPHeaderField: "Range")
         let trace = SourceNetworkDiagnostics.Trace(role: .hlsSegment, context: SourceNetworkDiagnostics.context(for: request))
-        var task: URLSessionTask?
-        var terminalError: Error?
-        defer {
-            if let task { trace.completed(task: task, error: terminalError) }
-            else { trace.record(.completed, originalURL: url, url: url, error: terminalError) }
+        let stream = try await openSegment(request, session: session, limit: .max)
+        return try await readHead(of: stream).verdict
+    }
+
+    /// A segment's head, classified, with the rest of its response still open: the VOD ingest starts
+    /// its producer on the same response rather than asking for the segment again, which would put a
+    /// second round trip in front of the first frame. `limit` bounds the whole body.
+
+    /// What the head read settled on, and the bytes it took to get there.
+    struct SegmentHead {
+        let verdict: MPEGTransportStreamCodecProbe.Verdict
+        let bytes: Data
+    }
+
+    /// A segment body being read as it arrives (`BoundedFetch.stream`), by one consumer at a time,
+    /// which may hand it on: the probe reads the head, the producer reads the rest. Dropping it ends
+    /// the transfer.
+    final class SegmentStream: @unchecked Sendable {
+        let response: URLResponse
+        private var iterator: AsyncThrowingStream<Data, Error>.AsyncIterator
+
+        fileprivate init(_ body: BoundedFetch.BodyStream) {
+            response = body.response
+            iterator = body.chunks.makeAsyncIterator()
         }
-        do {
-            let (bytes, response) = try await session.bytes(for: request)
-            task = bytes.task
-            trace.response(task: bytes.task, response: response)
-            defer { bytes.task.cancel() }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-            guard status == 200 || status == 206 else {
-                throw HLSIngestError.playlistUnreachable(status: status)
-            }
-            var data = Data()
-            data.reserveCapacity(segmentHeadChunkBytes)
-            var nextVerdictAt = segmentHeadChunkBytes
-            for try await byte in bytes {
-                data.append(byte)
-                guard data.count >= nextVerdictAt else { continue }
-                let verdict = MPEGTransportStreamCodecProbe.classify(data)
-                if verdict != .inconclusive { return verdict }
-                guard data.count < maximumSegmentHeadBytes else { break }
-                nextVerdictAt = min(maximumSegmentHeadBytes, data.count + segmentHeadChunkBytes)
-            }
-            guard !data.isEmpty else {
-                throw HLSIngestError.unsupportedSegmentFormat
-            }
-            return MPEGTransportStreamCodecProbe.classify(data)
-        } catch {
-            terminalError = error
-            throw error
+
+        /// The next piece of the body, nil at its end.
+        func next() async throws -> Data? {
+            try await iterator.next()
         }
+    }
+
+    private static func openSegment(
+        _ request: URLRequest, session: URLSession, limit: Int, owner: EngineHTTPRequests? = nil
+    ) async throws -> SegmentStream {
+        var request = request
+        let pooled = session === EngineHTTP.session
+        if pooled { request.timeoutInterval = idleTimeoutSeconds }
+        let body = try await BoundedFetch.stream(
+            for: request, session: session, limit: limit,
+            resourceTimeout: pooled ? resourceTimeoutSeconds : nil, owner: owner, role: .hlsSegment)
+        let status = (body.response as? HTTPURLResponse)?.statusCode ?? -1
+        guard status == 200 || status == 206 else {
+            throw HLSIngestError.playlistUnreachable(status: status)
+        }
+        return SegmentStream(body)
+    }
+
+    /// Reads `stream` until the PMT settles the carriage or `maximumSegmentHeadBytes` have arrived,
+    /// re-judging every `segmentHeadChunkBytes`.
+    private static func readHead(of stream: SegmentStream) async throws -> SegmentHead {
+        var data = Data()
+        data.reserveCapacity(segmentHeadChunkBytes)
+        var nextVerdictAt = segmentHeadChunkBytes
+        while let chunk = try await stream.next() {
+            data.append(chunk)
+            guard data.count >= nextVerdictAt else { continue }
+            let verdict = MPEGTransportStreamCodecProbe.classify(data.prefix(maximumSegmentHeadBytes))
+            if verdict != .inconclusive { return SegmentHead(verdict: verdict, bytes: data) }
+            guard data.count < maximumSegmentHeadBytes else { break }
+            nextVerdictAt = min(maximumSegmentHeadBytes, data.count + segmentHeadChunkBytes)
+        }
+        guard !data.isEmpty else { throw HLSIngestError.unsupportedSegmentFormat }
+        return SegmentHead(verdict: MPEGTransportStreamCodecProbe.classify(data.prefix(maximumSegmentHeadBytes)),
+                           bytes: data)
     }
 
     /// Resolves the playlist down to the segment whose PMT answers the question, or settles the verdict

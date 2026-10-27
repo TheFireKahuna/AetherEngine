@@ -74,11 +74,22 @@ enum BoundedFetch {
         }
         switch outcome {
         case .body(let data, let response): return (data, response)
-        case .refused(let response): return (Data(), response)
+        case .refused(let response), .streaming(let response): return (Data(), response)
         case .exceeded: throw Exceeded(limit: limit)
-        case .failed(let error): throw error
+        case .failed(let error):
+            if expired.isSet { throw URLError(.timedOut) }
+            throw error
         }
     }
+
+    /// A body read as it arrives (`stream`). For a non-2xx answer `chunks` is empty and finished.
+
+    /// `data(for:)`, but the body is handed out in the pieces the session delivers rather than held
+    /// until it ends, so a consumer can start on a large body (a transport-stream segment) while the
+    /// rest of it is still on the wire. Returns once the response head is in. The same head checks
+    /// apply (a declared length over `limit` throws `Exceeded` here), and a body that runs past
+    /// `limit` ends the stream throwing `Exceeded`. Stopping the iteration, or cancelling the task
+    /// iterating, ends the transfer.
 }
 
 private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, URLSessionDataDelegate,
@@ -86,6 +97,8 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
 {
     enum Outcome {
         case body(Data, URLResponse)
+        /// Streaming mode: the head is in and the body follows on `chunks`.
+        case streaming(URLResponse)
         case refused(URLResponse)
         case exceeded
         case failed(Error)
@@ -101,6 +114,10 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
     private var buffer = Data()
     private var response: URLResponse?
     private var verdict: Verdict?
+    /// Streaming mode: the body goes here as it arrives instead of into `buffer`.
+    private let chunks: AsyncThrowingStream<Data, Error>.Continuation?
+    private let expired: BoundedFetch.ExpiryFlag?
+    private var streamed = 0
 
     /// Guards the handoff between the caller, which installs the handler, and the session's delegate
     /// queue, which produces the outcome. Either can be first.
@@ -161,11 +178,27 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
             return
         }
         if declared > 0 { buffer.reserveCapacity(Int(min(declared, 8 * 1024 * 1024))) }
+        if chunks != nil {
+            deliver(.streaming(response))
+        } else if declared > 0 {
+            buffer.reserveCapacity(Int(declared))
+        }
         completionHandler(.allow)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard verdict == nil else { return }
+        if let chunks {
+            streamed += data.count
+            guard streamed <= limit else {
+                verdict = .exceeded
+                chunks.finish(throwing: BoundedFetch.Exceeded(limit: limit))
+                dataTask.cancel()
+                return
+            }
+            chunks.yield(data)
+            return
+        }
         guard buffer.count + data.count <= limit else {
             verdict = .exceeded
             buffer = Data()
@@ -179,6 +212,15 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
         // Refusal/body limits deliberately cancel the task; do not report that as user cancellation.
         trace.completed(task: task, error: verdict == nil ? error : nil,
                         phase: verdict == .exceeded ? .bodyLimitExceeded : .completed)
+        if let chunks, verdict == nil, response != nil {
+            // The head went out already; what is left to say is how the body ended.
+            if let error {
+                chunks.finish(throwing: expired?.isSet == true ? URLError(.timedOut) : error)
+            } else {
+                chunks.finish()
+            }
+            return
+        }
         switch verdict {
         case .refused?:
             if let response { deliver(.refused(response)) } else { deliver(.failed(URLError(.badServerResponse))) }

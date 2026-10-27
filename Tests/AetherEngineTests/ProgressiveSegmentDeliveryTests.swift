@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import AetherEngine
 
-/// `LoadOptions.progressiveSegmentDelivery`: a VOD segment is served while its producer writes it,
+/// A VOD segment is served while its producer writes it,
 /// so AVPlayer can use each fragment as it lands instead of waiting for the segment's cut. On a slow
 /// link that wait is a whole segment at the link's rate, which is the time to first frame.
 @Suite("Progressive segment delivery", .serialized)
@@ -99,8 +99,8 @@ struct ProgressiveSegmentDeliveryTests {
         #expect(reader.next(pollInterval: 0.01, idleTimeout: 0.2) == .abandoned)
     }
 
-    @Test("with the option off, a segment being written is not served until its cut")
-    func offWaitsForTheCut() throws {
+    @Test("a segment fetched whole (live) is not served while it is written, only at its cut")
+    func wholeFetchWaitsForTheCut() throws {
         let cache = makeCache()
         defer { cache.close() }
         let (staging, handle) = try makeStaging(cache, index: 2)
@@ -205,16 +205,6 @@ struct ProgressiveSegmentDeliveryTests {
         // A partial body AVPlayer would otherwise take for a whole segment.
         #expect(Self.decodeChunked(body) == .truncated(partial))
         withExtendedLifetime(provider) {}
-    }
-
-    // MARK: - Option
-
-    @Test("the option is off by default and a tuning field, not an identity one")
-    func optionDefaults() {
-        #expect(!LoadOptions().progressiveSegmentDelivery)
-        var proposed = LoadOptions()
-        proposed.progressiveSegmentDelivery = true
-        #expect(SessionOptionCorrection.refusedFields(from: LoadOptions(), to: proposed).isEmpty)
     }
 
     // MARK: - Helpers

@@ -765,8 +765,6 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private let iFrameSourceLock = NSLock()
     private var _iFrameSource: IFrameSegmentSource?
     private let isLive: Bool
-    /// `LoadOptions.progressiveSegmentDelivery`, read for VOD only (see `fetchesProgressively`).
-    private let servesSegmentsProgressively: Bool
     /// Sequential-origin session: playlist grows with finalized real durations (see _seqDurations).
     private let sequentialAppendPlaylist: Bool
     /// Drives both playlist firstVisible and cache eviction cutoff so they never drift.
@@ -1067,7 +1065,6 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         audioIsAtmosStreamCopy: Bool = false,
         videoLayout: String? = nil,
         isLive: Bool = false,
-        servesSegmentsProgressively: Bool = false,
         sequentialAppendPlaylist: Bool = false,
         liveWindowSizing: LiveWindowSizing = LiveWindowSizing(targetSegmentDurationSeconds: 4.0, dvrWindowSeconds: nil),
         nativeLiveDVRPolicy: LiveDVRRetentionPolicy? = nil,
@@ -1102,7 +1099,6 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.cache = cache
         self.segments = segments
         self.isLive = isLive
-        self.servesSegmentsProgressively = servesSegmentsProgressively
         self.sequentialAppendPlaylist = sequentialAppendPlaylist
         self.baseLiveWindowSizing = liveWindowSizing
         self.nativeLiveDVRPolicy = nativeLiveDVRPolicy
@@ -1786,7 +1782,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         }
     }
 
-    private var fetchesProgressively: Bool { !isLive && servesSegmentsProgressively }
+    /// A VOD segment still being written is served as it is written; live keeps its own window and
+    /// blocking-reload contracts and serves each segment at its cut.
+    private var fetchesProgressively: Bool { !isLive }
 
     private func serveSource(at index: Int) -> SegmentSource? {
         guard index >= 0, index < currentSegmentCount else { return nil }

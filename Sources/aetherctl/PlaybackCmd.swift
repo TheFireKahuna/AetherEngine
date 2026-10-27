@@ -105,13 +105,13 @@ enum LoadOptionChange {
 /// and log every overlay cue that arrives. Repro harness for "loads but never
 /// plays" reports and for live teletext end-to-end validation (#107).
 func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, liveCushion: Double? = nil, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool = false, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, mallocCensus: Bool = false, forceSoftware: Bool = false, softwareEscalation: Bool = true,
-                    censusThresholdMB: Int? = nil, censusHz: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, servedURL: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0, nativeVideoFrameDiagnostics: Bool = false, nativeVideoFrameRecovery: Bool = false,
+                    censusThresholdMB: Int? = nil, censusHz: Double? = nil, presentTimes: Bool = false, servedURL: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0, nativeVideoFrameDiagnostics: Bool = false, nativeVideoFrameRecovery: Bool = false,
                     sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil,
                     teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil,
                     audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [],
                     pausedMount: Bool = false,
                     optionCorrection: LoadOptionCorrectionRequest? = nil,
-                    sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, progressiveSegments: Bool = false, objectAudioRendering: ObjectAudioRendering = .off, declaredDuration: Double? = nil,
+                    sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, objectAudioRendering: ObjectAudioRendering = .off, declaredDuration: Double? = nil,
                     httpHeaders: [String: String] = [:],
                     deinterlaceFieldRate: DeinterlaceFieldRate = .field,
                     assertDolbyVision: Bool = false,
@@ -582,7 +582,6 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         heldSourceConnection: heldConnection,
         declaredDurationSeconds: declaredDuration,
         externalSubtitles: sidecars,
-        progressiveSegmentDelivery: progressiveSegments,
         // AE#464 round 2: the reporter's mount. A host that drives transport itself loads with
         // autoplay off and calls play() next to its own load; a rebuild the ENGINE raises has no
         // such caller, which is what made a mid-play nudge settle paused and stay there.

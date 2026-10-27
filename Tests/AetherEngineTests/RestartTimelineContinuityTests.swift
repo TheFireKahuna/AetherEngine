@@ -131,7 +131,7 @@ struct RestartTimelineContinuityTests {
         #expect(prov.mediaSegment(at: 0) != nil)
         let continuous = try #require(prov.mediaSegment(at: 1))
         let continuousTrafs = FMP4.trafSummaries(of: continuous)
-        #expect(continuousTrafs.count == 2, "fixture must carry video + audio: \(continuousTrafs)")
+        #expect(Set(continuousTrafs.map(\.trackID)).count == 2, "fixture must carry video + audio: \(continuousTrafs)")
         // The continuous segment 1 must sit at its playlist offset, not at 0: a zero tfdt here
         // would make the whole witness vacuous.
         #expect(continuousTrafs.allSatisfy { $0.baseMediaDecodeTime > 0 }, "\(continuousTrafs)")
