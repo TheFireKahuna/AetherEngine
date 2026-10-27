@@ -41,4 +41,25 @@ extension AetherEngine {
         return out
     }
 
+    /// Every subtitle stream of `demuxer` in order, as an index consumer pairs it with its track.
+    nonisolated static func indexedSubtitleStreams(of demuxer: Demuxer) -> [IndexedSubtitleStream] {
+        var out: [IndexedSubtitleStream] = []
+        var index: Int32 = 0
+        while let stream = demuxer.withStream(at: index, { st -> IndexedSubtitleStream? in
+            guard st.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else { return nil }
+            func tag(_ key: String) -> String? {
+                av_dict_get(st.pointee.metadata, key, nil, AV_DICT_IGNORE_SUFFIX).map { String(cString: $0.pointee.value) }
+            }
+            return IndexedSubtitleStream(
+                streamIndex: index, trackID: st.pointee.id,
+                codecName: String(cString: avcodec_get_name(st.pointee.codecpar.pointee.codec_id)),
+                language: av_dict_get(st.pointee.metadata, "language", nil, 0).map { String(cString: $0.pointee.value) },
+                frames: tag("NUMBER_OF_FRAMES").flatMap { Int($0) }, bytes: tag("NUMBER_OF_BYTES").flatMap { Int64($0) },
+                timeBase: st.pointee.time_base)
+        }) {
+            if let stream { out.append(stream) }
+            index += 1
+        }
+        return out
+    }
 }

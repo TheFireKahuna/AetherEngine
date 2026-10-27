@@ -301,6 +301,7 @@ extension HLSVideoEngine {
         if isLive {
             try? demuxer.peekPackets(maxPackets: 512, inspect)
         } else {
+            Self.scanSourceHead(demuxer: demuxer, rewind: true, readBudget: 512, inspect)
         }
         return metadata
     }

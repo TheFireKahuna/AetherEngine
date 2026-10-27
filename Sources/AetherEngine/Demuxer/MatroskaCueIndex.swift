@@ -1,0 +1,697 @@
+import Compression
+import Foundation
+import AetherLibavutil
+
+/// A Matroska source's own index, its Cues, read once per source (`SourceIndexRegistry`): where every
+/// subtitle block and every video keyframe lies, by time. The Cues list every block of a subtitle
+/// track with its exact position (cluster and `CueRelativePosition`, which mkvmerge writes by
+/// default), so a track's whole content is a few hundred small range reads instead of the
+/// multi-gigabyte remux around it; the video keyframes are what an I-frame rendition and a seek are
+/// built on.
+///
+/// Trusted only where it is provably complete: a track whose cue entries number exactly its
+/// `NUMBER_OF_FRAMES` statistic (mkvmerge's statistics tags), all of them with a relative position, and
+/// whose frames this reader can hand over as libavformat does (uncompressed, zlib or header-stripped).
+/// Anything else is left to the readers that walk the stream.
+struct MatroskaCueIndex: SourceIndex {
+
+    /// How a track's frames are stored (Matroska ContentEncoding).
+    enum FrameEncoding: Sendable, Equatable {
+        case none
+        /// zlib; `readFrame` inflates it, as libavformat does.
+        case zlib
+        /// Header stripping: these bytes were removed from the front of every frame.
+        case strippedHeader([UInt8])
+        /// Anything this reader cannot undo (bzlib, lzo, encryption).
+        case unsupported
+    }
+
+    let segmentDataStart: Int64
+    /// Nanoseconds per tick (Info TimestampScale, 1 ms when absent).
+    let timestampScale: Int64
+    /// Every subtitle track's blocks, in time order. A block's offset is the earliest byte it can
+    /// start at: the cluster, its 4-byte ID, the shortest size field, then the relative position.
+    let blocksByTrack: [UInt64: [SourceIndexBlock]]
+    /// Tracks with at least one cue entry lacking a relative position: listed, not addressable.
+    let tracksMissingRelativePosition: Set<UInt64>
+    let encodingByTrack: [UInt64: FrameEncoding]
+    /// The subtitle TrackEntries libavformat makes a stream of, in file order (it skips an entry with
+    /// no CodecID or one whose CodecID does not start with S or D, `matroska_parse_tracks`), with
+    /// mkvmerge's statistics tags where the file has them.
+    var subtitleTracks: [SourceIndexTrack] = []
+
+    /// A video TrackEntry, in file order.
+    struct VideoTrack: Sendable, Equatable {
+        var number: UInt64
+        var codecID: String
+    }
+
+    /// A cue point of a video track: a keyframe, by its timestamp and where it lies. The Cues name the
+    /// cluster always and the block within it only when the muxer wrote `CueRelativePosition`; a
+    /// keyframe without it is still the cluster's first frame of that track, which is where muxers put
+    /// it, so it is kept rather than dropped as the subtitle blocks are.
+    struct Keyframe: Sendable, Equatable {
+        var ticks: Int64
+        /// Cluster position relative to the segment's data, as the Cues state it.
+        var clusterPosition: Int64
+        /// Position of the block relative to the cluster's data, when the Cues state it.
+        var relativePosition: Int64?
+    }
+
+    /// The video TrackEntries.
+    var videoTracks: [VideoTrack] = []
+    /// Every video track's keyframes, in time order.
+    var keyframesByTrack: [UInt64: [Keyframe]] = [:]
+
+    /// `track`'s keyframes in time order; empty for a track the Cues do not list.
+    func keyframes(track: UInt64) -> [Keyframe] { keyframesByTrack[track] ?? [] }
+
+    /// Where `keyframe`'s cluster begins in the file: the byte a read of that keyframe starts at.
+    func byteOffset(of keyframe: Keyframe) -> Int64 { segmentDataStart + keyframe.clusterPosition }
+
+    /// The length of the clusters' size field when the clusters sampled at load agree: tried first, and
+    /// the other lengths after it, since a muxer can write a few clusters differently.
+    var clusterSizeFieldLength: Int?
+
+    // MARK: - SourceIndex
+
+    /// Codecs whose Matroska block becomes the packet libavformat hands over: the frame itself for
+    /// SubRip, ASS and PGS, and for WebVTT the cue text split out of it with its settings beside it
+    /// (`webVTTCue`, #233). Compressed frames are inflated by `readFrame`, so the encoding never
+    /// matters here. DVD and DVB bitmaps are left out: their packet parity is unverified.
+    var packetCodecs: Set<String> { ["subrip", "ass", "hdmv_pgs_subtitle", "webvtt"] }
+
+    func blocks(track: UInt64) -> [SourceIndexBlock] { blocksByTrack[track] ?? [] }
+
+    func coversKeyframes(track: UInt64) -> Bool {
+        if case .unsupported = encodingByTrack[track] ?? .none { return false }
+        return !(keyframesByTrack[track] ?? []).isEmpty
+    }
+
+    /// The block of the cluster at `position` nearest `ticks`, read where the Cues place it, or, for a
+    /// cue point without `CueRelativePosition`, found in the cluster by its time: the cluster's
+    /// timestamp plus the block's own offset is the cue's time, as libavformat stamps the packet.
+    func readKeyframe(track: UInt64, position: Int64, ticks: Int64, from source: RandomAccessByteSource) -> [UInt8]? {
+        let inCluster = keyframes(track: track).filter { byteOffset(of: $0) == position }
+        guard let keyframe = inCluster.min(by: { abs($0.ticks - ticks) < abs($1.ticks - ticks) }) else { return nil }
+        if let relative = keyframe.relativePosition {
+            let block = SourceIndexBlock(ticks: keyframe.ticks, durationTicks: nil,
+                                         offset: position + 4 + 1 + relative, size: nil)
+            return readFrame(block, track: track, from: source, prefix: nil)?.payload
+        }
+        return block(of: track, at: keyframe.ticks, inClusterAt: position, from: source)
+    }
+
+    /// Every track counts in segment ticks.
+    func timeBase(track: UInt64) -> AVRational {
+        AVRational(num: Int32(clamping: timestampScale), den: 1_000_000_000)
+    }
+
+    /// Every one of `track`'s `frameCount` frames has an addressable entry and its frames can be
+    /// handed over.
+    func isComplete(track: UInt64, frameCount: Int?) -> Bool {
+        guard let frameCount, frameCount > 0, let blocks = blocksByTrack[track],
+              !tracksMissingRelativePosition.contains(track) else { return false }
+        if case .unsupported = encodingByTrack[track] ?? .none { return false }
+        return blocks.count == frameCount
+    }
+
+    // MARK: - Reading
+
+    static let cuesSizeLimit = 64 * 1024 * 1024
+    static let headProbeBytes = 64 * 1024
+
+    /// Parses the index. Only `SourceIndexRegistry` can call this (it alone makes a `ParseToken`):
+    /// a source's index is parsed once and shared, never read again by the next consumer.
+    static func read(from source: RandomAccessByteSource,
+                     token: SourceIndexRegistry.ParseToken) throws -> MatroskaCueIndex {
+        guard let head = source.read(at: 0, count: headProbeBytes) else {
+            throw SourceIndexError.malformed("head unreadable")
+        }
+        guard head.count > 16 else { throw SourceIndexError.unsupportedContainer }
+        var cursor = 0
+        guard let ebml = EBML.element(head, at: cursor), ebml.id == 0x1A45DFA3 else { throw SourceIndexError.unsupportedContainer }
+        cursor = ebml.dataStart + Int(ebml.size)
+        guard let segment = EBML.element(head, at: cursor), segment.id == 0x18538067 else {
+            throw SourceIndexError.unsupportedContainer
+        }
+        let segmentDataStart = Int64(segment.dataStart)
+
+        // Top-level elements before the first cluster, and the SeekHead's pointers to the rest.
+        var positions: [UInt32: Int64] = [:]
+        var inHead: [UInt32: EBML.Element] = [:]
+        var offset = segment.dataStart
+        while let element = EBML.element(head, at: offset), element.id != 0x1F43B675 {
+            inHead[element.id] = element
+            if element.id == 0x114D9B74 {
+                for seek in EBML.children(head, of: element) where seek.id == 0x4DBB {
+                    var id: UInt32?
+                    var position: Int64?
+                    for field in EBML.children(head, of: seek) {
+                        if field.id == 0x53AB { id = UInt32(truncatingIfNeeded: EBML.uint(head, field)) }
+                        if field.id == 0x53AC { position = Int64(EBML.uint(head, field)) }
+                    }
+                    if let id, let position, positions[id] == nil { positions[id] = segmentDataStart + position }
+                }
+            }
+            guard !element.unknownSize, element.dataStart + Int(element.size) <= head.count else { break }
+            offset = element.dataStart + Int(element.size)
+        }
+
+        func load(_ id: UInt32, limit: Int) throws -> ([UInt8], EBML.Element)? {
+            if let element = inHead[id], element.dataStart + Int(element.size) <= head.count { return (head, element) }
+            guard let position = positions[id] else { return nil }
+            guard let header = source.read(at: position, count: 16),
+                  let element = EBML.element(header, at: 0), element.id == id, !element.unknownSize else {
+                throw SourceIndexError.malformed("element \(String(id, radix: 16)) not where the SeekHead says")
+            }
+            let total = element.dataStart + Int(element.size)
+            guard total <= limit else { throw SourceIndexError.malformed("element \(String(id, radix: 16)) too large") }
+            guard let bytes = source.read(at: position, count: total), bytes.count == total else {
+                throw SourceIndexError.malformed("element \(String(id, radix: 16)) short read")
+            }
+            return (bytes, element)
+        }
+
+        var timestampScale: Int64 = 1_000_000
+        if let (bytes, info) = try load(0x1549A966, limit: 1 << 20) {
+            for field in EBML.children(bytes, of: info) where field.id == 0x2AD7B1 {
+                let value = Int64(EBML.uint(bytes, field))
+                if value > 0 { timestampScale = value }
+            }
+        }
+
+        var encodings: [UInt64: FrameEncoding] = [:]
+        var subtitleTracks: [SourceIndexTrack] = []
+        var videoTracks: [VideoTrack] = []
+        var numberByUID: [UInt64: UInt64] = [:]
+        if let (bytes, tracks) = try load(0x1654AE6B, limit: 16 << 20) {
+            for entry in EBML.children(bytes, of: tracks) where entry.id == 0xAE {
+                var number: UInt64?
+                var type: UInt64?
+                var codec = ""
+                var language: String? = "eng"   // the Matroska default
+                var bcp47: String?
+                var uid: UInt64?
+                var encoding: FrameEncoding = .none
+                for field in EBML.children(bytes, of: entry) {
+                    switch field.id {
+                    case 0xD7: number = EBML.uint(bytes, field)
+                    case 0x73C5: uid = EBML.uint(bytes, field)
+                    case 0x83: type = EBML.uint(bytes, field)
+                    case 0x86: codec = EBML.string(bytes, field)
+                    case 0x22B59C: language = EBML.string(bytes, field)
+                    case 0x22B59D: bcp47 = EBML.string(bytes, field)
+                    case 0x6D80: encoding = frameEncoding(bytes, encodings: field)
+                    default: break
+                    }
+                }
+                guard let number else { continue }
+                encodings[number] = encoding
+                if let uid { numberByUID[uid] = number }
+                if type == 0x11, let first = codec.first, first == "S" || first == "D" {
+                    subtitleTracks.append(SourceIndexTrack(number: number, codecName: codecFamily[codec],
+                                                           language: bcp47 ?? language))
+                }
+                if type == 0x01 { videoTracks.append(VideoTrack(number: number, codecID: codec)) }
+            }
+        }
+
+        if let (bytes, tags) = try? load(0x1254C367, limit: 16 << 20) {
+            for tag in EBML.children(bytes, of: tags) where tag.id == 0x7373 {
+                var uids: [UInt64] = []
+                var frames: Int?
+                var byteCount: Int64?
+                for field in EBML.children(bytes, of: tag) {
+                    if field.id == 0x63C0 {
+                        for target in EBML.children(bytes, of: field) where target.id == 0x63C5 {
+                            uids.append(EBML.uint(bytes, target))
+                        }
+                    }
+                    guard field.id == 0x67C8 else { continue }
+                    var name = ""
+                    var value = ""
+                    for part in EBML.children(bytes, of: field) {
+                        if part.id == 0x45A3 { name = EBML.string(bytes, part) }
+                        if part.id == 0x4487 { value = EBML.string(bytes, part) }
+                    }
+                    if name == "NUMBER_OF_FRAMES" { frames = Int(value) }
+                    if name == "NUMBER_OF_BYTES" { byteCount = Int64(value) }
+                }
+                guard frames != nil || byteCount != nil else { continue }
+                for uid in uids {
+                    guard let number = numberByUID[uid],
+                          let k = subtitleTracks.firstIndex(where: { $0.number == number }) else { continue }
+                    subtitleTracks[k].frames = frames
+                    subtitleTracks[k].bytes = byteCount
+                }
+            }
+        }
+
+        guard let (bytes, cues) = try load(0x1C53BB6B, limit: cuesSizeLimit) else { throw SourceIndexError.noIndex }
+        var blocks: [UInt64: [(ticks: Int64, cluster: Int64, relative: Int64, duration: Int64?)]] = [:]
+        var keyframes: [UInt64: [Keyframe]] = [:]
+        let videoNumbers = Set(videoTracks.map(\.number))
+        var missingRelative: Set<UInt64> = []
+        for point in EBML.children(bytes, of: cues) where point.id == 0xBB {
+            var ticks: Int64?
+            var positionsAtTime: [(track: UInt64, cluster: Int64, relative: Int64?, duration: Int64?)] = []
+            for field in EBML.children(bytes, of: point) {
+                if field.id == 0xB3 { ticks = Int64(EBML.uint(bytes, field)) }
+                guard field.id == 0xB7 else { continue }
+                var track: UInt64?
+                var cluster: Int64?
+                var relative: Int64?
+                var duration: Int64?
+                for value in EBML.children(bytes, of: field) {
+                    switch value.id {
+                    case 0xF7: track = EBML.uint(bytes, value)
+                    case 0xF1: cluster = Int64(EBML.uint(bytes, value))
+                    case 0xF0: relative = Int64(EBML.uint(bytes, value))
+                    case 0xB2: duration = Int64(EBML.uint(bytes, value))
+                    default: break
+                    }
+                }
+                guard let track, let cluster else { continue }
+                positionsAtTime.append((track, cluster, relative, duration))
+            }
+            guard let ticks else { continue }
+            for (track, cluster, relative, duration) in positionsAtTime {
+                if videoNumbers.contains(track) {
+                    keyframes[track, default: []].append(
+                        Keyframe(ticks: ticks, clusterPosition: cluster, relativePosition: relative))
+                }
+                guard let relative else { missingRelative.insert(track); continue }
+                blocks[track, default: []].append((ticks, cluster, relative, duration))
+            }
+        }
+        for track in keyframes.keys { keyframes[track]?.sort { $0.ticks < $1.ticks } }
+        var addressed: [UInt64: [SourceIndexBlock]] = [:]
+        for (track, list) in blocks {
+            addressed[track] = list.sorted { $0.ticks < $1.ticks }.map {
+                SourceIndexBlock(ticks: $0.ticks, durationTicks: $0.duration,
+                                 offset: segmentDataStart + $0.cluster + 4 + 1 + $0.relative, size: nil)
+            }
+        }
+        var index = MatroskaCueIndex(segmentDataStart: segmentDataStart, timestampScale: timestampScale,
+                                          blocksByTrack: addressed, tracksMissingRelativePosition: missingRelative,
+                                          encodingByTrack: encodings)
+        index.subtitleTracks = subtitleTracks
+        index.videoTracks = videoTracks
+        index.keyframesByTrack = keyframes
+        index.clusterSizeFieldLength = sampledClusterSizeFieldLength(
+            clusters: Set(blocks.values.flatMap { $0.map(\.cluster) }).sorted(),
+            segmentDataStart: segmentDataStart, from: source)
+        return index
+    }
+
+    /// Reads the headers of a few clusters spread over the file: one size-field length for all of them
+    /// is the muxer's, and every block read can then start exactly where its block does.
+    private static func sampledClusterSizeFieldLength(clusters: [Int64], segmentDataStart: Int64,
+                                                      from source: RandomAccessByteSource) -> Int? {
+        guard !clusters.isEmpty else { return nil }
+        let picks = Set([0, clusters.count / 3, 2 * clusters.count / 3, clusters.count - 1]).map { clusters[$0] }
+        var lengths: Set<Int> = []
+        for position in picks {
+            guard let header = source.read(at: segmentDataStart + position, count: 12),
+                  let element = EBML.element(header, at: 0), element.id == 0x1F43B675 else { return nil }
+            lengths.insert(element.dataStart - 4)
+        }
+        return lengths.count == 1 ? lengths.first : nil
+    }
+
+    /// ContentEncodings: compression the frames carry (scope 1). Several encodings, or encryption, is
+    /// more than this reader undoes.
+    private static func frameEncoding(_ bytes: [UInt8], encodings: EBML.Element) -> FrameEncoding {
+        let list = EBML.children(bytes, of: encodings).filter { $0.id == 0x6240 }
+        guard !list.isEmpty else { return .none }
+        guard list.count == 1, let encoding = list.first else { return .unsupported }
+        var scope: UInt64 = 1
+        var result: FrameEncoding = .none
+        for field in EBML.children(bytes, of: encoding) {
+            switch field.id {
+            case 0x5032: scope = EBML.uint(bytes, field)
+            case 0x5035: return .unsupported
+            case 0x5034:
+                var algorithm: UInt64 = 0
+                var settings: [UInt8] = []
+                for value in EBML.children(bytes, of: field) {
+                    if value.id == 0x4254 { algorithm = EBML.uint(bytes, value) }
+                    if value.id == 0x4255 { settings = Array(bytes[value.dataStart..<value.dataStart + Int(value.size)]) }
+                }
+                switch algorithm {
+                case 0: result = .zlib
+                case 3: result = .strippedHeader(settings)
+                default: return .unsupported
+                }
+            default: break
+            }
+        }
+        return scope & 1 == 0 ? .none : result
+    }
+
+    /// Matroska codec IDs and the decoder libavformat gives their streams.
+    static let codecFamily: [String: String] = [
+        "S_HDMV/PGS": "hdmv_pgs_subtitle", "S_TEXT/UTF8": "subrip", "S_TEXT/ASCII": "subrip",
+        "S_TEXT/ASS": "ass", "S_ASS": "ass", "S_TEXT/SSA": "ass", "S_SSA": "ass",
+        "S_TEXT/WEBVTT": "webvtt", "S_VOBSUB": "dvd_subtitle", "S_DVBSUB": "dvb_subtitle",
+    ]
+
+    // MARK: - Blocks
+
+    /// Whether `track` is a WebVTT subtitle track, whose blocks are split before they are a packet.
+    private func isWebVTT(track: UInt64) -> Bool {
+        subtitleTracks.first(where: { $0.number == track })?.codecName == "webvtt"
+    }
+
+    /// A WebVTT block as libavformat hands it over (`matroska_parse_webvtt`): the payload is an
+    /// identifier line, a settings line and the cue text, each line ended by CR, LF or CRLF; the packet
+    /// is the text with its trailing line breaks stripped, and the settings ride as side data. Nil for
+    /// a block libavformat would refuse (a missing line, an empty text), which it drops.
+    static func webVTTCue(_ payload: [UInt8]) -> (text: [UInt8], settings: String)? {
+        var p = 0
+        func lineEnd(from start: Int) -> Int? {
+            var i = start
+            while i < payload.count {
+                if payload[i] == 0x0D || payload[i] == 0x0A { return i }
+                i += 1
+            }
+            return nil
+        }
+        func skipBreak(at end: Int) -> Int {
+            if payload[end] == 0x0D, end + 1 < payload.count, payload[end + 1] == 0x0A { return end + 2 }
+            return end + 1
+        }
+        guard let idEnd = lineEnd(from: p) else { return nil }
+        p = skipBreak(at: idEnd)
+        let settingsStart = p
+        guard let settingsEnd = lineEnd(from: p) else { return nil }
+        let settings = String(decoding: payload[settingsStart..<settingsEnd], as: UTF8.self)
+        p = skipBreak(at: settingsEnd)
+        var textEnd = payload.count
+        while textEnd > p, payload[textEnd - 1] == 0x0D || payload[textEnd - 1] == 0x0A { textEnd -= 1 }
+        guard textEnd > p else { return nil }
+        return (Array(payload[p..<textEnd]), settings)
+    }
+
+    /// The bytes a block read needs beyond the payload: the element's header plus the cluster size field
+    /// whose length is not known without reading the cluster's own header (1 to 8 bytes).
+    static let blockHeaderSlack = 48
+
+    /// The block as libavformat hands it over: header-stripped bytes restored, zlib inflated, a WebVTT
+    /// block split into its text and settings (an empty payload for one libavformat drops).
+    func readFrame(_ block: SourceIndexBlock, track: UInt64, from source: RandomAccessByteSource,
+                   prefix requestedPrefix: Int?) -> SourceIndexFrame? {
+        // A compressed frame has no readable prefix: it is read whole and inflated, and the prefix is
+        // taken from what it inflates to.
+        let compressed = encodingByTrack[track] == .zlib
+        let prefix = compressed ? nil : requestedPrefix
+        // The block starts at cluster + 4 (the cluster ID) + the size field (1...8) + relative position;
+        // the offset assumes the shortest field.
+        let earliest = block.offset
+        let want = (prefix ?? 512) + Self.blockHeaderSlack + 8
+        guard let window = source.read(at: earliest, count: want), !window.isEmpty else { return nil }
+        // The sampled length first; a muxer can still write a few clusters with another one.
+        let candidates = clusterSizeFieldLength.map { known in [known] + (1...8).filter { $0 != known } } ?? Array(1...8)
+        for sizeFieldLength in candidates {
+            let at = sizeFieldLength - 1
+            guard at < window.count,
+                  let located = Self.locate(window, at: at, track: track) else { continue }
+            var payload: [UInt8]
+            let payloadEnd = located.payloadStart + located.payloadLength
+            let isPrefix: Bool
+            if let prefix, located.payloadLength > prefix {
+                let end = min(window.count, located.payloadStart + prefix)
+                payload = Array(window[located.payloadStart..<end])
+                isPrefix = true
+            } else if payloadEnd <= window.count {
+                payload = Array(window[located.payloadStart..<payloadEnd])
+                isPrefix = false
+            } else {
+                guard let full = source.read(at: earliest + Int64(located.payloadStart), count: located.payloadLength),
+                      full.count == located.payloadLength else { return nil }
+                payload = full
+                isPrefix = false
+            }
+            guard let frame = restored(payload, track: track) else { return nil }
+            payload = frame
+            var prefixed = isPrefix
+            if compressed {
+                if let requestedPrefix, payload.count > requestedPrefix {
+                    payload = Array(payload.prefix(requestedPrefix))
+                    prefixed = true
+                }
+            }
+            var settings: String?
+            if !prefixed, isWebVTT(track: track) {
+                let cue = Self.webVTTCue(payload)
+                payload = cue?.text ?? []
+                settings = cue.flatMap { $0.settings.isEmpty ? nil : $0.settings }
+            }
+            return SourceIndexFrame(ticks: block.ticks, durationTicks: located.durationTicks ?? block.durationTicks,
+                                    payload: payload, webVTTSettings: settings, isPrefix: prefixed)
+        }
+        return nil
+    }
+
+    /// A frame's stored bytes as libavformat hands them over: the stripped header put back, a zlib frame
+    /// inflated. Nil for a frame that does not inflate.
+    private func restored(_ stored: [UInt8], track: UInt64) -> [UInt8]? {
+        switch encodingByTrack[track] ?? .none {
+        case .strippedHeader(let stripped): return stripped + stored
+        case .zlib: return ZlibBlock.inflate(stored)
+        case .none, .unsupported: return stored
+        }
+    }
+
+    /// Most of a cluster read to find its first block of a track: past it the cue is not where muxers put it.
+    static let clusterScanLimit = 8 << 20
+
+    /// The block of `track` at `ticks` in the cluster at `position`, walking the cluster's children
+    /// from its header. A cluster of unknown size (a live recording's) is walked the same way.
+    private func block(of track: UInt64, at ticks: Int64, inClusterAt position: Int64,
+                       from source: RandomAccessByteSource) -> [UInt8]? {
+        var window = source.read(at: position, count: 64 << 10) ?? []
+        func extend(to count: Int) -> Bool {
+            while window.count < count {
+                guard window.count < Self.clusterScanLimit,
+                      let more = source.read(at: position + Int64(window.count), count: max(count - window.count, 256 << 10)),
+                      !more.isEmpty else { return false }
+                window += more
+            }
+            return true
+        }
+        guard let cluster = EBML.element(window, at: 0), cluster.id == 0x1F43B675 else { return nil }
+        let clusterEnd = cluster.unknownSize ? Int.max : cluster.dataStart + Int(cluster.size)
+        var clusterTicks: Int64?
+        var offset = cluster.dataStart
+        while offset < clusterEnd {
+            guard extend(to: offset + 16), let child = EBML.element(window, at: offset), !child.unknownSize,
+                  child.id != 0x1F43B675 else { return nil }
+            let childEnd = child.dataStart + Int(child.size)
+            if child.id == 0xE7, extend(to: childEnd) { clusterTicks = Int64(EBML.uint(window, child)) }
+            if child.id == 0xA3 || child.id == 0xA0, let clusterTicks {
+                guard extend(to: min(childEnd, offset + 512)) else { return nil }
+                if let located = Self.locate(window, at: offset, track: track),
+                   clusterTicks + Int64(located.timecode) == ticks {
+                    guard extend(to: located.payloadStart + located.payloadLength) else { return nil }
+                    return restored(Array(window[located.payloadStart..<(located.payloadStart + located.payloadLength)]),
+                                    track: track)
+                }
+            }
+            offset = childEnd
+        }
+        return nil
+    }
+
+    /// A SimpleBlock or BlockGroup of `track` starting at `at`: where its frame lies and its duration.
+    /// Checked down to the block's track number and lacing, so a wrong guess of the cluster's size field
+    /// cannot pass for a block.
+    static func locate(_ bytes: [UInt8], at: Int, track: UInt64)
+        -> (payloadStart: Int, payloadLength: Int, durationTicks: Int64?, timecode: Int16)? {
+        guard let element = EBML.element(bytes, at: at), !element.unknownSize else { return nil }
+        let end = element.dataStart + Int(element.size)
+        func block(_ start: Int, _ length: Int) -> (Int, Int, Int16)? {
+            guard let number = EBML.vint(bytes, at: start), number.value == track else { return nil }
+            let flagsAt = start + number.length + 2
+            guard flagsAt < bytes.count, length > number.length + 3 else { return nil }
+            guard bytes[flagsAt] & 0x06 == 0 else { return nil }   // laced: never a subtitle or video frame
+            let timecode = Int16(bitPattern: UInt16(bytes[flagsAt - 2]) << 8 | UInt16(bytes[flagsAt - 1]))
+            let payloadStart = flagsAt + 1
+            return (payloadStart, length - (payloadStart - start), timecode)
+        }
+        switch element.id {
+        case 0xA3:
+            guard let (start, length, timecode) = block(element.dataStart, Int(element.size)) else { return nil }
+            return (start, length, nil, timecode)
+        case 0xA0:
+            var found: (Int, Int, Int16)?
+            var duration: Int64?
+            var offset = element.dataStart
+            while offset < min(end, bytes.count), let child = EBML.element(bytes, at: offset), !child.unknownSize {
+                if child.id == 0xA1 { found = block(child.dataStart, Int(child.size)) }
+                if child.id == 0x9B, child.dataStart + Int(child.size) <= bytes.count {
+                    duration = Int64(EBML.uint(bytes, child))
+                }
+                offset = child.dataStart + Int(child.size)
+            }
+            guard let (start, length, timecode) = found else { return nil }
+            return (start, length, duration, timecode)
+        default:
+            return nil
+        }
+    }
+}
+
+/// Random access to a source's bytes, for reading a container's own structures.
+protocol RandomAccessByteSource: AnyObject {
+    /// Up to `count` bytes at `offset`; fewer at the end of the source, nil on an error.
+    func read(at offset: Int64, count: Int) -> [UInt8]?
+}
+
+/// `RandomAccessByteSource` over an `IOReader` (an HTTP range reader, a file, a host's own reader).
+///
+/// `@unchecked Sendable`: a range reader is read without shared state, and anything else only under
+/// the lock, so the source can be handed to the parse that `SourceIndexRegistry` runs.
+final class IOReaderByteSource: RandomAccessByteSource, @unchecked Sendable {
+    private let reader: IOReader
+    private let lock = NSLock()
+
+
+    func read(at offset: Int64, count: Int) -> [UInt8]? {
+        guard count > 0 else { return [] }
+        lock.lock(); defer { lock.unlock() }
+        guard reader.seek(offset: offset, whence: SEEK_SET) == offset else { return nil }
+        var bytes = [UInt8](repeating: 0, count: count)
+        var filled = 0
+        while filled < count {
+            let got = bytes.withUnsafeMutableBufferPointer { buffer in
+                reader.read(buffer.baseAddress! + filled, size: Int32(count - filled))
+            }
+            if got < 0 { return nil }
+            if got == 0 { break }
+            filled += Int(got)
+        }
+        return Array(bytes.prefix(filled))
+    }
+
+}
+
+/// The few EBML primitives the index needs.
+enum EBML {
+    struct Element {
+        var id: UInt32
+        var dataStart: Int
+        var size: UInt64
+        var unknownSize: Bool
+    }
+
+    /// A variable-length integer at `at`, marker bit removed.
+    static func vint(_ bytes: [UInt8], at: Int) -> (value: UInt64, length: Int)? {
+        guard at < bytes.count else { return nil }
+        let first = bytes[at]
+        guard first != 0 else { return nil }
+        let length = first.leadingZeroBitCount + 1
+        guard at + length <= bytes.count else { return nil }
+        var value = UInt64(first & (0xFF >> length))
+        for k in 1..<length { value = (value << 8) | UInt64(bytes[at + k]) }
+        return (value, length)
+    }
+
+    static func element(_ bytes: [UInt8], at: Int) -> Element? {
+        guard at < bytes.count else { return nil }
+        let first = bytes[at]
+        guard first != 0 else { return nil }
+        let idLength = first.leadingZeroBitCount + 1
+        guard idLength <= 4, at + idLength <= bytes.count else { return nil }
+        var id: UInt32 = 0
+        for k in 0..<idLength { id = (id << 8) | UInt32(bytes[at + k]) }
+        guard let size = vint(bytes, at: at + idLength) else { return nil }
+        let allOnes = size.length < 8 ? (UInt64(1) << UInt64(7 * size.length)) - 1 : UInt64.max >> 8
+        return Element(id: id, dataStart: at + idLength + size.length, size: size.value,
+                       unknownSize: size.value == allOnes)
+    }
+
+    /// The children of `parent` that lie inside `bytes`.
+    static func children(_ bytes: [UInt8], of parent: Element) -> [Element] {
+        var out: [Element] = []
+        let end = min(bytes.count, parent.dataStart + Int(min(parent.size, UInt64(Int.max / 2))))
+        var offset = parent.dataStart
+        while offset < end, let child = element(bytes, at: offset), !child.unknownSize {
+            out.append(child)
+            offset = child.dataStart + Int(child.size)
+        }
+        return out
+    }
+
+    static func string(_ bytes: [UInt8], _ element: Element) -> String {
+        let end = min(bytes.count, element.dataStart + Int(element.size))
+        return String(decoding: bytes[element.dataStart..<end].prefix { $0 != 0 }, as: UTF8.self)
+    }
+
+    static func uint(_ bytes: [UInt8], _ element: Element) -> UInt64 {
+        var value: UInt64 = 0
+        let end = min(bytes.count, element.dataStart + Int(min(element.size, 8)))
+        for k in element.dataStart..<end { value = (value << 8) | UInt64(bytes[k]) }
+        return value
+    }
+}
+
+/// The part of a PGS display set the index needs without decoding it: its Presentation Composition.
+struct PGSCompositionHeader: Equatable {
+    /// 0x00 normal, 0x40 acquisition point, 0x80 epoch start.
+    var state: UInt8
+    var objectCount: Int
+    /// Any composition object carries the forced flag (0x40): the line shows with subtitles off.
+    var isForced: Bool
+
+    /// A display set that does not depend on earlier ones: decoding can start here.
+    var isSelfContained: Bool { state & 0xC0 != 0 }
+
+    /// Parses the composition segment a display set starts with. `payload` may be zlib-wrapped, in
+    /// which case only its first bytes are inflated.
+    static func parse(_ payload: [UInt8]) -> PGSCompositionHeader? {
+        var bytes = payload
+        if bytes.count > 2, bytes[0] == 0x78, [0x01, 0x5E, 0x9C, 0xDA].contains(bytes[1]) {
+            guard let inflated = inflatePrefix(Array(bytes.dropFirst(2)), want: 256) else { return nil }
+            bytes = inflated
+        }
+        if bytes.count > 10, bytes[0] == 0x50, bytes[1] == 0x47 { bytes.removeFirst(10) }   // "PG" stream header
+        guard bytes.count >= 3 + 11, bytes[0] == 0x16 else { return nil }
+        let pcs = 3
+        let state = bytes[pcs + 7]
+        let count = Int(bytes[pcs + 10])
+        var forced = false
+        var object = pcs + 11
+        for _ in 0..<count {
+            guard object + 8 <= bytes.count else { break }
+            let flags = bytes[object + 3]
+            if flags & 0x40 != 0 { forced = true }
+            object += 8 + (flags & 0x80 != 0 ? 8 : 0)
+        }
+        return PGSCompositionHeader(state: state, objectCount: count, isForced: forced)
+    }
+
+    /// The first bytes of a raw deflate stream, from as much of it as is at hand.
+    static func inflatePrefix(_ deflated: [UInt8], want: Int) -> [UInt8]? {
+        guard !deflated.isEmpty else { return nil }
+        let stream = UnsafeMutablePointer<compression_stream>.allocate(capacity: 1)
+        defer { stream.deallocate() }
+        guard compression_stream_init(stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB) == COMPRESSION_STATUS_OK else {
+            return nil
+        }
+        defer { compression_stream_destroy(stream) }
+        var out = [UInt8](repeating: 0, count: want)
+        let produced: Int = deflated.withUnsafeBufferPointer { input in
+            out.withUnsafeMutableBufferPointer { output in
+                stream.pointee.src_ptr = input.baseAddress!
+                stream.pointee.src_size = input.count
+                stream.pointee.dst_ptr = output.baseAddress!
+                stream.pointee.dst_size = want
+                _ = compression_stream_process(stream, 0)
+                return want - stream.pointee.dst_size
+            }
+        }
+        return produced > 0 ? Array(out.prefix(produced)) : nil
+    }
+}

@@ -1,4 +1,3 @@
-import Combine
 import Foundation
 import Testing
 import AetherLibavcodec
@@ -90,30 +89,37 @@ struct SupersededProbeGeometryTests {
             colorTransfer: codecpar.pointee.color_trc, colorMatrix: codecpar.pointee.color_space))
     }
 
-    @Test("A load superseded during its RPU audit does not write its width over the successor's")
-    func supersededAuditPublishesNothing() async throws {
-        let origin = try ProbeHTTPTestOrigin(data: try Self.dolbyVisionProfile5OverHDR10())
-        defer { origin.stop() }
+    /// The rule the audit made necessary, tested as the rule: a load's geometry reaches engine state
+    /// only while that load is current. This used to be pinned end to end, by holding the audit's
+    /// request at a test origin and superseding the load meanwhile. The audit now reads the bytes the
+    /// probe already fetched out of the source cache and never waits on the origin, so that test had
+    /// lost its hold and passed or failed on timing. The race is still real (the audit still takes
+    /// time); what makes a superseded load harmless is this check, and it no longer needs a race to
+    /// be seen.
+    @Test("A superseded load's probed geometry is not published")
+    func supersededGeometryIsNotPublished() throws {
         let engine = try AetherEngine()
         defer { engine.stop() }
-        // The open's last stage hops to the main actor ahead of the open's own continuation, so
-        // every request from here on is the audit's.
-        let sub = engine.$startupProgress.sink { progress in
-            if progress?.checkpoint == .streamsProbed { origin.holdLaterRequests() }
-        }
-        defer { sub.cancel() }
-
-        let superseded = Task { @MainActor in
-            try await engine.load(url: try #require(URL(string: "http://127.0.0.1:\(origin.port)/p5.mp4")))
-        }
-        try await waitFor { origin.held.entered }
-        _ = try await engine.load(url: try #require(URL(string: "http://127.0.0.1:9/vod.m3u8")),
-                                  options: LoadOptions(nativeRemoteHLS: true))
-        #expect(engine.sourceVideoWidth == 0)
-        origin.held.open()
-
-        await #expect(throws: CancellationError.self) { try await superseded.value }
+        engine.loadGeneration = 7
+        let published = engine.publishProbedGeometry(
+            .init(width: 3840, height: 2160, pixelAspect: 1), codec: AV_CODEC_ID_HEVC, forGeneration: 6)
+        #expect(!published)
         #expect(engine.sourceVideoWidth == 0)
         #expect(engine.sourceVideoHeight == 0)
+        #expect(engine.lastDetectedVideoCodec == AV_CODEC_ID_NONE)
+    }
+
+    @Test("The current load's probed geometry is published")
+    func currentGeometryIsPublished() throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        engine.loadGeneration = 7
+        let published = engine.publishProbedGeometry(
+            .init(width: 3840, height: 2160, pixelAspect: 4.0 / 3.0), codec: AV_CODEC_ID_HEVC, forGeneration: 7)
+        #expect(published)
+        #expect(engine.sourceVideoWidth == 3840)
+        #expect(engine.sourceVideoHeight == 2160)
+        #expect(engine.sourceVideoPixelAspectRatio == 4.0 / 3.0)
+        #expect(engine.lastDetectedVideoCodec == AV_CODEC_ID_HEVC)
     }
 }

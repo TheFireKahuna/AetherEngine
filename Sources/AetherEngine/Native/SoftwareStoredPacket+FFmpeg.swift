@@ -17,10 +17,12 @@ extension SoftwareStoredPacket {
             sides.append(SideData(type: side.type.rawValue,
                                   bytes: side.size == 0 ? Data() : Data(bytes: side.data, count: side.size)))
         }
+        let source = Demuxer.sourceStream(of: packet)
         self.init(pts: p.pts, dts: p.dts, duration: p.duration, position: p.pos,
                   streamIndex: p.stream_index, flags: p.flags,
                   timeBaseNumerator: p.time_base.num, timeBaseDenominator: p.time_base.den,
-                  bytes: p.size == 0 ? Data() : Data(bytes: p.data, count: Int(p.size)), sideData: sides)
+                  bytes: p.size == 0 ? Data() : Data(bytes: p.data, count: Int(p.size)), sideData: sides,
+                  sourceStream: source == p.stream_index ? -1 : source)
     }
 
     /// Ownership transfers to the existing demux-loop caller, which uses av_packet_free_safe.
@@ -38,6 +40,7 @@ extension SoftwareStoredPacket {
             packet.pointee.stream_index = streamIndex
             packet.pointee.flags = flags
             packet.pointee.time_base = AVRational(num: timeBaseNumerator, den: timeBaseDenominator)
+            if sourceStream >= 0 { packet.pointee.opaque = UnsafeMutableRawPointer(bitPattern: Int(sourceStream) + 1) }
             for side in sideData {
                 guard let target = av_packet_new_side_data(
                     packet, AVPacketSideDataType(rawValue: side.type), side.bytes.count) else {
