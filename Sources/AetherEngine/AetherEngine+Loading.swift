@@ -2539,10 +2539,6 @@ extension AetherEngine {
                     isSoftware: !(softwareHost?.usesHardwareVideoDecoder ?? false)
                 )
                 // AE#462: the rebuilt host's own resolved index (see the load site).
-                activeAudioDecoder = Self.softwareAudioDecoderLabel(
-                    audioTracks: audioTracks, activeIndex: softwareHost?.audioStreamIndex ?? -1,
-                    route: softwareHost?.audioRoute ?? .pcm
-                )
                 presentCurrentLayer()
                 // Keep the latest transport intent if play/pause changed while the rebuild awaited I/O.
                 if transportIntentUnderReconstruction ?? resumesPlaying { softwareHost?.play() }

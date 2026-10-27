@@ -105,6 +105,9 @@ the public-API contract.
   libavcodec cannot decode, so the tap's stream stayed empty for the whole session. The tap now decodes APAC
   with AudioToolbox, from the cookie the init segment carries, and downmixes the bed to its mono 48 kHz format
   on the same clock as every other codec.
+- **The Atmos output activator's pause grace checks the host again when it ends (AE#848).** It paused the
+  silent stream outright, so a host that started playing without a refresh in between lost Dolby Atmos on
+  the receiver sixty seconds into playback.
 - **A placeholder stream never reaches an AirPlay receiver.** AVPlayer handed a receiver the stream of a
   for those sessions, the picture stays on the device and the audio follows the route, and
 - **A retained paused session recovers a failed overlay layer on its return** (AE#870). With

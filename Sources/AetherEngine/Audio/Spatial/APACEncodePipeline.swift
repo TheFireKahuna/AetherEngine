@@ -43,8 +43,11 @@ final class APACEncodePipeline: @unchecked Sendable {
     struct StampedPacket {
         let data: Data
         let isSync: Bool
-        /// Output time base: 48 kHz frames.
+        /// Output time base: 48 kHz frames. Packet k of an encoder run is stamped at the run's first position
+        /// plus k·1024, its priming packets included (the HLS route's convention, see `SpatialAudioBridge.wrap`).
         let pts: Int64
+        /// k: where the packet sits in its encoder run. The first `leadingFrames` of a run's decoded audio are
+        let indexInRun: Int64
     }
 
     /// Planar float planes, one per bed channel, that grow on demand. Owned by one side at a time:
@@ -237,7 +240,7 @@ final class APACEncodePipeline: @unchecked Sendable {
         for packet in packets {
             stamped.append(StampedPacket(
                 data: packet.data, isSync: packet.isSync,
-                pts: start + packetsInRun * Int64(APACEncoder.framesPerPacket)))
+                pts: start + packetsInRun * Int64(APACEncoder.framesPerPacket), indexInRun: packetsInRun))
             packetsInRun += 1
         }
         cond.lock()

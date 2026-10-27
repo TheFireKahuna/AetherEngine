@@ -127,17 +127,16 @@ it to; `DoviShaderSyncTests` pins the serialized size and that every kernel is p
 
 ### 3.1 Audio
 
-Known trade-off of the route, following the maintainer's request to document it rather than work around it.
-The dual-layer route runs on `SoftwarePlaybackHost`, so its audio is the host's own `AudioDecoder` (FFmpeg
-decode to PCM, played through the sample-buffer audio renderer) and never AVPlayer. On tvOS only AVPlayer
-emits Dolby Atmos objects, and the platform does not pass a bitstream through. An E-AC-3 (JOC) track
-therefore plays as its channel-bed core (5.1 or 7.1), without the Atmos objects; on the native route the
-same track is handed to AVPlayer unchanged. TrueHD behaves as on the native route, which decodes it too and
-loses the objects either way. That is the default. With `LoadOptions.objectAudioRendering` set, the host keeps the
-objects: an E-AC-3 JOC track goes to the renderer compressed (after the system's Atmos decoder is registered in the
-process), and TrueHD Atmos and DTS:X are rendered as APAC. Verified on macOS only; the tvOS behaviour of both is
-unmeasured. Hosts that do not set it and want E-AC-3 Atmos on a Profile 7 FEL title leave
-`preferDualLayerDolbyVision` off for it. `DualLayerRouteAudioTests` pins the routing half of this.
+The composed overlay draws over a loopback AVPlayer session, so the title's audio is that session's: stream
+copy where Apple plays the codec (E-AC-3 JOC keeps its Atmos objects), and the APAC spatial bridge for
+TrueHD Atmos and DTS:X with `objectAudioRendering = .apac(...)`, exactly as on any other loopback session.
+
+Running the composition itself inside AVPlayer was tried and ruled out (2026-10-22). An `AVMutableComposition` with a
+custom compositor does decode both layers, hands the compositor each frame with its RPU, keeps Dolby Vision and its
+trims on the TV, and plays E-AC-3 Atmos as objects; but AVPlayer runs a composition only over sources it can index
+completely up front. HLS assets expose no tracks to compose, a byte-range MP4 is read fragment by fragment to its
+end before playback (with or without `mfra`/`sidx`), and a growing local `AVFragmentedAsset` did not pick up
+appended fragments.
 
 ## 4. Evidence
 

@@ -83,6 +83,21 @@ extension HLSVideoEngine {
         return layout
     }
 
+    /// Whether the probe alone says the track will play as APAC, so the Atmos activator can be on the HDMI link
+    /// before the display switch: TrueHD Atmos, and DTS-HD MA whose profile names DTS:X. A DTS-HD MA track the
+    /// probe does not label X may still be DTS:X; its first decoded frame decides that at routing, after the
+    /// criteria are written.
+    static func probeAnticipatesAPAC(rendering: ObjectAudioRendering, codecID: AVCodecID,
+                                     profile: Int32, sampleRate: Int32) -> Bool {
+        guard spatialRenderingLayout(rendering: rendering, codecID: codecID, profile: profile,
+                                     sampleRate: sampleRate) != nil else { return false }
+        switch objectAudioSource(codecID: codecID, profile: profile) {
+        case .trueHDAtmos: return true
+        case .dtsHDMasterAudio: return profile == AV_PROFILE_DTS_HD_MA_X || profile == AV_PROFILE_DTS_HD_MA_X_IMAX
+        case nil: return false
+        }
+    }
+
     static func objectAudioSource(codecID: AVCodecID, profile: Int32) -> ObjectAudioSource? {
         switch (codecID, profile) {
         case (AV_CODEC_ID_TRUEHD, AV_PROFILE_TRUEHD_ATMOS):

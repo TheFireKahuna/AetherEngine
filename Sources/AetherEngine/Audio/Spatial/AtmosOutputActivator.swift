@@ -68,6 +68,8 @@ final class AtmosOutputActivator {
     }
 
     /// `AVAudioSession.Port.HDMI.rawValue`, spelled out so the rule is testable where there is no session.
+    /// The value is "HDMIOutput", as the session logs it (`AudioRouteDescription`); "HDMI" matched no
+    /// route, and the activator stayed off on every HDMI sink.
     nonisolated static let hdmiPortType = "HDMIOutput"
 
     static func currentOutputPortTypes() -> [String] {
@@ -146,14 +148,13 @@ final class AtmosOutputActivator {
     }
 
     private func update() {
-        let playing: Bool
+        let paused: Bool
         if let rendererIsPlaying {
-            guard let state = rendererIsPlaying() else {
+            guard let playing = rendererIsPlaying() else {
                 // The session is gone: drop the route observer with the stream, not just the stream.
                 detach()
                 return
             }
-            playing = state
         } else {
             guard let host, let item = host.currentItem, playsAPAC(item) else {
                 release()
@@ -174,12 +175,13 @@ final class AtmosOutputActivator {
             release()
             return
         }
-        guard playing else {
+        guard !paused else {
             holdThroughPause()
             return
         }
         pauseAfterGrace?.cancel()
         pauseAfterGrace = nil
+        hostPausedAt = nil
         if looper == nil {
             looper = AVPlayerLooper(player: player, templateItem: AVPlayerItem(url: Self.silentAtmosStream))
         }
@@ -189,19 +191,38 @@ final class AtmosOutputActivator {
     /// True while the silent stream is playing.
     var isPlayingStream: Bool { player.rate != 0 }
 
+    /// Keeps the stream playing through `pauseGrace` from the host's pause, then pauses it. The grace's end asks
+    /// `update()` again rather than pausing outright, so a host that started playing without a refresh in between
+    /// keeps its stream.
     private func holdThroughPause() {
-        guard isPlayingStream, pauseAfterGrace == nil else { return }
-        pauseAfterGrace = Task { [weak self, pauseGrace] in
-            try? await Task.sleep(for: pauseGrace)
+        guard isPlayingStream else {
+            hostPausedAt = nil
+            return
+        }
+        let now = ContinuousClock.now
+        let pausedAt = hostPausedAt ?? now
+        hostPausedAt = pausedAt
+        let remaining = pauseGrace - (now - pausedAt)
+        guard remaining > .zero else {
+            pauseAfterGrace?.cancel()
+            pauseAfterGrace = nil
+            hostPausedAt = nil
+            player.pause()
+            return
+        }
+        guard pauseAfterGrace == nil else { return }
+        pauseAfterGrace = Task { [weak self] in
+            try? await Task.sleep(for: remaining)
             guard !Task.isCancelled, let self else { return }
             self.pauseAfterGrace = nil
-            self.player.pause()
+            self.update()
         }
     }
 
     private func release() {
         pauseAfterGrace?.cancel()
         pauseAfterGrace = nil
+        hostPausedAt = nil
         guard let looper else { return }
         player.pause()
         looper.disableLooping()
@@ -245,6 +266,21 @@ extension AetherEngine {
         } else {
             atmosOutputActivator?.detach()
         }
+        #endif
+    }
+
+    /// From before the display criteria write to the end of the load: the session about to start will play
+    /// APAC (`loadInternal` checked its track). The banner an LG G5 shows when the panel finishes its switch
+    /// to Dolby Vision read Dolby Vision alone on the FEL route, whose activator otherwise starts only once
+    /// the software host has loaded, after that switch; AVPlayer with both running from the start showed Dolby
+    /// Vision and Atmos.
+    /// The load's own `followAtmosOutput` (software host) or `currentAVPlayer` (native) takes over, and a load
+    /// that ends some other way releases it as the state leaves `.loading`.
+    func anticipateAtmosOutput() {
+        #if os(tvOS)
+        let activator = atmosOutputActivator ?? AtmosOutputActivator()
+        atmosOutputActivator = activator
+        activator.attachRenderer { [weak self] in self?.state == .loading ? true : nil }
         #endif
     }
 
