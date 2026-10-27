@@ -14,9 +14,6 @@ import AVFoundation
 /// player plays or waits to play an item `playsAPAC` accepts (and for a short grace after a pause,
 /// see #848), and is released otherwise, since a prerolled E-AC-3 stream would compete with other audio.
 ///
-/// It runs only for TrueHD Atmos rendered to APAC: a DTS:X programme is not Dolby Atmos, and the
-/// receiver must not say it is.
-///
 /// #834: it runs only while every output port is HDMI. On an AirPlay route there is no sink indicator
 /// to light, and a second unmuted player restarting beside the programme on every resume left a
 /// HomePod pair silent after a pause, then froze the picture after the second one.
@@ -28,10 +25,9 @@ import AVFoundation
 /// pause re-locking once on resume is the lesser cost; it ends before tvOS's shortest screen saver
 /// delay of two minutes.
 ///
-/// The software host plays APAC (TrueHD Atmos, DTS:X) or compressed E-AC-3 JOC through an
-/// `AVSampleBufferAudioRenderer`, and an Apple TV 4K (tvOS 26.6) whose receiver showed Atmos for the
-/// AVPlayer route's APAC did not show it for the same title's APAC on that renderer. There the activator
-/// follows the host's transport instead of a player (`attachRenderer`).
+/// The software host plays APAC through an `AVSampleBufferAudioRenderer`, and an Apple TV 4K (tvOS 26.6)
+/// whose receiver showed Atmos for the AVPlayer route's APAC did not show it for the same title's APAC on
+/// that renderer. There the activator follows the host's transport instead of a player (`attachRenderer`).
 @MainActor
 final class AtmosOutputActivator {
     static let silentAtmosStream = Bundle.module.url(forResource: "silent-atmos", withExtension: "mp4")!
@@ -40,6 +36,10 @@ final class AtmosOutputActivator {
     private var looper: AVPlayerLooper?
     private weak var host: AVPlayer?
     private var playsAPAC: @MainActor (AVPlayerItem) -> Bool = { _ in false }
+    /// While the host is starting a programme that plays APAC: the stream plays whatever the host is doing,
+    /// because the host is paused until the start and the sink reads the link as the display switch ends,
+    /// before it.
+    private var startingUp: @MainActor () -> Bool = { false }
     /// Set by `attachRenderer`: whether the renderer path is playing (or waiting to), nil once it is gone.
     private var rendererIsPlaying: (@MainActor () -> Bool?)?
     private var observations: [NSKeyValueObservation] = []
@@ -49,6 +49,8 @@ final class AtmosOutputActivator {
     private var loggedRouteVerdict: Bool?
     private let pauseGrace: Duration
     private var pauseAfterGrace: Task<Void, Never>?
+    /// When the host the stream follows paused, while the stream plays on through the grace.
+    private var hostPausedAt: ContinuousClock.Instant?
 
     nonisolated static let defaultPauseGrace: Duration = .seconds(60)
 
@@ -80,11 +82,15 @@ final class AtmosOutputActivator {
         #endif
     }
 
-    /// Follows `host`: its item, its audio selection and whether it is playing.
-    func attach(to host: AVPlayer, playsAPAC: @escaping @MainActor (AVPlayerItem) -> Bool) {
-        detach()
+    /// Follows `host`: its item, its audio selection and whether it is playing. While `startingUp` holds, the
+    /// stream plays through the host's paused startup and the item swap that opens it.
+    func attach(to host: AVPlayer, playsAPAC: @escaping @MainActor (AVPlayerItem) -> Bool,
+                startingUp: @escaping @MainActor () -> Bool = { false }) {
+        stopObserving()
         self.host = host
         self.playsAPAC = playsAPAC
+        self.startingUp = startingUp
+        observeRoute()
         // A host play() changes timeControlStatus synchronously on the main thread, so the stream
         // starts inside that call, ahead of the APAC output.
         observations = [
@@ -95,22 +101,23 @@ final class AtmosOutputActivator {
                 Self.onMain { self?.update() }
             },
         ]
-        observeRoute()
     }
 
-    /// Follows a renderer path that plays object audio. `isPlaying` answers true while it plays or waits
-    /// to, false while paused, and nil once the session is gone; the engine calls `refresh()` whenever its
-    /// transport state changes, since a renderer has nothing to observe.
+    /// Follows a renderer path that plays object audio (the software host, whose
+    /// `AVSampleBufferAudioRenderer` sends APAC to the sink as multichannel PCM until this runs beside it).
+    /// `isPlaying` answers true while it plays or waits to, false while paused, and nil once the session is
+    /// gone; the engine calls `refresh()` whenever its transport state changes, since a renderer has nothing
+    /// to observe.
     func attachRenderer(isPlaying: @escaping @MainActor () -> Bool?) {
-        detach()
+        stopObserving()
         rendererIsPlaying = isPlaying
         observeRoute()
         update()
     }
 
-    /// Re-reads the renderer path's transport (see `attachRenderer`). A no-op for an attached player.
+    /// Re-reads the renderer path's transport, or the host's startup.
     func refresh() {
-        guard rendererIsPlaying != nil else { return }
+        guard rendererIsPlaying != nil || host != nil else { return }
         update()
     }
 
@@ -125,14 +132,33 @@ final class AtmosOutputActivator {
     }
 
     func detach() {
+        stopObserving()
+        follow(nil)
+    }
+
+    /// Everything `detach()` drops except the stream itself, so a re-attach carries a playing stream across
+    /// to the next thing it follows instead of stopping it in between.
+    private func stopObserving() {
         observations.forEach { $0.invalidate() }
         observations = []
         if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
         routeObserver = nil
+        if let selectionObserver { NotificationCenter.default.removeObserver(selectionObserver) }
+        selectionObserver = nil
         host = nil
         rendererIsPlaying = nil
+        startingUp = { false }
         loggedRouteVerdict = nil
-        follow(nil)
+    }
+
+    /// What the stream does beside an `AVPlayer` host: nil to release it, true to play, false to pause.
+    /// `itemPlaysAPAC` is nil while the host has no item, which during a startup is the swap to the next one.
+    nonisolated static func hostVerdict(itemPlaysAPAC: Bool?, hostPaused: Bool, startingUp: Bool) -> Bool? {
+        switch itemPlaysAPAC {
+        case false?: return nil
+        case nil: return startingUp ? true : nil
+        case true?: return !hostPaused || startingUp
+        }
     }
 
     private func follow(_ item: AVPlayerItem?) {
@@ -155,12 +181,16 @@ final class AtmosOutputActivator {
                 detach()
                 return
             }
+            paused = !playing
         } else {
-            guard let host, let item = host.currentItem, playsAPAC(item) else {
+            guard let host,
+                  let plays = Self.hostVerdict(itemPlaysAPAC: host.currentItem.map { playsAPAC($0) },
+                                               hostPaused: host.timeControlStatus == .paused,
+                                               startingUp: startingUp()) else {
                 release()
                 return
             }
-            playing = host.timeControlStatus != .paused
+            paused = !plays
         }
         let ports = outputPortTypes()
         let routeTakesIt = Self.routeTakesActivator(outputPortTypes: ports)
@@ -241,28 +271,20 @@ final class AtmosOutputActivator {
 
 extension AetherEngine {
     /// tvOS only: the switch is an HDMI one, and on iOS and macOS a second unmuted player beside the
-    /// engine's would compete with it for Now Playing and the audio session for no gain. Follows the
-    /// engine's `AVPlayer` while it plays TrueHD Atmos as APAC, or else a software host whose renderer
-    /// receives Dolby Atmos (TrueHD Atmos as APAC, or compressed E-AC-3 JOC). DTS:X rendered to APAC is
-    /// not Dolby Atmos and the PCM decode has no Atmos, so neither brings the receiver to Dolby Atmos.
+    /// engine's would compete with it for Now Playing and the audio session for no gain.
     func followAtmosOutput() {
         #if os(tvOS)
         if let player = currentAVPlayer {
             let activator = atmosOutputActivator ?? AtmosOutputActivator()
             atmosOutputActivator = activator
-            activator.attach(to: player) { [weak self] _ in
-                guard let session = self?.nativeVideoSession else { return false }
-                return session.audioIsAPAC && session.audioAPACIsFromDolbyAtmos
-            }
         } else if let host = softwareHost, host.audioRouteCarriesDolbyAtmos {
-            let activator = atmosOutputActivator ?? AtmosOutputActivator()
-            atmosOutputActivator = activator
-            activator.attachRenderer { [weak self, weak host] in
-                guard let self, let host, self.softwareHost === host,
-                      let playing = Self.softwareAtmosOutputPlaying(self.state) else { return nil }
-                // `setRate(0)` parks the host without moving `state` off `.playing`.
-                return playing && (self.state != .playing || host.isPlaying)
-            }
+            activator.attach(
+                to: player,
+                playsAPAC: { [weak self] _ in self?.nativeVideoSession?.audioIsAPAC == true },
+                // The session is built before its player is published, so it already knows what it plays.
+                startingUp: { [weak self] in
+                    self?.state == .loading && self?.nativeVideoSession?.audioIsAPAC == true
+                })
         } else {
             atmosOutputActivator?.detach()
         }

@@ -21,10 +21,11 @@ public enum StartupCheckpoint: Int, CaseIterable, Sendable, Comparable {
     /// `avformat_find_stream_info` returned: tracks, codecs and duration are known. On a slow origin
     /// this is the longest single stretch of a load, and the one a host cannot otherwise see.
     case streamsProbed
-    /// The display-criteria handshake settled (or the path had none to run).
-    case displayPrepared
-    /// The playback route is chosen: native, software, audio, or the remote-HLS bypass.
+    /// The playback route is chosen: native, software overlay, audio, or the remote-HLS bypass.
     case routed
+    /// The display has been asked for this session's output (or the path asks it nothing). The switch the
+    /// request starts runs beside the session from here, and the start waits for it to end.
+    case displayPrepared
     /// The backend host is constructed and handed its item.
     case sessionConstructed
     /// The session reports itself ready (`isSessionReady`).
@@ -105,9 +106,9 @@ public struct StartupProgress: Sendable, Equatable {
         case .dispatched:         return .connecting
         case .sourceOpened:       return .openingContainer
         case .containerOpened:    return .analyzingStreams
-        case .streamsProbed:      return .preparingDisplay
-        case .displayPrepared:    return .selectingRoute
-        case .routed:             return .buildingSession
+        case .streamsProbed:      return .selectingRoute
+        case .routed:             return .preparingDisplay
+        case .displayPrepared:    return .buildingSession
         case .sessionConstructed: return .preparingPlayback
         case .ready:              return .awaitingFirstFrame
         case .presenting:         return .presenting

@@ -409,6 +409,9 @@ extension AetherEngine {
         self.setPresentationAxis(PresentationAxisMap())
         if currentAVPlayer !== host.avPlayer {
             self.currentAVPlayer = host.avPlayer
+        } else {
+            // A reused player publishes nothing, so the activator the load anticipated is handed to it here.
+            followAtmosOutput()
         }
 
         nativeCancellables.removeAll()
@@ -819,6 +822,7 @@ extension AetherEngine {
         preopenedDemuxer: Demuxer? = nil,
         keepsMediaPlaylistRoute: Bool = false,
         generation: UInt64,
+        plannedPanelIsInHDRMode: Bool? = nil,
         resolvePanelRouting: (() async throws -> Bool)? = nil
     ) async throws {
         // companionAudioReader is set by the reader's resolver before any main-stream byte flows, so it is
@@ -1391,6 +1395,9 @@ extension AetherEngine {
         // #93 residual: hand the resume position to the session so the FIRST producer anchors at
         // the matching segment instead of producing seg0 into an immediate teardown.
         session.initialStartSeconds = startPosition
+        // The startup plan's answer, when it had one before the display switch: `prepare()` builds the session for
+        // the playlist it implies, and `serve` hands AVPlayer that playlist.
+        session.plannedPanelIsInHDRMode = plannedPanelIsInHDRMode
         if keepsMediaPlaylistRoute {
             session.keepsMediaPlaylistRoute = true
             EngineLog.emit(
@@ -1402,9 +1409,9 @@ extension AetherEngine {
         // session.start() opens its own Demuxer + prewarm seek (~1-3 s on slow CDN); detach so @MainActor doesn't block.
         var playbackURL: URL
         if let resolvePanelRouting {
-            // AE#348: the panel is still switching. Produce the first segments now and choose the
-            // playlist once `resolvePanelRouting` has the settled answer; `panelIsInHDRMode` above was
-            // read before that and is not what routes this session.
+            // AE#348: the panel is still switching. Produce the first segments now and serve once
+            // `resolvePanelRouting` returns: the settled answer for a load whose plan left it open, or the
+            // plan's own once the switch an unproven master waits for has ended (#667).
             try await BlockingWork.detached(priority: .userInitiated) { [session] in
                 do { try session.prepare() }
                 catch { session.stop(reason: .loadFailed); throw error }
@@ -1524,6 +1531,9 @@ extension AetherEngine {
         // Publish before wiring mirrors so subscribers see the AVPlayer before the first time update. Only emit on change: re-publishing the same instance retriggers the AVKit re-registration this reuse path avoids.
         if currentAVPlayer !== host.avPlayer {
             self.currentAVPlayer = host.avPlayer
+        } else {
+            // A reused player publishes nothing, so the activator the load anticipated is handed to it here.
+            followAtmosOutput()
         }
 
         nativeCancellables.removeAll()
@@ -2814,7 +2824,7 @@ extension AetherEngine {
     /// the reason for every term. `sourceVideoFormat` is untouched: the probe answered that one already,
     /// and better than a sample entry can.
     @MainActor
-    private func applyDolbyVisionLabelUpgrade(itemFormat: VideoFormat) {
+    func applyDolbyVisionLabelUpgrade(itemFormat: VideoFormat) {
         guard let upgraded = Self.dolbyVisionLabelUpgrade(
             publishedFormat: videoFormat,
             sourceFormat: sourceVideoFormat,
