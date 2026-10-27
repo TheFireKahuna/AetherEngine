@@ -128,9 +128,11 @@ the public-API contract.
   suppressed for the overlay (a Profile 7 FEL composed over its base layer, a codec AVPlayer cannot decode), nothing
   told the system a film was playing, and an iPhone 17 Pro Max ran a 24p overlay at 60 Hz: frames alternated two
   and three refreshes, and measured one to five. The overlay's display link now asks, once the frame rate is
-  measured, for the rate's largest whole multiple up to 120 Hz (120 Hz for 24p and 30p, 100 Hz for 25p), pinned to
-  that one rate. An iPhone app reaches above 60 Hz only with `CADisableMinimumFrameDurationOnPhone` in its
-  Info.plist. tvOS is unchanged: the TV's mode switch sets its rate.
+  measured, for the content's own rate (23.976 Hz for a 23.976 film), as Core Animation's ProMotion guidance asks,
+  pinned to that one rate and capped by the fastest rate the device allows at the moment (its display link's
+  `duration`). Left a range up to the fastest, an iPhone ran a 23.976 overlay at 30 Hz at times. An iPhone app
+  reaches above 60 Hz only with `CADisableMinimumFrameDurationOnPhone` in its Info.plist. On tvOS with Match Frame
+  Rate the request is the rate the TV's mode switch already sets.
 - **The audio tap delivers audio on TrueHD Atmos and DTS:X sessions.** Their loopback audio is APAC, which
   libavcodec cannot decode, so the tap's stream stayed empty for the whole session. The tap now decodes APAC
   with AudioToolbox, from the cookie the init segment carries, and downmixes the bed to its mono 48 kHz format
