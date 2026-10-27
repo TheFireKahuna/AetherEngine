@@ -76,7 +76,7 @@ say so and leave the call to the maintainer.
 - **Protocol readers for one consumer's backend** (NNTP/Usenet, AE#791): `IOReader` is public, such a
   reader lives in the app; engine gaps found while building one are welcome.
 - **Turning on a patent-sensitive optional component by default** (`TrueHDObjectAudio`,
-  `DTSXObjectAudio`, `DualLayerDolbyVision`, `DolbyVisionStillReshaping`): they are off by default on
+  `DTSXObjectAudio`, `DualLayerDolbyVision`, `APACObjectOutput`): they are off by default on
   purpose and integrators opt in.
 - README "Non-goals": no UI, no analytics, no playlist management, no subtitle drawing, no
   third-party networking.

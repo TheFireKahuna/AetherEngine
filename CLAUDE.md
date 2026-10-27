@@ -31,8 +31,8 @@ swift test --enable-all-traits --scratch-path .build-alltraits
 says nothing about the XCTest half, and an XCTest failure still ends the process with 1. Never judge
 a run through a pipe (`| tail` returns tail's exit code); read the real exit code.
 
-Four package traits (`TrueHDObjectAudio`, `DTSXObjectAudio`, `DualLayerDolbyVision`,
-`DolbyVisionStillReshaping`) are off by default. Code behind a trait must compile both ways; CI
+Five package traits (`TrueHDObjectAudio`, `DTSXObjectAudio`, `DualLayerDolbyVision`,
+`APACObjectOutput`, `MLSubtitleUpscale`) are off by default. Code behind a trait must compile both ways; CI
 builds and tests the default and the all-traits configuration, and builds tvOS + visionOS
 simulators. The simulator has no hardware video decoders, so a `-12906` there is not a device finding.
 
@@ -46,6 +46,8 @@ local loopback server, so HEVC / H.264 / hardware AV1 keep Dolby Vision, HDR and
 AV1 without hardware decode, interlaced or MVC-carrying H.264, Dolby Vision Profile 7 FEL (when
 requested and built in) and every codec the native route does not carry (VP9, VP8, MPEG-2, VC-1, ...)
 go to the software host (dav1d / libavcodec into `AVSampleBufferDisplayLayer`).
+are decoded by the engine (dav1d / libavcodec, VideoToolbox for HEVC) and drawn as an overlay
+(`SoftwareOverlayRenderer`) over the AVPlayer session, which keeps transport, audio and signalling.
 Audio is stream-copied where Apple can play it and otherwise bridged (FLAC, or APAC for rendered
 object audio). Audio-only sources have their own pipeline. Subtitles are emitted as cues; the host
 draws them. The engine draws no UI.

@@ -465,13 +465,17 @@ extension AetherEngine {
         subtitleDrainLastTickUptime = tickUptime
         var work = SubtitleDrainTickWork(store: store, playhead: playhead,
                                          landingGeneration: subtitleLandingGeneration)
+        let upscale = bitmapSubtitleUpscaleRequest(playhead: playhead)
+        // In the background the GPU is refused, so nothing is upscaled; what decodes there is owed.
+        work.upscale = isBackgrounded ? nil : upscale
         for (channel, streamIndex) in subtitleDrainTargets {
             let plan = SubtitleOverlayDrainer.drainPlan(
                 cursor: subtitleDrainCursors[channel],
                 playhead: playhead,
                 lead: Self.subtitleDrainLeadSeconds,
                 backscan: Self.subtitleDrainBackscanSeconds,
-                elapsedSinceLastPlan: elapsed)
+                repositioning: subtitleRepositioning(elapsedSinceLastPlan: elapsed),
+                relanding: bitmapSubtitleRelanding.remove(channel) != nil)
             let window: (from: Double, through: Double)
             // #250: a reset starts a fresh contiguous decoded run; a steady tick extends the one
             // already running.
@@ -584,6 +588,9 @@ extension AetherEngine {
                 gapHoldTicksLeft = held?.harvestGapAt == cut.at
                     ? (held?.harvestGapTicksLeft ?? 0) - 1 : Self.subtitleDrainHarvestGapTicks
             }
+            if upscale != nil, work.upscale == nil, decodeEnd > 0, EmbeddedSubtitleDecoder.isBitmapCodec(decoder.codecID) {
+                bitmapSubtitleUpscaleOwed.insert(channel)
+            }
             work.channels.append(SubtitleDrainChannelWork(
                 channel: channel, streamIndex: streamIndex, plan: plan, isReset: isReset,
                 window: window, coverageStart: coverageStart, retained: retained,
@@ -602,6 +609,9 @@ extension AetherEngine {
                                  events decodedByChannel: [[EmbeddedSubtitleDecoder.SubtitleEvent?]]) {
         let store = work.store
         let playhead = work.playhead
+        if work.upscale != nil, BitmapSubtitleUpscaling.shared.takeFailures() {
+            bitmapSubtitleUpscaleOwed.formUnion(work.channels.map(\.channel))
+        }
         guard activeSubtitlePacketStore === store else { return }
         for (job, events) in zip(work.channels, decodedByChannel) {
             let channel = job.channel
@@ -615,7 +625,12 @@ extension AetherEngine {
             let retained = job.retained
             let entries = job.entries
             let batchEnd = job.batchEnd
-            let decodeEnd = job.decodeEnd
+            // An upscaling landing's decode stops at the composition that ends its reconstruction pass
+            // (`SubtitleDrainDecodeHandoff`), so fewer may have decoded than were handed out. The rest stay
+            // stored behind the cursor, as a capped batch's do, and the next tick, asked for at once,
+            // decodes them.
+            let decodeEnd = min(job.decodeEnd, events.count)
+            if decodeEnd < job.decodeEnd { subtitleDrainTickRequested = true }
             let gapHoldAt = job.gapHoldAt
             let gapHoldSequence = job.gapHoldSequence
             let gapHoldTicksLeft = job.gapHoldTicksLeft
@@ -1105,10 +1120,11 @@ extension AetherEngine {
     /// unique start PTS, so a same-start same-geometry image cue is the same object re-decoded (the audio-switch
     /// preserved placeholder vs its reconstruction), and a duplicate would render the bitmap twice until the next
     /// composition trims it. #146: the start PTS is unique per COMPOSITION, not per composition OBJECT; N objects
-    /// of one display set (forced sign + dialogue) legitimately share a start and differ in geometry (position and
-    /// pixel size, both deterministic across re-decodes via the alpha-bounding-box crop), so geometry is part of
-    /// the replacement key and sibling objects are all kept. Text cues at the same start are distinct simultaneous
-    /// speakers and are both kept.
+    /// of one display set (forced sign + dialogue) legitimately share a start and differ in geometry (the position,
+    /// the alpha-bounding-box crop's rect on the canvas, deterministic across re-decodes), so geometry is part of
+    /// the replacement key and sibling objects are all kept. The bitmap's pixel size is not: the position fixes the
+    /// source's, and an upscaled copy (`bitmapSubtitlePixelSize`) differs from its decoded self in pixels alone.
+    /// Text cues at the same start are distinct simultaneous speakers and are both kept.
     ///
     /// #121: `nextID` stamps every materialized cue with a session-monotonic id and de-dupes a non-image cue
     /// (text or rich text) already present with the same window + content. On a seek the overlay decoder is
@@ -1148,9 +1164,7 @@ extension AetherEngine {
         if case .image(let stampedImage) = stamped.body {
             for i in lower..<upper {
                 guard case .image(let otherImage) = cues[i].body else { continue }
-                if otherImage.position == stampedImage.position
-                    && otherImage.cgImage.width == stampedImage.cgImage.width
-                    && otherImage.cgImage.height == stampedImage.cgImage.height {
+                if otherImage.position == stampedImage.position {
                     cues[i] = stamped
                     return true
                 }
@@ -2329,9 +2343,17 @@ struct SubtitleDrainTickWork {
     /// The landing count the tick planned against; the cursors it writes have followed that many.
     let landingGeneration: UInt64
     var channels: [SubtitleDrainChannelWork] = []
+    /// The bitmap upscale the decode half applies, nil when none is asked for.
+    var upscale: BitmapSubtitleUpscaling.Request?
 
     var decodeHandoff: SubtitleDrainDecodeHandoff {
-        SubtitleDrainDecodeHandoff(jobs: channels.map { ($0.decoder, $0.entries[..<$0.decodeEnd]) })
+        SubtitleDrainDecodeHandoff(
+            jobs: channels.map { ($0.decoder, $0.entries[..<$0.decodeEnd]) },
+            forcedLinesOnly: channels.map(\.forcedLinesOnly),
+            upscaling: upscale.map { request in
+                (request, channels.map(\.streamIndex),
+                 channels.map { $0.isReset && EmbeddedSubtitleDecoder.isBitmapCodec($0.decoder.codecID) })
+            })
     }
 }
 
@@ -2344,21 +2366,41 @@ struct SubtitleDrainDecodeHandoff: @unchecked Sendable {
     /// Per job, whether only the cues the track flags forced show: the others are dropped from their events,
     /// which keep their trims, so a display set without a forced object reads as a clear.
     var forcedLinesOnly: [Bool] = []
+    /// The overlay's upscale, each job's stream, and whether the job is a bitmap landing
+    /// (`BitmapSubtitleUpscaling`); nil leaves the events as decoded, as the OCR worker reads them.
+    var upscaling: (request: BitmapSubtitleUpscaling.Request, streams: [Int32], landings: [Bool])? = nil
 
     var isEmpty: Bool { jobs.allSatisfy { $0.packets.isEmpty } }
 
+    /// One event per packet decoded, job by job. An upscaling landing stops after the composition that ends its
+    /// reconstruction pass, the first with a cue at or after the playhead (`PGSStaleArrivalGate`), and the rest
+    /// of that PTS's packets (#271): the tick publishes only once its cues are upscaled, so the landing line waits
+    /// for its own upscale and its successor's, not the whole lead's, and the pass ends as it always does.
     func decode() -> [[EmbeddedSubtitleDecoder.SubtitleEvent?]] {
-        jobs.map { job in
-            job.packets.map { AetherEngine.decodeStoredSubtitlePacket($0, with: job.decoder) }
         var tally = BitmapSubtitleUpscaling.Tally()
+        let decoded = jobs.indices.map { k in
+            let job = jobs[k]
             let forced = k < forcedLinesOnly.count && forcedLinesOnly[k]
             func decode(_ packet: StoredSubtitlePacket) -> EmbeddedSubtitleDecoder.SubtitleEvent? {
                 let event = AetherEngine.decodeStoredSubtitlePacket(packet, with: job.decoder)
                 return forced ? event.map(Self.forcedLines) : event
             }
             guard let upscaling else { return job.packets.map(decode) }
+            let playhead = upscaling.request.playhead
+            var events: [EmbeddedSubtitleDecoder.SubtitleEvent?] = []
+            var stopAfter: Double?
+            for packet in job.packets {
+                if let stop = stopAfter, packet.ptsSeconds > stop { break }
+                let event = decode(packet)
+                events.append(event)
+                if upscaling.landings[k], stopAfter == nil,
+                   event?.cues.contains(where: { $0.startTime >= playhead }) == true {
+                    stopAfter = packet.ptsSeconds
+                }
+            }
             tally.add(BitmapSubtitleUpscaling.shared.upscale(&events, stream: upscaling.streams[k],
                                                                request: upscaling.request))
+            return events
         }
         tally.report()
         return decoded

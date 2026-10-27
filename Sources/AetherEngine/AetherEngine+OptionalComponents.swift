@@ -15,6 +15,8 @@ extension AetherEngine {
         /// `LoadOptions.preferDualLayerDolbyVision`, and the stills (scrub thumbnails, I-frame stills) of Profile 5 /
         /// 10.0 sources, which have no base layer to show.
         case dualLayerDolbyVision = "DualLayerDolbyVision"
+        /// Bitmap subtitles upscaled to `bitmapSubtitlePixelSize` (trait `MLSubtitleUpscale`).
+        case mlSubtitleUpscale = "MLSubtitleUpscale"
 
         /// The package trait that compiles the component.
         public var traitName: String { rawValue }
@@ -40,6 +42,8 @@ extension AetherEngine {
                 #else
                 return false
                 #endif
+            case .mlSubtitleUpscale:
+                #if MLSubtitleUpscale
                 return true
                 #else
                 return false
