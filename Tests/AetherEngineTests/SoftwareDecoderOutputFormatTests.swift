@@ -15,7 +15,7 @@ struct SoftwareDecoderOutputFormatTests {
 
     // MARK: - The decision
 
-    @Test("full range is carried as a label on 8-bit and on 10-bit output")
+    @Test("a full-range frame goes out full range on 8-bit and on 10-bit output")
     func fullRangeIsALabel() {
         let eight = SoftwareVideoDecoder.outputFormat(
             pixelFormat: AV_PIX_FMT_YUV420P.rawValue, colorRange: AVCOL_RANGE_JPEG, streamIs10Bit: false)
@@ -43,7 +43,7 @@ struct SoftwareDecoderOutputFormatTests {
         let format = SoftwareVideoDecoder.outputFormat(
             pixelFormat: AV_PIX_FMT_YUV420P10LE.rawValue, colorRange: AVCOL_RANGE_MPEG, streamIs10Bit: false)
         #expect(format == .init(tenBit: true, fullRange: false))
-        #expect(format.swscaleFormat == AV_PIX_FMT_P010LE)
+        #expect(format.pixelFormatType == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
     }
 
     @Test("the stream's own 10-bit verdict is never narrowed by an 8-bit frame")
@@ -121,6 +121,17 @@ struct SoftwareDecoderOutputFormatTests {
         #expect(format(AV_PIX_FMT_GBRP).chroma == .yuv444)
         #expect(format(AV_PIX_FMT_GRAY8).chroma == .yuv420)
         #expect(format(AV_PIX_FMT_GBRP10LE).pixelFormatType == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange)
+        #expect(format(AV_PIX_FMT_PAL8).chroma == .yuv444, "a palette is RGB")
+        #expect(!format(AV_PIX_FMT_PAL8, AVCOL_RANGE_JPEG).fullRange)
+    }
+
+    @Test("an interlaced 12-bit 4:2:0 picture stays 4:2:0 (dithered) even when sv22 is asked for")
+    func interlacedKeepsItsChromaRows() {
+        let interlaced = SoftwareVideoDecoder.outputFormat(
+            pixelFormat: AV_PIX_FMT_YUV420P12LE.rawValue, colorRange: AVCOL_RANGE_MPEG, streamIs10Bit: true,
+            twelveBit420: .sv22, interlaced: true)
+        #expect(interlaced.chroma == .yuv420)
+        #expect(interlaced.dithers)
     }
 
     @Test("#8: every output format reads back from its own pixel format type")
@@ -175,7 +186,7 @@ struct SoftwareDecoderOutputFormatTests {
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         let luma = try #require(CVPixelBufferGetBaseAddressOfPlane(buffer, 0)).assumingMemoryBound(to: UInt8.self)
-        #expect(luma[0] == 255, "no range conversion: the decoder's bytes are copied across and only labelled")
+        #expect(luma[0] == 255, "8-bit full range to 8-bit full range keeps every code")
     }
 
     @Test("a 10-bit SDR AV1 picture stays 10-bit instead of being dithered to 8")

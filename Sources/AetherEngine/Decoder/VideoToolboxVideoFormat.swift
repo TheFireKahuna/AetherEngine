@@ -46,11 +46,16 @@ enum VideoToolboxVideoFormat {
         }
     }
 
-    static func make(stream: UnsafeMutablePointer<AVStream>) throws -> Configuration {
-        guard let codecpar = stream.pointee.codecpar else {
-            throw VideoDecoderError.noCodecParameters
-        }
-        let pixelAspectRatio = pixelAspectRatio(codecpar: codecpar, stream: stream)
+    /// The format description for a stream, from its parts: its codec parameters, the container's sample aspect
+    /// ratio and its average frame rate (VP9's level; zero when unknown).
+    static func make(parameters codecpar: UnsafePointer<AVCodecParameters>, containerSAR: AVRational,
+                     frameRate: AVRational) throws -> Configuration {
+        let pixelAspectRatio = PixelAspectPolicy.declaredPixelAspect(
+            bitstream: codecpar.pointee.sample_aspect_ratio,
+            container: containerSAR,
+            width: codecpar.pointee.width,
+            height: codecpar.pointee.height
+        )
 
         switch codecpar.pointee.codec_id {
         case AV_CODEC_ID_HEVC:
@@ -93,8 +98,8 @@ enum VideoToolboxVideoFormat {
 
         case AV_CODEC_ID_VP9:
             let vp9 = try vp9Configuration(
-                codecpar: UnsafePointer(codecpar),
-                frameRate: stream.pointee.avg_frame_rate
+                codecpar: codecpar,
+                frameRate: frameRate
             )
             let atoms: NSDictionary = ["vpcC": vp9.configurationBoxPayload]
             let extensions = extensions(atoms: atoms, pixelAspectRatio: pixelAspectRatio)
@@ -111,25 +116,13 @@ enum VideoToolboxVideoFormat {
         }
     }
 
-    private static func pixelAspectRatio(
-        codecpar: UnsafeMutablePointer<AVCodecParameters>,
-        stream: UnsafeMutablePointer<AVStream>
-    ) -> AVRational? {
-        PixelAspectPolicy.declaredPixelAspect(
-            bitstream: codecpar.pointee.sample_aspect_ratio,
-            container: stream.pointee.sample_aspect_ratio,
-            width: codecpar.pointee.width,
-            height: codecpar.pointee.height
-        )
-    }
-
     /// AV1 (seen on the built-in XDR panel): without colour in the description VideoToolbox guesses
     /// (`ColorInfoGuessedBy`) and tags its output BT.709 SDR in the buffer's CGColorSpace and the
     /// IOSurface's colour space ID, under the PQ transfer the frame handler attaches afterwards, and a
     /// PQ source came out blown out. VP9 gets the same keys so its output cannot be tagged that way
     /// either. HEVC carries its colour in the VUI of the hvcC's SPS and needs none of this.
     private static func addColor(
-        codecpar: UnsafeMutablePointer<AVCodecParameters>,
+        codecpar: UnsafePointer<AVCodecParameters>,
         to extensions: NSMutableDictionary
     ) {
         if let primaries = ColorAttachments.primaries(codecpar.pointee.color_primaries) {

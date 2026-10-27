@@ -21,6 +21,8 @@ enum FFmpegErr {
     static let eio: Int32 = -5
     /// `AVERROR(ENOSPC)`; ENOSPC is POSIX 28. The volume a write went to is full.
     static let enospc: Int32 = -28
+    /// `AVERROR(ENOMEM)`; ENOMEM is POSIX 12.
+    static let enomem: Int32 = -12
 
     /// FFmpeg's own text for an AVERROR code, with the raw number appended so a report never loses it
     /// ("Invalid data found when processing input (-1094995529)"). Falls back to the bare number when

@@ -28,9 +28,9 @@ enum AV1DolbyVisionRPU {
 
     /// AV1 Dolby Vision Profile 10.1, the profile whose RPU this route attaches. 10.0 has no base layer
     /// to present and the HLG base of 10.4 is unmeasured, so both keep the plain libavcodec path.
-    static func carriesProfile10_1(stream: UnsafeMutablePointer<AVStream>) -> Bool {
-        guard let codecpar = stream.pointee.codecpar, codecpar.pointee.codec_id == AV_CODEC_ID_AV1,
-              let dv = AetherEngine.dvConfig(stream: stream) else { return false }
+    static func carriesProfile10_1(parameters codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
+        guard codecpar.pointee.codec_id == AV_CODEC_ID_AV1,
+              let dv = AetherEngine.dvConfig(parameters: codecpar) else { return false }
         return dv.profile == 10 && dv.blCompatID == 1
     }
 
@@ -188,61 +188,5 @@ final class AV1DolbyVisionRPUTable: @unchecked Sendable {
                 IOSurfaceRemoveValue(surface, compatibilityKey)
             }
         }
-    }
-}
-
-/// Copies a decoded frame into a buffer from a pool of our own: the pixels, and the propagated
-/// attachments the decoder put on it. The AV1 Dolby Vision route attaches its RPU to the copy, see
-/// `HardwareVideoDecoder.handleDecodedFrame`. Called on VideoToolbox's output queue, one frame at a time.
-final class FrameCopier: @unchecked Sendable {
-    private let lock = NSLock()
-    private var pool: CVPixelBufferPool?
-    private var poolKey: (width: Int, height: Int, format: OSType)?
-
-    func copy(_ source: CVPixelBuffer) -> CVPixelBuffer? {
-        let width = CVPixelBufferGetWidth(source), height = CVPixelBufferGetHeight(source)
-        let format = CVPixelBufferGetPixelFormatType(source)
-        lock.lock()
-        if pool == nil || poolKey.map({ $0 != (width, height, format) }) ?? true {
-            let attributes: [String: Any] = [
-                kCVPixelBufferWidthKey as String: width,
-                kCVPixelBufferHeightKey as String: height,
-                kCVPixelBufferPixelFormatTypeKey as String: format,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
-                kCVPixelBufferMetalCompatibilityKey as String: true,
-            ]
-            var created: CVPixelBufferPool?
-            CVPixelBufferPoolCreate(nil, [kCVPixelBufferPoolMinimumBufferCountKey as String: 12] as CFDictionary,
-                                    attributes as CFDictionary, &created)
-            pool = created
-            poolKey = (width, height, format)
-        }
-        let pool = self.pool
-        lock.unlock()
-
-        guard let pool else { return nil }
-        var destination: CVPixelBuffer?
-        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &destination) == kCVReturnSuccess,
-              let destination else { return nil }
-        CVPixelBufferLockBaseAddress(source, .readOnly)
-        CVPixelBufferLockBaseAddress(destination, [])
-        defer {
-            CVPixelBufferUnlockBaseAddress(destination, [])
-            CVPixelBufferUnlockBaseAddress(source, .readOnly)
-        }
-        for plane in 0..<CVPixelBufferGetPlaneCount(source) {
-            guard let from = CVPixelBufferGetBaseAddressOfPlane(source, plane),
-                  let to = CVPixelBufferGetBaseAddressOfPlane(destination, plane) else { return nil }
-            let fromRow = CVPixelBufferGetBytesPerRowOfPlane(source, plane)
-            let toRow = CVPixelBufferGetBytesPerRowOfPlane(destination, plane)
-            let rowBytes = min(fromRow, toRow)
-            for row in 0..<CVPixelBufferGetHeightOfPlane(source, plane) {
-                memcpy(to + row * toRow, from + row * fromRow, rowBytes)
-            }
-        }
-        // Replaces rather than adds: a recycled pool buffer can still hold the previous frame's tags.
-        CVBufferRemoveAllAttachments(destination)
-        CVBufferPropagateAttachments(source, destination)
-        return destination
     }
 }

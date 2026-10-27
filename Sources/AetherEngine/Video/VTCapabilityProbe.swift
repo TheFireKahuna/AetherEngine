@@ -9,7 +9,7 @@ enum VTCapabilityProbe {
 
     /// True only when AVPlayer's HLS-fMP4 pipeline can HW-decode AV1. Apple's dav1d (macOS 14+/iOS 17+) is reachable via direct file playback but NOT via AVPlayer HLS in practice (verified 2026-05-14 on M1 macOS 26.4): VTIsHardwareDecodeSupported returns false, AVURLAsset.isPlayable returns false. False routes to SoftwarePlaybackHost/dav1d.
     static let av1Available: Bool = {
-        if #available(tvOS 26.2, iOS 26.2, macOS 16.0, visionOS 26.2, *) {
+        if #available(tvOS 26.2, iOS 26.2, macOS 11.0, visionOS 26.2, *) {
             VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_AV1)
         }
         let supported = VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
@@ -21,7 +21,7 @@ enum VTCapabilityProbe {
     /// format in OPPOSITE directions, which is why this is three-valued rather than a Bool:
     /// - the routing gate (`canHardwareDecode`) keeps the native path, because AVPlayer's decoder reads
     ///   in-band parameter sets and Annex-B carriage that the probe cannot see from the config record;
-    /// - `SoftwarePlaybackHost` must pick libavcodec, because `HardwareVideoDecoder` builds its format
+    /// - the software overlay must pick libavcodec, because `HardwareVideoDecoder` builds its format
     ///   description from the hvcC alone, so every unclassifiable class is one it can never open
     ///   (AE#461: a decode-path correction onto software failed `sessionCreationFailed(-4)` there).
     enum HardwareDecodeVerdict: Equatable {
@@ -47,10 +47,10 @@ enum VTCapabilityProbe {
     /// AVPlayer accepts the HLS CODECS string for H.264 High 4:2:2 / 4:4:4 / High-10 and HEVC Rext, but the
     /// underlying VT decoder only exists on some silicon (Apple Silicon: yes; Intel Macs / older Apple TV: no
     /// HW decoder), so the item reaches readyToPlay then renders nothing (issue #2, DrHurt Intel Mac mini).
-    /// Callers route `false` to the SoftwarePlaybackHost (libavcodec), which decodes these profiles fine.
+    /// Callers route `false` to the software overlay (libavcodec), which decodes these profiles fine.
     ///
     /// Returns `true` (keep the native path) whenever the format can't be classified, so a probe gap never
-    /// wrongly forces the software path. Not the question `SoftwarePlaybackHost` asks, see
+    /// wrongly forces the software path. Not the question the overlay's decoder choice asks, see
     /// `HardwareDecodeVerdict`.
     static func canHardwareDecode(codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
         if codecpar.pointee.codec_id == AV_CODEC_ID_AV1 {
@@ -69,7 +69,7 @@ enum VTCapabilityProbe {
     }
 
     /// Strict form of the gate for routes that need a PROVEN hardware session, such as the dual-layer path:
-    /// `.unclassifiable` is false here, unlike `canHardwareDecode`, because `SoftwarePlaybackHost` would
+    /// `.unclassifiable` is false here, unlike `canHardwareDecode`, because the overlay would
     /// hand an unclassifiable stream to libavcodec.
     static func opensHardwareDecoder(codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
         hardwareDecodeVerdict(codecpar: codecpar).opensHardwareDecoder

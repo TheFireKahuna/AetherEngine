@@ -44,15 +44,14 @@ protocol VideoDecodingPipeline: AnyObject, Sendable {
     func flush()
     /// End of source or a live seam: delivers what the decoder still owes before the `flush()` the host
     /// makes next. `flush()` of a decoder that delivers what it drains is enough, so the default does
-    /// nothing; a decoder whose `flush()` discards (the dual-layer one) overrides it. Seeks never call it.
+    /// nothing; a decoder whose `flush()` discards (the dual-layer and libavcodec ones) overrides it.
+    /// Seeks never call it.
     func drainForEndOfStream()
     func close()
 }
 
 extension VideoDecodingPipeline {
     func drainForEndOfStream() {}
-    /// A decoder that does not count reports no progress, so its preroll times out as before.
-    var framesDecoded: UInt64 { 0 }
 }
 
 enum VideoDecoderError: Error, LocalizedError {
@@ -62,6 +61,11 @@ enum VideoDecoderError: Error, LocalizedError {
     case unsupportedConfiguration(codec: String, detail: String)
     case hardwareDecoderUnavailable(codec: String)
     case formatDescriptionFailed(status: OSStatus)
+    /// The software decoder's pictures are in a pixel format its GPU finisher cannot read (hardware, Bayer, float
+    /// or XYZ samples, or Y'CbCr below 8 bits).
+    case unsupportedPixelFormat(name: String)
+    /// No Metal device: the software decoder's display path is a GPU pass.
+    case metalUnavailable
     case sessionCreationFailed(status: OSStatus)
     /// `DualLayerVideoDecoder` is single use (dolby-vision-fel.md §5.8): `open` after `close` refuses
     /// with this instead of inheriting the previous stream's state. Thrown rather than a
@@ -87,6 +91,8 @@ enum VideoDecoderError: Error, LocalizedError {
         case .hardwareDecoderUnavailable(let codec):
             "Hardware \(codec) decoder unavailable"
         case .formatDescriptionFailed(let s): "Format description failed (\(s))"
+        case .unsupportedPixelFormat(let name): "Decoded pixel format \(name) cannot be displayed"
+        case .metalUnavailable: "No Metal device for the software decoder's display path"
         case .sessionCreationFailed(let s): "Decoder session failed (\(s))"
         case .decoderClosed: "Decoder is closed (single use)"
         case .composerUnavailable: "Dolby Vision FEL composer unavailable (no Metal device or shader compilation failed)"
@@ -146,6 +152,8 @@ enum ColorAttachments {
         case AVCOL_SPC_BT2020_NCL, AVCOL_SPC_BT2020_CL: kCVImageBufferYCbCrMatrix_ITU_R_2020
         case AVCOL_SPC_SMPTE170M, AVCOL_SPC_BT470BG: kCVImageBufferYCbCrMatrix_ITU_R_601_4
         case AVCOL_SPC_SMPTE240M:                   kCVImageBufferYCbCrMatrix_SMPTE_240M_1995
+        // CoreVideo maps code point 14 to its own `ITU_R_2100_ICtCp`, which no public header names.
+        case AVCOL_SPC_ICTCP:                       CVYCbCrMatrixGetStringForIntegerCodePoint(14)?.takeUnretainedValue()
         default:                                    nil
         }
     }
